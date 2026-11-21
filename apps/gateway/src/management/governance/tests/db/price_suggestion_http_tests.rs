@@ -37,6 +37,8 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
     let c = calls.clone();
     let wide_responses = Arc::new(AtomicUsize::new(0));
     let wide_hits = wide_responses.clone();
+    let image_responses = Arc::new(AtomicUsize::new(0));
+    let image_hits = image_responses.clone();
     let catalog = axum::Router::new()
         .route("/models", axum::routing::get(move || {
             let c = c.clone();
@@ -50,6 +52,7 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
                     {"id":"v/m","context_length":4096,"top_provider":{"max_completion_tokens":100},"pricing":{"prompt":"3","completion":"3","input_cache_write":"1e400","overrides":[{"min_prompt_tokens":1,"input_cache_write":"0"}]}},
                     {"id":"v/large","context_length":4096,"top_provider":{"max_completion_tokens":100},"pricing":{"prompt":"1","overrides":tiers}},
                     {"id":"v/cold","pricing":{"prompt":"1"}},
+                    {"id":"v/image"},
                     {"id":"v/endpoint-large","context_length":4096,"top_provider":{"max_completion_tokens":100},"pricing":{"prompt":"1","completion":"2"}},
                     {"id":"v/endpoint-deep","context_length":4096,"top_provider":{"max_completion_tokens":100},"pricing":{"prompt":"1","completion":"2"}},
                     {"id":"v/endpoint-wide","context_length":4096,"top_provider":{"max_completion_tokens":100},"pricing":{"prompt":"1","completion":"2"}},
@@ -81,6 +84,17 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
                     format!(r#"{{{}{}"#, r#""metadata":0,"#.repeat(64), &valid[1..])
                 } else {
                     json!({"endpoints":[{"provider_name":"Recovered","status":0,"pricing":{"prompt":"3","completion":"3"}}]}).to_string()
+                };
+                ([("content-type", "application/json")], body)
+            }
+        }))
+        .route("/images/models/v/image/endpoints", axum::routing::get(move || {
+            let attempt = image_hits.fetch_add(1, Ordering::SeqCst);
+            async move {
+                let body = if attempt == 0 {
+                    r#"{"data":[[]]}"#
+                } else {
+                    r#"{"data":null,"data":null,"endpoints":[{"pricing":[{"billable":"output_image","unit":"image","cost_usd":"0.01"}]}]}"#
                 };
                 ([("content-type", "application/json")], body)
             }
@@ -117,6 +131,12 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
     let endpoint_wide = Uuid::new_v4();
     sqlx::query("INSERT INTO deployments(id,model_id,provider_connection_id,upstream_model) VALUES($1,$2,$3,'v/endpoint-wide')")
         .bind(endpoint_wide).bind(model).bind(connection).execute(&f.store.pool).await.unwrap();
+    let image_model = Uuid::new_v4();
+    let image_deployment = Uuid::new_v4();
+    sqlx::query("INSERT INTO models(id,public_name,supported_protocols) VALUES($1,'preview-image',ARRAY['images'])")
+        .bind(image_model).execute(&f.store.pool).await.unwrap();
+    sqlx::query("INSERT INTO deployments(id,model_id,provider_connection_id,upstream_model) VALUES($1,$2,$3,'v/image')")
+        .bind(image_deployment).bind(image_model).bind(connection).execute(&f.store.pool).await.unwrap();
     // Create an actual immutable price first. Preview is read-only even when
     // parsing fails or refuses a hostile entry.
     let admin = user(f.owner, true);
@@ -324,6 +344,32 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
         assert_eq!(body["endpoint"]["provider"], "Recovered");
     }
     assert_eq!(wide_responses.load(Ordering::SeqCst), 2);
+    let image_url =
+        format!("{gateway_url}/api/v1/platform/deployments/{image_deployment}/price-suggestion");
+    let invalid = client
+        .get(&image_url)
+        .header("cookie", &admin_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_GATEWAY);
+    for _ in 0..2 {
+        let recovered = client
+            .get(&image_url)
+            .header("cookie", &admin_cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(recovered.status(), StatusCode::OK);
+        let body: Value = recovered.json().await.unwrap();
+        assert!(
+            body["lines"].as_array().unwrap().iter().any(|line| {
+                line["meter"] == "output_images" && line["microusd_per_batch"] == "10000"
+            }),
+            "{body}"
+        );
+    }
+    assert_eq!(image_responses.load(Ordering::SeqCst), 2);
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     let r = client
         .get(format!(

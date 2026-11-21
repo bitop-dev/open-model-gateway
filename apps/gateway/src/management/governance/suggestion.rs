@@ -134,13 +134,18 @@ impl OpenRouterCatalog {
                 Err(CatalogError::Limit)
             };
         }
-        if !catalog_shape_matches(path, &body) {
+        if images {
+            let endpoints = image_endpoint_arrays(&body);
+            if endpoints.iter().all(Option::is_none) {
+                return Err(CatalogError::Unavailable);
+            }
+            if decode_image_endpoints(endpoints).is_none() {
+                // The envelope is valid, but these image prices cannot be read.
+                // Let the mapper report the missing rates and retry on next use.
+                return Ok(body);
+            }
+        } else if !catalog_shape_matches(path, &body) {
             return Err(CatalogError::Unavailable);
-        }
-        if images && decode_image_endpoints(&body).is_none() {
-            // The envelope is valid, but these image prices cannot be read.
-            // Let the mapper report the missing rates and retry on next use.
-            return Ok(body);
         }
         let mut cache = self.cache.lock().await;
         cache.retain(|_, (at, _)| at.elapsed() < CACHE_TTL);
@@ -159,7 +164,7 @@ struct CatalogEnvelope<'a> {
     endpoints: Option<&'a RawValue>,
 }
 
-fn object_envelope(body: &[u8]) -> Option<CatalogEnvelope<'_>> {
+fn object_envelope<'a, T: Deserialize<'a>>(body: &'a [u8]) -> Option<T> {
     if body.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
         return None;
     }
@@ -171,13 +176,13 @@ fn is_array(value: &RawValue) -> bool {
 }
 
 fn endpoint_arrays(body: &[u8]) -> [Option<&RawValue>; 2] {
-    let Some(envelope) = object_envelope(body) else {
+    let Some(envelope) = object_envelope::<CatalogEnvelope<'_>>(body) else {
         return [None, None];
     };
     let direct = envelope.endpoints.filter(|value| is_array(value));
     let wrapped = envelope
         .data
-        .and_then(|data| object_envelope(data.get().as_bytes()))
+        .and_then(|data| object_envelope::<CatalogEnvelope<'_>>(data.get().as_bytes()))
         .and_then(|data| data.endpoints)
         .filter(|value| is_array(value));
     [direct, wrapped]
@@ -185,7 +190,7 @@ fn endpoint_arrays(body: &[u8]) -> [Option<&RawValue>; 2] {
 
 fn catalog_shape_matches(path: &str, body: &[u8]) -> bool {
     if path.split('?').next() == Some("/models") {
-        return object_envelope(body)
+        return object_envelope::<CatalogEnvelope<'_>>(body)
             .and_then(|value| value.data)
             .is_some_and(is_array);
     }
@@ -616,15 +621,43 @@ struct ImagePrice {
     #[serde(default)]
     variant: Option<String>,
 }
-fn decode_image_endpoints(body: &[u8]) -> Option<Vec<ImageEndpoint>> {
-    endpoint_arrays(body)
+fn image_endpoint_arrays(body: &[u8]) -> [Option<&RawValue>; 2] {
+    #[derive(Deserialize)]
+    struct Direct<'a> {
+        #[serde(borrow)]
+        endpoints: &'a RawValue,
+    }
+    #[derive(Deserialize)]
+    struct Wrapped<'a> {
+        #[serde(borrow)]
+        data: &'a RawValue,
+    }
+
+    fn list(body: &[u8]) -> Option<&RawValue> {
+        object_envelope::<Direct<'_>>(body)
+            .map(|envelope| envelope.endpoints)
+            .filter(|value| is_array(value))
+    }
+
+    // Each accepted shape consumes only its own field. Repeated fields in
+    // the alternate shape cannot invalidate an otherwise readable list.
+    let wrapped = object_envelope::<Wrapped<'_>>(body)
+        .and_then(|envelope| list(envelope.data.get().as_bytes()));
+    [list(body), wrapped]
+}
+
+fn decode_image_endpoints(arrays: [Option<&RawValue>; 2]) -> Option<Vec<ImageEndpoint>> {
+    arrays
         .into_iter()
         .flatten()
         .find_map(|endpoints| serde_json::from_str(endpoints.get()).ok())
 }
 
 fn image_lines(d: &mut Draft, body: Option<&[u8]>) {
-    let Some(endpoints) = body.and_then(decode_image_endpoints) else {
+    let Some(endpoints) = body
+        .map(image_endpoint_arrays)
+        .and_then(decode_image_endpoints)
+    else {
         d.priced(
             Meter::OutputImages,
             "Image output",

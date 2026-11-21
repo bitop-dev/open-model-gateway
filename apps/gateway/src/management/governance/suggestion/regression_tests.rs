@@ -427,6 +427,42 @@ async fn a_wrong_endpoint_envelope_is_not_cached() {
     }
 }
 
+#[tokio::test]
+async fn image_endpoint_envelopes_ignore_repeated_fields_from_the_alternate_shape() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const PATH: &str = "/images/models/v/m/endpoints";
+    for body in [
+        r#"{"data":null,"data":null,"endpoints":[{"pricing":[{"billable":"output_image","unit":"image","cost_usd":"0.01"}]}]}"#,
+        r#"{"endpoints":null,"endpoints":null,"data":{"endpoints":[{"pricing":[{"billable":"output_image","unit":"image","cost_usd":"0.01"}]}]}}"#,
+    ] {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let requests = hits.clone();
+        let app = axum::Router::new().route(
+            PATH,
+            axum::routing::get(move || {
+                requests.fetch_add(1, Ordering::SeqCst);
+                async move { ([("content-type", "application/json")], body) }
+            }),
+        );
+        let (url, task) = tests::mock(app).await;
+        let catalog = OpenRouterCatalog::for_test(url, Duration::from_secs(2));
+        let model = json!({"id":"v/m"});
+        for _ in 0..2 {
+            let response = catalog.get(PATH).await.unwrap();
+            let draft = map(&model, WorkloadKind::Images, Some(&response));
+            assert!(
+                draft["lines"].as_array().unwrap().iter().any(|line| {
+                    line["meter"] == "output_images" && line["microusd_per_batch"] == "10000"
+                }),
+                "{draft}"
+            );
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        task.abort();
+    }
+}
+
 proptest::proptest! {
     #![proptest_config(crate::proptest_support_tests::config(100))]
     #[test]
