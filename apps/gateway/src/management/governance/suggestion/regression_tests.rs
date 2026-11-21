@@ -293,6 +293,38 @@ fn distinct_variants_across_bounded_endpoints_still_refuse_at_the_line_budget() 
 }
 
 #[test]
+fn a_refused_endpoint_retains_catalog_ceilings() {
+    let tiers: Vec<_> = (1..=64)
+        .map(|n| json!({"min_prompt_tokens":n,"prompt":"2"}))
+        .collect();
+    let model = json!({
+        "id":"v/m","context_length":4096,"top_provider":{"max_completion_tokens":100},
+        "pricing":{"prompt":"1","completion":"1","overrides":tiers}
+    });
+    let endpoints = json!({"endpoints":[{
+        "provider_name":"Example","status":0,"context_length":8192,"max_completion_tokens":1024,
+        "pricing":{"prompt":"1","completion":"1"}
+    }]});
+    let out = map_with_endpoints(
+        &model,
+        WorkloadKind::Generation,
+        None,
+        Some(&endpoints),
+        &[],
+    );
+    assert!(out.get("endpoint").is_none());
+    assert!(
+        out["draft"]["price_lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p["unknown"] == true)
+    );
+    assert_eq!(out["draft"]["input_token_limit"], 4096);
+    assert_eq!(out["draft"]["output_token_limit"], 100);
+}
+
+#[test]
 fn a_non_object_model_cannot_panic_when_an_endpoint_is_selected() {
     let endpoints =
         json!({"endpoints":[{"pricing":{"prompt":"1","completion":"1","request":"0"}}]});
@@ -318,10 +350,11 @@ async fn a_malformed_success_is_not_cached() {
         axum::routing::get(move || {
             let h = h.clone();
             async move {
-                let body = if h.fetch_add(1, Ordering::SeqCst) == 0 {
-                    "{broken"
-                } else {
-                    "{\"data\":[]}"
+                let body = match h.fetch_add(1, Ordering::SeqCst) {
+                    0 => "{broken",
+                    1 => "{\"data\":{}}",
+                    2 => "[[]]",
+                    _ => "{\"data\":[]}",
                 };
                 ([("content-type", "application/json")], body)
             }
@@ -329,10 +362,12 @@ async fn a_malformed_success_is_not_cached() {
     );
     let (url, task) = tests::mock(app).await;
     let catalog = OpenRouterCatalog::for_test(url, Duration::from_secs(2));
-    assert!(catalog.get("/models").await.is_err());
+    for _ in 0..3 {
+        assert!(catalog.get("/models").await.is_err());
+    }
     assert!(catalog.get("/models").await.is_ok());
     assert!(catalog.get("/models").await.is_ok());
-    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
     task.abort();
 }
 

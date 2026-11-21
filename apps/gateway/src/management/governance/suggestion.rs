@@ -123,6 +123,17 @@ impl OpenRouterCatalog {
         // Decode only bounded, complete JSON; a malformed 200 must not poison
         // subsequent previews for the cache TTL.
         limits::catalog_json(&body)?;
+        if path.split('?').next() == Some("/models") {
+            #[derive(Deserialize)]
+            struct Models {
+                #[serde(rename = "data")]
+                _data: Vec<serde::de::IgnoredAny>,
+            }
+            if body.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
+                return Err(CatalogError::Unavailable);
+            }
+            serde_json::from_slice::<Models>(&body).map_err(|_| CatalogError::Unavailable)?;
+        }
         let body = Arc::new(body);
         let mut cache = self.cache.lock().await;
         cache.retain(|_, (at, _)| at.elapsed() < CACHE_TTL);

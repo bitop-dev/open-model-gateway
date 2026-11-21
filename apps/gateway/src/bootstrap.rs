@@ -46,7 +46,36 @@ pub async fn provision_user(store: &Store, email: &str, platform_admin: bool) ->
 }
 
 /// Development fixtures require an explicitly local database, before any connection.
-pub fn ensure_dev_config(
+pub(crate) fn dev_connect_options(
+    environment: Environment,
+    database_url: &str,
+) -> Result<sqlx::postgres::PgConnectOptions> {
+    use sqlx::ConnectOptions;
+
+    let url = reqwest::Url::parse(database_url)
+        .map_err(|_| anyhow::anyhow!("invalid development database configuration"))?;
+    let mut options = sqlx::postgres::PgConnectOptions::from_url(&url)
+        .map_err(|_| anyhow::anyhow!("invalid development database configuration"))?;
+    ensure_dev_config(environment, &options)?;
+    let explicit_database = url
+        .query_pairs()
+        .filter(|(key, _)| key == "dbname")
+        .last()
+        .map_or_else(
+            || !url.path().trim_start_matches('/').is_empty(),
+            |(_, name)| !name.is_empty(),
+        );
+    anyhow::ensure!(
+        explicit_database,
+        "bootstrap-dev requires a database name in DATABASE_URL"
+    );
+    if options.get_host() == "[::1]" {
+        options = options.host("::1");
+    }
+    Ok(options)
+}
+
+fn ensure_dev_config(
     environment: Environment,
     options: &sqlx::postgres::PgConnectOptions,
 ) -> Result<()> {
@@ -163,6 +192,21 @@ pub async fn seed(store: &Store, environment: Environment) -> Result<Option<Deve
 mod config_tests {
     use super::*;
     use std::str::FromStr;
+
+    #[tokio::test]
+    async fn development_bootstrap_normalizes_ipv6_for_tcp_connection() {
+        let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let options = dev_connect_options(
+            Environment::Development,
+            &format!("postgres://gateway@[::1]:{port}/db"),
+        )
+        .unwrap();
+        let socket = tokio::net::TcpStream::connect((options.get_host(), options.get_port()))
+            .await
+            .unwrap();
+        assert!(socket.peer_addr().unwrap().is_ipv6());
+    }
 
     #[test]
     fn development_bootstrap_accepts_only_explicit_loopback_options() {

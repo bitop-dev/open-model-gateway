@@ -277,8 +277,15 @@ impl State {
             // `error` carries the code at the top level; `response.failed`
             // carries it in the response's `error`. Neither needs a started
             // response: a provider failure is reported whenever it happens.
-            "error" => Err(stream_error(&value)),
-            "response.failed" => Err(stream_error(&value["response"]["error"])),
+            "error" | "response.failed" => {
+                self.done = true;
+                let error = if kind == "error" {
+                    &value
+                } else {
+                    &value["response"]["error"]
+                };
+                Err(stream_error(error))
+            }
             _ => Err(InferenceError::InvalidUpstream),
         }
     }

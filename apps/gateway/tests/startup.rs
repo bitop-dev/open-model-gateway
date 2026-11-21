@@ -798,6 +798,24 @@ fn bootstrap_dev_refuses_remote_database_before_connecting_or_printing_keys() {
 }
 
 #[test]
+fn bootstrap_dev_requires_the_database_to_be_named_in_the_url() {
+    let f = Fixture::new();
+    let output = f.run(
+        &["bootstrap-dev"],
+        [
+            ("GATEWAY_ENV", "development"),
+            ("DATABASE_URL", "postgres://gateway@127.0.0.1:1"),
+            ("PGDATABASE", "ambient_database"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(
+        text(&output.stderr).contains("bootstrap-dev requires a database name in DATABASE_URL")
+    );
+}
+
+#[test]
 fn bootstrap_dev_refuses_a_socket_override_before_connecting() {
     let f = Fixture::new();
     let mut database = reqwest::Url::parse("postgres://gateway@127.0.0.1/db").unwrap();

@@ -877,6 +877,21 @@ fn a_terminal_pushed_after_the_terminal_is_refused() {
     }
 }
 
+#[test]
+fn a_response_cannot_start_after_a_provider_failure() {
+    for event in [
+        json!({"type":"error","code":"rate_limit_exceeded"}),
+        json!({"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded"}}}),
+    ] {
+        let mut state = State::default();
+        assert!(state.push(event).is_err());
+        assert!(matches!(
+            state.push(json!({"type":"response.created"})),
+            Err(InferenceError::InvalidUpstream)
+        ));
+    }
+}
+
 // ---- deterministic sweeps ----------------------------------------------------
 
 /// A canonical stream with every item kind, a phase, tool arguments in

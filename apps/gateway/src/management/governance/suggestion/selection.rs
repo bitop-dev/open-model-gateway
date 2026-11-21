@@ -132,7 +132,7 @@ pub(crate) fn map_with_endpoints(
     let (priced, tiers_dropped, unusable_limit) = endpoint_model(model, endpoint);
     let mut out = map(&priced, workload, images);
     if all_rates_unknown(&out) {
-        return out;
+        return limits::refused(model, workload);
     }
     if unusable_limit {
         push_warning(
