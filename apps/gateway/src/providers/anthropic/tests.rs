@@ -32,6 +32,7 @@ pub(super) fn request(stream: bool) -> ChatRequest {
             content: Some("hello".into()),
             tool_calls: vec![],
             tool_call_id: None,
+            tool_result_is_error: false,
         }],
         tools: vec![],
         tool_choice: None,
@@ -530,4 +531,34 @@ fn thinking_tokens_and_reported_model_are_telemetry_only() {
     let mut v = complete();
     v["model"] = json!("m".repeat(ReportedModel::MAX + 1));
     assert_eq!(decode(&v).unwrap().usage.reported_model, None);
+}
+
+#[cfg(feature = "integration-tests")]
+#[dbtest::test]
+async fn error_tool_sdk_anthropic_preserves_boolean_presence(pool: sqlx::PgPool) {
+    let mock = Mock::new(200, None).await;
+    let adapter = AnthropicAdapter::for_test(Arc::new(Resolver), mock.adapter.base.clone());
+    let mut deployment = target();
+    deployment.credential_ref = "env:FIXTURE_ONLY".into();
+    super::super::contract::assert_error_tool_sdk(pool, Arc::new(adapter), deployment).await;
+    let capture = mock.capture.lock().unwrap();
+    assert_eq!(capture.len(), 6);
+    let expected = super::super::contract::error_tool_result_requests();
+    for (i, ((_, _, body), (_, _, text))) in capture.iter().zip(expected).enumerate() {
+        let results = &body["messages"][2]["content"];
+        assert_eq!(results[0]["tool_use_id"], "second-call");
+        assert_eq!(results[0]["content"], text);
+        assert_eq!(
+            results[0].get("is_error"),
+            match i / 2 {
+                0 => None,
+                1 => Some(&json!(false)),
+                _ => Some(&json!(true)),
+            }
+        );
+        assert_eq!(
+            results[1],
+            json!({"type":"tool_result","tool_use_id":"first-call","content":"unchanged"})
+        );
+    }
 }

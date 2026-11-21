@@ -19,7 +19,7 @@ Providers are startup registry entries, not engine branches or database enums. M
 | --- | --- |
 | `openai` | Fixed `https://api.openai.com/v1`; native Chat, Responses, string embeddings, `gpt-image-*` image generation, audio transcription and speech, realtime sessions over `wss://api.openai.com/v1/realtime` (GA interface), and native batches on OpenAI Batch ([batches](batches.md)). It no longer offers `videos`: OpenAI shut down the Sora 2 models and the Videos API on 2026-09-24. No arbitrary cloud endpoint override. |
 | `anthropic` | Fixed `https://api.anthropic.com/v1`; native Messages, representable Chat subset. |
-| `bedrock` | Server AWS identity, an allowlisted named profile or an assumed IAM role; explicit region; optional allowlisted VPC endpoint; SigV4 Converse/ConverseStream, not an OpenAI URL. |
+| `bedrock` | Server AWS identity, an allowlisted named profile or an assumed IAM role; explicit region; optional allowlisted VPC endpoint; SigV4 Converse/ConverseStream, not an OpenAI URL. Failed tool results carry explicit Converse status. Bedrock evaluates model support. |
 | `openai_compatible` | Explicit approved local Chat/embedding subset, Jina/Cohere-style rerank and TypeSafe System One; not universal compatibility. |
 | `vllm`, `sglang` | Separately declared local Chat/embedding profiles plus rerank (vLLM's Jina/Cohere-style `/rerank`; SGLang's native `/v1/rerank`). No System One. |
 | `ollama` | Compatible Chat plus **native `/api/embed`**, derived from approved `/v1` base; not compatible embedding fallback. System One on `/v1/systemone` (Ollama v0.35.0+). No rerank. |
