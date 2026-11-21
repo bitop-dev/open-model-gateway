@@ -371,6 +371,36 @@ async fn a_malformed_success_is_not_cached() {
     task.abort();
 }
 
+#[tokio::test]
+async fn a_wrong_endpoint_envelope_is_not_cached() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    for path in ["/models/v/m/endpoints", "/images/models/v/m/endpoints"] {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let requests = hits.clone();
+        let app = axum::Router::new().route(
+            path,
+            axum::routing::get(move || {
+                let requests = requests.clone();
+                async move {
+                    let body = match requests.fetch_add(1, Ordering::SeqCst) {
+                        0 => json!({"data":{"endpoints":{}}}),
+                        _ => json!({"data":{"endpoints":[]}}),
+                    };
+                    axum::Json(body)
+                }
+            }),
+        );
+        let (url, task) = tests::mock(app).await;
+        let catalog = OpenRouterCatalog::for_test(url, Duration::from_secs(2));
+        assert!(catalog.get(path).await.is_err());
+        assert!(catalog.get(path).await.is_ok());
+        assert!(catalog.get(path).await.is_ok());
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        task.abort();
+    }
+}
+
 proptest::proptest! {
     #![proptest_config(crate::proptest_support_tests::config(100))]
     #[test]

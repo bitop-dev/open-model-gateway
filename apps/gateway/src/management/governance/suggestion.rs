@@ -123,16 +123,8 @@ impl OpenRouterCatalog {
         // Decode only bounded, complete JSON; a malformed 200 must not poison
         // subsequent previews for the cache TTL.
         limits::catalog_json(&body)?;
-        if path.split('?').next() == Some("/models") {
-            #[derive(Deserialize)]
-            struct Models {
-                #[serde(rename = "data")]
-                _data: Vec<serde::de::IgnoredAny>,
-            }
-            if body.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
-                return Err(CatalogError::Unavailable);
-            }
-            serde_json::from_slice::<Models>(&body).map_err(|_| CatalogError::Unavailable)?;
+        if !catalog_shape_matches(path, &body) {
+            return Err(CatalogError::Unavailable);
         }
         let body = Arc::new(body);
         let mut cache = self.cache.lock().await;
@@ -144,6 +136,41 @@ impl OpenRouterCatalog {
         Ok(body)
     }
 }
+// Only complete envelopes can be shared through the cache. Inspect the
+// required fields without allocating a second tree for their contents.
+fn catalog_shape_matches(path: &str, body: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    struct Envelope<'a> {
+        #[serde(borrow)]
+        data: Option<&'a RawValue>,
+        #[serde(borrow)]
+        endpoints: Option<&'a RawValue>,
+    }
+
+    let models = path.split('?').next() == Some("/models");
+    let endpoint_list = path.ends_with("/endpoints");
+    if !models && !endpoint_list {
+        return true;
+    }
+    if body.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
+        return false;
+    }
+    let Ok(envelope) = serde_json::from_slice::<Envelope<'_>>(body) else {
+        return false;
+    };
+    let is_array = |value: &RawValue| value.get().starts_with('[');
+    if models {
+        return envelope.data.is_some_and(is_array);
+    }
+    envelope.endpoints.is_some_and(is_array)
+        || envelope
+            .data
+            .filter(|data| data.get().starts_with('{'))
+            .and_then(|data| serde_json::from_str::<Envelope<'_>>(data.get()).ok())
+            .and_then(|data| data.endpoints)
+            .is_some_and(is_array)
+}
+
 fn default_catalog() -> Result<Arc<OpenRouterCatalog>, ApiError> {
     static CATALOG: OnceLock<Option<Arc<OpenRouterCatalog>>> = OnceLock::new();
     CATALOG

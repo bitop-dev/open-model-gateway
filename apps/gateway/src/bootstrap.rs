@@ -1,5 +1,5 @@
 use crate::{auth::NewApiKey, config::Environment, lifecycle, store::Store};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use uuid::Uuid;
 
 /// Printed once by the explicit development CLI; never sent to structured logs.
@@ -100,9 +100,26 @@ pub(crate) async fn ensure_empty(tx: &mut sqlx::PgConnection) -> Result<()> {
     Ok(())
 }
 
+async fn ensure_selected_database(conn: &mut sqlx::PgConnection, selected: &str) -> Result<()> {
+    let connected: String = sqlx::query_scalar("SELECT current_database()::text")
+        .fetch_one(conn)
+        .await?;
+    anyhow::ensure!(
+        connected == selected,
+        "bootstrap-dev connected to a database other than the one selected in DATABASE_URL"
+    );
+    Ok(())
+}
+
 pub async fn seed(store: &Store, environment: Environment) -> Result<Option<DevelopmentKeys>> {
-    ensure_dev_config(environment, &store.pool.connect_options())?;
+    let options = store.pool.connect_options();
+    ensure_dev_config(environment, &options)?;
+    let selected = options
+        .get_database()
+        .filter(|name| !name.is_empty())
+        .context("bootstrap-dev requires a database name in DATABASE_URL")?;
     let mut tx = crate::db::begin(&store.pool).await?;
+    ensure_selected_database(&mut tx, selected).await?;
     // Seeds the global catalog (providers, models, deployments): the
     // exclusive catalog lock, then the installation row.
     sqlx::query("SELECT pg_advisory_xact_lock(72419502)")
@@ -231,6 +248,19 @@ mod config_tests {
 #[cfg(all(test, feature = "integration-tests"))]
 mod tests {
     use super::*;
+
+    #[dbtest::test]
+    async fn bootstrap_refuses_a_different_connected_database(pool: sqlx::PgPool) {
+        let options = pool.connect_options();
+        let selected = options.get_database().unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(ensure_selected_database(&mut conn, selected).await.is_ok());
+        let error = ensure_selected_database(&mut conn, &format!("{selected}_other"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("other than the one selected"));
+    }
+
     #[dbtest::test]
     async fn operator_grants_are_explicit_audited_idempotent_and_do_not_create_personal_workspaces(
         pool: sqlx::PgPool,

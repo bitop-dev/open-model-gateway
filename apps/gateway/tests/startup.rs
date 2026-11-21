@@ -884,6 +884,54 @@ async fn bootstrap_dev_cli_refuses_unrelated_installation(pool: sqlx::PgPool) {
 
 #[cfg(feature = "integration-tests")]
 #[sqlx::test(migrations = "./enterprise_migrations")]
+async fn bootstrap_dev_cli_seeds_through_ipv6_loopback(pool: sqlx::PgPool) {
+    use sqlx::ConnectOptions;
+    use tokio::net::{TcpListener, TcpStream};
+
+    let options = pool.connect_options();
+    let host = options.get_host().trim_matches(['[', ']']).to_owned();
+    let port = options.get_port();
+    let listener = TcpListener::bind("[::1]:0").await.unwrap();
+    let mut database = options.to_url_lossy();
+    database.set_host(Some("[::1]")).unwrap();
+    database
+        .set_port(Some(listener.local_addr().unwrap().port()))
+        .unwrap();
+
+    let forwarder = tokio::spawn(async move {
+        while let Ok((mut downstream, _)) = listener.accept().await {
+            let host = host.clone();
+            tokio::spawn(async move {
+                if let Ok(mut upstream) = TcpStream::connect((host.as_str(), port)).await {
+                    let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
+                }
+            });
+        }
+    });
+    let output = tokio::task::spawn_blocking(move || {
+        Fixture::new().run(
+            &["bootstrap-dev"],
+            [
+                ("GATEWAY_ENV", "development"),
+                ("DATABASE_URL", database.as_str()),
+            ],
+        )
+    })
+    .await;
+    forwarder.abort();
+
+    let output = output.unwrap();
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let users: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM users WHERE email='developer@local.invalid'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(users, 1);
+}
+
+#[cfg(feature = "integration-tests")]
+#[sqlx::test(migrations = "./enterprise_migrations")]
 async fn bootstrap_dev_cli_seeds_once(pool: sqlx::PgPool) {
     use sqlx::ConnectOptions;
     let f = Fixture::new();

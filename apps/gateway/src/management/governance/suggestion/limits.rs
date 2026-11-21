@@ -9,6 +9,8 @@ const MAPPING_NODES: usize = 4096;
 const MAPPING_TEXT: usize = 16_384;
 const CATALOG_NODES: usize = 131_072;
 const CATALOG_TEXT: usize = 16_384;
+// Classify nesting refusals before serde_json reaches its recursion guard.
+const PREFLIGHT_DEPTH: usize = 96;
 
 struct Budget {
     nodes: usize,
@@ -23,10 +25,13 @@ impl Budget {
         E::custom(message)
     }
 }
-struct Check<'a>(&'a mut Budget);
+struct Check<'a>(&'a mut Budget, usize);
 impl<'de> DeserializeSeed<'de> for Check<'_> {
     type Value = ();
     fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        if self.1 > PREFLIGHT_DEPTH {
+            return Err(self.0.reject_limit("catalog depth limit"));
+        }
         if self.0.nodes == 0 {
             return Err(self.0.reject_limit("catalog complexity limit"));
         }
@@ -62,7 +67,7 @@ impl<'de> Visitor<'de> for Check<'_> {
     }
     fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<(), A::Error> {
         let mut n = 0;
-        while a.next_element_seed(Check(self.0))?.is_some() {
+        while a.next_element_seed(Check(self.0, self.1 + 1))?.is_some() {
             n += 1;
             if n > self.0.items {
                 return Err(self.0.reject_limit("catalog item limit"));
@@ -77,7 +82,7 @@ impl<'de> Visitor<'de> for Check<'_> {
             if n > self.0.items || key.len() > self.0.text {
                 return Err(self.0.reject_limit("catalog field limit"));
             }
-            a.next_value_seed(Check(self.0))?;
+            a.next_value_seed(Check(self.0, self.1 + 1))?;
         }
         Ok(())
     }
@@ -87,7 +92,7 @@ fn check_json(body: &[u8], budget: &mut Budget) -> Result<(), CatalogError> {
         return Err(CatalogError::Limit);
     }
     let mut d = serde_json::Deserializer::from_slice(body);
-    Check(budget).deserialize(&mut d).map_err(|_| {
+    Check(budget, 0).deserialize(&mut d).map_err(|_| {
         if budget.exceeded {
             CatalogError::Limit
         } else {
