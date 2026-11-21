@@ -244,6 +244,35 @@ fn refused_imports_keep_the_models_token_ceilings() {
 }
 
 #[test]
+fn cache_tier_with_omitted_or_null_base_requires_manual_base_rate() {
+    for cache_read in [None, Some(Value::Null)] {
+        let mut catalog = json!({"pricing": {
+            "prompt": "0",
+            "completion": "0",
+            "overrides": [{"min_prompt_tokens": 100, "input_cache_read": "0.000001"}]
+        }});
+        if let Some(value) = cache_read {
+            catalog["pricing"]["input_cache_read"] = value;
+        }
+        let out = map(&catalog, WorkloadKind::Generation, None);
+        let draft = out["draft"]["price_lines"].as_array().unwrap();
+        let cache: Vec<_> = draft
+            .iter()
+            .filter(|row| row["meter"] == "cache_read_tokens")
+            .collect();
+        assert_eq!(
+            cache,
+            vec![&json!({"meter":"cache_read_tokens","unknown":true})]
+        );
+        assert!(out["lines"].as_array().unwrap().iter().any(|row| {
+            row["meter"] == "cache_read_tokens"
+                && row["min_prompt_tokens"] == 100
+                && row["microusd_per_batch"].is_string()
+        }));
+    }
+}
+
+#[test]
 fn distinct_variants_across_bounded_endpoints_still_refuse_at_the_line_budget() {
     let endpoints: Vec<_> = (0..2).map(|endpoint| json!({"pricing": (0..64).map(|n| json!({"billable":"output_image","unit":"image","cost_usd":"1","variant":format!("size-{}",endpoint*64+n)})).collect::<Vec<_>>()})).collect();
     let body = json!({"endpoints":endpoints}).to_string();

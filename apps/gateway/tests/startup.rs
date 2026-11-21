@@ -895,4 +895,19 @@ async fn bootstrap_dev_cli_seeds_once(pool: sqlx::PgPool) {
     }
     let counts: (i64,i64) = sqlx::query_as("SELECT (SELECT count(*) FROM api_keys),(SELECT count(*) FROM audit_events WHERE action='installation.bootstrap_dev')").fetch_one(&pool).await.unwrap();
     assert_eq!(counts, (2, 1));
+
+    sqlx::query(
+        "UPDATE users SET email='renamed@local.invalid' WHERE email='developer@local.invalid'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO users(id,email) VALUES(gen_random_uuid(),'developer@local.invalid')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let refused = run();
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(refused.stdout.is_empty());
+    assert!(text(&refused.stderr).contains("requires an empty"));
 }

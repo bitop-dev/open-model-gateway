@@ -48,6 +48,7 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
                     {"id":"v/m","context_length":4096,"top_provider":{"max_completion_tokens":100},"pricing":{"prompt":"3","completion":"3","input_cache_write":"1e400","overrides":[{"min_prompt_tokens":1,"input_cache_write":"0"}]}},
                     {"id":"v/large","context_length":4096,"top_provider":{"max_completion_tokens":100},"pricing":{"prompt":"1","overrides":tiers}},
                     {"id":"v/cold","pricing":{"prompt":"1"}},
+                    {"id":"v/endpoint-large","context_length":4096,"top_provider":{"max_completion_tokens":100},"pricing":{"prompt":"1","completion":"2"}},
                     {"id":"v/tiers","context_length":4096,"top_provider":{"max_completion_tokens":100},"pricing":{"prompt":"1","overrides":&tiers[..64]}}
                 ]}).to_string())
             }
@@ -57,6 +58,11 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
                 {"provider_name":"Incomplete","status":0,"pricing":{"prompt":"0"}},
                 {"provider_name":"Unknown","status":null,"pricing":{"prompt":"0","completion":"0","request":"0"}},
                 {"provider_name":"C\u{202e}lean","status":0,"context_length":0,"max_completion_tokens":0,"pricing":{"prompt":"3","completion":"3","request":"0","input_cache_write":"1e400"}}
+            ]}))
+        }))
+        .route("/models/v/endpoint-large/endpoints", axum::routing::get(|| async {
+            axum::Json(json!({"endpoints":[
+                {"provider_name":"Example","description":"a".repeat(16_385),"pricing":{"prompt":"1","completion":"2"}}
             ]}))
         }))
         .layer(axum::middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
@@ -82,6 +88,9 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
     sqlx::query("INSERT INTO provider_connections(id,name,provider,credential_ref,endpoint,enabled) VALUES($1,'Preview','openrouter','env:NOT_USED','https://openrouter.ai/api/v1',false)").bind(connection).execute(&f.store.pool).await.unwrap();
     sqlx::query("INSERT INTO models(id,public_name,supported_protocols) VALUES($1,'preview',ARRAY['chat_completions'])").bind(model).execute(&f.store.pool).await.unwrap();
     sqlx::query("INSERT INTO deployments(id,model_id,provider_connection_id,upstream_model) VALUES($1,$3,$4,'v/m'),($2,$3,$4,'v/large'),($5,$3,$4,'v/tiers'),($6,$3,$4,'v/cold')").bind(deployment).bind(large).bind(model).bind(connection).bind(tiered).bind(cold).execute(&f.store.pool).await.unwrap();
+    let endpoint_large = Uuid::new_v4();
+    sqlx::query("INSERT INTO deployments(id,model_id,provider_connection_id,upstream_model) VALUES($1,$2,$3,'v/endpoint-large')")
+        .bind(endpoint_large).bind(model).bind(connection).execute(&f.store.pool).await.unwrap();
     // Create an actual immutable price first. Preview is read-only even when
     // parsing fails or refuses a hostile entry.
     let admin = user(f.owner, true);
@@ -250,7 +259,7 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
     assert_eq!(repeated.status(), StatusCode::OK);
     assert_eq!(repeated.json::<Value>().await.unwrap(), out);
     assert_eq!(all_requests.load(Ordering::SeqCst), fetched);
-    for refused in [large, tiered] {
+    for refused in [large, tiered, endpoint_large] {
         let r = client
             .get(format!(
                 "{gateway_url}/api/v1/platform/deployments/{refused}/price-suggestion"
