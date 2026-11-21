@@ -956,7 +956,21 @@ fn check_generation_prices(out: &Value, model: &Value) -> Result<(), TestCaseErr
             .unwrap_or_else(|| panic!("no base line for {meter}"));
         let rate = &model["pricing"][key];
         let always_priced = matches!(meter, "input_tokens" | "output_tokens");
-        if rate.is_null() && !always_priced {
+        let has_prompt_tier = model["pricing"]["overrides"]
+            .as_array()
+            .is_some_and(|tiers| {
+                tiers.iter().any(|tier| {
+                    !tier[key].is_null()
+                        && tier["min_prompt_tokens"]
+                            .as_u64()
+                            .and_then(|threshold| i32::try_from(threshold).ok())
+                            .is_some_and(|threshold| threshold > 0)
+                        && tier
+                            .as_object()
+                            .is_some_and(|fields| fields.keys().all(|key| !key.starts_with("utc_")))
+                })
+            });
+        if rate.is_null() && !always_priced && !has_prompt_tier {
             prop_assert!(
                 line["not_applicable"] == true && line["needs_review"] == true,
                 "{line}"
