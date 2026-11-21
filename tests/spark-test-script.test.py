@@ -49,6 +49,7 @@ case "$args" in
     probes=(management::tests::authz_matrix_tests::key_issuance_contention_tests::key_issuance_contention_measurement
             providers::anthropic::terminal_tests::terminal_fidelity_official_sdks_and_priced_http_evidence inert_library_probe)
     if [[ "$args" == *"--list"* ]]; then
+      if [[ "${STUB_UNIGNORED_LIBRARY:-}" = 1 && "$args" == *"--ignored"* ]]; then unset 'probes[0]'; fi
       printf '%s: test\n' "${probes[@]}"
     else
       n=0
@@ -59,7 +60,10 @@ case "$args" in
     exit 0 ;;
   *"--test runtime_privileges"*)
     probes=(enterprise_runtime_allowlist_and_rollback_probes controlled_lock_stall_recovers_on_runtime_http_path)
-    probes+=(populated_verifier_both populated_verifier_personal populated_verifier_scim inert_unrelated)
+    if [[ "${STUB_LEGACY_RUNTIME:-}" != 1 ]]; then
+      probes+=(populated_verifier_both populated_verifier_personal populated_verifier_scim)
+    fi
+    probes+=(inert_unrelated)
     if [[ "${STUB_MISSING_PROBE:-}" = 1 && "$args" == *"--ignored"* ]]; then unset 'probes[1]'; fi
     n=${#probes[@]}
     if [[ "$args" == *"--list"* ]]; then
@@ -249,6 +253,12 @@ class Pod(unittest.TestCase):
 
 
 class Shards(Pod):
+    def test_unignored_dedicated_probe_stops_ordinary_library_execution(self):
+        result = self.run_script(STUB_UNIGNORED_LIBRARY=1)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("missing ignored library probe:", result.stdout)
+        self.assertFalse(any("--lib -- --exact" in call for call in self.stub_calls()))
+
     def test_the_split_covers_every_listed_test_exactly_once_in_cis_order(self):
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -396,6 +406,18 @@ class Integration(Pod):
                      "providers::anthropic::terminal_tests::terminal_fidelity_official_sdks_and_priced_http_evidence"):
             self.assertEqual(sum("--exact" in c and name in c.split() for c in lib), 1)
         self.assertFalse(any("inert_library_probe" in c for c in lib))
+
+    def test_older_refs_run_their_two_runtime_probes_by_exact_name(self):
+        path = ".github/scripts/rust-shards.mjs"
+        helper = (ROOT / path).read_text().replace("export { KEY_CONTENTION, TERMINAL, DEDICATED_LIB_PROBES, DEDICATED_RUNTIME_PROBES };",
+                                                  "export { KEY_CONTENTION, TERMINAL };")
+        self.commit = self.make_repo({path: helper, "README.md": "historical runtime fixture\n"}, message="older runner")
+        result = self.run_script(OMG_SUITE="integration", STUB_LEGACY_RUNTIME=1, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stdout[-3000:])
+        calls = [c for c in self.stub_calls() if "--test runtime_privileges" in c and "--ignored --exact" in c]
+        self.assertEqual(len(calls), 2, calls)
+        for probe in ("enterprise_runtime_allowlist_and_rollback_probes", "controlled_lock_stall_recovers_on_runtime_http_path"):
+            self.assertEqual(sum(probe in call.split() for call in calls), 1)
 
     def test_runtime_ignored_run_must_execute_the_listed_probes(self):
         result = self.run_script(OMG_SUITE="integration", STUB_EMPTY_RUNTIME_RUN="1", timeout=120)

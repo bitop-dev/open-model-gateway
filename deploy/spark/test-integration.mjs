@@ -3,25 +3,38 @@
 import assert from "node:assert/strict";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { checkSources, identity, KEY_CONTENTION, TERMINAL, DEDICATED_RUNTIME_PROBES } from "./target-inventory.mjs";
+import { checkSources, identity, KEY_CONTENTION, TERMINAL, DEDICATED_LIB_PROBES, LEGACY_RUNTIME_PROBES, DEDICATED_RUNTIME_PROBES } from "./target-inventory.mjs";
 
 async function main() {
   const group = process.argv[2];
-  const { discoverTargets, parseListing, targetArgs, validateRun, runCargo } =
-    await import(pathToFileURL(resolve(".github/scripts/rust-shards.mjs")));
+  const selected = await import(pathToFileURL(resolve(".github/scripts/rust-shards.mjs")));
+  const { discoverTargets, parseListing, targetArgs, validateRun, runCargo } = selected;
   const metadata = JSON.parse(await runCargo(["metadata", "--no-deps", "--all-features", "--format-version", "1", "--locked"]));
   const runtime = group === "runtime" || group === "runtime-ignored";
-  if (runtime || group === "key-contention" || group === "terminal") {
+  if (runtime || group === "lib-preflight" || group === "key-contention" || group === "terminal") {
     if (runtime) checkSources(metadata, ["runtime_privileges"]);
     const selection = runtime ? ["--test", "runtime_privileges"] : ["--lib"];
     const args = ["test", "-p", "open-model-gateway", "--all-features", ...selection, "--"];
     const entries = parseListing(await runCargo([...args, "--list", "--format", "terse", "--color", "never"]));
     const ignored = parseListing(await runCargo([...args, "--list", "--ignored", "--format", "terse", "--color", "never"]));
     assert.ok(ignored.every(e => entries.some(t => t.kind === e.kind && t.name === e.name)), "ignored probes absent from inventory");
-    const probes = runtime ? DEDICATED_RUNTIME_PROBES : [group === "terminal" ? TERMINAL : KEY_CONTENTION];
-    for (const name of probes) {
-      assert.ok(ignored.some(e => e.kind === "test" && e.name === name), `missing ignored ${runtime ? "runtime" : "library"} probe: ${name}`);
+    const listed = (inventory, name) => inventory.some(e => e.kind === "test" && e.name === name);
+    const optional = probes => probes.filter(name => listed(entries, name));
+    let probes;
+    if (runtime) {
+      // Older refs still require their original ACL probes. Check any newer
+      // probes present in those inventories before running ordinary tests.
+      probes = selected.DEDICATED_RUNTIME_PROBES
+        ?? [...new Set([...LEGACY_RUNTIME_PROBES, ...optional(DEDICATED_RUNTIME_PROBES)])];
+    } else if (group === "lib-preflight") {
+      probes = selected.DEDICATED_LIB_PROBES ?? optional(DEDICATED_LIB_PROBES);
+    } else {
+      probes = [group === "terminal" ? TERMINAL : KEY_CONTENTION];
     }
+    for (const name of probes) {
+      assert.ok(listed(ignored, name), `missing ignored ${runtime ? "runtime" : "library"} probe: ${name}`);
+    }
+    if (group === "lib-preflight") return;
     if (group === "runtime") {
       const output = await runCargo(args, { echo: true });
       validateRun(output, { entries, ignored: ignored.map(e => e.name), total: entries.length });

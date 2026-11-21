@@ -4,9 +4,8 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { checkSources, identity, SPECIAL, KEY_CONTENTION, TERMINAL, DEDICATED_RUNTIME_PROBES } from "../../deploy/spark/target-inventory.mjs";
-export { KEY_CONTENTION, TERMINAL };
-const DEDICATED_LIB_PROBES = [TERMINAL, KEY_CONTENTION];
+import { checkSources, identity, SPECIAL, KEY_CONTENTION, TERMINAL, DEDICATED_LIB_PROBES, DEDICATED_RUNTIME_PROBES } from "../../deploy/spark/target-inventory.mjs";
+export { KEY_CONTENTION, TERMINAL, DEDICATED_LIB_PROBES, DEDICATED_RUNTIME_PROBES };
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const compare = (a, b) => a < b ? -1 : a > b ? 1 : 0;
 const fail = message => { throw new Error(message); };

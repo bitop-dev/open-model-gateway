@@ -3,8 +3,12 @@ import { isAbsolute, join } from "node:path";
 
 export const TERMINAL = "providers::anthropic::terminal_tests::terminal_fidelity_official_sdks_and_priced_http_evidence";
 export const KEY_CONTENTION = "management::tests::authz_matrix_tests::key_issuance_contention_tests::key_issuance_contention_measurement";
-export const DEDICATED_RUNTIME_PROBES = [
+export const DEDICATED_LIB_PROBES = [TERMINAL, KEY_CONTENTION];
+export const LEGACY_RUNTIME_PROBES = [
   "controlled_lock_stall_recovers_on_runtime_http_path", "enterprise_runtime_allowlist_and_rollback_probes",
+];
+export const DEDICATED_RUNTIME_PROBES = [
+  ...LEGACY_RUNTIME_PROBES,
   "populated_verifier_both", "populated_verifier_personal", "populated_verifier_scim",
 ];
 export const SPECIAL = ["filestore_s3", "runtime_privileges"];

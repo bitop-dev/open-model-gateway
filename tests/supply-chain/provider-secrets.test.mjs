@@ -409,6 +409,15 @@ test("npm forwards literal script operands to the main lifecycle event", () => {
   assert.throws(() => check("node runner.js"), /env.TOKEN/);
 });
 
+test("a shell environment prefix preserves the npm script's Cargo classification", () => {
+  const files = new Map([["package.json", JSON.stringify({
+    scripts: { verify: "cargo test", notify: "printf fixture" },
+  })]]);
+  const check = run => checkInputs({ jobs: { job: credentialJob(run) } }, "fixture.yml", new Map(), p => files.get(p));
+  check("RUST_LOG=debug npm run notify");
+  assert.throws(() => check("RUST_LOG=debug CARGO_TERM_COLOR=never npm run verify"), /env.TOKEN/);
+});
+
 test("removing the parent of an indexed wrapper still reports the missing file", t => {
   const checkout = mkdtempSync(posix.join(tmpdir(), "missing-wrapper-"));
   t.after(() => rmSync(checkout, { recursive: true, force: true }));

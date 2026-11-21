@@ -85,6 +85,7 @@ fn cfg_predicates(attrs: &[syn::Attribute]) -> impl Iterator<Item = String> {
 }
 
 type Names = BTreeSet<Vec<String>>;
+type ImportEdge = (Vec<String>, Vec<String>);
 
 fn segment(path: &mut Vec<String>, ident: &syn::Ident) {
     match ident.unraw().to_string().as_str() {
@@ -143,7 +144,7 @@ impl AliasScope {
         loop {
             let count = self.declared.len();
             for (source, target) in &edges {
-                if self.is_test_source(source) {
+                if self.resolves_test_source(source, &edges, &mut BTreeSet::new()) {
                     self.declared.insert(target.clone());
                 }
             }
@@ -153,11 +154,7 @@ impl AliasScope {
         }
     }
 
-    fn collect_imports(
-        items: &[syn::Item],
-        module: &mut Vec<String>,
-        edges: &mut Vec<(Vec<String>, Vec<String>)>,
-    ) {
+    fn collect_imports(items: &[syn::Item], module: &mut Vec<String>, edges: &mut Vec<ImportEdge>) {
         for item in items {
             match item {
                 syn::Item::Mod(m) => {
@@ -181,6 +178,35 @@ impl AliasScope {
 
     fn is_test_source(&self, path: &[String]) -> bool {
         path.last().is_some_and(|name| name == "test") || self.declared.contains(path)
+    }
+
+    fn resolves_test_source(
+        &self,
+        path: &[String],
+        edges: &[ImportEdge],
+        active: &mut BTreeSet<usize>,
+    ) -> bool {
+        if self.is_test_source(path) {
+            return true;
+        }
+        // Resolve the namespace prefix of an explicit import. Keep each
+        // edge to one visit per resolution so recursive module aliases end.
+        for (index, (source, binding)) in edges.iter().enumerate() {
+            let Some(suffix) = path.strip_prefix(binding.as_slice()) else {
+                continue;
+            };
+            if suffix.is_empty() || !active.insert(index) {
+                continue;
+            }
+            let mut qualified = source.clone();
+            qualified.extend_from_slice(suffix);
+            let matches = self.resolves_test_source(&qualified, edges, active);
+            active.remove(&index);
+            if matches {
+                return true;
+            }
+        }
+        false
     }
 
     fn import_item(&mut self, item: &syn::Item) {
@@ -348,6 +374,10 @@ fn test_attribute_aliases_follow_the_case_ignore_conditions() {
         mod exported { pub use tokio::test as attribute; }
         use exported as renamed;
         #[renamed::attribute] async fn qualified() {}
+        use renamed_again::attribute as qualified_import;
+        use renamed as renamed_again;
+        #[cfg_attr(review_platform, qualified_import)] async fn qualified_conditional() {}
+        #[cfg_attr(review_platform, qualified_import, ignore)] async fn qualified_opted_in() {}
         mod nested { use super::*; #[cfg_attr(unix, probe)] async fn inherited() {} }
     "#;
     assert_eq!(
@@ -358,6 +388,7 @@ fn test_attribute_aliases_follow_the_case_ignore_conditions() {
             "block_case",
             "chained_case",
             "qualified",
+            "qualified_conditional",
             "inherited"
         ]
     );

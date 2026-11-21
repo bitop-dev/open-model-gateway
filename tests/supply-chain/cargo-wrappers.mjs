@@ -5,6 +5,8 @@ import { posix } from "node:path";
 import ts from "typescript";
 import { shellCommands } from "./policy.mjs";
 
+const ASSIGNMENT = /^[A-Za-z_][A-Za-z_0-9]*=/;
+
 // Leave parent components intact until the filesystem reader has checked each prefix.
 export function wrapperPath(dir, name) {
   if (posix.isAbsolute(name) || posix.isAbsolute(dir)) return posix.resolve(dir, name);
@@ -165,11 +167,14 @@ export function cargoScanner(read, shellSources) {
     let cargo = false;
     for (const command of commands) {
       let first = 0;
+      if (!direct) {
+        while (!command[first]?.forwarded && ASSIGNMENT.test(command[first]?.text ?? "")) first++;
+      }
       while (!command[first]?.variable && ["exec", "env", "command"].includes(command[first]?.text)) {
         const launcher = command[first++].text;
         if (command[first]?.text === "--") first++;
         if (launcher === "env") {
-          while (/^[A-Za-z_][A-Za-z_0-9]*=/.test(command[first]?.text ?? "")) first++;
+          while (ASSIGNMENT.test(command[first]?.text ?? "")) first++;
         }
       }
       const invocation = command.slice(first);

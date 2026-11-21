@@ -281,6 +281,7 @@ suite_lib() {
   local bad=0 names index
   prepare_npm lib || return 1
   step lib build "${LIB[@]}" --no-run || return 1
+  step lib ignored-probes node "$OMG_SCRIPTS/test-integration.mjs" lib-preflight || return 1
   wait_db || return 1
   db_marker
   extra_args || return 1
