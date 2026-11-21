@@ -25,7 +25,7 @@ aws-smithy-eventstream = "=0.61.6"
 aws-smithy-async = "1"
 # File store (docs/file-storage.md): S3-compatible backend. Same SDK generation as
 # Bedrock (shared smithy/runtime crates); request checksums "when_required" for MinIO/RustFS.
-aws-sdk-s3 = { version = "=1.156.0", default-features = false, features = ["rt-tokio"] }
+aws-sdk-s3 = { version = "=1.157.0", default-features = false, features = ["rt-tokio"] }
 # Mandatory streaming AES-256-GCM encryption of every stored object.
 aes-gcm = { version = "=0.11.1", features = ["zeroize"] }
 base64 = "0.23"
@@ -49,7 +49,7 @@ dotenvy = "0.15"
 hex = "0.4"
 # Batch scheduling time windows (IANA zones, DST): the bundled tz database, so
 # window evaluation never depends on the host's zoneinfo.
-jiff = { version = "=0.2.43", default-features = false, features = ["std", "tzdb-bundle-always"] }
+jiff = { version = "=1.0.1", default-features = false, features = ["std", "tzdb-bundle-always"] }
 # SMTP delivery (invitations, alerts): rustls, async, one connection per message (no pool).
 lettre = { version = "=0.11.24", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"] }
 percent-encoding = "2"
@@ -57,7 +57,7 @@ percent-encoding = "2"
 # never classify webhook retryability by attacker-controlled error text.
 hyper = { version = "=1.12.0", default-features = false }
 # Prometheus/OpenMetrics exposition on the optional GATEWAY_METRICS_ADDR listener.
-prometheus-client = "=0.25.2"
+prometheus-client = "=0.26.0"
 # Secrets come only from the OS CSPRNG (rand::rngs::SysRng, fallible; src/entropy.rs).
 # The gateway never uses ThreadRng for secrets (it panics when the OS RNG fails);
 # seeded StdRng only for routing's deterministic, non-secret weighted choice.
@@ -86,8 +86,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 
 [dev-dependencies]
+# Tokenize literal SQL for the UUID binding policy.
+regex = "1"
 # Offline OpenAPI 3.1/Draft 2020-12 gates only (#81); no fetchers or schema-generator macros.
-jsonschema = { version = "=0.61.1", default-features = false }
+jsonschema = { version = "=0.61.2", default-features = false }
 # Deterministic paused-time coverage of the metrics worker's missed ticks.
 tokio = { version = "1", features = ["test-util"] }
 # `span-locations`: line and column of items, so the comment scan (#595) can leave out the test-only ones.
@@ -97,4 +99,6 @@ quote = "1"
 # Parse source inventories for route declarations and the configuration surface.
 syn = { version = "3", features = ["full", "visit"] }
 tempfile = "3"
+# `#[dbtest::test]`: database tests that clone a pre-migrated template (docs/verification.md, "Database tests").
+dbtest = { path = "../../crates/dbtest" }
 proptest = { version = "=1.12.0", default-features = false, features = ["std"] }

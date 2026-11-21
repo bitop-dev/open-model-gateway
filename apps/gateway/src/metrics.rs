@@ -423,9 +423,18 @@ mod tests {
         let mut out = String::new();
         encode(&mut out, &m.registry).unwrap();
         assert!(out.contains("gateway_report_generation_outcomes_total{category=\"timeout\"} 1"));
-        assert!(out.contains("gateway_report_due_backlog{} 1024"));
-        assert!(out.contains("gateway_report_due_backlog_capped{} 1"));
-        assert!(out.contains("gateway_report_oldest_due_lag_seconds{} 42"));
+        assert!(
+            out.lines()
+                .any(|line| line == "gateway_report_due_backlog 1024")
+        );
+        assert!(
+            out.lines()
+                .any(|line| line == "gateway_report_due_backlog_capped 1")
+        );
+        assert!(
+            out.lines()
+                .any(|line| line == "gateway_report_oldest_due_lag_seconds 42")
+        );
         assert!(
             out.contains("gateway_report_email_attempts_total{outcome=\"permanent_failure\"} 1")
         );
@@ -696,7 +705,7 @@ mod tests {
     }
 
     #[cfg(feature = "integration-tests")]
-    #[sqlx::test(migrations = "./enterprise_migrations")]
+    #[dbtest::test]
     async fn fair_dispatch_metrics_include_overdue_pending_and_no_workspace_labels(
         pool: sqlx::PgPool,
     ) {
@@ -720,13 +729,15 @@ mod tests {
         let m = Metrics::new();
         let scrape = m.render(Some(&store)).await;
         assert!(
-            scrape.contains("gateway_alert_delivery_pending_buckets{} 2"),
+            scrape
+                .lines()
+                .any(|line| line == "gateway_alert_delivery_pending_buckets 2"),
             "{scrape}"
         );
         let age = scrape
             .lines()
             .find_map(|line| {
-                line.strip_prefix("gateway_alert_delivery_oldest_pending_age_seconds{} ")
+                line.strip_prefix("gateway_alert_delivery_oldest_pending_age_seconds ")
             })
             .unwrap()
             .parse::<i64>()
@@ -737,24 +748,25 @@ mod tests {
             .clone()
             .with_leases(std::sync::Arc::new(crate::leases::Leases::new()));
         let scrape = m.render(Some(&unleased)).await;
-        assert!(
-            !scrape
-                .lines()
-                .any(|line| line.starts_with("gateway_alert_delivery_pending_buckets{"))
-        );
-        assert!(
-            !scrape
-                .lines()
-                .any(|line| line.starts_with("gateway_alert_delivery_oldest_pending_age_seconds{"))
-        );
+        for family in [
+            "gateway_alert_delivery_pending_buckets",
+            "gateway_alert_delivery_oldest_pending_age_seconds",
+        ] {
+            assert!(
+                !scrape
+                    .lines()
+                    .any(|line| line.split(['{', ' ']).next() == Some(family)),
+                "unleased collector exported {family}"
+            );
+        }
         crate::alerts::deliver_pending(&store, 25).await;
         let scrape = Metrics::new().render(Some(&store)).await;
-        assert!(scrape.contains("gateway_alert_delivery_pending_buckets{} 0"));
-        assert!(scrape.contains("gateway_alert_delivery_oldest_pending_age_seconds{} 0"));
+        assert!(scrape.contains("gateway_alert_delivery_pending_buckets 0"));
+        assert!(scrape.contains("gateway_alert_delivery_oldest_pending_age_seconds 0"));
     }
 
     #[cfg(feature = "integration-tests")]
-    #[sqlx::test(migrations = "./enterprise_migrations")]
+    #[dbtest::test]
     async fn expired_outbox_cleanup_remains_visible_past_failure_alert_window(pool: sqlx::PgPool) {
         let store = Store::new(pool.clone());
         let event = uuid::Uuid::new_v4();
@@ -812,7 +824,7 @@ mod tests {
     }
 
     #[cfg(feature = "integration-tests")]
-    #[sqlx::test(migrations = "./enterprise_migrations")]
+    #[dbtest::test]
     async fn alert_generation_suppressed_metric_is_bounded_to_last_24h(pool: sqlx::PgPool) {
         let store = Store::new(pool.clone());
         sqlx::raw_sql("WITH events AS (INSERT INTO alert_events(id,builtin,kind,subject_key,level,severity,summary) SELECT gen_random_uuid(),'scim_last_admin','scim_last_admin',i::text,1,'critical','Metrics' FROM generate_series(1,101) i RETURNING id) INSERT INTO alert_deliveries(id,event_id,transition) SELECT gen_random_uuid(),id,'fired' FROM events").execute(&pool).await.unwrap();
