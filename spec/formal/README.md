@@ -255,7 +255,7 @@ money.
    marked `finished = true` before the write, so a client disconnect while the inline settlement was
    awaited (`settle_complete`, `track_stream`) dropped the write and `Drop` did nothing. A failed or
    timed-out write still leaves `pending`, by design (test
-   [`fn diagnostic_settlement_timeout_is_not_cancellation_or_a_drop_retry`](../../apps/gateway/src/inference/tests.rs#L867) asserts no retry); the rest
+   [`fn diagnostic_settlement_timeout_is_not_cancellation_or_a_drop_retry`](../../apps/gateway/src/inference/tests.rs#L868) asserts no retry); the rest
    of this item describes that case and the original symptom. The reconciler then marks it
    `unknown`; the hold is kept (spend overstated) until an operator resolves it with evidence.
    `MoneyPathDiag` shows it (Receive usage, ClientCancel while `settling`, ExpireLease, Reconcile);

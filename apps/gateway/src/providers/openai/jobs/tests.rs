@@ -318,6 +318,7 @@ fn chat_request() -> BatchRequest {
             content: Some("hi".into()),
             tool_calls: vec![],
             tool_call_id: None,
+            tool_result_is_error: false,
         }],
         tools: vec![],
         tool_choice: None,
@@ -596,4 +597,23 @@ async fn native_cleanup_deletes_every_provider_copy() {
             (Method::DELETE, "/v1/files/file-out1".to_owned()),
         ]
     );
+}
+
+#[test]
+fn native_messages_batch_marks_failed_tool_results_on_chat_wire() {
+    use crate::providers::contract::{assert_error_tool_chat_wire, error_tool_result_requests};
+    for (request, failed, text) in error_tool_result_requests() {
+        let line: Value = serde_json::from_slice(
+            &encode_native_line(
+                &target("gpt-fixture"),
+                BatchEndpoint::Messages,
+                "l0",
+                &BatchRequest::Chat(request),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(line["url"], "/v1/chat/completions");
+        assert_error_tool_chat_wire(&line["body"], failed, &text);
+    }
 }
