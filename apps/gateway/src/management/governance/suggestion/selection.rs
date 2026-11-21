@@ -2,12 +2,21 @@
 //! a readable status. Recent recorded cost evidence wins before ranking.
 use super::*;
 
+/// The per-request fee in micro-USD. Endpoint price objects usually carry no
+/// `request` key, which means no fee; one that is present but unreadable makes
+/// the endpoint incomparable, like an unreadable token rate.
+fn request_fee(pricing: &Value) -> Option<i64> {
+    match pricing.get("request") {
+        None | Some(Value::Null) => Some(0),
+        Some(_) => microusd(&price_str(pricing, "request")?, 1).map(|x| x.0),
+    }
+}
 /// Exact list cost of `e` at an endpoint's token prices (each part rounded up).
 fn endpoint_cost(pricing: &Value, e: &Evidence) -> Option<i64> {
     let part = |key: &str, units: u64| microusd(&price_str(pricing, key)?, units).map(|x| x.0);
     part("prompt", e.input)?
         .checked_add(part("completion", e.output)?)?
-        .checked_add(part("request", 1)?)
+        .checked_add(request_fee(pricing)?)
 }
 /// Comparable list price: one million input plus one million output tokens
 /// plus one request fee, in micro-USD. `None` for variable/unparseable prices.
@@ -15,7 +24,7 @@ fn reference_cost(pricing: &Value) -> Option<i64> {
     let part = |key: &str, units: u64| microusd(&price_str(pricing, key)?, units).map(|x| x.0);
     part("prompt", 1_000_000)?
         .checked_add(part("completion", 1_000_000)?)?
-        .checked_add(part("request", 1)?)
+        .checked_add(request_fee(pricing)?)
 }
 /// Which endpoint to price from: `(index, selection, matched attempts)`.
 /// Evidence wins when any attempt's provider cost matches an endpoint's list
@@ -166,7 +175,12 @@ fn endpoint_model(model: &Value, endpoint: &Value) -> (Value, bool, bool) {
     let valid_limit = |v: &Value| v.as_u64().filter(|n| (1..=i32::MAX as u64).contains(n));
     let unusable_limit = ["context_length", "max_completion_tokens"]
         .iter()
-        .any(|key| endpoint.get(*key).is_some_and(|v| valid_limit(v).is_none()));
+        // An explicit null is an absent ceiling, not an unusable one.
+        .any(|key| {
+            endpoint
+                .get(*key)
+                .is_some_and(|v| !v.is_null() && valid_limit(v).is_none())
+        });
     if let Some(n) = valid_limit(&endpoint["context_length"]) {
         priced["context_length"] = json!(n);
     }
@@ -241,6 +255,15 @@ fn describe_endpoint(
             ),
         },
     );
+    // A zero list price is legitimate, and it is also what a wrong or hostile
+    // listing looks like: the cheapest endpoint is never free without review.
+    if selection != "evidence" && reference_cost(&endpoint["pricing"]) == Some(0) {
+        push_warning(
+            out,
+            "The cheapest current endpoint lists a zero price; confirm it before publishing a free price.",
+        );
+        out["needs_review"] = json!(true);
+    }
     if let Some((_, top)) = pricier {
         push_warning(
             out,

@@ -5,7 +5,13 @@ fn incomplete_prices_cannot_win_by_price_or_evidence() {
     let model = json!({"id":"v/m","pricing":{"prompt":"3","completion":"3"}});
     for missing in ["prompt", "completion", "request"] {
         let mut cheap = json!({"provider_name":"Incomplete","pricing":{"prompt":"0","completion":"0","request":"0"}});
-        cheap["pricing"].as_object_mut().unwrap().remove(missing);
+        if missing == "request" {
+            // A missing request fee is none (the next test); an unreadable one
+            // is as incomplete as a missing token rate.
+            cheap["pricing"]["request"] = json!(0);
+        } else {
+            cheap["pricing"].as_object_mut().unwrap().remove(missing);
+        }
         let endpoints = json!({"endpoints":[cheap,{"provider_name":"Complete","pricing":{"prompt":"1","completion":"1","request":"0"}}]});
         for evidence in [
             vec![],
@@ -25,6 +31,62 @@ fn incomplete_prices_cannot_win_by_price_or_evidence() {
             assert_eq!(out["endpoint"]["provider"], "Complete", "{missing}: {out}");
         }
     }
+}
+
+/// The shape OpenRouter serves: endpoint prices carry no `request` key and an
+/// absent ceiling is an explicit null. Neither makes the endpoint unusable.
+#[test]
+fn endpoints_without_a_request_fee_or_with_null_ceilings_are_comparable() {
+    let model = json!({"id":"v/m","context_length":4096,"top_provider":{"max_completion_tokens":100},"pricing":{"prompt":"3","completion":"3"}});
+    let endpoints = json!({"endpoints":[
+        {"provider_name":"Dear","status":0,"max_completion_tokens":null,"pricing":{"prompt":"0.000002","completion":"0.000004"}},
+        {"provider_name":"Cheap","status":0,"max_completion_tokens":null,"pricing":{"prompt":"0.000001","completion":"0.000002","input_cache_read":"0.0000001"}}
+    ]});
+    let evidence = Evidence {
+        input: 1_000_000,
+        output: 1_000_000,
+        cost: 6_000_000,
+    };
+    for (evidence, provider, selection) in [
+        (vec![], "Cheap", "cheapest"),
+        (vec![evidence], "Dear", "evidence"),
+    ] {
+        let out = map_with_endpoints(
+            &model,
+            WorkloadKind::Generation,
+            None,
+            Some(&endpoints),
+            &evidence,
+        );
+        assert_eq!(out["endpoint"]["provider"], provider, "{out}");
+        assert_eq!(out["endpoint"]["selection"], selection, "{out}");
+        let warnings = out["warnings"].to_string();
+        assert!(!warnings.contains("token ceiling was unusable"), "{out}");
+        assert!(
+            !warnings.contains("missing or unusable comparison rates"),
+            "{out}"
+        );
+    }
+}
+
+/// A free endpoint can be the cheapest, and is never offered without review.
+#[test]
+fn a_zero_priced_cheapest_endpoint_needs_review() {
+    let model = json!({"id":"v/m","context_length":4096,"top_provider":{"max_completion_tokens":100},"pricing":{"prompt":"3","completion":"3"}});
+    let endpoints = json!({"endpoints":[{"provider_name":"Free","status":0,"context_length":4096,"max_completion_tokens":100,"pricing":{"prompt":"0","completion":"0"}}]});
+    let out = map_with_endpoints(
+        &model,
+        WorkloadKind::Generation,
+        None,
+        Some(&endpoints),
+        &[],
+    );
+    assert_eq!(out["endpoint"]["provider"], "Free", "{out}");
+    assert_eq!(out["needs_review"], true, "{out}");
+    assert!(
+        out["warnings"].to_string().contains("lists a zero price"),
+        "{out}"
+    );
 }
 
 #[test]

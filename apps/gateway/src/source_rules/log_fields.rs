@@ -110,8 +110,8 @@ const DENIED_WORDS: &[&str] = &[
 ///   once, on purpose ("Development keys: save these now. They cannot be
 ///   retrieved again."). It is the operator's terminal output of a local
 ///   command, not a log line; the keys are fresh credentials for a local
-///   development database. That "local" basis rests on `GATEWAY_ENV`, which
-///   is tracked in #632.
+///   development database: the command refuses, before connecting, anything
+///   but development mode and a literal loopback database host.
 const EXEMPT: &[(&str, &str)] = &[
     (
         "http.rs :: request_context :: info :: header_latency_ms=started.elapsed().as_millis() ; status=response.status().as_u16()",

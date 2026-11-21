@@ -8,7 +8,7 @@ The gateway repository is now [bitop-dev/open-model-gateway](https://github.com/
 
 ## Pricing drafts
 
-OpenRouter operator price previews state an unusable base rate as unknown even when a prompt-size tier is priced (#635). Oversized catalog entries refuse the whole draft with bounded output; warnings are capped and deduplicated, and malformed successful JSON responses do not enter the cache (#649). Endpoint ranking requires complete comparable rates, unreadable statuses are unknown, unusable endpoint ceilings retain catalog values, and provider labels strip formatting controls (#650). Preview does not modify stored prices or accounting history.
+OpenRouter operator price previews state an unusable base rate as unknown even when a prompt-size tier is priced (#635). Oversized catalog entries refuse the whole draft with bounded output; warnings are capped and deduplicated, and malformed successful JSON responses do not enter the cache (#649). Endpoint ranking requires readable prompt and completion rates (a missing per-request fee is none; an unreadable one excludes the endpoint), a zero-priced cheapest endpoint needs review, unreadable statuses are unknown, unusable endpoint ceilings retain catalog values, and provider labels strip formatting controls (#650). Preview does not modify stored prices or accounting history.
 
 ## Upgrade
 

@@ -1337,12 +1337,13 @@ fn sum(parts: [Cost; 3]) -> Cost {
 }
 
 /// The comparable list price: 10^6 input and output tokens plus one request;
-/// any unusable or missing compared price excludes the endpoint.
+/// an unusable or missing token rate, or an unusable request fee, excludes the
+/// endpoint. A missing request fee is none.
 fn list_cost(pricing: &Value) -> Cost {
     sum([
         part(pricing, "prompt", 1_000_000, true),
         part(pricing, "completion", 1_000_000, true),
-        part(pricing, "request", 1, true),
+        part(pricing, "request", 1, false),
     ])
 }
 
@@ -1351,7 +1352,7 @@ fn attempt_cost(pricing: &Value, input: u64, output: u64) -> Cost {
     sum([
         part(pricing, "prompt", input, true),
         part(pricing, "completion", output, true),
-        part(pricing, "request", 1, true),
+        part(pricing, "request", 1, false),
     ])
 }
 
