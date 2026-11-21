@@ -14,16 +14,23 @@ struct Budget {
     nodes: usize,
     items: usize,
     text: usize,
+    exceeded: bool,
+}
+
+impl Budget {
+    fn reject_limit<E: serde::de::Error>(&mut self, message: &'static str) -> E {
+        self.exceeded = true;
+        E::custom(message)
+    }
 }
 struct Check<'a>(&'a mut Budget);
 impl<'de> DeserializeSeed<'de> for Check<'_> {
     type Value = ();
     fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
-        self.0.nodes = self
-            .0
-            .nodes
-            .checked_sub(1)
-            .ok_or_else(|| serde::de::Error::custom("catalog complexity limit"))?;
+        if self.0.nodes == 0 {
+            return Err(self.0.reject_limit("catalog complexity limit"));
+        }
+        self.0.nodes -= 1;
         d.deserialize_any(self)
     }
 }
@@ -49,7 +56,7 @@ impl<'de> Visitor<'de> for Check<'_> {
     }
     fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<(), E> {
         if s.len() > self.0.text {
-            return Err(E::custom("catalog text limit"));
+            return Err(self.0.reject_limit("catalog text limit"));
         }
         Ok(())
     }
@@ -58,7 +65,7 @@ impl<'de> Visitor<'de> for Check<'_> {
         while a.next_element_seed(Check(self.0))?.is_some() {
             n += 1;
             if n > self.0.items {
-                return Err(serde::de::Error::custom("catalog item limit"));
+                return Err(self.0.reject_limit("catalog item limit"));
             }
         }
         Ok(())
@@ -68,28 +75,35 @@ impl<'de> Visitor<'de> for Check<'_> {
         while let Some(key) = a.next_key::<std::borrow::Cow<'de, str>>()? {
             n += 1;
             if n > self.0.items || key.len() > self.0.text {
-                return Err(serde::de::Error::custom("catalog field limit"));
+                return Err(self.0.reject_limit("catalog field limit"));
             }
             a.next_value_seed(Check(self.0))?;
         }
         Ok(())
     }
 }
-fn check_json(body: &[u8], budget: &mut Budget) -> Result<(), ()> {
+fn check_json(body: &[u8], budget: &mut Budget) -> Result<(), CatalogError> {
     if body.len() > BODY_CAP {
-        return Err(());
+        return Err(CatalogError::Limit);
     }
     let mut d = serde_json::Deserializer::from_slice(body);
-    Check(budget).deserialize(&mut d).map_err(|_| ())?;
-    d.end().map_err(|_| ())
+    Check(budget).deserialize(&mut d).map_err(|_| {
+        if budget.exceeded {
+            CatalogError::Limit
+        } else {
+            CatalogError::Unavailable
+        }
+    })?;
+    d.end().map_err(|_| CatalogError::Unavailable)
 }
-pub(super) fn catalog_json(body: &[u8]) -> Result<(), ()> {
+pub(super) fn catalog_json(body: &[u8]) -> Result<(), CatalogError> {
     check_json(
         body,
         &mut Budget {
             nodes: CATALOG_NODES,
             items: CATALOG_NODES,
             text: CATALOG_TEXT,
+            exceeded: false,
         },
     )
 }
@@ -100,6 +114,7 @@ pub(super) fn mapping_json(body: &[u8]) -> bool {
             nodes: MAPPING_NODES,
             items: MAX_ITEMS,
             text: MAPPING_TEXT,
+            exceeded: false,
         },
     )
     .is_ok()

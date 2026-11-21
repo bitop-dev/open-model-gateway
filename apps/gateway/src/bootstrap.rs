@@ -83,7 +83,7 @@ pub async fn seed(store: &Store, environment: Environment) -> Result<Option<Deve
         .execute(&mut *tx)
         .await?;
     let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM audit_events WHERE action='installation.bootstrap_dev') AND EXISTS(SELECT 1 FROM users WHERE email='developer@local.invalid')",
+        "SELECT EXISTS(SELECT 1 FROM audit_events a JOIN users u ON u.id=a.actor_user_id WHERE a.action='installation.bootstrap_dev' AND u.email='developer@local.invalid')",
     )
     .fetch_one(&mut *tx)
     .await?;

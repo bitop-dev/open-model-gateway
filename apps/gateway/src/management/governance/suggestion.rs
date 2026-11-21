@@ -32,6 +32,12 @@ const BODY_CAP: usize = 4 * 1024 * 1024;
 const CACHE_TTL: Duration = Duration::from_secs(600);
 const CACHE_ENTRIES: usize = 64;
 
+#[derive(Debug)]
+enum CatalogError {
+    Unavailable,
+    Limit,
+}
+
 type Cache = HashMap<String, (Instant, Arc<Vec<u8>>)>;
 pub(crate) struct OpenRouterCatalog {
     client: crate::egress::HttpClient,
@@ -69,7 +75,7 @@ impl OpenRouterCatalog {
         assert_eq!(url.host_str(), Some("127.0.0.1"));
         Self::build(base, timeout).unwrap()
     }
-    async fn get(&self, path: &str) -> Result<Arc<Vec<u8>>, ()> {
+    async fn get(&self, path: &str) -> Result<Arc<Vec<u8>>, CatalogError> {
         let url = format!("{}{path}", self.base);
         if let Some((at, body)) = self.cache.lock().await.get(&url)
             && at.elapsed() < CACHE_TTL
@@ -83,34 +89,37 @@ impl OpenRouterCatalog {
                 .header(reqwest::header::ACCEPT, "application/json")
                 .send()
                 .await
-                .map_err(crate::egress::UpstreamClient::Openrouter.count_then(()))?;
+                .map_err(
+                    crate::egress::UpstreamClient::Openrouter.count_then(CatalogError::Unavailable),
+                )?;
             let json = response
                 .headers()
                 .get(reqwest::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v.starts_with("application/json"));
             // Redirects are not followed: any non-200 (including 3xx) fails.
-            if response.status() != reqwest::StatusCode::OK
-                || !json
-                || response
-                    .content_length()
-                    .is_some_and(|n| n > BODY_CAP as u64)
+            if response.status() != reqwest::StatusCode::OK || !json {
+                return Err(CatalogError::Unavailable);
+            }
+            if response
+                .content_length()
+                .is_some_and(|n| n > BODY_CAP as u64)
             {
-                return Err(());
+                return Err(CatalogError::Limit);
             }
             let mut out = Vec::new();
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|_| ())?;
+                let chunk = chunk.map_err(|_| CatalogError::Unavailable)?;
                 if out.len() + chunk.len() > BODY_CAP {
-                    return Err(());
+                    return Err(CatalogError::Limit);
                 }
                 out.extend_from_slice(&chunk);
             }
             Ok(out)
         })
         .await
-        .map_err(|_| ())??;
+        .map_err(|_| CatalogError::Unavailable)??;
         // Decode only bounded, complete JSON; a malformed 200 must not poison
         // subsequent previews for the cache TTL.
         limits::catalog_json(&body)?;
@@ -212,14 +221,10 @@ pub(super) async fn price_suggestion(
     // Token-priced workloads: price from one concrete endpoint (the one the
     // evidence matches, else the cheapest current one). If the endpoint list
     // is unavailable, fall back to the catalog's top-provider price.
-    let endpoints = if workload == WorkloadKind::Images {
+    let endpoint_body = if workload == WorkloadKind::Images {
         None
     } else {
-        catalog
-            .get(&format!("/models/{slug}/endpoints"))
-            .await
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        Some(catalog.get(&format!("/models/{slug}/endpoints")).await)
     };
     let evidence: Vec<Evidence> = evidence
         .into_iter()
@@ -231,13 +236,20 @@ pub(super) async fn price_suggestion(
             })
         })
         .collect();
-    let mut out = map_with_endpoints(
-        &model,
-        workload,
-        images.as_deref().map(Vec::as_slice),
-        endpoints.as_ref(),
-        &evidence,
-    );
+    let mut out = if matches!(&endpoint_body, Some(Err(CatalogError::Limit))) {
+        limits::refused(&model, workload)
+    } else {
+        let endpoints = endpoint_body
+            .and_then(Result::ok)
+            .and_then(|body| serde_json::from_slice::<Value>(&body).ok());
+        map_with_endpoints(
+            &model,
+            workload,
+            images.as_deref().map(Vec::as_slice),
+            endpoints.as_ref(),
+            &evidence,
+        )
+    };
     out["deployment_id"] = json!(id);
     out["upstream_model"] = json!(upstream);
     Ok(Json(out))
@@ -486,12 +498,26 @@ fn overrides(d: &mut Draft, pricing: &Value) {
         };
         for (key, meter, sku) in TOKEN_KEYS {
             if let Some(p) = price_str(o, key) {
-                if !d
+                let Some(base) = d
                     .lines
                     .iter()
-                    .any(|l| l["meter"] == meter.as_str() && l["not_applicable"] != true)
-                {
+                    .find(|l| l["meter"] == meter.as_str() && l["min_prompt_tokens"].is_null())
+                else {
                     continue;
+                };
+                // A prompt-size rate is evidence that an unlisted base is
+                // unknown. Keep the tier visible until the base is reviewed.
+                if base["not_applicable"] == true {
+                    d.priced(
+                        meter,
+                        sku,
+                        None,
+                        &format!("pricing.{key}"),
+                        true,
+                        None,
+                        None,
+                        "",
+                    );
                 }
                 d.priced(
                     meter,
