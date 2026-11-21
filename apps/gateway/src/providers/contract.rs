@@ -249,7 +249,12 @@ pub async fn assert_text_chat_contract(
 pub fn error_tool_result_requests() -> Vec<(ChatRequest, bool, String)> {
     let mut cases = vec![];
     for flag in [None, Some(false), Some(true)] {
-        for text in ["", "failed\n東京"] {
+        let nonempty = if flag == Some(false) {
+            "[tool_error]\n東京"
+        } else {
+            "failed\n東京"
+        };
+        for text in ["", nonempty] {
             let mut body = serde_json::json!({"model":"public","max_tokens":32,
                 "messages":[{"role":"user","content":"ping"},
                 {"role":"assistant","content":[
@@ -295,7 +300,7 @@ pub async fn assert_error_tool_sdk(
     adapter: std::sync::Arc<dyn ProviderAdapter>,
     target: Deployment,
 ) {
-    run_error_tool_sdk(pool, adapter, target, None).await;
+    run_error_tool_sdk(pool, adapter, target, false).await;
 }
 
 #[cfg(feature = "integration-tests")]
@@ -303,7 +308,7 @@ pub async fn run_error_tool_sdk(
     pool: sqlx::PgPool,
     adapter: std::sync::Arc<dyn ProviderAdapter>,
     target: Deployment,
-    refusal: Option<(u16, crate::inference::error::InferenceError)>,
+    expect_upstream_refusal: bool,
 ) {
     use crate::{
         bootstrap,
@@ -329,10 +334,7 @@ pub async fn run_error_tool_sdk(
         .execute(&pool)
         .await
         .unwrap();
-    if matches!(
-        refusal,
-        Some((_, crate::inference::error::InferenceError::UpstreamRejected))
-    ) {
+    if expect_upstream_refusal {
         sqlx::query("INSERT INTO deployment_prices(id,deployment_id,input_microusd_per_million,output_microusd_per_million,input_token_limit,output_token_limit,pricing_version) SELECT gen_random_uuid(),id,1000000,1000000,100,50,1 FROM deployments")
             .execute(&pool).await.unwrap();
     }
@@ -350,8 +352,10 @@ pub async fn run_error_tool_sdk(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/tool-result-errors.mjs");
     let mut command = tokio::process::Command::new("node");
     command.arg(script);
-    if let Some((status, error)) = refusal {
-        command.arg(status.to_string()).arg(error.message());
+    if expect_upstream_refusal {
+        command
+            .arg("400")
+            .arg(crate::inference::error::InferenceError::UpstreamRejected.message());
     }
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(30),
@@ -375,10 +379,6 @@ pub async fn run_error_tool_sdk(
         .fetch_one(&pool)
         .await
         .unwrap();
-    let expected = match refusal {
-        Some((_, crate::inference::error::InferenceError::Unsupported)) => 0,
-        Some(_) => 2,
-        None => 6,
-    };
+    let expected = if expect_upstream_refusal { 2 } else { 6 };
     assert_eq!(attempts, expected, "durable attempts for SDK requests");
 }

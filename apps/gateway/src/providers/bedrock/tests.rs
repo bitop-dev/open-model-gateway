@@ -1033,6 +1033,8 @@ async fn error_tool_results_use_converse_status_without_changing_text() {
     let adapter = mock.adapter();
     for model in [
         "test-model",
+        "anthropic.claude-sonnet-5-v1:0",
+        "new-region.anthropic.claude-sonnet-4-20250514-v1:0",
         "amazon.nova-pro-v1:0",
         "apac.amazon.nova-2-lite-v1:0",
         "us.anthropic.claude-haiku-4-5-20251001-v1:0",
@@ -1062,10 +1064,12 @@ async fn error_tool_results_use_converse_status_without_changing_text() {
 }
 
 #[cfg(feature = "integration-tests")]
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn error_tool_sdk_bedrock(pool: sqlx::PgPool) {
     let mock = Mock::serve(complete(false), wire(events(false)), 200).await;
-    super::super::contract::assert_error_tool_sdk(pool, Arc::new(mock.adapter()), target()).await;
+    let mut deployment = target();
+    deployment.upstream_model = "new-region.anthropic.claude-sonnet-5-v1:0".into();
+    super::super::contract::assert_error_tool_sdk(pool, Arc::new(mock.adapter()), deployment).await;
     let capture = mock.requests.lock().unwrap();
     assert_eq!(capture.len(), 6);
     for (captured, (_, error, text)) in capture
@@ -1083,58 +1087,24 @@ async fn error_tool_sdk_bedrock(pool: sqlx::PgPool) {
     }
 }
 
-#[tokio::test]
-async fn error_tool_result_refused_for_identifiable_unsupported_models() {
-    let mock = Mock::serve(complete(false), wire(events(false)), 200).await;
-    let adapter = mock.adapter();
-    for model in [
-        "meta.llama3-1-70b-instruct-v1:0",
-        "us.meta.llama3-1-70b-instruct-v1:0",
-        "anthropic.claude-v2:1",
-        "arn:aws:bedrock:us-east-1::foundation-model/cohere.command-r-v1:0",
-        "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.meta.llama3-1-70b-instruct-v1:0",
-    ] {
-        let mut target = target();
-        target.upstream_model = model.into();
-        for (request, failed, text) in super::super::contract::error_tool_result_requests() {
-            let result = adapter.execute(&target, request).await;
-            if failed {
-                assert!(
-                    matches!(result, Err(InferenceError::Unsupported)),
-                    "{model}"
-                );
-            } else {
-                result.unwrap();
-                let capture = mock.requests.lock().unwrap();
-                assert_eq!(
-                    capture.last().unwrap().body["messages"][2]["content"][0]["toolResult"],
-                    json!({"toolUseId":"second-call","content":[{"text":text}]})
-                );
-            }
-        }
-    }
-    assert_eq!(mock.requests.lock().unwrap().len(), 5 * 4);
+#[cfg(feature = "integration-tests")]
+#[dbtest::test]
+async fn error_tool_sdk_bedrock_model_validation_refusal(pool: sqlx::PgPool) {
+    assert_bedrock_tool_status_refusal(pool, "us.meta.llama3-1-70b-instruct-v1:0").await;
 }
 
 #[cfg(feature = "integration-tests")]
-#[sqlx::test(migrations = "./enterprise_migrations")]
-async fn error_tool_sdk_bedrock_known_refusal(pool: sqlx::PgPool) {
-    let mock = Mock::serve(complete(false), wire(events(false)), 200).await;
-    let mut deployment = target();
-    deployment.upstream_model = "us.meta.llama3-1-70b-instruct-v1:0".into();
-    super::super::contract::run_error_tool_sdk(
+#[dbtest::test]
+async fn error_tool_sdk_bedrock_opaque_validation_refusal(pool: sqlx::PgPool) {
+    assert_bedrock_tool_status_refusal(
         pool,
-        Arc::new(mock.adapter()),
-        deployment,
-        Some((501, InferenceError::Unsupported)),
+        "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/a1b2c3d4e5",
     )
     .await;
-    assert!(mock.requests.lock().unwrap().is_empty());
 }
 
 #[cfg(feature = "integration-tests")]
-#[sqlx::test(migrations = "./enterprise_migrations")]
-async fn error_tool_sdk_bedrock_opaque_validation_failure(pool: sqlx::PgPool) {
+async fn assert_bedrock_tool_status_refusal(pool: sqlx::PgPool, upstream_model: &str) {
     let mock = Mock::serve(
         json!({"__type":"ValidationException","message":"unsupported toolResult.status"}),
         vec![],
@@ -1142,16 +1112,15 @@ async fn error_tool_sdk_bedrock_opaque_validation_failure(pool: sqlx::PgPool) {
     )
     .await;
     let mut deployment = target();
-    deployment.upstream_model =
-        "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/a1b2c3d4e5".into();
+    deployment.upstream_model = upstream_model.into();
     super::super::contract::run_error_tool_sdk(
         pool.clone(),
         Arc::new(mock.adapter()),
         deployment,
-        Some((400, InferenceError::UpstreamRejected)),
+        true,
     )
     .await;
-    // Paid requests rejected before the stream opens have no usage evidence.
+    // Priced requests rejected before the stream opens have no usage evidence.
     // Each 100-input + 32-output hold remains available for reconciliation.
     let unknown: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM governance_reservations r

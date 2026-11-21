@@ -198,8 +198,10 @@ impl Engine {
     // observation, and another authorized route may still accept the
     // same request.
     //
-    // Cache wire validation per provider and scan for failed results once.
-    // Each deployment supplies its own model identity for the status check.
+    // Validation depends only on the adapter and the client request, so it
+    // runs once per adapter (provider id), not once per deployment: a model
+    // with many routes on one provider must not multiply this unmetered,
+    // pre-admission work.
     pub(super) fn eligible_candidates(
         &self,
         deployments: Vec<Deployment>,
@@ -210,7 +212,6 @@ impl Engine {
         let mut refused = Vec::new();
         let mut verdicts: std::collections::HashMap<String, Result<(), InferenceError>> =
             std::collections::HashMap::new();
-        let has_failed_result = request.has_failed_tool_result();
         for deployment in deployments {
             if !deployment
                 .supported_protocols
@@ -242,9 +243,7 @@ impl Engine {
                         Err(InferenceError::Unsupported)
                     }
                 });
-            match verdict
-                .and_then(|()| adapter.validate_tool_result_target(&deployment, has_failed_result))
-            {
+            match verdict {
                 Ok(()) => candidates.push(deployment),
                 Err(error) => refused.push((deployment, error)),
             }

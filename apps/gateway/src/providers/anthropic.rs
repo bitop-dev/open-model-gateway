@@ -178,11 +178,7 @@ fn check_supported(request: &ChatRequest) -> Result<()> {
 fn content_blocks(message: &Message) -> Result<Vec<Value>> {
     let mut content = vec![];
     if message.role == Role::Tool {
-        let mut result = json!({"type":"tool_result","tool_use_id":message.tool_call_id,"content":message.content});
-        if message.tool_result_is_error {
-            result["is_error"] = json!(true);
-        }
-        content.push(result);
+        content.push(json!({"type":"tool_result","tool_use_id":message.tool_call_id,"content":message.content}));
     } else {
         if let Some(text) = &message.content {
             content.push(json!({"type":"text","text":text}));

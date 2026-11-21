@@ -570,7 +570,7 @@ async fn error_tool_results_use_explicit_marker_on_all_local_profiles() {
 }
 
 #[cfg(feature = "integration-tests")]
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn error_tool_sdk_local_profiles(pool: sqlx::PgPool) {
     error_tool_sdk_profile(pool, Profile::OpenAiCompatible).await;
 }
@@ -592,19 +592,19 @@ async fn error_tool_sdk_profile(pool: sqlx::PgPool, profile: Profile) {
 }
 
 #[cfg(feature = "integration-tests")]
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn error_tool_sdk_vllm(pool: sqlx::PgPool) {
     error_tool_sdk_profile(pool, Profile::Vllm).await;
 }
 
 #[cfg(feature = "integration-tests")]
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn error_tool_sdk_sglang(pool: sqlx::PgPool) {
     error_tool_sdk_profile(pool, Profile::Sglang).await;
 }
 
 #[cfg(feature = "integration-tests")]
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn error_tool_sdk_ollama(pool: sqlx::PgPool) {
     error_tool_sdk_profile(pool, Profile::Ollama).await;
 }

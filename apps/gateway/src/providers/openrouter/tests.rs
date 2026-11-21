@@ -1142,7 +1142,7 @@ async fn error_tool_results_use_explicit_openrouter_marker() {
 }
 
 #[cfg(feature = "integration-tests")]
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn error_tool_sdk_openrouter(pool: sqlx::PgPool) {
     let mut reply = glm_complete();
     reply["choices"][0]["finish_reason"] = json!("stop");

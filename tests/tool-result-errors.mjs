@@ -23,7 +23,7 @@ if (expectedStatus) {
   process.exit(0);
 }
 for (const flag of [undefined, false, true]) {
-  for (const content of ["", "failed\n東京"]) {
+  for (const content of ["", flag === false ? "[tool_error]\n東京" : "failed\n東京"]) {
     const block = { type: "tool_result", tool_use_id: "second-call", content };
     if (flag !== undefined) block.is_error = flag;
     const response = await client.messages.create(followup(block));

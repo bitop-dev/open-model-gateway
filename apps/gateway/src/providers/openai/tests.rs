@@ -1086,7 +1086,7 @@ async fn error_tool_results_use_explicit_openai_marker() {
 }
 
 #[cfg(feature = "integration-tests")]
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn error_tool_sdk_openai(pool: sqlx::PgPool) {
     let mock = Mock::json(complete()).await;
     super::super::contract::assert_error_tool_sdk(pool, Arc::new(mock.adapter()), target()).await;

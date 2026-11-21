@@ -311,3 +311,33 @@ async fn retrieve_cancel_results_and_delete() {
         ]
     );
 }
+
+#[test]
+fn native_messages_batch_preserves_tool_result_flags() {
+    for (i, (request, _, text)) in crate::providers::contract::error_tool_result_requests()
+        .into_iter()
+        .enumerate()
+    {
+        let line: Value = serde_json::from_slice(
+            &encode_native_line(
+                &target(),
+                BatchEndpoint::Messages,
+                "l0",
+                &BatchRequest::Chat(request),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let result = &line["params"]["messages"][2]["content"][0];
+        assert_eq!(result["tool_use_id"], "second-call");
+        assert_eq!(result["content"], text);
+        assert_eq!(
+            result.get("is_error"),
+            match i / 2 {
+                0 => None,
+                1 => Some(&json!(false)),
+                _ => Some(&json!(true)),
+            }
+        );
+    }
+}

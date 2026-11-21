@@ -534,7 +534,7 @@ fn thinking_tokens_and_reported_model_are_telemetry_only() {
 }
 
 #[cfg(feature = "integration-tests")]
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn error_tool_sdk_anthropic_preserves_boolean_presence(pool: sqlx::PgPool) {
     let mock = Mock::new(200, None).await;
     let adapter = AnthropicAdapter::for_test(Arc::new(Resolver), mock.adapter.base.clone());
@@ -543,13 +543,11 @@ async fn error_tool_sdk_anthropic_preserves_boolean_presence(pool: sqlx::PgPool)
     super::super::contract::assert_error_tool_sdk(pool, Arc::new(adapter), deployment).await;
     let capture = mock.capture.lock().unwrap();
     assert_eq!(capture.len(), 6);
-    for (i, (_, _, body)) in capture.iter().enumerate() {
+    let expected = super::super::contract::error_tool_result_requests();
+    for (i, ((_, _, body), (_, _, text))) in capture.iter().zip(expected).enumerate() {
         let results = &body["messages"][2]["content"];
         assert_eq!(results[0]["tool_use_id"], "second-call");
-        assert_eq!(
-            results[0]["content"],
-            if i % 2 == 0 { "" } else { "failed\n東京" }
-        );
+        assert_eq!(results[0]["content"], text);
         assert_eq!(
             results[0].get("is_error"),
             match i / 2 {
