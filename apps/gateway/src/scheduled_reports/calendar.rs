@@ -61,7 +61,7 @@ impl Calendar {
     /// shifts gaps forward by their size and chooses the earlier fold only.
     pub(crate) fn delivery_after(&self, end: UtcInstant) -> Result<UtcInstant, sqlx::Error> {
         let ts = jiff::Timestamp::from_second(end.timestamp()).map_err(|_| invalid())?;
-        let local = ts.to_zoned(self.zone.clone());
+        let local = ts.to_zoned_datetime(self.zone.clone());
         let mut d = CalendarDate::from_ymd_opt(
             i32::from(local.year()),
             local.month() as u32,
@@ -81,7 +81,7 @@ impl Calendar {
                 0,
             )
             .map_err(|_| invalid())?;
-            let zoned = self.zone.to_zoned(civil).map_err(|_| invalid())?;
+            let zoned = self.zone.to_zoned_datetime(civil).map_err(|_| invalid())?;
             let due =
                 UtcInstant::from_timestamp(zoned.timestamp().as_second(), 0).ok_or_else(invalid)?;
             if due > end {
