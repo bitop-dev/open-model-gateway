@@ -511,11 +511,23 @@ impl Config {
         ))
     }
 
-    pub async fn connect(&self) -> Result<sqlx::PgPool> {
+    fn primary_pool_options(&self) -> PgPoolOptions {
         PgPoolOptions::new()
             .max_connections(self.database_max_connections)
             .acquire_timeout(ACQUIRE_TIMEOUT)
+    }
+
+    pub async fn connect(&self) -> Result<sqlx::PgPool> {
+        self.primary_pool_options()
             .connect(&self.database_url)
+            .await
+            .context("could not connect to PostgreSQL")
+    }
+
+    pub async fn connect_bootstrap_dev(&self) -> Result<sqlx::PgPool> {
+        let options = crate::bootstrap::dev_connect_options(self.environment, &self.database_url)?;
+        self.primary_pool_options()
+            .connect_with(options)
             .await
             .context("could not connect to PostgreSQL")
     }
