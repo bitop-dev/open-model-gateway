@@ -93,8 +93,8 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     env:
-      DATABASE_URL: postgres://gateway:gateway@localhost:5432/gateway
-      DATETIME_PG_URL: postgres://gateway:gateway@localhost:5432/gateway
+      DATABASE_URL: postgres://gateway:gateway@127.0.0.1:5432/gateway
+      DATETIME_PG_URL: postgres://gateway:gateway@127.0.0.1:5432/gateway
       # No debug information in test builds: nothing in CI reads it, and it is
       # a large share of the gateway's compile and link time. A failing test
       # still reports its panic location, which is compiled in.
@@ -130,8 +130,8 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     env:
-      DATABASE_URL: postgres://gateway:gateway@localhost:5432/gateway
-      DATETIME_PG_URL: postgres://gateway:gateway@localhost:5432/gateway
+      DATABASE_URL: postgres://gateway:gateway@127.0.0.1:5432/gateway
+      DATETIME_PG_URL: postgres://gateway:gateway@127.0.0.1:5432/gateway
       # No debug information in test builds: nothing in CI reads it, and it is
       # a large share of the gateway's compile and link time. A failing test
       # still reports its panic location, which is compiled in.
