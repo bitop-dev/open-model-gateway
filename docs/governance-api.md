@@ -58,6 +58,8 @@ Delivery is the first configured local HH:MM **strictly after** UTC period closu
 
 Creation, resumption and configuration edits select the next future occurrence, above any already published period end. Pre-upgrade null cursors are initialized from database time, without historical replay. Edits never mutate completed runs. After downtime, only the latest completed UTC period is eligible, with the number of skipped intervals recorded separately; their usage is never combined. If its delivery preference is still in the future, catch-up waits for it rather than producing an older report followed shortly by the latest one.
 
+An active schedule stores its pending delivery time in UTC. When a gateway upgrade changes the bundled timezone rules, the worker waits for that stored time before applying the current calendar. A rule change that moves a local delivery earlier can therefore leave the pending occurrence late. The worker computes subsequent delivery times with the updated rules. The UTC accounting windows are unchanged.
+
 ### Fenced aggregate generation
 
 Every replica starts a 30-second tick, but only the `ReportScheduler` lease holder works. Selection binds one database cutoff and reads a **32-row indexed keyset page before checking claims**. At most eight eligible schedules are selected from that page, preferring never-attempted work and then the oldest expired claim within the page. The advisory scan frontier advances even over live claims and failures, wraps at the end, and may reset after restart/failover. It is not a global fairness sort over the schedule population. At most eight paused null cursors are initialized separately through a partial index.
