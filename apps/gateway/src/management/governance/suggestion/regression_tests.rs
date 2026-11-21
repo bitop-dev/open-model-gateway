@@ -401,8 +401,15 @@ async fn a_wrong_endpoint_envelope_is_not_cached() {
         );
         let (url, task) = tests::mock(app).await;
         let catalog = OpenRouterCatalog::for_test(url, Duration::from_secs(2));
-        let first = catalog.get(path).await.unwrap();
-        assert_eq!(serde_json::from_slice::<Value>(&first).unwrap(), invalid);
+        let first = catalog.get(path).await;
+        if path.starts_with("/images/") {
+            assert_eq!(
+                serde_json::from_slice::<Value>(&first.unwrap()).unwrap(),
+                invalid
+            );
+        } else {
+            assert!(matches!(first, Err(CatalogError::Unavailable)));
+        }
         let corrected = catalog.get(path).await.unwrap();
         assert_eq!(
             serde_json::from_slice::<Value>(&corrected).unwrap(),

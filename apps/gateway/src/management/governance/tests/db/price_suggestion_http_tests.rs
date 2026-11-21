@@ -35,6 +35,8 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
     let all_requests = Arc::new(AtomicUsize::new(0));
     let observed_requests = all_requests.clone();
     let c = calls.clone();
+    let wide_responses = Arc::new(AtomicUsize::new(0));
+    let wide_hits = wide_responses.clone();
     let catalog = axum::Router::new()
         .route("/models", axum::routing::get(move || {
             let c = c.clone();
@@ -71,8 +73,16 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
             let body = format!(r#"{{"endpoints":[],"metadata":{}null{}}}"#, "[".repeat(130), "]".repeat(130));
             ([( "content-type", "application/json")], body)
         }))
-        .route("/models/v/endpoint-wide/endpoints", axum::routing::get(|| async {
-            axum::Json(json!({"metadata": vec![0; 65]}))
+        .route("/models/v/endpoint-wide/endpoints", axum::routing::get(move || {
+            let wide_hits = wide_hits.clone();
+            async move {
+                let body = if wide_hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                    format!(r#"{{{}"metadata":0}}"#, r#""metadata":0,"#.repeat(64))
+                } else {
+                    json!({"endpoints":[{"provider_name":"Recovered","status":0,"pricing":{"prompt":"3","completion":"3"}}]}).to_string()
+                };
+                ([("content-type", "application/json")], body)
+            }
         }))
         .layer(axum::middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
             observed_requests.fetch_add(1, Ordering::SeqCst);
@@ -299,6 +309,20 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
         assert!(out.get("endpoint").is_none());
         assert!(!out["warnings"].to_string().contains("price was used"));
     }
+    let corrected_url =
+        format!("{gateway_url}/api/v1/platform/deployments/{endpoint_wide}/price-suggestion");
+    for _ in 0..2 {
+        let corrected = client
+            .get(&corrected_url)
+            .header("cookie", &admin_cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(corrected.status(), StatusCode::OK);
+        let body: Value = corrected.json().await.unwrap();
+        assert_eq!(body["endpoint"]["provider"], "Recovered");
+    }
+    assert_eq!(wide_responses.load(Ordering::SeqCst), 2);
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     let r = client
         .get(format!(

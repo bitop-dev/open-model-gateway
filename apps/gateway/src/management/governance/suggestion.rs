@@ -125,11 +125,20 @@ impl OpenRouterCatalog {
         limits::catalog_json(&body)?;
         let body = Arc::new(body);
         if path.ends_with("/endpoints") {
-            // The mapper checks its own budget before using any rates. Give
-            // it uncached responses that exceed that budget or lack the
-            // expected shape so it can distinguish refusal from fallback.
-            if !limits::mapping_json(&body) || !catalog_shape_matches(path, &body) {
-                return Ok(body);
+            let within_budget = limits::mapping_json(&body);
+            if !within_budget || !catalog_shape_matches(path, &body) {
+                if path.starts_with("/images/") {
+                    // Image mapping consumes the raw body and applies its
+                    // own limits. Keep incomplete responses uncached.
+                    return Ok(body);
+                }
+                // Token mapping uses a value tree, which can collapse
+                // duplicate fields. Refuse the raw response before decoding.
+                return Err(if within_budget {
+                    CatalogError::Unavailable
+                } else {
+                    CatalogError::Limit
+                });
             }
         } else if !catalog_shape_matches(path, &body) {
             return Err(CatalogError::Unavailable);
