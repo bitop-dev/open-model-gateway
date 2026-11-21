@@ -7,15 +7,17 @@ pub(super) const MAX_ITEMS: usize = 64;
 pub(super) const MAX_WARNINGS: usize = 64;
 const MAPPING_NODES: usize = 4096;
 const MAPPING_TEXT: usize = 16_384;
+const MAPPING_DEPTH: usize = 64;
 const CATALOG_NODES: usize = 131_072;
 const CATALOG_TEXT: usize = 16_384;
 // Classify nesting refusals before serde_json reaches its recursion guard.
-const PREFLIGHT_DEPTH: usize = 96;
+const CATALOG_DEPTH: usize = 96;
 
 struct Budget {
     nodes: usize,
     items: usize,
     text: usize,
+    depth: usize,
     exceeded: bool,
 }
 
@@ -29,7 +31,7 @@ struct Check<'a>(&'a mut Budget, usize);
 impl<'de> DeserializeSeed<'de> for Check<'_> {
     type Value = ();
     fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
-        if self.1 > PREFLIGHT_DEPTH {
+        if self.1 > self.0.depth {
             return Err(self.0.reject_limit("catalog depth limit"));
         }
         if self.0.nodes == 0 {
@@ -108,6 +110,7 @@ pub(super) fn catalog_json(body: &[u8]) -> Result<(), CatalogError> {
             nodes: CATALOG_NODES,
             items: CATALOG_NODES,
             text: CATALOG_TEXT,
+            depth: CATALOG_DEPTH,
             exceeded: false,
         },
     )
@@ -119,6 +122,7 @@ pub(super) fn mapping_json(body: &[u8]) -> bool {
             nodes: MAPPING_NODES,
             items: MAX_ITEMS,
             text: MAPPING_TEXT,
+            depth: MAPPING_DEPTH,
             exceeded: false,
         },
     )
@@ -126,7 +130,7 @@ pub(super) fn mapping_json(body: &[u8]) -> bool {
 }
 pub(super) fn mapping_value(v: &Value) -> bool {
     fn walk(v: &Value, remaining: &mut usize, depth: usize) -> bool {
-        if *remaining == 0 || depth > 64 {
+        if *remaining == 0 || depth > MAPPING_DEPTH {
             return false;
         }
         *remaining -= 1;

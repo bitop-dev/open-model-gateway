@@ -50,6 +50,7 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
                     {"id":"v/cold","pricing":{"prompt":"1"}},
                     {"id":"v/endpoint-large","context_length":4096,"top_provider":{"max_completion_tokens":100},"pricing":{"prompt":"1","completion":"2"}},
                     {"id":"v/endpoint-deep","context_length":4096,"top_provider":{"max_completion_tokens":100},"pricing":{"prompt":"1","completion":"2"}},
+                    {"id":"v/endpoint-wide","context_length":4096,"top_provider":{"max_completion_tokens":100},"pricing":{"prompt":"1","completion":"2"}},
                     {"id":"v/tiers","context_length":4096,"top_provider":{"max_completion_tokens":100},"pricing":{"prompt":"1","overrides":&tiers[..64]}}
                 ]}).to_string())
             }
@@ -69,6 +70,9 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
         .route("/models/v/endpoint-deep/endpoints", axum::routing::get(|| async {
             let body = format!(r#"{{"endpoints":[],"metadata":{}null{}}}"#, "[".repeat(130), "]".repeat(130));
             ([( "content-type", "application/json")], body)
+        }))
+        .route("/models/v/endpoint-wide/endpoints", axum::routing::get(|| async {
+            axum::Json(json!({"metadata": vec![0; 65]}))
         }))
         .layer(axum::middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
             observed_requests.fetch_add(1, Ordering::SeqCst);
@@ -99,6 +103,9 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
     let endpoint_deep = Uuid::new_v4();
     sqlx::query("INSERT INTO deployments(id,model_id,provider_connection_id,upstream_model) VALUES($1,$2,$3,'v/endpoint-deep')")
         .bind(endpoint_deep).bind(model).bind(connection).execute(&f.store.pool).await.unwrap();
+    let endpoint_wide = Uuid::new_v4();
+    sqlx::query("INSERT INTO deployments(id,model_id,provider_connection_id,upstream_model) VALUES($1,$2,$3,'v/endpoint-wide')")
+        .bind(endpoint_wide).bind(model).bind(connection).execute(&f.store.pool).await.unwrap();
     // Create an actual immutable price first. Preview is read-only even when
     // parsing fails or refuses a hostile entry.
     let admin = user(f.owner, true);
@@ -267,7 +274,7 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
     assert_eq!(repeated.status(), StatusCode::OK);
     assert_eq!(repeated.json::<Value>().await.unwrap(), out);
     assert_eq!(all_requests.load(Ordering::SeqCst), fetched);
-    for refused in [large, tiered, endpoint_large, endpoint_deep] {
+    for refused in [large, tiered, endpoint_large, endpoint_deep, endpoint_wide] {
         let r = client
             .get(format!(
                 "{gateway_url}/api/v1/platform/deployments/{refused}/price-suggestion"

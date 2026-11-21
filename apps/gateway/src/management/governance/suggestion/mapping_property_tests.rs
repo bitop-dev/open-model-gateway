@@ -956,21 +956,37 @@ fn check_generation_prices(out: &Value, model: &Value) -> Result<(), TestCaseErr
             .unwrap_or_else(|| panic!("no base line for {meter}"));
         let rate = &model["pricing"][key];
         let always_priced = matches!(meter, "input_tokens" | "output_tokens");
-        let has_prompt_tier = model["pricing"]["overrides"]
+        let expected_tiers: std::collections::BTreeMap<_, _> = model["pricing"]["overrides"]
             .as_array()
-            .is_some_and(|tiers| {
-                tiers.iter().any(|tier| {
-                    !tier[key].is_null()
-                        && tier["min_prompt_tokens"]
-                            .as_u64()
-                            .and_then(|threshold| i32::try_from(threshold).ok())
-                            .is_some_and(|threshold| threshold > 0)
-                        && tier
-                            .as_object()
-                            .is_some_and(|fields| fields.keys().all(|key| !key.starts_with("utc_")))
-                })
-            });
-        if rate.is_null() && !always_priced && !has_prompt_tier {
+            .into_iter()
+            .flatten()
+            .filter_map(|tier| {
+                let fields = tier.as_object()?;
+                let threshold = i32::try_from(tier["min_prompt_tokens"].as_u64()?).ok()?;
+                (threshold > 0
+                    && !tier[key].is_null()
+                    && fields.keys().all(|key| !key.starts_with("utc_")))
+                .then_some((threshold, &tier[key]))
+            })
+            .collect();
+        for (threshold, rate) in &expected_tiers {
+            let tier = lines(out)
+                .iter()
+                .find(|tier| tier["meter"] == meter && tier["min_prompt_tokens"] == *threshold);
+            prop_assert!(tier.is_some(), "missing {meter} tier at {threshold}");
+            let actual = tier.unwrap()["microusd_per_batch"]
+                .as_str()
+                .map(|amount| amount.parse::<i64>().unwrap());
+            let expected = rate.as_str().and_then(|rate| reference(rate, 1_000_000));
+            if expected.as_ref().is_none_or(|rate| !rate.wide) {
+                prop_assert_eq!(
+                    actual,
+                    expected.and_then(|rate| rate.amount),
+                    "{meter} tier at {threshold}"
+                );
+            }
+        }
+        if rate.is_null() && !always_priced && expected_tiers.is_empty() {
             prop_assert!(
                 line["not_applicable"] == true && line["needs_review"] == true,
                 "{line}"

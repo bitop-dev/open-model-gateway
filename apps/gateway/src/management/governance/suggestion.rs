@@ -123,10 +123,17 @@ impl OpenRouterCatalog {
         // Decode only bounded, complete JSON; a malformed 200 must not poison
         // subsequent previews for the cache TTL.
         limits::catalog_json(&body)?;
-        if !catalog_shape_matches(path, &body) {
+        let body = Arc::new(body);
+        if path.ends_with("/endpoints") {
+            // The mapper checks its own budget before using any rates. Give
+            // it uncached responses that exceed that budget or lack the
+            // expected shape so it can distinguish refusal from fallback.
+            if !limits::mapping_json(&body) || !catalog_shape_matches(path, &body) {
+                return Ok(body);
+            }
+        } else if !catalog_shape_matches(path, &body) {
             return Err(CatalogError::Unavailable);
         }
-        let body = Arc::new(body);
         let mut cache = self.cache.lock().await;
         cache.retain(|_, (at, _)| at.elapsed() < CACHE_TTL);
         if cache.len() >= CACHE_ENTRIES {
@@ -136,8 +143,9 @@ impl OpenRouterCatalog {
         Ok(body)
     }
 }
-// Only complete envelopes can be shared through the cache. Inspect the
-// required fields without allocating a second tree for their contents.
+// Only complete envelopes can be shared through the cache. Image responses
+// use the same decoder as the mapper; model and token responses need only
+// their outer structure here.
 fn catalog_shape_matches(path: &str, body: &[u8]) -> bool {
     #[derive(Deserialize)]
     struct Envelope<'a> {
@@ -151,6 +159,9 @@ fn catalog_shape_matches(path: &str, body: &[u8]) -> bool {
     let endpoint_list = path.ends_with("/endpoints");
     if !models && !endpoint_list {
         return true;
+    }
+    if path.starts_with("/images/") {
+        return decode_image_endpoints(body).is_some();
     }
     if body.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
         return false;
@@ -599,17 +610,19 @@ struct ImagePrice {
     #[serde(default)]
     variant: Option<String>,
 }
-fn image_lines(d: &mut Draft, body: Option<&[u8]>) {
+fn decode_image_endpoints(body: &[u8]) -> Option<ImageEndpoints> {
     #[derive(Deserialize)]
     struct Wrapped {
         data: ImageEndpoints,
     }
-    let parsed = body.and_then(|b| {
-        serde_json::from_slice::<ImageEndpoints>(b)
-            .ok()
-            .or_else(|| serde_json::from_slice::<Wrapped>(b).ok().map(|w| w.data))
-    });
-    let Some(parsed) = parsed else {
+
+    serde_json::from_slice::<ImageEndpoints>(body)
+        .ok()
+        .or_else(|| serde_json::from_slice::<Wrapped>(body).ok().map(|w| w.data))
+}
+
+fn image_lines(d: &mut Draft, body: Option<&[u8]>) {
+    let Some(parsed) = body.and_then(decode_image_endpoints) else {
         d.priced(
             Meter::OutputImages,
             "Image output",

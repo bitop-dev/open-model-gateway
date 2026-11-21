@@ -375,16 +375,24 @@ async fn a_malformed_success_is_not_cached() {
 async fn a_wrong_endpoint_envelope_is_not_cached() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    for path in ["/models/v/m/endpoints", "/images/models/v/m/endpoints"] {
+    for (path, invalid) in [
+        ("/models/v/m/endpoints", json!({"data":{"endpoints":{}}})),
+        (
+            "/images/models/v/m/endpoints",
+            json!({"data":{"endpoints":[{"pricing":[{}]}]}}),
+        ),
+    ] {
         let hits = Arc::new(AtomicUsize::new(0));
         let requests = hits.clone();
+        let invalid_body = invalid.clone();
         let app = axum::Router::new().route(
             path,
             axum::routing::get(move || {
                 let requests = requests.clone();
+                let invalid_body = invalid_body.clone();
                 async move {
                     let body = match requests.fetch_add(1, Ordering::SeqCst) {
-                        0 => json!({"data":{"endpoints":{}}}),
+                        0 => invalid_body,
                         _ => json!({"data":{"endpoints":[]}}),
                     };
                     axum::Json(body)
@@ -393,9 +401,14 @@ async fn a_wrong_endpoint_envelope_is_not_cached() {
         );
         let (url, task) = tests::mock(app).await;
         let catalog = OpenRouterCatalog::for_test(url, Duration::from_secs(2));
-        assert!(catalog.get(path).await.is_err());
-        assert!(catalog.get(path).await.is_ok());
-        assert!(catalog.get(path).await.is_ok());
+        let first = catalog.get(path).await.unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&first).unwrap(), invalid);
+        let corrected = catalog.get(path).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&corrected).unwrap(),
+            json!({"data":{"endpoints":[]}})
+        );
+        assert_eq!(catalog.get(path).await.unwrap(), corrected);
         assert_eq!(hits.load(Ordering::SeqCst), 2);
         task.abort();
     }
