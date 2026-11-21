@@ -132,19 +132,19 @@ struct AliasScope {
     module: Vec<String>,
     declared: Names,
     local: Names,
+    import_edges: Vec<ImportEdge>,
 }
 
 impl AliasScope {
     // A qualified attribute may reach an explicit re-export declared later.
     fn index(&mut self, items: &[syn::Item]) {
-        let mut edges = Vec::new();
-        Self::collect_imports(items, &mut self.module, &mut edges);
+        Self::collect_imports(items, &mut self.module, &mut self.import_edges);
         // Each explicit import contributes one possible destination. Resolving
         // to a fixed point handles forward re-exports and terminates on cycles.
         loop {
             let count = self.declared.len();
-            for (source, target) in &edges {
-                if self.resolves_test_source(source, &edges, &mut BTreeSet::new()) {
+            for (source, target) in &self.import_edges {
+                if self.resolves_test_source(source, &mut BTreeSet::new()) {
                     self.declared.insert(target.clone());
                 }
             }
@@ -180,18 +180,13 @@ impl AliasScope {
         path.last().is_some_and(|name| name == "test") || self.declared.contains(path)
     }
 
-    fn resolves_test_source(
-        &self,
-        path: &[String],
-        edges: &[ImportEdge],
-        active: &mut BTreeSet<usize>,
-    ) -> bool {
+    fn resolves_test_source(&self, path: &[String], active: &mut BTreeSet<usize>) -> bool {
         if self.is_test_source(path) {
             return true;
         }
         // Resolve the namespace prefix of an explicit import. Keep each
         // edge to one visit per resolution so recursive module aliases end.
-        for (index, (source, binding)) in edges.iter().enumerate() {
+        for (index, (source, binding)) in self.import_edges.iter().enumerate() {
             let Some(suffix) = path.strip_prefix(binding.as_slice()) else {
                 continue;
             };
@@ -200,7 +195,7 @@ impl AliasScope {
             }
             let mut qualified = source.clone();
             qualified.extend_from_slice(suffix);
-            let matches = self.resolves_test_source(&qualified, edges, active);
+            let matches = self.resolves_test_source(&qualified, active);
             active.remove(&index);
             if matches {
                 return true;
@@ -213,7 +208,7 @@ impl AliasScope {
         let syn::Item::Use(u) = item else { return };
         imports(&u.tree, self.module.clone(), &mut |path, binding| {
             let prefix: Vec<_> = binding.into_iter().collect();
-            if self.is_test_source(path) && !prefix.is_empty() {
+            if !prefix.is_empty() && self.resolves_test_source(path, &mut BTreeSet::new()) {
                 self.local.insert(prefix.clone());
             }
             for name in &self.declared {
@@ -239,7 +234,7 @@ impl AliasScope {
         for s in &path.segments {
             segment(&mut qualified, &s.ident);
         }
-        self.declared.contains(&qualified)
+        self.resolves_test_source(&qualified, &mut BTreeSet::new())
     }
 }
 
@@ -378,6 +373,8 @@ fn test_attribute_aliases_follow_the_case_ignore_conditions() {
         use renamed as renamed_again;
         #[cfg_attr(review_platform, qualified_import)] async fn qualified_conditional() {}
         #[cfg_attr(review_platform, qualified_import, ignore)] async fn qualified_opted_in() {}
+        #[cfg_attr(review_platform, renamed_again::attribute)] async fn qualified_direct() {}
+        #[cfg_attr(review_platform, renamed_again::attribute, ignore)] async fn qualified_direct_opted_in() {}
         mod nested { use super::*; #[cfg_attr(unix, probe)] async fn inherited() {} }
     "#;
     assert_eq!(
@@ -389,6 +386,7 @@ fn test_attribute_aliases_follow_the_case_ignore_conditions() {
             "chained_case",
             "qualified",
             "qualified_conditional",
+            "qualified_direct",
             "inherited"
         ]
     );
