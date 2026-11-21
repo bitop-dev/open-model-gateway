@@ -253,6 +253,18 @@ class Pod(unittest.TestCase):
 
 
 class Shards(Pod):
+    def test_older_ref_without_shard_helper_still_checks_dedicated_library_probes(self):
+        (self.repo / ".github" / "scripts" / "rust-shards.mjs").unlink()
+        self.commit = self.make_repo({}, message="older library fixture without shard helper")
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(sum("--lib -- --exact" in call for call in self.stub_calls()), 4)
+        self.log.unlink()
+        result = self.run_script(STUB_UNIGNORED_LIBRARY=1)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("missing ignored library probe:", result.stdout)
+        self.assertFalse(any("--lib -- --exact" in call for call in self.stub_calls()))
+
     def test_unignored_dedicated_probe_stops_ordinary_library_execution(self):
         result = self.run_script(STUB_UNIGNORED_LIBRARY=1)
         self.assertNotEqual(result.returncode, 0, result.stdout)

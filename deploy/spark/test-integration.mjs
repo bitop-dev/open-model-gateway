@@ -1,13 +1,35 @@
 // Enumerate and reconcile every whole integration target with the CI inventory
 // and libtest validators. The source ref supplies the same module its CI uses.
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { checkSources, identity, KEY_CONTENTION, TERMINAL, DEDICATED_LIB_PROBES, LEGACY_RUNTIME_PROBES, DEDICATED_RUNTIME_PROBES } from "./target-inventory.mjs";
 
+function checkLegacyLibraryProbes() {
+  const list = (...flags) => new Set(execFileSync("cargo", [
+    "test", "-p", "open-model-gateway", "--all-features", "--lib", "--",
+    "--list", ...flags, "--format", "terse", "--color", "never",
+  ], { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] }).split(/\r?\n/).filter(Boolean));
+  const entries = list();
+  const ignored = list("--ignored");
+  assert.ok([...ignored].every(entry => entries.has(entry)), "ignored probes absent from inventory");
+  for (const name of DEDICATED_LIB_PROBES) {
+    const entry = `${name}: test`;
+    if (entries.has(entry)) assert.ok(ignored.has(entry), `missing ignored library probe: ${name}`);
+  }
+}
+
 async function main() {
   const group = process.argv[2];
-  const selected = await import(pathToFileURL(resolve(".github/scripts/rust-shards.mjs")));
+  const helper = resolve(".github/scripts/rust-shards.mjs");
+  // Library runs also support refs predating the CI shard helper.
+  if (group === "lib-preflight" && !existsSync(helper)) {
+    checkLegacyLibraryProbes();
+    return;
+  }
+  const selected = await import(pathToFileURL(helper));
   const { discoverTargets, parseListing, targetArgs, validateRun, runCargo } = selected;
   const metadata = JSON.parse(await runCargo(["metadata", "--no-deps", "--all-features", "--format-version", "1", "--locked"]));
   const runtime = group === "runtime" || group === "runtime-ignored";
