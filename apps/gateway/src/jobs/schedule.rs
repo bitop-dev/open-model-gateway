@@ -185,7 +185,7 @@ impl CompiledWindow {
         let Ok(ts) = jiff::Timestamp::from_second(at.timestamp()) else {
             return false;
         };
-        let local = ts.to_zoned(self.tz.clone());
+        let local = ts.to_zoned_datetime(self.tz.clone());
         let day = local.weekday().to_monday_zero_offset() as u8;
         let minute = local.hour() as u16 * 60 + local.minute() as u16;
         let on = |d: u8| self.days & (1 << d) != 0;
