@@ -77,7 +77,8 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
             let wide_hits = wide_hits.clone();
             async move {
                 let body = if wide_hits.fetch_add(1, Ordering::SeqCst) == 0 {
-                    format!(r#"{{{}"metadata":0}}"#, r#""metadata":0,"#.repeat(64))
+                    let valid = json!({"endpoints":[{"provider_name":"Example","status":0,"pricing":{"prompt":"1","completion":"2"}}]}).to_string();
+                    format!(r#"{{{}{}"#, r#""metadata":0,"#.repeat(64), &valid[1..])
                 } else {
                     json!({"endpoints":[{"provider_name":"Recovered","status":0,"pricing":{"prompt":"3","completion":"3"}}]}).to_string()
                 };

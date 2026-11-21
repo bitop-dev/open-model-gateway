@@ -124,24 +124,23 @@ impl OpenRouterCatalog {
         // subsequent previews for the cache TTL.
         limits::catalog_json(&body)?;
         let body = Arc::new(body);
-        if path.ends_with("/endpoints") {
-            let within_budget = limits::mapping_json(&body);
-            if !within_budget || !catalog_shape_matches(path, &body) {
-                if path.starts_with("/images/") {
-                    // Image mapping consumes the raw body and applies its
-                    // own limits. Keep incomplete responses uncached.
-                    return Ok(body);
-                }
-                // Token mapping uses a value tree, which can collapse
-                // duplicate fields. Refuse the raw response before decoding.
-                return Err(if within_budget {
-                    CatalogError::Unavailable
-                } else {
-                    CatalogError::Limit
-                });
-            }
-        } else if !catalog_shape_matches(path, &body) {
+        let images = path.starts_with("/images/");
+        if path.ends_with("/endpoints") && !limits::mapping_json(&body) {
+            // Image mapping applies its limits to the raw body. Token
+            // mapping uses a value tree, which can collapse duplicate fields.
+            return if images {
+                Ok(body)
+            } else {
+                Err(CatalogError::Limit)
+            };
+        }
+        if !catalog_shape_matches(path, &body) {
             return Err(CatalogError::Unavailable);
+        }
+        if images && decode_image_endpoints(&body).is_none() {
+            // The envelope is valid, but these image prices cannot be read.
+            // Let the mapper report the missing rates and retry on next use.
+            return Ok(body);
         }
         let mut cache = self.cache.lock().await;
         cache.retain(|_, (at, _)| at.elapsed() < CACHE_TTL);
@@ -152,43 +151,45 @@ impl OpenRouterCatalog {
         Ok(body)
     }
 }
-// Only complete envelopes can be shared through the cache. Image responses
-// use the same decoder as the mapper; model and token responses need only
-// their outer structure here.
-fn catalog_shape_matches(path: &str, body: &[u8]) -> bool {
-    #[derive(Deserialize)]
-    struct Envelope<'a> {
-        #[serde(borrow)]
-        data: Option<&'a RawValue>,
-        #[serde(borrow)]
-        endpoints: Option<&'a RawValue>,
-    }
+#[derive(Deserialize)]
+struct CatalogEnvelope<'a> {
+    #[serde(borrow)]
+    data: Option<&'a RawValue>,
+    #[serde(borrow)]
+    endpoints: Option<&'a RawValue>,
+}
 
-    let models = path.split('?').next() == Some("/models");
-    let endpoint_list = path.ends_with("/endpoints");
-    if !models && !endpoint_list {
-        return true;
-    }
-    if path.starts_with("/images/") {
-        return decode_image_endpoints(body).is_some();
-    }
+fn object_envelope(body: &[u8]) -> Option<CatalogEnvelope<'_>> {
     if body.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
-        return false;
+        return None;
     }
-    let Ok(envelope) = serde_json::from_slice::<Envelope<'_>>(body) else {
-        return false;
+    serde_json::from_slice(body).ok()
+}
+
+fn is_array(value: &RawValue) -> bool {
+    value.get().starts_with('[')
+}
+
+fn endpoint_arrays(body: &[u8]) -> [Option<&RawValue>; 2] {
+    let Some(envelope) = object_envelope(body) else {
+        return [None, None];
     };
-    let is_array = |value: &RawValue| value.get().starts_with('[');
-    if models {
-        return envelope.data.is_some_and(is_array);
+    let direct = envelope.endpoints.filter(|value| is_array(value));
+    let wrapped = envelope
+        .data
+        .and_then(|data| object_envelope(data.get().as_bytes()))
+        .and_then(|data| data.endpoints)
+        .filter(|value| is_array(value));
+    [direct, wrapped]
+}
+
+fn catalog_shape_matches(path: &str, body: &[u8]) -> bool {
+    if path.split('?').next() == Some("/models") {
+        return object_envelope(body)
+            .and_then(|value| value.data)
+            .is_some_and(is_array);
     }
-    envelope.endpoints.is_some_and(is_array)
-        || envelope
-            .data
-            .filter(|data| data.get().starts_with('{'))
-            .and_then(|data| serde_json::from_str::<Envelope<'_>>(data.get()).ok())
-            .and_then(|data| data.endpoints)
-            .is_some_and(is_array)
+    !path.ends_with("/endpoints") || endpoint_arrays(body).iter().any(Option::is_some)
 }
 
 fn default_catalog() -> Result<Arc<OpenRouterCatalog>, ApiError> {
@@ -601,10 +602,6 @@ fn overrides(d: &mut Draft, pricing: &Value) {
     }
 }
 #[derive(Deserialize)]
-struct ImageEndpoints {
-    endpoints: Vec<ImageEndpoint>,
-}
-#[derive(Deserialize)]
 struct ImageEndpoint {
     #[serde(default)]
     pricing: Vec<ImagePrice>,
@@ -619,19 +616,15 @@ struct ImagePrice {
     #[serde(default)]
     variant: Option<String>,
 }
-fn decode_image_endpoints(body: &[u8]) -> Option<ImageEndpoints> {
-    #[derive(Deserialize)]
-    struct Wrapped {
-        data: ImageEndpoints,
-    }
-
-    serde_json::from_slice::<ImageEndpoints>(body)
-        .ok()
-        .or_else(|| serde_json::from_slice::<Wrapped>(body).ok().map(|w| w.data))
+fn decode_image_endpoints(body: &[u8]) -> Option<Vec<ImageEndpoint>> {
+    endpoint_arrays(body)
+        .into_iter()
+        .flatten()
+        .find_map(|endpoints| serde_json::from_str(endpoints.get()).ok())
 }
 
 fn image_lines(d: &mut Draft, body: Option<&[u8]>) {
-    let Some(parsed) = body.and_then(decode_image_endpoints) else {
+    let Some(endpoints) = body.and_then(decode_image_endpoints) else {
         d.priced(
             Meter::OutputImages,
             "Image output",
@@ -644,12 +637,12 @@ fn image_lines(d: &mut Draft, body: Option<&[u8]>) {
         );
         return;
     };
-    if parsed.endpoints.len() > 1 {
+    if endpoints.len() > 1 {
         d.warnings.push(
             "Several image endpoints are listed; the highest price per size was used.".into(),
         );
     }
-    if parsed.endpoints.iter().any(|e| {
+    if endpoints.iter().any(|e| {
         e.discount
             .as_ref()
             .is_some_and(|d| discounted(&serde_json::from_str(d.get()).unwrap_or(Value::Null)))
@@ -658,7 +651,7 @@ fn image_lines(d: &mut Draft, body: Option<&[u8]>) {
             .push("An endpoint discount was not applied; list prices are conservative.".into());
     }
     let mut best: Vec<(Option<String>, i64, String)> = vec![];
-    for p in parsed.endpoints.iter().flat_map(|e| &e.pricing) {
+    for p in endpoints.iter().flat_map(|e| &e.pricing) {
         if p.billable != "output_image" || p.unit != "image" {
             d.warnings.push(format!(
                 "An image price per {} cannot be represented and was ignored.",

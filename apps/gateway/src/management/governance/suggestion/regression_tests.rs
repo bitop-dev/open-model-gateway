@@ -375,11 +375,17 @@ async fn a_malformed_success_is_not_cached() {
 async fn a_wrong_endpoint_envelope_is_not_cached() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    for (path, invalid) in [
-        ("/models/v/m/endpoints", json!({"data":{"endpoints":{}}})),
+    const TOKEN: &str = "/models/v/m/endpoints";
+    const IMAGE: &str = "/images/models/v/m/endpoints";
+    for (path, invalid, valid_envelope) in [
+        (TOKEN, json!({"data":{"endpoints":{}}}), false),
+        (IMAGE, json!({"data":{"endpoints":{}}}), false),
+        (IMAGE, json!([[]]), false),
+        (IMAGE, json!({"data":[[]]}), false),
         (
-            "/images/models/v/m/endpoints",
+            IMAGE,
             json!({"data":{"endpoints":[{"pricing":[{}]}]}}),
+            true,
         ),
     ] {
         let hits = Arc::new(AtomicUsize::new(0));
@@ -402,7 +408,7 @@ async fn a_wrong_endpoint_envelope_is_not_cached() {
         let (url, task) = tests::mock(app).await;
         let catalog = OpenRouterCatalog::for_test(url, Duration::from_secs(2));
         let first = catalog.get(path).await;
-        if path.starts_with("/images/") {
+        if valid_envelope {
             assert_eq!(
                 serde_json::from_slice::<Value>(&first.unwrap()).unwrap(),
                 invalid
