@@ -5,10 +5,10 @@
   "workspaces": ["apps/web"],
   "engines": { "node": ">=22.12.0" },
   "devDependencies": {
-    "@anthropic-ai/sdk": "^1.8.0",
+    "@anthropic-ai/sdk": "^1.10.0",
     "@axe-core/playwright": "4.14.0",
-    "@playwright/test": "1.65.0",
-    "openai": "^7.55.0",
+    "@playwright/test": "1.65.1",
+    "openai": "^7.59.0",
     "pg": "8.23.1",
     "yaml": "2.9.1"
   },
@@ -18,16 +18,16 @@
     "typecheck:web": "npm run typecheck --workspace @omg/web",
     "test:web": "npm run test --workspace @omg/web",
     "test:sdk-bases": "node --experimental-strip-types --test tests/inference-sdk-bases.test.mjs",
-    "test:demo": "node --test tests/demo-oidc.test.mjs && python3 tests/demo-runtime.test.py && python3 tests/spark-env.test.py && python3 tests/spark-test.test.py && python3 tests/spark-test-script.test.py && python3 tests/journeys.test.py",
+    "test:demo": "node --test tests/demo-oidc.test.mjs && python3 tests/demo-runtime.test.py && python3 tests/spark-env.test.py && python3 tests/spark-test.test.py && python3 tests/spark-test-script.test.py && python3 tests/journeys.test.py && python3 tests/test-fast.test.py",
     "test:container": "node --test tests/container-image.test.mjs",
     "test:supply-chain": "node --test tests/bash-preflight.test.mjs tests/supply-chain.test.mjs tests/supply-chain/*.test.mjs tests/release-metadata.test.mjs",
     "test:ci": "node --test tests/ci.test.mjs",
     "test:conflict-markers": "node --test tests/conflict-markers.test.mjs",
     "test:structure": "node --test tests/structure.test.mjs",
-    "test:rules": "node --test tests/entrypoint-no-migrate.test.mjs",
+    "test:rules": "node --test tests/entrypoint-no-migrate.test.mjs tests/formal-citations.test.mjs && python3 -I tests/migration-columns.test.py",
     "test:monitoring": "node --test tests/monitoring.test.mjs",
     "test:helm": "helm lint deploy/helm/open-model-gateway && helm lint deploy/helm/open-model-gateway -f deploy/helm/open-model-gateway/ci/external-db-values.yaml && helm lint deploy/helm/open-model-gateway -f deploy/helm/open-model-gateway/ci/cnpg-values.yaml && helm lint deploy/helm/open-model-gateway -f deploy/helm/open-model-gateway/ci/loadtest-values.yaml && node --test tests/helm-chart.test.mjs",
-    "test:staging": "python3 tests/staging.test.py && python3 tests/provider-acceptance.test.py && python3 tests/backup.test.py",
+    "test:staging": "python3 tests/staging.test.py && python3 -I tests/staging-isolation.test.py && python3 tests/provider-acceptance.test.py && python3 tests/backup.test.py",
     "test:browser": "playwright test -c tests/browser/playwright.config.ts"
   }
 }

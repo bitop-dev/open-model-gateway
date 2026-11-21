@@ -623,7 +623,7 @@ async fn file_deleted(f: &Fixture, id: Option<Uuid>) -> bool {
         .unwrap()
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn gateway_run_mixed_providers_end_to_end(pool: PgPool) {
     let w = world(pool, true, false, 2).await;
     let f = &w.f;
@@ -731,7 +731,7 @@ async fn gateway_run_mixed_providers_end_to_end(pool: PgPool) {
     consistent(f).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn omitted_batch_maxima_pin_parent_child_and_native_execution_without_rewriting_input(
     pool: PgPool,
 ) {
@@ -815,13 +815,13 @@ async fn omitted_batch_maxima_pin_parent_child_and_native_execution_without_rewr
     consistent(f).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn omitted_maximum_stale_planning_price_is_refused_before_parent_admission(pool: PgPool) {
     stale_plan_is_refused_then_replanned(pool, crate::governance::locks::AdmissionMode::Scoped)
         .await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn omitted_maximum_stale_planning_price_is_refused_in_global_admission(pool: PgPool) {
     stale_plan_is_refused_then_replanned(pool, crate::governance::locks::AdmissionMode::Global)
         .await;
@@ -951,7 +951,7 @@ async fn stale_plan_is_refused_then_replanned(
     consistent(f).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn omitted_maximum_boundary_preserves_compact_numbers_in_both_batch_modes(pool: PgPool) {
     let w = world(pool, true, false, 1).await;
     let f = &w.f;
@@ -990,7 +990,7 @@ async fn omitted_maximum_boundary_preserves_compact_numbers_in_both_batch_modes(
     assert_eq!(w.openai.script.lock().unwrap().maxima, [Some(50)]);
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn validation_rejects_with_line_numbers_and_creates_nothing(pool: PgPool) {
     let w = world(pool, false, false, 2).await;
     let f = &w.f;
@@ -1077,7 +1077,7 @@ async fn admission_rowcounts(f: &Fixture) -> (i64, i64, i64, i64) {
         .unwrap()
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn strict_tool_lines_against_an_anthropic_model_reserve_and_dispatch_nothing(pool: PgPool) {
     // #238: every line is a deterministic adapter rejection (coarse
     // `supports_chat_request` passes; `validate_chat_request`, #228's
@@ -1113,7 +1113,7 @@ async fn strict_tool_lines_against_an_anthropic_model_reserve_and_dispatch_nothi
     assert_eq!(w.anthropic.executed(), Vec::<String>::new());
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn mixed_batch_reserves_only_for_the_valid_lines(pool: PgPool) {
     // #238: one line of two is a deterministic adapter rejection. Planning
     // must reserve the parent envelope as if that line did not exist, and
@@ -1196,7 +1196,7 @@ async fn mixed_batch_reserves_only_for_the_valid_lines(pool: PgPool) {
     consistent(f).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn multi_route_unpinned_line_is_sized_and_runs_on_the_accepting_route(pool: PgPool) {
     // #238 MULTI-ROUTE (required): planning must judge an unpinned
     // (explicit-maximum) line against every authorized, protocol-capable
@@ -1262,7 +1262,7 @@ async fn multi_route_unpinned_line_is_sized_and_runs_on_the_accepting_route(pool
     consistent(f).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn scheduler_skips_a_rejecting_route_and_claims_the_accepting_one_with_both_enabled(
     pool: PgPool,
 ) {
@@ -1354,7 +1354,7 @@ async fn scheduler_skips_a_rejecting_route_and_claims_the_accepting_one_with_bot
     consistent(f).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn ungated_dispatch_never_admits_when_a_route_starts_accepting_before_execution(
     pool: PgPool,
 ) {
@@ -1445,7 +1445,7 @@ async fn ungated_dispatch_never_admits_when_a_route_starts_accepting_before_exec
     consistent(f).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn omitted_maximum_ungated_dispatch_never_admits_when_its_pinned_route_recovers_before_execution(
     pool: PgPool,
 ) {
@@ -1530,7 +1530,7 @@ async fn omitted_maximum_ungated_dispatch_never_admits_when_its_pinned_route_rec
     consistent(f).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn omitted_maximum_line_on_an_available_pinned_route_is_claimed_and_admitted_normally(
     pool: PgPool,
 ) {
@@ -1593,7 +1593,7 @@ async fn omitted_maximum_line_on_an_available_pinned_route_is_claimed_and_admitt
     consistent(f).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn ungated_admission_refusal_does_not_rate_limit_batch_dispatch(pool: PgPool) {
     // #243 review finding 2: `LineRepository::refuse_ungated` returns
     // `InferenceError::Busy`, and `LineRun::run` used to treat every Busy
@@ -1651,7 +1651,7 @@ async fn ungated_admission_refusal_does_not_rate_limit_batch_dispatch(pool: PgPo
     consistent(f).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn multi_route_all_candidates_reject_with_differing_kinds_is_invalid_request_not_unsupported(
     pool: PgPool,
 ) {
@@ -1690,7 +1690,7 @@ async fn multi_route_all_candidates_reject_with_differing_kinds_is_invalid_reque
     consistent(f).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn batch_planning_memoizes_model_level_lookups_within_one_scan(pool: PgPool) {
     // #238 follow-up (adversarial re-review, medium): with configuration
     // caches bypassed (the test default - `ConfigVersions::new` starts
@@ -1752,7 +1752,7 @@ async fn batch_planning_memoizes_model_level_lookups_within_one_scan(pool: PgPoo
     );
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn pinned_line_refused_by_its_own_route_is_classified_like_interactive_not_model_unavailable(
     pool: PgPool,
 ) {
@@ -1805,7 +1805,7 @@ async fn pinned_line_refused_by_its_own_route_is_classified_like_interactive_not
     consistent(f).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn omitted_maximum_validation_uses_the_clamped_bound_not_the_raw_omission(pool: PgPool) {
     // #238 CLAMPED REQUEST: the deterministic pre-admission check must see
     // the same clamped body `encode_native_line` already does (the line's
@@ -1887,7 +1887,7 @@ async fn omitted_maximum_validation_uses_the_clamped_bound_not_the_raw_omission(
     consistent(f).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn a_deterministic_exclusion_forces_gateway_mode_never_native(pool: PgPool) {
     // #238 NATIVE BATCHES: the native decision must not ignore deterministic
     // exclusions. This fake's `encode_native_line` is more permissive than
@@ -1953,7 +1953,7 @@ async fn a_deterministic_exclusion_forces_gateway_mode_never_native(pool: PgPool
     consistent(f).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn mixed_upload_with_the_rejected_line_first_reports_invalid_request_in_order(pool: PgPool) {
     // #238 coverage: `validate_chat_request`'s other contractual outcome
     // (`InvalidRequest`, a `bad-tool-args` body) and a rejection that is not
@@ -2015,7 +2015,7 @@ async fn mixed_upload_with_the_rejected_line_first_reports_invalid_request_in_or
     consistent(f).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn budget_exhaustion_mid_batch_stops_and_keeps_partial_results(pool: PgPool) {
     let w = world(pool, false, false, 1).await;
     let f = &w.f;
@@ -2087,7 +2087,7 @@ async fn budget_exhaustion_mid_batch_stops_and_keeps_partial_results(pool: PgPoo
 /// runs afterwards fails exactly as the interactive endpoint refuses the key
 /// (401 `authentication_error`, never `model_not_found`), and nothing reaches
 /// a provider.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn lines_of_a_revoked_key_fail_with_the_authentication_error(pool: PgPool) {
     let w = world(pool, false, false, 1).await;
     let f = &w.f;
@@ -2122,7 +2122,7 @@ async fn lines_of_a_revoked_key_fail_with_the_authentication_error(pool: PgPool)
     consistent(f).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn cancel_failures_and_explicit_retries(pool: PgPool) {
     let w = world(pool, false, false, 1).await;
     let f = &w.f;
@@ -2218,7 +2218,7 @@ async fn cancel_failures_and_explicit_retries(pool: PgPool) {
     consistent(f).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn restart_resumes_without_re_executing_lines(pool: PgPool) {
     let w = world(pool, false, false, 1).await;
     let f = &w.f;
@@ -2274,7 +2274,7 @@ async fn restart_resumes_without_re_executing_lines(pool: PgPool) {
     assert_eq!(interrupted, "interrupted");
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn lines_never_run_twice_under_concurrency(pool: PgPool) {
     let w = world(pool, false, false, 2).await;
     let f = &w.f;
@@ -2359,7 +2359,7 @@ async fn v3_price(f: &Fixture, deployment: Uuid, batch: bool) {
         .execute(&f.store.pool).await.unwrap();
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn native_openai_batch_charges_published_batch_prices(pool: PgPool) {
     let w = world(pool, true, false, 2).await;
     let f = &w.f;
@@ -2455,7 +2455,7 @@ async fn native_openai_batch_charges_published_batch_prices(pool: PgPool) {
     consistent(f).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn standard_prices_apply_without_a_batch_list_and_to_gateway_runs(pool: PgPool) {
     let w = world(pool, true, false, 2).await;
     let f = &w.f;
@@ -2512,7 +2512,7 @@ async fn standard_prices_apply_without_a_batch_list_and_to_gateway_runs(pool: Pg
     consistent(f).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn native_anthropic_messages_batch_with_errored_lines(pool: PgPool) {
     let w = world(pool, false, true, 2).await;
     let f = &w.f;
@@ -2563,7 +2563,7 @@ async fn native_anthropic_messages_batch_with_errored_lines(pool: PgPool) {
     consistent(f).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn native_cancel_before_submission_releases_the_hold(pool: PgPool) {
     let w = world(pool, true, false, 2).await;
     let f = &w.f;
@@ -2590,7 +2590,7 @@ async fn native_cancel_before_submission_releases_the_hold(pool: PgPool) {
     consistent(f).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn batches_are_private_to_their_workspace(pool: PgPool) {
     let w = world(pool, false, false, 2).await;
     let f = &w.f;
@@ -2635,7 +2635,7 @@ async fn batches_are_private_to_their_workspace(pool: PgPool) {
     assert_eq!(api, None);
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn batch_alerts_fire_for_failed_and_stalled_batches(pool: PgPool) {
     let w = world(pool, false, false, 1).await;
     let f = &w.f;
@@ -2723,7 +2723,7 @@ async fn batch_alerts_fire_for_failed_and_stalled_batches(pool: PgPool) {
     assert_eq!(open, ["batch_failed"]);
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn embeddings_and_responses_batches_run_through_the_engine(pool: PgPool) {
     let w = world(pool, false, false, 2).await;
     let f = &w.f;
@@ -2845,7 +2845,7 @@ fn listed(list: &[u8], id: &str) -> bool {
 /// files (list, retrieve, content, delete, use as a batch's input_file_id)
 /// and batches (list, retrieve, cancel), objects of a member's key and of a
 /// service-account key. Hidden objects answer exactly like missing ones.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn object_visibility_matrix_for_files_and_batches(pool: PgPool) {
     use crate::visibility::test_support::{CALLERS, Owner, expected, may_modify, team};
     let w = world(pool, true, false, 2).await;
@@ -3076,7 +3076,7 @@ async fn object_visibility_matrix_for_files_and_batches(pool: PgPool) {
     }
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn cache_ttl_price_refusal_cannot_reuse_a_clean_batch_line_preview(pool: PgPool) {
     let w = world(pool, false, true, 1).await;
     let f = &w.f;
@@ -3106,7 +3106,7 @@ async fn cache_ttl_price_refusal_cannot_reuse_a_clean_batch_line_preview(pool: P
     consistent(f).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn gateway_cache_lines_require_read_prices_and_settle_repeated_hits(pool: PgPool) {
     use crate::billing::CacheRate;
     let w = world(pool, false, false, 1).await;
@@ -3181,7 +3181,7 @@ async fn gateway_cache_lines_require_read_prices_and_settle_repeated_hits(pool: 
     }
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn memoized_refusal_classification_stays_per_line(pool: PgPool) {
     // Coordinator review of the #238 memoization: the cached lookups must not
     // fix one model's refusal *kind* for every later line. Two lines of the
@@ -3223,12 +3223,12 @@ mod fence;
 /// Streaming classification must not change the non-stream classes that drive
 /// explicit line retries: OpenAI invalid output is not retryable; OpenRouter's
 /// pre-existing unavailable class is. Neither becomes Busy.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn openai_non_stream_200_errors_preserve_batch_retry_semantics(pool: PgPool) {
     non_stream_200_batch_error(pool, crate::providers::stream_class_tests::Kind::OpenAi).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn openrouter_non_stream_200_errors_preserve_batch_retry_semantics(pool: PgPool) {
     non_stream_200_batch_error(pool, crate::providers::stream_class_tests::Kind::OpenRouter).await;
 }
