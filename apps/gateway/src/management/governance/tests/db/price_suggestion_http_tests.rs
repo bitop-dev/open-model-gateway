@@ -28,7 +28,7 @@ async fn session(pool: &PgPool, id: Uuid, email: &str) -> String {
     format!("omg_session={cookie}")
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPool) {
     let f = fixture(pool).await;
     let calls = Arc::new(AtomicUsize::new(0));

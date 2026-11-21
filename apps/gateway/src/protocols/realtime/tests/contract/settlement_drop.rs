@@ -89,12 +89,12 @@ async fn interrupted(pool: PgPool, during_response: bool) {
     );
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn drop_during_final_write(pool: PgPool) {
     interrupted(pool, false).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn drop_during_response_write(pool: PgPool) {
     interrupted(pool, true).await;
 }
