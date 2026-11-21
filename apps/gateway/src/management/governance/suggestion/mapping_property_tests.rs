@@ -982,7 +982,9 @@ fn check_generation_prices(out: &Value, model: &Value) -> Result<(), TestCaseErr
                 prop_assert_eq!(
                     actual,
                     expected.and_then(|rate| rate.amount),
-                    "{meter} tier at {threshold}"
+                    "{} tier at {}",
+                    meter,
+                    threshold,
                 );
             }
         }

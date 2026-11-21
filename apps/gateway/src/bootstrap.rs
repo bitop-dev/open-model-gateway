@@ -101,9 +101,10 @@ pub(crate) async fn ensure_empty(tx: &mut sqlx::PgConnection) -> Result<()> {
 }
 
 async fn ensure_selected_database(conn: &mut sqlx::PgConnection, selected: &str) -> Result<()> {
-    let connected: String = sqlx::query_scalar("SELECT pg_catalog.current_database()::pg_catalog.text")
-        .fetch_one(conn)
-        .await?;
+    let connected: String =
+        sqlx::query_scalar("SELECT pg_catalog.current_database()::pg_catalog.text")
+            .fetch_one(conn)
+            .await?;
     anyhow::ensure!(
         connected == selected,
         "bootstrap-dev connected to a database other than the one selected in DATABASE_URL"
