@@ -104,9 +104,12 @@ fn usage(value: &Value) -> Result<Usage> {
         "cache_write_tokens",
     )
 }
-/// Structural failure still fails, but a valid usage object is kept as evidence.
 fn decode(value: &Value) -> Result<ChatResponse> {
-    crate::inference::evidence::preserve(decode_shape(value), || {
+    preserve_usage_on_error(value, decode_shape(value))
+}
+
+fn preserve_usage_on_error<T>(value: &Value, result: Result<T>) -> Result<T> {
+    crate::inference::evidence::preserve(result, || {
         value["usage"].is_object().then(|| {
             usage(&value["usage"]).map(|u| super::metering::with_model(u, &value["model"]))
         })
@@ -479,14 +482,15 @@ impl State {
         Ok(vec![])
     }
     fn terminal(&mut self, kind: &str, value: &Value) -> Result<Vec<ChatEvent>> {
-        if (kind == "response.completed" && value["response"]["status"] != "completed")
-            || (kind == "response.incomplete" && value["response"]["status"] != "incomplete")
+        let snapshot = &value["response"];
+        if (kind == "response.completed" && snapshot["status"] != "completed")
+            || (kind == "response.incomplete" && snapshot["status"] != "incomplete")
         {
-            return Err(InferenceError::InvalidUpstream);
+            return preserve_usage_on_error(snapshot, Err(InferenceError::InvalidUpstream));
         }
-        let response = decode(&value["response"])?;
+        let response = decode(snapshot)?;
         if self.stopped.len() != self.items.len()
-            || value["response"]["output"].as_array().map(Vec::len) != Some(self.items.len())
+            || snapshot["output"].as_array().map(Vec::len) != Some(self.items.len())
             || response.content.as_deref().unwrap_or("") != self.text
             || response.tool_calls.len() != self.calls.len()
             || response

@@ -13,7 +13,9 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::stream_class_tests::{Kind, NAMES, Step, http_class, response, serve, sse};
+use super::stream_class_tests::{
+    Kind, NAMES, Step, http_class, response, responses_complete, serve, sse,
+};
 use crate::{
     billing::v3::Meter,
     governance::tests::db::{Fixture, fixture},
@@ -439,6 +441,74 @@ per_kind! {
     openai_responses: Kind::Responses,
     openrouter: Kind::OpenRouter,
     local: Kind::Local,
+}
+
+#[dbtest::test]
+async fn responses_terminal_status_mismatch_preserves_valid_usage(pool: PgPool) {
+    let kind = Kind::Responses;
+    let w = world(pool, kind, false).await;
+    let (content, rest, _) = kind.valid();
+    let prefix = [content, rest].concat();
+    let snapshot = responses_complete();
+    let reported_usage = snapshot["usage"].clone();
+    let class = InferenceError::InvalidUpstream;
+    let mut problems = Vec::new();
+    for (event, status) in [
+        ("response.incomplete", "completed"),
+        ("response.completed", "incomplete"),
+    ] {
+        let mut snapshot = snapshot.clone();
+        snapshot["status"] = json!(status);
+        if status == "incomplete" {
+            snapshot["incomplete_details"] = json!({"reason":"max_output_tokens"});
+        }
+        for (label, usage, input, output) in [
+            ("reported", Some(reported_usage.clone()), Some(3), Some(2)),
+            ("partial", Some(json!({"input_tokens":3})), Some(3), None),
+            ("missing", None, None, None),
+            (
+                "invalid",
+                Some(json!({"input_tokens":3,"output_tokens":-2})),
+                None,
+                None,
+            ),
+        ] {
+            if let Some(usage) = usage {
+                snapshot["usage"] = usage;
+            } else {
+                snapshot.as_object_mut().unwrap().remove("usage");
+            }
+            let terminal = sse(&[json!({"type":event,"response":snapshot})]);
+            let steps = vec![Step::Bytes([prefix.clone(), terminal].concat())];
+            let reply = w.ask(Client::Responses, steps).await;
+            let at = format!("{event} with {status} snapshot and {label} usage");
+            assert_eq!(reply.status, 200, "{at}");
+            assert_eq!(last_event(&reply.body)["type"], "error", "{at}");
+            assert_eq!(told(Client::Responses, &reply.body), class.code(), "{at}");
+            for event in ["response.completed", "response.incomplete", "[DONE]"] {
+                assert!(!reply.body.contains(event), "{at}: unexpected {event}");
+            }
+            let got = recorded(&w.f.store.pool, w.deployment, reply.id).await;
+            let want = Recorded {
+                input,
+                output,
+                ..failed_with(class, None)
+            };
+            if got != want {
+                problems.push(format!("{at}: recorded {got:?}, want {want:?}"));
+            }
+            let (held, admitted): (i64, i64) = sqlx::query_as(
+                "SELECT r.held_microusd,l.amount_microusd FROM inference_executions e JOIN governance_reservations r ON r.execution_id=e.id JOIN monetary_ledger l ON l.execution_id=e.id WHERE e.root_request_id=$1 AND l.kind='hold'",
+            )
+            .bind(reply.id)
+            .fetch_one(&w.f.store.pool)
+            .await
+            .unwrap();
+            assert!(admitted > 0, "{at}: the fixture must reserve money");
+            assert_eq!(held, admitted, "{at}: the full hold remains");
+        }
+    }
+    assert!(problems.is_empty(), "{problems:#?}");
 }
 
 /// #622: a reset or a body that ends before the terminal frame (including
