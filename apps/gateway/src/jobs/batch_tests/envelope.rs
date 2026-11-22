@@ -620,3 +620,5 @@ async fn a_failed_batch_commit_keeps_work_until_its_outcome_is_known(pool: PgPoo
     assert_eq!(live_files(&w).await, before + 1);
     consistent(&w.f).await;
 }
+
+mod weighted;
