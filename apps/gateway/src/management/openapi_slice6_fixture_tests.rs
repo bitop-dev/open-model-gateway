@@ -397,6 +397,7 @@ fn query_candidates(template: &str, base: &[(&str, &str)]) -> Vec<(String, Strin
                             .map(|(name, value)| (name.to_owned(), value)),
                     );
                 } else {
+                    out.push(("cursor".into(), format!("9{longest}")));
                     out.push(("cursor".into(), format!("{longest}0")));
                     out.push(("cursor".into(), longest));
                 }

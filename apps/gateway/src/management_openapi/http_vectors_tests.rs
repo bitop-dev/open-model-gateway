@@ -3346,3 +3346,108 @@ fn supplied_counterfactual_follows_array_and_map_use_sites() {
         assert!(plan.cases.iter().any(|case| !case.accept && case.body == json!([1,{"n":"2".repeat(16),"next":"3"}])));
     }
 }
+
+#[test]
+fn supplied_width_edge_keeps_the_repeated_digit_class_and_prefix() {
+    let document = unbounded_pattern(json!({}));
+    let at = "2".repeat(15);
+    let plan = |over: String| {
+        super::http_vectors::body_plan(
+            &document,
+            &document["paths"][TEMPLATE]["post"],
+            &json!({"n":"2"}),
+            &[],
+            &[("/n".into(), json!(at)), ("/n".into(), json!(over))],
+        )
+    };
+    for malformed in [format!("{at}x"), format!("0{at}")] {
+        assert!(
+            plan(malformed).is_err(),
+            "widening the digit run still refuses this shape"
+        );
+    }
+    plan("2".repeat(16)).unwrap();
+}
+
+#[test]
+fn supplied_width_edge_accounts_for_bytes_beneath_a_character_cap() {
+    for (chars, bytes) in [(6, 8), (4, 4)] {
+        let schema = json!({"type":"string","pattern":"^(é|é{2,8})$","maxLength":chars,"x-omg-max-bytes":bytes});
+        let document = body_only(schema);
+        let at = "é".repeat(bytes / 2);
+        let plan = super::http_vectors::body_plan(
+            &document,
+            &document["paths"][TEMPLATE]["post"],
+            &json!("é"),
+            &[],
+            &[
+                ("(root)".into(), json!(at)),
+                ("(root)".into(), json!(format!("{at}é"))),
+            ],
+        )
+        .unwrap();
+        assert_eq!(plan.notes.dominated_patterns, 1);
+    }
+}
+
+#[test]
+fn supplied_width_edge_query_counterfactual_keeps_the_pattern() {
+    let mut document = query_document();
+    document["paths"][TEMPLATE]["get"]["parameters"] = json!([parameter(
+        "s",
+        true,
+        json!({"type":"string","pattern":"^(é|é{2,8})$","x-omg-max-bytes":4})
+    )]);
+    let plan = |over: &str| {
+        super::http_vectors::query_plan(
+            &document,
+            &document["paths"][TEMPLATE]["get"],
+            &[("s".into(), "é".into())],
+            &[],
+            &[("s".into(), "éé".into()), ("s".into(), over.into())],
+        )
+    };
+    assert!(
+        plan("ééx").is_err(),
+        "the same spelling still fails after relaxing the byte limit"
+    );
+    assert_eq!(plan("ééé").unwrap().notes.dominated_patterns, 1);
+}
+
+#[test]
+fn supplied_width_edge_reports_fixed_grammar_as_shape_only() {
+    let document = body_only(json!({"type":"string","pattern":"^(on|off)$"}));
+    let plan = super::http_vectors::body_plan(
+        &document,
+        &document["paths"][TEMPLATE]["post"],
+        &json!("on"),
+        &[],
+        &[
+            ("(root)".into(), json!("off")),
+            ("(root)".into(), json!("offx")),
+        ],
+    )
+    .unwrap();
+    assert_eq!(plan.notes.shape_only_patterns, 1);
+}
+
+#[test]
+fn supplied_width_edge_keeps_a_reachable_character_cap() {
+    let document = body_only(
+        json!({"type":"string","pattern":"^([aé]|[aé]{2,8})$","maxLength":6,"x-omg-max-bytes":8}),
+    );
+    let plan = |at: &str, over: &str| {
+        super::http_vectors::body_plan(
+            &document,
+            &document["paths"][TEMPLATE]["post"],
+            &json!("a"),
+            &[],
+            &[("(root)".into(), json!(at)), ("(root)".into(), json!(over))],
+        )
+    };
+    assert!(plan("éééé", "ééééé").is_err());
+    assert_eq!(
+        plan("aaaaaa", "aaaaaaa").unwrap().notes.dominated_patterns,
+        1
+    );
+}
