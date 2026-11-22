@@ -200,16 +200,19 @@ fn malformed_native_thinking_streams_fail_without_done() {
 }
 
 #[test]
-fn translated_error_results_are_supported_without_native_images() {
-    let r = native(fixture());
-    for class in [
-        super::super::messages::ProviderClass::OpenAi,
-        super::super::messages::ProviderClass::Bedrock,
-        super::super::messages::ProviderClass::Local,
-    ] {
-        // Image refusal is independent of native error-result support.
-        let mut r = r.clone();
-        r.messages_options.as_mut().unwrap().images.clear();
-        assert!(super::super::messages::validate(&r, class).is_ok());
+fn translated_error_results_are_supported() {
+    use super::super::messages::{ProviderClass, validate};
+    for (request, error, _) in crate::providers::contract::error_tool_result_requests() {
+        assert_eq!(
+            request.messages.iter().any(|m| m.tool_result_is_error),
+            error,
+        );
+        for class in [
+            ProviderClass::OpenAi,
+            ProviderClass::Bedrock,
+            ProviderClass::Local,
+        ] {
+            assert!(validate(&request, class).is_ok());
+        }
     }
 }
