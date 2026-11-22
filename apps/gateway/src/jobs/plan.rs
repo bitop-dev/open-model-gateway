@@ -86,6 +86,7 @@ struct RoutingMemo {
 #[derive(Default)]
 struct LineRouting {
     estimate: Option<Resolved>,
+    gateway_error: Option<InferenceError>,
     rejection: Option<InferenceError>,
 }
 
@@ -116,9 +117,9 @@ struct PendingGroup {
     legacy: bool,
 }
 
-/// Pricing diagnostics for a route that might not be used.
+/// Route and price diagnostics for a mode that might not be used.
 #[derive(Default)]
-struct PricingErrors {
+struct PreviewErrors {
     issues: Vec<Issue>,
     job: Option<InferenceError>,
 }
@@ -138,8 +139,8 @@ struct ScanState {
     // Gateway estimates can split a model across differently priced routes.
     // Native selection and pricing still use the batch-wide deployment.
     gateway_groups: Vec<PendingGroup>,
-    native_pricing_errors: PricingErrors,
-    gateway_pricing_errors: PricingErrors,
+    native_preview_errors: PreviewErrors,
+    gateway_preview_errors: PreviewErrors,
     requests: u32,
     physical: u64,
     // Native eligibility is tracked independently of the pricing previews.
@@ -202,6 +203,7 @@ impl Jobs {
         model: &str,
         request: &BatchRequest,
         line_index: u32,
+        model_route: Uuid,
         memo: &mut RoutingMemo,
     ) -> Result<LineRouting, JobError> {
         let protocol = scope.endpoint.protocol();
@@ -240,10 +242,21 @@ impl Jobs {
                 &candidates,
             ) {
                 Ok(id) => id,
-                // Keep the model-level estimate if the body-specific routes
-                // are cooling or unavailable. Dispatch can replan later.
-                Err(InferenceError::RouteCoolingDown(_) | InferenceError::ModelUnavailable) => {
+                // A compatible model route within policy may wait out
+                // cooldown. The scheduler will check it again at dispatch.
+                Err(InferenceError::RouteCoolingDown(_))
+                    if candidates.contains(&model_route) && routes.is_cooling(model_route) =>
+                {
                     return Ok(LineRouting::default());
+                }
+                Err(
+                    error
+                    @ (InferenceError::RouteCoolingDown(_) | InferenceError::ModelUnavailable),
+                ) => {
+                    return Ok(LineRouting {
+                        gateway_error: Some(error),
+                        ..LineRouting::default()
+                    });
                 }
                 Err(e) => return Err(e.into()),
             };
@@ -262,7 +275,7 @@ impl Jobs {
                     adapter,
                     legacy: false,
                 }),
-                rejection: None,
+                ..LineRouting::default()
             });
         }
         // Every capable adapter refused. Classify from the routes the
@@ -287,8 +300,8 @@ impl Jobs {
             ) && usable.contains(id)
         });
         Ok(LineRouting {
-            estimate: None,
             rejection: Some(invalid.map_or(InferenceError::Unsupported, |(_, e)| *e)),
+            ..LineRouting::default()
         })
     }
 
@@ -467,8 +480,8 @@ impl ScanState {
             prices: HashMap::new(),
             native_groups: Vec::new(),
             gateway_groups: Vec::new(),
-            native_pricing_errors: PricingErrors::default(),
-            gateway_pricing_errors: PricingErrors::default(),
+            native_preview_errors: PreviewErrors::default(),
+            gateway_preview_errors: PreviewErrors::default(),
             requests: 0,
             physical: 0,
             native_ok: true,
@@ -488,10 +501,10 @@ impl ScanState {
     /// The whole-file checks after the last line, then the result.
     fn finish(mut self) -> Result<Scanned, PlanError> {
         let native = self.native_ok && self.native_deployment.is_some();
-        let (groups, pricing_errors) = if native {
+        let (groups, preview_errors) = if native {
             (
                 std::mem::take(&mut self.native_groups),
-                std::mem::take(&mut self.native_pricing_errors),
+                std::mem::take(&mut self.native_preview_errors),
             )
         } else {
             if self.issues.is_empty() {
@@ -499,16 +512,16 @@ impl ScanState {
             }
             (
                 std::mem::take(&mut self.gateway_groups),
-                std::mem::take(&mut self.gateway_pricing_errors),
+                std::mem::take(&mut self.gateway_preview_errors),
             )
         };
-        self.issues.extend(pricing_errors.issues);
+        self.issues.extend(preview_errors.issues);
         self.issues.sort_by_key(|issue| issue.line);
         self.issues.truncate(MAX_ISSUES);
         if !self.issues.is_empty() {
             return Err(PlanError::Invalid(self.issues));
         }
-        if let Some(error) = pricing_errors.job {
+        if let Some(error) = preview_errors.job {
             return Err(error.into());
         }
         if groups.is_empty() {

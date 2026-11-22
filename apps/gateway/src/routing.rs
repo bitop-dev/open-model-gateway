@@ -166,6 +166,19 @@ impl RouteInputs {
         )
     }
 
+    pub(crate) fn is_cooling(&self, id: Uuid) -> bool {
+        let candidates = self
+            .rows
+            .iter()
+            .filter(|row| row.deployment_id == id)
+            .cloned()
+            .collect();
+        matches!(
+            eligible_candidates(&self.policy, candidates),
+            Err(InferenceError::RouteCoolingDown(_))
+        )
+    }
+
     /// Estimate the scheduler's first eligible route for an unpinned line.
     /// Weighted routing only needs the first draw.
     pub(crate) fn first_route(

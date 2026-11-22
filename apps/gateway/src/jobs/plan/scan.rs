@@ -29,7 +29,7 @@ struct LinePrices {
 
 type PricingCheck<T> = Result<Result<T, LineError>, InferenceError>;
 
-impl PricingErrors {
+impl PreviewErrors {
     fn defer(&mut self, line: u64, check: PricingCheck<LinePrice>) -> Option<LinePrice> {
         match check {
             Ok(Ok(price)) => return Some(price),
@@ -72,6 +72,7 @@ impl Jobs {
         };
         let LineRouting {
             estimate,
+            gateway_error,
             rejection,
         } = if requested.is_some() && !resolved.legacy {
             self.line_routing(
@@ -79,6 +80,7 @@ impl Jobs {
                 &model,
                 &line.request,
                 state.requests - 1,
+                resolved.deployment.id,
                 &mut state.routing,
             )
             .await?
@@ -108,7 +110,14 @@ impl Jobs {
             None
         };
         let LinePrices { primary, gateway } = match self
-            .price_routes(scope, state, &line.request, &resolved, requested, alternate)
+            .price_routes(
+                scope,
+                state,
+                &line.request,
+                &resolved,
+                requested,
+                gateway_error.map_or(Ok(alternate), Err),
+            )
             .await?
         {
             Ok(prices) => prices,
@@ -150,8 +159,28 @@ impl Jobs {
         request: &BatchRequest,
         resolved: &Arc<Resolved>,
         requested: Option<u32>,
-        alternate: Option<Resolved>,
+        alternate: Result<Option<Resolved>, InferenceError>,
     ) -> PricingCheck<LinePrices> {
+        let alternate = match alternate {
+            Ok(route) => route,
+            Err(error) => {
+                // A native encoding has its own batch-wide route and price.
+                // Only gateway mode requires a compatible per-line route.
+                state.gateway_preview_errors.job.get_or_insert(error);
+                let primary = if state.native_ok {
+                    let check = self
+                        .price_line(scope, state, request, resolved, requested)
+                        .await;
+                    state.native_preview_errors.defer(state.physical, check)
+                } else {
+                    None
+                };
+                return Ok(Ok(LinePrices {
+                    primary,
+                    gateway: None,
+                }));
+            }
+        };
         let price = self
             .price_line(scope, state, request, resolved, requested)
             .await;
@@ -170,9 +199,9 @@ impl Jobs {
             .price_line(scope, state, request, &alternate, requested)
             .await;
         Ok(Ok(LinePrices {
-            primary: state.native_pricing_errors.defer(state.physical, price),
+            primary: state.native_preview_errors.defer(state.physical, price),
             gateway: state
-                .gateway_pricing_errors
+                .gateway_preview_errors
                 .defer(state.physical, alternate_price)
                 .map(|price| PricedRoute {
                     resolved: Arc::new(alternate),
