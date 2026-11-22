@@ -899,11 +899,9 @@ async fn access_requests_queue_identity_and_frozen_workspace_name(pool: PgPool) 
     assert_eq!(r2["workspace_name_at_request"], json!("Team Renamed"));
 }
 
-/// Adversarial review (#83 UX fix): the Members "Add member" picker (`members::candidates`)
-/// excludes a disabled/cleaned/unentitled user, so an approval queue that joined `users`
-/// unconditionally would disclose *more* than that picker ever would once a requester loses
-/// entitlement after submitting. Both fields must redact to `null` the moment that happens,
-/// for every approver scope, not just at submission time.
+/// Both approval queues redact the requester's name and email once the
+/// requester becomes ineligible for the member picker, including after
+/// submission.
 #[dbtest::test]
 async fn access_requests_redacts_requester_identity_once_picker_ineligible(pool: PgPool) {
     let f = fixture(&pool).await;

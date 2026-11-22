@@ -1362,29 +1362,13 @@ async fn scheduler_skips_a_rejecting_route_and_claims_the_accepting_one_with_bot
 async fn ungated_dispatch_never_admits_when_a_route_starts_accepting_before_execution(
     pool: PgPool,
 ) {
-    // #243 review finding: an unpinned line both authorized candidates
-    // deterministically reject at dispatch-time planning
-    // (`Runner::plan_route_inner`) runs ungated - the runner claims no
-    // route capacity for it and expects only the engine's own refusal. That
-    // planning decision is cached (and the line claimed into `batch_lines`)
-    // well before the line actually executes. If a candidate starts
-    // accepting the exact body in that window - openai here, right after
-    // the planning check that found it still rejecting - the engine's own
-    // admission would otherwise select and admit it, executing the line on
-    // a route the scheduler never claimed capacity on
-    // (`batch_lines.deployment_id` stays NULL): a bypass of route windows,
-    // live-load gates, fair-share ordering and cross-runner route
-    // concurrency accounting. The fix (`LineRepository::admit`/
-    // `admit_embeddings`/`admit_workload`) must refuse that admission: an
-    // ungated line may only be refused, never admitted, no matter what a
-    // candidate decides after dispatch.
+    // An unpinned line dispatched without a route claim stays ineligible for
+    // admission even if a candidate starts accepting before execution. Without
+    // a claim, that route's capacity and concurrency accounting would be bypassed.
     //
-    // A single-line "every candidate rejects" upload is refused whole at
-    // creation (no batch at all), so this is a mixed upload: an ordinary
-    // line keeps the batch real and dispatching, and the raced line is
-    // physically first so its planning is the first `validate_chat_request`
-    // call after the flip is armed (`accept_after_first_check`), not the
-    // ordinary line's.
+    // The ordinary line keeps the mixed upload valid. Place the raced line
+    // first so its dispatch consumes the adapter's first validation after the
+    // flip is armed.
     let w = world(pool, false, false, 1).await;
     let f = &w.f;
     second_claude_route(&w).await;
@@ -1453,29 +1437,10 @@ async fn ungated_dispatch_never_admits_when_a_route_starts_accepting_before_exec
 async fn omitted_maximum_ungated_dispatch_never_admits_when_its_pinned_route_recovers_before_execution(
     pool: PgPool,
 ) {
-    // #243 review finding 1: `LineRepository::gated` used to conflate two
-    // different facts stored in the same `pins` map - an omitted-maximum
-    // line's creation-time routing/pricing plan (`jobs/plan.rs`, pinned to
-    // one deployment at upload) and THIS attempt's scheduler route-capacity
-    // claim. `LineRun::execute` calls `self.repository.pin(..)` whenever a
-    // plan exists, even when the scheduler never claimed a route (dispatch
-    // found the pinned deployment ineligible and spawned the line
-    // ungated, `pin: Option<Pin>` is `None`). The old `gated()` - keyed off
-    // presence in `pins` - then treated that ungated attempt as pinned, so
-    // if the pinned deployment became eligible again before the engine's
-    // own admission check, it admitted and ran on a route the scheduler
-    // never claimed capacity on: a bypass of route windows, live-load
-    // gates, fair share and cross-runner route concurrency accounting.
-    //
-    // Mirrors `ungated_dispatch_never_admits_when_a_route_starts_accepting_before_execution`
-    // (an explicit-maximum/unpinned line), but for an OMITTED-maximum
-    // (pinned) line: its one candidate (`w.openai`, the only deployment of
-    // `company/smart`) is made ineligible for exactly the runner's
-    // dispatch-time planning call (`Runner::plan_route_inner`,
-    // `coarse_unavailable_once`), armed only after creation so the
-    // upload's own resolution (`Jobs::resolve`/`Jobs::select`) sees it
-    // eligible, then becomes eligible again for every later call,
-    // including the engine's own admission check.
+    // A creation-time routing and pricing plan does not grant a scheduler
+    // capacity claim. Make the pinned route unavailable only at dispatch and
+    // eligible again by engine admission. The line must still be refused
+    // because dispatch never claimed capacity for it.
     let w = world(pool, false, false, 1).await;
     let f = &w.f;
     let mut line = chat_line("race", "company/smart", "normal");
@@ -1538,13 +1503,9 @@ async fn omitted_maximum_ungated_dispatch_never_admits_when_its_pinned_route_rec
 async fn omitted_maximum_line_on_an_available_pinned_route_is_claimed_and_admitted_normally(
     pool: PgPool,
 ) {
-    // #243 review finding 1 POSITIVE CONTROL, alongside the ungated-recovery
-    // test above: an omitted-maximum line whose pinned route stays
-    // eligible all the way through dispatch must still be claimed by the
-    // scheduler (gated) and admitted normally, at its creation-time pinned
-    // price - the fix (tracking the scheduler's claim separately from the
-    // creation-time plan) must not turn every omitted-maximum line
-    // ungated.
+    // A pinned route that stays eligible is claimed by the scheduler and
+    // admitted at its creation-time price. This is the positive control for the
+    // pinned line dispatched without a capacity claim.
     let w = world(pool, false, false, 1).await;
     let f = &w.f;
     let mut line = chat_line("a", "company/smart", "normal");
@@ -1599,23 +1560,9 @@ async fn omitted_maximum_line_on_an_available_pinned_route_is_claimed_and_admitt
 
 #[dbtest::test]
 async fn ungated_admission_refusal_does_not_rate_limit_batch_dispatch(pool: PgPool) {
-    // #243 review finding 2: `LineRepository::refuse_ungated` returns
-    // `InferenceError::Busy`, and `LineRun::run` used to treat every Busy
-    // as upstream rate limiting (`RunState::rate_limited`), backing off the
-    // WHOLE batch's dispatch (>= 1 s, doubling to 60 s) even though an
-    // ungated refusal is internal and never reached an upstream. The fix
-    // only calls `rate_limited()` when the attempt was claimed/gated
-    // (`pin.is_some()` at the `LineRun::run` call site), since an ungated
-    // attempt can no longer reach a provider.
-    //
-    // Reuses the same #243 ungated-admission race as
-    // `ungated_dispatch_never_admits_when_a_route_starts_accepting_before_execution`
-    // (the "race" line is refused with Busy at admission), immediately
-    // followed in the SAME batch by an ordinary "safe" line on the same
-    // model, with only one worker permit (`concurrency: 1`): if the first
-    // line's refusal incorrectly paused dispatch, the second line waits
-    // out that pause before it can claim its own permit, adding at least
-    // the backoff's first step (1 s) to this call's wall time.
+    // An internal Busy refusal on an unclaimed line leaves dispatch running.
+    // Queue an ordinary line behind it with one worker permit so an incorrect
+    // batch-wide backoff delays the second line by at least one second.
     let w = world(pool, false, false, 1).await;
     let f = &w.f;
     second_claude_route(&w).await;
@@ -1696,15 +1643,9 @@ async fn multi_route_all_candidates_reject_with_differing_kinds_is_invalid_reque
 
 #[dbtest::test]
 async fn batch_planning_memoizes_model_level_lookups_within_one_scan(pool: PgPool) {
-    // #238 follow-up (adversarial re-review, medium): with configuration
-    // caches bypassed (the test default - `ConfigVersions::new` starts
-    // disabled until `enable()`/`start()`), `every_candidate_route_refuses`
-    // must fetch `company/claude`'s candidate deployments and classify its
-    // universal refusal at most once per scan, not once per
-    // explicit-maximum line. Without memoization this upload of 50
-    // identical lines would run 50 `Store::deployments` reads and 50
-    // `Store::route_plan` selects before `admit_batch` ever checks a
-    // budget or job limit; repeated uploads amplify that load.
+    // With configuration caches bypassed, the scan fetches candidate routes and
+    // classifies their universal refusal once for 50 identical lines. This
+    // bounds the pre-admission database work before budget or job limits apply.
     let w = world(pool, false, false, 1).await;
     let f = &w.f;
     second_claude_route(&w).await;
@@ -3187,11 +3128,9 @@ async fn gateway_cache_lines_require_read_prices_and_settle_repeated_hits(pool: 
 
 #[dbtest::test]
 async fn memoized_refusal_classification_stays_per_line(pool: PgPool) {
-    // Coordinator review of the #238 memoization: the cached lookups must not
-    // fix one model's refusal *kind* for every later line. Two lines of the
-    // same model, each refused by every capable route, but with different
-    // kinds: the first is unsupported everywhere, the second is invalid
-    // everywhere. Each line must be reported with its own kind.
+    // Cached candidate lookups preserve each line's own refusal kind.
+    // The two lines share a model, but one is unsupported on every route
+    // and the other is invalid on every route.
     let w = world(pool, false, false, 1).await;
     let f = &w.f;
     second_claude_route(&w).await;
