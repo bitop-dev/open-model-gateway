@@ -2,7 +2,8 @@
 use super::{framing::*, openai::OpenAiAdapter};
 use crate::inference::{error::InferenceError, types::*};
 use futures_util::StreamExt;
-use serde_json::{Value, json};
+use serde::{Deserialize, de::IgnoredAny};
+use serde_json::{Value, json, value::RawValue};
 
 pub(super) async fn execute(
     adapter: &OpenAiAdapter,
@@ -38,10 +39,19 @@ pub(super) async fn execute(
     check_sse(&response)?;
     Ok(ProviderOutput::Stream(Box::pin(
         async_stream::try_stream! {
-            let frames = frames(response); futures_util::pin_mut!(frames);
+            let frames = frames_with(response, |frame| Ok((frame_json(&frame)?, frame)));
+            futures_util::pin_mut!(frames);
             let mut state = State::default();
-            while let Some(value) = frames.next().await {
-                for event in state.push(value?)? { let done = matches!(event, ChatEvent::Done); yield event; if done { return; } }
+            while let Some(frame) = frames.next().await {
+                let events = {
+                    let (value, bytes) = frame?;
+                    state.push_frame(value, &bytes)?
+                };
+                for event in events {
+                    let done = matches!(event, ChatEvent::Done);
+                    yield event;
+                    if done { return; }
+                }
             }
         },
     )))
@@ -115,6 +125,86 @@ fn preserve_usage_on_error<T>(value: &Value, result: Result<T>) -> Result<T> {
         })
     })
 }
+// The initial Value parse checks JSON syntax and depth, but it collapses
+// repeated keys. On a terminal mismatch, probe the same bounded frame with
+// typed fields so ambiguous envelope and usage evidence is never recorded.
+#[derive(Deserialize)]
+struct EvidenceFrame<'a> {
+    #[serde(rename = "type")]
+    _kind: IgnoredAny,
+    #[serde(borrow)]
+    response: EvidenceSnapshot<'a>,
+}
+
+#[derive(Deserialize)]
+struct EvidenceSnapshot<'a> {
+    #[serde(rename = "status")]
+    _status: Option<IgnoredAny>,
+    #[serde(rename = "model")]
+    _model: Option<IgnoredAny>,
+    #[serde(borrow)]
+    usage: EvidenceUsage<'a>,
+}
+
+#[derive(Deserialize)]
+struct EvidenceUsage<'a> {
+    #[serde(rename = "input_tokens")]
+    _input: Option<IgnoredAny>,
+    #[serde(rename = "output_tokens")]
+    _output: Option<IgnoredAny>,
+    #[serde(rename = "total_tokens")]
+    _total: Option<IgnoredAny>,
+    #[serde(rename = "input_tokens_details")]
+    _input_details: Option<CacheEvidence>,
+    #[serde(borrow)]
+    output_tokens_details: Option<&'a RawValue>,
+    #[serde(borrow)]
+    completion_tokens_details: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct CacheEvidence {
+    #[serde(rename = "cached_tokens")]
+    _read: Option<IgnoredAny>,
+    #[serde(rename = "cache_write_tokens")]
+    _write: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+struct ReasoningEvidence {
+    #[serde(rename = "reasoning_tokens")]
+    _reasoning: Option<IgnoredAny>,
+}
+
+fn mismatch_usage(snapshot: &Value, frame: &[u8]) -> Result<Usage> {
+    let probe: EvidenceFrame<'_> =
+        serde_json::from_slice(frame).map_err(|_| InferenceError::InvalidUpstream)?;
+    let wire = probe.response.usage;
+    for details in [wire.output_tokens_details, wire.completion_tokens_details]
+        .into_iter()
+        .flatten()
+    {
+        if details.get().starts_with('{') {
+            serde_json::from_str::<ReasoningEvidence>(details.get())
+                .map_err(|_| InferenceError::InvalidUpstream)?;
+        }
+    }
+    let value = &snapshot["usage"];
+    let observed = usage(value)?;
+    if let Some(total) = super::metering::count(&value["total_tokens"])? {
+        // A total can disqualify contradictory counts. It never supplies a
+        // missing count, since only directly reported counters are evidence.
+        let contradictory = match (observed.input_tokens, observed.output_tokens) {
+            (Some(input), Some(output)) => input.checked_add(output) != Some(total),
+            (input, output) => input.or(output).is_some_and(|count| count > total),
+        };
+        if contradictory {
+            return Err(InferenceError::InvalidUpstream);
+        }
+    }
+    Ok(super::metering::with_model(observed, &snapshot["model"]))
+}
+
 /// Responses message `phase` labels assistant text: `commentary` (preamble) or
 /// `final_answer`. Both are assistant output text, kept in output order; any
 /// other phase is an unsupported capability and fails rather than being dropped.
@@ -251,7 +341,13 @@ fn stream_error(error: &Value) -> InferenceError {
     super::stream_error::classify(error, status_error)
 }
 impl State {
+    #[cfg(test)]
     fn push(&mut self, value: Value) -> Result<Vec<ChatEvent>> {
+        let frame = serde_json::to_vec(&value).unwrap();
+        self.push_frame(value, &frame)
+    }
+
+    fn push_frame(&mut self, value: Value, frame: &[u8]) -> Result<Vec<ChatEvent>> {
         if self.done {
             return Err(InferenceError::InvalidUpstream);
         }
@@ -275,7 +371,7 @@ impl State {
             }
             "response.output_item.done" if self.started => self.output_item_done(&value),
             "response.completed" | "response.incomplete" if self.started => {
-                self.terminal(kind, &value)
+                self.terminal(kind, &value, frame)
             }
             // `error` carries the code at the top level; `response.failed`
             // carries it in the response's `error`. Neither needs a started
@@ -481,12 +577,19 @@ impl State {
         }
         Ok(vec![])
     }
-    fn terminal(&mut self, kind: &str, value: &Value) -> Result<Vec<ChatEvent>> {
+    fn terminal(&mut self, kind: &str, value: &Value, frame: &[u8]) -> Result<Vec<ChatEvent>> {
         let snapshot = &value["response"];
         if (kind == "response.completed" && snapshot["status"] != "completed")
             || (kind == "response.incomplete" && snapshot["status"] != "incomplete")
         {
-            return preserve_usage_on_error(snapshot, Err(InferenceError::InvalidUpstream));
+            return crate::inference::evidence::preserve(
+                Err(InferenceError::InvalidUpstream),
+                || {
+                    snapshot["usage"]
+                        .is_object()
+                        .then(|| mismatch_usage(snapshot, frame))
+                },
+            );
         }
         let response = decode(snapshot)?;
         if self.stopped.len() != self.items.len()

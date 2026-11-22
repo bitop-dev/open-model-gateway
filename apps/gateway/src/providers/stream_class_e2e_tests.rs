@@ -450,7 +450,6 @@ async fn responses_terminal_status_mismatch_preserves_valid_usage(pool: PgPool) 
     let (content, rest, _) = kind.valid();
     let prefix = [content, rest].concat();
     let snapshot = responses_complete();
-    let reported_usage = snapshot["usage"].clone();
     let class = InferenceError::InvalidUpstream;
     let mut problems = Vec::new();
     for (event, status) in [
@@ -462,23 +461,82 @@ async fn responses_terminal_status_mismatch_preserves_valid_usage(pool: PgPool) 
         if status == "incomplete" {
             snapshot["incomplete_details"] = json!({"reason":"max_output_tokens"});
         }
+        snapshot.as_object_mut().unwrap().remove("usage");
+        let mut wire_snapshot = snapshot.to_string();
+        wire_snapshot.pop(); // Append raw fields before the closing brace.
         for (label, usage, input, output) in [
-            ("reported", Some(reported_usage.clone()), Some(3), Some(2)),
-            ("partial", Some(json!({"input_tokens":3})), Some(3), None),
-            ("missing", None, None, None),
+            (
+                "reported",
+                r#","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}"#,
+                Some(3),
+                Some(2),
+            ),
+            (
+                "partial input",
+                r#","usage":{"input_tokens":3,"total_tokens":5}"#,
+                Some(3),
+                None,
+            ),
+            (
+                "partial output",
+                r#","usage":{"output_tokens":2,"total_tokens":5}"#,
+                None,
+                Some(2),
+            ),
+            (
+                "explicit zeros",
+                r#","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}"#,
+                Some(0),
+                Some(0),
+            ),
+            ("missing", "", None, None),
+            ("total only", r#","usage":{"total_tokens":5}"#, None, None),
             (
                 "invalid",
-                Some(json!({"input_tokens":3,"output_tokens":-2})),
+                r#","usage":{"input_tokens":3,"output_tokens":-2}"#,
                 None,
                 None,
             ),
+            (
+                "contradictory total",
+                r#","usage":{"input_tokens":5000,"output_tokens":2,"total_tokens":5001}"#,
+                None,
+                None,
+            ),
+            (
+                "impossible partial",
+                r#","usage":{"output_tokens":2,"total_tokens":1}"#,
+                None,
+                None,
+            ),
+            (
+                "duplicate count",
+                r#","usage":{"input_tokens":null,"input_\u0074okens":5000,"output_tokens":2,"total_tokens":5002}"#,
+                None,
+                None,
+            ),
+            (
+                "duplicate usage",
+                r#","usage":null,"usage":{"input_tokens":3,"output_tokens":2}"#,
+                None,
+                None,
+            ),
+            (
+                "duplicate cache count",
+                r#","usage":{"input_tokens":3,"output_tokens":2,"input_tokens_details":{"cached_tokens":0,"cached_tokens":1}}"#,
+                None,
+                None,
+            ),
+            (
+                "above admission bounds",
+                r#","usage":{"input_tokens":5000,"output_tokens":2,"total_tokens":5002}"#,
+                Some(5000),
+                Some(2),
+            ),
         ] {
-            if let Some(usage) = usage {
-                snapshot["usage"] = usage;
-            } else {
-                snapshot.as_object_mut().unwrap().remove("usage");
-            }
-            let terminal = sse(&[json!({"type":event,"response":snapshot})]);
+            let terminal =
+                format!("data: {{\"type\":\"{event}\",\"response\":{wire_snapshot}{usage}}}}}\n\n")
+                    .into_bytes();
             let steps = vec![Step::Bytes([prefix.clone(), terminal].concat())];
             let reply = w.ask(Client::Responses, steps).await;
             let at = format!("{event} with {status} snapshot and {label} usage");
@@ -497,15 +555,57 @@ async fn responses_terminal_status_mismatch_preserves_valid_usage(pool: PgPool) 
             if got != want {
                 problems.push(format!("{at}: recorded {got:?}, want {want:?}"));
             }
-            let (held, admitted): (i64, i64) = sqlx::query_as(
-                "SELECT r.held_microusd,l.amount_microusd FROM inference_executions e JOIN governance_reservations r ON r.execution_id=e.id JOIN monetary_ledger l ON l.execution_id=e.id WHERE e.root_request_id=$1 AND l.kind='hold'",
+            type AccountingRow = (
+                i64,
+                i64,
+                Option<i64>,
+                Option<i64>,
+                Option<i64>,
+                Option<i64>,
+                i64,
+            );
+            let (held, admitted, reserved_input, reserved_output, ledger_input, ledger_output, floor): AccountingRow = sqlx::query_as(
+                "SELECT r.held_microusd,h.amount_microusd,r.input_tokens,r.output_tokens,u.input_tokens,u.output_tokens,u.amount_microusd
+                 FROM inference_executions e
+                 JOIN governance_reservations r ON r.execution_id=e.id AND r.admitted_at=e.started_at
+                 JOIN monetary_ledger h ON h.execution_id=e.id AND h.admitted_at=e.started_at AND h.kind='hold'
+                 JOIN monetary_ledger u ON u.execution_id=e.id AND u.admitted_at=e.started_at AND u.kind='unknown'
+                 WHERE e.root_request_id=$1",
             )
             .bind(reply.id)
             .fetch_one(&w.f.store.pool)
             .await
             .unwrap();
             assert!(admitted > 0, "{at}: the fixture must reserve money");
-            assert_eq!(held, admitted, "{at}: the full hold remains");
+            // This fixture prices both counts at one micro-USD per token.
+            let expected_floor = input.unwrap_or(0) + output.unwrap_or(0);
+            let got = (
+                reserved_input,
+                reserved_output,
+                ledger_input,
+                ledger_output,
+                floor,
+                held,
+            );
+            let want = (
+                input,
+                output,
+                input,
+                output,
+                expected_floor,
+                admitted.max(expected_floor),
+            );
+            if got != want {
+                problems.push(format!(
+                    "{at}: reservation and ledger {got:?}, want {want:?}"
+                ));
+            }
+            if label == "above admission bounds" {
+                assert!(
+                    held > admitted,
+                    "{at}: the known floor must increase the hold"
+                );
+            }
         }
     }
     assert!(problems.is_empty(), "{problems:#?}");
