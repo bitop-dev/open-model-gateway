@@ -3451,3 +3451,54 @@ fn supplied_width_edge_keeps_a_reachable_character_cap() {
         1
     );
 }
+
+#[test]
+fn supplied_boundary_requires_an_accepted_string_for_a_query_pattern() {
+    let mut document = query_document();
+    document["paths"][TEMPLATE]["get"]["parameters"] = json!([parameter(
+        "s",
+        true,
+        json!({"type":["integer","string"],"pattern":"^a[0-9]{0,1}$"})
+    )]);
+    let plan = |at: &str| {
+        super::http_vectors::query_plan(
+            &document,
+            &document["paths"][TEMPLATE]["get"],
+            &[("s".into(), "a".into())],
+            &[],
+            &[("s".into(), at.into()), ("s".into(), "a12".into())],
+        )
+    };
+    assert!(
+        plan("12")
+            .err()
+            .expect("integer cannot witness a string edge")
+            .to_string()
+            .contains("straddle")
+    );
+    plan("a1").unwrap();
+}
+
+#[test]
+fn supplied_boundary_limits_total_regex_derivation_work() {
+    let count = 120;
+    let pattern = format!("^{}$", "a{0,1}".repeat(count));
+    let document = body_only(json!({"type":"string","pattern":pattern}));
+    let result = super::http_vectors::body_plan(
+        &document,
+        &document["paths"][TEMPLATE]["post"],
+        &json!("a"),
+        &[],
+        &[
+            ("(root)".into(), json!("a".repeat(count))),
+            ("(root)".into(), json!("a".repeat(count + 1))),
+        ],
+    );
+    assert!(
+        result
+            .err()
+            .expect("the cumulative variant size exceeds the budget")
+            .to_string()
+            .contains("regex derivation budget")
+    );
+}
