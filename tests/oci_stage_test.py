@@ -72,7 +72,7 @@ if kind == 'cp' and {diagnostic is not None!r}:
 else:
     print('credentialed-error fixture-private-token', file=sys.stderr)
 if kind == {fail!r}:
-    sys.exit(9)
+    sys.exit(1)
 if kind == 'login':
     auth.write_text(json.dumps({{'auths': {{'ghcr.io': {{'auth': 'fixture-credential'}}}}}}))
 ''')
@@ -277,6 +277,14 @@ if kind == 'login':
             (destination + b"POST " + url + b": response status code 403: fixture-private-token", "registry-access"),
             (registry + b"toomanyrequests: slow down", "registry-rate-limit"),
             (destination + b"POST " + url + b": response status code 429: Too Many Requests", "registry-rate-limit"),
+            (registry + b"blob upload invalid: detail", "registry-content"),
+            (registry + b"blob upload unknown: detail", "registry-content"),
+            (registry + b"manifest unknown: detail", "registry-content"),
+            (destination + b"PUT " + url + b": EOF", "transport"),
+            (destination + b"PUT " + url + b": unexpected EOF", "transport"),
+            (destination + b'HEAD ' + url + b': Get "https://ghcr.io/token?fixture=secret": EOF', "transport"),
+            (destination + b'HEAD ' + url + b': Get "https://other.invalid/token": EOF', "unknown"),
+            (destination + b"PUT " + url + b": EOF in opaque message", "unknown"),
             (registry + b"manifest blob unknown: fixture-private-token", "registry-content"),
             (destination + b"PUT " + url + b": response status code 503: Service Unavailable", "registry-server"),
             (destination + b"Head " + url + b": dial tcp: lookup ghcr.io: no such host", "transport"),
@@ -295,6 +303,30 @@ if kind == 'login':
                 self.log.unlink(missing_ok=True)
                 self.install_tool(fail="cp", diagnostic=stderr + b"\n")
                 self.refused(calls=2, diagnostic=f"copy failed ({category})")
+
+    def test_copy_diagnostics_after_registry_warnings(self):
+        warning = (b"[2026-11-22T08:12:08.123Z][WARNING]: fixture text\n"
+                   b"[Data]:\n  registry=ghcr.io\n\n\n")
+        error = b"Error response from registry: toomanyrequests: fixture detail\n"
+        for report, category in (
+            (warning + error, "registry-rate-limit"),
+            (warning * 2 + error, "registry-rate-limit"),
+            (warning.replace(b"fixture text", b"line one\nline two") + error, "unknown"),
+            (warning + error + b"Error: another failure\n", "unknown"),
+            (warning * 4 + error, "unknown"),
+            (warning + error + b"x" * 4096, "unknown"),
+        ):
+            self.assertEqual(self.api.copy_failure_category(io.BytesIO(report), IMAGE), category)
+
+    def test_copy_process_outcome_precedes_stderr(self):
+        def signaled(args, **kwargs):
+            kwargs["stderr"].write(b"Error response from registry: denied\n")
+            return subprocess.CompletedProcess(args, -15)
+        for effect, label in ((signaled, "signal"), (FileNotFoundError(), "execution"),
+                              (lambda args, **kw: subprocess.CompletedProcess(args, 9), "unknown")):
+            with mock.patch.object(self.api.subprocess, "run", side_effect=effect):
+                with self.assertRaisesRegex(self.api.Refusal, rf"^copy failed \({label}\)$"):
+                    self.api.run(self.tool, [], {}, self.base, "copy failed", copy_image=IMAGE)
 
     def test_login_and_copy_timeouts_are_bounded_redacted_and_cleaned(self):
         run = subprocess.run

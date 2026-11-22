@@ -25,12 +25,22 @@ layout = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(layout)
 IMAGES = {"ghcr.io/bitop-dev/open-model-gateway", "ghcr.io/bitop-dev/open-model-gateway-loadtest"}
 SOURCE_COMMIT = "9b1fc815f6b7fba743f08b9b5c5846639cc11d3c"
-DIAGNOSTIC_LINE_BYTES = 4096
+DIAGNOSTIC_BYTES = 4096
+MAX_REGISTRY_WARNINGS = 3
+# ORAS TextFormatter prints the timestamp, one message, registry field and
+# separator. Only single-line warning text has an unambiguous boundary.
+REGISTRY_WARNING = re.compile(
+    rb"\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})\]"
+    rb"\[WARNING\]: [^\x00-\x1f\x7f]*\n\[Data\]:\n  registry=ghcr\.io\n\n\n"
+)
 REGISTRY_CODES = {
     b"unauthorized": "registry-access",
     b"denied": "registry-access",
     b"toomanyrequests": "registry-rate-limit",
     b"blob unknown": "registry-content",
+    b"blob upload unknown": "registry-content",
+    b"blob upload invalid": "registry-content",
+    b"manifest unknown": "registry-content",
     b"manifest blob unknown": "registry-content",
     b"manifest invalid": "registry-content",
     b"digest invalid": "registry-content",
@@ -105,14 +115,21 @@ def snapshot(source, target, limit, executable=False):
 
 
 def copy_failure_category(stderr, image):
-    # The pinned ORAS CLI wraps registry errors with these prefixes. Its SDK
-    # may render either an OCI error code or an HTTP status. Treat the rest as
-    # untrusted and return only fixed labels from one bounded, complete line.
     stderr.seek(0)
-    line = stderr.readline(DIAGNOSTIC_LINE_BYTES + 1)
-    if len(line) > DIAGNOSTIC_LINE_BYTES or not line.endswith(b"\n"):
+    report = stderr.read(DIAGNOSTIC_BYTES + 1)
+    offset = 0
+    for _ in range(MAX_REGISTRY_WARNINGS):
+        warning = REGISTRY_WARNING.match(report, offset)
+        if warning is None:
+            break
+        offset = warning.end()
+    line, newline, trailing = report[offset:].partition(b"\n")
+    if not newline or offset + len(line) + 1 > DIAGNOSTIC_BYTES:
         return "unknown"
-    line = line[:-1]
+    # After a warning, require exactly one remaining error line through EOF.
+    # An embedded newline in registry-supplied warning text can mimic output.
+    if offset and trailing:
+        return "unknown"
     for prefix in (b"Error response from registry: ",
                    f'Error from destination registry for "{image}": '.encode("ascii")):
         if line.startswith(prefix):
@@ -134,7 +151,11 @@ def copy_failure_category(stderr, image):
             return "registry-rate-limit"
         if 500 <= code <= 599:
             return "registry-server"
-    if (detail == b"net/http: TLS handshake timeout"
+    # Bearer-token retrieval can wrap a second request inside the first.
+    token_request = re.match(rb'(?:Get|Post) "https://ghcr\.io/token(?:\?[^"\x00-\x20\x7f]*)?": ', detail)
+    if token_request:
+        detail = detail[token_request.end():]
+    if (detail in (b"EOF", b"unexpected EOF", b"net/http: TLS handshake timeout")
             or detail.startswith((b"dial tcp: ", b"dial tcp ", b"tls: failed to verify certificate: "))):
         return "transport"
     return "unknown"
@@ -152,11 +173,14 @@ def run(tool, args, env, work, reason, password=b"", *, copy_image=None):
             if result.returncode == 0:
                 return
             if copy_image is not None:
-                category = copy_failure_category(err, copy_image)
+                if result.returncode < 0:
+                    category = "signal"
+                elif result.returncode == 1:
+                    category = copy_failure_category(err, copy_image)
     except subprocess.TimeoutExpired:
         category = "deadline"
     except (OSError, subprocess.SubprocessError):
-        pass
+        category = "execution"
     if copy_image is not None:
         reason += f" ({category})"
     raise Refusal(reason)
