@@ -60,8 +60,9 @@ fn expand(args: TokenStream2, function: ItemFn) -> syn::Result<TokenStream2> {
         fn #name() #ret {
             async fn #name(#inputs) #ret #body
 
-            let f: fn(_) -> _ = #name;
-            crate::dbtest_runtime::run(concat!(module_path!(), "::", stringify!(#name)), f)
+            crate::dbtest_runtime::run(concat!(module_path!(), "::", stringify!(#name)), |pool| {
+                ::std::boxed::Box::pin(#name(pool))
+            })
         }
     })
 }
