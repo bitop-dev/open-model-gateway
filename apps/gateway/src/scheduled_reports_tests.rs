@@ -246,6 +246,70 @@ mod db {
     }
 
     #[dbtest::test]
+    async fn scheduled_reports_dispatch_progress_past_sustained_row_locks(pool: PgPool) {
+        let (store, fence, first, user) = setup(&pool).await;
+        let (_, period_end, _) = cursor(&pool, first).await;
+        sqlx::query(
+            "INSERT INTO report_schedules(scope_kind,created_by,cadence,timezone,delivery_time,
+                                          state,next_run_at,next_period_end,cursor_tzdb)
+             SELECT 'installation',$1,'weekly','UTC','00:01','active',
+                    $2::timestamptz + g * interval '1 minute',$2,$3
+             FROM generate_series(2,9) g",
+        )
+        .bind(user)
+        .bind(period_end.unwrap())
+        .bind(scheduled_reports::calendar::TZDB_VERSION)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let ids: Vec<Uuid> =
+            sqlx::query_scalar("SELECT id FROM report_schedules ORDER BY next_run_at,id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(ids[0], first);
+        let mut locks = crate::db::begin(&pool).await.unwrap();
+        let locked = sqlx::query("SELECT id FROM report_schedules WHERE id=ANY($1) FOR UPDATE")
+            .bind(&ids[..8])
+            .fetch_all(&mut *locks)
+            .await
+            .unwrap();
+        assert_eq!(locked.len(), 8);
+        for _ in 0..4 {
+            tick(&store, &fence).await.unwrap();
+        }
+        let published: Vec<Uuid> = sqlx::query_scalar("SELECT schedule_id FROM report_runs")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            published,
+            [ids[8]],
+            "the ninth schedule must publish while the first eight are locked"
+        );
+        let locked_claims: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM report_generation_claims WHERE schedule_id=ANY($1)",
+        )
+        .bind(&ids[..8])
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(locked_claims, 0);
+        locks.rollback().await.unwrap();
+
+        assert_eq!(tick(&store, &fence).await.unwrap(), 8);
+        assert_eq!(tick(&store, &fence).await.unwrap(), 0);
+        assert_eq!(count(&pool).await, 9);
+        let released: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM report_generation_claims WHERE expires_at<=clock_timestamp()",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(released, 9);
+    }
+
+    #[dbtest::test]
     async fn scheduled_reports_worker_dispatches_during_calendar_delay_and_failure(pool: PgPool) {
         let (_, _, original, user) = setup(&pool).await;
         sqlx::query("UPDATE report_schedules SET state='paused' WHERE id=$1")
