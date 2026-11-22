@@ -336,7 +336,7 @@ cnpg:
     storageClass: local-ssd
     storageSize: 20Gi
     walStorageSize: 5Gi
-    image: ghcr.io/cloudnative-pg/postgresql:17.6
+    image: ghcr.io/cloudnative-pg/postgresql:17.6@sha256:30b304a2e300ed80b6d1b740e4369e9b0f25599fb518de78c01fd9f25531791b
     # With synchronous unset, the template preserves the legacy min/max=1/1
     # behaviour. Optional explicit legacy overrides (including 0) remain supported:
     # minSyncReplicas: 1
