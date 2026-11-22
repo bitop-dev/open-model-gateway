@@ -126,10 +126,9 @@ fixed_enum!(ErrorKind { InvalidRequest => "invalid_request", Unauthorized => "un
 // counted" also covers construction, not just export.
 fixed_enum!(DropReason { Contexts => "contexts", RequestLimit => "request_limit", SpanLimit => "span_limit", QueueFull => "queue_full", Shutdown => "shutdown", Ineligible => "ineligible", Delivery => "delivery", Invalid => "invalid" });
 
-/// Constructed only after primary admission has proved shared-workspace
-/// eligibility. Intentionally has no production constructor in PR 1: PR 2
-/// connects this capability to live admission. Dropping an unclassified
-/// context exports nothing, including pre-admission observations.
+/// Live primary admission constructs this capability after a commit that
+/// confirms shared-workspace eligibility. An unclassified context exports
+/// nothing, including pre-admission observations.
 ///
 /// It also carries the canonical public model alias that admission resolved,
 /// so the alias attribute's provenance is admission itself: no caller can
@@ -500,7 +499,7 @@ pub struct Context {
 }
 impl Context {
     /// Children share this trace and root sampling decision, without reacquiring
-    /// an active context. Timing is supplied at actual phase boundaries in PR 2.
+    /// an active context.
     pub fn trace_id(&self) -> [u8; 16] {
         self.trace
     }
@@ -595,7 +594,7 @@ tokio::task_local! {
     /// bridges a reserved "admission"/"settlement" wrapper span to the real
     /// phase boundaries reached inside the `governance` module's admission/
     /// settlement transactions, across the `InferenceRepository`
-    /// trait-object boundary (PR 2 does not change that trait). Absent for
+    /// trait-object boundary. Absent for
     /// every call that is not wrapped in [`with_phases`] (disabled
     /// telemetry, or any admission/settlement path outside interactive
     /// generation), so [`mark_phase`]/[`mark_shared`] are then a single

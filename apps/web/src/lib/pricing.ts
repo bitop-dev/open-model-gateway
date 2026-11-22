@@ -121,7 +121,7 @@ export const WORKLOAD_METERS: Record<WorkloadKind, Meter[]> = {
   batches: ["input_tokens", "output_tokens", "cache_read_tokens", "requests"],
 };
 const generation = new Set<string>(["chat_completions", "responses", "messages"]);
-/** One workload per model (Phase 1): chat/responses/messages are text generation; every other protocol is its own workload. */
+/** One workload per model: chat/responses/messages are text generation; every other protocol is its own workload. */
 export function workloadOf(protocols: readonly (ModelProtocol | string)[]): WorkloadKind {
   const first = protocols[0];
   if (!first || generation.has(first)) return "generation";

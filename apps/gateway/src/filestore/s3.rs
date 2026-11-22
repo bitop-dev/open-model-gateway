@@ -382,9 +382,8 @@ impl S3Backend {
             // default since the 1.15x generation, #456). An http:// endpoint
             // would let anyone on the path choose it.
             .disable_clock_skew_correction(true)
-            // A stuck credential source fails the request after 5 s, as before
-            // that generation; the SDK now derives a longer wait (here 300 s)
-            // from the operation timeouts.
+            // Cap credential loading at 5 s independently of the SDK's
+            // operation timeouts.
             .identity_cache(
                 aws_sdk_s3::config::IdentityCache::lazy()
                     .load_timeout(Duration::from_secs(5))

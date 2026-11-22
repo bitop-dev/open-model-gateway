@@ -1,11 +1,10 @@
-//! #90 slice 1: access review campaigns. A Platform Admin starts a one-shot
+//! Access review campaigns. A Platform Admin starts a one-shot
 //! campaign that snapshots the live shared (Team/Project) memberships,
 //! elevated platform role grants (Admin, Auditor) and/or shared-workspace key
-//! lineages (slice 6) it covers, and closes it. Each item records one grant
-//! or key lineage; the database
-//! derives the item from the grant and accepts items only in the
-//! transaction that creates the campaign. Reviewer decisions follow in later
-//! slices. Browser-only: Platform Admins start campaigns; Platform Admins and
+//! lineages it covers, and closes it. Each item records one grant or key
+//! lineage. The database derives items from their subjects and accepts
+//! inserts only in the transaction that creates the campaign. In the
+//! browser, Platform Admins start campaigns and Platform Admins and
 //! Auditors read them.
 use super::*;
 use crate::governance::locks;
@@ -37,7 +36,7 @@ const CAMPAIGN_JSON: &str = "jsonb_build_object('id',c.id,'name',c.name,'subject
 
 /// The latest decision and assignment of item `i` (as `d` and `a`).
 const LATEST_DECISION: &str = "LEFT JOIN LATERAL (SELECT x.decision,x.decided_by,x.decided_at FROM access_review_decisions x WHERE x.item_id=i.id ORDER BY x.seq DESC LIMIT 1) d ON true LEFT JOIN LATERAL (SELECT y.reviewer_user_id FROM access_review_assignments y WHERE y.item_id=i.id ORDER BY y.seq DESC LIMIT 1) a ON true";
-/// Whether item `i` is a key lineage (slice 6).
+/// Whether item `i` is a key lineage.
 const KEY_ITEM: &str = "i.subject_kind='workspace_key'";
 /// A key item's live expiry (its newest unrevoked key's, else the snapshot key's)
 /// and the lineage's latest admitted attempt (per key, one index probe of
@@ -83,7 +82,7 @@ fn inbox_item_json() -> String {
 /// Whether anyone may decide item `i` now (#469): its review is open, it is
 /// in effect, and it has a reviewer who still qualifies (an assignee, or else another owner/admin of
 /// its workspace, or another Platform Admin for platform roles). For a key
-/// (slice 6), whether its workspace has any owner or admin: platform readers
+/// lineage, whether its workspace has any owner or admin: platform readers
 /// must not learn a key's holder, which excluding the holder would reveal
 /// when the holder is the only one (such a key stays pending; closing the
 /// review is the remedy). Needs the [`reviewer_sets`] CTEs and the latest
@@ -422,7 +421,7 @@ fn reviewer_rule(user: &str, admin_ws: &str, admin: &str) -> String {
     )
 }
 
-/// #90 slice 4: rows `(at, id, item, is_read, state)` of the viewer's access
+/// Rows `(at, id, item, is_read, state)` of the viewer's access
 /// review reminders, for the in-app notification feed: one per open campaign
 /// in which the viewer (`user`, a live Platform Admin flag `admin`) has items
 /// they may decide that nobody has decided yet, derived live. The state is

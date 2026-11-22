@@ -144,7 +144,7 @@ struct ScanState {
     // batch (see the end of the scan).
     deterministic_rejects: Vec<(u64, InferenceError)>,
     // Model-level memoization of `every_candidate_route_refuses`'s
-    // read-only lookups, scoped to this one scan (#238 follow-up).
+    // read-only lookups, scoped to this one scan.
     refusal_memo: RefusalMemo,
 }
 
@@ -203,13 +203,13 @@ impl Jobs {
     /// No admission, reservation or routing-health write happens here.
     ///
     /// Both DB-backed lookups this needs are memoized in `memo` for the
-    /// whole scan (#238 follow-up): `Store::deployments` once per model, and
+    /// whole scan: `Store::deployments` once per model, and
     /// (only when every capable route refuses) `Store::route_plan` once per
     /// model and refused-route set. The refusal kind stays per line:
     /// a 50,000-line upload must not run ~50k deployment reads and ~100k
     /// routing selects before `admit_batch` ever checks a budget or job
     /// limit. Per-line adapter validation (bodies differ) still runs on
-    /// every line, deduplicated per provider within that line as before;
+    /// every line, deduplicated per provider within that line;
     /// nothing here survives past this one scan.
     async fn every_candidate_route_refuses(
         &self,

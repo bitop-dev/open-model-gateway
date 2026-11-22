@@ -15,12 +15,12 @@ type RemovalTarget = (
     bool,
 );
 
-/// A "remove" decision (#90 slice 3): the access is removed at once, in the
+/// A "remove" decision removes access at once, in the
 /// same transaction, through the path the direct routes use (memberships:
 /// the members path, owner-only for owners, the last owner protected, keys
 /// revoked once no membership remains; platform roles: the role path, under
 /// the exclusive catalog lock, entitlement loss as when revoking directly;
-/// keys (slice 6): the revoke path, every key of the lineage revoked).
+/// keys: the revoke path, every key of the lineage revoked).
 /// A refused removal records nothing. Locks before any check or write; the
 /// same 404 as any decision for an item the viewer may not decide.
 #[cfg_attr(not(test), expect(clippy::too_many_lines, reason = "#499"))]

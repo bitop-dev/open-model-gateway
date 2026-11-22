@@ -1,8 +1,7 @@
 /*
- * Admin API tokens (#37 PR3): browser-only metadata for a Platform Admin's own long-lived
- * management credentials. Browser session, platform_write only (BrowserAdminOnly on the
- * backend): a caller creates for themself, any Admin may revoke any token, and there is no
- * renewal, enable or ownership transfer. Scopes are explicit per route and do not imply read
+ * Platform Admin browser sessions can list admin-token metadata for all owners.
+ * An Admin creates tokens only for themself and can revoke any token. Tokens
+ * cannot be renewed, re-enabled or transferred. Scopes are explicit per route and do not imply read
  * access (`platform:read` is separate from the four `*:write` scopes). These tokens can never
  * call inference or issue inference keys.
  */

@@ -284,7 +284,7 @@ enum Refusal {
 /// shared table refuses outright (`Disposition::Refused`, decided once for
 /// this file and `egress.rs`) is refused here too, in every environment and
 /// over both schemes; carrier-grade NAT (`Disposition::Cgnat`) is refused
-/// unconditionally, as it always was here (egress alone lets a private
+/// unconditionally (egress alone lets a private
 /// allowlist reach it); loopback only in development; private addresses over
 /// either scheme; public addresses over HTTPS only.
 fn judge(category: crate::special_use::Category, development: bool, http: bool) -> Option<Refusal> {

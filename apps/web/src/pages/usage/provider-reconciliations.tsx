@@ -1,4 +1,4 @@
-/* Admin/Auditor read-only frozen comparisons (#48, PR 1). No financial writes,
+/* Admin/Auditor read-only frozen comparisons (#48). No financial writes,
  * attribution, allocation, or variance computation happens in the browser.
  */
 import { useEffect, useId, useRef, useState } from "react";

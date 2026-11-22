@@ -477,9 +477,8 @@ pub fn start(store: Store, every: Duration) -> tokio::task::JoinHandle<()> {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            // With leases (serve), only the `alerts` lease holder evaluates:
-            // before P5 each replica evaluated whenever its own tick found the
-            // tick lock free, so N replicas evaluated about N times per interval.
+            // Only the `alerts` lease holder evaluates when leases are
+            // configured, so adding replicas does not add evaluations.
             let evaluated = match store.leases() {
                 Some(leases) => match leases.held(crate::leases::Lease::Alerts) {
                     Some(fence) => {

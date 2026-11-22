@@ -1,4 +1,4 @@
-//! #83 slice B3: access-request events in the in-app notification feed.
+//! Access-request events in the in-app notification feed.
 //!
 //! Derived live from `access_requests` on every read, so visibility is the
 //! current authority, never a copy made when the request changed:

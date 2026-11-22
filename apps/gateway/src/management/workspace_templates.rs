@@ -1,4 +1,4 @@
-//! #84 slice A: authoring and review of Team/Project onboarding templates.
+//! Authoring, review and application of Team/Project onboarding templates.
 //!
 //! A template has immutable versions. A version is created pending review,
 //! reviewed by a Platform Admin other than its author, then published (one
@@ -6,7 +6,7 @@
 //! retired at any time. Content holds references only: the workspace kind,
 //! catalogs (inherit, or a replacement list), catalog model ids, an optional
 //! local limits body and member slots. No secrets, emails, platform roles or
-//! group mappings. Applying a published version (slice B) creates one shared
+//! group mappings. Applying a published version creates one shared
 //! workspace from it. Browser-only Platform Admin routes.
 use super::*;
 use serde::Serialize;
@@ -482,7 +482,7 @@ fn assignment_plan<'a>(c: &'a Content, b: &ApplyInput) -> Result<Vec<Planned<'a>
     }
     Ok(plan)
 }
-/// `POST /api/v1/platform/workspace-templates/{id}/apply` (#84 slice B):
+/// `POST /api/v1/platform/workspace-templates/{id}/apply`:
 /// create one shared workspace from the template's published version, in one
 /// transaction, within the applying Platform Admin's own authority: the
 /// workspace and owner, the catalog replacement, the catalog model

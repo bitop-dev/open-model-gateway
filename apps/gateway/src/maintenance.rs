@@ -287,8 +287,8 @@ async fn compact_execution_details(store: &Store, days: i32) {
 }
 
 /// Run `work` once: under `lease` when this replica runs leased background
-/// work (serve), skipping the tick unless it holds the lease; otherwise
-/// (no leases configured) unconditionally, as before P5.
+/// work in serve, skipping the tick unless it holds the lease. Without
+/// configured leases, run unconditionally.
 pub(crate) async fn singleton<T, F, Fut>(
     store: &Store,
     lease: crate::leases::Lease,
