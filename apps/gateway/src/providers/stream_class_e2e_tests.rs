@@ -464,24 +464,26 @@ per_kind! {
 
 #[dbtest::test]
 async fn responses_first_terminal_wins_and_closes_the_upstream_body(pool: PgPool) {
-    terminal_order(
-        pool,
-        Kind::Responses,
-        Client::Responses,
-        3,
-        "response.completed",
-    )
-    .await;
+    terminal_order(pool, Kind::Responses, Client::Responses, 3).await;
 }
 
 #[dbtest::test]
 async fn anthropic_first_terminal_wins_and_closes_the_upstream_body(pool: PgPool) {
-    terminal_order(pool, Kind::Anthropic, Client::Messages, 4, "message_stop").await;
+    terminal_order(pool, Kind::Anthropic, Client::Messages, 4).await;
 }
 
-async fn terminal_order(pool: PgPool, kind: Kind, client: Client, input: i64, terminal: &str) {
+#[dbtest::test]
+async fn anthropic_chat_first_terminal_wins_and_closes_the_upstream_body(pool: PgPool) {
+    terminal_order(pool, Kind::Anthropic, Client::Chat, 4).await;
+}
+
+async fn terminal_order(pool: PgPool, kind: Kind, client: Client, input: i64) {
     let w = world(pool, kind, false).await;
-    let terminal_line = format!("event: {terminal}");
+    let terminal_line = match client {
+        Client::Chat => "data: [DONE]",
+        Client::Messages => "event: message_stop",
+        Client::Responses => "event: response.completed",
+    };
     for (label, wire, failed) in terminal_order_cases(kind) {
         let at = format!("{kind:?} {label}, error={failed:?}");
         let reply = w.ask_hanging(client, wire, &at).await;
@@ -503,7 +505,21 @@ async fn terminal_order(pool: PgPool, kind: Kind, client: Client, input: i64, te
             assert_eq!(told(client, &reply.body), shown(client, expected), "{at}");
             assert_eq!(got, failed_with(expected, None), "{at}");
         } else {
-            assert_eq!(last_event(&reply.body)["type"], terminal, "{at}");
+            match client {
+                Client::Chat => assert_eq!(
+                    reply.body.trim_end().lines().last(),
+                    Some(terminal_line),
+                    "{at}"
+                ),
+                Client::Messages => {
+                    assert_eq!(last_event(&reply.body)["type"], "message_stop", "{at}")
+                }
+                Client::Responses => assert_eq!(
+                    last_event(&reply.body)["type"],
+                    "response.completed",
+                    "{at}"
+                ),
+            }
             assert_eq!(got.state, "succeeded", "{at}");
             assert_eq!(got.error_code, None, "{at}");
             assert_eq!((got.input, got.output), (Some(input), Some(2)), "{at}");

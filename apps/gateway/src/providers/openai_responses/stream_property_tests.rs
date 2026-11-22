@@ -895,6 +895,26 @@ fn a_response_cannot_start_after_a_provider_failure() {
 }
 
 #[test]
+fn response_terminal_before_start_closes_the_parser() {
+    for (event, status) in [
+        ("response.completed", "completed"),
+        ("response.incomplete", "incomplete"),
+    ] {
+        let mut state = State::default();
+        assert_eq!(
+            state
+                .push(json!({"type":event,"response":{"status":status,"output":[]}}))
+                .err(),
+            Some(InferenceError::InvalidUpstream)
+        );
+        assert_eq!(
+            state.push(json!({"type":"response.created"})).err(),
+            Some(InferenceError::InvalidUpstream)
+        );
+    }
+}
+
+#[test]
 fn a_started_response_cannot_complete_after_a_rejected_terminal() {
     let response = json!({"status":"completed","output":[]});
     let completed = json!({"type":"response.completed","response":response});

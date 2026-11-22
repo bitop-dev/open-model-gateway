@@ -119,6 +119,19 @@ fn in_stream_errors_are_classified_like_the_same_http_error() {
 }
 
 #[test]
+fn message_stop_before_start_closes_the_parser() {
+    let mut state = State::default();
+    assert_eq!(
+        state.push(json!({"type":"message_stop"})).err(),
+        Some(InferenceError::InvalidUpstream)
+    );
+    assert_eq!(
+        state.push(stream()[0].clone()).err(),
+        Some(InferenceError::InvalidUpstream)
+    );
+}
+
+#[test]
 fn a_started_message_cannot_finish_after_a_rejected_terminal() {
     let frames = stream();
     for (terminal, expected) in [
