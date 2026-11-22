@@ -33,6 +33,10 @@ struct Counters<'a> {
     total_tokens: Option<u64>,
     #[serde(borrow)]
     input_tokens_details: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct OutputDetails<'a> {
     #[serde(borrow)]
     output_tokens_details: Option<&'a RawValue>,
     #[serde(borrow)]
@@ -68,6 +72,14 @@ fn reasoning(details: Option<&RawValue>, output_bound: Option<u64>) -> Result<Op
         .reasoning_tokens
         .and_then(|raw| serde_json::from_str::<u64>(raw.get()).ok())
         .filter(|&n| metering::plausible_reasoning(n, output_bound)))
+}
+
+// Keep ambiguity in optional reasoning metadata local to that observation.
+fn reported_reasoning(usage: &RawValue, output_bound: Option<u64>) -> Result<Option<u64>> {
+    let fields: OutputDetails<'_> = object(usage.get().as_bytes())?;
+    let native = reasoning(fields.output_tokens_details, output_bound)?;
+    let compatible = reasoning(fields.completion_tokens_details, output_bound)?;
+    Ok(native.or(compatible))
 }
 
 pub(super) fn rejected_terminal_usage(bytes: &[u8]) -> Result<Usage> {
@@ -106,9 +118,9 @@ pub(super) fn rejected_terminal_usage(bytes: &[u8]) -> Result<Usage> {
         // Billing keeps the original observation.
         output_bound = Some(counts.output_tokens.unwrap_or(remaining));
     }
-    let native = reasoning(counts.output_tokens_details, output_bound)?;
-    let compatible = reasoning(counts.completion_tokens_details, output_bound)?;
-    observed.reasoning_tokens = native.or(compatible);
+    observed.reasoning_tokens = reported_reasoning(response.usage, output_bound)
+        .ok()
+        .flatten();
     observed.reported_model = response
         .model
         .and_then(|raw| serde_json::from_str::<String>(raw.get()).ok())
