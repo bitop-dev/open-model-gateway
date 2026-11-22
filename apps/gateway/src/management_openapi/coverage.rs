@@ -186,6 +186,20 @@ struct Expected {
     branches: BTreeMap<(String, String), BTreeMap<usize, (String, bool)>>,
 }
 
+/// Constraints on this same array compose through references and allOf.
+fn array_cap(document: &Value, node: &Value, seen: &mut BTreeSet<String>) -> Result<u64> {
+    let mut cap = node["maxItems"].as_u64().unwrap_or(u64::MAX);
+    if let Some((target, pointer)) = follow(document, node)?
+        && seen.insert(pointer)
+    {
+        cap = cap.min(array_cap(document, target, seen)?);
+    }
+    for branch in node["allOf"].as_array().into_iter().flatten() {
+        cap = cap.min(array_cap(document, branch, seen)?);
+    }
+    Ok(cap)
+}
+
 /// Static walk: every reachable array and union branch, at every data location.
 fn expect(
     document: &Value,
@@ -194,12 +208,14 @@ fn expect(
     sptr: &str,
     out: &mut Expected,
     stack: &mut Vec<String>,
+    inherited_cap: u64,
 ) -> Result<()> {
+    let cap = inherited_cap.min(array_cap(document, node, &mut BTreeSet::new())?);
     if let Some((target, pointer)) = follow(document, node)?
         && !stack.contains(&pointer)
     {
         stack.push(pointer.clone());
-        expect(document, target, data, &pointer, out, stack)?;
+        expect(document, target, data, &pointer, out, stack, cap)?;
         stack.pop();
     }
     if is_array_schema(node) {
@@ -239,6 +255,7 @@ fn expect(
                     &format!("{sptr}/{keyword}/{i}"),
                     out,
                     stack,
+                    cap,
                 )?;
             }
         }
@@ -251,6 +268,7 @@ fn expect(
             &format!("{sptr}/allOf/{i}"),
             out,
             stack,
+            cap,
         )?;
     }
     for keyword in ["then", "else"] {
@@ -262,6 +280,7 @@ fn expect(
                 &format!("{sptr}/{keyword}"),
                 out,
                 stack,
+                cap,
             )?;
         }
     }
@@ -274,13 +293,12 @@ fn expect(
             &format!("{sptr}/properties/{name}"),
             out,
             stack,
+            u64::MAX,
         )?;
     }
     let prefix = node["prefixItems"].as_array().map_or(0, Vec::len);
     if let Some(items) = node.get("items").filter(|v| v.is_object())
-        && node["maxItems"]
-            .as_u64()
-            .is_none_or(|max| max > prefix as u64)
+        && cap > prefix as u64
     {
         expect(
             document,
@@ -289,12 +307,14 @@ fn expect(
             &format!("{sptr}/items"),
             out,
             stack,
+            u64::MAX,
         )?;
     }
     for (i, child) in node["prefixItems"]
         .as_array()
         .into_iter()
         .flatten()
+        .take(usize::try_from(cap).unwrap_or(usize::MAX))
         .enumerate()
     {
         expect(
@@ -304,6 +324,7 @@ fn expect(
             &format!("{sptr}/prefixItems/{i}"),
             out,
             stack,
+            u64::MAX,
         )?;
     }
     // Typed map values live at the wildcard location of their map.
@@ -320,6 +341,7 @@ fn expect(
             &format!("{sptr}/patternProperties/{}", segment(pattern)),
             out,
             stack,
+            u64::MAX,
         )?;
     }
     if let Some(child) = node.get("additionalProperties").filter(|v| v.is_object()) {
@@ -330,6 +352,7 @@ fn expect(
             &format!("{sptr}/additionalProperties"),
             out,
             stack,
+            u64::MAX,
         )?;
     }
     Ok(())
@@ -592,6 +615,7 @@ impl Observed {
                 &format!("/response/{status}"),
                 &mut expected,
                 &mut Vec::new(),
+                u64::MAX,
             )?;
         }
         for (key, exempt) in &expected.arrays {

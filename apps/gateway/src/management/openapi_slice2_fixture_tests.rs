@@ -2216,13 +2216,11 @@ async fn slice2_fixtures(pool: PgPool, shard: usize) -> (Vec<String>, PositiveFi
             Uuid::nil(),
             "f09f9880".repeat(128)
         );
-        let session_candidates: Vec<(&str, String)> = vec![
+        let mut session_candidates: Vec<(&str, String)> = vec![
             ("status", "succeeded".to_owned()),
             ("status", cut("succeeded")),
             ("finish_reason", "stop".to_owned()),
             ("finish_reason", cut("stop")),
-            ("cursor", format!("{longest_cursor}0")),
-            ("cursor", longest_cursor),
             ("cursor", cursor.clone()),
             ("cursor", cursor.replacen('_', "", 1)),
             ("q", "abcd".to_owned()),
@@ -2230,6 +2228,7 @@ async fn slice2_fixtures(pool: PgPool, shard: usize) -> (Vec<String>, PositiveFi
             ("q", "a".repeat(36)),
             ("q", "a".repeat(37)),
         ];
+        session_candidates.extend(super::session_cursor_width_candidates(longest_cursor));
         let detail_candidates: Vec<(&str, &str)> = session_candidates
             .iter()
             .filter(|(name, _)| *name != "cursor")

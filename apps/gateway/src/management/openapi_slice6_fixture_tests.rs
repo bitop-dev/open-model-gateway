@@ -391,9 +391,15 @@ fn query_candidates(template: &str, base: &[(&str, &str)]) -> Vec<(String, Strin
                 if template.ends_with("/sessions") {
                     longest.push('_');
                     longest.push_str(&"f09f9880".repeat(128));
+                    out.extend(
+                        super::session_cursor_width_candidates(longest)
+                            .into_iter()
+                            .map(|(name, value)| (name.to_owned(), value)),
+                    );
+                } else {
+                    out.push(("cursor".into(), format!("{longest}0")));
+                    out.push(("cursor".into(), longest));
                 }
-                out.push(("cursor".into(), format!("{longest}0")));
-                out.push(("cursor".into(), longest));
                 out.push(("cursor".into(), (*value).to_owned()));
                 out.push(("cursor".into(), cut.as_str().to_owned()));
             }

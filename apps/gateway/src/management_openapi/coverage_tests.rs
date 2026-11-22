@@ -1381,3 +1381,39 @@ fn response_tail_coverage_respects_positional_capacity() {
     response["maxItems"] = json!(2);
     assert!(run(&doc(op(response, json!([])), json!({})), &[json!([1])], &[]).is_err());
 }
+
+#[test]
+fn boundary_review_unconditional_caps_bound_tails_across_composition() {
+    let tuple = json!({"type":"array","prefixItems":[{"type":"integer"}],"items":{"type":"array","items":{"type":"integer"}}});
+    for cap in [1, 2] {
+        let schemas = json!({"Tuple":tuple,"Cap":{"maxItems":cap}});
+        for response in [
+            json!({"allOf":[{"$ref":"#/components/schemas/Tuple"},{"$ref":"#/components/schemas/Cap"}]}),
+            json!({"$ref":"#/components/schemas/Tuple","allOf":[{"maxItems":cap}]}),
+        ] {
+            let document = doc(op(response, json!([])), schemas.clone());
+            assert_eq!(run(&document, &[json!([1])], &[]).is_ok(), cap == 1);
+            if cap == 2 {
+                run(&document, &[json!([1, [2]])], &[]).unwrap();
+            }
+        }
+    }
+    let mut response = tuple;
+    response["if"] = json!({"maxItems":1});
+    response["then"] = json!({"maxItems":1});
+    let document = doc(op(response, json!([])), json!({}));
+    assert!(run(&document, &[json!([1])], &[]).is_err());
+    run(&document, &[json!([1, [2]])], &[]).unwrap();
+}
+
+#[test]
+fn boundary_review_unconditional_caps_bound_prefix_positions() {
+    for cap in [1, 2] {
+        let response = json!({"type":"array","prefixItems":[{"type":"integer"},{"type":"array","items":{"type":"integer"}}],"allOf":[{"maxItems":cap}]});
+        let document = doc(op(response, json!([])), json!({}));
+        assert_eq!(run(&document, &[json!([1])], &[]).is_ok(), cap == 1);
+        if cap == 2 {
+            run(&document, &[json!([1, [2]])], &[]).unwrap();
+        }
+    }
+}

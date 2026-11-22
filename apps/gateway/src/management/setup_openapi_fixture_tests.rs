@@ -459,6 +459,25 @@ fn judged_when(
         judged(captured, rules.1)
     }
 }
+fn positional_provider_probe(captured: openapi::responses::Captured, body: &Value) -> Probe {
+    if schema_accepts("POST", "/api/v1/platform/providers", body)
+        && positional_provider_refusal(body)
+    {
+        assert_eq!(
+            captured.status,
+            StatusCode::BAD_REQUEST,
+            "expected positional provider refusal"
+        );
+        assert!(
+            serde_json::from_slice::<Value>(&captured.bytes)
+                .is_ok_and(|error| error["error"]["message"] == "Invalid request"),
+            "unexpected positional provider refusal explanation"
+        );
+        Probe::decided(captured, true)
+    } else {
+        captured.into()
+    }
+}
 fn positional_provider_refusal(body: &Value) -> bool {
     let Some(items) = body.as_array() else {
         return false;
@@ -3441,16 +3460,7 @@ async fn slice3_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
                 Some(body.clone()),
             )
             .await;
-            if captured.status == StatusCode::BAD_REQUEST
-                && schema_accepts("POST", providers, &body)
-                && serde_json::from_slice::<Value>(&captured.bytes)
-                    .is_ok_and(|error| error["error"]["message"] == "Invalid request")
-                && positional_provider_refusal(&body)
-            {
-                Probe::decided(captured, true)
-            } else {
-                captured.into()
-            }
+            positional_provider_probe(captured, &body)
         })
         .await;
     }
@@ -4636,6 +4646,42 @@ fn management_openapi_price_integer_encoding_is_not_a_domain_refusal() {
         assert!(
             price_refused(&duplicate),
             "duplicate-line domain refusal lost"
+        );
+    }
+}
+
+#[test]
+fn boundary_review_predicted_provider_refusal_requires_the_status_and_explanation() {
+    let body = json!([
+        "Local",
+        "ollama",
+        "none",
+        "http://127.0.0.1:11434/v1",
+        null,
+        false,
+        null,
+        null
+    ]);
+    assert!(
+        schema_accepts("POST", "/api/v1/platform/providers", &body)
+            && positional_provider_refusal(&body)
+    );
+    for (status, message, expected) in [
+        (StatusCode::BAD_REQUEST, "Invalid request", true),
+        (StatusCode::OK, "Invalid request", false),
+        (StatusCode::BAD_REQUEST, "unrelated refusal", false),
+    ] {
+        let captured = openapi::responses::Captured {
+            status,
+            headers: Default::default(),
+            bytes: json!({"error":{"message":message}}).to_string().into(),
+            method: "POST".into(),
+            template: Some("/api/v1/platform/providers".into()),
+            query: vec![],
+        };
+        assert_eq!(
+            std::panic::catch_unwind(|| positional_provider_probe(captured, &body)).is_ok(),
+            expected
         );
     }
 }

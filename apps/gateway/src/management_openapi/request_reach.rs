@@ -11,7 +11,8 @@
 //! every property, every `patternProperties` / schema-valued
 //! `additionalProperties` value, every `prefixItems` index and the `items` tail
 //! and every `oneOf` / `anyOf` arm. `allOf` members and `then`/`else` contents are
-//! walked transparently. A location is REACHED by a base body when the body
+//! walked for their contents. Scalar-constraining conditional arms and array
+//! bounds are obligations in their own right. A location is REACHED by a base body when the body
 //! carries it (and, for an arm, matches the arm).
 //!
 //! Exempt only with `x-omg-unprobed-location: "<reason>"` on the location's
@@ -147,6 +148,52 @@ fn declare_child(
     declare(document, child, &key, out, stack, depth + 1, scope)
 }
 
+/// Scalar constraints have no child location that could otherwise witness the arm.
+fn scalar_constraints(document: &Value, node: &Value, depth: usize) -> Result<bool> {
+    ensure!(depth < 48, "conditional schema nesting too deep");
+    if [
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minLength",
+        "maxLength",
+        "pattern",
+        "format",
+        "enum",
+        "const",
+        "x-omg-max-bytes",
+    ]
+    .iter()
+    .any(|k| node.get(*k).is_some())
+        || node["type"]
+            .as_str()
+            .into_iter()
+            .chain(
+                node["type"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str),
+            )
+            .any(|t| matches!(t, "integer" | "number" | "boolean" | "string" | "null"))
+    {
+        return Ok(true);
+    }
+    for branch in node["allOf"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(follow(document, node)?.map(|(target, _)| target))
+    {
+        if scalar_constraints(document, branch, depth + 1)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn declare(
     document: &Value,
     node: &Value,
@@ -174,7 +221,12 @@ fn declare(
                 Declared {
                     kind: "array bound",
                     exempt: false,
-                    identity: identity(&key, scope),
+                    // Keep conditional arms within the defining component distinct.
+                    // Another reference to that same bound shares its evidence.
+                    identity: match scope {
+                        Some((component, start)) => format!("{component}{}", &key[start..]),
+                        None => key,
+                    },
                 },
             );
         }
@@ -279,6 +331,17 @@ fn declare(
     }
     for keyword in ["then", "else"] {
         if let Some(child) = node.get(keyword).filter(|c| c.is_object()) {
+            if node.get("if").is_some() && scalar_constraints(document, child, 0)? {
+                let path = format!("{key}/{keyword}");
+                out.insert(
+                    path.clone(),
+                    Declared {
+                        kind: "conditional arm",
+                        exempt: exempt(document, child),
+                        identity: path,
+                    },
+                );
+            }
             declare(
                 document,
                 child,
@@ -386,7 +449,7 @@ fn reach(
     if let Some(condition) = node.get("if") {
         let keyword = if matches(condition)? { "then" } else { "else" };
         if let Some(branch) = node.get(keyword).filter(|b| b.is_object()) {
-            if ctx.walked.is_none() {
+            if ctx.counts(at) {
                 out.insert(format!("{key}/{keyword}"));
             }
             reach(

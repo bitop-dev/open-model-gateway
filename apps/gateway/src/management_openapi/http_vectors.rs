@@ -388,6 +388,7 @@ pub(super) struct Notes {
     /// Non-decisive candidates that were not sent (counted, never silent).
     pub(super) minor: usize,
     implied: usize,
+    pub(super) dominated_patterns: usize,
     /// Locations whose vectors cannot be trusted (unbounded patterns without
     /// candidates, one-sided candidates).
     pub(super) problems: Vec<String>,
@@ -430,6 +431,12 @@ impl Notes {
     }
     /// One line, counts only: never a candidate or a location's value.
     fn report(&self, method: &str, template: &str) {
+        if self.dominated_patterns > 0 {
+            eprintln!(
+                "{method} {template}: {} finite pattern edges implied by tighter length limits",
+                self.dominated_patterns
+            );
+        }
         if self.implied > 0 {
             eprintln!(
                 "{method} {template}: {} boundary pairs also refused by another constraint",
@@ -1074,7 +1081,7 @@ const STRADDLE: &str = "supplied candidates must straddle the boundary: include 
 /// Do the `(candidate, schema verdict)` pairs hold an accepted value and a
 /// refused one within edit distance 1 of it? Two candidates far apart (`0` and
 /// sixteen digits) prove nothing about WHERE the boundary lies.
-fn straddles(nodes: &[&Value], verdicts: &[(String, bool)]) -> bool {
+fn straddles(nodes: &[&Value], verdicts: &[(String, bool)], notes: &mut Notes) -> bool {
     // For anchored patterns with a finite maximum, require the length edge.
     // HIR literals are UTF-8 bytes, but JSON Schema measures Unicode scalars.
     fn width(hir: &regex_syntax::hir::Hir) -> Option<usize> {
@@ -1110,6 +1117,16 @@ fn straddles(nodes: &[&Value], verdicts: &[(String, bool)]) -> bool {
             width(&hir)
         })
         .min();
+    let maximum = maximum.map(|width| {
+        let cap = nodes
+            .iter()
+            .flat_map(|node| [node["maxLength"].as_u64(), node[MAX_BYTES].as_u64()])
+            .flatten()
+            .filter_map(|n| usize::try_from(n).ok())
+            .fold(width, usize::min);
+        notes.dominated_patterns += usize::from(cap < width);
+        cap
+    });
     fn one_edit(a: &str, b: &str) -> bool {
         let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
         let (short, long) = if a.len() <= b.len() {
@@ -1427,7 +1444,15 @@ fn scalar_mutations(
                 out.push((kind, json!(candidate)));
             }
         }
-        for format in strings(nodes, "format") {
+        let formats = strings(nodes, "format");
+        if formats.contains("uuid") && formats.contains("uri") {
+            out.push(("format violation", json!("urn:example:resource")));
+            out.push((
+                "format violation",
+                json!("123e4567e89b12d3a456426614174000"),
+            ));
+        }
+        for format in formats {
             let bad = format_violations(format)
                 .with_context(|| format!("no request violation vectors for format {format}"))?;
             for candidate in bad {
@@ -1472,6 +1497,28 @@ fn render(value: &Value) -> String {
         Value::String(text) => text.clone(),
         other => other.to_string(),
     }
+}
+
+/// Gather the possible wire types before a typed value can select a union arm.
+fn query_type_nodes<'a>(
+    document: &'a Value,
+    schema: &'a Value,
+    out: &mut Vec<&'a Value>,
+    depth: usize,
+) -> Result<()> {
+    ensure!(depth < 16, "query schema nesting too deep");
+    for node in chain(document, schema)? {
+        out.push(node);
+        for branch in ["allOf", "anyOf", "oneOf"]
+            .iter()
+            .flat_map(|k| node[k].as_array().into_iter().flatten())
+            .chain(node.get("then"))
+            .chain(node.get("else"))
+        {
+            query_type_nodes(document, branch, out, depth + 1)?;
+        }
+    }
+    Ok(())
 }
 
 /// A raw query string value as the typed JSON the schema describes (query
@@ -1588,12 +1635,24 @@ pub(super) fn query_plan(
             .map(|(_, v)| v.as_str())
             .context("every documented query parameter needs a valid base or seed value")?;
         let mut nodes = Vec::new();
-        let kinds = {
-            applicable(document, schema, &json!(raw), &mut nodes, 0)?;
-            types(&nodes)
+        query_type_nodes(document, schema, &mut nodes, 0)?;
+        let kinds = types(&nodes);
+        let wire_value = |raw: &str| -> Result<Value> {
+            let typed = coerce(&kinds, raw);
+            // A numeric-looking value may already satisfy a string arm.
+            if !typed.is_string()
+                && kinds.contains("string")
+                && valid(document, schema, &json!(raw))?
+            {
+                return Ok(json!(raw));
+            }
+            Ok(typed)
         };
+        let typed = wire_value(raw)?;
+        nodes.clear();
+        applicable(document, schema, &typed, &mut nodes, 0)?;
         ensure!(
-            valid(document, schema, &coerce(&kinds, raw))?,
+            valid(document, schema, &typed)?,
             "the valid base value of a query parameter must satisfy its schema"
         );
         let mut seen = BTreeSet::from([raw.to_owned()]);
@@ -1610,14 +1669,8 @@ pub(super) fn query_plan(
             .filter(|(n, _)| n == name)
             .map(|(_, v)| v.as_str())
             .collect();
-        let mut mutations = scalar_mutations(
-            document,
-            schema,
-            &nodes,
-            &coerce(&kinds, raw),
-            true,
-            supplied.len(),
-        )?;
+        let mut mutations =
+            scalar_mutations(document, schema, &nodes, &typed, true, supplied.len())?;
         if mutations.needs_candidates {
             notes.problems.push(format!(
                 "query parameter {name}: the pattern has no derivable length bounds; supply boundary candidates or annotate it with {PATTERN_BOUNDARIES}"
@@ -1631,14 +1684,9 @@ pub(super) fn query_plan(
         if !supplied.is_empty() {
             let verdicts = supplied
                 .iter()
-                .map(|v| {
-                    Ok((
-                        v.to_string(),
-                        accepts(document, schema, &coerce(&kinds, v))?,
-                    ))
-                })
+                .map(|v| Ok((v.to_string(), accepts(document, schema, &wire_value(v)?)?)))
                 .collect::<Result<Vec<_>>>()?;
-            if !straddles(&nodes, &verdicts) {
+            if !straddles(&nodes, &verdicts, &mut notes) {
                 notes
                     .problems
                     .push(format!("query parameter {name}: {STRADDLE}"));
@@ -1682,7 +1730,7 @@ pub(super) fn query_plan(
                 {
                     serde_json::from_str(&raw)?
                 } else {
-                    coerce(&kinds, &raw)
+                    wire_value(&raw)?
                 };
                 let accept = accepts(document, schema, &typed)?;
                 out.push(QueryCase {
@@ -2362,16 +2410,15 @@ impl Walk<'_> {
         }
         if !supplied.is_empty() {
             self.candidates_used.insert(here.clone());
-            let verdicts = supplied
-                .iter()
-                .map(|candidate| {
-                    Ok((
-                        render(candidate),
-                        accepts(self.document, schema, candidate)?,
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            if !straddles(&nodes, &verdicts) {
+            let mut verdicts = Vec::new();
+            for candidate in &supplied {
+                let leaf = accepts(self.document, schema, candidate)?;
+                let body = set(&self.valid_body, path, Some(candidate.clone()));
+                if accepts(self.document, self.root_schema, &body)? == leaf {
+                    verdicts.push((render(candidate), leaf));
+                }
+            }
+            if !straddles(&nodes, &verdicts, &mut self.notes) {
                 self.notes.problems.push(format!("{here}: {STRADDLE}"));
             }
             for candidate in supplied {

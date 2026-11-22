@@ -2992,3 +2992,166 @@ fn dependent_property_coverage_needs_a_base_containing_both_names() {
         |b| b == &json!({"period":"month"})
     ));
 }
+
+#[test]
+fn boundary_review_supplied_pairs_require_whole_request_witnesses() {
+    let schema = json!({"type":"object","properties":{"n":{"type":"string","pattern":"^(0|[1-9][0-9]{0,14})$"}},
+        "not":{"properties":{"n":{"const":"1".repeat(15)}}}});
+    let document = body_only(schema);
+    let plan = |digit: &str| {
+        super::http_vectors::body_plan(
+            &document,
+            &document["paths"][TEMPLATE]["post"],
+            &json!({"n":"1"}),
+            &[],
+            &[
+                ("/n".into(), json!(digit.repeat(15))),
+                ("/n".into(), json!(digit.repeat(16))),
+            ],
+        )
+    };
+    assert!(
+        format!("{:#}", plan("1").err().expect("both bodies are invalid")).contains("straddle")
+    );
+    let cases = plan("2").unwrap().cases;
+    for (length, accepted) in [(15, true), (16, false)] {
+        assert!(has(
+            &cases,
+            "/n",
+            "supplied candidate",
+            accepted,
+            |b| b["n"] == "2".repeat(length)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn boundary_review_formats_each_disagree_with_a_single_format_handler() {
+    let document = body_only(json!({"type":"string","format":"uri","allOf":[{"format":"uuid"}]}));
+    let base = json!("urn:uuid:123e4567-e89b-12d3-a456-426614174000");
+    let uri = |v: &String| reqwest::Url::parse(v).is_ok();
+    let uuid = |v: &String| uuid::Uuid::parse_str(v).is_ok();
+    let cases = cases_of(&document, &base, &[]).unwrap();
+    for (single, other) in [
+        (uri as fn(&String) -> bool, uuid as fn(&String) -> bool),
+        (uuid, uri),
+    ] {
+        let error = message(run_judged(&judge(single), &document, base.clone(), &[]).await);
+        assert!(
+            error.contains("format violation")
+                && error.contains("schema refuses but handler accepts"),
+            "{error}"
+        );
+        assert!(cases.iter().any(|case| {
+            !case.accept
+                && case.kind == "format violation"
+                && case
+                    .body
+                    .as_str()
+                    .is_some_and(|v| single(&v.to_string()) && !other(&v.to_string()))
+        }));
+    }
+    run_judged(
+        &judge::<String>(|v| reqwest::Url::parse(v).is_ok() && uuid::Uuid::parse_str(v).is_ok()),
+        &document,
+        base,
+        &[],
+    )
+    .await
+    .unwrap();
+}
+
+#[test]
+fn boundary_review_array_bounds_are_specific_to_each_conditional_arm() {
+    let document = body_only(
+        json!({"type":"object","properties":{"flag":{"type":"boolean"},"xs":{"type":["null","array"],"items":{"type":"string"}}},
+        "if":{"properties":{"flag":{"const":true}}},"then":{"properties":{"xs":{"maxItems":2}}},"else":{"properties":{"xs":{"maxItems":5}}}}),
+    );
+    let mut reached = reach_of(&document, &json!({"flag":true,"xs":["a"]}), &[]);
+    reached.extend(reach_of(&document, &json!({"flag":false,"xs":null}), &[]));
+    assert!(
+        unreached_paths(&document, &reached).contains(&"/else/properties/xs/maxItems".to_owned())
+    );
+    reached.extend(reach_of(&document, &json!({"flag":false,"xs":["b"]}), &[]));
+    assert!(unreached_paths(&document, &reached).is_empty());
+
+    let common = json!({"$ref":"#/components/schemas/Shared"});
+    let mut document = body_only(json!({
+        "type":"object","properties":{"flag":{"type":"boolean"},"xs":common},
+        "if":{"properties":{"flag":{"const":true}}},"then":{"properties":{"xs":common}}
+    }));
+    document["components"]["schemas"]["Shared"] = json!({
+        "type":"array","maxItems":2,"items":{"type":"string"}
+    });
+    let reached = reach_of(&document, &json!({"flag":false,"xs":["a"]}), &[]);
+    assert!(unreached_paths(&document, &reached).is_empty());
+}
+
+#[test]
+fn boundary_review_scalar_conditional_coverage_requires_both_arms() {
+    let document = body_only(
+        json!({"type":"array","items":{"type":"integer","if":{"maximum":0},"then":{"minimum":-3},"else":{"maximum":8}}}),
+    );
+    let negative = reach_of(&document, &json!([-1]), &[]);
+    assert!(unreached_paths(&document, &negative).contains(&"/items/else".to_owned()));
+    let positive = reach_of(&document, &json!([1]), &[]);
+    assert!(unreached_paths(&document, &positive).contains(&"/items/then".to_owned()));
+    assert!(unreached_paths(&document, &reach_of(&document, &json!([-1, 1]), &[])).is_empty());
+}
+
+#[test]
+fn boundary_review_finite_pattern_can_be_dominated_by_length() {
+    for (cap, edge) in [(Some(4), 4), (None, 8)] {
+        let mut schema = json!({"type":"string","pattern":"^(a|a{2,8})$"});
+        if let Some(cap) = cap {
+            schema["maxLength"] = json!(cap);
+        }
+        let document = body_only(schema);
+        let plan = super::http_vectors::body_plan(
+            &document,
+            &document["paths"][TEMPLATE]["post"],
+            &json!("a"),
+            &[],
+            &[
+                ("(root)".into(), json!("a".repeat(edge))),
+                ("(root)".into(), json!("a".repeat(edge + 1))),
+            ],
+        )
+        .unwrap();
+        assert_eq!(plan.notes.dominated_patterns, usize::from(cap.is_some()));
+    }
+}
+
+#[tokio::test]
+async fn boundary_review_query_uses_typed_value_to_select_the_integer_arm() {
+    let mut document = query_document();
+    document["paths"][TEMPLATE]["get"]["parameters"][0]["schema"] =
+        json!({"type":"string","anyOf":[{"type":"integer"},{"type":"string","maxLength":4}]});
+    let cases = query_cases(&document, &document["paths"][TEMPLATE]["get"], &base(), &[]).unwrap();
+    assert!(
+        cases
+            .iter()
+            .any(|c| c.param == "limit" && c.kind == "maxLength+1" && !c.accept)
+    );
+    document["paths"][TEMPLATE]["get"]["parameters"][0]["schema"] =
+        json!({"oneOf":[{"type":"integer","minimum":1,"maximum":4242},{"type":"boolean"}]});
+    let cases = query_cases(&document, &document["paths"][TEMPLATE]["get"], &base(), &[]).unwrap();
+    assert!(
+        cases
+            .iter()
+            .any(|c| c.param == "limit" && c.edit == Edit::Set("true".into()) && c.accept)
+    );
+    assert!(
+        cases
+            .iter()
+            .any(|c| c.param == "limit" && c.kind == "maximum+1" && !c.accept)
+    );
+    document["paths"][TEMPLATE]["get"]["parameters"][0]["schema"] =
+        json!({"type":"integer","minimum":1,"anyOf":[{"type":"integer","maximum":4242}]});
+    run(&query_app(EXACT), &document).await.unwrap();
+    let text = message(run(&query_app(Handler { max: 4243, ..EXACT }), &document).await);
+    assert!(
+        text.contains("maximum+1") && text.contains("schema refuses but handler accepts"),
+        "{text}"
+    );
+}
