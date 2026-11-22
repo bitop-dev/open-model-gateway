@@ -109,21 +109,89 @@ pub async fn plan(
     candidates: &[Deployment],
     request_id: Uuid,
 ) -> Result<RoutePlan, InferenceError> {
-    if candidates.len() > MAX_CANDIDATES {
-        return Err(InferenceError::Configuration);
+    let inputs = RouteInputs::load(store, principal, model, candidates).await?;
+    order_candidates(
+        &inputs.policy,
+        inputs.rows,
+        weighted_order_seed(principal, model, request_id),
+    )
+}
+
+/// Reuse the read-only inputs within a batch scan. Dispatch loads its own
+/// inputs and uses the same ordering with the current eligible routes.
+pub(crate) struct RouteInputs {
+    policy: RoutingPolicy,
+    rows: Vec<Candidate>,
+}
+
+impl RouteInputs {
+    pub(crate) async fn load(
+        store: &Store,
+        principal: &Principal,
+        model: &str,
+        candidates: &[Deployment],
+    ) -> Result<Self, InferenceError> {
+        if candidates.len() > MAX_CANDIDATES {
+            return Err(InferenceError::Configuration);
+        }
+        let ids: Vec<_> = candidates.iter().map(|d| d.id).collect();
+        validate_ids(&ids)?;
+        let (policy, rows) = if store.caches.enabled() {
+            cached_inputs(store, principal, model, &ids).await?
+        } else {
+            live_inputs(store, principal, model, &ids).await?
+        };
+        Ok(Self { policy, rows })
     }
-    let ids: Vec<_> = candidates.iter().map(|d| d.id).collect();
-    validate_ids(&ids)?;
-    let (policy, rows) = if store.caches.enabled() {
-        cached_inputs(store, principal, model, &ids).await?
-    } else {
-        live_inputs(store, principal, model, &ids).await?
-    };
+
+    fn subset(&self, ids: &HashSet<Uuid>) -> Vec<Candidate> {
+        self.rows
+            .iter()
+            .filter(|row| ids.contains(&row.deployment_id))
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn plan_for(
+        &self,
+        principal: &Principal,
+        model: &str,
+        request_id: Uuid,
+        ids: &HashSet<Uuid>,
+    ) -> Result<RoutePlan, InferenceError> {
+        order_candidates(
+            &self.policy,
+            self.subset(ids),
+            weighted_order_seed(principal, model, request_id),
+        )
+    }
+
+    /// The scheduler only uses the first draw. Skip ordering the remaining
+    /// routes when estimating an unpinned weighted line.
+    pub(crate) fn first_weighted(
+        &self,
+        principal: &Principal,
+        model: &str,
+        request_id: Uuid,
+        ids: &HashSet<Uuid>,
+    ) -> Result<Option<Uuid>, InferenceError> {
+        if self.policy.strategy != "weighted" {
+            return Ok(None);
+        }
+        let candidates = eligible_candidates(&self.policy, self.subset(ids))?;
+        let mut rng = StdRng::from_seed(weighted_order_seed(principal, model, request_id));
+        Ok(Some(
+            candidates[weighted_index(&candidates, &mut rng)?].deployment_id,
+        ))
+    }
+}
+
+fn weighted_order_seed(principal: &Principal, model: &str, request_id: Uuid) -> [u8; 32] {
     let mut seed = Sha256::new();
     seed.update(principal.workspace_id.as_bytes());
     seed.update(request_id.as_bytes());
     seed.update(model.as_bytes());
-    order_candidates(&policy, rows, seed.finalize().into())
+    seed.finalize().into()
 }
 
 /// Planning inputs read live: the model's routing policy (as the workspace
@@ -303,11 +371,10 @@ fn validate_ids(ids: &[Uuid]) -> Result<(), InferenceError> {
     Ok(())
 }
 
-fn order_candidates(
+fn eligible_candidates(
     policy: &RoutingPolicy,
     mut candidates: Vec<Candidate>,
-    seed: [u8; 32],
-) -> Result<RoutePlan, InferenceError> {
+) -> Result<Vec<Candidate>, InferenceError> {
     policy.validate()?;
     validate_ids(
         &candidates
@@ -344,18 +411,34 @@ fn order_candidates(
         return Err(InferenceError::RouteCoolingDown(seconds));
     }
     // Stable sorting retains repository order when priority values tie.
+    if candidates.is_empty() {
+        return Err(InferenceError::ModelUnavailable);
+    }
     candidates.sort_by_key(|c| c.priority);
+    Ok(candidates)
+}
+
+fn weighted_index(candidates: &[Candidate], rng: &mut StdRng) -> Result<usize, InferenceError> {
+    let tier = candidates
+        .iter()
+        .take_while(|c| c.priority == candidates[0].priority)
+        .count();
+    let weights = WeightedIndex::new(candidates[..tier].iter().map(|c| c.weight as u32))
+        .map_err(|_| InferenceError::Configuration)?;
+    Ok(weights.sample(rng))
+}
+
+fn order_candidates(
+    policy: &RoutingPolicy,
+    candidates: Vec<Candidate>,
+    seed: [u8; 32],
+) -> Result<RoutePlan, InferenceError> {
+    let mut candidates = eligible_candidates(policy, candidates)?;
     let mut ordered = Vec::with_capacity(candidates.len());
     if policy.strategy == "weighted" {
         let mut rng = StdRng::from_seed(seed);
         while !candidates.is_empty() {
-            let tier = candidates
-                .iter()
-                .take_while(|c| c.priority == candidates[0].priority)
-                .count();
-            let weights = WeightedIndex::new(candidates[..tier].iter().map(|c| c.weight as u32))
-                .map_err(|_| InferenceError::Configuration)?;
-            ordered.push(candidates.remove(weights.sample(&mut rng)));
+            ordered.push(candidates.remove(weighted_index(&candidates, &mut rng)?));
         }
     } else {
         ordered = candidates;
