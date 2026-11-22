@@ -312,6 +312,18 @@ async fn every_claim_of_a_batch_moves_its_epoch_on(pool: PgPool) {
         .execute(&w.f.store.pool)
         .await;
     assert!(back.is_err());
+
+    // A renewal reaching the database after release cannot postpone takeover.
+    again.release(&w.f.store).await.unwrap();
+    assert_eq!(
+        again.renew(&w.f.store, 60.0).await.unwrap(),
+        Renewed::Fenced
+    );
+    let replacements = claim_gateway(&w.f.store, Uuid::new_v4(), 60.0, 1, &[])
+        .await
+        .unwrap();
+    assert_eq!(replacements.len(), 1);
+    assert_eq!(replacements[0].1.epoch, again.epoch + 1);
 }
 
 #[dbtest::test]

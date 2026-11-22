@@ -165,7 +165,7 @@ impl BatchFence {
         store: &Store,
         lease_seconds: f64,
     ) -> Result<Renewed, sqlx::Error> {
-        let row: Option<(bool, bool)> = sqlx::query_as("UPDATE async_jobs SET runner_lease_until=clock_timestamp()+make_interval(secs=>$4) WHERE id=$1 AND runner_id=$2 AND runner_epoch=$3 RETURNING cancel_requested_at IS NOT NULL,settled_at IS NOT NULL")
+        let row: Option<(bool, bool)> = sqlx::query_as("UPDATE async_jobs SET runner_lease_until=clock_timestamp()+make_interval(secs=>$4) WHERE id=$1 AND runner_id=$2 AND runner_epoch=$3 AND runner_lease_until IS NOT NULL RETURNING cancel_requested_at IS NOT NULL,settled_at IS NOT NULL")
             .bind(self.job).bind(self.runner).bind(self.epoch).bind(lease_seconds)
             .fetch_optional(&store.pool).await.map_err(job_storage)?;
         Ok(match row {
