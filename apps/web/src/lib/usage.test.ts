@@ -82,7 +82,7 @@ describe("exact money and measures", () => {
   it("draws with Numbers but labels drawn values from the exact strings, money rounded for reading", () => {
     const format = chartLabeler("spend", ["9007199254740993", "3", "4035947", null]);
     expect(format(chartNumber("spend", "9007199254740993"))).toBe("$9,007,199,254.74");
-    // Axis/peak labels follow the money display rule (review #3/#12): "$4.04", never "$4.035947"; sub-cent stays non-zero.
+    // Axis and peak labels display cents and preserve nonzero sub-cent amounts.
     expect(format(4035947)).toBe("$4.04");
     expect(format(3)).toBe("$0.000003");
     expect(format(Number.NaN)).toBe("No data");
