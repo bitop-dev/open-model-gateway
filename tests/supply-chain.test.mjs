@@ -1718,8 +1718,10 @@ fail() {
   exit 1
 }
 
-args=("$@")
-artifact=\${args[-1]}
+# Record the invocation before any local refusal so a premature call is observable.
+jq -nc --args '["cosign", $ARGS.positional[]]' -- "$@" >>"$FIXTURE_DIR/calls"
+
+artifact=\${!#}
 bundle_path=
 identity=
 issuer=
@@ -1744,20 +1746,17 @@ if [[ ! $artifact =~ ^sha256:[0-9a-f]{64}$ || -e $artifact ]]; then
   fail 'expected a digest, not a file'
 fi
 
-# One jq invocation records both contracts and checks the fixture payload.
+# Read the validated bundle once for the metadata record and payload check.
 cd -P .
 records=$(jq -nc --arg cwd "$PWD" --rawfile bundle "$bundle_path" \\
-  --arg artifact "$artifact" --arg identity "$identity" --arg issuer "$issuer" --args '
-  ["cosign", $ARGS.positional[]],
+  --arg artifact "$artifact" --arg identity "$identity" --arg issuer "$issuer" '
   {$cwd, $bundle, $artifact, $identity, $issuer},
   ($bundle | fromjson | .dsseEnvelope.payload | . == "fixture-payload" or . == "fixture-second")
-' -- "\${args[@]}")
+')
 {
-  IFS= read -r call
   IFS= read -r blob
   IFS= read -r valid
 } <<<"$records"
-printf '%s\\n' "$call" >>"\${FIXTURE_DIR}/calls"
 printf '%s\\n' "$blob" >>"\${FIXTURE_DIR}/blob-calls"
 [[ $valid == true ]] || fail 'fixture tampered payload or bad digest'
 
@@ -1960,6 +1959,15 @@ test("collapsed child discovery 'no signatures found' is never artifact-binding 
   try {
     // GetBundles can swallow a transport error and fall back to this exact text.
     assert.notEqual(f.run(script, { CHILD_ERROR: "no signatures found" }).status, 0);
+  } finally { f.cleanup(); }
+});
+
+test("the offline verifier records attempts even when its inputs are refused", () => {
+  const f = probeFixture();
+  try {
+    const result = f.run('cosign verify-blob --bundle ./bundle.json "$DIGEST"', {}, f.dir);
+    assert.notEqual(result.status, 0);
+    assert.deepEqual(f.calls(), [["cosign", "verify-blob", "--bundle", "./bundle.json", f.env.DIGEST]]);
   } finally { f.cleanup(); }
 });
 
