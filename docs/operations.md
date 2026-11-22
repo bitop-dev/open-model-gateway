@@ -372,7 +372,20 @@ To debug a running container without a shell, use `docker exec CONTAINER /usr/lo
 
 ## Metrics
 
-Metrics are served only when `GATEWAY_METRICS_ADDR` is set. They use a dedicated listener that answers `GET /metrics` with OpenMetrics text (`application/openmetrics-text; version=1.0.0`) and returns 404 for every other path. Metrics are never on the public port and never behind the SPA fallback. The endpoint has no authentication, so bind it to loopback or a private scrape network. In the staging Compose file the variable is passed through but empty by default, and Caddy never routes to it. Prometheus 2.x and 3.x negotiate OpenMetrics automatically. The exposition also parses as classic text: `promtool check metrics` reports only the expected HELP lint for OpenMetrics `_total` naming.
+Metrics are served only when `GATEWAY_METRICS_ADDR` is set. They use a dedicated listener that answers `GET /metrics` with OpenMetrics text (`application/openmetrics-text; version=1.0.0`) and returns 404 for every other path. Metrics are never on the public port and never behind the SPA fallback. The endpoint has no authentication, so bind it to loopback or a private scrape network. In the staging Compose file the variable is passed through but empty by default, and Caddy never routes to it. Prometheus 2.x and 3.x negotiate OpenMetrics automatically.
+
+To verify a scrape, configure Prometheus to use the metrics listener (see [the example scrape config](../deploy/monitoring/prometheus.example.yml)). Check that the target is **UP** with no scrape error on the Prometheus Targets page, or confirm that `up{job="open-model-gateway"}` is `1` for the intended instance.
+
+To lint the response body separately, run the following from a host that can reach the metrics listener. Substitute the configured address if needed.
+
+```sh
+curl -fsS http://127.0.0.1:9464/metrics -o gateway-metrics.om &&
+  promtool check metrics < gateway-metrics.om
+```
+
+`promtool check metrics` parses the body as classic Prometheus text and applies metadata, naming and unit conventions. With promtool 3.5.1, a parsing error exits with status 1 and lint findings exit with status 3.
+
+Expect `no help text` on some `_total` samples because OpenMetrics puts HELP on the family name without that suffix. When the usage rollup counter is present, the linter also reports `gateway_usage_rollup_hours_total use base unit "seconds" instead of "hours"`. The counter counts hourly buckets processed, with the `reason` label set to `new` or `changed`. Investigate parsing errors and unexpected lint findings separately from target health.
 
 Labels are deliberately low-cardinality:
 
