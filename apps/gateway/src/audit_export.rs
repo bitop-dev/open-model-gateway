@@ -2246,8 +2246,8 @@ mod tests {
     }
 
     /// The per-delivery logger emits host-free OTLP warnings on transitions
-    /// into and out of failure. Idle means backoff and leaves the failure
-    /// state unchanged. Webhook warnings name the host on every failure.
+    /// into and out of failure. Idle leaves the failure state unchanged.
+    /// Webhook warnings name the host on every failure.
     #[test]
     fn otlp_delivery_log_is_transition_only_and_host_free_but_webhook_delivery_log_still_names_the_host()
      {

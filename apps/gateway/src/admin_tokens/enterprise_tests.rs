@@ -1694,8 +1694,7 @@ async fn a_forged_future_created_at_cannot_make_a_token_practically_unexpiring(p
     );
 }
 
-/// Owner cleanup scrubs the token's last-use address, which is retained
-/// for misuse investigations until revocation or owner cleanup.
+/// Owner cleanup revokes the token and scrubs its recorded last-use address.
 #[dbtest::test]
 async fn cleanup_scrubs_the_last_used_address(pool: PgPool) {
     let store = Store::new(pool.clone());
