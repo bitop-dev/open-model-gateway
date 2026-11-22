@@ -189,12 +189,15 @@ pub(crate) fn exclusive() -> Lock {
 
 /// Keeps spans created from now on recorded, until dropped (see
 /// [`SPANS_KEPT`]). Installs the subscriber, like [`exclusive`], but takes no lock.
+#[cfg(feature = "integration-tests")]
 pub(crate) struct Spans(());
+#[cfg(feature = "integration-tests")]
 impl Drop for Spans {
     fn drop(&mut self) {
         SPANS_KEPT.fetch_sub(1, Ordering::AcqRel);
     }
 }
+#[cfg(feature = "integration-tests")]
 pub(crate) fn keep_spans() -> Spans {
     ensure_global_subscriber();
     SPANS_KEPT.fetch_add(1, Ordering::AcqRel);

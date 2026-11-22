@@ -131,7 +131,7 @@ impl Metrics {
     }
 
     /// Refused records counted so far (tests).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "integration-tests"))]
     pub(crate) fn audit_export_rejected_count(&self) -> u64 {
         self.audit_export_rejected_records.get()
     }

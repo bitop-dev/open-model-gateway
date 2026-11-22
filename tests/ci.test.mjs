@@ -55,6 +55,7 @@ function validateGraph(data) {
   assert.deepEqual(runs(data.jobs["gateway-lint"]), [
     "cargo fmt --all -- --check", "cargo clippy --workspace --all-targets --all-features -- -D warnings",
     "cargo clippy -p open-model-gateway --bins --lib --locked -- -D warnings",
+    "cargo clippy -p open-model-gateway --all-targets --locked -- -D warnings",
   ]);
 }
 

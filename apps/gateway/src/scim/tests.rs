@@ -1,6 +1,5 @@
 use super::*;
 use axum::{body::Body, http::Method};
-use gateway_datetime_compat::UtcInstant;
 use tower::ServiceExt;
 
 const TOKEN: &str = "scim-test-token-0123456789abcdefghijklmnop";
@@ -412,6 +411,7 @@ fn group_patch_semantics_cover_member_paths() {
 #[cfg(feature = "integration-tests")]
 mod database {
     use super::*;
+    use gateway_datetime_compat::UtcInstant;
     use sqlx::PgPool;
 
     async fn person(pool: &PgPool, email: &str, manual: Option<&str>) -> Uuid {
