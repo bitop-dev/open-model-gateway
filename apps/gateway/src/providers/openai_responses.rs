@@ -196,7 +196,16 @@ fn mismatch_usage(snapshot: &Value, frame: &[u8]) -> Result<Usage> {
         // missing count, since only directly reported counters are evidence.
         let contradictory = match (observed.input_tokens, observed.output_tokens) {
             (Some(input), Some(output)) => input.checked_add(output) != Some(total),
-            (input, output) => input.or(output).is_some_and(|count| count > total),
+            (_, output) => {
+                let input_floor = observed
+                    .billing
+                    .ok_or(InferenceError::InvalidUpstream)?
+                    .input_lower_bound()
+                    .map_err(|_| InferenceError::InvalidUpstream)?;
+                input_floor
+                    .checked_add(output.unwrap_or(0))
+                    .is_none_or(|floor| floor > total)
+            }
         };
         if contradictory {
             return Err(InferenceError::InvalidUpstream);

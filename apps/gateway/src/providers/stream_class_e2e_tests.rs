@@ -464,74 +464,106 @@ async fn responses_terminal_status_mismatch_preserves_valid_usage(pool: PgPool) 
         snapshot.as_object_mut().unwrap().remove("usage");
         let mut wire_snapshot = snapshot.to_string();
         wire_snapshot.pop(); // Append raw fields before the closing brace.
-        for (label, usage, input, output) in [
+        // The fixture prices input and output at one micro-USD per token.
+        for (label, usage, input, output, expected_floor) in [
             (
                 "reported",
                 r#","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}"#,
                 Some(3),
                 Some(2),
+                5,
             ),
             (
                 "partial input",
                 r#","usage":{"input_tokens":3,"total_tokens":5}"#,
                 Some(3),
                 None,
+                3,
             ),
             (
                 "partial output",
                 r#","usage":{"output_tokens":2,"total_tokens":5}"#,
                 None,
                 Some(2),
+                2,
             ),
             (
                 "explicit zeros",
                 r#","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}"#,
                 Some(0),
                 Some(0),
+                0,
             ),
-            ("missing", "", None, None),
-            ("total only", r#","usage":{"total_tokens":5}"#, None, None),
+            ("missing", "", None, None, 0),
+            (
+                "total only",
+                r#","usage":{"total_tokens":5}"#,
+                None,
+                None,
+                0,
+            ),
             (
                 "invalid",
                 r#","usage":{"input_tokens":3,"output_tokens":-2}"#,
                 None,
                 None,
+                0,
             ),
             (
                 "contradictory total",
                 r#","usage":{"input_tokens":5000,"output_tokens":2,"total_tokens":5001}"#,
                 None,
                 None,
+                0,
             ),
             (
                 "impossible partial",
                 r#","usage":{"output_tokens":2,"total_tokens":1}"#,
                 None,
                 None,
+                0,
+            ),
+            (
+                "cache evidence exceeds partial total",
+                r#","usage":{"output_tokens":2,"input_tokens_details":{"cached_tokens":5000},"total_tokens":2}"#,
+                None,
+                None,
+                0,
+            ),
+            (
+                "cache evidence fits partial total",
+                r#","usage":{"output_tokens":2,"input_tokens_details":{"cached_tokens":5000},"total_tokens":5002}"#,
+                None,
+                Some(2),
+                5002,
             ),
             (
                 "duplicate count",
                 r#","usage":{"input_tokens":null,"input_\u0074okens":5000,"output_tokens":2,"total_tokens":5002}"#,
                 None,
                 None,
+                0,
             ),
             (
                 "duplicate usage",
                 r#","usage":null,"usage":{"input_tokens":3,"output_tokens":2}"#,
                 None,
                 None,
+                0,
             ),
             (
                 "duplicate cache count",
                 r#","usage":{"input_tokens":3,"output_tokens":2,"input_tokens_details":{"cached_tokens":0,"cached_tokens":1}}"#,
                 None,
                 None,
+                0,
             ),
             (
                 "above admission bounds",
                 r#","usage":{"input_tokens":5000,"output_tokens":2,"total_tokens":5002}"#,
                 Some(5000),
                 Some(2),
+                5002,
             ),
         ] {
             let terminal =
@@ -577,8 +609,6 @@ async fn responses_terminal_status_mismatch_preserves_valid_usage(pool: PgPool) 
             .await
             .unwrap();
             assert!(admitted > 0, "{at}: the fixture must reserve money");
-            // This fixture prices both counts at one micro-USD per token.
-            let expected_floor = input.unwrap_or(0) + output.unwrap_or(0);
             let got = (
                 reserved_input,
                 reserved_output,
