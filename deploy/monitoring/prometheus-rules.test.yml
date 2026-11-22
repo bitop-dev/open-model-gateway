@@ -1,7 +1,7 @@
 # Run with promtool test rules; CI pins the executable and verifies its archive.
 rule_files:
   - prometheus-rules.yml
-evaluation_interval: 1m
+evaluation_interval: 30s
 tests:
   - name: missing accounting series never fires
     interval: 1m
@@ -30,27 +30,29 @@ tests:
   - name: one failure on existing counters
     interval: 1m
     input_series:
-      - series: gateway_accounting_failures_total{stage="route_lookup",cause="deadline_in_database",instance="gateway-a"}
+      - series: up{job="open-model-gateway",instance="gateway-a"}
+        values: 1+0x30
+      - series: gateway_accounting_failures_total{job="open-model-gateway",stage="route_lookup",cause="deadline_in_database",instance="gateway-a"}
         values: 1+0x14 2+0x15
-      - series: gateway_accounting_failures_total{stage="pool_acquire_and_begin",cause="deadline_in_database",instance="gateway-a"}
+      - series: gateway_accounting_failures_total{job="open-model-gateway",stage="pool_acquire_and_begin",cause="deadline_in_database",instance="gateway-a"}
         values: 1+0x14 2+0x15
-      - series: gateway_accounting_failures_total{stage="governance_storage",cause="deadline_in_database",instance="gateway-a"}
+      - series: gateway_accounting_failures_total{job="open-model-gateway",stage="governance_storage",cause="deadline_in_database",instance="gateway-a"}
         values: 1+0x14 2+0x15
-      - series: gateway_accounting_failures_total{stage="key_authentication",cause="deadline_in_database",instance="gateway-a"}
+      - series: gateway_accounting_failures_total{job="open-model-gateway",stage="key_authentication",cause="deadline_in_database",instance="gateway-a"}
         values: 1+0x14 2+0x15
-      - series: gateway_accounting_failures_total{stage="realtime_admission",cause="deadline_in_database",instance="gateway-a"}
+      - series: gateway_accounting_failures_total{job="open-model-gateway",stage="realtime_admission",cause="deadline_in_database",instance="gateway-a"}
         values: 1+0x14 2+0x15
-      - series: gateway_accounting_failures_total{stage="job_storage",cause="deadline_in_database",instance="gateway-a"}
+      - series: gateway_accounting_failures_total{job="open-model-gateway",stage="job_storage",cause="deadline_in_database",instance="gateway-a"}
         values: 1+0x14 2+0x15
-      - series: gateway_accounting_failures_total{stage="maintenance",cause="deadline_in_database",instance="gateway-a"}
+      - series: gateway_accounting_failures_total{job="open-model-gateway",stage="maintenance",cause="deadline_in_database",instance="gateway-a"}
         values: 1+0x14 2+0x15
-      - series: gateway_accounting_failures_total{stage="explicit_settlement",cause="deadline_in_database",instance="gateway-a"}
+      - series: gateway_accounting_failures_total{job="open-model-gateway",stage="explicit_settlement",cause="deadline_in_database",instance="gateway-a"}
         values: 1+0x14 2+0x15
-      - series: gateway_accounting_failures_total{stage="cancellation_settlement",cause="deadline_in_database",instance="gateway-a"}
+      - series: gateway_accounting_failures_total{job="open-model-gateway",stage="cancellation_settlement",cause="deadline_in_database",instance="gateway-a"}
         values: 1+0x14 2+0x15
-      - series: gateway_accounting_failures_total{stage="realtime_settlement",cause="deadline_in_database",instance="gateway-a"}
+      - series: gateway_accounting_failures_total{job="open-model-gateway",stage="realtime_settlement",cause="deadline_in_database",instance="gateway-a"}
         values: 1+0x14 2+0x15
-      - series: gateway_accounting_failures_total{stage="job_settlement",cause="deadline_in_database",instance="gateway-a"}
+      - series: gateway_accounting_failures_total{job="open-model-gateway",stage="job_settlement",cause="deadline_in_database",instance="gateway-a"}
         values: 1+0x14 2+0x15
     alert_rule_test:
       - eval_time: 14m
@@ -65,7 +67,8 @@ tests:
       - eval_time: 15m
         alertname: GatewaySettlementAccountingFailures
         exp_alerts: &critical_alerts
-          - exp_labels:
+          - &explicit_settlement_alert
+            exp_labels:
               stage: explicit_settlement
               cause: deadline_in_database
               severity: critical
@@ -106,7 +109,8 @@ tests:
       - eval_time: 20m
         alertname: GatewayAccountingFailures
         exp_alerts: &warning_alerts
-          - exp_labels:
+          - &route_lookup_alert
+            exp_labels:
               stage: route_lookup
               cause: deadline_in_database
               severity: warning
@@ -182,27 +186,29 @@ tests:
   - name: new series starts at its first failure
     interval: 1m
     input_series:
-      - series: gateway_accounting_failures_total{stage="route_lookup",cause="deadline_in_database",instance="gateway-a"}
+      - series: up{job="open-model-gateway",instance="gateway-a"}
+        values: 1+0x30
+      - series: gateway_accounting_failures_total{job="open-model-gateway",stage="route_lookup",cause="deadline_in_database",instance="gateway-a"}
         values: _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 1+0x15
-      - series: gateway_accounting_failures_total{stage="pool_acquire_and_begin",cause="deadline_in_database",instance="gateway-a"}
+      - series: gateway_accounting_failures_total{job="open-model-gateway",stage="pool_acquire_and_begin",cause="deadline_in_database",instance="gateway-a"}
         values: _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 1+0x15
-      - series: gateway_accounting_failures_total{stage="governance_storage",cause="deadline_in_database",instance="gateway-a"}
+      - series: gateway_accounting_failures_total{job="open-model-gateway",stage="governance_storage",cause="deadline_in_database",instance="gateway-a"}
         values: _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 1+0x15
-      - series: gateway_accounting_failures_total{stage="key_authentication",cause="deadline_in_database",instance="gateway-a"}
+      - series: gateway_accounting_failures_total{job="open-model-gateway",stage="key_authentication",cause="deadline_in_database",instance="gateway-a"}
         values: _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 1+0x15
-      - series: gateway_accounting_failures_total{stage="realtime_admission",cause="deadline_in_database",instance="gateway-a"}
+      - series: gateway_accounting_failures_total{job="open-model-gateway",stage="realtime_admission",cause="deadline_in_database",instance="gateway-a"}
         values: _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 1+0x15
-      - series: gateway_accounting_failures_total{stage="job_storage",cause="deadline_in_database",instance="gateway-a"}
+      - series: gateway_accounting_failures_total{job="open-model-gateway",stage="job_storage",cause="deadline_in_database",instance="gateway-a"}
         values: _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 1+0x15
-      - series: gateway_accounting_failures_total{stage="maintenance",cause="deadline_in_database",instance="gateway-a"}
+      - series: gateway_accounting_failures_total{job="open-model-gateway",stage="maintenance",cause="deadline_in_database",instance="gateway-a"}
         values: _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 1+0x15
-      - series: gateway_accounting_failures_total{stage="explicit_settlement",cause="deadline_in_database",instance="gateway-a"}
+      - series: gateway_accounting_failures_total{job="open-model-gateway",stage="explicit_settlement",cause="deadline_in_database",instance="gateway-a"}
         values: _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 1+0x15
-      - series: gateway_accounting_failures_total{stage="cancellation_settlement",cause="deadline_in_database",instance="gateway-a"}
+      - series: gateway_accounting_failures_total{job="open-model-gateway",stage="cancellation_settlement",cause="deadline_in_database",instance="gateway-a"}
         values: _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 1+0x15
-      - series: gateway_accounting_failures_total{stage="realtime_settlement",cause="deadline_in_database",instance="gateway-a"}
+      - series: gateway_accounting_failures_total{job="open-model-gateway",stage="realtime_settlement",cause="deadline_in_database",instance="gateway-a"}
         values: _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 1+0x15
-      - series: gateway_accounting_failures_total{stage="job_settlement",cause="deadline_in_database",instance="gateway-a"}
+      - series: gateway_accounting_failures_total{job="open-model-gateway",stage="job_settlement",cause="deadline_in_database",instance="gateway-a"}
         values: _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 1+0x15
     alert_rule_test:
       - eval_time: 14m
@@ -244,9 +250,11 @@ tests:
   - name: unchanged counters recover from a short scrape outage
     interval: 1m
     input_series:
-      - series: gateway_accounting_failures_total{stage="route_lookup",cause="deadline_in_database",instance="gateway-a"}
+      - series: up{job="open-model-gateway",instance="gateway-a"}
+        values: 1+0x19 0+0x5 1+0x19
+      - series: gateway_accounting_failures_total{job="open-model-gateway",stage="route_lookup",cause="deadline_in_database",instance="gateway-a"}
         values: 1+0x19 stale _ _ _ _ _ 1+0x19
-      - series: gateway_accounting_failures_total{stage="explicit_settlement",cause="deadline_in_database",instance="gateway-a"}
+      - series: gateway_accounting_failures_total{job="open-model-gateway",stage="explicit_settlement",cause="deadline_in_database",instance="gateway-a"}
         values: 1+0x19 stale _ _ _ _ _ 1+0x19
     alert_rule_test:
       # Scrapes resume at 26m. At 30m the offset reaches the start of the gap.
@@ -259,3 +267,223 @@ tests:
       - eval_time: 35m
         alertname: GatewayAccountingFailures
         exp_alerts: []
+  - name: first failure after a restart with the same instance labels
+    interval: 1m
+    input_series:
+      # The old process last reported at 19m. The restarted process is
+      # scraped successfully from 20m, but its first failure is at 35m.
+      - series: up{job="open-model-gateway",instance="gateway-a"}
+        values: 1+0x50
+      - series: gateway_accounting_failures_total{job="open-model-gateway",instance="gateway-a",stage="route_lookup",cause="deadline_in_database"}
+        values: 1+0x19 stale _ _ _ _ _ _ _ _ _ _ _ _ _ _ 1+0x15
+      - series: gateway_accounting_failures_total{job="open-model-gateway",instance="gateway-a",stage="explicit_settlement",cause="deadline_in_database"}
+        values: 1+0x19 stale _ _ _ _ _ _ _ _ _ _ _ _ _ _ 1+0x15
+    alert_rule_test:
+      - eval_time: 34m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: []
+      - eval_time: 35m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: [*explicit_settlement_alert]
+      - eval_time: 39m
+        alertname: GatewayAccountingFailures
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: GatewayAccountingFailures
+        exp_alerts: [*route_lookup_alert]
+      - eval_time: 44m
+        alertname: GatewayAccountingFailures
+        exp_alerts: [*route_lookup_alert]
+      - eval_time: 44m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: [*explicit_settlement_alert]
+      - eval_time: 45m
+        alertname: GatewayAccountingFailures
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: []
+  - name: a failure during a short scrape outage fires on recovery
+    interval: 1m
+    input_series:
+      - series: up{job="open-model-gateway",instance="gateway-a"}
+        values: 1+0x19 0+0x3 1+0x19
+      - series: gateway_accounting_failures_total{job="open-model-gateway",instance="gateway-a",stage="explicit_settlement",cause="deadline_in_database"}
+        values: 1+0x19 stale _ _ _ 2+0x19
+    alert_rule_test:
+      - eval_time: 23m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: []
+      - eval_time: 24m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: [*explicit_settlement_alert]
+      - eval_time: 28m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: [*explicit_settlement_alert]
+      - eval_time: 29m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: []
+  - name: a lower counter after restart counts as a reset
+    interval: 1m
+    input_series:
+      - series: up{job="open-model-gateway",instance="gateway-a"}
+        values: 1+0x39
+      - series: gateway_accounting_failures_total{job="open-model-gateway",instance="gateway-a",stage="explicit_settlement",cause="deadline_in_database"}
+        values: 5+0x19 1+0x19
+    alert_rule_test:
+      - eval_time: 19m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: [*explicit_settlement_alert]
+      - eval_time: 29m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: []
+  - name: a long scrape outage can re-fire an unchanged counter once
+    interval: 1m
+    input_series:
+      - series: up{job="open-model-gateway",instance="gateway-a"}
+        values: 1+0x19 0+0x14 1+0x24
+      - series: gateway_accounting_failures_total{job="open-model-gateway",instance="gateway-a",stage="route_lookup",cause="deadline_in_database"}
+        values: 1+0x19 stale _ _ _ _ _ _ _ _ _ _ _ _ _ _ 1+0x24
+      - series: gateway_accounting_failures_total{job="open-model-gateway",instance="gateway-a",stage="explicit_settlement",cause="deadline_in_database"}
+        values: 1+0x19 stale _ _ _ _ _ _ _ _ _ _ _ _ _ _ 1+0x24
+    alert_rule_test:
+      - eval_time: 34m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: []
+      - eval_time: 35m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: []
+      # At 39m the old samples leave the offset window.
+      - eval_time: 38m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: []
+      - eval_time: 39m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: [*explicit_settlement_alert]
+      - eval_time: 43m
+        alertname: GatewayAccountingFailures
+        exp_alerts: []
+      - eval_time: 44m
+        alertname: GatewayAccountingFailures
+        exp_alerts: [*route_lookup_alert]
+      - eval_time: 44m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: [*explicit_settlement_alert]
+      - eval_time: 45m
+        alertname: GatewayAccountingFailures
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: []
+      - eval_time: 59m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: []
+  - name: metrics outage pages only after five minutes and clears on recovery
+    interval: 1m
+    input_series:
+      - series: up{job="open-model-gateway",instance="gateway-a"}
+        values: 1+0x4 0+0x5 1+0x4
+      - series: up{job="other-service",instance="other"}
+        values: 0+0x15
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: GatewayMetricsDown
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: GatewayMetricsDown
+        exp_alerts:
+          - exp_labels:
+              job: open-model-gateway
+              instance: gateway-a
+              severity: critical
+            exp_annotations:
+              summary: Gateway metrics endpoint is unreachable
+              description: gateway-a has not been scraped for 5 minutes. Check the process, GATEWAY_METRICS_ADDR and the private scrape network.
+      - eval_time: 11m
+        alertname: GatewayMetricsDown
+        exp_alerts: []
+  - name: a scrape outage between restart and first observed failure
+    interval: 15s
+    input_series:
+      # At 20m the restarted target omits the counter. From 28m15s its
+      # scrapes fail, then at 34m the counter is first observed again.
+      - series: up{job="open-model-gateway",instance="gateway-a"}
+        values: 1+0x112 0+0x22 1+0x23 0+0x7 1+0x11 0+0x7 1+0x15
+      - series: gateway_accounting_failures_total{job="open-model-gateway",instance="gateway-a",stage="route_lookup",cause="deadline_in_database"}
+        values: 1+0x79 stale _x54 1+0x23 stale _x7 1+0x11 stale _x7 1+0x15
+      - series: gateway_accounting_failures_total{job="open-model-gateway",instance="gateway-a",stage="explicit_settlement",cause="deadline_in_database"}
+        values: 1+0x79 stale _x54 1+0x23 stale _x7 1+0x11 stale _x7 1+0x15
+    alert_rule_test:
+      - eval_time: 33m30s
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: []
+      - eval_time: 33m30s
+        alertname: GatewayAccountingFailures
+        exp_alerts: []
+      - eval_time: 34m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: [*explicit_settlement_alert]
+      - eval_time: 34m
+        alertname: GatewayAccountingFailures
+        exp_alerts: []
+      - eval_time: 38m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: [*explicit_settlement_alert]
+      - eval_time: 38m
+        alertname: GatewayAccountingFailures
+        exp_alerts: []
+      - eval_time: 38m30s
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: [*explicit_settlement_alert]
+      - eval_time: 38m30s
+        alertname: GatewayAccountingFailures
+        exp_alerts: []
+      - eval_time: 39m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: [*explicit_settlement_alert]
+      - eval_time: 39m
+        alertname: GatewayAccountingFailures
+        exp_alerts: [*route_lookup_alert]
+      - eval_time: 40m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: [*explicit_settlement_alert]
+      - eval_time: 40m
+        alertname: GatewayAccountingFailures
+        exp_alerts: [*route_lookup_alert]
+      # The scrape is down at 40m and returns at 42m. The recorded
+      # failures stay eligible while the scrape has no counter sample.
+      - eval_time: 41m30s
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: [*explicit_settlement_alert]
+      - eval_time: 41m30s
+        alertname: GatewayAccountingFailures
+        exp_alerts: [*route_lookup_alert]
+      - eval_time: 42m
+        alertname: GatewayAccountingFailures
+        exp_alerts: [*route_lookup_alert]
+      - eval_time: 43m30s
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: [*explicit_settlement_alert]
+      - eval_time: 43m30s
+        alertname: GatewayAccountingFailures
+        exp_alerts: [*route_lookup_alert]
+      - eval_time: 44m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: []
+      - eval_time: 44m
+        alertname: GatewayAccountingFailures
+        exp_alerts: []
+      # Another outage begins at 45m. At 47m the same counter returns.
+      - eval_time: 47m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: []
+    promql_expr_test:
+      - expr: sum(count_over_time(instance_stage_cause:accounting_failure_series:first_observed[15m]))
+        eval_time: 47m
+        exp_samples:
+          # One first observation for each of the two counters.
+          - labels: '{}'
+            value: 2
