@@ -264,12 +264,12 @@ describe("comments state invariants, not review history", () => {
       for (const [target, name, type] of [[file, "linked.test.tsx", "file"], [outside, "linked-dir", "dir"]] as const) {
         const link = join(root, name);
         symlinkSync(target, link, type);
-        expect(() => walk(root)).toThrowError(`unsupported source entry: ${link}`);
+        expect(() => walk(root)).toThrowError(new Error(`unsupported source entry: ${link}`));
         unlinkSync(link);
       }
       const linkedRoot = join(tmp, "linked-root");
       symlinkSync(outside, linkedRoot, "dir");
-      expect(() => walk(linkedRoot)).toThrowError(`unsupported source entry: ${linkedRoot}`);
+      expect(() => walk(linkedRoot)).toThrowError(new Error(`unsupported source entry: ${linkedRoot}`));
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
