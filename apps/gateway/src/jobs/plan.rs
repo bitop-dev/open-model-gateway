@@ -19,7 +19,7 @@ use crate::{
 
 mod scan;
 
-/// At most this many problems are reported (scanning stops there).
+/// At most this many problems are reported.
 pub const MAX_ISSUES: usize = 20;
 
 /// One reported problem: the 1-based physical line number of the file.
@@ -62,7 +62,7 @@ struct Resolved {
     legacy: bool,
 }
 
-/// Test-only counters for the candidate and routing-input reads in a scan.
+/// Test-only counters for candidate, routing-input and price reads in a scan.
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct PlanLookupCounts {
@@ -116,6 +116,13 @@ struct PendingGroup {
     legacy: bool,
 }
 
+/// Pricing diagnostics for a route that might not be used.
+#[derive(Default)]
+struct PricingErrors {
+    issues: Vec<Issue>,
+    job: Option<InferenceError>,
+}
+
 /// The scan's mutable state.
 struct ScanState {
     issues: Vec<Issue>,
@@ -124,17 +131,20 @@ struct ScanState {
     // Cache TTL requirements are part of the memoization key: a clean
     // line must not authorize a later cached line at an incompatible price.
     previews: HashMap<(Uuid, Option<u32>, u8), LinePreview>,
-    prices: HashMap<Uuid, LinePricing>,
+    // A failed load is shared by all preview keys for that deployment.
+    prices: HashMap<Uuid, Result<LinePricing, InferenceError>>,
     // One per deployment, in first-use order.
-    groups: Vec<PendingGroup>,
+    native_groups: Vec<PendingGroup>,
     // Gateway estimates can split a model across differently priced routes.
     // Native selection and pricing still use the batch-wide deployment.
     gateway_groups: Vec<PendingGroup>,
-    gateway_pricing_error: Option<PlanError>,
+    native_pricing_errors: PricingErrors,
+    gateway_pricing_errors: PricingErrors,
     requests: u32,
     physical: u64,
-    // Lines a native submission could not encode / the engine cannot run.
+    // Native eligibility is tracked independently of the pricing previews.
     native_ok: bool,
+    native_deployment: Option<Uuid>,
     gateway_unsupported: Option<u64>,
     // Lines the coarse check passed but the adapter's own pure encoder
     // (`ProviderAdapter::validate_chat_request`, #228) refuses
@@ -444,7 +454,7 @@ impl Jobs {
             state.record(endpoint, &line);
             scan::copy_line(work, raw, &line).await?;
         }
-        state.finish(endpoint, force_gateway)
+        state.finish()
     }
 }
 
@@ -456,12 +466,14 @@ impl ScanState {
             models: HashMap::new(),
             previews: HashMap::new(),
             prices: HashMap::new(),
-            groups: Vec::new(),
+            native_groups: Vec::new(),
             gateway_groups: Vec::new(),
-            gateway_pricing_error: None,
+            native_pricing_errors: PricingErrors::default(),
+            gateway_pricing_errors: PricingErrors::default(),
             requests: 0,
             physical: 0,
             native_ok: true,
+            native_deployment: None,
             gateway_unsupported: None,
             deterministic_rejects: Vec::new(),
             routing: RoutingMemo::default(),
@@ -475,53 +487,49 @@ impl ScanState {
     }
 
     /// The whole-file checks after the last line, then the result.
-    fn finish(
-        mut self,
-        endpoint: BatchEndpoint,
-        force_gateway: bool,
-    ) -> Result<Scanned, PlanError> {
-        if self.requests == 0 && self.issues.is_empty() {
-            self.issues.push(Issue {
-                line: 1,
-                error: LineError::EmptyFile,
-            });
-        }
-        let native = !force_gateway
-            && self.native_ok
-            && self.deterministic_rejects.is_empty()
-            && self.groups.len() == 1
-            && self.groups[0]
-                .adapter
-                .native_batch(&self.groups[0].group.deployment, endpoint);
-        if self.issues.is_empty() && !native {
-            self.gateway_issue();
-        }
-        if self.issues.is_empty() && self.groups.is_empty() {
-            self.report_rejects();
-        }
+    fn finish(mut self) -> Result<Scanned, PlanError> {
+        let native = self.native_ok && self.native_deployment.is_some();
+        let (groups, pricing_errors) = if native {
+            (
+                std::mem::take(&mut self.native_groups),
+                std::mem::take(&mut self.native_pricing_errors),
+            )
+        } else {
+            if self.issues.is_empty() {
+                self.gateway_issue();
+            }
+            (
+                std::mem::take(&mut self.gateway_groups),
+                std::mem::take(&mut self.gateway_pricing_errors),
+            )
+        };
+        self.issues.extend(pricing_errors.issues);
+        self.issues.sort_by_key(|issue| issue.line);
+        self.issues.truncate(MAX_ISSUES);
         if !self.issues.is_empty() {
             return Err(PlanError::Invalid(self.issues));
         }
-        if !native {
-            if let Some(error) = self.gateway_pricing_error {
-                return Err(error);
-            }
-            self.groups = self.gateway_groups;
+        if let Some(error) = pricing_errors.job {
+            return Err(error.into());
         }
-        let first_model = &self.groups[0].group.model;
-        let model = if self.groups.iter().all(|g| g.group.model == *first_model) {
+        if groups.is_empty() {
+            self.report_rejects();
+            return Err(PlanError::Invalid(self.issues));
+        }
+        let first_model = &groups[0].group.model;
+        let model = if groups.iter().all(|g| g.group.model == *first_model) {
             first_model.clone()
         } else {
             "mixed".to_owned()
         };
         let native = native.then(|| {
             (
-                self.groups[0].group.deployment.clone(),
-                self.groups[0].adapter.clone(),
+                groups[0].group.deployment.clone(),
+                groups[0].adapter.clone(),
             )
         });
         Ok((
-            self.groups.into_iter().map(|g| g.group).collect(),
+            groups.into_iter().map(|g| g.group).collect(),
             self.requests,
             native,
             model,
@@ -532,7 +540,7 @@ impl ScanState {
     /// cannot run.
     fn gateway_issue(&mut self) {
         // Lines only a native batch could run.
-        if let Some(g) = self.groups.iter().find(|g| g.legacy) {
+        if let Some(g) = self.gateway_groups.iter().find(|g| g.legacy) {
             self.issues.push(Issue {
                 line: g.first_line,
                 error: LineError::ModelUnsupported,

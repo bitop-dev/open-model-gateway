@@ -2,22 +2,52 @@
 //! adapter's deterministic refusal; then sizing and copying an accepted line.
 use super::*;
 
-/// A line that passed every per-line check.
+/// A line with its available estimates for each execution mode.
 pub(super) struct CheckedLine {
     model: String,
-    resolved: Arc<Resolved>,
-    /// The line's own output maximum (`Some(0)` for embeddings).
-    requested: Option<u32>,
-    price_id: Uuid,
-    max: u32,
+    pin: Option<lines::LinePlan>,
+    native: Option<PricedRoute>,
+    gateway: Option<PricedRoute>,
     deterministic_reject: Option<InferenceError>,
-    gateway_estimate: Option<(Resolved, u32)>,
+}
+
+struct PricedRoute {
+    resolved: Arc<Resolved>,
+    price: LinePrice,
+}
+
+#[derive(Clone, Copy)]
+struct LinePrice {
+    id: Uuid,
+    output: u32,
+}
+
+struct LinePrices {
+    primary: Option<LinePrice>,
+    gateway: Option<PricedRoute>,
+}
+
+type PricingCheck<T> = Result<Result<T, LineError>, InferenceError>;
+
+impl PricingErrors {
+    fn defer(&mut self, line: u64, check: PricingCheck<LinePrice>) -> Option<LinePrice> {
+        match check {
+            Ok(Ok(price)) => return Some(price),
+            Ok(Err(error)) if self.issues.len() < MAX_ISSUES => {
+                self.issues.push(Issue { line, error });
+            }
+            Ok(Err(_)) => {}
+            Err(error) => {
+                self.job.get_or_insert(error);
+            }
+        }
+        None
+    }
 }
 
 impl Jobs {
-    /// Every per-line check, in order: shape, unique `custom_id`, model,
-    /// price and bound, native/engine support and the adapter's own
-    /// deterministic refusal.
+    /// Check shape, `custom_id`, model, routing, price bounds and adapter
+    /// support. Keep distinct pricing outcomes while auto mode is unresolved.
     pub(super) async fn check_line(
         &self,
         scope: ScanScope<'_>,
@@ -40,7 +70,10 @@ impl Jobs {
             BatchRequest::Chat(r) => r.max_output_tokens,
             BatchRequest::Embeddings(_) => Some(0),
         };
-        let mut routing = if requested.is_some() && !resolved.legacy {
+        let LineRouting {
+            estimate,
+            rejection,
+        } = if requested.is_some() && !resolved.legacy {
             self.line_routing(
                 scope,
                 &model,
@@ -52,94 +85,100 @@ impl Jobs {
         } else {
             LineRouting::default()
         };
-        // Once native mode is ruled out, validate the weighted estimate
-        // directly. When auto mode may still be native, keep its separate
-        // batch-wide estimate until the whole input has been checked.
+        // Native eligibility depends on encoding and a single deployment.
+        // Track that deployment even when its pricing preview fails.
         state.native_ok &= !scope.force_gateway
+            && state
+                .native_deployment
+                .is_none_or(|id| id == resolved.deployment.id)
             && resolved
                 .adapter
                 .native_batch(&resolved.deployment, scope.endpoint);
-        let has_estimate = routing.estimate.is_some();
-        if !state.native_ok
-            && let Some(estimate) = routing.estimate.take()
-        {
-            resolved = Arc::new(estimate);
+        if requested.is_some() && !resolved.legacy {
+            state.check_native_encoding(scope.endpoint, &line.request, &resolved);
+            state.native_ok &= rejection.is_none();
         }
-        let (price_id, max) = match self
-            .price_line(scope, state, &line.request, &resolved, requested)
+        let has_estimate = estimate.is_some();
+        let alternate = if state.native_ok {
+            estimate.filter(|route| route.deployment.id != resolved.deployment.id)
+        } else {
+            if let Some(estimate) = estimate {
+                resolved = Arc::new(estimate);
+            }
+            None
+        };
+        let LinePrices { primary, gateway } = match self
+            .price_routes(scope, state, &line.request, &resolved, requested, alternate)
             .await?
         {
-            Ok(priced) => priced,
-            Err(e) => return Ok(Err(e)),
+            Ok(prices) => prices,
+            Err(error) => return Ok(Err(error)),
         };
-        // Encoding checks use the same bound as the parent hold; the
-        // uploaded body and private body retain the optional omission.
-        let mut execution_request = line.request.clone();
-        if let BatchRequest::Chat(r) = &mut execution_request {
-            r.max_output_tokens = Some(max);
-        }
-        let coarse_ok =
-            match state.engine_checks(scope.endpoint, &line.request, &execution_request, &resolved)
-            {
-                Ok(coarse_ok) => coarse_ok,
-                Err(e) => return Ok(Err(e)),
+        let pin = if let (None, Some(price)) = (requested, primary) {
+            Some(lines::LinePlan {
+                deployment: resolved.deployment.id,
+                price: price.id,
+                output: price.output,
+            })
+        } else {
+            None
+        };
+        let rejection =
+            match state.check_engine(scope.endpoint, line.request, &resolved, pin, has_estimate) {
+                Ok(pinned_rejection) => rejection.or(pinned_rejection),
+                Err(error) => return Ok(Err(error)),
             };
-        if requested.is_none()
-            && !resolved.legacy
-            && coarse_ok
-            && let BatchRequest::Chat(r) = &execution_request
-        {
-            routing.rejection = resolved.adapter.validate_chat_request(r).err();
-        }
-        if !coarse_ok && !has_estimate && state.gateway_unsupported.is_none() {
-            state.gateway_unsupported = Some(state.physical);
-        }
-        let gateway_estimate = self
-            .gateway_estimate(
-                scope,
-                state,
-                &line.request,
-                &resolved,
-                requested,
-                routing.estimate,
-            )
-            .await;
+        state.native_ok &= rejection.is_none();
+        let native = if state.native_ok {
+            primary.map(|price| PricedRoute { resolved, price })
+        } else {
+            None
+        };
         Ok(Ok(CheckedLine {
             model,
-            resolved,
-            requested,
-            price_id,
-            max,
-            deterministic_reject: routing.rejection,
-            gateway_estimate,
+            pin,
+            native,
+            gateway,
+            deterministic_reject: rejection,
         }))
     }
 
-    /// A native batch sizes against its one deployment. Keep an alternate
-    /// price error until the scan knows whether it will run in gateway mode.
-    async fn gateway_estimate(
+    async fn price_routes(
         &self,
         scope: ScanScope<'_>,
         state: &mut ScanState,
         request: &BatchRequest,
-        resolved: &Resolved,
+        resolved: &Arc<Resolved>,
         requested: Option<u32>,
-        estimate: Option<Resolved>,
-    ) -> Option<(Resolved, u32)> {
-        let estimate = estimate.filter(|d| d.deployment.id != resolved.deployment.id)?;
-        let error = match self
-            .price_line(scope, state, request, &estimate, requested)
-            .await
-        {
-            Ok(Ok((_, output))) => return Some((estimate, output)),
-            Ok(Err(error)) => PlanError::Invalid(vec![Issue {
-                line: state.physical,
-                error,
-            }]),
-            Err(error) => error,
+        alternate: Option<Resolved>,
+    ) -> PricingCheck<LinePrices> {
+        let price = self
+            .price_line(scope, state, request, resolved, requested)
+            .await;
+        let Some(alternate) = alternate else {
+            return Ok(price?.map(|price| LinePrices {
+                primary: Some(price),
+                gateway: Some(PricedRoute {
+                    resolved: resolved.clone(),
+                    price,
+                }),
+            }));
         };
-        state.gateway_pricing_error.get_or_insert(error);
-        None
+        // An explicit maximum can be checked against both routes. Only
+        // the preview for the final mode can reject the file.
+        let alternate_price = self
+            .price_line(scope, state, request, &alternate, requested)
+            .await;
+        Ok(Ok(LinePrices {
+            primary: state.native_pricing_errors.defer(state.physical, price),
+            gateway: state
+                .gateway_pricing_errors
+                .defer(state.physical, alternate_price)
+                .map(|price| PricedRoute {
+                    resolved: Arc::new(alternate),
+                    price,
+                }),
+        }))
     }
 
     /// The model's deployment for this key, resolved at most once per scan.
@@ -168,7 +207,7 @@ impl Jobs {
         request: &BatchRequest,
         resolved: &Resolved,
         requested: Option<u32>,
-    ) -> Result<Result<(Uuid, u32), LineError>, PlanError> {
+    ) -> PricingCheck<LinePrice> {
         let cache_controls = match request {
             BatchRequest::Chat(r) if resolved.deployment.provider == "anthropic" => r
                 .messages_options
@@ -188,17 +227,25 @@ impl Jobs {
                 self.plan_lookup_counts
                     .prices
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                price.insert(LinePricing::load(&self.store, id).await?);
+                price.insert(LinePricing::load(&self.store, id).await);
             }
-            slot.insert(state.prices[&id].preview(
-                scope.endpoint.protocol(),
-                requested,
-                resolved.adapter.generation_output_limit(),
-                cache_controls,
-            )?);
+            slot.insert(
+                state.prices[&id]
+                    .as_ref()
+                    .map_err(|error| *error)?
+                    .preview(
+                        scope.endpoint.protocol(),
+                        requested,
+                        resolved.adapter.generation_output_limit(),
+                        cache_controls,
+                    )?,
+            );
         }
         Ok(match state.previews[&key] {
-            LinePreview::Ok { price_id, output } => Ok((price_id, output)),
+            LinePreview::Ok { price_id, output } => Ok(LinePrice {
+                id: price_id,
+                output,
+            }),
             LinePreview::OutputLimit => Err(LineError::OutputLimit),
             LinePreview::Unpriced | LinePreview::Unbounded => Err(LineError::Unpriced),
         })
@@ -211,17 +258,9 @@ pub(super) async fn copy_line(
     raw: Vec<u8>,
     line: &CheckedLine,
 ) -> Result<(), PlanError> {
-    let mut copy = if line.requested.is_none() {
-        lines::planned_copy(
-            raw,
-            lines::LinePlan {
-                deployment: line.resolved.deployment.id,
-                price: line.price_id,
-                output: line.max,
-            },
-        )?
-    } else {
-        raw
+    let mut copy = match line.pin {
+        Some(pin) => lines::planned_copy(raw, pin)?,
+        None => raw,
     };
     copy.push(b'\n');
     work.raw(copy).await?;
@@ -229,35 +268,63 @@ pub(super) async fn copy_line(
 }
 
 impl ScanState {
-    /// Whether the engine can run the line (the coarse check). Native
-    /// encodability is folded into `native_ok`; a legacy line must be
-    /// encodable.
-    fn engine_checks(
+    /// Native encoding is checked on the batch-wide route while it is
+    /// eligible. Legacy lines always require native encoding.
+    fn check_native_encoding(
         &mut self,
         endpoint: BatchEndpoint,
         request: &BatchRequest,
-        execution_request: &BatchRequest,
         resolved: &Resolved,
-    ) -> Result<bool, LineError> {
-        // Can this line run natively, and can the engine run it?
+    ) -> bool {
+        if !self.native_ok && !resolved.legacy {
+            return false;
+        }
         let encodable = resolved
             .adapter
-            .native_batch(&resolved.deployment, endpoint)
-            && resolved
-                .adapter
-                .encode_native_line(&resolved.deployment, endpoint, "l0", execution_request)
-                .is_ok();
-        if resolved.legacy && !encodable {
-            return Err(LineError::UnsupportedFeature);
-        }
+            .encode_native_line(&resolved.deployment, endpoint, "l0", request)
+            .is_ok();
         self.native_ok &= encodable;
-        Ok(resolved.legacy
-            || match request {
+        if self.native_ok {
+            self.native_deployment = Some(resolved.deployment.id);
+        }
+        encodable
+    }
+
+    /// Gateway support and the encoding checks that require a pinned bound.
+    fn check_engine(
+        &mut self,
+        endpoint: BatchEndpoint,
+        mut request: BatchRequest,
+        resolved: &Resolved,
+        pin: Option<lines::LinePlan>,
+        has_estimate: bool,
+    ) -> Result<Option<InferenceError>, LineError> {
+        let mut rejection = None;
+        let coarse_ok = resolved.legacy
+            || match &request {
                 BatchRequest::Chat(r) => resolved.adapter.supports_chat_request(r),
                 BatchRequest::Embeddings(r) => resolved
                     .adapter
                     .supports_embedding_target(&resolved.deployment, r),
-            })
+            };
+        if resolved.legacy || pin.is_some() {
+            // Omitted maxima must use the plan's clamped body for encoding
+            // and deterministic adapter validation.
+            if let (Some(pin), BatchRequest::Chat(r)) = (pin, &mut request) {
+                r.max_output_tokens = Some(pin.output);
+                if !resolved.legacy && coarse_ok {
+                    rejection = resolved.adapter.validate_chat_request(r).err();
+                }
+            }
+            let encodable = self.check_native_encoding(endpoint, &request, resolved);
+            if resolved.legacy && !encodable {
+                return Err(LineError::UnsupportedFeature);
+            }
+        }
+        if !coarse_ok && !has_estimate && self.gateway_unsupported.is_none() {
+            self.gateway_unsupported = Some(self.physical);
+        }
+        Ok(rejection)
     }
 
     /// Size an accepted line into its deployment's group, or set it aside
@@ -269,28 +336,24 @@ impl ScanState {
             self.deterministic_rejects.push((self.physical, error));
             return;
         }
-        record_group(
-            &mut self.groups,
-            self.physical,
-            endpoint,
-            line,
-            &line.resolved,
-            line.max,
-        );
-        let (resolved, output) = line
-            .gateway_estimate
-            .as_ref()
-            .map_or((line.resolved.as_ref(), line.max), |(route, output)| {
-                (route, *output)
-            });
-        record_group(
-            &mut self.gateway_groups,
-            self.physical,
-            endpoint,
-            line,
-            resolved,
-            output,
-        );
+        if let Some(route) = &line.native {
+            record_group(
+                &mut self.native_groups,
+                self.physical,
+                endpoint,
+                line,
+                route,
+            );
+        }
+        if let Some(route) = &line.gateway {
+            record_group(
+                &mut self.gateway_groups,
+                self.physical,
+                endpoint,
+                line,
+                route,
+            );
+        }
     }
 }
 
@@ -299,10 +362,11 @@ fn record_group(
     physical: u64,
     endpoint: BatchEndpoint,
     line: &CheckedLine,
-    resolved: &Resolved,
-    output: u32,
+    route: &PricedRoute,
 ) {
-    let price_id = line.requested.is_none().then_some(line.price_id);
+    let resolved = &route.resolved;
+    let output = route.price.output;
+    let price_id = line.pin.map(|pin| pin.price);
     match groups
         .iter_mut()
         .find(|g| g.group.deployment.id == resolved.deployment.id)

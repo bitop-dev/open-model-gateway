@@ -9,8 +9,8 @@ fn line_seed(batch: Uuid, line: u32) -> Uuid {
     Uuid::from_bytes(hash.finalize()[..16].try_into().unwrap())
 }
 
-async fn weighted_world(pool: PgPool) -> (World, Uuid, Uuid) {
-    let mut w = world(pool, false, false, 2).await;
+async fn weighted_routes(pool: PgPool, native: bool) -> (World, Uuid) {
+    let mut w = world(pool, false, native, 2).await;
     // The workspace ID is part of the sampler's seed.
     let workspace = Uuid::from_u128(702);
     let key = crate::auth::NewApiKey::generate().unwrap();
@@ -51,6 +51,18 @@ async fn weighted_world(pool: PgPool) -> (World, Uuid, Uuid) {
         .execute(&w.f.store.pool)
         .await
         .unwrap();
+    sqlx::query(
+        "INSERT INTO workspace_model_grants(workspace_id,model_id,source) VALUES($1,$2,'direct')",
+    )
+    .bind(workspace)
+    .bind(w.f.model)
+    .execute(&w.f.store.pool)
+    .await
+    .unwrap();
+    (w, expensive)
+}
+
+async fn weighted_seed(w: &World, batch_route: Uuid, line_routes: [Uuid; 2], after: u128) -> Uuid {
     let f = &w.f;
     let model = "company/claude";
     let candidates = f.store.deployments(&f.principal, model).await.unwrap();
@@ -62,18 +74,23 @@ async fn weighted_world(pool: PgPool) -> (World, Uuid, Uuid) {
             .unwrap()
             .deployment_ids[0]
     };
-    // Find a reproducible witness for this workspace's routing hash: the
-    // old parent uses the expensive route twice; the two line seeds split.
-    for n in 1..=128 {
+    for n in after + 1..=after + 128 {
         let batch = Uuid::from_u128(n);
-        if first(batch).await == expensive
-            && first(line_seed(batch, 0)).await == w.claude_deployment
-            && first(line_seed(batch, 1)).await == expensive
+        if first(batch).await == batch_route
+            && first(line_seed(batch, 0)).await == line_routes[0]
+            && first(line_seed(batch, 1)).await == line_routes[1]
         {
-            return (w, expensive, batch);
+            return batch;
         }
     }
     panic!("no routing witness for the two weights");
+}
+
+async fn weighted_world(pool: PgPool) -> (World, Uuid, Uuid) {
+    let (w, expensive) = weighted_routes(pool, false).await;
+    // The batch-wide draw uses the expensive route; the line seeds split.
+    let batch = weighted_seed(&w, expensive, [w.claude_deployment, expensive], 0).await;
+    (w, expensive, batch)
 }
 
 async fn set_budget(w: &World, limit: i64) {
@@ -113,6 +130,168 @@ async fn create(w: &World, id: Uuid, file: String) -> Result<JobRow, CreateError
             },
         )
         .await
+}
+
+/// Use the production create handler with a fixed server-side request ID so
+/// the weighted witness does not depend on the router's random request ID.
+async fn submit_with_seed(
+    w: &World,
+    id: Uuid,
+    file: String,
+    metadata: Option<&Value>,
+) -> (reqwest::StatusCode, Value) {
+    use axum::Extension;
+    let (gateway, task) = serve(
+        axum::Router::new()
+            .route(
+                "/v1/batches",
+                axum::routing::post(crate::protocols::batches::create),
+            )
+            .layer(Extension(crate::http::RequestId(id)))
+            .layer(Extension(w.f.principal))
+            .layer(Extension(w.jobs.engine.clone().unwrap()))
+            .layer(Extension(w.files.runtime().clone()))
+            .with_state(w.f.store.clone()),
+    )
+    .await;
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap()
+        .post(format!("{gateway}/v1/batches"))
+        .json(
+            &json!({"input_file_id":file,"endpoint":"/v1/chat/completions",
+                      "completion_window":"24h","metadata":metadata}),
+        )
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.json().await.unwrap();
+    task.abort();
+    (status, body)
+}
+
+#[dbtest::test]
+async fn weighted_route_output_limit_depends_on_final_batch_mode(pool: PgPool) {
+    let (w, expensive) = weighted_routes(pool, true).await;
+    let native = w.claude_deployment;
+    sqlx::query("INSERT INTO deployment_prices(id,deployment_id,input_microusd_per_million,output_microusd_per_million,input_token_limit,output_token_limit,pricing_version) VALUES($1,$2,2000000,2000000,100,8,1)")
+        .bind(Uuid::new_v4())
+        .bind(native)
+        .execute(&w.f.store.pool)
+        .await
+        .unwrap();
+    let mut id = weighted_seed(&w, native, [expensive, expensive], 0).await;
+    let weighted = chat_line("weighted", "company/claude", "ten tokens");
+    let gateway_only = chat_line("gateway", "company/smart", "gateway only");
+
+    let solo = w
+        .upload(&w.f.principal, std::slice::from_ref(&weighted))
+        .await;
+    let (status, body) = submit_with_seed(&w, id, solo, None).await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(body["errors"]["data"].as_array().unwrap().len(), 1);
+    assert_eq!(body["errors"]["data"][0]["line"], 1);
+    assert_eq!(body["errors"]["data"][0]["code"], "max_tokens_too_large");
+    assert_eq!(admission_rowcounts(&w.f).await, (0, 0, 0, 0));
+
+    for mode in [Some(json!({"omg_mode":"gateway"})), None] {
+        for lines in [
+            [weighted.clone(), gateway_only.clone()],
+            [gateway_only.clone(), weighted.clone()],
+        ] {
+            let file = w.upload(&w.f.principal, &lines).await;
+            let (status, body) = submit_with_seed(&w, id, file, mode.as_ref()).await;
+            assert_eq!(
+                status,
+                reqwest::StatusCode::OK,
+                "mode {mode:?}, first line {}: {body}",
+                lines[0]["custom_id"]
+            );
+            let job = store::reload(
+                &w.f.store,
+                parse_client_id("batch_", body["id"].as_str().unwrap()).unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(job.mode(), Some(BatchMode::Gateway));
+            assert_eq!(reservation(&w.f, id).await.1, Some(550));
+            assert!(Runner::new(w.jobs.clone()).run_next().await.unwrap());
+            let job = w.reload(&job).await;
+            assert_eq!(
+                (job.request_completed, job.request_failed),
+                (Some(2), Some(0))
+            );
+            let expected: Vec<_> = lines
+                .iter()
+                .map(|line| {
+                    let (route, held, actual) = if line["custom_id"] == "weighted" {
+                        (expensive, 440, 60)
+                    } else {
+                        (w.f.deployment, 110, 15)
+                    };
+                    (route, "settled".into(), Some(held), Some(actual))
+                })
+                .collect();
+            assert_eq!(children(&w, &job).await, expected);
+            consistent(&w.f).await;
+
+            // Successful admissions need distinct execution IDs. Keep the
+            // same route draws for the batch and both line positions.
+            id = weighted_seed(&w, native, [expensive, expensive], id.as_u128()).await;
+        }
+    }
+}
+
+#[dbtest::test]
+async fn weighted_alternate_price_load_failure_is_read_once_per_scan(pool: PgPool) {
+    let (w, expensive) = weighted_routes(pool, true).await;
+    let id = weighted_seed(&w, w.claude_deployment, [expensive, expensive], 0).await;
+    w.openai.script.lock().unwrap().permissive = true;
+    // Make the price row undecodable only for the alternate deployment.
+    sqlx::raw_sql(&format!(
+        "ALTER TABLE deployment_prices RENAME TO test_prices;
+         CREATE VIEW deployment_prices AS SELECT id, deployment_id, created_at,
+           input_microusd_per_million, output_microusd_per_million,
+           CASE WHEN deployment_id='{expensive}' THEN NULL ELSE input_token_limit END AS input_token_limit,
+           output_token_limit, pricing_version, cache_pricing, price_lines, max_units, batch_price_lines
+         FROM test_prices;"
+    ))
+    .execute(&w.f.store.pool)
+    .await
+    .unwrap();
+    let mut lines: Vec<_> = (0..8)
+        .map(|i| {
+            // Anthropic refuses this body; every line draws the OpenAI alternate.
+            let mut line = chat_line(&format!("line-{i}"), "company/claude", "strict-tool");
+            line["body"]["max_completion_tokens"] = json!(10 + i);
+            line
+        })
+        .collect();
+    let native_file = w.upload(&w.f.principal, &lines).await;
+    lines.push(chat_line("gateway", "company/smart", "gateway only"));
+    let file = w.upload(&w.f.principal, &lines).await;
+    assert!(matches!(
+        create(&w, id, file).await,
+        Err(CreateError::Job(JobError::Inference(
+            InferenceError::Storage
+        )))
+    ));
+    use std::sync::atomic::Ordering::Relaxed;
+    assert_eq!(
+        w.jobs.plan_lookup_counts.prices.load(Relaxed),
+        3,
+        "one price read each for the native route, failing alternate, and gateway-only model"
+    );
+    assert_eq!(admission_rowcounts(&w.f).await, (0, 0, 0, 0));
+
+    let job = create(&w, id, native_file)
+        .await
+        .expect("native admission does not use the alternate price");
+    assert_eq!(job.mode(), Some(BatchMode::Native));
+    assert_eq!(w.jobs.plan_lookup_counts.prices.load(Relaxed), 5);
 }
 
 async fn children(w: &World, job: &JobRow) -> Vec<(Uuid, String, Option<i64>, Option<i64>)> {
