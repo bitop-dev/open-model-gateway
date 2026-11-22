@@ -27,30 +27,33 @@ async fn reserve(
         .bind(ws)
         .execute(&mut *tx)
         .await?;
-    let quota: Option<Option<i64>> = sqlx::query_scalar(QUOTA_SQL)
-        .bind(ws)
-        .fetch_optional(&mut *tx)
-        .await?;
-    let quota = quota.ok_or(FileError::Invalid)?;
-    let used: i64 = sqlx::query_scalar(&used_sql())
-        .bind(ws)
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?;
-    let used = u64::try_from(used).unwrap_or_default();
     let mut ahead = needed.saturating_add(RESERVE_STEP);
     if let Some(cap) = cap {
         ahead = ahead.min(cap.max(needed));
     }
-    let reserved = match (mode, quota.and_then(|q| u64::try_from(q).ok())) {
-        (QuotaMode::Enforce, Some(quota)) => {
-            let available = quota.saturating_sub(used);
+    let reserved = if mode == QuotaMode::Enforce {
+        let quota: Option<Option<i64>> = sqlx::query_scalar(QUOTA_SQL)
+            .bind(ws)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if let Some(quota) = quota.ok_or(FileError::Invalid)? {
+            let used: i64 = sqlx::query_scalar(&used_sql())
+                .bind(ws)
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+            let available = (quota as u64).saturating_sub(u64::try_from(used).unwrap_or_default());
             if needed > available {
                 return Err(FileError::QuotaExceeded);
             }
             ahead.min(available)
+        } else {
+            ahead
         }
-        _ => ahead,
+    } else {
+        // Count-only uploads serialize reservations with enforcing uploads.
+        // They need no usage sum because the effective quota cannot refuse them.
+        ahead
     };
     let updated = sqlx::query("UPDATE stored_files SET reserved_bytes=greatest(reserved_bytes,$2) WHERE id=$1 AND workspace_id=$3 AND committed_at IS NULL AND deleted_at IS NULL")
         .bind(id)

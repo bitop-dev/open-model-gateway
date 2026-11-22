@@ -584,8 +584,8 @@ pub struct WaitRow {
 fn order_sql(ready_only: bool) -> String {
     format!(
         "WITH w AS (SELECT job_id,workspace_id,last_claim_at,since FROM batch_route_waits WHERE deployment_id=$1 {} AND updated_at>clock_timestamp()-make_interval(secs=>{WAIT_FRESH_SECONDS})),
- jr AS (SELECT job_id,count(*) n FROM batch_lines WHERE deployment_id=$1 AND state='running' GROUP BY job_id),
- wr AS (SELECT workspace_id,count(*) n FROM batch_lines WHERE deployment_id=$1 AND state='running' GROUP BY workspace_id),
+ jr AS (SELECT job_id,count(*) n FROM batch_lines WHERE deployment_id=$1 AND state='running' AND NOT awaiting_segment GROUP BY job_id),
+ wr AS (SELECT workspace_id,count(*) n FROM batch_lines WHERE deployment_id=$1 AND state='running' AND NOT awaiting_segment GROUP BY workspace_id),
  x AS (SELECT w.job_id,w.last_claim_at,w.since,coalesce(jr.n,0) jn,coalesce(wr.n,0) wn,max(w.last_claim_at) OVER (PARTITION BY w.workspace_id) wl FROM w LEFT JOIN jr ON jr.job_id=w.job_id LEFT JOIN wr ON wr.workspace_id=w.workspace_id)
  SELECT job_id FROM x ORDER BY wn,wl NULLS FIRST,jn,last_claim_at NULLS FIRST,since,job_id LIMIT 1",
         if ready_only { "AND ready" } else { "" }
@@ -771,7 +771,7 @@ impl Scheduler {
     /// Batch lines running on `deployment` (all batches, all processes).
     pub async fn running_lines(&self, deployment: Uuid) -> Result<i64, sqlx::Error> {
         sqlx::query_scalar(
-            "SELECT count(*) FROM batch_lines WHERE deployment_id=$1 AND state='running'",
+            "SELECT count(*) FROM batch_lines WHERE deployment_id=$1 AND state='running' AND NOT awaiting_segment",
         )
         .bind(deployment)
         .fetch_one(&self.store.pool)
@@ -784,7 +784,7 @@ impl Scheduler {
 /// kind, and routes paused per reason.
 pub async fn observe_metrics(store: &Store) -> Result<(), sqlx::Error> {
     let lines: Vec<(String, i64, i64)> = sqlx::query_as(&format!("WITH w AS (SELECT p.provider,sum(b.waiting_lines)::bigint n FROM batch_route_waits b JOIN deployments d ON d.id=b.deployment_id JOIN provider_connections p ON p.id=d.provider_connection_id WHERE b.updated_at>clock_timestamp()-make_interval(secs=>{WAIT_FRESH_SECONDS}) GROUP BY 1),
- r AS (SELECT p.provider,count(*) n FROM batch_lines l JOIN deployments d ON d.id=l.deployment_id JOIN provider_connections p ON p.id=d.provider_connection_id WHERE l.state='running' AND l.deployment_id IS NOT NULL GROUP BY 1)
+ r AS (SELECT p.provider,count(*) n FROM batch_lines l JOIN deployments d ON d.id=l.deployment_id JOIN provider_connections p ON p.id=d.provider_connection_id WHERE l.state='running' AND NOT l.awaiting_segment AND l.deployment_id IS NOT NULL GROUP BY 1)
  SELECT coalesce(w.provider,r.provider),coalesce(w.n,0),coalesce(r.n,0) FROM w FULL JOIN r ON r.provider=w.provider"))
         .fetch_all(&store.pool)
         .await.map_err(job_storage)?;
