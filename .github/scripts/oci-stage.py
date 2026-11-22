@@ -117,6 +117,8 @@ def snapshot(source, target, limit, executable=False):
 def copy_failure_category(stderr, image):
     stderr.seek(0)
     report = stderr.read(DIAGNOSTIC_BYTES + 1)
+    if len(report) > DIAGNOSTIC_BYTES:
+        return "unknown"
     offset = 0
     for _ in range(MAX_REGISTRY_WARNINGS):
         warning = REGISTRY_WARNING.match(report, offset)
@@ -124,7 +126,7 @@ def copy_failure_category(stderr, image):
             break
         offset = warning.end()
     line, newline, trailing = report[offset:].partition(b"\n")
-    if not newline or offset + len(line) + 1 > DIAGNOSTIC_BYTES:
+    if not newline:
         return "unknown"
     # After a warning, require exactly one remaining error line through EOF.
     # An embedded newline in registry-supplied warning text can mimic output.

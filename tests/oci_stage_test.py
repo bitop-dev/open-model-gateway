@@ -318,15 +318,23 @@ if kind == 'login':
         ):
             self.assertEqual(self.api.copy_failure_category(io.BytesIO(report), IMAGE), category)
 
+    def test_warning_free_report_byte_limit_includes_trailing_lines(self):
+        line = b"Error response from registry: denied\n"
+        exact = line + b"x" * (4095 - len(line)) + b"\n"
+        for report, label in ((exact, "registry-access"), (exact + b"\n", "unknown")):
+            self.assertEqual(self.api.copy_failure_category(io.BytesIO(report), IMAGE), label)
+
     def test_copy_process_outcome_precedes_stderr(self):
-        def signaled(args, **kwargs):
-            kwargs["stderr"].write(b"Error response from registry: denied\n")
-            return subprocess.CompletedProcess(args, -15)
-        for effect, label in ((signaled, "signal"), (FileNotFoundError(), "execution"),
-                              (lambda args, **kw: subprocess.CompletedProcess(args, 9), "unknown")):
-            with mock.patch.object(self.api.subprocess, "run", side_effect=effect):
+        for code, label in ((1, "registry-access"), (9, "unknown"), (-15, "signal")):
+            def terminated(args, **kwargs):
+                kwargs["stderr"].write(b"Error response from registry: denied\n")
+                return subprocess.CompletedProcess(args, code)
+            with mock.patch.object(self.api.subprocess, "run", side_effect=terminated):
                 with self.assertRaisesRegex(self.api.Refusal, rf"^copy failed \({label}\)$"):
                     self.api.run(self.tool, [], {}, self.base, "copy failed", copy_image=IMAGE)
+        with mock.patch.object(self.api.subprocess, "run", side_effect=FileNotFoundError()):
+            with self.assertRaisesRegex(self.api.Refusal, r"^copy failed \(execution\)$"):
+                self.api.run(self.tool, [], {}, self.base, "copy failed", copy_image=IMAGE)
 
     def test_login_and_copy_timeouts_are_bounded_redacted_and_cleaned(self):
         run = subprocess.run
