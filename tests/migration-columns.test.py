@@ -38,20 +38,32 @@ def sql_tokens(sql):
             end = sql.index(word, pos)
             yield sql[match.start():end + len(word)]
             pos = end + len(word)
-        elif word.startswith(('"', "'")):
+        elif word.startswith(('"', "'")) or word[:2].lower() == "e'":
             yield word
         else:
             yield word.translate(lower_ascii)
 
 
 def supported_language(token):
-    if token.startswith("e'"):
+    if token.startswith("$") and len(token) > 1:
+        end = token.index("$", 1) + 1
+        return token[end:-end] in ("plpgsql", "sql")
+    if token[:2].lower() == "e'":
         token = token[1:]
-    if token.startswith("'"):
-        token = token.lower()
     if len(token) >= 2 and token[0] == token[-1] and token[0] in ("'", '"'):
         token = token[1:-1]
     return token in ("plpgsql", "sql")
+
+
+def standalone_body(statement, index):
+    if index >= len(statement):
+        return False
+    word = statement[index]
+    if word.startswith("'") and index + 1 < len(statement) and statement[index + 1].startswith("'"):
+        # Newline-separated string fragments form one PostgreSQL literal.
+        # A fragment on its own need not contain complete SQL.
+        return False
+    return word.startswith(("$", "'"))
 
 
 def routine_bodies(statement):
@@ -64,7 +76,7 @@ def routine_bodies(statement):
                 if j + 1 >= len(statement) or not supported_language(statement[j + 1]):
                     continue
                 j += 2
-            if j < len(statement) and statement[j].startswith(("$", "'")):
+            if standalone_body(statement, j):
                 if statement[j + 1:j + 2] == ["language"] and not (
                     j + 2 < len(statement) and supported_language(statement[j + 2])
                 ):
@@ -89,7 +101,7 @@ def routine_bodies(statement):
                     # consume the name as data and cannot reset that choice.
                     if option == "language" and supported_language(value):
                         supported = True
-                    elif option == "as" and value.startswith(("$", "'")):
+                    elif option == "as" and standalone_body(statement, k + 1):
                         body = value
             if supported and body:
                 yield body
@@ -328,6 +340,30 @@ class MigrationColumns(unittest.TestCase):
             'unreviewed: 9000_fixture.sql sample "DemoSecret" text',
             "unreviewed: 9000_fixture.sql sample demo_token text",
         ])
+
+    def test_quoted_language_names_preserve_case(self):
+        for language, expected in (
+            ("$lang$plpgsql$lang$", [("x", "api_secret", "text")]),
+            ("'SQL'", []),
+            ("E'SQL'", []),
+        ):
+            with self.subTest(language=language):
+                sql = f"DO LANGUAGE {language} 'BEGIN ALTER TABLE x ADD api_secret text; END';"
+                self.assertEqual(list(columns(sql)), expected)
+
+    def test_concatenated_body_is_left_to_review(self):
+        for routine in (
+            "DO LANGUAGE plpgsql",
+            "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS",
+            "CREATE PROCEDURE p() LANGUAGE plpgsql AS",
+        ):
+            with self.subTest(routine=routine):
+                sql = f"""{routine} 'BEGIN /* part one'
+                    'part two */ NULL; END';
+                    ALTER TABLE sample ADD demo_secret text;"""
+                self.assertEqual(self.fixture_findings(sql), [
+                    "unreviewed: 9000_fixture.sql sample demo_secret text",
+                ])
 
     def test_explicit_clauses_preserve_names_and_body_language(self):
         sql = """

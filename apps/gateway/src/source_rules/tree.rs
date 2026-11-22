@@ -165,7 +165,7 @@ impl<'ast> Visit<'ast> for Unreadable<'_> {
             .path
             .segments
             .last()
-            .is_some_and(|s| s.ident == "include")
+            .is_some_and(|s| s.ident.unraw() == "include")
         {
             panic!(
                 "{}: include! adds code the source rules cannot read",
@@ -201,11 +201,14 @@ impl<'ast> Visit<'ast> for Unreadable<'_> {
             );
         }
         for attr in &module.attrs {
-            if attr.path().is_ident("cfg_attr")
+            if attr
+                .path()
+                .get_ident()
+                .is_some_and(|id| id.unraw() == "cfg_attr")
                 && let Meta::List(list) = &attr.meta
                 && flat(list.tokens.clone())
                     .iter()
-                    .any(|t| matches!(t, TokenTree::Ident(i) if i == "path"))
+                    .any(|t| matches!(t, TokenTree::Ident(i) if i.unraw() == "path"))
             {
                 panic!(
                     "{}: cfg_attr(.., path = ..) on a module chooses a file the source rules cannot predict",
@@ -872,6 +875,33 @@ mod tests {
             ],
             "lib.rs",
         );
+    }
+
+    #[test]
+    fn raw_include_is_rejected() {
+        assert_loader_refuses(
+            || tree(&[("lib.rs", r#"r#include!("other.rs");"#)], "lib.rs"),
+            "lib.rs: include!",
+        );
+    }
+
+    #[test]
+    fn conditional_module_paths_with_raw_identifiers_are_rejected() {
+        for attr in [
+            r#"#[cfg_attr(all(), r#path = "chosen.rs")]"#,
+            r#"#[r#cfg_attr(all(), path = "chosen.rs")]"#,
+        ] {
+            let source = format!("{attr} mod m;");
+            assert_loader_refuses(
+                || {
+                    tree(
+                        &[("lib.rs", &source), ("m.rs", ""), ("chosen.rs", "")],
+                        "lib.rs",
+                    )
+                },
+                "lib.rs: cfg_attr(.., path",
+            );
+        }
     }
 
     #[test]
