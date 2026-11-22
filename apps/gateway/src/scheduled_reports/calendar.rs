@@ -1,6 +1,10 @@
 //! UTC accounting periods; IANA civil time affects only the due instant.
 use gateway_datetime_compat::{CalendarDate, SignedDuration as TimeDelta, UtcInstant};
-use jiff::tz::TimeZone;
+use jiff::tz::{TimeZone, TimeZoneDatabase};
+use std::sync::LazyLock;
+
+pub(crate) const TZDB_VERSION: &str = jiff_tzdb::VERSION;
+static TZDB: LazyLock<TimeZoneDatabase> = LazyLock::new(TimeZoneDatabase::bundled);
 
 #[derive(Clone, Debug)]
 pub(crate) struct Calendar {
@@ -26,7 +30,7 @@ impl Calendar {
         let minutes = crate::jobs::schedule::parse_hhmm(time).ok_or_else(invalid)?;
         Ok(Self {
             monthly: cadence == "monthly",
-            zone: TimeZone::get(zone).map_err(|_| invalid())?,
+            zone: TZDB.get(zone).map_err(|_| invalid())?,
             hour: (minutes / 60) as i8,
             minute: (minutes % 60) as i8,
         })

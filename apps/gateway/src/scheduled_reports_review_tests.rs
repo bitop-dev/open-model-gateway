@@ -44,14 +44,14 @@ fn scheduled_reports_failure_categories_are_bounded() {
 mod db {
     use crate::scheduled_reports::{
         CANDIDATE_BATCH, SELECT_CANDIDATES_AFTER, SELECT_CANDIDATES_FIRST, SELECT_ELIGIBLE,
-        begin_dispatch,
+        SELECT_STALE_AFTER, SELECT_STALE_FIRST, begin_dispatch, calendar::TZDB_VERSION,
     };
     use gateway_datetime_compat::UtcInstant;
     use serde_json::Value;
     use sqlx::PgPool;
     use uuid::Uuid;
-    fn inspect(v: &Value, found: &mut bool, work: &mut f64) {
-        if v["Index Name"].as_str() == Some("report_schedules_dispatch_due") {
+    fn inspect(v: &Value, index: &str, found: &mut bool, work: &mut f64) {
+        if v["Index Name"].as_str() == Some(index) {
             *found = true;
         }
         if v["Node Type"].as_str().is_some_and(|s| s.contains("Scan")) {
@@ -61,7 +61,7 @@ mod db {
         }
         if let Some(plans) = v["Plans"].as_array() {
             for p in plans {
-                inspect(p, found, work);
+                inspect(p, index, found, work);
             }
         }
     }
@@ -107,7 +107,7 @@ mod db {
             .await
             .unwrap();
         let (mut ignored, mut join_work) = (false, 0.);
-        inspect(&join[0]["Plan"], &mut ignored, &mut join_work);
+        inspect(&join[0]["Plan"], "", &mut ignored, &mut join_work);
         assert!(
             join_work <= CANDIDATE_BATCH as f64 * 4.,
             "unbounded claim join: {join}"
@@ -133,7 +133,12 @@ mod db {
                 query.fetch_one(&mut *tx).await.unwrap()
             };
             let (mut found, mut work) = (false, 0.);
-            inspect(&plan[0]["Plan"], &mut found, &mut work);
+            inspect(
+                &plan[0]["Plan"],
+                "report_schedules_dispatch_due",
+                &mut found,
+                &mut work,
+            );
             assert!(found, "{plan}");
             assert!(
                 work <= CANDIDATE_BATCH as f64 * 4.,
@@ -152,5 +157,70 @@ mod db {
             crate::scheduled_reports::Outcome::classify(&error),
             crate::scheduled_reports::Outcome::Timeout
         );
+    }
+
+    #[dbtest::test]
+    async fn scheduled_reports_tzdb_stale_index_range_is_bounded(pool: PgPool) {
+        let user: Uuid = sqlx::query_scalar("INSERT INTO users(id,email) VALUES(gen_random_uuid(),'report-tz-plan@example.test') RETURNING id")
+            .fetch_one(&pool).await.unwrap();
+        let pinned: String =
+            sqlx::query_scalar("SELECT report_tzdb FROM work_leases WHERE name='report_scheduler'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            pinned, TZDB_VERSION,
+            "a bundle update must move the database pin"
+        );
+        sqlx::query("INSERT INTO report_schedules(scope_kind,created_by,cadence,timezone,delivery_time,state,next_run_at,next_period_end,cursor_tzdb) SELECT 'installation',$1,'weekly','UTC','09:00','active',now()+interval '1 year',now()+interval '1 year',CASE WHEN n<=5000 THEN '' ELSE $2 END FROM generate_series(1,25000) n")
+            .bind(user).bind(TZDB_VERSION).execute(&pool).await.unwrap();
+        sqlx::query("ANALYZE report_schedules")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let first: Vec<(String, UtcInstant, Uuid)> = sqlx::query_as(SELECT_STALE_FIRST)
+            .bind(TZDB_VERSION)
+            .bind(8i64)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 8);
+        let (bundle, end, id) = first.last().unwrap();
+        let next: Vec<(String, UtcInstant, Uuid)> = sqlx::query_as(SELECT_STALE_AFTER)
+            .bind(TZDB_VERSION)
+            .bind(8i64)
+            .bind(bundle)
+            .bind(end)
+            .bind(id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(next.len(), 8);
+        assert!(next[0] > *first.last().unwrap());
+        for sql in [SELECT_STALE_FIRST, SELECT_STALE_AFTER] {
+            let explain = format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {sql}");
+            let query = sqlx::query_scalar::<_, Value>(&explain)
+                .bind(TZDB_VERSION)
+                .bind(8i64);
+            let plan = if sql == SELECT_STALE_AFTER {
+                query
+                    .bind(bundle)
+                    .bind(end)
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            } else {
+                query.fetch_one(&pool).await.unwrap()
+            };
+            let (mut found, mut work) = (false, 0.);
+            inspect(
+                &plan[0]["Plan"],
+                "report_schedules_stale_calendar",
+                &mut found,
+                &mut work,
+            );
+            assert!(found && work <= 8., "{plan}");
+        }
     }
 }

@@ -461,7 +461,7 @@ async fn scheduled_reports_run_as_runtime(pool: &PgPool) {
     open_model_gateway::scheduled_reports::tick(&store, &fence)
         .await
         .unwrap();
-    sqlx::query("UPDATE report_schedules SET next_period_end=date_trunc('week',clock_timestamp(),'UTC')-interval '7 days',next_run_at=clock_timestamp()-interval '1 day' WHERE id=$1").bind(id).execute(&runtime).await.unwrap();
+    sqlx::query("UPDATE report_schedules SET next_period_end=date_trunc('week',clock_timestamp(),'UTC')-interval '7 days',next_run_at=clock_timestamp()-interval '1 day' WHERE id=$1").bind(id).execute(pool).await.unwrap();
     open_model_gateway::scheduled_reports::tick(&store, &fence)
         .await
         .unwrap();
@@ -541,6 +541,8 @@ async fn scheduled_reports_run_as_runtime(pool: &PgPool) {
         "UPDATE report_schedules SET created_by=gen_random_uuid()",
         "UPDATE report_schedules SET scope_kind='installation'",
         "UPDATE report_schedules SET configuration_revision=4",
+        "UPDATE report_schedules SET next_run_at=clock_timestamp()",
+        "UPDATE report_schedules SET cursor_tzdb=''",
         "DELETE FROM report_schedules",
         "TRUNCATE report_schedules CASCADE",
         "UPDATE report_schedule_recipients SET user_id=gen_random_uuid()",

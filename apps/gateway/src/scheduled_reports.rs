@@ -17,6 +17,9 @@ use uuid::Uuid;
 pub(crate) const CANDIDATE_BATCH: i64 = 32;
 pub(crate) const SELECT_CANDIDATES_FIRST: &str = "SELECT coalesce(next_run_at,'0001-01-01 00:00:00+00'::timestamptz) due_at,id FROM report_schedules WHERE state='active' AND deleted_at IS NULL AND coalesce(next_run_at,'0001-01-01 00:00:00+00'::timestamptz)<=$1 ORDER BY coalesce(next_run_at,'0001-01-01 00:00:00+00'::timestamptz),id LIMIT $2";
 pub(crate) const SELECT_CANDIDATES_AFTER: &str = "SELECT coalesce(next_run_at,'0001-01-01 00:00:00+00'::timestamptz) due_at,id FROM report_schedules WHERE state='active' AND deleted_at IS NULL AND coalesce(next_run_at,'0001-01-01 00:00:00+00'::timestamptz)<=$1 AND (coalesce(next_run_at,'0001-01-01 00:00:00+00'::timestamptz),id)>($3,$4) ORDER BY coalesce(next_run_at,'0001-01-01 00:00:00+00'::timestamptz),id LIMIT $2";
+pub(crate) type CalendarScanKey = (String, UtcInstant, Uuid);
+pub(crate) const SELECT_STALE_FIRST: &str = "SELECT cursor_tzdb,next_period_end,id FROM report_schedules WHERE state='active' AND deleted_at IS NULL AND next_run_at IS NOT NULL AND next_period_end IS NOT NULL AND cursor_tzdb<$1 ORDER BY cursor_tzdb,next_period_end,id LIMIT $2";
+pub(crate) const SELECT_STALE_AFTER: &str = "SELECT cursor_tzdb,next_period_end,id FROM report_schedules WHERE state='active' AND deleted_at IS NULL AND next_run_at IS NOT NULL AND next_period_end IS NOT NULL AND cursor_tzdb<$1 AND (cursor_tzdb,next_period_end,id)>($3,$4,$5) ORDER BY cursor_tzdb,next_period_end,id LIMIT $2";
 /// Every dispatcher transaction has a server deadline, including non-generation
 /// work. A client cancellation is not the only bound on database work.
 pub(crate) async fn begin_dispatch(
@@ -106,11 +109,20 @@ struct Schedule {
     next_period_end: Option<UtcInstant>,
     last_period_end: Option<UtcInstant>,
     next_run_at: Option<UtcInstant>,
+    cursor_tzdb: String,
 }
-const COLUMNS: &str = "id,workspace_id,cost_center_id,scope_kind,created_by,cadence,timezone,left(delivery_time::text,5) delivery_time,configuration_revision,next_period_end,last_period_end,next_run_at";
+const COLUMNS: &str = "id,workspace_id,cost_center_id,scope_kind,created_by,cadence,timezone,left(delivery_time::text,5) delivery_time,configuration_revision,next_period_end,last_period_end,next_run_at,cursor_tzdb";
 impl Schedule {
     fn calendar(&self) -> Result<Calendar, sqlx::Error> {
         Calendar::new(&self.cadence, &self.timezone, &self.delivery_time)
+    }
+    fn reconciled_due(&self, now: UtcInstant) -> Result<UtcInstant, sqlx::Error> {
+        let c = self.calendar()?;
+        let latest = c.latest_complete(now)?;
+        match self.next_period_end {
+            Some(end) if end > latest.end => c.delivery_after(end),
+            _ => Ok(latest.due),
+        }
     }
     fn scopes(&self) -> Vec<Scope> {
         self.workspace_id
@@ -162,6 +174,25 @@ async fn pause(tx: &mut Transaction<'_, Postgres>, s: &Schedule) -> Result<(), s
     )
     .await
 }
+async fn set_cursor(
+    tx: &mut Transaction<'_, Postgres>,
+    s: &Schedule,
+    due: UtcInstant,
+    period_end: UtcInstant,
+    delivered_end: Option<UtcInstant>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT omg_report_set_cursor($1,$2,$3,$4,$5,$6)")
+        .bind(s.id)
+        .bind(s.configuration_revision)
+        .bind(calendar::TZDB_VERSION)
+        .bind(due)
+        .bind(period_end)
+        .bind(delivered_end)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 /// Called inside CRUD after its configuration write and by bounded worker
 /// initialization for pre-upgrade NULL cursors. Database time, no backfill.
 pub(crate) async fn initialize(
@@ -179,12 +210,7 @@ async fn initialize_with_clock(
     if let Some(s) = s {
         let now = clock.now(tx).await?;
         let o = s.calendar()?.next_after(now, s.last_period_end)?;
-        sqlx::query("UPDATE report_schedules SET next_run_at=$2,next_period_end=$3 WHERE id=$1")
-            .bind(id)
-            .bind(o.due)
-            .bind(o.end)
-            .execute(&mut **tx)
-            .await?;
+        set_cursor(tx, &s, o.due, o.end, None).await?;
     }
     Ok(())
 }
@@ -222,13 +248,21 @@ async fn claim_with_clock(
         crate::metrics::METRICS.observe_report_outcome(Outcome::AuthorityLost);
         return Ok(None);
     }
-    if s.next_run_at.is_none() || s.next_period_end.is_none() {
+    let (Some(stored_due), Some(pending_end)) = (s.next_run_at, s.next_period_end) else {
         initialize_with_clock(&mut tx, id, clock).await?;
         tx.commit().await?;
         return Ok(None);
-    }
+    };
     let now = clock.now(&mut tx).await?;
-    if s.next_run_at.is_some_and(|due| due > now) {
+    let due = if s.cursor_tzdb == calendar::TZDB_VERSION {
+        stored_due
+    } else {
+        let due = s.reconciled_due(now)?;
+        reconcile_cursor(&mut tx, &s, due).await?;
+        due
+    };
+    if due > now {
+        tx.commit().await?;
         return Ok(None);
     }
     let c = s.calendar()?;
@@ -236,21 +270,16 @@ async fn claim_with_clock(
     // Never emit an older period just before the latest complete period's
     // delivery preference. Preserve the original cursor for skipped counting.
     if period.due > now {
-        sqlx::query("UPDATE report_schedules SET next_run_at=$2 WHERE id=$1")
-            .bind(id)
-            .bind(period.due)
-            .execute(&mut *tx)
-            .await?;
+        set_cursor(&mut tx, &s, period.due, pending_end, None).await?;
         tx.commit().await?;
         return Ok(None);
     }
-    if s.next_period_end.is_some_and(|end| period.end < end)
-        || s.last_period_end.is_some_and(|end| period.end <= end)
-    {
+    if period.end < pending_end || s.last_period_end.is_some_and(|end| period.end <= end) {
+        tx.commit().await?;
         return Ok(None);
     }
     let token = Uuid::new_v4();
-    let skipped = c.skipped(s.next_period_end.unwrap(), period.end);
+    let skipped = c.skipped(pending_end, period.end);
     let won=sqlx::query("INSERT INTO report_generation_claims(schedule_id,token,configuration_revision,period_start,period_end,skipped_intervals,expires_at) VALUES($1,$2,$3,$4,$5,$6,clock_timestamp()+interval '30 seconds') ON CONFLICT(schedule_id) DO UPDATE SET token=excluded.token,configuration_revision=excluded.configuration_revision,period_start=excluded.period_start,period_end=excluded.period_end,skipped_intervals=excluded.skipped_intervals,expires_at=excluded.expires_at WHERE report_generation_claims.expires_at<=clock_timestamp()")
         .bind(id).bind(token).bind(s.configuration_revision).bind(period.start).bind(period.end).bind(skipped).execute(&mut *tx).await?.rows_affected()==1;
     tx.commit().await?;
@@ -315,7 +344,7 @@ pub(crate) async fn complete(
         record_outcome(&mut tx, &s, Some(c), Outcome::Success, Some(run)).await?;
     }
     let next = s.calendar()?.next_after(c.period.due, Some(c.period.end))?;
-    sqlx::query("UPDATE report_schedules SET last_period_end=$2,next_period_end=$3,next_run_at=$4 WHERE id=$1").bind(s.id).bind(c.period.end).bind(next.end).bind(next.due).execute(&mut *tx).await?;
+    set_cursor(&mut tx, &s, next.due, next.end, Some(c.period.end)).await?;
     sqlx::query("UPDATE report_generation_claims SET expires_at=clock_timestamp() WHERE schedule_id=$1 AND token=$2").bind(s.id).bind(c.token).execute(&mut *tx).await?;
     tx.commit().await?;
     if run.is_some() {
@@ -323,6 +352,82 @@ pub(crate) async fn complete(
     }
     Ok(run.is_some())
 }
+/// Only the delivery instant is derived from tzdb. Keep the original UTC
+/// period cursor for skipped counting, including after a catch-up deferral.
+async fn reconcile_cursor(
+    tx: &mut Transaction<'_, Postgres>,
+    s: &Schedule,
+    due: UtcInstant,
+) -> Result<(), sqlx::Error> {
+    set_cursor(tx, s, due, s.next_period_end.unwrap(), None).await?;
+    // Claims for a stale cursor were made under the former calendar. The
+    // lease cutover fences their publishers; release their slots immediately.
+    sqlx::query("UPDATE report_generation_claims SET expires_at=clock_timestamp() WHERE schedule_id=$1 AND expires_at>clock_timestamp()")
+        .bind(s.id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn reconcile_stale_calendars(
+    tx: &mut Transaction<'_, Postgres>,
+    store: &Store,
+    cutoff: UtcInstant,
+) -> Result<(), sqlx::Error> {
+    let frontier = store
+        .report_calendar_scan
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let mut candidates: Vec<CalendarScanKey> = match frontier {
+        Some((bundle, end, id)) => {
+            sqlx::query_as(SELECT_STALE_AFTER)
+                .bind(calendar::TZDB_VERSION)
+                .bind(PER_TICK)
+                .bind(bundle)
+                .bind(end)
+                .bind(id)
+                .fetch_all(&mut **tx)
+                .await?
+        }
+        None => Vec::new(),
+    };
+    if candidates.is_empty() {
+        candidates = sqlx::query_as(SELECT_STALE_FIRST)
+            .bind(calendar::TZDB_VERSION)
+            .bind(PER_TICK)
+            .fetch_all(&mut **tx)
+            .await?;
+    }
+    // Limit the ordered range before point-locking. SKIP LOCKED on the range
+    // itself could walk an arbitrary number of locked schedules.
+    let ids: Vec<_> = candidates.iter().map(|(_, _, id)| *id).collect();
+    if !ids.is_empty() {
+        let sql = format!(
+            "SELECT s.* FROM unnest($1::uuid[]) i(id) CROSS JOIN LATERAL (SELECT {COLUMNS} FROM report_schedules WHERE id=i.id AND state='active' AND deleted_at IS NULL AND next_run_at IS NOT NULL AND next_period_end IS NOT NULL AND cursor_tzdb<$2 FOR UPDATE SKIP LOCKED) s"
+        );
+        let schedules: Vec<Schedule> = sqlx::query_as(&sql)
+            .bind(ids)
+            .bind(calendar::TZDB_VERSION)
+            .fetch_all(&mut **tx)
+            .await?;
+        for s in schedules {
+            // A zone removed from a future bundle must not block the page.
+            // The frontier revisits it without hiding other pending schedules.
+            let Ok(due) = s.reconciled_due(cutoff) else {
+                tracing::warn!(schedule_id=%s.id, "could not reconcile report calendar");
+                continue;
+            };
+            reconcile_cursor(tx, &s, due).await?;
+        }
+    }
+    *store
+        .report_calendar_scan
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = candidates.pop();
+    Ok(())
+}
+
 /// Index range scan first, bounded point-lookups/fairness second. The frontier
 /// is advisory and rotates even across live claims or failed reports. No lock
 /// or transaction is held across generation, and failover may reset the scan.
@@ -334,12 +439,9 @@ async fn select_tick_with_clock(
     let mut tx = begin_dispatch(&store.pool).await?;
     fence.check(&mut tx).await?;
     let cutoff = clock.now(&mut tx).await?;
-    // Claim eligibility is an expiry check, not a scheduling decision.
-    let expiry_cutoff = match clock {
-        SchedulingClock::Database => cutoff,
-        #[cfg(all(test, feature = "integration-tests"))]
-        SchedulingClock::Fixed(_) => SchedulingClock::Database.now(&mut tx).await?,
-    };
+    reconcile_stale_calendars(&mut tx, store, cutoff).await?;
+    // Use real time after reconciliation so just-expired old claims are eligible.
+    let expiry_cutoff = SchedulingClock::Database.now(&mut tx).await?;
     let pending=sqlx::query_scalar("SELECT id FROM report_schedules WHERE state='paused' AND deleted_at IS NULL AND next_run_at IS NULL ORDER BY id LIMIT $1").bind(PER_TICK).fetch_all(&mut *tx).await?;
     let frontier = *store
         .report_dispatch

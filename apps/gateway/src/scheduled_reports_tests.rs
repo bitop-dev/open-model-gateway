@@ -135,6 +135,158 @@ mod db {
             .unwrap()
     }
     #[dbtest::test]
+    async fn scheduled_reports_tzdb_earlier_persisted_boundary(pool: PgPool) {
+        let (store, fence, id, _) = setup(&pool).await;
+        let end = at("2026-11-16T00:00:00Z");
+        let old_due = at("2026-11-16T14:00:00Z");
+        let due = at("2026-11-16T13:00:00Z");
+        sqlx::query(
+            "UPDATE report_schedules SET timezone='Cuba',delivery_time='09:00' WHERE id=$1",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE report_schedules SET next_period_end=$2,next_run_at=$3 WHERE id=$1")
+            .bind(id)
+            .bind(end)
+            .bind(old_due)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(cursor(&pool, id).await, (Some(old_due), Some(end), None));
+        assert_eq!(
+            Calendar::new("weekly", "Cuba", "09:00")
+                .unwrap()
+                .delivery_after(end)
+                .unwrap(),
+            due
+        );
+        assert_eq!(
+            scheduled_reports::tick_at(&store, &fence, at("2026-11-16T12:59:59Z"))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(cursor(&pool, id).await, (Some(due), Some(end), None));
+        assert_eq!(
+            scheduled_reports::tick_at(&store, &fence, due)
+                .await
+                .unwrap(),
+            1,
+            "the persisted old instant must not hide a now-due occurrence"
+        );
+        assert_eq!(count(&pool).await, 1);
+    }
+    #[dbtest::test]
+    async fn scheduled_reports_tzdb_later_preserves_skips_snapshot_and_delivery(pool: PgPool) {
+        let (store, fence, id, _) = setup(&pool).await;
+        sqlx::query("UPDATE report_schedules SET timezone='Africa/Casablanca',delivery_time='09:00' WHERE id=$1")
+            .bind(id).execute(&pool).await.unwrap();
+        let revision: i64 =
+            sqlx::query_scalar("SELECT configuration_revision FROM report_schedules WHERE id=$1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let previous_end = at("2026-10-26T00:00:00Z");
+        let previous_due = at("2026-10-26T09:00:00Z");
+        sqlx::query("UPDATE report_schedules SET next_period_end=$2,next_run_at=$3 WHERE id=$1")
+            .bind(id)
+            .bind(previous_end)
+            .bind(previous_due)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            scheduled_reports::tick_at(&store, &fence, previous_due)
+                .await
+                .unwrap(),
+            1
+        );
+        let previous: (Uuid, Value) = sqlx::query_as("SELECT run_id,body FROM report_snapshots")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        // 2026b used UTC+01. The old worker had deferred delivery to the latest
+        // completed week while retaining the first pending week for skip counts.
+        let first_pending = at("2026-11-02T00:00:00Z");
+        let end = at("2026-11-16T00:00:00Z");
+        let old_due = at("2026-11-16T08:00:00Z");
+        let due = at("2026-11-16T09:00:00Z");
+        sqlx::query("UPDATE report_schedules SET next_run_at=$2,cursor_tzdb='2026b' WHERE id=$1")
+            .bind(id)
+            .bind(old_due)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            cursor(&pool, id).await,
+            (Some(old_due), Some(first_pending), Some(previous_end))
+        );
+        sqlx::query("UPDATE report_generation_claims SET token=gen_random_uuid(),period_start=$2,period_end=$3,expires_at=clock_timestamp()+interval '30 seconds' WHERE schedule_id=$1")
+            .bind(id).bind(at("2026-11-09T00:00:00Z")).bind(end).execute(&pool).await.unwrap();
+
+        assert!(
+            scheduled_reports::claim_at(&store, &fence, id, old_due)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            cursor(&pool, id).await,
+            (Some(due), Some(first_pending), Some(previous_end))
+        );
+        assert_eq!(count(&pool).await, 1);
+        assert!(!sqlx::query_scalar::<_, bool>(
+            "SELECT expires_at>clock_timestamp() FROM report_generation_claims WHERE schedule_id=$1"
+        ).bind(id).fetch_one(&pool).await.unwrap());
+
+        sqlx::query("SELECT omg_lease_release('report_scheduler',$1,$2)")
+            .bind(fence.holder)
+            .bind(fence.epoch)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let leases = Leases::new();
+        leases.renew_once(&pool).await;
+        let next_fence = leases.held(Lease::ReportScheduler).unwrap();
+        assert!(next_fence.epoch > fence.epoch);
+        let restarted = Store::new(pool.clone());
+        assert!(crate::leases::is_fenced(
+            &scheduled_reports::tick_at(&restarted, &fence, due)
+                .await
+                .unwrap_err()
+        ));
+        assert_eq!(
+            scheduled_reports::tick_at(&restarted, &next_fence, old_due)
+                .await
+                .unwrap(),
+            0
+        );
+        let (a, b) = tokio::join!(
+            scheduled_reports::tick_at(&restarted, &next_fence, due),
+            scheduled_reports::tick_at(&restarted, &next_fence, due)
+        );
+        assert_eq!(a.unwrap() + b.unwrap(), 1);
+        assert_eq!(count(&pool).await, 2);
+        let new: (i64, i64, i64) = sqlx::query_as(
+            "SELECT r.configuration_revision,r.skipped_intervals,(SELECT count(*) FROM alert_deliveries d WHERE d.report_run_id=r.id) FROM report_runs r WHERE r.schedule_id=$1 AND r.period_end=$2"
+        ).bind(id).bind(end).fetch_one(&pool).await.unwrap();
+        assert_eq!(new, (revision, 2, 1));
+        assert_eq!(
+            sqlx::query_as::<_, (Uuid, Value)>(
+                "SELECT run_id,body FROM report_snapshots WHERE run_id=$1"
+            )
+            .bind(previous.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            previous
+        );
+    }
+    #[dbtest::test]
     async fn scheduled_reports_delivery_boundary_defers_then_catches_up_once(pool: PgPool) {
         let (s, f, id, _) = setup(&pool).await;
         let before = at("2026-10-26T00:00:30Z");
