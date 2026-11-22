@@ -446,8 +446,9 @@ GRANT EXECUTE ON FUNCTION public.omg_scope_key(uuid),public.omg_type_key(text),
 GRANT SELECT,UPDATE(version,changed_at) ON public.config_versions TO gateway_runtime;
 GRANT EXECUTE ON FUNCTION public.omg_config_bump(text) TO gateway_runtime;
 -- Work leases (0029): replicas take, renew, fence and release the seeded
--- singleton-job leases through these helpers (FOR SHARE fencing needs an
--- UPDATE column). Lease names are seeded and never created, renamed or
+-- singleton-job leases through these helpers. FOR SHARE fencing and report
+-- management's calendar check need an UPDATE column. The bundle pin is
+-- migration-owned. Lease names are seeded and never created, renamed or
 -- removed at runtime; epochs only move forward (trigger).
 GRANT SELECT,UPDATE(holder,epoch,acquired_at,expires_at,last_completed_at,last_completed_epoch)
  ON public.work_leases TO gateway_runtime;

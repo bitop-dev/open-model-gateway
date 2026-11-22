@@ -51,7 +51,7 @@ RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public
 DECLARE required_bundle text;
 BEGIN
  SELECT report_tzdb INTO STRICT required_bundle FROM public.work_leases
-  WHERE name='report_scheduler';
+  WHERE name='report_scheduler' FOR SHARE;
  IF required_bundle IS DISTINCT FROM bundle THEN
   RAISE EXCEPTION 'report calendar bundle mismatch' USING ERRCODE='55006';
  END IF;

@@ -74,6 +74,9 @@ impl Outcome {
 }
 pub(crate) const SELECT_ELIGIBLE: &str = "SELECT i.id FROM unnest($1::uuid[]) WITH ORDINALITY i(id,n) LEFT JOIN LATERAL (SELECT schedule_id,expires_at FROM report_generation_claims WHERE schedule_id=i.id OFFSET 0) c ON true WHERE c.schedule_id IS NULL OR c.expires_at<=$2 ORDER BY c.expires_at NULLS FIRST,i.n LIMIT $3";
 const PER_TICK: i64 = 8;
+pub(crate) const CALENDAR_PAGE: i64 = 128;
+const CALENDAR_PAGES_PER_PASS: usize = 16;
+const CALENDAR_CONTINUATION: Duration = Duration::from_secs(1);
 const DEADLINE: Duration = Duration::from_secs(10);
 /// Scheduling decisions only; leases, claim expiry and retention use database time.
 #[derive(Clone, Copy)]
@@ -193,6 +196,23 @@ async fn set_cursor(
     Ok(())
 }
 
+/// Take the same lease-row lock as the scheduler before locking authority or
+/// schedule rows. A pin update queues behind initialization or wins first and
+/// refuses the older binary before it chooses a pending period.
+pub(crate) async fn lock_calendar(tx: &mut Transaction<'_, Postgres>) -> Result<(), sqlx::Error> {
+    let bundle: String = sqlx::query_scalar(
+        "SELECT report_tzdb FROM work_leases WHERE name='report_scheduler' FOR SHARE",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    if bundle != calendar::TZDB_VERSION {
+        return Err(sqlx::Error::Protocol(
+            "report calendar bundle mismatch".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Called inside CRUD after its configuration write and by bounded worker
 /// initialization for pre-upgrade NULL cursors. Database time, no backfill.
 pub(crate) async fn initialize(
@@ -200,6 +220,14 @@ pub(crate) async fn initialize(
     id: Uuid,
 ) -> Result<(), sqlx::Error> {
     initialize_with_clock(tx, id, SchedulingClock::Database).await
+}
+#[cfg(all(test, feature = "integration-tests"))]
+pub(super) async fn initialize_at(
+    tx: &mut Transaction<'_, Postgres>,
+    id: Uuid,
+    now: UtcInstant,
+) -> Result<(), sqlx::Error> {
+    initialize_with_clock(tx, id, SchedulingClock::Fixed(now)).await
 }
 async fn initialize_with_clock(
     tx: &mut Transaction<'_, Postgres>,
@@ -369,36 +397,40 @@ async fn reconcile_cursor(
     Ok(())
 }
 
-async fn reconcile_stale_calendars(
-    tx: &mut Transaction<'_, Postgres>,
+/// One page per transaction keeps the lease and schedule locks short. The
+/// frontier advances past contended rows and restarts on the next regular tick.
+async fn reconcile_calendar_page(
     store: &Store,
-    cutoff: UtcInstant,
-) -> Result<(), sqlx::Error> {
+    fence: &Fence,
+    clock: SchedulingClock,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = begin_dispatch(&store.pool).await?;
+    fence.check(&mut tx).await?;
+    let cutoff = clock.now(&mut tx).await?;
     let frontier = store
         .report_calendar_scan
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    let mut candidates: Vec<CalendarScanKey> = match frontier {
+    let candidates: Vec<CalendarScanKey> = match frontier {
         Some((bundle, end, id)) => {
             sqlx::query_as(SELECT_STALE_AFTER)
                 .bind(calendar::TZDB_VERSION)
-                .bind(PER_TICK)
+                .bind(CALENDAR_PAGE)
                 .bind(bundle)
                 .bind(end)
                 .bind(id)
-                .fetch_all(&mut **tx)
+                .fetch_all(&mut *tx)
                 .await?
         }
-        None => Vec::new(),
+        None => {
+            sqlx::query_as(SELECT_STALE_FIRST)
+                .bind(calendar::TZDB_VERSION)
+                .bind(CALENDAR_PAGE)
+                .fetch_all(&mut *tx)
+                .await?
+        }
     };
-    if candidates.is_empty() {
-        candidates = sqlx::query_as(SELECT_STALE_FIRST)
-            .bind(calendar::TZDB_VERSION)
-            .bind(PER_TICK)
-            .fetch_all(&mut **tx)
-            .await?;
-    }
     // Limit the ordered range before point-locking. SKIP LOCKED on the range
     // itself could walk an arbitrary number of locked schedules.
     let ids: Vec<_> = candidates.iter().map(|(_, _, id)| *id).collect();
@@ -409,23 +441,55 @@ async fn reconcile_stale_calendars(
         let schedules: Vec<Schedule> = sqlx::query_as(&sql)
             .bind(ids)
             .bind(calendar::TZDB_VERSION)
-            .fetch_all(&mut **tx)
+            .fetch_all(&mut *tx)
             .await?;
+        let mut ids = Vec::new();
+        let mut revisions = Vec::new();
+        let mut due_times = Vec::new();
+        let mut period_ends = Vec::new();
         for s in schedules {
-            // A zone removed from a future bundle must not block the page.
-            // The frontier revisits it without hiding other pending schedules.
+            // Advance past a zone removed from the bundle and revisit it on
+            // the next pass without preventing other schedules from running.
             let Ok(due) = s.reconciled_due(cutoff) else {
                 tracing::warn!(schedule_id=%s.id, "could not reconcile report calendar");
                 continue;
             };
-            reconcile_cursor(tx, &s, due).await?;
+            ids.push(s.id);
+            revisions.push(s.configuration_revision);
+            due_times.push(due);
+            period_ends.push(s.next_period_end.unwrap());
         }
+        sqlx::query("SELECT omg_report_set_cursor(id,revision,$5,due_at,period_end,NULL) FROM unnest($1::uuid[],$2::bigint[],$3::timestamptz[],$4::timestamptz[]) AS c(id,revision,due_at,period_end)")
+            .bind(&ids).bind(revisions).bind(due_times).bind(period_ends).bind(calendar::TZDB_VERSION)
+            .execute(&mut *tx).await?;
+        // The lease cutover fenced the previous claims' publishers.
+        sqlx::query("UPDATE report_generation_claims SET expires_at=clock_timestamp() WHERE schedule_id=ANY($1) AND expires_at>clock_timestamp()")
+            .bind(&ids).execute(&mut *tx).await?;
     }
+    tx.commit().await?;
+    let more = candidates.len() == CALENDAR_PAGE as usize;
     *store
         .report_calendar_scan
         .lock()
-        .unwrap_or_else(|e| e.into_inner()) = candidates.pop();
-    Ok(())
+        .unwrap_or_else(|e| e.into_inner()) = if more {
+        candidates.into_iter().last()
+    } else {
+        None
+    };
+    Ok(more)
+}
+
+async fn reconcile_calendar_pass(
+    store: &Store,
+    fence: &Fence,
+    clock: SchedulingClock,
+) -> Result<bool, sqlx::Error> {
+    for _ in 0..CALENDAR_PAGES_PER_PASS {
+        if !reconcile_calendar_page(store, fence, clock).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Index range scan first, bounded point-lookups/fairness second. The frontier
@@ -439,8 +503,6 @@ async fn select_tick_with_clock(
     let mut tx = begin_dispatch(&store.pool).await?;
     fence.check(&mut tx).await?;
     let cutoff = clock.now(&mut tx).await?;
-    reconcile_stale_calendars(&mut tx, store, cutoff).await?;
-    // Use real time after reconciliation so just-expired old claims are eligible.
     let expiry_cutoff = SchedulingClock::Database.now(&mut tx).await?;
     let pending=sqlx::query_scalar("SELECT id FROM report_schedules WHERE state='paused' AND deleted_at IS NULL AND next_run_at IS NULL ORDER BY id LIMIT $1").bind(PER_TICK).fetch_all(&mut *tx).await?;
     let frontier = *store
@@ -524,7 +586,9 @@ pub(crate) async fn failed(
 }
 /// One bounded tick; no unfenced operator mode can publish occurrences.
 pub async fn tick(store: &Store, fence: &Fence) -> Result<usize, sqlx::Error> {
-    tick_with_clock(store, fence, SchedulingClock::Database).await
+    tick_with_clock(store, fence, SchedulingClock::Database)
+        .await
+        .map(|(generated, _)| generated)
 }
 #[cfg(all(test, feature = "integration-tests"))]
 pub(super) async fn tick_at(
@@ -532,16 +596,19 @@ pub(super) async fn tick_at(
     fence: &Fence,
     now: UtcInstant,
 ) -> Result<usize, sqlx::Error> {
-    tick_with_clock(store, fence, SchedulingClock::Fixed(now)).await
+    tick_with_clock(store, fence, SchedulingClock::Fixed(now))
+        .await
+        .map(|(generated, _)| generated)
 }
 async fn tick_with_clock(
     store: &Store,
     fence: &Fence,
     clock: SchedulingClock,
-) -> Result<usize, sqlx::Error> {
+) -> Result<(usize, bool), sqlx::Error> {
     if fence.lease != Lease::ReportScheduler {
         return Err(sqlx::Error::Protocol("wrong report lease".into()));
     }
+    let more = reconcile_calendar_pass(store, fence, clock).await?;
     let (pending, ids) = select_tick_with_clock(store, fence, clock).await?;
     for id in pending {
         let mut tx = begin_dispatch(&store.pool).await?;
@@ -579,30 +646,48 @@ async fn tick_with_clock(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(generated)
+    Ok((generated, more))
 }
 pub fn start(store: Store) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticks = tokio::time::interval(Duration::from_secs(30));
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut more = false;
         loop {
-            ticks.tick().await;
+            // Keep the ordinary dispatch cadence and generation cap even
+            // while an upgrade has additional pages ready to reconcile.
+            let dispatch = tokio::select! {
+                biased;
+                _ = ticks.tick() => true,
+                _ = tokio::time::sleep(CALENDAR_CONTINUATION), if more => false,
+            };
             if let Some(leases) = store.leases() {
-                crate::leases::run_singleton(
+                more = crate::leases::run_singleton(
                     leases,
                     Lease::ReportScheduler,
                     crate::ops_log::Job::ReportScheduler,
                     Duration::from_secs(90),
                     |fence| {
                         let store = &store;
-                        async move { tick(store, &fence).await }
+                        async move {
+                            let clock = SchedulingClock::Database;
+                            if dispatch {
+                                tick_with_clock(store, &fence, clock)
+                                    .await
+                                    .map(|(_, more)| more)
+                            } else {
+                                reconcile_calendar_pass(store, &fence, clock).await
+                            }
+                        }
                     },
                 )
-                .await;
+                .await
+                .unwrap_or(false);
                 if leases.held(Lease::ReportScheduler).is_none() {
                     crate::metrics::METRICS.clear_report_queue();
                 }
             } else {
+                more = false;
                 crate::metrics::METRICS.clear_report_queue();
             }
         }

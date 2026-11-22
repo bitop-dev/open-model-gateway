@@ -43,8 +43,9 @@ fn scheduled_reports_failure_categories_are_bounded() {
 #[cfg(feature = "integration-tests")]
 mod db {
     use crate::scheduled_reports::{
-        CANDIDATE_BATCH, SELECT_CANDIDATES_AFTER, SELECT_CANDIDATES_FIRST, SELECT_ELIGIBLE,
-        SELECT_STALE_AFTER, SELECT_STALE_FIRST, begin_dispatch, calendar::TZDB_VERSION,
+        CALENDAR_PAGE, CANDIDATE_BATCH, SELECT_CANDIDATES_AFTER, SELECT_CANDIDATES_FIRST,
+        SELECT_ELIGIBLE, SELECT_STALE_AFTER, SELECT_STALE_FIRST, begin_dispatch,
+        calendar::TZDB_VERSION,
     };
     use gateway_datetime_compat::UtcInstant;
     use serde_json::Value;
@@ -180,28 +181,28 @@ mod db {
             .unwrap();
         let first: Vec<(String, UtcInstant, Uuid)> = sqlx::query_as(SELECT_STALE_FIRST)
             .bind(TZDB_VERSION)
-            .bind(8i64)
+            .bind(CALENDAR_PAGE)
             .fetch_all(&pool)
             .await
             .unwrap();
-        assert_eq!(first.len(), 8);
+        assert_eq!(first.len(), CALENDAR_PAGE as usize);
         let (bundle, end, id) = first.last().unwrap();
         let next: Vec<(String, UtcInstant, Uuid)> = sqlx::query_as(SELECT_STALE_AFTER)
             .bind(TZDB_VERSION)
-            .bind(8i64)
+            .bind(CALENDAR_PAGE)
             .bind(bundle)
             .bind(end)
             .bind(id)
             .fetch_all(&pool)
             .await
             .unwrap();
-        assert_eq!(next.len(), 8);
+        assert_eq!(next.len(), CALENDAR_PAGE as usize);
         assert!(next[0] > *first.last().unwrap());
         for sql in [SELECT_STALE_FIRST, SELECT_STALE_AFTER] {
             let explain = format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {sql}");
             let query = sqlx::query_scalar::<_, Value>(&explain)
                 .bind(TZDB_VERSION)
-                .bind(8i64);
+                .bind(CALENDAR_PAGE);
             let plan = if sql == SELECT_STALE_AFTER {
                 query
                     .bind(bundle)
@@ -220,7 +221,7 @@ mod db {
                 &mut found,
                 &mut work,
             );
-            assert!(found && work <= 8., "{plan}");
+            assert!(found && work <= CALENDAR_PAGE as f64, "{plan}");
         }
     }
 }

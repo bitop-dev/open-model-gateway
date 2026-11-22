@@ -154,3 +154,64 @@ async fn scheduled_reports_0084_upgrade_fences_old_claims_and_keeps_pending_curs
         snapshot
     );
 }
+
+#[sqlx::test(migrations = false)]
+#[allow(clippy::disallowed_methods)] // Dedicated connections for lock ordering.
+async fn scheduled_reports_pin_cutover_waits_for_cursor_writer(pool: PgPool) {
+    MIGRATOR.run(&pool).await.unwrap();
+    let id: Uuid = sqlx::query_scalar("WITH creator AS (INSERT INTO users(id,email) VALUES(gen_random_uuid(),'report-cutover@example.test') RETURNING id) INSERT INTO report_schedules(scope_kind,created_by,cadence,timezone,delivery_time) SELECT 'installation',id,'weekly','Cuba','09:00' FROM creator RETURNING id")
+        .fetch_one(&pool).await.unwrap();
+    let mut writer = pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT omg_report_set_cursor($1,1,'2026f','2026-11-23 13:00Z','2026-11-23 00:00Z',NULL)",
+    )
+    .bind(id)
+    .execute(&mut *writer)
+    .await
+    .unwrap();
+    let mut upgrade = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL lock_timeout='100ms'")
+        .execute(&mut *upgrade)
+        .await
+        .unwrap();
+    let error = sqlx::query("UPDATE work_leases SET report_tzdb='2026g',expires_at='-infinity' WHERE name='report_scheduler'")
+        .execute(&mut *upgrade).await.expect_err("cutover interleaved with the cursor transaction");
+    assert_eq!(
+        error.as_database_error().unwrap().code().as_deref(),
+        Some("55P03")
+    );
+    upgrade.rollback().await.unwrap();
+    writer.commit().await.unwrap();
+
+    let mut upgrade = pool.begin().await.unwrap();
+    sqlx::query("UPDATE work_leases SET report_tzdb='2026g',expires_at='-infinity' WHERE name='report_scheduler'")
+        .execute(&mut *upgrade).await.unwrap();
+    let mut writer = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL lock_timeout='100ms'")
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    let old_write =
+        "SELECT omg_report_set_cursor($1,1,'2026f','2026-11-30 13:00Z','2026-11-30 00:00Z',NULL)";
+    let error = sqlx::query(old_write)
+        .bind(id)
+        .execute(&mut *writer)
+        .await
+        .expect_err("cursor write interleaved with the pin update");
+    assert_eq!(
+        error.as_database_error().unwrap().code().as_deref(),
+        Some("55P03")
+    );
+    writer.rollback().await.unwrap();
+    upgrade.commit().await.unwrap();
+    let error = sqlx::query(old_write)
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    let error = error.as_database_error().unwrap();
+    assert_eq!(error.code().as_deref(), Some("55006"));
+    assert_eq!(error.message(), "report calendar bundle mismatch");
+    assert!(sqlx::query_scalar::<_, bool>("SELECT cursor_tzdb='2026f' AND next_run_at='2026-11-23 13:00Z' AND next_period_end='2026-11-23 00:00Z' FROM report_schedules WHERE id=$1")
+        .bind(id).fetch_one(&pool).await.unwrap());
+}

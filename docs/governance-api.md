@@ -58,7 +58,7 @@ Delivery is the first configured local HH:MM **strictly after** UTC period closu
 
 Creation, resumption and configuration edits select the next future occurrence, above any already published period end. Pre-upgrade null cursors are initialized from database time, without historical replay. Edits never mutate completed runs. After downtime, only the latest completed UTC period is eligible, with the number of skipped intervals recorded separately; their usage is never combined. If its delivery preference is still in the future, catch-up waits for it rather than producing an older report followed shortly by the latest one.
 
-An active schedule stores its pending delivery time in UTC. When a gateway upgrade changes the bundled timezone rules, the worker waits for that stored time before applying the current calendar. A rule change that moves a local delivery earlier can therefore leave the pending occurrence late. The worker computes subsequent delivery times with the updated rules. The UTC accounting windows are unchanged.
+An active schedule stores its pending delivery time in UTC. After a bundled timezone-data upgrade, the scheduler recalculates pending delivery times in indexed batches, including deliveries that move earlier. The claim path also checks stale cursors before publication. The upgrade preserves the first pending UTC accounting period and prior publications. Create and edit operations committed before the cutover select their first pending period under the former calendar, and operations after the cutover select it under the new calendar.
 
 ### Fenced aggregate generation
 

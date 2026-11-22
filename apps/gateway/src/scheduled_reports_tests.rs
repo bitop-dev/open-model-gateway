@@ -134,9 +134,106 @@ mod db {
             .await
             .unwrap()
     }
+    async fn stale_utc_backlog(pool: &PgPool, user: Uuid) {
+        sqlx::query("INSERT INTO report_schedules(scope_kind,created_by,cadence,timezone,delivery_time,state,next_run_at,next_period_end) SELECT 'installation',$1,'weekly','UTC','09:00','active','2026-11-30 09:00Z','2026-11-30 00:00Z' FROM generate_series(1,1000)")
+            .bind(user).execute(pool).await.unwrap();
+    }
+
+    #[dbtest::test]
+    async fn scheduled_reports_tzdb_cutover_preserves_period_chosen_by_initialization(
+        pool: PgPool,
+    ) {
+        use scheduled_reports::calendar::TZDB_VERSION;
+        let (store, _, old_id, user) = setup(&pool).await;
+        let pin = "UPDATE work_leases SET report_tzdb=$1,expires_at='-infinity' WHERE name='report_scheduler'";
+        sqlx::query(pin).bind("2026b").execute(&pool).await.unwrap();
+        // At 08:30 the former Casablanca delivery had passed, so a management
+        // transaction committing before cutover selected the following week.
+        let mut edit = crate::db::begin(&pool).await.unwrap();
+        sqlx::query("SELECT report_tzdb FROM work_leases WHERE name='report_scheduler' FOR SHARE")
+            .execute(&mut *edit)
+            .await
+            .unwrap();
+        let revision: i64 = sqlx::query_scalar("UPDATE report_schedules SET timezone='Africa/Casablanca',delivery_time='09:00' WHERE id=$1 RETURNING configuration_revision")
+            .bind(old_id).fetch_one(&mut *edit).await.unwrap();
+        sqlx::query("SELECT omg_report_set_cursor($1,$2,'2026b','2026-11-23 08:00Z','2026-11-23 00:00Z',NULL)")
+            .bind(old_id).bind(revision).execute(&mut *edit).await.unwrap();
+        edit.commit().await.unwrap();
+        sqlx::query(pin)
+            .bind(TZDB_VERSION)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The same initialization after cutover selects this week's still
+        // future 09:00 occurrence. The previous edit keeps its UTC period.
+        let now = at("2026-11-16T08:30:00Z");
+        let mut create = crate::db::begin(&pool).await.unwrap();
+        scheduled_reports::lock_calendar(&mut create).await.unwrap();
+        let new_id: Uuid = sqlx::query_scalar("INSERT INTO report_schedules(scope_kind,created_by,cadence,timezone,delivery_time,state) VALUES('installation',$1,'weekly','Africa/Casablanca','09:00','active') RETURNING id")
+            .bind(user).fetch_one(&mut *create).await.unwrap();
+        scheduled_reports::initialize_at(&mut create, new_id, now)
+            .await
+            .unwrap();
+        create.commit().await.unwrap();
+        assert_eq!(
+            cursor(&pool, new_id).await,
+            (
+                Some(at("2026-11-16T09:00:00Z")),
+                Some(at("2026-11-16T00:00:00Z")),
+                None
+            )
+        );
+
+        let leases = Leases::new();
+        leases.renew_once(&pool).await;
+        let fence = leases.held(Lease::ReportScheduler).unwrap();
+        assert_eq!(
+            scheduled_reports::tick_at(&store, &fence, now)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            cursor(&pool, old_id).await,
+            (
+                Some(at("2026-11-23T09:00:00Z")),
+                Some(at("2026-11-23T00:00:00Z")),
+                None
+            )
+        );
+        let due = at("2026-11-16T09:00:00Z");
+        assert_eq!(
+            scheduled_reports::tick_at(&store, &fence, due)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            scheduled_reports::tick_at(&store, &fence, due)
+                .await
+                .unwrap(),
+            0
+        );
+        let runs: Vec<(Uuid, UtcInstant, UtcInstant)> =
+            sqlx::query_as("SELECT schedule_id,period_start,period_end FROM report_runs")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            runs,
+            [(
+                new_id,
+                at("2026-11-09T00:00:00Z"),
+                at("2026-11-16T00:00:00Z")
+            )]
+        );
+    }
+
     #[dbtest::test]
     async fn scheduled_reports_tzdb_earlier_persisted_boundary(pool: PgPool) {
-        let (store, fence, id, _) = setup(&pool).await;
+        let (store, fence, id, user) = setup(&pool).await;
+        stale_utc_backlog(&pool, user).await;
         let end = at("2026-11-16T00:00:00Z");
         let old_due = at("2026-11-16T14:00:00Z");
         let due = at("2026-11-16T13:00:00Z");
@@ -147,7 +244,7 @@ mod db {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query("UPDATE report_schedules SET next_period_end=$2,next_run_at=$3 WHERE id=$1")
+        sqlx::query("UPDATE report_schedules SET next_period_end=$2,next_run_at=$3,cursor_tzdb='2026e' WHERE id=$1")
             .bind(id)
             .bind(end)
             .bind(old_due)
@@ -162,25 +259,24 @@ mod db {
                 .unwrap(),
             due
         );
-        assert_eq!(
-            scheduled_reports::tick_at(&store, &fence, at("2026-11-16T12:59:59Z"))
-                .await
-                .unwrap(),
-            0
-        );
-        assert_eq!(cursor(&pool, id).await, (Some(due), Some(end), None));
+        let started = std::time::Instant::now();
         assert_eq!(
             scheduled_reports::tick_at(&store, &fence, due)
                 .await
                 .unwrap(),
             1,
-            "the persisted old instant must not hide a now-due occurrence"
+            "the first tick at the new instant must see Cuba through the stale backlog"
         );
+        eprintln!(
+            "first tick with 1,001 stale schedules took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(cursor(&pool, id).await.2, Some(end));
         assert_eq!(count(&pool).await, 1);
     }
     #[dbtest::test]
     async fn scheduled_reports_tzdb_later_preserves_skips_snapshot_and_delivery(pool: PgPool) {
-        let (store, fence, id, _) = setup(&pool).await;
+        let (store, fence, id, user) = setup(&pool).await;
         sqlx::query("UPDATE report_schedules SET timezone='Africa/Casablanca',delivery_time='09:00' WHERE id=$1")
             .bind(id).execute(&pool).await.unwrap();
         let revision: i64 =
@@ -228,6 +324,23 @@ mod db {
         sqlx::query("UPDATE report_generation_claims SET token=gen_random_uuid(),period_start=$2,period_end=$3,expires_at=clock_timestamp()+interval '30 seconds' WHERE schedule_id=$1")
             .bind(id).bind(at("2026-11-09T00:00:00Z")).bind(end).execute(&pool).await.unwrap();
 
+        stale_utc_backlog(&pool, user).await;
+        let started = std::time::Instant::now();
+        assert_eq!(
+            scheduled_reports::tick_at(&store, &fence, at("2026-11-16T07:59:59Z"))
+                .await
+                .unwrap(),
+            0
+        );
+        eprintln!(
+            "first tick with 1,001 stale schedules took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            cursor(&pool, id).await,
+            (Some(due), Some(first_pending), Some(previous_end)),
+            "an unrelated stale backlog must not delay the later boundary update"
+        );
         assert!(
             scheduled_reports::claim_at(&store, &fence, id, old_due)
                 .await

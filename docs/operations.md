@@ -16,7 +16,20 @@ Scheduled reports reuse SMTP and the shared alert/email dispatcher. Configure **
 
 Deploy the complete migration lineage, including **0061 schedules, 0063 generation and 0065 delivery**, on the explicitly selected database only. Apply with the matching migrator, then `grants apply` and `grants verify`; run gateways with `gateway_runtime`, never owner credentials. This UI/CSV slice has no new migration or write grant; new reads reuse explicit SELECT ACLs and are covered by the runtime-role handler probe. Stop old workers before the schema upgrade; mixed-schema binaries are unsupported. 0065 preserves #277 quota admission for alerts and makes report envelopes quota-exempt, not recipient-guard-exempt. Large existing outboxes need a maintenance window for its transactional indexes. `serve` never migrates, resets or replays history. After a migration, rollback requires the backup/restore procedure, not an old image against the new schema.
 
-Migration **0084** pins the scheduler to the bundled IANA release and expires the former report lease in the same transaction. The database refuses lease acquisition by an unversioned or mismatched worker and removes the legacy cursor write grant. Drain older replicas before applying the migration. Reserve a maintenance window for the transactional index build, which scans and locks the schedules table. After startup the scheduler sweeps up to eight initialized active cursors per tick, in version and UTC period order, then runs the usual due scan. A due claim also rechecks the calendar under the schedule lock. The pending UTC periods, skipped-count baseline, configuration revisions and published snapshots survive the upgrade. For each future bundled tzdb release, add a migration that updates `work_leases.report_tzdb` and sets `expires_at='-infinity'` together for `report_scheduler`. The PostgreSQL plan test checks that the pin matches the compiled bundle. Paused schedules take current rules when resumed.
+Migration **0084** pins the scheduler to the bundled IANA release and expires the former report lease in the same transaction. The database refuses lease acquisition by an unversioned or mismatched worker and removes the legacy cursor write grant. Drain older replicas before applying the migration. Reserve a maintenance window for the transactional index build, which scans and locks the schedules table.
+
+On the new leader's first report tick, reconciliation processes up to 2,048 initialized active cursors in 128-row indexed transactions. If that pass fills, the leader continues after a one-second pause between passes while report generation keeps its normal 30-second cadence and eight-report limit. Contended cursors are revisited after the sweep wraps. Allow time for this catch-up when scheduling an upgrade close to a delivery boundary. Its duration depends on stale population, database latency and lock contention. A due claim also rechecks the calendar under the schedule lock. The pending UTC periods, skipped-count baseline, configuration revisions and published snapshots survive the upgrade. Paused schedules take current rules when resumed. To check whether the active-cursor sweep has finished, query the primary:
+
+```sql
+SELECT EXISTS (
+  SELECT 1 FROM report_schedules
+  WHERE state='active' AND deleted_at IS NULL
+    AND next_run_at IS NOT NULL AND next_period_end IS NOT NULL
+    AND cursor_tzdb < (SELECT report_tzdb FROM work_leases WHERE name='report_scheduler')
+) AS reconciliation_pending;
+```
+
+For each future bundled tzdb release, add a migration that updates `work_leases.report_tzdb` and sets `expires_at='-infinity'` together for `report_scheduler`. Take that lease lock before any report-schedule locks. Scheduler transactions fence on the lease first. Management initialization holds a shared lock on the same row from before it touches schedules through commit, and refuses a binary whose bundle no longer matches. The PostgreSQL plan test checks that the pin matches the compiled bundle.
 
 **Coordinator rehearsal gate (not a claim of completed execution):**
 

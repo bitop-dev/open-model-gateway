@@ -359,7 +359,9 @@ SET CONSTRAINTS provider_cost_import_complete,provider_cost_mapping_complete DEF
 SELECT lock_installation();
 -- Report probes: runtime may manage configuration/cursors, never immutable
 -- lineage, snapshots, retained tombstones or recipients outside fifty slots.
-DO $$ DECLARE who uuid:=gen_random_uuid(); schedule uuid; col text; BEGIN
+DO $$ DECLARE who uuid:=gen_random_uuid(); schedule uuid; col text; required_bundle text; saved jsonb; BEGIN
+ IF public.omg_lease_acquire('report_scheduler',gen_random_uuid(),30) IS NOT NULL THEN RAISE EXCEPTION 'unversioned report lease acquired'; END IF;
+ SELECT report_tzdb INTO STRICT required_bundle FROM work_leases WHERE name='report_scheduler' FOR SHARE;
  INSERT INTO users(id,email) VALUES(who,'report-acl-'||who||'@example.invalid');
  INSERT INTO report_schedules(scope_kind,created_by,cadence,timezone,delivery_time) VALUES('installation',who,'weekly','UTC','09:00') RETURNING id INTO schedule;
  INSERT INTO report_schedule_recipients(schedule_id,slot,user_id) VALUES(schedule,1,who);
@@ -369,6 +371,18 @@ DO $$ DECLARE who uuid:=gen_random_uuid(); schedule uuid; col text; BEGIN
  IF (SELECT configuration_revision FROM report_schedules WHERE id=schedule)<>2 THEN RAISE EXCEPTION 'report no-op advanced revision'; END IF;
  UPDATE report_schedules SET recipient_revision=recipient_revision+1 WHERE id=schedule;
  IF (SELECT configuration_revision FROM report_schedules WHERE id=schedule)<>3 THEN RAISE EXCEPTION 'report recipient change not versioned'; END IF;
+ PERFORM public.omg_report_set_cursor(schedule,3,required_bundle,'2026-01-01 09:00Z','2026-01-01 00:00Z',NULL);
+ SELECT to_jsonb(s) INTO STRICT saved FROM report_schedules s WHERE id=schedule
+  AND cursor_tzdb=required_bundle AND next_run_at='2026-01-01 09:00Z' AND next_period_end='2026-01-01 00:00Z';
+ BEGIN
+  PERFORM public.omg_report_set_cursor(schedule,3,required_bundle||'-wrong','2026-02-01 09:00Z','2026-02-01 00:00Z','2026-01-01 00:00Z');
+  RAISE EXCEPTION 'wrong report cursor bundle allowed';
+ EXCEPTION WHEN SQLSTATE '55006' THEN
+  IF SQLERRM <> 'report calendar bundle mismatch' THEN RAISE; END IF;
+ END;
+ IF (SELECT to_jsonb(s) FROM report_schedules s WHERE id=schedule) IS DISTINCT FROM saved THEN
+  RAISE EXCEPTION 'wrong report cursor bundle changed the schedule';
+ END IF;
  BEGIN UPDATE report_schedules SET recipient_revision=recipient_revision-1 WHERE id=schedule; RAISE EXCEPTION 'report recipient revision decreased'; EXCEPTION WHEN raise_exception THEN IF SQLERRM NOT LIKE 'report recipient revision must%' THEN RAISE; END IF; END;
  FOREACH col IN ARRAY ARRAY['id','scope_kind','workspace_id','cost_center_id','created_by','configuration_revision','created_at','updated_at'] LOOP
   BEGIN EXECUTE format('UPDATE report_schedules SET %1$I=%1$I WHERE id=$1',col) USING schedule; RAISE EXCEPTION 'report identity/cursor update allowed'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
@@ -404,11 +418,6 @@ DO $$ DECLARE stmt text; BEGIN
   BEGIN EXECUTE stmt; RAISE EXCEPTION 'report immutable operation allowed: %',stmt; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
  END LOOP;
  IF public.omg_report_prune_snapshots(0)<>0 THEN RAISE EXCEPTION 'zero-cap report prune'; END IF;
- IF public.omg_lease_acquire('report_scheduler',gen_random_uuid(),30) IS NOT NULL THEN RAISE EXCEPTION 'unversioned report lease acquired'; END IF;
- BEGIN
-  PERFORM public.omg_report_set_cursor(gen_random_uuid(),1,'',now(),now(),NULL);
-  RAISE EXCEPTION 'unversioned report cursor writer allowed';
- EXCEPTION WHEN SQLSTATE '55006' THEN NULL; END;
  BEGIN
   INSERT INTO report_runs(schedule_id,period_start,period_end,configuration_revision,claim_token,lease_holder,lease_epoch,skipped_intervals,observed_at) VALUES(gen_random_uuid(),now()-interval '7 days',now(),1,gen_random_uuid(),gen_random_uuid(),-1,0,now());
   RAISE EXCEPTION 'unfenced report publication allowed';
