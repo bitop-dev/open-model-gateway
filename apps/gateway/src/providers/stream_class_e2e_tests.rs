@@ -6,15 +6,19 @@
 //! each client protocol sees, the recorded execution, the reservation and the
 //! routing-health observation. The adapters' own parsing is
 //! `stream_class_tests`; Bedrock's is `bedrock::stream_error_tests`.
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use axum::{Router, body::Bytes};
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 use super::stream_class_tests::{
-    Kind, NAMES, Step, http_class, response, responses_complete, serve, sse,
+    Kind, NAMES, Step, http_class, response, responses_complete, serve, sse, terminal_order_cases,
 };
 use crate::{
     billing::v3::Meter,
@@ -441,6 +445,80 @@ per_kind! {
     openai_responses: Kind::Responses,
     openrouter: Kind::OpenRouter,
     local: Kind::Local,
+}
+
+#[dbtest::test]
+async fn responses_first_terminal_wins_and_closes_the_upstream_body(pool: PgPool) {
+    terminal_order(
+        pool,
+        Kind::Responses,
+        Client::Responses,
+        3,
+        "response.completed",
+    )
+    .await;
+}
+
+#[dbtest::test]
+async fn anthropic_first_terminal_wins_and_closes_the_upstream_body(pool: PgPool) {
+    terminal_order(pool, Kind::Anthropic, Client::Messages, 4, "message_stop").await;
+}
+
+async fn terminal_order(pool: PgPool, kind: Kind, client: Client, input: i64, terminal: &str) {
+    let w = world(pool, kind, false).await;
+    let terminal_line = format!("event: {terminal}");
+    for (label, wire, failed) in terminal_order_cases(kind) {
+        let at = format!("{kind:?} {label}, failed={failed}");
+        let dropped = Arc::new(Notify::new());
+        let reply = tokio::time::timeout(
+            Duration::from_secs(5),
+            w.ask(client, vec![Step::BytesThenHang(wire, dropped.clone())]),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{at}: gateway waited for upstream EOF"));
+        tokio::time::timeout(Duration::from_secs(5), dropped.notified())
+            .await
+            .unwrap_or_else(|_| panic!("{at}: upstream body stayed open"));
+
+        assert_eq!(reply.status, 200, "{at}");
+        assert!(reply.body.contains("Hello"), "{at}");
+        assert!(!reply.body.contains("late text"), "{at}");
+        assert_eq!(
+            reply
+                .body
+                .lines()
+                .filter(|line| *line == terminal_line)
+                .count(),
+            usize::from(!failed),
+            "{at}"
+        );
+        let got = recorded(&w.f.store.pool, w.deployment, reply.id).await;
+        if failed {
+            assert_eq!(
+                told(client, &reply.body),
+                shown(client, InferenceError::Busy),
+                "{at}"
+            );
+            assert_eq!(got, failed_with(InferenceError::Busy, None), "{at}");
+        } else {
+            assert_eq!(last_event(&reply.body)["type"], terminal, "{at}");
+            assert_eq!(got.state, "succeeded", "{at}");
+            assert_eq!(got.error_code, None, "{at}");
+            assert_eq!((got.input, got.output), (Some(input), Some(2)), "{at}");
+            assert_eq!(got.reservation, "settled", "{at}");
+            assert_eq!(got.actual, Some(input + 2), "{at}");
+            assert_eq!(got.ledger, ["hold", "settlement"], "{at}");
+            if client == Client::Responses {
+                assert_eq!(
+                    last_event(&reply.body)["response"]["usage"],
+                    json!({
+                        "input_tokens": input, "output_tokens": 2, "total_tokens": input + 2
+                    }),
+                    "{at}"
+                );
+            }
+        }
+    }
 }
 
 #[dbtest::test]
@@ -973,7 +1051,8 @@ async fn client_drop(pool: PgPool, kind: Kind) {
             .execute(&w.f.store.pool)
             .await
             .unwrap();
-        *w.script.lock().unwrap() = vec![Step::Bytes(content.clone()), Step::Hang];
+        let dropped = Arc::new(Notify::new());
+        *w.script.lock().unwrap() = vec![Step::BytesThenHang(content.clone(), dropped.clone())];
         let mut response = client_request(&w.base, client)
             .bearer_auth(&w.token)
             .send()
@@ -984,9 +1063,24 @@ async fn client_drop(pool: PgPool, kind: Kind) {
             .unwrap()
             .parse()
             .unwrap();
-        // The client has the start of the stream, then goes away.
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), response.chunk()).await;
+        // Wait for actual upstream content before disconnecting the client.
+        let at = format!("{kind:?} {client:?}");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await.unwrap() {
+                body.extend_from_slice(&chunk);
+                if body.windows(5).any(|bytes| bytes == b"Hello") {
+                    return;
+                }
+            }
+            panic!("{at}: no upstream content before EOF");
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{at}: no upstream content"));
         drop(response);
+        tokio::time::timeout(Duration::from_secs(5), dropped.notified())
+            .await
+            .unwrap_or_else(|_| panic!("{at}: upstream body stayed open after disconnect"));
         let mut state = String::new();
         for _ in 0..100 {
             state = sqlx::query_scalar(
@@ -1001,7 +1095,6 @@ async fn client_drop(pool: PgPool, kind: Kind) {
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        let at = format!("{kind:?} {client:?}");
         assert_eq!(state, "cancelled", "{at}");
         // Give a wrongly recorded health observation time to land.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;

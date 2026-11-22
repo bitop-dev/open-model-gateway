@@ -30,6 +30,7 @@ use axum::{
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
+use tokio::sync::Notify;
 
 pub(crate) struct Resolver;
 impl SecretResolver for Resolver {
@@ -63,6 +64,15 @@ pub(crate) enum Step {
     Reset,
     /// The body stalls for good (until the client goes away).
     Hang,
+    /// Send the bytes and leave the body open until the peer closes it.
+    BytesThenHang(Vec<u8>, Arc<Notify>),
+}
+
+struct NotifyOnDrop(Arc<Notify>);
+impl Drop for NotifyOnDrop {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
 }
 
 /// The mock's response: `status`, `content_type` and the body the steps make.
@@ -81,6 +91,11 @@ pub(crate) fn response(
                     yield Err(std::io::Error::other("reset"));
                 }
                 Step::Hang => std::future::pending::<()>().await,
+                Step::BytesThenHang(bytes, dropped) => {
+                    let _guard = NotifyOnDrop(dropped);
+                    yield Ok(Bytes::from(bytes));
+                    std::future::pending::<()>().await;
+                }
             }
         }
     };
@@ -185,7 +200,7 @@ impl Kind {
         match self {
             Self::Anthropic => (
                 sse(&[
-                    json!({"type":"message_start","message":{"id":"x","type":"message","role":"assistant","model":"private","content":[],"stop_reason":null,"usage":{"input_tokens":4,"output_tokens":0}}}),
+                    json!({"type":"message_start","message":{"id":"x","type":"message","role":"assistant","model":"private","content":[],"stop_reason":null,"usage":{"input_tokens":4,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}),
                     json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
                     json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}),
                 ]),
@@ -333,6 +348,7 @@ pub(crate) async fn run(
         match next {
             Ok(ChatEvent::Done) => {
                 events.push(ChatEvent::Done);
+                assert!(stream.next().await.is_none(), "nothing follows Done");
                 return Outcome::Completed(events);
             }
             Ok(event) => events.push(event),
@@ -367,6 +383,93 @@ async fn a_complete_stream_completes() {
                 panic!("{kind:?} messages={messages}: not completed");
             };
             assert_eq!(delivered_text(&events), "Hello", "{kind:?}");
+        }
+    }
+}
+
+pub(super) fn terminal_order_cases(kind: Kind) -> Vec<(&'static str, Vec<u8>, bool)> {
+    let (content, rest, terminal) = kind.valid();
+    let (error_name, delta) = match kind {
+        Kind::Responses => (
+            "rate_limit_exceeded",
+            json!({"type":"response.output_text.delta","output_index":0,"item_id":"m","content_index":0,"delta":"late text"}),
+        ),
+        Kind::Anthropic => (
+            "rate_limit_error",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"late text"}}),
+        ),
+        _ => unreachable!(),
+    };
+    let complete = [content.clone(), rest.clone(), terminal.clone()].concat();
+    let mut cases = vec![(
+        "late delta",
+        [complete.clone(), sse(&[delta])].concat(),
+        false,
+    )];
+    for frame in kind.errors(error_name) {
+        let label = if frame["type"] == "response.failed" {
+            "response.failed"
+        } else {
+            "error"
+        };
+        let error = sse(&[frame]);
+        cases.push((label, [complete.clone(), error.clone()].concat(), false));
+        cases.push((
+            label,
+            [content.clone(), rest.clone(), error, terminal.clone()].concat(),
+            true,
+        ));
+    }
+    if kind == Kind::Responses {
+        let mut later = responses_complete();
+        later["usage"] = json!({"input_tokens":30,"output_tokens":20});
+        cases.push((
+            "late completion with different usage",
+            [
+                complete,
+                sse(&[json!({"type":"response.completed","response":later})]),
+            ]
+            .concat(),
+            false,
+        ));
+    }
+    cases
+}
+
+#[tokio::test]
+async fn the_driver_ends_at_the_first_terminal_frame() {
+    for (kind, messages, input) in [(Kind::Responses, false, 3), (Kind::Anthropic, true, 4)] {
+        for (label, wire, failed) in terminal_order_cases(kind) {
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(5),
+                sse_run(kind, messages, vec![Step::Bytes(wire), Step::Hang]),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{kind:?} {label}: driver waited for upstream EOF"));
+            if failed {
+                let Outcome::Failed(events, InferenceError::Busy) = outcome else {
+                    panic!("{kind:?} {label}: {outcome:?}");
+                };
+                assert_eq!(delivered_text(&events), "Hello");
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, ChatEvent::Done | ChatEvent::Usage(_)))
+                );
+            } else {
+                let Outcome::Completed(events) = outcome else {
+                    panic!("{kind:?} {label}: {outcome:?}");
+                };
+                assert_eq!(delivered_text(&events), "Hello");
+                let counts: Vec<_> = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        ChatEvent::Usage(usage) => Some((usage.input_tokens, usage.output_tokens)),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(counts, [(Some(input), Some(2))], "{kind:?} {label}");
+            }
         }
     }
 }

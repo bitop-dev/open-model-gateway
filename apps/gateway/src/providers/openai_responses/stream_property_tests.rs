@@ -867,7 +867,8 @@ fn a_terminal_pushed_after_the_terminal_is_refused() {
         for late in [
             built.events.last().unwrap().clone(),
             json!({"type":"response.in_progress"}),
-            json!({"type":"error","code":"rate_limit_exceeded"}),
+            json!({"type":"response.output_text.delta","output_index":0,"item_id":"msg_0","content_index":0,"delta":"late"}),
+            json!({"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded"}}}),
         ] {
             assert!(matches!(
                 state.push(late),
@@ -889,6 +890,44 @@ fn a_response_cannot_start_after_a_provider_failure() {
             state.push(json!({"type":"response.created"})),
             Err(InferenceError::InvalidUpstream)
         ));
+    }
+}
+
+#[test]
+fn a_started_response_cannot_complete_after_a_rejected_terminal() {
+    let response = json!({"status":"completed","output":[]});
+    let completed = json!({"type":"response.completed","response":response});
+    for (terminal, expected) in [
+        (
+            json!({"type":"response.failed","response":{"status":"failed","error":{"code":"rate_limit_exceeded"}}}),
+            InferenceError::Busy,
+        ),
+        (
+            json!({"type":"error","code":"rate_limit_exceeded"}),
+            InferenceError::Busy,
+        ),
+        (
+            json!({"type":"response.completed","response":{"status":"incomplete","output":[]}}),
+            InferenceError::InvalidUpstream,
+        ),
+        (
+            json!({"type":"response.incomplete","response":response}),
+            InferenceError::InvalidUpstream,
+        ),
+        (
+            // The snapshot decodes, but its item was never streamed.
+            json!({"type":"response.completed","response":super::super::stream_class_tests::responses_complete()}),
+            InferenceError::InvalidUpstream,
+        ),
+    ] {
+        let mut state = State::default();
+        state.push(json!({"type":"response.created"})).unwrap();
+        assert_eq!(state.push(terminal.clone()).err(), Some(expected));
+        assert_eq!(
+            state.push(completed.clone()).err(),
+            Some(InferenceError::InvalidUpstream),
+            "{terminal}"
+        );
     }
 }
 

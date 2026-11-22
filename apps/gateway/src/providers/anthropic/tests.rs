@@ -119,6 +119,36 @@ fn in_stream_errors_are_classified_like_the_same_http_error() {
 }
 
 #[test]
+fn a_started_message_cannot_finish_after_a_rejected_terminal() {
+    let frames = stream();
+    for (terminal, expected) in [
+        (
+            json!({"type":"error","error":{"type":"rate_limit_error"}}),
+            InferenceError::Busy,
+        ),
+        (
+            json!({"type":"message_stop"}),
+            InferenceError::InvalidUpstream,
+        ),
+    ] {
+        let mut state = State {
+            messages: true,
+            ..State::default()
+        };
+        for frame in &frames[..3] {
+            state.push(frame.clone()).unwrap();
+        }
+        assert_eq!(state.push(terminal).err(), Some(expected));
+        for late in &frames[3..] {
+            assert_eq!(
+                state.push(late.clone()).err(),
+                Some(InferenceError::InvalidUpstream)
+            );
+        }
+    }
+}
+
+#[test]
 fn messages_sampling_is_forwarded_and_client_labels_are_not() {
     let mut r = request(false);
     r.messages_options = Some(Box::new(MessagesOptions {
@@ -421,7 +451,6 @@ fn tool_deltas_and_ordering() {
     for part in ["{\"city\":", "\"東京\"}"] {
         state.push(json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":part}})).unwrap();
     }
-    assert!(state.push(json!({"type":"message_stop"})).is_err());
     state
         .push(json!({"type":"content_block_stop","index":0}))
         .unwrap();
