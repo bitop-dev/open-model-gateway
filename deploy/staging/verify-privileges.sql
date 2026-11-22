@@ -359,6 +359,8 @@ SET CONSTRAINTS provider_cost_import_complete,provider_cost_mapping_complete DEF
 SELECT lock_installation();
 -- Report probes: runtime may manage configuration/cursors, never immutable
 -- lineage, snapshots, retained tombstones or recipients outside fifty slots.
+-- Release the report lease lock and discard the report fixtures before other probes.
+SAVEPOINT report_schedule_probe;
 DO $$ DECLARE who uuid:=gen_random_uuid(); schedule uuid; col text; required_bundle text; saved jsonb; BEGIN
  IF public.omg_lease_acquire('report_scheduler',gen_random_uuid(),30) IS NOT NULL THEN RAISE EXCEPTION 'unversioned report lease acquired'; END IF;
  SELECT report_tzdb INTO STRICT required_bundle FROM work_leases WHERE name='report_scheduler' FOR SHARE;
@@ -398,6 +400,8 @@ DO $$ DECLARE who uuid:=gen_random_uuid(); schedule uuid; col text; required_bun
  UPDATE report_schedules SET state='paused',deleted_at=clock_timestamp() WHERE id=schedule;
  BEGIN UPDATE report_schedules SET deleted_at=NULL WHERE id=schedule; RAISE EXCEPTION 'deleted schedule resurrected'; EXCEPTION WHEN raise_exception THEN IF SQLERRM NOT LIKE 'immutable report schedule%' THEN RAISE; END IF; END;
 END $$;
+ROLLBACK TO SAVEPOINT report_schedule_probe;
+RELEASE SAVEPOINT report_schedule_probe;
 -- 0065 shared envelopes keep report lineage insert-only. No existing rows
 -- are changed by these refusal probes, including on a live installation.
 DO $$ BEGIN

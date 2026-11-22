@@ -80,7 +80,7 @@ const CALENDAR_CONTINUATION: Duration = Duration::from_secs(1);
 const DEADLINE: Duration = Duration::from_secs(10);
 /// Scheduling decisions only; leases, claim expiry and retention use database time.
 #[derive(Clone, Copy)]
-enum SchedulingClock {
+pub(super) enum SchedulingClock {
     Database,
     #[cfg(all(test, feature = "integration-tests"))]
     Fixed(UtcInstant),
@@ -488,8 +488,19 @@ async fn reconcile_calendar_pass(
         if !reconcile_calendar_page(store, fence, clock).await? {
             return Ok(false);
         }
+        // Let a ready dispatch tick run even if every database poll was ready.
+        tokio::task::yield_now().await;
     }
     Ok(true)
+}
+
+#[cfg(all(test, feature = "integration-tests"))]
+pub(super) async fn reconcile_at(
+    store: &Store,
+    fence: &Fence,
+    now: UtcInstant,
+) -> Result<bool, sqlx::Error> {
+    reconcile_calendar_pass(store, fence, SchedulingClock::Fixed(now)).await
 }
 
 /// Index range scan first, bounded point-lookups/fairness second. The frontier
@@ -586,9 +597,7 @@ pub(crate) async fn failed(
 }
 /// One bounded tick; no unfenced operator mode can publish occurrences.
 pub async fn tick(store: &Store, fence: &Fence) -> Result<usize, sqlx::Error> {
-    tick_with_clock(store, fence, SchedulingClock::Database)
-        .await
-        .map(|(generated, _)| generated)
+    tick_with_clock(store, fence, SchedulingClock::Database).await
 }
 #[cfg(all(test, feature = "integration-tests"))]
 pub(super) async fn tick_at(
@@ -596,19 +605,16 @@ pub(super) async fn tick_at(
     fence: &Fence,
     now: UtcInstant,
 ) -> Result<usize, sqlx::Error> {
-    tick_with_clock(store, fence, SchedulingClock::Fixed(now))
-        .await
-        .map(|(generated, _)| generated)
+    tick_with_clock(store, fence, SchedulingClock::Fixed(now)).await
 }
 async fn tick_with_clock(
     store: &Store,
     fence: &Fence,
     clock: SchedulingClock,
-) -> Result<(usize, bool), sqlx::Error> {
+) -> Result<usize, sqlx::Error> {
     if fence.lease != Lease::ReportScheduler {
         return Err(sqlx::Error::Protocol("wrong report lease".into()));
     }
-    let more = reconcile_calendar_pass(store, fence, clock).await?;
     let (pending, ids) = select_tick_with_clock(store, fence, clock).await?;
     for id in pending {
         let mut tx = begin_dispatch(&store.pool).await?;
@@ -646,50 +652,77 @@ async fn tick_with_clock(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok((generated, more))
+    Ok(generated)
 }
-pub fn start(store: Store) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut ticks = tokio::time::interval(Duration::from_secs(30));
-        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut more = false;
-        loop {
-            // Keep the ordinary dispatch cadence and generation cap even
-            // while an upgrade has additional pages ready to reconcile.
-            let dispatch = tokio::select! {
-                biased;
-                _ = ticks.tick() => true,
-                _ = tokio::time::sleep(CALENDAR_CONTINUATION), if more => false,
-            };
-            if let Some(leases) = store.leases() {
-                more = crate::leases::run_singleton(
-                    leases,
-                    Lease::ReportScheduler,
-                    crate::ops_log::Job::ReportScheduler,
-                    Duration::from_secs(90),
-                    |fence| {
-                        let store = &store;
-                        async move {
-                            let clock = SchedulingClock::Database;
-                            if dispatch {
-                                tick_with_clock(store, &fence, clock)
-                                    .await
-                                    .map(|(_, more)| more)
-                            } else {
-                                reconcile_calendar_pass(store, &fence, clock).await
-                            }
-                        }
-                    },
-                )
-                .await
-                .unwrap_or(false);
-                if leases.held(Lease::ReportScheduler).is_none() {
-                    crate::metrics::METRICS.clear_report_queue();
-                }
-            } else {
-                more = false;
-                crate::metrics::METRICS.clear_report_queue();
-            }
+
+async fn dispatch_loop(
+    store: &Store,
+    leases: &crate::leases::Leases,
+    clock: SchedulingClock,
+    period: Duration,
+) {
+    let mut ticks = tokio::time::interval(period);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticks.tick().await;
+        crate::leases::run_singleton(
+            leases,
+            Lease::ReportScheduler,
+            crate::ops_log::Job::ReportScheduler,
+            Duration::from_secs(90),
+            |fence| async move { tick_with_clock(store, &fence, clock).await },
+        )
+        .await;
+        if leases.held(Lease::ReportScheduler).is_none() {
+            crate::metrics::METRICS.clear_report_queue();
         }
+    }
+}
+
+async fn calendar_loop(
+    store: &Store,
+    leases: &crate::leases::Leases,
+    clock: SchedulingClock,
+    period: Duration,
+) {
+    loop {
+        let more = crate::leases::run_singleton(
+            leases,
+            Lease::ReportScheduler,
+            crate::ops_log::Job::ReportScheduler,
+            Duration::from_secs(90),
+            |fence| async move { reconcile_calendar_pass(store, &fence, clock).await },
+        )
+        .await;
+        tokio::time::sleep(if more == Some(true) {
+            CALENDAR_CONTINUATION
+        } else {
+            period
+        })
+        .await;
+    }
+}
+
+pub fn start(store: Store) -> tokio::task::JoinHandle<()> {
+    start_with_clock(store, SchedulingClock::Database, Duration::from_secs(30))
+}
+
+pub(super) fn start_with_clock(
+    store: Store,
+    clock: SchedulingClock,
+    period: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let Some(leases) = store.leases() else {
+            crate::metrics::METRICS.clear_report_queue();
+            return;
+        };
+        // Separate futures keep a slow or failed page off the dispatch path.
+        // Aborting the scheduler still stops both loops together.
+        tokio::join!(
+            biased;
+            dispatch_loop(&store, leases, clock, period),
+            calendar_loop(&store, leases, clock, period),
+        );
     })
 }

@@ -188,6 +188,11 @@ mod db {
         let leases = Leases::new();
         leases.renew_once(&pool).await;
         let fence = leases.held(Lease::ReportScheduler).unwrap();
+        assert!(
+            !scheduled_reports::reconcile_at(&store, &fence, now)
+                .await
+                .unwrap()
+        );
         assert_eq!(
             scheduled_reports::tick_at(&store, &fence, now)
                 .await
@@ -230,6 +235,162 @@ mod db {
         );
     }
 
+    async fn wait_for_db(mut condition: impl AsyncFnMut() -> bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(6), async {
+            while !condition().await {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("worker did not reach the expected database state");
+    }
+
+    #[dbtest::test]
+    async fn scheduled_reports_worker_dispatches_during_calendar_delay_and_failure(pool: PgPool) {
+        let (_, _, original, user) = setup(&pool).await;
+        sqlx::query("UPDATE report_schedules SET state='paused' WHERE id=$1")
+            .bind(original)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE work_leases SET expires_at='-infinity' WHERE name='report_scheduler'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let leases = std::sync::Arc::new(Leases::new());
+        leases.renew_once(&pool).await;
+        let fence = leases.held(Lease::ReportScheduler).unwrap();
+
+        sqlx::query("INSERT INTO report_schedules(scope_kind,created_by,cadence,timezone,delivery_time,state,next_run_at,next_period_end) SELECT 'installation',$1,'weekly','UTC','09:00','active','2026-11-09 09:00Z','2026-11-09 00:00Z' FROM generate_series(1,2176)")
+            .bind(user).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO report_schedules(scope_kind,created_by,cadence,timezone,delivery_time,state,next_run_at,next_period_end) VALUES ('installation',$1,'weekly','Etc/UTC','09:00','active','2026-11-16 09:00Z','2026-11-16 00:00Z')")
+            .bind(user).execute(&pool).await.unwrap();
+        sqlx::raw_sql(
+            r#"
+            CREATE SEQUENCE report_test_attempts;
+            CREATE FUNCTION report_test_delay() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                IF nextval('report_test_attempts') = 1 THEN
+                    PERFORM pg_advisory_xact_lock(74875301);
+                    RAISE EXCEPTION 'fixture reconciliation failure' USING ERRCODE='40001';
+                END IF;
+                PERFORM pg_advisory_xact_lock(74875302);
+                RETURN NEW;
+            END $$;
+            CREATE TRIGGER report_test_delay BEFORE UPDATE ON report_schedules FOR EACH ROW
+            WHEN (OLD.timezone='Etc/UTC' AND OLD.cursor_tzdb='' AND NEW.cursor_tzdb<>'')
+            EXECUTE FUNCTION report_test_delay();
+        "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut delay = crate::db::begin(&pool).await.unwrap();
+        let mut retry = crate::db::begin(&pool).await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(74875301)")
+            .execute(&mut *delay)
+            .await
+            .unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(74875302)")
+            .execute(&mut *retry)
+            .await
+            .unwrap();
+        let attempt = async || {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM report_test_attempts",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        let seed_due = async |n| {
+            sqlx::query("INSERT INTO report_schedules(scope_kind,created_by,cadence,timezone,delivery_time,state,next_run_at,next_period_end,cursor_tzdb) SELECT 'installation',$1,'weekly','UTC','09:00','active','2026-11-02 09:00Z','2026-11-02 00:00Z',$2 FROM generate_series(1,$3)")
+                .bind(user).bind(scheduled_reports::calendar::TZDB_VERSION).bind(n).execute(&pool).await.unwrap();
+        };
+        let worker = scheduled_reports::start_with_clock(
+            Store::new(pool.clone()).with_leases(leases.clone()),
+            scheduled_reports::SchedulingClock::Fixed(at("2026-11-02T10:00:00Z")),
+            std::time::Duration::from_secs(2),
+        );
+
+        let check = async {
+            wait_for_db(async || attempt().await == 1).await;
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM report_schedules WHERE state='active' AND cursor_tzdb=''"
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+                1
+            );
+            let delayed = std::time::Instant::now();
+            seed_due(9i32).await;
+            wait_for_db(async || count(&pool).await == 8).await;
+            wait_for_db(async || count(&pool).await == 9).await;
+            eprintln!(
+                "nine ordinary reports dispatched in {:?} while page 18 was blocked",
+                delayed.elapsed()
+            );
+            delay.commit().await.unwrap();
+
+            wait_for_db(async || attempt().await == 2).await;
+            seed_due(1i32).await;
+            wait_for_db(async || count(&pool).await == 10).await;
+            retry.commit().await.unwrap();
+            wait_for_db(async || {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT cursor_tzdb<>'' FROM report_schedules WHERE timezone='Etc/UTC'",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            })
+            .await;
+
+            sqlx::query(
+                "UPDATE work_leases SET expires_at='-infinity' WHERE name='report_scheduler'",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            seed_due(1i32).await;
+            sqlx::query("INSERT INTO report_schedules(scope_kind,created_by,cadence,timezone,delivery_time,state,next_run_at,next_period_end) VALUES ('installation',$1,'weekly','Zulu','09:00','active','2026-11-16 09:00Z','2026-11-16 00:00Z')")
+                .bind(user).execute(&pool).await.unwrap();
+            let reconciled = async || {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT cursor_tzdb<>'' FROM report_schedules WHERE timezone='Zulu'",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+            assert_eq!(
+                count(&pool).await,
+                10,
+                "an expired database lease cannot publish"
+            );
+            assert!(
+                !reconciled().await,
+                "an expired database lease cannot reconcile"
+            );
+            leases.renew_once(&pool).await;
+            assert!(leases.held(Lease::ReportScheduler).unwrap().epoch > fence.epoch);
+            wait_for_db(async || count(&pool).await == 11 && reconciled().await).await;
+        };
+        // Abort the worker if an assertion unwinds while an advisory lock is held.
+        let _abort = WorkerAbort(worker);
+        check.await;
+    }
+
+    struct WorkerAbort(tokio::task::JoinHandle<()>);
+    impl Drop for WorkerAbort {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
     #[dbtest::test]
     async fn scheduled_reports_tzdb_earlier_persisted_boundary(pool: PgPool) {
         let (store, fence, id, user) = setup(&pool).await;
@@ -260,15 +421,20 @@ mod db {
             due
         );
         let started = std::time::Instant::now();
+        assert!(
+            !scheduled_reports::reconcile_at(&store, &fence, due)
+                .await
+                .unwrap()
+        );
         assert_eq!(
             scheduled_reports::tick_at(&store, &fence, due)
                 .await
                 .unwrap(),
             1,
-            "the first tick at the new instant must see Cuba through the stale backlog"
+            "dispatch uses the earlier Cuba instant after the sweep"
         );
         eprintln!(
-            "first tick with 1,001 stale schedules took {:?}",
+            "sweep and dispatch with 1,001 stale schedules took {:?}",
             started.elapsed()
         );
         assert_eq!(cursor(&pool, id).await.2, Some(end));
@@ -326,6 +492,11 @@ mod db {
 
         stale_utc_backlog(&pool, user).await;
         let started = std::time::Instant::now();
+        assert!(
+            !scheduled_reports::reconcile_at(&store, &fence, at("2026-11-16T07:59:59Z"))
+                .await
+                .unwrap()
+        );
         assert_eq!(
             scheduled_reports::tick_at(&store, &fence, at("2026-11-16T07:59:59Z"))
                 .await
@@ -333,7 +504,7 @@ mod db {
             0
         );
         eprintln!(
-            "first tick with 1,001 stale schedules took {:?}",
+            "sweep and dispatch with 1,001 stale schedules took {:?}",
             started.elapsed()
         );
         assert_eq!(

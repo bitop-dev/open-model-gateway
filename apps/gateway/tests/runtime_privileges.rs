@@ -36,6 +36,50 @@ async fn controlled_lock_stall_recovers_on_runtime_http_path(pool: PgPool) {
     stall_recovery::run(pool).await;
 }
 
+async fn report_probe_releases_lease(pool: &PgPool) {
+    let holder = uuid::Uuid::new_v4();
+    let acquire = "SELECT omg_lease_acquire('report_scheduler',$1,120) FROM set_config('gateway.report_tzdb',(SELECT report_tzdb FROM work_leases WHERE name='report_scheduler'),true)";
+    let epoch: i64 = sqlx::query_scalar(acquire)
+        .bind(holder)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let (report_probe, _) = open_model_gateway::store::VERIFY_PRIVILEGES_SQL
+        .split_once("-- 0065 shared envelopes")
+        .expect("verifier checkpoint after the report probe");
+    // The prefix opens the actual verifier transaction. Keep that connection
+    // open at the checkpoint while a separate runtime connection renews.
+    let mut verifier = pool.acquire().await.unwrap().detach();
+    sqlx::raw_sql(report_probe)
+        .execute(&mut verifier)
+        .await
+        .unwrap();
+    let mut renewal = pool.begin().await.unwrap();
+    sqlx::raw_sql("SET LOCAL ROLE gateway_runtime; SET LOCAL lock_timeout='250ms'")
+        .execute(&mut *renewal)
+        .await
+        .unwrap();
+    let renewed: i64 = sqlx::query_scalar(acquire)
+        .bind(holder)
+        .fetch_one(&mut *renewal)
+        .await
+        .expect("report probe must release its lease lock before unrelated probes");
+    assert_eq!(renewed, epoch);
+    renewal.commit().await.unwrap();
+    assert!(sqlx::query_scalar::<_, bool>("SELECT current_user='gateway_runtime' AND NOT EXISTS(SELECT FROM users WHERE email LIKE 'report-acl-%')")
+        .fetch_one(&mut verifier).await.unwrap());
+    sqlx::query("ROLLBACK")
+        .execute(&mut verifier)
+        .await
+        .unwrap();
+    sqlx::query("SELECT omg_lease_release('report_scheduler',$1,$2)")
+        .bind(holder)
+        .bind(epoch)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
 #[sqlx::test(migrations = "./enterprise_migrations")]
 #[ignore = "role/maintenance ACL probe: run only on a disposable test PostgreSQL cluster"]
 async fn enterprise_runtime_allowlist_and_rollback_probes(pool: PgPool) {
@@ -66,6 +110,7 @@ async fn enterprise_runtime_allowlist_and_rollback_probes(pool: PgPool) {
     store.apply_runtime_grants().await.unwrap();
     // Idempotent: reapplying after every migration must succeed.
     store.apply_runtime_grants().await.unwrap();
+    report_probe_releases_lease(&pool).await;
     store.verify_runtime_grants().await.unwrap();
     assert!(
         store.is_ready().await,
