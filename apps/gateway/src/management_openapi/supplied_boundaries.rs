@@ -3,7 +3,9 @@
 //! every other reference, including a second reference to the same component.
 use super::{Step, coverage, valid};
 use anyhow::{Result, ensure};
+use regex_syntax::hir::{Hir, HirKind};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 fn conjunct(node: &mut Value, schema: Value) {
     node.as_object_mut()
@@ -143,11 +145,11 @@ pub(super) fn relaxations(
 /// Maximum Unicode scalar count, and the fewest UTF-8 bytes a match of
 /// that width can occupy. A byte edge can stand in for the character edge
 /// only when the byte budget makes the latter unreachable.
-#[derive(Clone, Copy)]
 pub(super) struct PatternWidth {
     pub(super) chars: usize,
-    pub(super) min_bytes: usize,
-    pub(super) bytes_per_char: usize,
+    min_bytes: usize,
+    bytes_per_char: usize,
+    hir: Hir,
 }
 
 pub(super) fn pattern_width(pattern: &str) -> Option<PatternWidth> {
@@ -206,7 +208,128 @@ pub(super) fn pattern_width(pattern: &str) -> Option<PatternWidth> {
         chars,
         min_bytes,
         bytes_per_char: min_scalar_bytes(&hir).unwrap_or(1),
+        hir,
     })
+}
+
+// Each entry is the least UTF-8 cost for its scalar count. The last
+// bucket includes longer matches: these could still cross maxLength.
+type Costs = BTreeMap<usize, usize>;
+
+struct WidthBudget {
+    target: usize,
+    remaining: usize,
+}
+
+impl WidthBudget {
+    fn charge(&mut self, steps: usize) -> Option<()> {
+        self.remaining = self.remaining.checked_sub(steps)?;
+        Some(())
+    }
+
+    fn concat(&mut self, left: &Costs, right: &Costs) -> Option<Costs> {
+        self.charge(left.len().checked_mul(right.len())?)?;
+        let mut costs = Costs::new();
+        for (&a, &a_bytes) in left {
+            for (&b, &b_bytes) in right {
+                let bytes = a_bytes.saturating_add(b_bytes);
+                let best = costs.entry((a + b).min(self.target)).or_insert(bytes);
+                *best = (*best).min(bytes);
+            }
+        }
+        Some(costs)
+    }
+
+    // Binary powers keep large repeat counts logarithmic. Adding an empty
+    // choice to an atom turns an exact power into up to that many copies.
+    fn power(&mut self, mut unit: Costs, mut count: u32) -> Option<Costs> {
+        let mut result = Costs::from([(0, 0)]);
+        while count > 0 {
+            if count % 2 == 1 {
+                result = self.concat(&result, &unit)?;
+            }
+            count /= 2;
+            if count > 0 {
+                unit = self.concat(&unit, &unit)?;
+            }
+        }
+        Some(result)
+    }
+
+    fn costs(&mut self, hir: &Hir) -> Option<Costs> {
+        self.charge(1)?;
+        match hir.kind() {
+            HirKind::Empty | HirKind::Look(_) => Some(Costs::from([(0, 0)])),
+            HirKind::Literal(lit) => {
+                let chars = std::str::from_utf8(&lit.0).ok()?.chars().count();
+                Some(Costs::from([(chars.min(self.target), lit.0.len())]))
+            }
+            HirKind::Class(class) => Some(Costs::from([(1, class.minimum_len()?)])),
+            HirKind::Capture(c) => self.costs(&c.sub),
+            HirKind::Concat(parts) => {
+                let mut result = Costs::from([(0, 0)]);
+                for part in parts {
+                    let next = self.costs(part)?;
+                    result = self.concat(&result, &next)?;
+                }
+                Some(result)
+            }
+            HirKind::Alternation(parts) => {
+                let mut result = Costs::new();
+                for part in parts {
+                    let next = self.costs(part)?;
+                    self.charge(next.len())?;
+                    for (chars, bytes) in next {
+                        let best = result.entry(chars).or_insert(bytes);
+                        *best = (*best).min(bytes);
+                    }
+                }
+                Some(result)
+            }
+            HirKind::Repetition(r) => {
+                let mut unit = self.costs(&r.sub)?;
+                let required = self.power(unit.clone(), r.min)?;
+                unit.insert(0, 0);
+                let optional = self.power(unit, r.max? - r.min)?;
+                self.concat(&required, &optional)
+            }
+        }
+    }
+}
+
+/// Prove the byte cap excludes all matches at or above the character edge.
+/// Cheap bounds apply at any width. The cost table is limited in size and
+/// cumulative work across the patterns at this edge. An inconclusive result
+/// leaves the character witness required.
+pub(super) fn byte_cap_prevents_width<'a>(
+    patterns: impl Iterator<Item = &'a PatternWidth>,
+    target: u64,
+    cap: u64,
+) -> bool {
+    let mut budget = WidthBudget {
+        target: target as usize,
+        remaining: 64 * 1024,
+    };
+    for pattern in patterns {
+        if cap / (pattern.bytes_per_char as u64) < target {
+            return true;
+        }
+        if target > pattern.chars as u64 || cap >= pattern.min_bytes as u64 {
+            continue;
+        }
+        if target == pattern.chars as u64 {
+            return true;
+        }
+        if (1..=256).contains(&target)
+            && let Some(costs) = budget.costs(&pattern.hir)
+            && costs
+                .get(&budget.target)
+                .is_some_and(|&bytes| bytes as u64 > cap)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Widen a single variable-count range by one repetition. Source spans
@@ -257,4 +380,43 @@ pub(super) fn wider_patterns(
         }
     }
     Ok(wider)
+}
+
+#[test]
+fn intermediate_width_costs_combine_branches_and_repetitions() {
+    for (pattern, target, least_bytes) in [
+        ("^(a|é{2,8})$", 6, 12),
+        ("^([aé]|[aé]{2,8})$", 6, 6),
+        ("^(?:a|é{2,3})(?:b|✓{2,3})$", 5, 12),
+        ("^(?:a|é{2,3}){2}$", 5, 10),
+        ("^(?:é{6}|a{7}|✓{9})$", 6, 7),
+    ] {
+        let width = pattern_width(pattern).unwrap();
+        assert!(
+            byte_cap_prevents_width([&width].into_iter(), target, least_bytes - 1),
+            "{pattern}"
+        );
+        assert!(
+            !byte_cap_prevents_width([&width].into_iter(), target, least_bytes),
+            "{pattern}"
+        );
+    }
+}
+
+#[test]
+fn intermediate_width_inconclusive_costs_leave_the_edge_required() {
+    let width = pattern_width("^(a|é{2,1000000})$").unwrap();
+    // The cheap ASCII alternative prevents the general scalar bound from
+    // deciding this large intermediate width. No width-sized table is built.
+    assert!(!byte_cap_prevents_width(
+        [&width].into_iter(),
+        500000,
+        750000
+    ));
+    assert!(!byte_cap_prevents_width([&width].into_iter(), 6, u64::MAX));
+    let mut small_budget = WidthBudget {
+        target: 6,
+        remaining: 1,
+    };
+    assert!(small_budget.costs(&width.hir).is_none());
 }

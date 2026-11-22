@@ -977,14 +977,18 @@ fn string_bounds(
         evidence.settle(("minLength", Some("minLength-1")), min, found, dominated);
     }
     let shortest = mins.last().copied().unwrap_or(0) as usize;
+    let byte_masks_chars = maxs
+        .first()
+        .zip(byte_limits.first())
+        .is_some_and(|(&max, &cap)| {
+            let widths: Vec<_> = strings(nodes, "pattern")
+                .into_iter()
+                .filter_map(pattern_width)
+                .collect();
+            byte_cap_prevents_width(widths.iter(), max, cap)
+        });
     for &max in &maxs {
-        let dominated = Some(&max) != maxs.first()
-            || byte_limits.first().is_some_and(|cap| {
-                strings(nodes, "pattern")
-                    .into_iter()
-                    .filter_map(pattern_width)
-                    .any(|w| cap / (w.bytes_per_char as u64) < max)
-            });
+        let dominated = Some(&max) != maxs.first() || byte_masks_chars;
         if max >= LONGEST {
             evidence.settle(("maxLength", Some("maxLength+1")), max, None, dominated);
         } else {
@@ -1020,7 +1024,9 @@ fn string_bounds(
         // character, or a schema that refuses multibyte text, leaves nothing
         // to tell apart (counted, not decisive).
         let kinds = ("multibyte maxLength", Some("multibyte maxLength+1"));
-        if byte_limits.iter().any(|limit| *limit < 2 * max)
+        if byte_limits
+            .iter()
+            .any(|limit| *limit < max.saturating_mul(2))
             || !multibyte_possible(document, schema, seed, shortest, max as usize)?
         {
             evidence.dropped.push("multibyte not applicable".to_owned());
@@ -1070,14 +1076,17 @@ fn string_bounds(
                 .filter(|(at, _)| at.as_str().is_some_and(|t| t.len() == limit as usize)),
         )?;
         let possible = multibyte_possible(document, schema, seed, shortest, usize::MAX)?;
-        let wide = if possible {
+        // A short ASCII alternative can hide a longer multibyte match from
+        // the shortest-length probe. Exercise the byte edge that masks maxLength.
+        let wide = if possible || (ascii.is_none() && byte_masks_chars && !dominated) {
             find_pair(document, schema, None, byte_pairs(seed, limit as usize))?
         } else {
             None
         };
+        let test_multibyte = possible || wide.is_some();
         let exact = ascii.or_else(|| wide.clone());
         evidence.settle(("maxBytes", Some("maxBytes+1")), limit, exact, dominated);
-        if possible {
+        if test_multibyte {
             evidence.settle(
                 ("multibyte maxBytes", Some("multibyte maxBytes+1")),
                 limit,
@@ -1094,7 +1103,7 @@ const STRADDLE: &str = "supplied candidates must straddle the boundary: include 
 #[path = "supplied_boundaries.rs"]
 mod supplied_boundaries;
 
-use supplied_boundaries::{pattern_width, wider_patterns};
+use supplied_boundaries::{byte_cap_prevents_width, pattern_width, wider_patterns};
 
 /// An adjacent accepted/refused pair at the effective limit. Byte caps and
 /// JSON Schema character limits use different units for the same candidate.
@@ -1110,6 +1119,7 @@ fn straddles(
         .map(|p| {
             let width = pattern_width(p);
             let wider = width
+                .as_ref()
                 .map(|w| wider_patterns(p, w.chars, &mut remaining_variant_bytes))
                 .transpose()?
                 .unwrap_or_default();
@@ -1118,10 +1128,18 @@ fn straddles(
         .collect::<Result<_>>()?;
     let maximum = patterns
         .iter()
-        .filter_map(|(_, w, _)| *w)
-        .min_by_key(|w| (w.chars, std::cmp::Reverse(w.min_bytes)));
+        .filter_map(|(_, w, _)| w.as_ref().map(|w| w.chars as u64))
+        .min();
     let char_cap = distinct_u64(nodes, "maxLength").first().copied();
     let byte_cap = distinct_u64(nodes, MAX_BYTES).first().copied();
+    let edge = maximum.map(|width| char_cap.unwrap_or(width).min(width));
+    let byte_dominates = edge.zip(byte_cap).is_some_and(|(edge, cap)| {
+        byte_cap_prevents_width(
+            patterns.iter().filter_map(|(_, w, _)| w.as_ref()),
+            edge,
+            cap,
+        )
+    });
     // The extra repetition may contain several scalars (a hex byte, for
     // example). The rest of the string must agree before and after it.
     fn insertion(short: &str, long: &str) -> bool {
@@ -1152,18 +1170,12 @@ fn straddles(
                 std::cmp::Ordering::Less => at - over == 1 && insertion(refused, accepted),
                 std::cmp::Ordering::Greater => over - at == 1 && insertion(accepted, refused),
             };
-            if let Some(width) = maximum {
-                let edge = char_cap.unwrap_or(u64::MAX).min(width.chars as u64);
-                let min_bytes = if edge == width.chars as u64 {
-                    width.min_bytes as u64
-                } else {
-                    edge.saturating_mul(width.bytes_per_char as u64)
-                };
+            if let Some(edge) = edge {
                 if adjacent
                     && at < edge
                     && over <= edge
                     && let Some(cap) = byte_cap
-                    && cap < min_bytes
+                    && byte_dominates
                     && accepted.len() as u64 == cap
                     && refused.len() as u64 > cap
                     && confirms(MAX_BYTES, &json!(cap), None, accepted, refused)?
@@ -1174,7 +1186,7 @@ fn straddles(
                 if at != edge || over <= edge || !insertion(accepted, refused) {
                     continue;
                 }
-                if edge < width.chars as u64 {
+                if maximum.is_some_and(|width| edge < width) {
                     if adjacent && confirms("maxLength", &json!(edge), None, accepted, refused)? {
                         notes.dominated_patterns += 1;
                         return Ok(true);
@@ -1210,7 +1222,7 @@ fn straddles(
                 }
             }
             for (pattern, width, wider) in &patterns {
-                if maximum.is_some_and(|max| width.is_none_or(|w| w.chars != max.chars))
+                if maximum.is_some_and(|max| width.as_ref().is_none_or(|w| w.chars as u64 != max))
                     || super::validation::pattern_validator(pattern)?.is_valid(&json!(refused))
                 {
                     continue;

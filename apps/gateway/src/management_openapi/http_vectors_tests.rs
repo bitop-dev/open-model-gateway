@@ -3502,3 +3502,63 @@ fn supplied_boundary_limits_total_regex_derivation_work() {
             .contains("regex derivation budget")
     );
 }
+
+#[test]
+fn intermediate_width_generated_bounds_ignore_too_short_ascii_alternatives() {
+    let document = body_only(
+        json!({"type":"string","pattern":"^(a|é{2,8})$","maxLength":6,"x-omg-max-bytes":8}),
+    );
+    let plan = super::http_vectors::body_plan(
+        &document,
+        &document["paths"][TEMPLATE]["post"],
+        &json!("éé"),
+        &[],
+        &[],
+    )
+    .unwrap();
+    assert!(
+        plan.cases
+            .iter()
+            .any(|case| case.body == json!("éééé") && case.accept)
+    );
+}
+
+#[test]
+fn intermediate_width_supplied_pairs_respect_reachable_alternatives() {
+    for (pattern, ascii_at_six) in [("^(a|é{2,8})$", false), ("^([aé]|[aé]{2,8})$", true)] {
+        let document =
+            body_only(json!({"type":"string","pattern":pattern,"maxLength":6,"x-omg-max-bytes":8}));
+        let plan = |at: &str, past: &str| {
+            super::http_vectors::body_plan(
+                &document,
+                &document["paths"][TEMPLATE]["post"],
+                &json!("a"),
+                &[],
+                &[("(root)".into(), json!(at)), ("(root)".into(), json!(past))],
+            )
+        };
+        let bytes = plan("éééé", "ééééé");
+        if ascii_at_six {
+            assert!(
+                bytes
+                    .err()
+                    .expect("six ASCII characters fit")
+                    .to_string()
+                    .contains("straddle")
+            );
+            assert_eq!(
+                plan("aaaaaa", "aaaaaaa").unwrap().notes.dominated_patterns,
+                1
+            );
+        } else {
+            let bytes = bytes.unwrap();
+            assert_eq!(bytes.notes.dominated_patterns, 1);
+            assert!(
+                bytes
+                    .cases
+                    .iter()
+                    .any(|c| c.body == json!("ééééé") && !c.accept)
+            );
+        }
+    }
+}
