@@ -267,6 +267,9 @@ describe("comments state invariants, not review history", () => {
         expect(() => walk(root)).toThrowError(`unsupported source entry: ${link}`);
         unlinkSync(link);
       }
+      const linkedRoot = join(tmp, "linked-root");
+      symlinkSync(outside, linkedRoot, "dir");
+      expect(() => walk(linkedRoot)).toThrowError(`unsupported source entry: ${linkedRoot}`);
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }

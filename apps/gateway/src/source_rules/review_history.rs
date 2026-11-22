@@ -546,10 +546,14 @@ mod tests {
         fs::create_dir(&outside).unwrap();
         let file = outside.join("other_tests.rs");
         fs::write(&file, "fn test_helper() {}").unwrap();
-        for (target, name) in [(&file, "linked_tests.rs"), (&outside, "linked_dir")] {
-            let link = root.join(name);
+        let linked_root = tmp.path().join("linked_root");
+        for (target, link, scan_root) in [
+            (&file, root.join("linked_tests.rs"), &root),
+            (&outside, root.join("linked_dir"), &root),
+            (&outside, linked_root.clone(), &linked_root),
+        ] {
             symlink(target, &link).unwrap();
-            let failure = std::panic::catch_unwind(|| scan_tree(&rules(), &root)).unwrap_err();
+            let failure = std::panic::catch_unwind(|| scan_tree(&rules(), scan_root)).unwrap_err();
             assert_eq!(
                 failure.downcast_ref::<String>().unwrap(),
                 &format!("unsupported source entry: {}", link.display())
