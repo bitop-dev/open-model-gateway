@@ -246,6 +246,57 @@ async fn weighted_route_output_limit_depends_on_final_batch_mode(pool: PgPool) {
 }
 
 #[dbtest::test]
+async fn unavailable_gateway_route_is_checked_only_for_final_gateway_mode(pool: PgPool) {
+    let (w, cooling) = weighted_routes(pool, true).await;
+    w.openai.script.lock().unwrap().permissive = true;
+    sqlx::query(
+        "INSERT INTO deployment_health(deployment_id,open_until)
+         VALUES($1,clock_timestamp()+interval '1 hour')",
+    )
+    .bind(cooling)
+    .execute(&w.f.store.pool)
+    .await
+    .unwrap();
+
+    // The native encoder can carry this body, while gateway execution
+    // requires the alternate route that is cooling down.
+    let line = chat_line("native", "company/claude", "strict-tool");
+    let file = w.upload(&w.f.principal, std::slice::from_ref(&line)).await;
+    let id = Uuid::new_v4();
+    let (status, body) = submit_with_seed(&w, id, file.clone(), None).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    let native = store::reload(
+        &w.f.store,
+        parse_client_id("batch_", body["id"].as_str().unwrap()).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(native.mode(), Some(BatchMode::Native));
+    assert_eq!(native.deployment_id, w.claude_deployment);
+    assert_eq!(reservation(&w.f, id).await.1, Some(220));
+
+    let before = admission_rowcounts(&w.f).await;
+    let forced = json!({"omg_mode":"gateway"});
+    let gateway_only = chat_line("gateway", "company/smart", "gateway only");
+    let native_first = w
+        .upload(&w.f.principal, &[line.clone(), gateway_only.clone()])
+        .await;
+    let gateway_first = w.upload(&w.f.principal, &[gateway_only, line]).await;
+    for (input, mode) in [
+        (file, Some(&forced)),
+        (native_first, None),
+        (gateway_first, None),
+    ] {
+        let (status, body) = submit_with_seed(&w, Uuid::new_v4(), input, mode).await;
+        assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["code"], "model_temporarily_unavailable");
+        assert_eq!(admission_rowcounts(&w.f).await, before);
+    }
+    assert!(w.openai.executed().is_empty());
+    assert!(w.anthropic.executed().is_empty());
+}
+
+#[dbtest::test]
 async fn weighted_alternate_price_load_failure_is_read_once_per_scan(pool: PgPool) {
     let (w, expensive) = weighted_routes(pool, true).await;
     let id = weighted_seed(&w, w.claude_deployment, [expensive, expensive], 0).await;
