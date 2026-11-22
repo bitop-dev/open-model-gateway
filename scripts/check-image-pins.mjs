@@ -1,29 +1,20 @@
 // Report registry tag drift for the upstream Compose and chart defaults.
 import { execFileSync } from "node:child_process";
 import { parseStrict, readLocalFromRepo, root, toData } from "../tests/supply-chain/lib.mjs";
-import { isPinnedImage } from "../tests/supply-chain/policy.mjs";
+import { checkedComposeFiles, isPinnedImage, upstreamComposeImages } from "../tests/supply-chain/policy.mjs";
 
 const yaml = file => toData(parseStrict(readLocalFromRepo(file), file));
-const image = (file, service) => yaml(file).services[service].image;
-const loadtest = "deploy/loadtest/compose.yaml";
-const staging = "deploy/staging/compose.yaml";
-const stagingDefault = (service, variable) => image(staging, service).match(
-  new RegExp(`^\\$\\{${variable}:-([^}]+)\\}$`),
-)?.[1];
 const chart = "deploy/helm/open-model-gateway/values.yaml";
-
-// Digest-only staging defaults need an explicit tracking tag. The local
-// gateway and load-test outputs, and the chart's release image, have their
-// own build or release lifecycle.
-const pins = [
-  ["compose.yaml", image("compose.yaml", "postgres")],
-  ["deploy/demo/compose.yaml", image("deploy/demo/compose.yaml", "postgres")],
-  [loadtest, image(loadtest, "postgres")],
-  [loadtest, image(loadtest, "pgbouncer")],
-  [staging, stagingDefault("postgres", "STAGING_POSTGRES_IMAGE"), "17-bookworm"],
-  [staging, stagingDefault("ingress", "STAGING_CADDY_IMAGE"), "2-alpine"],
-  [chart, yaml(chart).cnpg.cluster.image],
-];
+const pins = [];
+// These two staging defaults are digest-only. Other upstreams carry their tag.
+const stagingTags = new Map([["postgres", "17-bookworm"], ["ingress", "2-alpine"]]);
+for (const file of checkedComposeFiles()) {
+  for (const { name, image } of upstreamComposeImages(file, yaml(file))) {
+    const tag = file === "deploy/staging/compose.yaml" ? stagingTags.get(name) : undefined;
+    pins.push([`${file} services.${name}`, image, tag]);
+  }
+}
+pins.push([chart, yaml(chart).cnpg.cluster.image]);
 
 const lookups = new Map();
 function indexDigest(reference) {

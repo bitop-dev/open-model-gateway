@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("staging", ROOT / "scripts" / "staging.py")
@@ -36,6 +37,18 @@ class StagingTests(unittest.TestCase):
             self.assertEqual(config["STAGING_BIND_ADDRESS"], "127.0.0.1")
             self.assertNotIn("GATEWAY_OIDC_ISSUER", config)
             self.assertNotIn("STAGING_OPENAI_ENABLED", config)
+
+    def test_explicit_build_loads_the_named_image(self):
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / "staging.env").write_text("GATEWAY_IMAGE=omg-staging-fixture:local\n")
+            argv = ["staging.py", "build", "--state-dir", folder]
+            with patch.object(sys, "argv", argv), patch.object(subprocess, "run") as run:
+                staging.main()
+            self.assertEqual(run.call_args.args[0], [
+                "docker", "buildx", "build", "--load", "--tag", "omg-staging-fixture:local", ".",
+            ])
+            self.assertEqual(run.call_args.kwargs["cwd"], ROOT)
+            self.assertTrue(run.call_args.kwargs["check"])
 
     def test_settings_refuse_a_key_set_twice(self):
         # The last value would win, so a second GATEWAY_IMAGE (even indented) could replace
