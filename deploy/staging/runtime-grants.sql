@@ -342,6 +342,8 @@ GRANT EXECUTE ON FUNCTION public.valid_model_protocols_base(text[]),
 -- Rows are inserted once and never deleted: removal sets deleted_at and clears the
 -- filename/content type. Identity, ownership, purpose and backend are fixed (the
 -- key id changes only through `files rekey`); size/sha256/committed_at are written once and deleted rows are final (trigger).
+-- Batch finalization locks result rows against deletion claims. The sweeper
+-- checks the output/error references using the existing SELECT on async_jobs.
 -- Settings: per-group toggles, retention and the last storage health check.
 GRANT SELECT,INSERT ON public.stored_files TO gateway_runtime;
 GRANT UPDATE(size_bytes,sha256,committed_at,expires_at,deleted_at,filename,content_type,

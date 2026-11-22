@@ -2,7 +2,9 @@
 //!
 //! The sweeper removes objects whose file expired (explicit `expires_at` or the
 //! purpose group's current retention), whose deletion is pending, or whose upload
-//! never committed within a day. Replica-safe without holding row locks across
+//! never committed within a day. It also removes public batch results that have
+//! been committed for a day without being linked to a job.
+//! Replica-safe without holding row locks across
 //! network I/O: a short transaction claims rows (`last_delete_attempt_at` acts as
 //! a 5-minute lease), the objects are deleted (idempotent), then each row is
 //! marked deleted or its failure recorded (`delete_attempts`, `last_delete_error`).
@@ -41,16 +43,45 @@ pub async fn sweep_once_fenced(
     fence: Option<&crate::leases::Fence>,
 ) -> Result<SweepReport, sqlx::Error> {
     let limit = limit.clamp(1, 1000);
-    // Expiry and retention skip held files (#75); an unfinished upload holds
-    // no data and is still removed.
+    // Unlinked results can be left by a crash after committing the objects.
+    // Age them from commit, so time spent streaming does not use up the grace
+    // period. Internal batch work files and segments have no API purpose.
     let held = crate::legal_holds::file_held("f");
-    let sql = format!(
-        "UPDATE stored_files f SET last_delete_attempt_at=clock_timestamp() FROM (SELECT f.id FROM stored_files f CROSS JOIN installation_settings s WHERE s.singleton AND f.deleted_at IS NULL AND (f.last_delete_attempt_at IS NULL OR f.last_delete_attempt_at < now()-interval '5 minutes') AND ((f.committed_at IS NULL AND f.created_at < now()-interval '1 day') OR ((f.expires_at <= now() OR f.created_at + make_interval(days => {RETENTION_SQL}) <= now()) AND NOT {held})) ORDER BY f.created_at,f.id LIMIT $1 FOR UPDATE OF f SKIP LOCKED) due WHERE f.id=due.id RETURNING f.id,f.object_key,f.backend"
+    let eligible = format!(
+        "((f.committed_at IS NULL AND f.created_at < now()-interval '1 day') OR
+          ((f.expires_at <= now() OR f.created_at + make_interval(days => {RETENTION_SQL}) <= now()
+            OR (f.api_purpose='batch_output' AND f.committed_at < now()-interval '1 day'
+                AND NOT EXISTS(SELECT 1 FROM async_jobs j WHERE j.output_file_id=f.id)
+                AND NOT EXISTS(SELECT 1 FROM async_jobs j WHERE j.error_file_id=f.id)))
+           AND NOT {held}))"
     );
     let mut tx = crate::db::begin(&db.pool).await?;
     crate::leases::fence(&mut tx, fence).await?;
-    let due: Vec<(Uuid, String, String)> =
-        sqlx::query_as(&sql).bind(limit).fetch_all(&mut *tx).await?;
+    let candidates: Vec<Uuid> = sqlx::query_scalar(&format!(
+        "SELECT f.id FROM stored_files f CROSS JOIN installation_settings s
+         WHERE s.singleton AND f.deleted_at IS NULL
+           AND (f.last_delete_attempt_at IS NULL OR f.last_delete_attempt_at < now()-interval '5 minutes')
+           AND {eligible}
+         ORDER BY f.created_at,f.id LIMIT $1 FOR UPDATE OF f SKIP LOCKED"
+    ))
+    .bind(limit)
+    .fetch_all(&mut *tx)
+    .await?;
+    // Batch finalization takes the same file locks before writing job links.
+    // Recheck with a fresh snapshot once we hold the locks, since a job can
+    // have linked a result between candidate selection and locking its row.
+    let due: Vec<(Uuid, String, String)> = if candidates.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as(&format!(
+            "UPDATE stored_files f SET last_delete_attempt_at=clock_timestamp()
+             FROM installation_settings s WHERE s.singleton AND f.id=ANY($1) AND {eligible}
+             RETURNING f.id,f.object_key,f.backend"
+        ))
+        .bind(&candidates)
+        .fetch_all(&mut *tx)
+        .await?
+    };
     tx.commit().await?;
     let mut report = SweepReport {
         claimed: due.len() as u64,

@@ -585,11 +585,8 @@ impl Runner {
                 },
             )
             .await;
-        // The result files are removed when the outcome is certain and the
-        // batch does not reference them: the claim ended (zero rows), or the
-        // statement was rolled back. When the connection failed with the
-        // statement possibly sent, the server may still commit it, so the
-        // files stay (a later sweep removes them if it did not).
+        // Clean up files the batch did not link when the outcome is known.
+        // After an unacknowledged commit, the sweeper can check for links.
         let job = match finished {
             Ok(row) => {
                 let unused = [output_file, error_file].map(|f| {
