@@ -700,8 +700,8 @@ fn management_openapi_http_vectors_seeds_add_declared_absent_optionals() {
     assert!(has(&cases, "/all", "optional added", false, |b| {
         b["all"] == json!(true) && b["ids"] == json!(["abcd"])
     }));
-    // The seeded value is walked too: its own flip is a vector.
-    assert!(has(&cases, "/all", "boolean flip", true, |b| b["all"]
+    // A cross-field-invalid addition is sent but cannot establish reach.
+    assert!(!has(&cases, "/all", "boolean flip", true, |b| b["all"]
         == json!(false)));
     // A seed for an undeclared or already present location is a harness error
     // that names the pointer.
@@ -720,7 +720,7 @@ fn management_openapi_http_vectors_seeds_add_declared_absent_optionals() {
     assert!(
         cases
             .iter()
-            .any(|c| c.accept && c.body == json!(["abcd", true]))
+            .any(|c| c.kind == "maxItems" && c.accept && c.body == json!(["abcd", true]))
     );
 }
 
@@ -1414,6 +1414,8 @@ fn management_openapi_http_vectors_report_union_arms_the_valid_body_did_not_matc
         unreached_in(&both, &object),
         vec![
             ("/oneOf/1".to_owned(), "union arm"),
+            ("/oneOf/1/maxItems".to_owned(), "array bound"),
+            ("/oneOf/1/minItems".to_owned(), "array bound"),
             ("/oneOf/1/prefixItems/0".to_owned(), "array element")
         ]
     );
@@ -2221,10 +2223,18 @@ fn at_most_9_bytes(b: &Code) -> bool {
     bytes_within(9, b)
 }
 fn under_9_bytes(b: &Code) -> bool {
-    bytes_within(8, b)
+    if b.code.is_ascii() {
+        bytes_within(9, b)
+    } else {
+        bytes_within(8, b)
+    }
 }
 fn at_most_10_bytes(b: &Code) -> bool {
-    bytes_within(10, b)
+    if b.code.is_ascii() {
+        bytes_within(9, b)
+    } else {
+        bytes_within(10, b)
+    }
 }
 
 #[tokio::test]
@@ -2266,12 +2276,12 @@ async fn management_openapi_http_vectors_byte_limits_are_probed_at_the_exact_byt
     for (check, kind, side) in [
         (
             under_9_bytes as fn(&Code) -> bool,
-            "maxLength",
+            "multibyte maxBytes",
             "schema accepts but handler refuses",
         ),
         (
             at_most_10_bytes,
-            "maxLength+1",
+            "multibyte maxBytes+1",
             "schema refuses but handler accepts",
         ),
     ] {
@@ -2376,8 +2386,8 @@ fn management_openapi_http_vectors_candidates_must_straddle_the_boundary() {
     assert!(text.contains("straddle") && text.contains("/n"), "{text}");
     // GREEN: fifteen and sixteen digits differ by one character.
     plan(&[("/n", json!("1".repeat(15))), ("/n", json!("1".repeat(16)))]).unwrap();
-    // A changed character straddles too: "0" accepted, "00" refused (one added).
-    plan(&[("/n", json!("0")), ("/n", json!("00"))]).unwrap();
+    // A leading-zero refusal does not exercise the fifteen-digit limit.
+    plan(&[("/n", json!("0")), ("/n", json!("00"))]).unwrap_err();
 }
 
 #[test]
@@ -2898,4 +2908,87 @@ async fn management_openapi_integer_encoding_wire_spellings() {
     run_judged(&app, &document, json!({"n":2}), &[])
         .await
         .unwrap();
+}
+
+#[test]
+fn composed_patterns_and_formats_generate_each_boundary() {
+    let document = body_only(
+        json!({"type":"string","allOf":[{"pattern":"^[a-z]{1,8}$"},{"pattern":"^[a-z]{2,6}$"}]}),
+    );
+    let cases = cases_of(&document, &json!("abc"), &[]).unwrap();
+    assert!(cases.iter().any(|c| c.body == json!("abcabc") && c.accept));
+    let document = body_only(json!({"type":"string","format":"uri","allOf":[{"format":"uuid"}]}));
+    let cases = cases_of(
+        &document,
+        &json!("urn:uuid:123e4567-e89b-12d3-a456-426614174000"),
+        &[],
+    )
+    .unwrap();
+    for violation in ["not a uri", "not-a-uuid"] {
+        assert!(
+            cases.iter().any(|case| case.kind == "format violation"
+                && case.body == violation
+                && !case.accept)
+        );
+    }
+}
+
+#[test]
+fn repeated_seed_probes_past_an_implied_immediate_neighbour() {
+    let document = body_only(json!({"type":"string","pattern":"^(ab)+$","maxLength":64}));
+    let cases = cases_of(&document, &json!("ab"), &[]).unwrap();
+    assert!(
+        cases
+            .iter()
+            .any(|c| c.kind == "past maxLength" && c.body == json!("ab".repeat(33)) && !c.accept)
+    );
+}
+
+#[test]
+fn a_root_constraint_cannot_supply_a_vacuous_leaf_witness() {
+    let document = body_only(
+        json!({"type":"object","properties":{"v":{"type":"string","maxLength":4}},
+        "if":{"properties":{"v":{"const":"aaaa"}}},"then":false}),
+    );
+    let error = cases_of(&document, &json!({"v":"a"}), &[]).err().unwrap();
+    assert!(format!("{error:#}").contains("whole-request"));
+}
+
+#[test]
+fn null_values_do_not_cover_array_bounds_and_keyword_only_arms_are_walked() {
+    let document =
+        property_document(json!({"type":["null","array"],"maxItems":2,"items":{"type":"string"}}));
+    assert!(
+        unreached_in(&document, &reach_of(&document, &json!({"big":null}), &[]))
+            .iter()
+            .any(|(key, kind)| key == "/properties/big/maxItems" && *kind == "array bound")
+    );
+    let document = body_only(
+        json!({"type":"array","items":{"type":"integer","if":{"maximum":0},"then":{"minimum":-3},"else":{"maximum":8}}}),
+    );
+    let cases = cases_of(&document, &json!([-1, 1]), &[]).unwrap();
+    assert!(has(&cases, "/1", "maximum+1", false, |b| b[1] == 9));
+}
+
+#[test]
+fn dependent_property_coverage_needs_a_base_containing_both_names() {
+    let document = body_only(
+        json!({"type":"object","properties":{"period":{"type":"string"},"budget":{"type":"string"}},
+        "dependentRequired":{"period":["budget"]}}),
+    );
+    let only_budget = reach_of(&document, &json!({"budget":"50"}), &[]);
+    assert!(
+        unreached_in(&document, &only_budget)
+            .iter()
+            .any(|(_, kind)| *kind == "dependent property")
+    );
+    let both = json!({"period":"month","budget":"50"});
+    assert!(unreached_in(&document, &reach_of(&document, &both, &[])).is_empty());
+    assert!(has(
+        &cases_of(&document, &both, &[]).unwrap(),
+        "/budget",
+        "omitted",
+        false,
+        |b| b == &json!({"period":"month"})
+    ));
 }

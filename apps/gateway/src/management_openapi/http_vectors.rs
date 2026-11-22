@@ -200,6 +200,19 @@ fn resolve<'a>(document: &'a Value, mut node: &'a Value) -> Result<&'a Value> {
     bail!("reference chain too deep")
 }
 
+/// Formats with a known HTTP probe strategy. Raw uploads use the binary runner.
+pub(super) fn format_violations(format: &str) -> Option<&'static [&'static str]> {
+    Some(match format {
+        "date" => &["2024-02-30", "2024-13-01", "not-a-date"],
+        "omg-chrono-date-time" | "date-time" => &["yesterday", "2024-01-01"],
+        "uuid" => &["not-a-uuid"],
+        "email" => &["not-an-email"],
+        "uri" => &["not a uri"],
+        "binary" => &[],
+        _ => return None,
+    })
+}
+
 /// Every node along a `$ref` chain, the node itself first: siblings of a `$ref`
 /// (`{"$ref": ..., "maxLength": 15}`) are keywords of the instance too, so the
 /// validator, `declare` and `reach` see them and the vectors must as well.
@@ -258,8 +271,8 @@ fn applicable<'a>(
     Ok(())
 }
 
-fn first<'a>(nodes: &[&'a Value], key: &str) -> Option<&'a Value> {
-    nodes.iter().find_map(|node| node.get(key))
+fn strings<'a>(nodes: &[&'a Value], key: &str) -> BTreeSet<&'a str> {
+    nodes.iter().filter_map(|node| node[key].as_str()).collect()
 }
 /// EVERY distinct value of a bound across the applicable nodes (the base
 /// schema and each active `allOf`/`then`/union arm may state a different one):
@@ -374,6 +387,7 @@ pub(super) struct Notes {
     pub(super) exempt: usize,
     /// Non-decisive candidates that were not sent (counted, never silent).
     pub(super) minor: usize,
+    implied: usize,
     /// Locations whose vectors cannot be trusted (unbounded patterns without
     /// candidates, one-sided candidates).
     pub(super) problems: Vec<String>,
@@ -416,6 +430,12 @@ impl Notes {
     }
     /// One line, counts only: never a candidate or a location's value.
     fn report(&self, method: &str, template: &str) {
+        if self.implied > 0 {
+            eprintln!(
+                "{method} {template}: {} boundary pairs also refused by another constraint",
+                self.implied
+            );
+        }
         if self.minor > 0 || self.exempt > 0 {
             eprintln!(
                 "{method} {template}: {} non-decisive and {} reviewed-unsendable vector candidates were not sent",
@@ -602,7 +622,7 @@ pub(super) fn pattern_candidates(
         "~".to_owned(),
         "\u{e9}".to_owned(),
     ];
-    for control in ['\n', '\0', '\u{7f}', '\u{85}'] {
+    for control in ['\n', '\0', '\u{7f}', '\u{85}', '\u{2028}'] {
         out.push(control.to_string());
         out.push(format!("{seed}{control}"));
         out.push(format!("{control}{seed}"));
@@ -648,6 +668,7 @@ pub(super) fn pattern_candidates(
 /// Decisive vectors of one location, by label (`kind@bound`).
 #[derive(Default)]
 struct Evidence {
+    implied: usize,
     labelled: Vec<(String, &'static str, Value)>,
     dropped: Vec<String>,
 }
@@ -655,6 +676,7 @@ struct Evidence {
 /// An at-limit vector the schema accepts and the vector just past it.
 #[derive(Clone)]
 struct Pair {
+    implied: bool,
     at: Value,
     over: Value,
 }
@@ -677,6 +699,7 @@ impl Evidence {
         let all = [Some(kinds.0), kinds.1];
         match found {
             Some(pair) => {
+                self.implied += usize::from(pair.implied);
                 self.labelled
                     .push((label(kinds.0, bound), kinds.0, pair.at));
                 if let Some(over) = kinds.1 {
@@ -783,9 +806,17 @@ fn find_pair(
             None => valid(document, schema, &over)?,
         };
         if alone {
-            return Ok(Some(Pair { at, over }));
+            return Ok(Some(Pair {
+                at,
+                over,
+                implied: false,
+            }));
         }
-        implied.get_or_insert(Pair { at, over });
+        implied.get_or_insert(Pair {
+            at,
+            over,
+            implied: true,
+        });
     }
     Ok(implied)
 }
@@ -948,6 +979,20 @@ fn string_bounds(
                 out.push(("maxLength", json!(repeat_to(seed, max as usize))));
                 out.push(("maxLength+1", json!(repeat_to(seed, max as usize + 1))));
             }
+            if found.as_ref().is_some_and(|pair| pair.implied) {
+                // A repeated unit can cross a length bound only at its next
+                // complete repetition. Keep the immediate neighbour as well.
+                let period = seed.chars().count();
+                if period > 1 {
+                    let next = (max as usize / period + 1).saturating_mul(period);
+                    if next > max as usize + 1 && next <= LONGEST as usize {
+                        let candidate = json!(repeat_to(seed, next));
+                        if validator.is_valid(&candidate) {
+                            out.push(("past maxLength", candidate));
+                        }
+                    }
+                }
+            }
             evidence.settle(("maxLength", Some("maxLength+1")), max, found, dominated);
         }
         // Characters, not bytes: `max` multibyte characters are within maxLength
@@ -1029,7 +1074,42 @@ const STRADDLE: &str = "supplied candidates must straddle the boundary: include 
 /// Do the `(candidate, schema verdict)` pairs hold an accepted value and a
 /// refused one within edit distance 1 of it? Two candidates far apart (`0` and
 /// sixteen digits) prove nothing about WHERE the boundary lies.
-fn straddles(verdicts: &[(String, bool)]) -> bool {
+fn straddles(nodes: &[&Value], verdicts: &[(String, bool)]) -> bool {
+    // For anchored patterns with a finite maximum, require the length edge.
+    // HIR literals are UTF-8 bytes, but JSON Schema measures Unicode scalars.
+    fn width(hir: &regex_syntax::hir::Hir) -> Option<usize> {
+        use regex_syntax::hir::HirKind::*;
+        match hir.kind() {
+            Empty | Look(_) => Some(0),
+            Literal(lit) => Some(std::str::from_utf8(&lit.0).ok()?.chars().count()),
+            Class(_) => Some(1),
+            Capture(c) => width(&c.sub),
+            Repetition(r) => width(&r.sub)?.checked_mul(r.max? as usize),
+            Concat(parts) => parts
+                .iter()
+                .try_fold(0usize, |n, p| n.checked_add(width(p)?)),
+            Alternation(parts) => parts
+                .iter()
+                .map(width)
+                .collect::<Option<Vec<_>>>()?
+                .into_iter()
+                .max(),
+        }
+    }
+    let maximum = strings(nodes, "pattern")
+        .into_iter()
+        .filter_map(|p| {
+            let hir = regex_syntax::Parser::new().parse(p).ok()?;
+            use regex_syntax::hir::Look;
+            let props = hir.properties();
+            if !props.look_set_prefix().contains(Look::Start)
+                || !props.look_set_suffix().contains(Look::End)
+            {
+                return None;
+            }
+            width(&hir)
+        })
+        .min();
     fn one_edit(a: &str, b: &str) -> bool {
         let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
         let (short, long) = if a.len() <= b.len() {
@@ -1050,14 +1130,17 @@ fn straddles(verdicts: &[(String, bool)]) -> bool {
         }
     }
     verdicts.iter().any(|(accepted, ok)| {
-        *ok && verdicts
-            .iter()
-            .any(|(refused, ok)| !*ok && one_edit(accepted, refused))
+        *ok && verdicts.iter().any(|(refused, ok)| {
+            !*ok && maximum.is_none_or(|max| {
+                accepted.chars().count() == max && refused.chars().count() == max.saturating_add(1)
+            }) && one_edit(accepted, refused)
+        })
     })
 }
 
 /// The candidates of one location and the decisive kinds it could not produce.
 struct Mutations {
+    implied: usize,
     vectors: Vec<(&'static str, Value)>,
     /// Decisive vectors of one bound, by label (`maxLength+1@64`): built from
     /// candidates that satisfy the other constraints, see [`length_pair`].
@@ -1307,26 +1390,19 @@ fn scalar_mutations(
         let seed = value.as_str().unwrap_or("a");
         string_bounds(document, schema, nodes, seed, &mut out, &mut evidence)?;
         dropped.append(&mut evidence.dropped);
-        if let Some(pattern) = first(nodes, "pattern").and_then(Value::as_str) {
-            // A pattern is bounded by its own shape, or by `maxLength` /
-            // `x-omg-max-bytes` (a `minLength` alone bounds nothing from above),
-            // or by a reviewed reason.
-            let bounded = simple_bounds(pattern).is_some()
-                || !distinct_u64(nodes, "maxLength").is_empty()
-                || nodes.iter().any(|node| {
-                    node.get(MAX_BYTES).is_some() || node.get(PATTERN_BOUNDARIES).is_some()
-                });
-            needs_candidates = !bounded && candidates == 0;
-            // The reviewed reason is for a pattern whose bounds cannot be
-            // derived and for which no candidates are supplied; once the
-            // pattern, a maxLength/maxBytes or candidates cover it, it is stale.
-            let own = simple_bounds(pattern).is_some()
-                || !distinct_u64(nodes, "maxLength").is_empty()
-                || nodes.iter().any(|node| node.get(MAX_BYTES).is_some());
-            stale_pattern_boundaries = nodes
-                .iter()
-                .any(|node| node.get(PATTERN_BOUNDARIES).is_some())
-                && (own || candidates > 0);
+        let patterns = strings(nodes, "pattern");
+        let annotated = nodes
+            .iter()
+            .any(|node| node.get(PATTERN_BOUNDARIES).is_some());
+        let needs_witness = patterns
+            .iter()
+            .any(|pattern| simple_bounds(pattern).is_none())
+            && distinct_u64(nodes, "maxLength").is_empty()
+            && !nodes.iter().any(|node| node.get(MAX_BYTES).is_some())
+            && candidates == 0;
+        needs_candidates = needs_witness && !annotated;
+        stale_pattern_boundaries = annotated && !patterns.is_empty() && !needs_witness;
+        for pattern in patterns {
             let (shapes, lengths) = pattern_candidates(pattern, seed, &mut dropped);
             for (length, candidate) in lengths {
                 let kind = if accepts(document, schema, &json!(candidate))? {
@@ -1351,15 +1427,9 @@ fn scalar_mutations(
                 out.push((kind, json!(candidate)));
             }
         }
-        if let Some(format) = first(nodes, "format").and_then(Value::as_str) {
-            let bad: &[&str] = match format {
-                "date" => &["2024-02-30", "2024-13-01", "not-a-date"],
-                "date-time" => &["yesterday", "2024-01-01"],
-                "uuid" => &["not-a-uuid"],
-                "email" => &["not-an-email"],
-                "uri" => &["not a uri"],
-                _ => &[],
-            };
+        for format in strings(nodes, "format") {
+            let bad = format_violations(format)
+                .with_context(|| format!("no request violation vectors for format {format}"))?;
             for candidate in bad {
                 out.push(("format violation", json!(candidate)));
             }
@@ -1371,6 +1441,7 @@ fn scalar_mutations(
         }
     }
     Ok(Mutations {
+        implied: evidence.implied,
         vectors: out,
         labelled: evidence.labelled,
         dropped,
@@ -1567,7 +1638,7 @@ pub(super) fn query_plan(
                     ))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            if !straddles(&verdicts) {
+            if !straddles(&nodes, &verdicts) {
                 notes
                     .problems
                     .push(format!("query parameter {name}: {STRADDLE}"));
@@ -1576,6 +1647,7 @@ pub(super) fn query_plan(
                 .vectors
                 .extend(supplied.iter().map(|v| ("supplied candidate", json!(v))));
         }
+        notes.implied += mutations.implied;
         let mut dropped = mutations.dropped;
         let mut sent: Vec<String> = Vec::new();
         let all = mutations.labelled.into_iter().chain(
@@ -1981,6 +2053,19 @@ struct Walk<'a> {
     walked: std::collections::BTreeMap<String, (Value, BTreeSet<String>)>,
 }
 impl Walk<'_> {
+    fn push_boundary(&mut self, path: &[Step], kind: &'static str, value: Value) -> Result<()> {
+        if !(kind == "pattern candidate" || kind == "pattern violation") {
+            let at_limit = !kind.ends_with("+1") && !kind.ends_with("-1");
+            let body = set(&self.valid_body, path, Some(value.clone()));
+            ensure!(
+                accepts(self.document, self.root_schema, &body)? == at_limit,
+                "{kind} at {}: decisive pair needs a whole-request boundary witness",
+                pointer(path)
+            );
+        }
+        self.push(path, kind, Some(value))
+    }
+
     fn push(&mut self, path: &[Step], kind: &'static str, new: Option<Value>) -> Result<()> {
         let body = set(&self.valid_body, path, new);
         if body == self.valid_body
@@ -2032,7 +2117,7 @@ impl Walk<'_> {
         Ok(())
     }
     /// The caller's seed for an absent declared location: send it ADDED to the
-    /// valid body, then walk the WHOLE seeded body from its root (a seed such as
+    /// valid body, then walk a schema-valid result from its root (a seed such as
     /// `/mode` changes which conditional arms and union branches constrain the
     /// siblings, so the siblings must be mutated in the seeded base too).
     fn seeded(&mut self, path: &mut [Step]) -> Result<()> {
@@ -2044,7 +2129,7 @@ impl Walk<'_> {
         self.push(path, "optional added", Some(seed.clone()))?;
         let base = set(&self.valid_body, path, Some(seed));
         let key = serde_json::to_string(&base)?;
-        if self.bases.insert(key.clone()) {
+        if self.bases.insert(key.clone()) && accepts(self.document, self.root_schema, &base)? {
             let saved = std::mem::replace(&mut self.valid_body, base.clone());
             let saved_key = std::mem::replace(&mut self.valid_key, key);
             let walked = self.walk(self.root_schema, &base, &mut Vec::new());
@@ -2212,6 +2297,7 @@ impl Walk<'_> {
             }
             evidence.settle(kinds, bound, found, dominated);
         }
+        self.notes.implied += evidence.implied;
         let sent: Vec<&str> = evidence
             .labelled
             .iter()
@@ -2227,19 +2313,19 @@ impl Walk<'_> {
             decisively_bounded(nodes),
         );
         for (_, kind, value) in evidence.labelled {
-            self.push(path, kind, Some(value))?;
+            self.push_boundary(path, kind, value)?;
         }
         Ok(())
     }
     fn walk(&mut self, schema: &Value, value: &Value, path: &mut Vec<Step>) -> Result<()> {
         ensure!(path.len() < 12, "request body nesting too deep");
+        let mut nodes = Vec::new();
+        applicable(self.document, schema, value, &mut nodes, 0)?;
         self.walked
             .entry(self.valid_key.clone())
             .or_insert_with(|| (self.valid_body.clone(), BTreeSet::new()))
             .1
             .insert(raw_pointer(path));
-        let mut nodes = Vec::new();
-        applicable(self.document, schema, value, &mut nodes, 0)?;
         let here = pointer(path);
         let supplied = self.candidates.get(&here).cloned().unwrap_or_default();
         let mutations =
@@ -2254,6 +2340,7 @@ impl Walk<'_> {
                 "{here}: {PATTERN_BOUNDARIES} is stale: the pattern, a maxLength or the supplied candidates already cover its boundaries; delete it"
             ));
         }
+        self.notes.implied += mutations.implied;
         let sent: Vec<&str> = mutations
             .vectors
             .iter()
@@ -2268,7 +2355,7 @@ impl Walk<'_> {
         self.settle_at(&here, &mutations.dropped, &sent, exempt, bounded);
         // Decisive kinds first: a body sent twice keeps the first kind's name.
         for (_, kind, new) in mutations.labelled {
-            self.push(path, kind, Some(new))?;
+            self.push_boundary(path, kind, new)?;
         }
         for (kind, new) in mutations.vectors {
             self.push(path, kind, Some(new))?;
@@ -2284,7 +2371,7 @@ impl Walk<'_> {
                     ))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            if !straddles(&verdicts) {
+            if !straddles(&nodes, &verdicts) {
                 self.notes.problems.push(format!("{here}: {STRADDLE}"));
             }
             for candidate in supplied {
@@ -2763,7 +2850,12 @@ pub(super) fn owns_next(kind: &str, location: &str) -> bool {
 /// in minutes rather than after every vector. `finish` always FAILS such a run
 /// (it is never a contract check); the full run without it is the gate.
 pub(crate) fn plan_only() -> bool {
-    std::env::var_os("OMG_OPENAPI_PLAN_ONLY").is_some_and(|v| v == "1")
+    let enabled = std::env::var_os("OMG_OPENAPI_PLAN_ONLY").is_some_and(|v| v == "1");
+    assert!(
+        !enabled || std::env::var_os("GITHUB_ACTIONS").is_none(),
+        "OMG_OPENAPI_PLAN_ONLY cannot run in GitHub Actions"
+    );
+    enabled
 }
 
 pub(crate) async fn run_body_with(
@@ -2879,7 +2971,7 @@ pub(crate) async fn body_vectors_http(
 /// [`body_vectors_http`] with caller-supplied `seeds`: `(JSON pointer, valid
 /// value)` for declared optional properties (or the next positional item) that
 /// `valid` omits. Each seed is sent ADDED to `valid` (so `{"ids":[x]}` plus
-/// `/all: true` reaches the handler) and its value is walked like any other.
+/// `/all: true` reaches the handler) and a schema-valid result is walked from its root.
 /// A seed that names nothing the body omits fails the run.
 pub(crate) async fn body_vectors_seeded(
     fixtures: &mut PositiveFixtures,

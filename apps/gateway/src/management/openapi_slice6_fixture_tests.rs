@@ -386,7 +386,18 @@ fn query_candidates(template: &str, base: &[(&str, &str)]) -> Vec<(String, Strin
         cut.next();
         match *name {
             // The valid value, and the same with its first character cut off.
-            "status" | "finish_reason" | "cursor" => {
+            "cursor" => {
+                let mut longest = format!("1000000000000000000_{}", Uuid::nil());
+                if template.ends_with("/sessions") {
+                    longest.push('_');
+                    longest.push_str(&"f09f9880".repeat(128));
+                }
+                out.push(("cursor".into(), format!("{longest}0")));
+                out.push(("cursor".into(), longest));
+                out.push(("cursor".into(), (*value).to_owned()));
+                out.push(("cursor".into(), cut.as_str().to_owned()));
+            }
+            "status" | "finish_reason" => {
                 out.push(((*name).to_owned(), (*value).to_owned()));
                 out.push(((*name).to_owned(), cut.as_str().to_owned()));
             }
@@ -402,6 +413,9 @@ fn query_candidates(template: &str, base: &[(&str, &str)]) -> Vec<(String, Strin
             }
             // Twenty actions of up to 64 characters.
             "exclude_actions" => {
+                let longest = vec!["a".repeat(64); 20].join(",");
+                out.push(("exclude_actions".into(), format!("{longest}a")));
+                out.push(("exclude_actions".into(), longest));
                 out.push(("exclude_actions".into(), vec!["a"; 20].join(",")));
                 out.push(("exclude_actions".into(), vec!["a"; 21].join(",")));
                 out.push(("exclude_actions".into(), "a".repeat(64)));

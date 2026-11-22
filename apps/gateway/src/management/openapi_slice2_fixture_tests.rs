@@ -26,7 +26,7 @@ const ISSUER: &str = "https://issuer.example.test";
 const VECTOR_ISSUER: &str = "https://issuer.example.test/";
 /// Handler-derived probes run by the fixture, and how many of the expected
 /// accepts the handler gives as a domain refusal (404/409) rather than 2xx.
-const EXPECTED_PINS: usize = 153;
+const EXPECTED_PINS: usize = 154;
 const EXPECTED_DOMAIN_PINS: usize = 1;
 struct Server(tokio::task::JoinHandle<()>);
 impl Drop for Server {
@@ -2210,11 +2210,19 @@ async fn slice2_fixtures(pool: PgPool, shard: usize) -> (Vec<String>, PositiveFi
         // Boundary candidates for the query patterns whose length the harness cannot
         // derive: each pair straddles the boundary within one edit.
         let cut = |text: &str| text.chars().skip(1).collect::<String>();
+        // Nineteen timestamp digits and 128 four-byte Unicode session characters.
+        let longest_cursor = format!(
+            "-0000000000000000001_{}_{}",
+            Uuid::nil(),
+            "f09f9880".repeat(128)
+        );
         let session_candidates: Vec<(&str, String)> = vec![
             ("status", "succeeded".to_owned()),
             ("status", cut("succeeded")),
             ("finish_reason", "stop".to_owned()),
             ("finish_reason", cut("stop")),
+            ("cursor", format!("{longest_cursor}0")),
+            ("cursor", longest_cursor),
             ("cursor", cursor.clone()),
             ("cursor", cursor.replacen('_', "", 1)),
             ("q", "abcd".to_owned()),
@@ -3172,6 +3180,12 @@ async fn slice2_fixtures(pool: PgPool, shard: usize) -> (Vec<String>, PositiveFi
             (
                 "C1 control character in the path",
                 "https://issuer.example.test/a\u{85}b",
+                false,
+                false,
+            ),
+            (
+                "Unicode line separator in the path",
+                "https://issuer.example.test/a\u{2028}b",
                 false,
                 false,
             ),

@@ -276,7 +276,12 @@ fn expect(
             stack,
         )?;
     }
-    if let Some(items) = node.get("items").filter(|v| v.is_object()) {
+    let prefix = node["prefixItems"].as_array().map_or(0, Vec::len);
+    if let Some(items) = node.get("items").filter(|v| v.is_object())
+        && node["maxItems"]
+            .as_u64()
+            .is_none_or(|max| max > prefix as u64)
+    {
         expect(
             document,
             items,

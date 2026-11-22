@@ -2604,6 +2604,7 @@ dependencies = [
  "quote",
  "rand 0.10.4",
  "regex",
+ "regex-syntax",
  "reqwest",
  "rustls",
  "serde",
