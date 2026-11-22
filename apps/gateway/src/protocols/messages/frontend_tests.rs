@@ -81,7 +81,14 @@ fn claude_code_field_rules_by_provider_class() {
         for class in classes {
             let parsed = request(body.clone()).unwrap();
             let verdict = crate::providers::messages::validate(&parsed, class);
-            if always_refuse && (field != "image" || class != ProviderClass::Anthropic) {
+            let bedrock_refuses = class == ProviderClass::Bedrock
+                && matches!(
+                    field,
+                    "cache_control" | "thinking" | "context_management" | "defer_loading"
+                );
+            if bedrock_refuses
+                || (always_refuse && (field != "image" || class != ProviderClass::Anthropic))
+            {
                 assert!(
                     matches!(verdict, Err(InferenceError::InvalidField(f)) if f == field),
                     "{field}"
@@ -112,11 +119,11 @@ fn cache_hints_have_the_same_rule_at_every_supported_position() {
                 .is_empty()
         );
         assert!(crate::providers::messages::validate(&r, ProviderClass::Anthropic).is_ok());
-        for class in [
-            ProviderClass::OpenAi,
-            ProviderClass::Bedrock,
-            ProviderClass::Local,
-        ] {
+        assert_eq!(
+            crate::providers::messages::validate(&r, ProviderClass::Bedrock),
+            Err(InferenceError::InvalidField("cache_control")),
+        );
+        for class in [ProviderClass::OpenAi, ProviderClass::Local] {
             assert!(crate::providers::messages::validate(&r, class).is_ok());
         }
     }
