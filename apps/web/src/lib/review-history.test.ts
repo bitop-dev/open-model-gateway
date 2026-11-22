@@ -1,4 +1,5 @@
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, lstatSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
@@ -202,10 +203,12 @@ const SOURCE_FILE = /\.[cm]?[jt]sx?$/;
 const sourceFile = (path: string) => SOURCE_FILE.test(path) && !path.endsWith(".d.ts");
 
 function walk(dir: string, out: string[] = []): string[] {
-  for (const name of readdirSync(dir)) {
-    const path = join(dir, name);
-    if (statSync(path).isDirectory()) walk(path, out);
-    else out.push(path);
+  if (!lstatSync(dir).isDirectory()) throw new Error(`unsupported source entry: ${dir}`);
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) walk(path, out);
+    else if (entry.isFile()) out.push(path);
+    else throw new Error(`unsupported source entry: ${path}`);
   }
   return out;
 }
@@ -249,6 +252,26 @@ function forms(comment: string): { name: string; file: string; source: string }[
 }
 
 describe("comments state invariants, not review history", () => {
+  it("rejects linked sources and directories", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "review-history-"));
+    try {
+      const root = join(tmp, "src");
+      const outside = join(tmp, "other");
+      mkdirSync(root);
+      mkdirSync(outside);
+      const file = join(outside, "other.test.tsx");
+      writeFileSync(file, "export const value = 1;");
+      for (const [target, name, type] of [[file, "linked.test.tsx", "file"], [outside, "linked-dir", "dir"]] as const) {
+        const link = join(root, name);
+        symlinkSync(target, link, type);
+        expect(() => walk(root)).toThrowError(`unsupported source entry: ${link}`);
+        unlinkSync(link);
+      }
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   it("reads the shared pattern file", () => {
     expect(rules.patterns.length).toBeGreaterThanOrEqual(15);
     expect(rules.refuse.length).toBeGreaterThanOrEqual(25);

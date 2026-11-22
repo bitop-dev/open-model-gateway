@@ -478,10 +478,17 @@ fn is_allowed(hit: &Hit) -> bool {
 }
 
 /// (files, comment blocks, hits) of the crate's src directory.
-fn scan_tree(rules: &Rules) -> (usize, usize, Vec<Hit>) {
-    let src = src_dir();
+fn scan_tree(rules: &Rules, src: &std::path::Path) -> (usize, usize, Vec<Hit>) {
+    let metadata = src
+        .symlink_metadata()
+        .unwrap_or_else(|e| panic!("{}: {e}", src.display()));
+    assert!(
+        metadata.is_dir(),
+        "unsupported source entry: {}",
+        src.display()
+    );
     let mut files = Vec::new();
-    let mut dirs = vec![src.clone()];
+    let mut dirs = vec![src.to_owned()];
     while let Some(dir) = dirs.pop() {
         for entry in dir
             .read_dir()
@@ -492,6 +499,11 @@ fn scan_tree(rules: &Rules) -> (usize, usize, Vec<Hit>) {
             let kind = entry
                 .file_type()
                 .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            assert!(
+                kind.is_dir() || kind.is_file(),
+                "unsupported source entry: {}",
+                path.display()
+            );
             if kind.is_dir() {
                 dirs.push(path);
             } else if path.extension().is_some_and(|ext| ext == "rs") {
@@ -503,7 +515,7 @@ fn scan_tree(rules: &Rules) -> (usize, usize, Vec<Hit>) {
     let (mut blocks, mut hits) = (0, Vec::new());
     for path in &files {
         let file = path
-            .strip_prefix(&src)
+            .strip_prefix(src)
             .unwrap()
             .to_string_lossy()
             .replace('\\', "/");
@@ -521,6 +533,29 @@ mod tests {
 
     fn rules() -> Rules {
         parse_rules(PATTERNS)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_linked_sources_and_directories() {
+        use std::{fs, os::unix::fs::symlink};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("src");
+        let outside = tmp.path().join("other");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let file = outside.join("other_tests.rs");
+        fs::write(&file, "fn test_helper() {}").unwrap();
+        for (target, name) in [(&file, "linked_tests.rs"), (&outside, "linked_dir")] {
+            let link = root.join(name);
+            symlink(target, &link).unwrap();
+            let failure = std::panic::catch_unwind(|| scan_tree(&rules(), &root)).unwrap_err();
+            assert_eq!(
+                failure.downcast_ref::<String>().unwrap(),
+                &format!("unsupported source entry: {}", link.display())
+            );
+            fs::remove_file(link).unwrap();
+        }
     }
 
     fn refused(rules: &Rules, comment: &str) -> bool {
@@ -839,7 +874,7 @@ fn f() -> usize {
     #[test]
     fn source_comments_state_invariants_without_review_history() {
         let rules = rules();
-        let (files, blocks, hits) = scan_tree(&rules);
+        let (files, blocks, hits) = scan_tree(&rules, &src_dir());
         // A floor so a walk that misses much of src cannot pass.
         assert!(
             files >= 500 && blocks >= 3_880,
