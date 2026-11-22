@@ -200,9 +200,7 @@ pub(super) async fn resolve(
             .collect();
         locks::rows(&mut tx, &touches, false).await?;
         let reason = p.reason.as_deref().ok_or_else(invalid)?;
-        for row in &eligible {
-            settle(&mut tx, row, u.user_id(), reason).await?;
-        }
+        settle(&mut tx, &eligible, u.user_id(), reason).await?;
         audit(&mut tx, &eligible, u.user_id(), reason).await?;
     }
     // Applying removes resolved rows from the candidate sequence. Continue
@@ -216,16 +214,47 @@ pub(super) async fn resolve(
 }
 async fn settle(
     tx: &mut Transaction<'_, Postgres>,
-    r: &Candidate,
+    rows: &[Candidate],
     actor: Uuid,
     reason: &str,
 ) -> Result<(), ApiError> {
-    sqlx::query("UPDATE governance_reservations SET state='settled',actual_microusd=0,free_price_resolved=true WHERE execution_id=$1 AND admitted_at=$2 AND state='unknown'")
-        .bind(r.execution_id).bind(r.admitted_at).execute(&mut **tx).await?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<_> = rows.iter().map(|r| r.execution_id).collect();
+    let ats: Vec<_> = rows.iter().map(|r| r.admitted_at).collect();
+    // The page's reservation and budget locks are already held. Statement
+    // triggers aggregate deltas across the page before touching the totals.
+    let changed = sqlx::query(
+        "UPDATE governance_reservations SET state='settled',actual_microusd=0,free_price_resolved=true
+         WHERE (execution_id,admitted_at) IN (SELECT * FROM unnest($1::uuid[],$2::timestamptz[]))
+         AND state='unknown'",
+    )
+    .bind(&ids)
+    .bind(&ats)
+    .execute(&mut **tx)
+    .await?;
+    if changed.rows_affected() != rows.len() as u64 {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "Eligible count changed; preview again",
+        ));
+    }
     // INSERT SELECT copies observations exactly, including SQL NULLs. Neither
     // history surface is assigned fabricated tokens, meters or cost components.
-    sqlx::query("INSERT INTO monetary_ledger(id,execution_id,admitted_at,kind,amount_microusd,input_tokens,output_tokens,billing_usage,meter_usage,output_image_variant,provider_cost_microusd,evidence) SELECT gen_random_uuid(),execution_id,admitted_at,'reconciliation',0,input_tokens,output_tokens,billing_usage,meter_usage,output_image_variant,provider_cost_microusd,$3 FROM governance_reservations WHERE execution_id=$1 AND admitted_at=$2")
-        .bind(r.execution_id).bind(r.admitted_at).bind(format!("free-price:{actor}:{reason}")).execute(&mut **tx).await?;
+    sqlx::query(
+        "INSERT INTO monetary_ledger(id,execution_id,admitted_at,kind,amount_microusd,
+           input_tokens,output_tokens,billing_usage,meter_usage,output_image_variant,provider_cost_microusd,evidence)
+         SELECT gen_random_uuid(),execution_id,admitted_at,'reconciliation',0,
+           input_tokens,output_tokens,billing_usage,meter_usage,output_image_variant,provider_cost_microusd,$3
+         FROM governance_reservations
+         WHERE (execution_id,admitted_at) IN (SELECT * FROM unnest($1::uuid[],$2::timestamptz[]))",
+    )
+    .bind(&ids)
+    .bind(&ats)
+    .bind(format!("free-price:{actor}:{reason}"))
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 async fn audit(

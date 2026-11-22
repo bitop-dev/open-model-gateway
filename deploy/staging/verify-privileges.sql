@@ -1113,9 +1113,14 @@ BEGIN
   INSERT INTO governance_reservations(execution_id,workspace_id,api_key_id,deployment_id,price_id,admitted_at,minute_start,month_start,lease_expires_at,state,held_microusd) VALUES(zero_execution,ws,k,d,zero_price,now(),date_trunc('minute',now()),date_trunc('month',now()),now(),'unknown',0);
   BEGIN UPDATE governance_reservations SET state='settled',actual_microusd=0 WHERE execution_id=zero_execution;
    RAISE EXCEPTION 'unmarked NULL usage settlement allowed'; EXCEPTION WHEN check_violation THEN NULL; END;
-  UPDATE governance_reservations SET state='settled',actual_microusd=0,free_price_resolved=true WHERE execution_id=zero_execution;
+  UPDATE governance_reservations SET state='settled',actual_microusd=0,free_price_resolved=true
+   WHERE (execution_id,admitted_at) IN (SELECT * FROM unnest(ARRAY[zero_execution],ARRAY[now()])) AND state='unknown';
+  IF NOT FOUND THEN RAISE EXCEPTION 'free resolution did not update the reservation'; END IF;
   IF EXISTS(SELECT FROM governance_reservations WHERE execution_id=zero_execution AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)) THEN RAISE EXCEPTION 'free resolution fabricated tokens'; END IF;
-  INSERT INTO monetary_ledger(id,execution_id,admitted_at,kind,amount_microusd,input_tokens,output_tokens,evidence) SELECT gen_random_uuid(),execution_id,admitted_at,'reconciliation',0,input_tokens,output_tokens,'free-price:'||u||':rollback probe' FROM governance_reservations WHERE execution_id=zero_execution;
+  INSERT INTO monetary_ledger(id,execution_id,admitted_at,kind,amount_microusd,input_tokens,output_tokens,billing_usage,meter_usage,output_image_variant,provider_cost_microusd,evidence)
+   SELECT gen_random_uuid(),execution_id,admitted_at,'reconciliation',0,input_tokens,output_tokens,billing_usage,meter_usage,output_image_variant,provider_cost_microusd,'free-price:'||u||':rollback probe'
+   FROM governance_reservations WHERE (execution_id,admitted_at) IN (SELECT * FROM unnest(ARRAY[zero_execution],ARRAY[now()]));
+  IF NOT FOUND THEN RAISE EXCEPTION 'free resolution did not append ledger evidence'; END IF;
   INSERT INTO audit_events(id,workspace_id,actor_user_id,action,resource_type,resource_id,metadata) VALUES(gen_random_uuid(),ws,u,'usage.free_price_resolved','workspace',ws,'{"reason":"rollback probe","resolved_count":"1"}');
  END;
  -- 0083: only terminal gateway envelopes can retain NULL usage at zero.
