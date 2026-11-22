@@ -92,6 +92,22 @@ pub(crate) fn validate(request: &ChatRequest, class: ProviderClass) -> Result<()
     if options.strict_tools {
         return refuse("strict");
     }
+    if class == ProviderClass::Bedrock {
+        // The Converse mapping cannot carry these Messages controls.
+        // Both admission and dispatch use this encoder policy.
+        if options.thinking.is_some() || !options.history_thinking.is_empty() {
+            return refuse("thinking");
+        }
+        if !options.cache_controls.is_empty() {
+            return refuse("cache_control");
+        }
+        if options.context_management.is_some() {
+            return refuse("context_management");
+        }
+        if !options.defer_loading.is_empty() {
+            return refuse("defer_loading");
+        }
+    }
     if class != ProviderClass::Anthropic {
         if !options.history_thinking.is_empty()
             && request
@@ -103,8 +119,6 @@ pub(crate) fn validate(request: &ChatRequest, class: ProviderClass) -> Result<()
             // history leaves no text/tool conversation at all.
             return Err(InferenceError::InvalidRequest);
         }
-        // Reasoning mapping is delivery 3. Hints and foreign signed thinking
-        // are deliberately omitted by translated providers, not forwarded.
         if options.top_k.is_some() {
             return refuse("top_k");
         }

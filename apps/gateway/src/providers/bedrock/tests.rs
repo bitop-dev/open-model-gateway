@@ -1,6 +1,9 @@
 use super::*;
 #[path = "auth_tests.rs"]
 mod auth_tests;
+#[cfg(feature = "integration-tests")]
+#[path = "messages_options_tests.rs"]
+mod messages_options_tests;
 #[path = "stream_decode_tests.rs"]
 mod stream_decode_tests;
 #[cfg(feature = "integration-tests")]
