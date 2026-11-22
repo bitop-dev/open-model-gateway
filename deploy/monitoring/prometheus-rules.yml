@@ -88,8 +88,7 @@ groups:
             or
               (gateway_accounting_failures_total{stage!~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"} unless present_over_time(gateway_accounting_failures_total{stage!~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"}[10m] offset 10m))
             or
-              (gateway_accounting_failures_total{stage!~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"}
-                and present_over_time(instance_stage_cause:accounting_failure_series:first_observed{stage!~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"}[10m]))
+              last_over_time(instance_stage_cause:accounting_failure_series:first_observed{stage!~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"}[10m])
           ) > 0
         for: 5m
         labels: {severity: warning}
@@ -104,8 +103,7 @@ groups:
             or
               (gateway_accounting_failures_total{stage=~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"} unless present_over_time(gateway_accounting_failures_total{stage=~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"}[10m] offset 10m))
             or
-              (gateway_accounting_failures_total{stage=~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"}
-                and present_over_time(instance_stage_cause:accounting_failure_series:first_observed{stage=~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"}[10m]))
+              last_over_time(instance_stage_cause:accounting_failure_series:first_observed{stage=~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"}[10m])
           ) > 0
         labels: {severity: critical}
         annotations:

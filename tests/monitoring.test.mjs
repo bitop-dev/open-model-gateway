@@ -100,7 +100,7 @@ test("accounting failures alert, split by settlement stage (#528)", () => {
     const counter = `gateway_accounting_failures_total{${matcher}}`;
     return `sum by (stage, cause) ( increase(${counter}[10m]) > 0 or ` +
       `(${counter} unless present_over_time(${counter}[10m] offset 10m)) or ` +
-      `(${counter} and present_over_time(${firstObservation.record}{${matcher}}[10m])) ) > 0`;
+      `last_over_time(${firstObservation.record}{${matcher}}[10m]) ) > 0`;
   };
   const expected = {
     GatewayAccountingFailures: { expr: failures(`stage!~"${settlement}"`), for: "5m", severity: "warning" },

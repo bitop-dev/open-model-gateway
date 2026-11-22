@@ -411,11 +411,11 @@ tests:
       # At 20m the restarted target omits the counter. From 28m15s its
       # scrapes fail, then at 34m the counter is first observed again.
       - series: up{job="open-model-gateway",instance="gateway-a"}
-        values: 1+0x112 0+0x22 1+0x43 0+0x7 1+0x15
+        values: 1+0x112 0+0x22 1+0x23 0+0x7 1+0x11 0+0x7 1+0x15
       - series: gateway_accounting_failures_total{job="open-model-gateway",instance="gateway-a",stage="route_lookup",cause="deadline_in_database"}
-        values: 1+0x79 stale _x54 1+0x43 stale _x7 1+0x15
+        values: 1+0x79 stale _x54 1+0x23 stale _x7 1+0x11 stale _x7 1+0x15
       - series: gateway_accounting_failures_total{job="open-model-gateway",instance="gateway-a",stage="explicit_settlement",cause="deadline_in_database"}
-        values: 1+0x79 stale _x54 1+0x43 stale _x7 1+0x15
+        values: 1+0x79 stale _x54 1+0x23 stale _x7 1+0x11 stale _x7 1+0x15
     alert_rule_test:
       - eval_time: 33m30s
         alertname: GatewaySettlementAccountingFailures
@@ -453,6 +453,17 @@ tests:
       - eval_time: 40m
         alertname: GatewayAccountingFailures
         exp_alerts: [*route_lookup_alert]
+      # The scrape is down at 40m and returns at 42m. The recorded
+      # failures stay eligible while the scrape has no counter sample.
+      - eval_time: 41m30s
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: [*explicit_settlement_alert]
+      - eval_time: 41m30s
+        alertname: GatewayAccountingFailures
+        exp_alerts: [*route_lookup_alert]
+      - eval_time: 42m
+        alertname: GatewayAccountingFailures
+        exp_alerts: [*route_lookup_alert]
       - eval_time: 43m30s
         alertname: GatewaySettlementAccountingFailures
         exp_alerts: [*explicit_settlement_alert]
@@ -465,7 +476,7 @@ tests:
       - eval_time: 44m
         alertname: GatewayAccountingFailures
         exp_alerts: []
-      # A second outage begins at 45m. At 47m the same counter returns.
+      # Another outage begins at 45m. At 47m the same counter returns.
       - eval_time: 47m
         alertname: GatewaySettlementAccountingFailures
         exp_alerts: []
