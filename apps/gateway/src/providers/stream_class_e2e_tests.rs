@@ -164,7 +164,8 @@ fn client_request(base: &str, client: Client) -> reqwest::RequestBuilder {
         Client::Chat => http
             .post(format!("{base}/v1/chat/completions"))
             .json(&json!({
-                "model":"company/smart","stream":true,"messages":[{"role":"user","content":"hi"}]
+                "model":"company/smart","stream":true,"stream_options":{"include_usage":true},
+                "messages":[{"role":"user","content":"hi"}]
             })),
         Client::Messages => http
             .post(format!("{base}/v1/messages"))
@@ -396,6 +397,14 @@ async fn anthropic_stop_reason_controls_stream_success_and_settlement(pool: PgPo
         ]);
         [content.as_slice(), &delta, &stop].concat()
     };
+    let events = |body: &str| -> Vec<Value> {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim)
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect()
+    };
     let invalid = wire("unknown_reason");
     let valid = wire("end_turn");
 
@@ -414,21 +423,28 @@ async fn anthropic_stop_reason_controls_stream_success_and_settlement(pool: PgPo
         .await;
         assert!(problems.is_empty(), "{client:?}: {problems:#?}");
         assert!(reply.body.contains("Hello"), "{client:?}");
-        let events: Vec<Value> = reply
-            .body
-            .lines()
-            .filter_map(|line| line.strip_prefix("data:"))
-            .map(|data| serde_json::from_str(data).unwrap())
-            .collect();
+        let refused = events(&reply.body);
         assert_eq!(
-            events.iter().filter(|e| e.get("error").is_some()).count(),
+            refused.iter().filter(|e| e.get("error").is_some()).count(),
             1
         );
-        assert!(
-            events
-                .iter()
-                .all(|e| { e["usage"].is_null() && e["choices"][0]["finish_reason"].is_null() })
-        );
+        assert!(refused.iter().all(|e| {
+            e["usage"].is_null()
+                && e["choices"][0]["finish_reason"].is_null()
+                && e["delta"]["stop_reason"].is_null()
+        }));
+        let (held, admitted): (i64, i64) = sqlx::query_as(
+            "SELECT r.held_microusd,h.amount_microusd FROM inference_executions e
+             JOIN governance_reservations r ON r.execution_id=e.id AND r.admitted_at=e.started_at
+             JOIN monetary_ledger h ON h.execution_id=e.id AND h.admitted_at=e.started_at AND h.kind='hold'
+             WHERE e.root_request_id=$1",
+        )
+        .bind(reply.id)
+        .fetch_one(&w.f.store.pool)
+        .await
+        .unwrap();
+        assert!(admitted > 0);
+        assert_eq!(held, admitted, "{client:?}");
 
         let reply = w.ask(client, vec![Step::Bytes(valid.clone())]).await;
         assert_eq!(reply.status, 200, "{client:?}");
@@ -441,6 +457,25 @@ async fn anthropic_stop_reason_controls_stream_success_and_settlement(pool: PgPo
             reply.body.lines().filter(|line| *line == terminal).count(),
             1
         );
+        let (before_terminal, _) = reply.body.split_once(terminal).unwrap();
+        let accepted = events(before_terminal);
+        if client == Client::Messages {
+            let finish = accepted
+                .iter()
+                .find(|e| e["delta"]["stop_reason"] == "end_turn")
+                .unwrap();
+            assert_eq!(finish["usage"]["input_tokens"], 4);
+            assert_eq!(finish["usage"]["output_tokens"], 2);
+        } else {
+            assert!(
+                accepted
+                    .iter()
+                    .any(|e| e["choices"][0]["finish_reason"] == "stop")
+            );
+            let usage = accepted.iter().find(|e| e["usage"].is_object()).unwrap();
+            assert_eq!(usage["usage"]["prompt_tokens"], 4);
+            assert_eq!(usage["usage"]["completion_tokens"], 2);
+        }
         assert_eq!(
             recorded(&w.f.store.pool, w.deployment, reply.id).await,
             Recorded {
