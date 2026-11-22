@@ -28,7 +28,7 @@ impl Scheduler {
         fence.hold_counted(&mut tx, Hold::Rows).await?;
         lock_route(&mut tx, deployment).await?;
         let running: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM batch_lines WHERE deployment_id=$1 AND state='running'",
+            "SELECT count(*) FROM batch_lines WHERE deployment_id=$1 AND state='running' AND NOT awaiting_segment",
         )
         .bind(deployment)
         .fetch_one(&mut *tx)
@@ -92,7 +92,7 @@ impl Scheduler {
         fence.hold_counted(&mut tx, Hold::Rows).await?;
         lock_route(&mut tx, deployment).await?;
         let running: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM batch_lines WHERE deployment_id=$1 AND state='running'",
+            "SELECT count(*) FROM batch_lines WHERE deployment_id=$1 AND state='running' AND NOT awaiting_segment",
         )
         .bind(deployment)
         .fetch_one(&mut *tx)
