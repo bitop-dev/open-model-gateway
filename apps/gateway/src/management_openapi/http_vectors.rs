@@ -1792,6 +1792,7 @@ pub(crate) async fn run_query_with<C>(
 /// for a callback, for example); `seeds` give valid values for documented
 /// optional parameters that request does not carry; `send` issues the request
 /// target's query string and returns the exchange with the handler's verdict.
+#[cfg(feature = "integration-tests")]
 pub(crate) async fn query_vectors<C>(
     fixtures: &mut PositiveFixtures,
     method: &str,
@@ -1806,6 +1807,7 @@ pub(crate) async fn query_vectors<C>(
 /// [`query_vectors`] with `candidates`: `(parameter, value)` boundary values for a
 /// parameter whose pattern has no derivable length bounds (the expected verdict
 /// of each is computed from the schema; they must include accepted and refused ones).
+#[cfg(feature = "integration-tests")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn query_vectors_extended<C>(
     fixtures: &mut PositiveFixtures,
@@ -1841,6 +1843,7 @@ pub(crate) async fn query_vectors_extended<C>(
     fixtures.record_vectors(method, template, "query");
 }
 
+#[cfg(feature = "integration-tests")]
 fn own(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
     pairs
         .iter()
@@ -1849,6 +1852,7 @@ fn own(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
 }
 
 /// [`query_vectors`] for operations whose valid request is a fixed query.
+#[cfg(feature = "integration-tests")]
 pub(crate) async fn query_vectors_fixed(
     fixtures: &mut PositiveFixtures,
     method: &str,
@@ -3078,6 +3082,7 @@ pub(super) async fn run_binary(
 /// body a 413 (over the documented size) or 415 (not the declared media type);
 /// any other status fails the run, and [`Probe::decided`] still overrides the
 /// reading of a status in the expected set.
+#[cfg(feature = "integration-tests")]
 pub(crate) async fn binary_body_vectors_http(
     fixtures: &mut PositiveFixtures,
     method: &str,

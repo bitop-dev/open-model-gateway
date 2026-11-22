@@ -1253,6 +1253,7 @@ MEQCIGAcCPbBblVzsp1NwOYvXCOq+9Dd4Wm31YmIQd53Bww8AiA+fZ/bRchz1t8Q
 2uH+ATSczUV2iUeqx+wDpYWusexEDg==
 -----END CERTIFICATE-----
 ";
+    #[cfg(feature = "integration-tests")]
     pub(crate) const OTHER_CA: &str = "-----BEGIN CERTIFICATE-----
 MIIBpjCCAU2gAwIBAgIUYpUDpfHgyL62mSSc6ydAac++jfwwCgYIKoZIzj0EAwIw
 IDEeMBwGA1UEAwwVT01HIFVucmVsYXRlZCBUZXN0IENBMCAXDTI2MDEwMTAwMDAw
@@ -1279,6 +1280,7 @@ ISAhBc4rf7HIuml6NoGmuZ/wA8y+5rAFbcR61nM=
 -----END CERTIFICATE-----
 ";
     /// Signed by [`CA`] for `siem.example.test` only: a name mismatch on 127.0.0.1.
+    #[cfg(feature = "integration-tests")]
     pub(crate) const WRONG_NAME_CERT: &str = "-----BEGIN CERTIFICATE-----
 MIIByzCCAXGgAwIBAgIURx9n10MhilUEloMJ/O4DKBWnQQowCgYIKoZIzj0EAwIw
 FjEUMBIGA1UEAwwLT01HIFRlc3QgQ0EwIBcNMjYwMTAxMDAwMDAwWhgPMjEyNjAx
