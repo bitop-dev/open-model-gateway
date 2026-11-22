@@ -44,11 +44,13 @@ groups:
     rules:
       # Accounting failures (#389, docs/operations.md#accounting-failures): each
       # one is a `503 accounting_unavailable` or a settlement that did not finish.
-      # A series starts at 1 on its first failure. Keep it eligible for the
-      # first 10 minutes if there were no samples in the preceding 10-minute
-      # window. Looking across that window tolerates short scrape outages.
-      # A longer gap can make an unchanged counter appear new after recovery.
-      # Filter zero increases so they cannot mask the first-failure term.
+      # A series starts at 1 on its first failure. A successful scrape without
+      # that series shows it was not yet exported, even if an earlier process
+      # at the same target exported it. Compare sample counts per scrape target:
+      # a failed scrape contributes 0 to up and no counter sample.
+      # With no older samples in the offset window, treat the series as new.
+      # A long scrape outage can therefore re-fire an unchanged counter once.
+      # Filter zero increases so they cannot mask either first-failure term.
       # Critical exactly when a failure at that stage leaves money held until
       # reconciliation (#497), with no pending period: the reservation stays
       # held and can block budgeted admission, so the first failure pages.
@@ -71,6 +73,10 @@ groups:
               increase(gateway_accounting_failures_total{stage!~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"}[10m]) > 0
             or
               (gateway_accounting_failures_total{stage!~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"} unless present_over_time(gateway_accounting_failures_total{stage!~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"}[10m] offset 10m))
+            or
+              (gateway_accounting_failures_total{stage!~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"}
+                and (count_over_time(gateway_accounting_failures_total{stage!~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"}[10m])
+                  < ignoring(stage, cause) group_left sum_over_time(up[10m])))
           ) > 0
         for: 5m
         labels: {severity: warning}
@@ -84,6 +90,10 @@ groups:
               increase(gateway_accounting_failures_total{stage=~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"}[10m]) > 0
             or
               (gateway_accounting_failures_total{stage=~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"} unless present_over_time(gateway_accounting_failures_total{stage=~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"}[10m] offset 10m))
+            or
+              (gateway_accounting_failures_total{stage=~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"}
+                and (count_over_time(gateway_accounting_failures_total{stage=~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"}[10m])
+                  < ignoring(stage, cause) group_left sum_over_time(up[10m])))
           ) > 0
         labels: {severity: critical}
         annotations:

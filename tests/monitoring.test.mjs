@@ -86,10 +86,12 @@ test("accounting failures alert, split by settlement stage (#528)", () => {
     "route_lookup",
   ]);
   const settlement = "explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement";
-  // Keep a first failure visible when the preceding observation window is empty.
-  const failures = matcher =>
-    `sum by (stage, cause) ( increase(gateway_accounting_failures_total{${matcher}}[10m]) > 0 or ` +
-    `(gateway_accounting_failures_total{${matcher}} unless present_over_time(gateway_accounting_failures_total{${matcher}}[10m] offset 10m)) ) > 0`;
+  const failures = matcher => {
+    const counter = `gateway_accounting_failures_total{${matcher}}`;
+    return `sum by (stage, cause) ( increase(${counter}[10m]) > 0 or ` +
+      `(${counter} unless present_over_time(${counter}[10m] offset 10m)) or ` +
+      `(${counter} and (count_over_time(${counter}[10m]) < ignoring(stage, cause) group_left sum_over_time(up[10m]))) ) > 0`;
+  };
   const expected = {
     GatewayAccountingFailures: { expr: failures(`stage!~"${settlement}"`), for: "5m", severity: "warning" },
     GatewaySettlementAccountingFailures: { expr: failures(`stage=~"${settlement}"`), for: undefined, severity: "critical" },
