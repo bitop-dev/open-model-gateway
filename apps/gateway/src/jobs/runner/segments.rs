@@ -62,6 +62,9 @@ pub(super) fn decode_record(bytes: &[u8]) -> Result<(i32, bool, Value), Inferenc
         r: &'a serde_json::value::RawValue,
     }
 
+    if !bytes.trim_ascii_start().starts_with(b"{") {
+        return Err(InferenceError::Storage);
+    }
     // RawValue's syntax scanner is iterative. Cap its depth before it
     // buffers nesting, then apply serde's normal validation to the payload.
     check_depth(bytes).map_err(|_| InferenceError::Storage)?;
@@ -395,6 +398,19 @@ impl Probe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_records_require_named_envelope_fields() {
+        let row = json!({"custom_id":"fixture"});
+        assert_eq!(
+            decode_record(br#"  {"r":{"custom_id":"fixture"},"e":true,"n":7}"#).unwrap(),
+            (7, true, row)
+        );
+        assert!(matches!(
+            decode_record(br#"  [7,true,{"custom_id":"fixture"}]"#),
+            Err(InferenceError::Storage)
+        ));
+    }
 
     #[test]
     fn stored_depth_matches_the_public_result_budget() {
