@@ -92,6 +92,10 @@ impl Writer {
             )
             .await
         };
+        self.record_flush(result, succeeded)
+    }
+
+    fn record_flush(&self, result: FenceResult<()>, succeeded: Vec<(i32, Uuid)>) -> bool {
         let unknown = matches!(result, Err(FenceError::Unknown));
         match self.state.written(result) {
             Ok(Some(())) => {

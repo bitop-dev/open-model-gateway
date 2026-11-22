@@ -312,6 +312,18 @@ async fn every_claim_of_a_batch_moves_its_epoch_on(pool: PgPool) {
         .execute(&w.f.store.pool)
         .await;
     assert!(back.is_err());
+
+    // A renewal reaching the database after release cannot postpone takeover.
+    again.release(&w.f.store).await.unwrap();
+    assert_eq!(
+        again.renew(&w.f.store, 60.0).await.unwrap(),
+        Renewed::Fenced
+    );
+    let replacements = claim_gateway(&w.f.store, Uuid::new_v4(), 60.0, 1, &[])
+        .await
+        .unwrap();
+    assert_eq!(replacements.len(), 1);
+    assert_eq!(replacements[0].1.epoch, again.epoch + 1);
 }
 
 #[dbtest::test]
@@ -697,6 +709,353 @@ async fn a_takeover_between_the_result_files_and_finishing_leaves_no_duplicate_f
     consistent(&w.f).await;
 }
 
+/// Advance committed fixtures across the grace period without a wall-clock wait.
+async fn age_result_files(w: &World, ids: &[Uuid]) {
+    let mut tx = crate::db::begin(&w.f.store.pool).await.unwrap();
+    sqlx::query("ALTER TABLE stored_files DISABLE TRIGGER stored_files_guard")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE stored_files SET created_at=now()-interval '2 days',committed_at=now()-interval '2 days' WHERE id=ANY($1)")
+        .bind(ids)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE stored_files ENABLE TRIGGER stored_files_guard")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+}
+
+/// Losing the process after writing both files leaves their objects and rows,
+/// with no job reference. Recovery must work even with batch retention off.
+#[dbtest::test]
+async fn crashed_batch_finalization_outputs_are_reclaimed_without_retention(pool: PgPool) {
+    use crate::filestore::sweep::sweep_once;
+
+    let (w, job) = batch(pool, &[("ok", "plain"), ("err", "fail")]).await;
+    let db = &w.f.store;
+    let runtime = w.files.runtime();
+    let ws = job.workspace_id;
+    let other_ws = w.f.team.workspace_id;
+    let other_file = w
+        .upload(&w.f.team, &[chat_line("other", "company/smart", "plain")])
+        .await;
+    let other_bytes = w
+        .files
+        .workspace_storage(other_ws)
+        .await
+        .unwrap()
+        .used_bytes;
+    w.jobs.finalize_hold.arm();
+    let old = start(&w);
+    w.jobs.finalize_hold.reached().await;
+    let orphans: Vec<(Uuid, String, i64)> = sqlx::query_as(
+        "SELECT id,object_key,size_bytes FROM stored_files WHERE api_purpose='batch_output' AND workspace_id=$1 AND deleted_at IS NULL ORDER BY id",
+    )
+    .bind(ws)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(orphans.len(), 2);
+    let orphan_ids: Vec<_> = orphans.iter().map(|(id, _, _)| *id).collect();
+    // A long write may have started before the grace cutoff. Its freshly
+    // committed result still belongs to the live producer.
+    sqlx::query("UPDATE stored_files SET created_at=now()-interval '2 days' WHERE id=ANY($1)")
+        .bind(&orphan_ids)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let open = w.reload(&job).await;
+    assert_eq!((open.output_file_id, open.error_file_id), (None, None));
+    assert_eq!(sweep_once(db, runtime, 100).await.unwrap().claimed, 0);
+    old.abort();
+    assert!(old.await.unwrap_err().is_cancelled());
+    lapse(&w, &job).await;
+    assert!(Runner::new(w.jobs.clone()).run_next().await.unwrap());
+    let done = w.reload(&job).await;
+    assert!(done.settled_at.is_some());
+    let cost = crate::governance::batch::batch_cost(db, job.id)
+        .await
+        .unwrap();
+    let stored = w.files.workspace_storage(ws).await.unwrap().used_bytes;
+
+    // The normal schema requires retention. Force NULL only in this
+    // disposable fixture to exercise cleanup independently of that policy.
+    let mut tx = crate::db::begin(&db.pool).await.unwrap();
+    sqlx::query(
+        "ALTER TABLE installation_settings ALTER COLUMN file_batch_retention_days DROP NOT NULL",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE installation_settings SET file_batch_retention_days=NULL")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let mut aged = orphan_ids;
+    aged.extend([done.output_file_id.unwrap(), done.error_file_id.unwrap()]);
+    age_result_files(&w, &aged).await;
+
+    let user = w.f.principal.user_id.unwrap();
+    let hold: Uuid = sqlx::query_scalar(
+        "INSERT INTO legal_holds(id,user_id,reference) VALUES(gen_random_uuid(),$1,'batch-cleanup-hold') RETURNING id",
+    )
+    .bind(user)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(sweep_once(db, runtime, 100).await.unwrap().claimed, 0);
+    sqlx::query("UPDATE legal_holds SET released_at=now(),released_by_user_id=$2 WHERE id=$1")
+        .bind(hold)
+        .bind(user)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let (a, b) = tokio::join!(sweep_once(db, runtime, 100), sweep_once(db, runtime, 100));
+    assert_eq!(a.unwrap().deleted + b.unwrap().deleted, 2);
+    assert_eq!(sweep_once(db, runtime, 100).await.unwrap().claimed, 0);
+    for (id, key, _) in &orphans {
+        assert!(file_deleted(&w.f, Some(*id)).await);
+        let key = crate::filestore::ObjectKey::parse(key).unwrap();
+        assert!(runtime.store().unwrap().head(&key).await.unwrap().is_none());
+    }
+    let reclaimed = orphans.iter().map(|(_, _, size)| *size as u64).sum::<u64>();
+    assert_eq!(
+        w.files.workspace_storage(ws).await.unwrap().used_bytes,
+        stored - reclaimed
+    );
+    assert_eq!(w.read(ws, done.output_file_id).await.len(), 1);
+    assert_eq!(w.read(ws, done.error_file_id).await.len(), 1);
+    let other_id = crate::filestore::files::parse_public_id(&other_file).unwrap();
+    assert!(
+        w.files
+            .get(other_id, Some(other_ws))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(w.files.get(other_id, Some(ws)).await.unwrap().is_none());
+    assert!(
+        w.files
+            .get(done.output_file_id.unwrap(), Some(other_ws))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        w.files
+            .workspace_storage(other_ws)
+            .await
+            .unwrap()
+            .used_bytes,
+        other_bytes
+    );
+    assert_eq!(w.openai.executed().len(), 2);
+    assert_eq!(
+        crate::governance::batch::batch_cost(db, job.id)
+            .await
+            .unwrap(),
+        cost
+    );
+    consistent(&w.f).await;
+}
+
+/// A rekey can hold a result lock across I/O. The runner must give up its
+/// claim while the file remains locked, so a replacement can finish.
+#[dbtest::test]
+async fn rekey_locked_result_does_not_delay_batch_takeover(pool: PgPool) {
+    let (w, job) = batch(pool, &[("ok", "plain"), ("err", "fail")]).await;
+    let db = &w.f.store;
+    w.jobs.finalize_hold.arm();
+    let old = start(&w);
+    w.jobs.finalize_hold.reached().await;
+
+    let mut rekey = crate::db::begin(&db.pool).await.unwrap();
+    let locked: Uuid = sqlx::query_scalar(
+        "SELECT id FROM stored_files WHERE api_purpose='batch_output'
+         ORDER BY id DESC LIMIT 1 FOR NO KEY UPDATE",
+    )
+    .fetch_one(&mut *rekey)
+    .await
+    .unwrap();
+    w.jobs.finalize_hold.release();
+    let error = tokio::time::timeout(Duration::from_secs(3), old)
+        .await
+        .expect("runner waited for the rekey lock")
+        .unwrap();
+    assert!(error.is_err());
+    let open = w.reload(&job).await;
+    assert_eq!(open.state, "in_progress");
+    assert!(open.output_file_id.is_none() && open.error_file_id.is_none());
+
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            Runner::new(w.jobs.clone()).run_next()
+        )
+        .await
+        .expect("takeover waited for the old file lock")
+        .unwrap()
+    );
+    let done = w.reload(&job).await;
+    assert!(done.settled_at.is_some());
+    assert_ne!(done.output_file_id, Some(locked));
+    assert_ne!(done.error_file_id, Some(locked));
+    assert_eq!(w.read(job.workspace_id, done.output_file_id).await.len(), 1);
+    assert_eq!(w.read(job.workspace_id, done.error_file_id).await.len(), 1);
+    rekey.rollback().await.unwrap();
+    assert_eq!(w.openai.executed().len(), 2);
+    consistent(&w.f).await;
+}
+
+/// Both lock orders are safe: a result being linked is skipped, and an
+/// outstanding delete claim cannot be linked even before the object is gone.
+#[dbtest::test]
+async fn finalization_and_orphan_cleanup_exclude_each_other(pool: PgPool) {
+    use crate::filestore::sweep::sweep_once;
+
+    let (w, job) = batch(pool, &[("ok", "plain")]).await;
+    let db = &w.f.store;
+    let runtime = w.files.runtime();
+    let fence = claim(&w, &job).await;
+    let result_file = |internal, ws, key| {
+        w.files.create(
+            crate::jobs::io::batch_file(internal, ws, key, None, "results.jsonl".into()),
+            Box::pin(futures_util::stream::once(async {
+                Ok(axum::body::Bytes::from_static(b"{}\n"))
+            })),
+        )
+    };
+    let file = result_file(false, job.workspace_id, job.api_key_id)
+        .await
+        .unwrap();
+    let other = result_file(false, w.f.team.workspace_id, w.f.team.key_id)
+        .await
+        .unwrap();
+    let finish = |output, error_file| store::Finished {
+        state: JobState::Completed,
+        error_code: None,
+        output_file: Some(output),
+        error_file,
+        counts: None,
+    };
+    assert!(matches!(
+        fence
+            .finish_batch(db, &finish(file.id, Some(other.id)))
+            .await,
+        Err(FenceError::Storage)
+    ));
+    assert!(w.reload(&job).await.output_file_id.is_none());
+    assert!(!file_deleted(&w.f, Some(other.id)).await);
+
+    let internal = result_file(true, job.workspace_id, job.api_key_id)
+        .await
+        .unwrap();
+    age_result_files(&w, &[file.id, internal.id]).await;
+    let mut tx = crate::db::begin(&db.pool).await.unwrap();
+    fence
+        .hold_counted(&mut tx, crate::jobs::fence::Hold::Update)
+        .await
+        .unwrap();
+    store::finish_batch_tx(&mut tx, job.id, &finish(file.id, None))
+        .await
+        .unwrap();
+    assert_eq!(sweep_once(db, runtime, 100).await.unwrap().claimed, 0);
+
+    // Capture the old view of the references before the finalizer commits.
+    // The claim must recheck after the file lock changes hands.
+    let mut sweep = crate::db::begin(&db.pool).await.unwrap();
+    let candidates: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT f.id FROM stored_files f WHERE f.id=$1
+         AND NOT EXISTS(SELECT 1 FROM async_jobs j WHERE j.output_file_id=f.id)",
+    )
+    .bind(file.id)
+    .fetch_all(&mut *sweep)
+    .await
+    .unwrap();
+    assert_eq!(candidates, [file.id]);
+    tx.commit().await.unwrap();
+    sqlx::query("SELECT id FROM stored_files WHERE id=$1 FOR UPDATE")
+        .bind(file.id)
+        .execute(&mut *sweep)
+        .await
+        .unwrap();
+    assert!(
+        crate::filestore::sweep::claim_locked_candidates(&mut sweep, &candidates)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    sweep.commit().await.unwrap();
+    assert_eq!(sweep_once(db, runtime, 100).await.unwrap().claimed, 0);
+    assert!(!file_deleted(&w.f, Some(file.id)).await);
+    assert!(!file_deleted(&w.f, Some(internal.id)).await);
+
+    let input = public_id(job.input_file_id.unwrap());
+    let retry = w
+        .create(w.f.principal, &input, BatchEndpoint::ChatCompletions, None)
+        .await
+        .unwrap();
+    let orphan = result_file(false, job.workspace_id, job.api_key_id)
+        .await
+        .unwrap();
+    age_result_files(&w, &[orphan.id]).await;
+    let failed = sweep_once(db, &FileStoreRuntime::off(), 100).await.unwrap();
+    assert_eq!((failed.claimed, failed.deleted, failed.failed), (1, 0, 1));
+    assert!(
+        runtime
+            .store()
+            .unwrap()
+            .head(&orphan.key)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(matches!(
+        store::finish_batch(db, retry.id, &finish(orphan.id, None)).await,
+        Err(sqlx::Error::RowNotFound)
+    ));
+    assert!(w.reload(&retry).await.output_file_id.is_none());
+    assert_eq!(sweep_once(db, runtime, 100).await.unwrap().claimed, 0);
+    sqlx::query(
+        "UPDATE stored_files SET last_delete_attempt_at=now()-interval '6 minutes' WHERE id=$1",
+    )
+    .bind(orphan.id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(sweep_once(db, runtime, 100).await.unwrap().deleted, 1);
+    assert!(
+        runtime
+            .store()
+            .unwrap()
+            .head(&orphan.key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let replacement = result_file(false, job.workspace_id, job.api_key_id)
+        .await
+        .unwrap();
+    let done = store::finish_batch(db, retry.id, &finish(replacement.id, None))
+        .await
+        .unwrap();
+    assert_eq!(done.output_file_id, Some(replacement.id));
+
+    // Explicit expiry still applies to linked results.
+    sqlx::query("UPDATE stored_files SET expires_at=now() WHERE id=$1")
+        .bind(file.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(sweep_once(db, runtime, 100).await.unwrap().deleted, 1);
+    assert!(file_deleted(&w.f, Some(file.id)).await);
+}
+
 /// The next owner can read a completed line's segment while it interrupts
 /// the line whose provider call is still in flight.
 #[dbtest::test]
@@ -1001,23 +1360,9 @@ async fn a_soft_lost_run_leaves_the_batch_open_and_a_second_runner_completes_it(
     consistent(&w.f).await;
 }
 
-/// Failed `finish_batch` statements keep the result files only when the
-/// server may still commit them.
-#[test]
-fn only_a_connection_failure_leaves_the_outcome_unknown() {
-    use crate::jobs::fence::outcome_unknown;
-    assert!(outcome_unknown(&sqlx::Error::Io(std::io::Error::other(
-        "reset"
-    ))));
-    assert!(outcome_unknown(&sqlx::Error::WorkerCrashed));
-    assert!(!outcome_unknown(&sqlx::Error::PoolTimedOut));
-    assert!(!outcome_unknown(&sqlx::Error::PoolClosed));
-}
-
-/// A server error is certain: nothing was applied (a file id that does not
-/// exist violates a foreign key).
+/// A missing file and a stale fence are detected before COMMIT.
 #[dbtest::test]
-async fn a_rejected_finish_is_a_certain_failure_and_a_refused_one_is_stale(pool: PgPool) {
+async fn finishing_distinguishes_rejection_and_stale_claim(pool: PgPool) {
     let (w, job) = batch(pool, &[("a", "plain")]).await;
     let old = claim(&w, &job).await;
     let new = claim(&w, &job).await;
@@ -1037,7 +1382,67 @@ async fn a_rejected_finish_is_a_certain_failure_and_a_refused_one_is_stale(pool:
         old.finish_batch(&w.f.store, &done(None)).await,
         Err(FenceError::Stale)
     ));
-    assert_eq!(w.reload(&job).await.state, "queued");
+}
+
+#[dbtest::test]
+async fn unacknowledged_finish_leaves_actual_results_for_sweep(pool: PgPool) {
+    let (w, job) = batch(pool, &[("ok", "plain"), ("err", "fail")]).await;
+    let db = &w.f.store;
+    let runtime = w.files.runtime();
+    w.jobs.finalize_hold.arm();
+    let old = start(&w);
+    w.jobs.finalize_hold.reached().await;
+    let ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM stored_files WHERE api_purpose='batch_output' AND committed_at IS NOT NULL",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(ids.len(), 2);
+    sqlx::raw_sql(
+        "CREATE FUNCTION reject_finish_at_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN RAISE EXCEPTION 'fixture refused batch commit'; END $$;
+         CREATE CONSTRAINT TRIGGER refuse_finish_at_commit AFTER UPDATE ON async_jobs
+         DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+         WHEN (OLD.state='in_progress' AND NEW.state='completed')
+         EXECUTE FUNCTION reject_finish_at_commit()",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    w.jobs.finalize_hold.release();
+    assert!(old.await.unwrap().is_err());
+    let open = w.reload(&job).await;
+    assert_eq!(open.state, "in_progress");
+    assert!(open.output_file_id.is_none() && open.error_file_id.is_none());
+    for &id in &ids {
+        assert_eq!(w.read(job.workspace_id, Some(id)).await.len(), 1);
+    }
+
+    sqlx::query("DROP TRIGGER refuse_finish_at_commit ON async_jobs")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(Runner::new(w.jobs.clone()).run_next().await.unwrap());
+    let done = w.reload(&job).await;
+    assert!(done.settled_at.is_some());
+    let output = done.output_file_id.unwrap();
+    let error = done.error_file_id.unwrap();
+    assert!(!ids.contains(&output) && !ids.contains(&error));
+    let mut aged = ids.clone();
+    aged.extend([output, error]);
+    age_result_files(&w, &aged).await;
+    let swept = crate::filestore::sweep::sweep_once(db, runtime, 200)
+        .await
+        .unwrap();
+    assert_eq!((swept.claimed, swept.deleted, swept.failed), (2, 2, 0));
+    for id in ids {
+        assert!(file_deleted(&w.f, Some(id)).await);
+    }
+    assert_eq!(w.read(job.workspace_id, Some(output)).await.len(), 1);
+    assert_eq!(w.read(job.workspace_id, Some(error)).await.len(), 1);
+    assert_eq!(w.openai.executed().len(), 2);
+    consistent(&w.f).await;
 }
 
 #[dbtest::test]
