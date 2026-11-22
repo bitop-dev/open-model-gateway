@@ -256,8 +256,8 @@ async fn a_connection_lost_before_a_complete_head_is_counted() {
     }
 }
 
-/// Not counted: the gateway's own request body failing is the gateway's
-/// error, whatever io error kind its stream used (#483 review).
+/// A local request-body error does not contribute to upstream timeout
+/// counts, regardless of the stream's I/O error kind.
 #[tokio::test]
 async fn a_request_body_stream_that_fails_is_not_counted() {
     let client = client_with_idle(Duration::from_secs(1));

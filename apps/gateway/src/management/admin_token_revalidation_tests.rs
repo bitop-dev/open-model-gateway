@@ -1,13 +1,6 @@
-//! #37 PR2 item 1: transaction-level admin-token and owner revalidation.
-//!
-//! Deterministic two-connection concurrency tests: no sleep is ever used to
-//! *decide* ordering. Each blocking assertion polls `pg_stat_activity` /
-//! `pg_blocking_pids` for the real wait state, bounded by a timeout, and
-//! only the poll *interval* uses a short sleep. These exercise the
-//! transaction-level revalidation `resources::platform_write`/
-//! `revalidate_admin_token` must perform (middleware preflight is a
-//! lock-free snapshot taken before the handler's own transaction, and is
-//! therefore not enough on its own).
+//! These tests exercise transaction-level revalidation of admin tokens and
+//! their owners after middleware authentication. To establish ordering,
+//! the tests poll PostgreSQL wait state and blocking PIDs with a timeout.
 use super::*;
 use crate::{admin_tokens, governance::locks, identity::AdminTokenContext};
 use std::time::Duration;
@@ -59,13 +52,8 @@ async fn backend_pid(tx: &mut Transaction<'_, Postgres>) -> i32 {
         .unwrap()
 }
 
-/// Which `pg_locks` wait this test expects to find the waiter blocked on
-/// (#37 PR2 review: the previous `wait_until_blocked_by` accepted *any*
-/// backend blocked by *any* other backend, so it could not actually tell
-/// a token-row wait from an unrelated advisory wait, or even from a
-/// different test's leftover connection -- a guard could be deleted
-/// entirely and this helper would still report "blocked" as long as
-/// something, anything, was waiting on the holder for any reason).
+/// The expected lock wait distinguishes the token row from the owner's
+/// advisory lock. The probe matches the expected holder and waiter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExpectedWait {
     /// A plain row lock conflict on `admin_api_tokens` (the token's own
@@ -248,9 +236,8 @@ async fn a_mutation_holding_its_locks_finishes_before_a_concurrent_explicit_revo
     let (pid_tx, pid_rx) = tokio::sync::oneshot::channel();
     let revoke_task = tokio::spawn(async move {
         let mut tx_b = crate::db::begin(&pool_b).await.unwrap();
-        // Captured from inside B's own transaction, before it ever issues
-        // the blocking `UPDATE` below, so the probe polls for exactly this
-        // backend rather than "any blocked backend" (#37 PR2 review).
+        // Capture the waiter PID before its blocking update so the probe can
+        // identify this transaction's wait.
         let pid_b = backend_pid(&mut tx_b).await;
         let _ = pid_tx.send(pid_b);
         admin_tokens::revoke_admin_token(&mut tx_b, token_id)
