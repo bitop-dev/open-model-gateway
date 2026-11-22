@@ -42,7 +42,7 @@ use std::{
 
 use async_trait::async_trait;
 use gateway_datetime_compat::UtcInstant;
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::sync::{Semaphore, mpsc};
 
 use super::{
@@ -69,11 +69,11 @@ mod repository;
 mod segments;
 use dispatch::Dispatch;
 use lanes::{Head, Lane, Pin, Planned, note, permits, spawn_line, wait_reason_without_permits};
-use line::{LineRun, Record, RunState, Stop};
+use line::{LineRun, RunState, Stop};
 use repository::LineRepository;
 #[cfg(all(test, feature = "integration-tests"))]
 pub(crate) use segments::Probe as SegmentProbe;
-use segments::write_segments;
+use segments::{Record, write_segments};
 
 /// Runner lease of a claimed batch, renewed every [`RENEW`].
 const LEASE_SECONDS: f64 = 60.0;
@@ -290,7 +290,7 @@ impl Runner {
             state.hold_unavailable.store(true, Ordering::SeqCst);
         }
         let line = self.line_run(job, engine, endpoint, &state);
-        let (records, receiver) = mpsc::channel::<Record>(64);
+        let (records, receiver) = mpsc::channel::<Record>(8);
         let writer = tokio::spawn(write_segments(
             store.clone(),
             files.clone(),
@@ -485,16 +485,14 @@ impl Runner {
                         .await
                         .map_err(|_| InferenceError::Storage)?;
                 while let Some(raw) = reader.next_request().await? {
-                    let record: Value =
-                        serde_json::from_slice(&raw).map_err(|_| InferenceError::Storage)?;
-                    let n = record["n"].as_i64().ok_or(InferenceError::Storage)? as i32;
+                    let (n, is_error, result) = segments::decode_record(&raw)?;
                     if !written.insert(n) {
                         continue;
                     }
-                    if record["e"] == json!(true) {
-                        err.line(&record["r"]).await?;
+                    if is_error {
+                        err.line(&result).await?;
                     } else {
-                        out.line(&record["r"]).await?;
+                        out.line(&result).await?;
                     }
                 }
             }
@@ -550,9 +548,8 @@ impl Runner {
         };
         #[cfg(test)]
         self.jobs.finalize_hold.pause().await;
-        // A line recorded `succeeded` whose result was never stored (it sat in
-        // the segment buffer of a run that lost the batch) is listed in the
-        // error file as unavailable, so it is counted failed, not completed.
+        // Older runners could commit success before storing its segment. Such
+        // a line is listed in the error file and contributes to the failed count.
         let counted = sqlx::query_as("SELECT count(*) FILTER(WHERE state='succeeded' AND segment IS NOT NULL),count(*) FILTER(WHERE state IN('failed','interrupted') OR (state='succeeded' AND segment IS NULL)) FROM batch_lines WHERE job_id=$1")
             .bind(job.id)
             .fetch_one(&store.pool)
