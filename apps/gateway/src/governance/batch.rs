@@ -158,47 +158,49 @@ pub enum LinePreview {
     Unbounded,
 }
 
-/// Read-only preview of one line at a deployment's current standard price
-/// (a native batch's batch list shares the ceilings and is checked again at
-/// admission).
-pub async fn preview_line(
-    store: &Store,
-    deployment: Uuid,
-    protocol: ApiProtocol,
-    output: Option<u32>,
-    price_id: Option<Uuid>,
-    output_limit: u32,
-    native_cache_controls: &[serde_json::Value],
-) -> Result<LinePreview, InferenceError> {
-    let mut tx = crate::db::begin(&store.pool).await.map_err(begin_storage)?;
-    let price = match price_id {
-        Some(id) => Some(price_version(&mut tx, id, deployment).await?),
-        None => latest_price(&mut tx, deployment).await?,
-    };
-    tx.commit().await.map_err(storage)?;
-    require_native_cache_price(price.as_ref(), native_cache_controls)?;
-    let Some(p) = price else {
-        return Ok(LinePreview::Unpriced);
-    };
-    let generation = protocol.workload() == WorkloadKind::Generation;
-    let output = if generation {
-        match generation_bound(Some(p.output_token_limit), output, output_limit) {
-            Ok(bound) => bound
-                .max_output_tokens
-                .ok_or(InferenceError::Configuration)?,
-            Err(InferenceError::InvalidRequest) => return Ok(LinePreview::OutputLimit),
-            Err(e) => return Err(e),
+/// An immutable price snapshot used only by the planning scan. Initial
+/// admission still reads the latest price under its catalog lock.
+pub(crate) struct LinePricing(Option<Price>);
+
+impl LinePricing {
+    pub(crate) async fn load(store: &Store, deployment: Uuid) -> Result<Self, InferenceError> {
+        let mut tx = crate::db::begin(&store.pool).await.map_err(begin_storage)?;
+        let price = latest_price(&mut tx, deployment).await?;
+        tx.commit().await.map_err(storage)?;
+        Ok(Self(price))
+    }
+
+    pub(crate) fn preview(
+        &self,
+        protocol: ApiProtocol,
+        output: Option<u32>,
+        output_limit: u32,
+        native_cache_controls: &[serde_json::Value],
+    ) -> Result<LinePreview, InferenceError> {
+        require_native_cache_price(self.0.as_ref(), native_cache_controls)?;
+        let Some(p) = &self.0 else {
+            return Ok(LinePreview::Unpriced);
+        };
+        let generation = protocol.workload() == WorkloadKind::Generation;
+        let output = if generation {
+            match generation_bound(Some(p.output_token_limit), output, output_limit) {
+                Ok(bound) => bound
+                    .max_output_tokens
+                    .ok_or(InferenceError::Configuration)?,
+                Err(InferenceError::InvalidRequest) => return Ok(LinePreview::OutputLimit),
+                Err(e) => return Err(e),
+            }
+        } else {
+            0
+        };
+        match line_bound(p, output, generation) {
+            Ok(_) => Ok(LinePreview::Ok {
+                price_id: p.id,
+                output,
+            }),
+            Err(InferenceError::Configuration) => Ok(LinePreview::Unbounded),
+            Err(e) => Err(e),
         }
-    } else {
-        0
-    };
-    match line_bound(&p, output, generation) {
-        Ok(_) => Ok(LinePreview::Ok {
-            price_id: p.id,
-            output,
-        }),
-        Err(InferenceError::Configuration) => Ok(LinePreview::Unbounded),
-        Err(e) => Err(e),
     }
 }
 

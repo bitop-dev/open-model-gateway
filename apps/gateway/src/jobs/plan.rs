@@ -13,13 +13,13 @@ use super::{
 };
 use crate::{
     filestore::StoredFile,
-    governance::batch::{LineGroup, LinePreview},
-    inference::types::ChatRequest,
+    governance::batch::{LineGroup, LinePreview, LinePricing},
+    routing::RouteInputs,
 };
 
 mod scan;
 
-/// At most this many problems are reported (scanning stops there).
+/// At most this many problems are reported.
 pub const MAX_ISSUES: usize = 20;
 
 /// One reported problem: the 1-based physical line number of the file.
@@ -62,38 +62,32 @@ struct Resolved {
     legacy: bool,
 }
 
-/// Test-only counters proving [`Jobs::every_candidate_route_refuses`]'s two
-/// model-level, read-only lookups (`Store::deployments`, `Store::route_plan`)
-/// are memoized at most once per model per scan (#238 follow-up), not once
-/// per explicit-maximum line. Incremented only at those two call sites;
-/// never read outside tests.
+/// Test-only counters for candidate, routing-input and price reads in a scan.
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct PlanLookupCounts {
     pub(crate) deployments: std::sync::atomic::AtomicUsize,
     pub(crate) route_plan: std::sync::atomic::AtomicUsize,
+    pub(crate) prices: std::sync::atomic::AtomicUsize,
 }
 
-/// Per-scan memoization of [`Jobs::every_candidate_route_refuses`]'s
-/// model-level, read-only lookups. With configuration caches bypassed
-/// (`GATEWAY_CONFIG_CACHE=off`, or a version-unconfirmed cache miss), a
-/// naive per-line call ran `Store::deployments` and (when every capable
-/// route refused) `Store::route_plan` for every explicit-maximum line, so a
-/// large upload amplified database load before `admit_batch` ever checked a
-/// budget or job limit. Neither entry survives this one scan: nothing here
-/// is cached across scans or requests.
+/// Reuse the inputs for per-line routing within one scan, even when the
+/// adapter verdict and seed differ on every line. Dispatch checks its own
+/// live inputs.
 #[derive(Default)]
-struct RefusalMemo {
-    /// A model's candidate deployments (`Store::deployments`) never depend
-    /// on a line's body: fetched at most once per model per scan.
+struct RoutingMemo {
     deployments: HashMap<String, Arc<Vec<Deployment>>>,
-    /// The routes the read-only routing policy would use (`route_plan`)
-    /// for a given set of refused candidates, keyed by model and the sorted
-    /// refused deployment ids. Which routes are capable depends on the line
-    /// (coarse feature support), and the refusal *kind* depends on the
-    /// line's body, so only this usable-route set is reused; the 400/501
-    /// decision is still made per line from its own adapter verdicts.
+    routes: HashMap<String, RouteInputs>,
+    /// Route sets for refusal classification, which uses a batch-wide seed.
+    /// Adapter verdicts still belong to the individual line.
     usable: HashMap<(String, Vec<Uuid>), Arc<Vec<Uuid>>>,
+}
+
+#[derive(Default)]
+struct LineRouting {
+    estimate: Option<Resolved>,
+    gateway_error: Option<InferenceError>,
+    rejection: Option<InferenceError>,
 }
 
 /// What [`Jobs::scan`] returns: the groups, the request count, the native
@@ -111,6 +105,7 @@ struct ScanScope<'a> {
     principal: &'a Principal,
     request_id: Uuid,
     endpoint: BatchEndpoint,
+    force_gateway: bool,
 }
 
 /// A deployment's group, built while scanning.
@@ -122,6 +117,13 @@ struct PendingGroup {
     legacy: bool,
 }
 
+/// Route and price diagnostics for a mode that might not be used.
+#[derive(Default)]
+struct PreviewErrors {
+    issues: Vec<Issue>,
+    job: Option<InferenceError>,
+}
+
 /// The scan's mutable state.
 struct ScanState {
     issues: Vec<Issue>,
@@ -130,22 +132,27 @@ struct ScanState {
     // Cache TTL requirements are part of the memoization key: a clean
     // line must not authorize a later cached line at an incompatible price.
     previews: HashMap<(Uuid, Option<u32>, u8), LinePreview>,
-    prices: HashMap<Uuid, Uuid>,
+    // A failed load is shared by all preview keys for that deployment.
+    prices: HashMap<Uuid, Result<LinePricing, InferenceError>>,
     // One per deployment, in first-use order.
-    groups: Vec<PendingGroup>,
+    native_groups: Vec<PendingGroup>,
+    // Gateway estimates can split a model across differently priced routes.
+    // Native selection and pricing still use the batch-wide deployment.
+    gateway_groups: Vec<PendingGroup>,
+    native_preview_errors: PreviewErrors,
+    gateway_preview_errors: PreviewErrors,
     requests: u32,
     physical: u64,
-    // Lines a native submission could not encode / the engine cannot run.
+    // Native eligibility is tracked independently of the pricing previews.
     native_ok: bool,
+    native_deployment: Option<Uuid>,
     gateway_unsupported: Option<u64>,
     // Lines the coarse check passed but the adapter's own pure encoder
     // (`ProviderAdapter::validate_chat_request`, #228) refuses
     // deterministically: excluded from the parent envelope, not from the
     // batch (see the end of the scan).
     deterministic_rejects: Vec<(u64, InferenceError)>,
-    // Model-level memoization of `every_candidate_route_refuses`'s
-    // read-only lookups, scoped to this one scan (#238 follow-up).
-    refusal_memo: RefusalMemo,
+    routing: RoutingMemo,
 }
 
 impl Jobs {
@@ -186,40 +193,20 @@ impl Jobs {
         })
     }
 
-    /// Whether *every* authorized, protocol-capable candidate deployment of
-    /// `model` would deterministically refuse `request` on `protocol`: the
-    /// same per-adapter/provider enumeration `Engine::execute_protocol` runs
-    /// before interactive admission (#228), reused here read-only so an
-    /// unpinned batch line's exclusion from the parent envelope matches what
-    /// the runner's own dispatch would actually do (#238) - not just what
-    /// the one deployment planning happened to size the line against.
-    ///
-    /// `Ok(None)`: at least one capable candidate accepts, or none was even
-    /// protocol-capable for this request (the coarse whole-batch check
-    /// already reports that case). `Ok(Some(error))`: every capable
-    /// candidate refuses, classified like the engine would (400
-    /// `invalid_request_error` only when a route the live routing policy
-    /// would actually use returned it, else 501 `unsupported_capability`).
-    /// No admission, reservation or routing-health write happens here.
-    ///
-    /// Both DB-backed lookups this needs are memoized in `memo` for the
-    /// whole scan (#238 follow-up): `Store::deployments` once per model, and
-    /// (only when every capable route refuses) `Store::route_plan` once per
-    /// model and refused-route set. The refusal kind stays per line:
-    /// a 50,000-line upload must not run ~50k deployment reads and ~100k
-    /// routing selects before `admit_batch` ever checks a budget or job
-    /// limit. Per-line adapter validation (bodies differ) still runs on
-    /// every line, deduplicated per provider within that line as before;
-    /// nothing here survives past this one scan.
-    async fn every_candidate_route_refuses(
+    /// Estimate the scheduler's first compatible route for an unpinned line
+    /// or classify a deterministic refusal when every capable route rejects
+    /// the body. Candidate filtering precedes route selection here and at
+    /// dispatch. This preview does not admit a line.
+    async fn line_routing(
         &self,
-        principal: &Principal,
+        scope: ScanScope<'_>,
         model: &str,
-        protocol: ApiProtocol,
-        request_id: Uuid,
-        request: &ChatRequest,
-        memo: &mut RefusalMemo,
-    ) -> Result<Option<InferenceError>, JobError> {
+        request: &BatchRequest,
+        line_index: u32,
+        model_route: Uuid,
+        memo: &mut RoutingMemo,
+    ) -> Result<LineRouting, JobError> {
+        let protocol = scope.endpoint.protocol();
         let deployments = match memo.deployments.get(model) {
             Some(cached) => cached.clone(),
             None => {
@@ -227,15 +214,108 @@ impl Jobs {
                 self.plan_lookup_counts
                     .deployments
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let fetched = Arc::new(self.store.deployments(principal, model).await?);
+                let fetched = Arc::new(self.store.deployments(scope.principal, model).await?);
                 memo.deployments.insert(model.to_owned(), fetched.clone());
                 fetched
             }
         };
-        let mut candidates: Vec<Deployment> = Vec::new();
-        let mut refused: Vec<(Deployment, InferenceError)> = Vec::new();
+        let (candidates, refused) = self.line_candidates(protocol, request, &deployments);
+        if refused.is_empty() && (candidates.is_empty() || deployments.len() == 1) {
+            return Ok(LineRouting::default());
+        }
+        if let std::collections::hash_map::Entry::Vacant(slot) = memo.routes.entry(model.to_owned())
+        {
+            #[cfg(test)]
+            self.plan_lookup_counts
+                .route_plan
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            slot.insert(
+                RouteInputs::load(&self.store, scope.principal, model, &deployments).await?,
+            );
+        }
+        let routes = &memo.routes[model];
+        if !candidates.is_empty() {
+            let id = match routes.first_route(
+                scope.principal,
+                model,
+                lines::routing_seed(scope.request_id, line_index),
+                &candidates,
+            ) {
+                Ok(id) => id,
+                // A compatible model route within policy may wait out
+                // cooldown. The scheduler will check it again at dispatch.
+                Err(InferenceError::RouteCoolingDown(_))
+                    if candidates.contains(&model_route) && routes.is_cooling(model_route) =>
+                {
+                    return Ok(LineRouting::default());
+                }
+                Err(
+                    error
+                    @ (InferenceError::RouteCoolingDown(_) | InferenceError::ModelUnavailable),
+                ) => {
+                    return Ok(LineRouting {
+                        gateway_error: Some(error),
+                        ..LineRouting::default()
+                    });
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let deployment = deployments
+                .iter()
+                .find(|d| d.id == id)
+                .ok_or(InferenceError::Configuration)?
+                .clone();
+            let adapter = self
+                .registry
+                .get(&deployment.provider)
+                .ok_or(InferenceError::Configuration)?;
+            return Ok(LineRouting {
+                estimate: Some(Resolved {
+                    deployment,
+                    adapter,
+                    legacy: false,
+                }),
+                ..LineRouting::default()
+            });
+        }
+        // Every capable adapter refused. Classify from the routes the
+        // routing policy would use, using this line's own adapter verdicts.
+        let mut key_ids: Vec<Uuid> = refused.iter().map(|(id, _)| *id).collect();
+        key_ids.sort_unstable();
+        let key = (model.to_owned(), key_ids);
+        let usable = match memo.usable.get(&key) {
+            Some(cached) => cached.clone(),
+            None => {
+                let ids = refused.iter().map(|(id, _)| *id).collect();
+                let plan = routes.plan_for(scope.principal, model, scope.request_id, &ids)?;
+                let ids = Arc::new(plan.deployment_ids);
+                memo.usable.insert(key, ids.clone());
+                ids
+            }
+        };
+        let invalid = refused.iter().find(|(id, error)| {
+            matches!(
+                error,
+                InferenceError::InvalidRequest | InferenceError::InvalidField(_)
+            ) && usable.contains(id)
+        });
+        Ok(LineRouting {
+            rejection: Some(invalid.map_or(InferenceError::Unsupported, |(_, e)| *e)),
+            ..LineRouting::default()
+        })
+    }
+
+    /// Per-body protocol capability and adapter validation match dispatch.
+    fn line_candidates(
+        &self,
+        protocol: ApiProtocol,
+        request: &BatchRequest,
+        deployments: &[Deployment],
+    ) -> (HashSet<Uuid>, Vec<(Uuid, InferenceError)>) {
+        let mut candidates = HashSet::new();
+        let mut refused = Vec::new();
         let mut verdicts: HashMap<String, Result<(), InferenceError>> = HashMap::new();
-        for deployment in deployments.iter() {
+        for deployment in deployments {
             if !deployment
                 .supported_protocols
                 .iter()
@@ -246,69 +326,33 @@ impl Jobs {
             let Some(adapter) = self.registry.get(&deployment.provider) else {
                 continue;
             };
-            if !(adapter.supports_protocol(protocol) && adapter.supports_chat_request(request)) {
+            if !adapter.supports_protocol(protocol) {
                 continue;
             }
-            let verdict = *verdicts
-                .entry(deployment.provider.clone())
-                .or_insert_with(|| match adapter.validate_chat_request(request) {
-                    Ok(()) => Ok(()),
-                    Err(e @ (InferenceError::InvalidRequest | InferenceError::InvalidField(_))) => {
-                        Err(e)
-                    }
-                    Err(InferenceError::Unsupported) => Err(InferenceError::Unsupported),
-                    // Outside the adapter's contract (#228): never silently
-                    // admitted, logged for the operator, same as the engine.
-                    Err(other) => {
-                        tracing::warn!(provider = %deployment.provider, error = ?other,
-                            "adapter request validation returned an error outside its contract");
-                        Err(InferenceError::Unsupported)
-                    }
-                });
+            let verdict = match request {
+                BatchRequest::Chat(r) if adapter.supports_chat_request(r) => {
+                    *verdicts.entry(deployment.provider.clone()).or_insert_with(|| {
+                        match adapter.validate_chat_request(r) {
+                            verdict @ (Ok(()) | Err(InferenceError::InvalidRequest | InferenceError::InvalidField(_) | InferenceError::Unsupported)) => verdict,
+                            Err(other) => {
+                                tracing::warn!(provider = %deployment.provider, error = ?other,
+                                    "adapter request validation returned an error outside its contract");
+                                Err(InferenceError::Unsupported)
+                            }
+                        }
+                    })
+                }
+                BatchRequest::Embeddings(r) if adapter.supports_embedding_target(deployment, r) => Ok(()),
+                _ => continue,
+            };
             match verdict {
-                Ok(()) => candidates.push(deployment.clone()),
-                Err(error) => refused.push((deployment.clone(), error)),
+                Ok(()) => {
+                    candidates.insert(deployment.id);
+                }
+                Err(error) => refused.push((deployment.id, error)),
             }
         }
-        if !candidates.is_empty() || refused.is_empty() {
-            return Ok(None);
-        }
-        // Every protocol-capable candidate refused: classify it only from
-        // the routes the read-only routing policy would actually use
-        // (residency, operator-disabled routes and cooldown), exactly as
-        // `Engine::execute_protocol` does for an interactive request. The
-        // usable-route set is memoized per (model, refused set); the kind
-        // below is still decided from this line's own verdicts.
-        let mut key_ids: Vec<Uuid> = refused.iter().map(|(d, _)| d.id).collect();
-        key_ids.sort_unstable();
-        let key = (model.to_owned(), key_ids);
-        let usable = match memo.usable.get(&key) {
-            Some(cached) => cached.clone(),
-            None => {
-                #[cfg(test)]
-                self.plan_lookup_counts
-                    .route_plan
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let refused_deployments: Vec<Deployment> =
-                    refused.iter().map(|(d, _)| d.clone()).collect();
-                let plan = self
-                    .store
-                    .route_plan(principal, model, &refused_deployments, request_id)
-                    .await?;
-                let ids = Arc::new(plan.deployment_ids);
-                memo.usable.insert(key, ids.clone());
-                ids
-            }
-        };
-        let invalid = refused.iter().find(|(d, error)| {
-            matches!(
-                error,
-                InferenceError::InvalidRequest | InferenceError::InvalidField(_)
-            ) && usable.contains(&d.id)
-        });
-        Ok(Some(
-            invalid.map_or(InferenceError::Unsupported, |(_, e)| *e),
-        ))
+        (candidates, refused)
     }
 
     /// Validate `input` (already opened) and copy it to the batch's private
@@ -384,6 +428,7 @@ impl Jobs {
             principal,
             request_id,
             endpoint,
+            force_gateway,
         };
         let mut state = ScanState::new();
         loop {
@@ -421,7 +466,7 @@ impl Jobs {
             state.record(endpoint, &line);
             scan::copy_line(work, raw, &line).await?;
         }
-        state.finish(endpoint, force_gateway)
+        state.finish()
     }
 }
 
@@ -433,13 +478,17 @@ impl ScanState {
             models: HashMap::new(),
             previews: HashMap::new(),
             prices: HashMap::new(),
-            groups: Vec::new(),
+            native_groups: Vec::new(),
+            gateway_groups: Vec::new(),
+            native_preview_errors: PreviewErrors::default(),
+            gateway_preview_errors: PreviewErrors::default(),
             requests: 0,
             physical: 0,
             native_ok: true,
+            native_deployment: None,
             gateway_unsupported: None,
             deterministic_rejects: Vec::new(),
-            refusal_memo: RefusalMemo::default(),
+            routing: RoutingMemo::default(),
         }
     }
 
@@ -450,46 +499,49 @@ impl ScanState {
     }
 
     /// The whole-file checks after the last line, then the result.
-    fn finish(
-        mut self,
-        endpoint: BatchEndpoint,
-        force_gateway: bool,
-    ) -> Result<Scanned, PlanError> {
-        if self.requests == 0 && self.issues.is_empty() {
-            self.issues.push(Issue {
-                line: 1,
-                error: LineError::EmptyFile,
-            });
-        }
-        let native = !force_gateway
-            && self.native_ok
-            && self.deterministic_rejects.is_empty()
-            && self.groups.len() == 1
-            && self.groups[0]
-                .adapter
-                .native_batch(&self.groups[0].group.deployment, endpoint);
-        if self.issues.is_empty() && !native {
-            self.gateway_issue();
-        }
-        if self.issues.is_empty() && self.groups.is_empty() {
-            self.report_rejects();
-        }
+    fn finish(mut self) -> Result<Scanned, PlanError> {
+        let native = self.native_ok && self.native_deployment.is_some();
+        let (groups, preview_errors) = if native {
+            (
+                std::mem::take(&mut self.native_groups),
+                std::mem::take(&mut self.native_preview_errors),
+            )
+        } else {
+            if self.issues.is_empty() {
+                self.gateway_issue();
+            }
+            (
+                std::mem::take(&mut self.gateway_groups),
+                std::mem::take(&mut self.gateway_preview_errors),
+            )
+        };
+        self.issues.extend(preview_errors.issues);
+        self.issues.sort_by_key(|issue| issue.line);
+        self.issues.truncate(MAX_ISSUES);
         if !self.issues.is_empty() {
             return Err(PlanError::Invalid(self.issues));
         }
-        let model = if self.groups.len() == 1 {
-            self.groups[0].group.model.clone()
+        if let Some(error) = preview_errors.job {
+            return Err(error.into());
+        }
+        if groups.is_empty() {
+            self.report_rejects();
+            return Err(PlanError::Invalid(self.issues));
+        }
+        let first_model = &groups[0].group.model;
+        let model = if groups.iter().all(|g| g.group.model == *first_model) {
+            first_model.clone()
         } else {
             "mixed".to_owned()
         };
         let native = native.then(|| {
             (
-                self.groups[0].group.deployment.clone(),
-                self.groups[0].adapter.clone(),
+                groups[0].group.deployment.clone(),
+                groups[0].adapter.clone(),
             )
         });
         Ok((
-            self.groups.into_iter().map(|g| g.group).collect(),
+            groups.into_iter().map(|g| g.group).collect(),
             self.requests,
             native,
             model,
@@ -500,7 +552,7 @@ impl ScanState {
     /// cannot run.
     fn gateway_issue(&mut self) {
         // Lines only a native batch could run.
-        if let Some(g) = self.groups.iter().find(|g| g.legacy) {
+        if let Some(g) = self.gateway_groups.iter().find(|g| g.legacy) {
             self.issues.push(Issue {
                 line: g.first_line,
                 error: LineError::ModelUnsupported,

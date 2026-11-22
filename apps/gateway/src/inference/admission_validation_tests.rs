@@ -76,7 +76,7 @@ fn counting_mock(hits: Arc<AtomicUsize>) -> Router {
 
 /// Counts of every durable row kind a deterministic refusal must never add
 /// to, across admission, settlement and health observation.
-async fn snapshot(pool: &PgPool) -> (i64, i64, i64, i64, i64, i64, i64) {
+pub(crate) async fn snapshot(pool: &PgPool) -> (i64, i64, i64, i64, i64, i64, i64) {
     sqlx::query_as(
         "SELECT (SELECT count(*) FROM inference_executions),
                 (SELECT count(*) FROM governance_reservations),
