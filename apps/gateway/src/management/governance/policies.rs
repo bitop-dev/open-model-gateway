@@ -660,7 +660,7 @@ pub(crate) async fn store_initial_key_limits(
 /// Test oracle (#81 slice 3): does the REAL budget parser accept this budget
 /// list (one budget per period, at most one per known period, valid amounts)?
 /// Decides which policy refusal is the documented cross-item rule.
-#[cfg(test)]
+#[cfg(all(test, feature = "integration-tests"))]
 pub(crate) fn budgets_parse(list: &serde_json::Value) -> bool {
     serde_json::from_value::<Vec<BudgetInput>>(list.clone())
         .is_ok_and(|list| parse_budgets(&list).is_ok())

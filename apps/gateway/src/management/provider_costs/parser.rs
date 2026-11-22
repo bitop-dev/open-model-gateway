@@ -330,7 +330,7 @@ fn management_openapi_money_raw_upload_request_vectors() {
 /// Test oracle: does the REAL parser (every relation between the elements of an
 /// upload: pages, buckets, windows, limits, duplicate lines) accept this JSON
 /// body, in either wire form? Used to decide which 400 is a domain refusal.
-#[cfg(test)]
+#[cfg(all(test, feature = "integration-tests"))]
 pub(crate) fn upload_parses(input: &serde_json::Value) -> bool {
     serde_json::from_str::<Upload>(&input.to_string()).is_ok_and(|upload| parse(&upload).is_ok())
 }

@@ -325,7 +325,7 @@ pub(crate) async fn verify_in(
 /// `$6` requests at once, `$7` reserved tokens, `$8` jobs at once. Returns
 /// (rate limits ok, job limit ok). Admission no longer runs it: the
 /// installation policy layer, its last user, was removed in 0026.
-#[cfg(test)]
+#[cfg(all(test, feature = "integration-tests"))]
 pub(crate) const SCAN: &str = r#"WITH accounting AS (
   SELECT r.workspace_id,r.api_key_id,r.minute_start,r.state,r.lease_expires_at,r.reserved_tokens,r.input_tokens,r.output_tokens,r.billing_usage,e.workload_kind IN('videos','batches') OR e.batch_job_id IS NOT NULL AS job,j.id IS NOT NULL OR e.batch_job_id IS NOT NULL AS accepted,coalesce(j.state IN('completed','failed','cancelled','expired') OR j.cancel_requested_at IS NOT NULL,e.batch_job_id IS NOT NULL) AS job_done FROM governance_reservations r JOIN inference_executions e ON e.id=r.execution_id LEFT JOIN async_jobs j ON j.execution_id=r.execution_id WHERE r.minute_start=date_trunc('minute',$3::timestamptz,'UTC') OR (r.state='pending' AND r.lease_expires_at>$3)
   UNION ALL SELECT e.workspace_id,e.api_key_id,date_trunc('minute',e.started_at,'UTC'),'unknown',NULL::timestamptz,NULL::bigint,e.input_tokens,e.output_tokens,e.billing_usage,false,false,false FROM inference_executions e WHERE e.started_at>=date_trunc('minute',$3::timestamptz,'UTC') AND e.started_at<date_trunc('minute',$3::timestamptz,'UTC')+interval '1 minute' AND NOT EXISTS(SELECT 1 FROM governance_reservations r WHERE r.execution_id=e.id)
