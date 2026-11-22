@@ -709,7 +709,7 @@ async fn access_layers_explain_why_models_are_unavailable(pool: PgPool) {
     let rb = route(&pool, "acc-b", "openai").await;
     let rc = route(&pool, "acc-c", "openai").await;
     route(&pool, "acc-d", "openai").await;
-    route(&pool, "acc-e", "openai").await;
+    model(&pool, "acc-e").await;
     enable(&pool, &ra).await;
     enable(&pool, &rb).await;
     enable(&pool, &rc).await;
@@ -784,6 +784,20 @@ async fn access_layers_explain_why_models_are_unavailable(pool: PgPool) {
     assert!(reasons(&v, "acc-a").is_empty());
     assert!(reasons(&v, "acc-d").contains(&"key_restriction".to_owned()));
     assert_eq!(v["layers"][3]["restriction"]["mode"], "restricted");
+    // A disabled second deployment still counts toward the total route count.
+    sqlx::query(
+        "INSERT INTO deployments(id,model_id,provider_connection_id,upstream_model)
+         SELECT gen_random_uuid(),model_id,provider_connection_id,'not-serving'
+         FROM deployments WHERE id=$1",
+    )
+    .bind(ra.deployment)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (status, v) = get(&f, &f.member, &kpath).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reasons(&v, "acc-a"), ["some_routes_unavailable"]);
+    assert_eq!(v["summary"]["partial"], 1);
     crate::governance::set_test_budget(&pool, "local", None, Some(f.team), None, "day", Some(10))
         .await;
     attempt(&pool, &ra, simple(f.team, id(&k), "acc-a", "now()", 10)).await;
@@ -793,7 +807,7 @@ async fn access_layers_explain_why_models_are_unavailable(pool: PgPool) {
         .unwrap()
         .iter()
         .find(|m| m["public_name"] == "acc-a")
-        .unwrap()["reasons"][0]
+        .unwrap()["reasons"][1]
         .clone();
     assert_eq!(
         a_reason,

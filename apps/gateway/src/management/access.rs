@@ -132,6 +132,39 @@ async fn budget_reasons(
     }
     Ok(())
 }
+fn model_rows_sql() -> String {
+    let eligible = "EXISTS(SELECT 1 FROM catalog_models cm WHERE cm.model_id=m.id AND ((EXISTS(SELECT 1 FROM workspace_catalog_overrides h WHERE h.workspace_id=w.id) AND EXISTS(SELECT 1 FROM workspace_catalog_override_items i WHERE i.workspace_id=w.id AND i.catalog_id=cm.catalog_id)) OR (NOT EXISTS(SELECT 1 FROM workspace_catalog_overrides h WHERE h.workspace_id=w.id) AND EXISTS(SELECT 1 FROM workspace_type_catalogs t WHERE t.kind=w.kind AND t.catalog_id=cm.catalog_id))))";
+    let serving = &*resources::SERVING_ROUTE;
+    // Count both route totals for the bounded page. In a separate WHERE
+    // subquery, the planner can start from all enabled connections for each
+    // model, inflating the estimate enough to trigger JIT.
+    format!(
+        "SELECT page.id, page.public_name, page.display_name, page.enabled,
+                page.eligible, page.granted, page.key_selected,
+                routes.total, routes.serving
+         FROM (
+             SELECT m.id, m.public_name, m.display_name, m.enabled, {eligible} AS eligible,
+                    (workspace_model_allowed(w.id,m.id)
+                        OR EXISTS(SELECT 1 FROM workspace_model_grants g WHERE g.workspace_id=w.id AND g.model_id=m.id)) AS granted,
+                    CASE WHEN $2::uuid IS NULL OR NOT EXISTS(
+                        SELECT 1 FROM key_model_restrictions r WHERE r.workspace_id=w.id AND r.governance_key_id=$2
+                    ) THEN NULL ELSE EXISTS(
+                        SELECT 1 FROM key_model_selections s WHERE s.workspace_id=w.id AND s.governance_key_id=$2 AND s.model_id=m.id
+                    ) END AS key_selected
+             FROM models m CROSS JOIN workspaces w
+             WHERE w.id=$1 AND ({eligible}
+                 OR EXISTS(SELECT 1 FROM workspace_model_grants g WHERE g.workspace_id=w.id AND g.model_id=m.id)
+                 OR m.id=$3)
+             ORDER BY m.public_name,m.id LIMIT 201
+         ) page
+         CROSS JOIN LATERAL (
+             SELECT count(*) AS total, count(*) FILTER (WHERE {serving}) AS serving
+             FROM deployments d WHERE d.model_id=page.id
+         ) routes
+         ORDER BY page.public_name,page.id"
+    )
+}
+
 /// The models the workspace can see (up to 201), with their route counts.
 async fn model_rows(
     tx: &mut Transaction<'_, Postgres>,
@@ -139,8 +172,12 @@ async fn model_rows(
     lineage: Option<Uuid>,
     model: Option<Uuid>,
 ) -> Result<Vec<ModelRow>, ApiError> {
-    let eligible = "EXISTS(SELECT 1 FROM catalog_models cm WHERE cm.model_id=m.id AND ((EXISTS(SELECT 1 FROM workspace_catalog_overrides h WHERE h.workspace_id=w.id) AND EXISTS(SELECT 1 FROM workspace_catalog_override_items i WHERE i.workspace_id=w.id AND i.catalog_id=cm.catalog_id)) OR (NOT EXISTS(SELECT 1 FROM workspace_catalog_overrides h WHERE h.workspace_id=w.id) AND EXISTS(SELECT 1 FROM workspace_type_catalogs t WHERE t.kind=w.kind AND t.catalog_id=cm.catalog_id))))";
-    Ok(sqlx::query_as(&format!("SELECT m.id,m.public_name,m.display_name,m.enabled,{eligible},workspace_model_allowed(w.id,m.id) OR EXISTS(SELECT 1 FROM workspace_model_grants g WHERE g.workspace_id=w.id AND g.model_id=m.id),CASE WHEN $2::uuid IS NULL OR NOT EXISTS(SELECT 1 FROM key_model_restrictions r WHERE r.workspace_id=w.id AND r.governance_key_id=$2) THEN NULL ELSE EXISTS(SELECT 1 FROM key_model_selections s WHERE s.workspace_id=w.id AND s.governance_key_id=$2 AND s.model_id=m.id) END,(SELECT count(*) FROM deployments d WHERE d.model_id=m.id),(SELECT count(*) FROM deployments d WHERE d.model_id=m.id AND {}) FROM models m CROSS JOIN workspaces w WHERE w.id=$1 AND ({eligible} OR EXISTS(SELECT 1 FROM workspace_model_grants g WHERE g.workspace_id=w.id AND g.model_id=m.id) OR m.id=$3) ORDER BY m.public_name,m.id LIMIT 201", *resources::SERVING_ROUTE)).bind(ws).bind(lineage).bind(model).fetch_all(&mut **tx).await?)
+    Ok(sqlx::query_as(&model_rows_sql())
+        .bind(ws)
+        .bind(lineage)
+        .bind(model)
+        .fetch_all(&mut **tx)
+        .await?)
 }
 /// The key's model restriction, if the request is for a key.
 async fn key_restriction(
@@ -298,4 +335,27 @@ pub(super) async fn key_access(
     Query(q): Query<AccessQuery>,
 ) -> ApiResult {
     access(s, u, ws, Some(key), q.model_id).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[dbtest::test]
+    async fn key_access_model_rows_stay_below_default_jit_threshold(pool: sqlx::PgPool) {
+        let plan: Value = sqlx::query_scalar(&format!(
+            "EXPLAIN (GENERIC_PLAN, FORMAT JSON) {}",
+            model_rows_sql()
+        ))
+        .bind(Uuid::nil())
+        .bind(Uuid::nil())
+        .bind(None::<Uuid>)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let cost = plan[0]["Plan"]["Total Cost"].as_f64().unwrap();
+        // Guard the estimate on a freshly migrated database with sparse statistics.
+        // Compare planner cost instead of wall time or whether LLVM is installed.
+        assert!(cost < 100_000.0, "key access plan cost: {cost}");
+    }
 }
