@@ -1382,6 +1382,7 @@ async fn finishing_distinguishes_rejection_and_stale_claim(pool: PgPool) {
         old.finish_batch(&w.f.store, &done(None)).await,
         Err(FenceError::Stale)
     ));
+    assert_eq!(w.reload(&job).await.state, "queued");
 }
 
 #[dbtest::test]
