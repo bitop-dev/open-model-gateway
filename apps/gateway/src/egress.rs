@@ -539,7 +539,6 @@ pub(crate) async fn resolve_classified(
     host: &str,
     port: u16,
 ) -> Result<Vec<SocketAddr>, ResolveError> {
-    // SMTP tracks refusals independently for each resolution.
     resolve_classified_tracked(policy, purpose, host, port, &AtomicBool::new(false)).await
 }
 
