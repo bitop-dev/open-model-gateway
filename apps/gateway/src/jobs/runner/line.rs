@@ -296,11 +296,7 @@ impl LineRun {
             .await_segment(&self.store, line, execution)
             .await;
         if !matches!(ready, Ok(true)) {
-            self.finished(
-                line,
-                execution,
-                ready.and_then(|_| Err(FenceError::Storage)),
-            );
+            self.finished(line, execution, ready.and(Err(FenceError::Storage)));
             return;
         }
         #[cfg(test)]
