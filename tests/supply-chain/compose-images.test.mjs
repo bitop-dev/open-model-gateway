@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { parseStrict, readLocalFromRepo, toData } from "./lib.mjs";
-import { checkedComposeFiles, isPinnedImage, upstreamComposeImages } from "./policy.mjs";
+import { checkedComposeFiles, imageTrackingReference, isPinnedImage, upstreamComposeImages } from "./policy.mjs";
 
 const staging = "deploy/staging/compose.yaml";
 const loadtest = "deploy/loadtest/compose.yaml";
@@ -68,4 +68,12 @@ test("a new tagged upstream enters the Compose freshness inventory", () => {
   const image = "redis:7@sha256:" + "a".repeat(64);
   const data = { services: { cache: { image }, envOverlay: { environment: { LOG_LEVEL: "info" } } } };
   assert.deepEqual(upstreamComposeImages("deploy/cache/compose.yaml", data), [{ name: "cache", image }]);
+});
+
+test("staging uses the reference's tag before its digest-only fallback", () => {
+  const digest = "@sha256:" + "a".repeat(64);
+  const name = "registry.example:5000/team/postgres";
+  assert.equal(imageTrackingReference(name + ":18" + digest, "17-bookworm"), name + ":18");
+  assert.equal(imageTrackingReference(name + digest, "17-bookworm"), name + ":17-bookworm");
+  assert.equal(imageTrackingReference(name + digest), undefined);
 });

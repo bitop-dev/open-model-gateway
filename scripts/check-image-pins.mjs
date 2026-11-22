@@ -1,7 +1,7 @@
 // Report registry tag drift for the upstream Compose and chart defaults.
 import { execFileSync } from "node:child_process";
 import { parseStrict, readLocalFromRepo, root, toData } from "../tests/supply-chain/lib.mjs";
-import { checkedComposeFiles, isPinnedImage, upstreamComposeImages } from "../tests/supply-chain/policy.mjs";
+import { checkedComposeFiles, imageTrackingReference, isPinnedImage, upstreamComposeImages } from "../tests/supply-chain/policy.mjs";
 
 const yaml = file => toData(parseStrict(readLocalFromRepo(file), file));
 const chart = "deploy/helm/open-model-gateway/values.yaml";
@@ -38,9 +38,9 @@ function indexDigest(reference) {
 for (const [file, pinned, trackingTag] of pins) {
   try {
     if (typeof pinned !== "string" || !isPinnedImage(pinned)) throw new Error("expected a digest-pinned image");
-    const [name, digest] = pinned.split("@");
-    const tag = trackingTag ? `${name}:${trackingTag}` : name;
-    if (!/:[^/]+$/.test(tag)) throw new Error(`${pinned} has no tracking tag`);
+    const [, digest] = pinned.split("@");
+    const tag = imageTrackingReference(pinned, trackingTag);
+    if (!tag) throw new Error(`${pinned} has no tracking tag`);
     if (indexDigest(pinned) !== digest) throw new Error(`${pinned} did not resolve to its pinned digest`);
     const current = indexDigest(tag);
     if (current !== digest) throw new Error(`${tag} moved from ${digest} to ${current}`);

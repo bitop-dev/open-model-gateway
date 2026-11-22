@@ -45,7 +45,7 @@ class StagingTests(unittest.TestCase):
             with patch.object(sys, "argv", argv), patch.object(subprocess, "run") as run:
                 staging.main()
             self.assertEqual(run.call_args.args[0], [
-                "docker", "buildx", "build", "--load", "--tag", "omg-staging-fixture:local", ".",
+                "docker", "build", "--load", "--tag", "omg-staging-fixture:local", ".",
             ])
             self.assertEqual(run.call_args.kwargs["cwd"], ROOT)
             self.assertTrue(run.call_args.kwargs["check"])

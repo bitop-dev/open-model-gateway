@@ -44,6 +44,12 @@ export function isPinnedImage(image) {
   return normalizedPath.length <= 255;
 }
 
+export function imageTrackingReference(pinned, fallbackTag) {
+  const [reference] = pinned.split("@");
+  if (reference.lastIndexOf(":") > reference.lastIndexOf("/")) return reference;
+  if (fallbackTag) return `${reference}:${fallbackTag}`;
+}
+
 // Container `options:` that reach the host or replace what the image runs, refused unless
 // listed here as `<file>: <where>: <option>` with the reason. None is listed: today's options
 // are the PostgreSQL services' --health-* settings.
