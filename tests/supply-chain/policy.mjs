@@ -437,7 +437,7 @@ export function stagingCandidateViolations(compose, envExample, ci, overlays = r
       if (candidates.has(name) && isMapping(service) && "pull_policy" in service && service.pull_policy !== "never") {
         out.push(`${file}: service '${name}' must retain pull_policy: never for the local candidate`);
       }
-      if (isMapping(service) && "build" in service) out.push(`${file}: service '${name}' may not set build; only deploy/staging/compose.yaml builds the candidate`);
+      if (isMapping(service) && "build" in service) out.push(`${file}: service '${name}' may not set build; staging runs a prepared candidate`);
     }
   }
   const example = "deploy/staging/staging.env.example";

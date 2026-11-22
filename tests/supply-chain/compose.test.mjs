@@ -17,9 +17,7 @@ test("every Compose build section builds a known Dockerfile from the checkout", 
   for (const expected of ["compose.yaml", "deploy/demo/compose.yaml", "deploy/loadtest/compose.yaml", "deploy/staging/compose.yaml", "deploy/staging/compose.openai.yaml"]) assert.ok(files.includes(expected), expected);
   const builds = [];
   assert.deepEqual(files.flatMap(file => composeBuildViolations(file, toData(parseStrict(readLocalFromRepo(file), file)), builds)), []);
-  // The staging services that share the gateway's build (through the merge key) are read.
-  assert.deepEqual([...new Set(builds.map(b => `${b.file} ${b.context} ${b.dockerfile}`))], ["deploy/staging/compose.yaml . Dockerfile"]);
-  assert.ok(builds.length >= 2 && builds.some(b => b.service === "gateway"), "the gateway service and the ops services built with it");
+  assert.deepEqual(builds.filter(build => build.file === COMPOSE_FILE), [], "staging runs a prepared image");
 });
 
 test("no tracked .env sits beside a checked Compose file", () => {
@@ -88,6 +86,7 @@ const REFUSED_COMPOSE_EDITS = [
 for (const [label, mutate, reason] of REFUSED_COMPOSE_EDITS) {
   test(`the staging Compose file refuses ${label}`, () => {
     const data = staging();
+    data.services.gateway.build = { context: "../..", dockerfile: "Dockerfile" };
     mutate(data);
     assert.match(composeBuildViolations(COMPOSE_FILE, data).join(), reason);
   });
