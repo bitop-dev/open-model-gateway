@@ -541,6 +541,15 @@ async fn terminal_order(pool: PgPool, kind: Kind, client: Client, input: i64) {
 
 #[dbtest::test]
 async fn responses_terminal_status_mismatch_preserves_valid_usage(pool: PgPool) {
+    responses_rejected_terminal_evidence(pool, false).await;
+}
+
+#[dbtest::test]
+async fn responses_terminal_content_mismatch_preserves_valid_usage(pool: PgPool) {
+    responses_rejected_terminal_evidence(pool, true).await;
+}
+
+async fn responses_rejected_terminal_evidence(pool: PgPool, matching_status: bool) {
     let kind = Kind::Responses;
     let w = world(pool, kind, false).await;
     let (content, rest, late_completion) = kind.valid();
@@ -548,12 +557,20 @@ async fn responses_terminal_status_mismatch_preserves_valid_usage(pool: PgPool) 
     let snapshot = responses_complete();
     let class = InferenceError::InvalidUpstream;
     let mut problems = Vec::new();
-    for (event, status) in [
-        ("response.incomplete", "completed"),
-        ("response.completed", "incomplete"),
+    for (event, terminal_status, other_status) in [
+        ("response.incomplete", "incomplete", "completed"),
+        ("response.completed", "completed", "incomplete"),
     ] {
         let mut snapshot = snapshot.clone();
+        let status = if matching_status {
+            terminal_status
+        } else {
+            other_status
+        };
         snapshot["status"] = json!(status);
+        if matching_status {
+            snapshot["output"][0]["content"][0]["text"] = json!("Different final text");
+        }
         if status == "incomplete" {
             snapshot["incomplete_details"] = json!({"reason":"max_output_tokens"});
         }
@@ -648,6 +665,27 @@ async fn responses_terminal_status_mismatch_preserves_valid_usage(pool: PgPool) 
                 5,
             ),
             (
+                "reasoning exceeds total less input",
+                r#","usage":{"input_tokens":3,"total_tokens":5,"output_tokens_details":{"reasoning_tokens":3}}"#,
+                Some(3),
+                None,
+                3,
+            ),
+            (
+                "reasoning exceeds total less cache floor",
+                r#","usage":{"input_tokens_details":{"cached_tokens":3,"cache_write_tokens":1},"total_tokens":5,"completion_tokens_details":{"reasoning_tokens":2}}"#,
+                None,
+                None,
+                4,
+            ),
+            (
+                "reasoning fits total less cache floor",
+                r#","usage":{"input_tokens_details":{"cached_tokens":3,"cache_write_tokens":1},"total_tokens":5,"output_tokens_details":{"reasoning_tokens":1}}"#,
+                None,
+                None,
+                4,
+            ),
+            (
                 "duplicate count",
                 r#","usage":{"input_tokens":null,"input_\u0074okens":5000,"output_tokens":2,"total_tokens":5002}"#,
                 None,
@@ -685,6 +723,21 @@ async fn responses_terminal_status_mismatch_preserves_valid_usage(pool: PgPool) 
             assert_eq!(reply.status, 200, "{at}");
             assert_eq!(last_event(&reply.body)["type"], "error", "{at}");
             assert_eq!(told(Client::Responses, &reply.body), class.code(), "{at}");
+            assert_eq!(
+                reply
+                    .body
+                    .lines()
+                    .filter(|line| *line == "event: error")
+                    .count(),
+                1,
+                "{at}"
+            );
+            assert!(
+                reply.body.contains("Hello"),
+                "{at}: a delta must reach the client"
+            );
+            assert!(!reply.body.contains("Different final text"), "{at}");
+
             for event in ["response.completed", "response.incomplete", "[DONE]"] {
                 assert!(!reply.body.contains(event), "{at}: unexpected {event}");
             }
@@ -718,7 +771,15 @@ async fn responses_terminal_status_mismatch_preserves_valid_usage(pool: PgPool) 
             .fetch_one(&w.f.store.pool)
             .await
             .unwrap();
-            if label == "conflicting reasoning fields" {
+            let expected_reasoning = match label {
+                "conflicting reasoning fields" | "reasoning fits total less cache floor" => {
+                    Some(Some(1))
+                }
+                "reasoning exceeds total less input"
+                | "reasoning exceeds total less cache floor" => Some(None),
+                _ => None,
+            };
+            if let Some(expected_reasoning) = expected_reasoning {
                 let telemetry: (Option<i64>, Option<String>) = sqlx::query_as(
                     "SELECT reasoning_tokens,reported_upstream_model FROM inference_executions WHERE root_request_id=$1",
                 )
@@ -726,7 +787,10 @@ async fn responses_terminal_status_mismatch_preserves_valid_usage(pool: PgPool) 
                 .fetch_one(&w.f.store.pool)
                 .await
                 .unwrap();
-                assert_eq!(telemetry, (Some(1), Some("served".into())), "{at}");
+                let want = (expected_reasoning, Some("served".into()));
+                if telemetry != want {
+                    problems.push(format!("{at}: telemetry {telemetry:?}, want {want:?}"));
+                }
             }
             assert!(admitted > 0, "{at}: the fixture must reserve money");
             let got = (
