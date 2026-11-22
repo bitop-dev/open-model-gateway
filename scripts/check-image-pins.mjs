@@ -1,5 +1,5 @@
 // Report registry tag drift for upstream Compose, chart and workflow image pins.
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { actionName, jobsOf, parseStrict, readLocalFromRepo, repoFiles, root, stepsOf, toData } from "../tests/supply-chain/lib.mjs";
 import { checkedComposeFiles, imageTrackingReference, isPinnedImage, upstreamComposeImages } from "../tests/supply-chain/policy.mjs";
 
@@ -47,15 +47,25 @@ for (const { file, text } of repoFiles()) {
 const lookups = new Map();
 function indexDigest(reference) {
   if (!lookups.has(reference)) {
-    const index = JSON.parse(execFileSync("docker", [
+    const lookup = spawnSync("docker", [
       "buildx", "imagetools", "inspect", "--format", "{{json .Manifest}}", reference,
-    ], { cwd: root, encoding: "utf8", timeout: 30_000 }));
+    ], { cwd: root, encoding: "utf8", timeout: 30_000, stdio: ["ignore", "pipe", "ignore"] });
+    if (lookup.error || lookup.status !== 0) {
+      const outcome = Number.isInteger(lookup.status) ? `exited ${lookup.status}` : "did not complete";
+      throw new Error(`lookup ${outcome} for ${reference}`);
+    }
+    let index;
+    try {
+      index = JSON.parse(lookup.stdout);
+    } catch {
+      throw new Error(`${reference} returned invalid manifest JSON`);
+    }
     for (const architecture of ["amd64", "arm64"]) {
-      if (!index.manifests?.some(m => m.platform?.os === "linux" && m.platform.architecture === architecture)) {
+      if (!Array.isArray(index?.manifests) || !index.manifests.some(m => m?.platform?.os === "linux" && m.platform.architecture === architecture)) {
         throw new Error(`${reference} lacks a linux/${architecture} manifest`);
       }
     }
-    if (!/^sha256:[a-f0-9]{64}$/.test(index.digest)) {
+    if (typeof index.digest !== "string" || !/^sha256:[a-f0-9]{64}$/.test(index.digest)) {
       throw new Error(`${reference} did not return an index digest`);
     }
     lookups.set(reference, index.digest);

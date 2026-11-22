@@ -37,7 +37,7 @@ console.log(JSON.stringify({digest: current, manifests}));
   });
   assert.ifError(result.error);
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /fixture registry unavailable/);
+  assert.doesNotMatch(result.stdout + result.stderr, /fixture registry unavailable/);
   for (const name of ["branch-images", "image", "loadtest-image", "ci"]) {
     assert.match(result.stdout, new RegExp(`workflows/${name}\\.yml.*mirror\\.gcr\\.io/moby/buildkit:buildx-stable-1 matches sha256:`));
   }
@@ -45,7 +45,7 @@ console.log(JSON.stringify({digest: current, manifests}));
     assert.match(result.stderr, new RegExp(`workflows/${name}\\.yml.*mirror\\.gcr\\.io/docker/buildkit-syft-scanner:stable-1 moved from sha256:[a-f0-9]{64} to sha256:f{64}`));
   }
   for (const job of ["gateway-tests", "gateway-special", "browser"]) {
-    assert.match(result.stderr, new RegExp(`workflows/ci\\.yml.*job '${job}'.*Command failed:.*mirror\\.gcr\\.io/library/postgres:17-alpine@sha256:[a-f0-9]{64}`));
+    assert.match(result.stderr, new RegExp(`workflows/ci\\.yml.*job '${job}' services\\.postgres: lookup exited 1 for mirror\\.gcr\\.io/library/postgres:17-alpine@sha256:[a-f0-9]{64}`));
   }
   const lookups = readFileSync(calls, "utf8").trim().split("\n");
   for (const tag of [
