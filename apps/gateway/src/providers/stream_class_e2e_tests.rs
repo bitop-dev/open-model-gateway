@@ -686,6 +686,20 @@ async fn responses_rejected_terminal_evidence(pool: PgPool, matching_status: boo
                 4,
             ),
             (
+                "duplicate reasoning count",
+                r#","usage":{"input_tokens":5000,"output_tokens":2,"total_tokens":5002,"output_tokens_details":{"reasoning_tokens":1,"reasoning_tokens":2}}"#,
+                Some(5000),
+                Some(2),
+                5002,
+            ),
+            (
+                "duplicate compatibility details",
+                r#","usage":{"input_tokens":5000,"output_tokens":2,"total_tokens":5002,"completion_tokens_details":null,"completion_tokens_details":{"reasoning_tokens":1}}"#,
+                Some(5000),
+                Some(2),
+                5002,
+            ),
+            (
                 "duplicate count",
                 r#","usage":{"input_tokens":null,"input_\u0074okens":5000,"output_tokens":2,"total_tokens":5002}"#,
                 None,
@@ -776,7 +790,9 @@ async fn responses_rejected_terminal_evidence(pool: PgPool, matching_status: boo
                     Some(Some(1))
                 }
                 "reasoning exceeds total less input"
-                | "reasoning exceeds total less cache floor" => Some(None),
+                | "reasoning exceeds total less cache floor"
+                | "duplicate reasoning count"
+                | "duplicate compatibility details" => Some(None),
                 _ => None,
             };
             if let Some(expected_reasoning) = expected_reasoning {
