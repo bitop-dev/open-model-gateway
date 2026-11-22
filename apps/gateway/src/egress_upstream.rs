@@ -176,7 +176,7 @@ pub(crate) fn count_here(metrics: &'static Metrics) -> impl Drop {
 /// retryable, the connection was reused and `retry_canceled_requests` (on by
 /// default, and reqwest 0.12.28 offers no switch) is true, so a request
 /// handed back unwritten may go to a new connection, once per stale idle
-/// connection until a fresh one is used. The request is written once.
+/// connection until a fresh one is used. The request is written at most once.
 /// Handing back an unwritten request does not count as a failure. A shorter
 /// pool idle timeout reduces these handoffs.
 pub(crate) fn connection_lost_before_response(error: &reqwest::Error) -> bool {

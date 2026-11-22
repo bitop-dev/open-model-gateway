@@ -38,8 +38,7 @@ pub const SCOPES: [&str; 5] = [
 pub const MIN_EXPIRES_IN_DAYS: i32 = 1;
 pub const MAX_EXPIRES_IN_DAYS: i32 = 90;
 
-/// Admin tokens never cache a positive authorization; successful use is
-/// recorded at most this often (migration 0051: `last_used_at`/`last_used_address`).
+/// The interval between recorded authorized admin-token attempts (migration 0051: `last_used_at`/`last_used_address`).
 const LAST_USE_EVERY_SECONDS: i64 = 5 * 60;
 
 const PREFIX: &str = "omg_admin_";
@@ -483,7 +482,7 @@ impl Store {
         }))
     }
 
-    /// Records successful use at most once per five minutes across replicas.
+    /// Records an authorized attempt before dispatch, at most once per five minutes across replicas.
     /// A single conditional update enforces the interval atomically.
     /// Identity middleware supplies the parsed client address. An absent
     /// address is stored as NULL.

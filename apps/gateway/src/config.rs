@@ -32,9 +32,8 @@ pub struct Config {
     /// `GATEWAY_REPORTING_MAX_LAG_SECONDS` (default 30, 1-3600): a replica
     /// replaying WAL further behind than this is skipped for the primary.
     pub reporting_max_lag: Duration,
-    /// `GATEWAY_ADMISSION_MODE` (`scoped`, default, or `global`): scoped
-    /// admission locks, or the former installation row lock as an
-    /// operational rollback for one release (see `governance::locks`).
+    /// `GATEWAY_ADMISSION_MODE` selects scoped locks (the default) or
+    /// serialization on the installation row (`global`). See `governance::locks`.
     pub admission_mode: crate::governance::locks::AdmissionMode,
     /// `GATEWAY_LISTEN_DATABASE_URL` (default `DATABASE_URL`): the session
     /// connection that LISTENs for configuration changes (`crate::notify`).

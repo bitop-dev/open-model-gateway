@@ -38,8 +38,7 @@ pub enum AdmissionMode {
     /// Scoped authority locks and totals/counter row locks (default).
     #[default]
     Scoped,
-    /// The former protocol: admission and settlement serialize on the
-    /// installation row (operational rollback for one release).
+    /// Admission and settlement serialize on the installation row.
     Global,
 }
 impl AdmissionMode {
