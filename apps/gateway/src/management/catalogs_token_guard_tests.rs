@@ -1,12 +1,6 @@
-//! #37 PR2 review: `catalogs::change_model`'s non-direct branch
-//! (`select_model`/`deselect_model`) takes its `workspace_access` User-scope
-//! revalidation lock up front, then the Workspace/Lineage scope locks
-//! later -- out of canonical order for a token actor specifically. Only
-//! `BrowserPrincipal` reaches this branch through the HTTP routes today
-//! (their own extractor type), so this test calls `change_model` directly
-//! (made `pub(super)` for exactly this) with a token-shaped
-//! `ManagementPrincipal`, bypassing that extractor, to prove the function's
-//! own fail-closed guard refuses it -- not just routing.
+//! The browser-only model selection branch refuses a token actor even when
+//! called directly. This keeps token actors out of a lock sequence that
+//! takes the user lock before the workspace and lineage locks.
 use super::*;
 use crate::identity::AdminTokenContext;
 

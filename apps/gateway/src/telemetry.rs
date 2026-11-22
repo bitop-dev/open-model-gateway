@@ -1097,9 +1097,8 @@ mod tests {
         for _ in 0..65 {
             context.record(span());
         }
-        // Children are capped one below MAX_REQUEST (#98 PR 2 review item
-        // 1), reserving the last slot for the root: 65 calls against a
-        // 63-child cap drop 2, not 1.
+        // One slot is reserved for the root. Of 65 child records, the
+        // 63-child cap drops two.
         assert_eq!(recorder.counts.dropped(DropReason::RequestLimit), 2);
         // Unknown or failed eligibility never exports buffered observations.
         drop(context);
@@ -1125,17 +1124,9 @@ mod tests {
         rx.close();
     }
 
-    /// #98 PR 2 review item 6 (revised by item 1): the root span
-    /// (`inference.request`) is recorded last, once the terminal outcome is
-    /// known, after every child span (`routing`, `admission`(.*),
-    /// `upstream.attempt`, `settlement`(.*)) a request's attempts already
-    /// recorded. Three failover attempts plus an admission deadlock retry
-    /// can fill the whole child budget before the root is ever recorded,
-    /// which would otherwise drop the root itself (an orphaned trace: every
-    /// child exports, but the trace's own anchor never does). The total
-    /// must still never exceed the documented 64 spans/request bound
-    /// (docs/operations.md): children are capped at `MAX_REQUEST - 1` so
-    /// the root always fits in the one slot reserved for it.
+    /// The terminal root span still fits when failover and retries have
+    /// filled the child budget. The root is recorded last, and its reserved
+    /// slot keeps the complete trace within the 64-span per-request limit.
     #[tokio::test]
     async fn the_root_span_survives_the_per_request_budget_even_once_children_fill_it() {
         let (recorder, mut rx) = Recorder::channel(1.0);
@@ -1165,11 +1156,9 @@ mod tests {
         rx.close();
     }
 
-    /// #98 PR 2 review item 1: a second `record_root` call (which must never
-    /// happen in production - `RequestTelemetry::finish` guards it with its
-    /// own `finished` flag - but the API itself must stay safe if it ever
-    /// did) is counted `DropReason::RequestLimit` and not pushed again,
-    /// rather than growing `Context`'s span buffer without bound.
+    /// A second root record counts as a request-limit drop and leaves the
+    /// buffer length unchanged. This tests the buffer invariant even if a
+    /// caller bypasses `RequestTelemetry::finish`'s duplicate-call guard.
     #[tokio::test]
     async fn a_repeated_record_root_call_is_counted_instead_of_growing_the_span_buffer() {
         let (recorder, mut rx) = Recorder::channel(1.0);
@@ -1236,11 +1225,8 @@ mod tests {
         context.export(admission);
     }
 
-    /// Exports exactly `n` spans (`n <= MAX_REQUEST`) from one context,
-    /// using [`Context::record_root`]'s dedicated slot for the last one so
-    /// callers that pass `MAX_REQUEST` still get every span recorded, not
-    /// `MAX_REQUEST - 1` (#98 PR 2 review item 1 reserves one slot of the
-    /// per-request budget for the root).
+    /// Exports exactly `n` spans (`n <= MAX_REQUEST`). Recording the last span
+    /// as the root allows the fixture to use the entire per-request budget.
     fn emit(recorder: &Recorder, n: usize) {
         let mut context = recorder.begin(Uuid::new_v4()).unwrap();
         for _ in 0..n.saturating_sub(1) {
@@ -1680,18 +1666,10 @@ mod tests {
         task.abort();
     }
 
-    // The two tests below are now a secondary, informational check only.
-    // The real, compiler-enforced invariant (#98 PR 2 review item 3) is:
-    // `SharedAdmission::new` has default (private) visibility, so no module
-    // outside this file can construct one at all; and `mark_shared` takes
-    // a `governance::SharedEligibilityCommitted` token constructible only
-    // inside `governance`'s own private `proof` submodule (narrower than
-    // the whole `governance` module tree, which a bare private field on a
-    // struct defined directly in `governance.rs` would have exposed to
-    // every one of its submodules), so no module outside `governance.rs`'s
-    // own `admit_unobserved` can call `mark_shared` at all. A bypass like
-    // `use crate::telemetry::mark_shared as m;` or a line-wrapped call no
-    // longer helps: the compiler itself rejects it from any other module.
+    // These source checks supplement the type-level constraint.
+    // `SharedAdmission::new` is private to this module, and `mark_shared`
+    // requires a `governance::SharedEligibilityCommitted` token. Only the
+    // private governance proof module can construct that token.
     #[test]
     fn shared_admission_has_one_production_call_site() {
         // Built from parts so this assertion's own source line is never a
@@ -1779,9 +1757,8 @@ mod tests {
         assert_eq!(names, ["lock_wait_prune", "rate_prune"]);
     }
 
-    /// #98 PR 2 review item 5: `Span::new` returning `None` (here, a
-    /// malformed `end < start` shape) must be counted `DropReason::Invalid`
-    /// with a `Recorder` in hand, not silently discarded.
+    /// A malformed span with an end before its start increments the
+    /// `Invalid` drop count when a recorder is present.
     #[test]
     fn record_background_counts_an_unbuildable_span_instead_of_silently_dropping_it() {
         let (recorder, mut rx) = Recorder::channel(1.0);

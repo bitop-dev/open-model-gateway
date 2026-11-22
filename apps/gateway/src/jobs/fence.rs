@@ -28,7 +28,7 @@
 use sqlx::{Postgres, Transaction, postgres::PgArguments, query::Query};
 use uuid::Uuid;
 
-use super::store::{Finished, JobRow, finish_batch_sql, job_storage};
+use super::store::{Finished, JobRow, finish_batch_tx, job_storage};
 use crate::store::Store;
 
 /// What a runner holds for one claim of a batch.
@@ -44,11 +44,11 @@ pub(crate) struct BatchFence {
 pub(crate) enum FenceError {
     /// The claim ended: the batch belongs to another claim now.
     Stale,
-    /// A statement failed and was not applied (counted where it ran): the
-    /// server answered with an error, or the statement never reached it.
+    /// A write failed and was not applied. Counted where it ran.
     Storage,
-    /// The connection failed with the statement possibly sent: the server may
-    /// still commit it. Counted where it ran.
+    /// Result file locked by a concurrent operation. The batch can retry.
+    FileBusy,
+    /// COMMIT did not return a successful acknowledgement. Counted where it ran.
     Unknown,
 }
 impl From<sqlx::Error> for FenceError {
@@ -133,17 +133,6 @@ impl BatchFence {
         Ok(tx)
     }
 
-    /// Whether the claim is still current (a read; it fences nothing).
-    pub(crate) async fn current(&self, store: &Store) -> Result<bool, sqlx::Error> {
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM async_jobs WHERE id=$1 AND runner_id=$2 AND runner_epoch=$3)")
-            .bind(self.job)
-            .bind(self.runner)
-            .bind(self.epoch)
-            .fetch_one(&store.pool)
-            .await
-            .map_err(job_storage)
-    }
-
     /// A statement whose first three parameters are the fence's.
     fn query<'q>(&self, sql: &'q str) -> Query<'q, Postgres, PgArguments> {
         sqlx::query(sql)
@@ -176,7 +165,7 @@ impl BatchFence {
         store: &Store,
         lease_seconds: f64,
     ) -> Result<Renewed, sqlx::Error> {
-        let row: Option<(bool, bool)> = sqlx::query_as("UPDATE async_jobs SET runner_lease_until=clock_timestamp()+make_interval(secs=>$4) WHERE id=$1 AND runner_id=$2 AND runner_epoch=$3 RETURNING cancel_requested_at IS NOT NULL,settled_at IS NOT NULL")
+        let row: Option<(bool, bool)> = sqlx::query_as("UPDATE async_jobs SET runner_lease_until=clock_timestamp()+make_interval(secs=>$4) WHERE id=$1 AND runner_id=$2 AND runner_epoch=$3 AND runner_lease_until IS NOT NULL RETURNING cancel_requested_at IS NOT NULL,settled_at IS NOT NULL")
             .bind(self.job).bind(self.runner).bind(self.epoch).bind(lease_seconds)
             .fetch_optional(&store.pool).await.map_err(job_storage)?;
         Ok(match row {
@@ -230,34 +219,22 @@ impl BatchFence {
         store: &Store,
         f: &Finished<'_>,
     ) -> FenceResult<JobRow> {
-        let row: Option<JobRow> = sqlx::query_as(&finish_batch_sql(true))
-            .bind(self.job)
-            .bind(self.runner)
-            .bind(self.epoch)
-            .bind(f.state.as_str())
-            .bind(f.error_code)
-            .bind(f.output_file)
-            .bind(f.error_file)
-            .bind(f.counts.map(|c| c.total as i32))
-            .bind(f.counts.map(|c| c.completed as i32))
-            .bind(f.counts.map(|c| c.failed as i32))
-            .fetch_optional(&store.pool)
+        let mut tx = self.begin(store, Hold::Update).await?;
+        let row = finish_batch_tx(&mut tx, self.job, f)
             .await
-            .map_err(|e| {
-                let unknown = outcome_unknown(&e);
-                job_storage(e);
-                if unknown {
-                    FenceError::Unknown
-                } else {
-                    FenceError::Storage
+            .map_err(|error| match &error {
+                sqlx::Error::Database(e) if e.code().as_deref() == Some("55P03") => {
+                    FenceError::FileBusy
                 }
+                _ => FenceError::Storage,
             })?;
-        match row {
-            Some(row) => Ok(row),
-            // Already finished by this claim, or the claim ended.
-            None if self.current(store).await? => Ok(super::store::reload(store, self.job).await?),
-            None => Err(FenceError::Stale),
-        }
+        // An error at COMMIT cannot authorize cleanup. The sweeper can
+        // check whether the job links actually committed.
+        tx.commit().await.map_err(|e| {
+            job_storage(e);
+            FenceError::Unknown
+        })?;
+        Ok(row)
     }
 
     pub(crate) async fn mark_settled(&self, store: &Store) -> FenceResult<()> {
@@ -389,16 +366,6 @@ async fn count_lines(
         .bind(job).bind(completed).bind(failed)
         .execute(&mut **tx).await.map_err(job_storage)?;
     Ok(())
-}
-
-/// Whether a failed statement may still have been applied: the connection
-/// broke with the statement possibly sent. A server error (the statement was
-/// rolled back) and a statement that never left the pool are certain.
-pub(crate) fn outcome_unknown(error: &sqlx::Error) -> bool {
-    !matches!(
-        error,
-        sqlx::Error::Database(_) | sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed
-    )
 }
 
 fn is_unique_violation(error: &sqlx::Error) -> bool {

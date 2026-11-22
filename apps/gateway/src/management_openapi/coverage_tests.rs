@@ -275,8 +275,8 @@ fn management_openapi_coverage_microusd_markers_are_non_numeric_literals_only() 
         check(closed(json!({"cost_microusd":{"const":marker}})))
             .unwrap_or_else(|e| panic!("rejected marker {marker}: {e:#}"));
     }
-    // Only an identifier-like literal is a marker: decimals, signs, exponents
-    // and punctuation could all be read as an amount (review).
+    // The marker must be identifier-like. Numeric and punctuation forms
+    // are rejected.
     for number in [
         "", "0", "7", "-1", "-", "007", "1.5", "+5", "1e3", "-n/a-", "N/A", "nan", "inf",
         "infinity",

@@ -74,7 +74,9 @@ impl RunState {
                 self.lose();
                 Ok(None)
             }
-            Err(FenceError::Storage | FenceError::Unknown) => Err(InferenceError::Storage.into()),
+            Err(FenceError::Storage | FenceError::Unknown | FenceError::FileBusy) => {
+                Err(InferenceError::Storage.into())
+            }
         }
     }
     pub(super) fn stop_reason(&self, job: &JobRow) -> Option<Stop> {

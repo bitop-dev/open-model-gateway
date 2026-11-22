@@ -79,13 +79,8 @@ fn concrete_path(path: &str, team: Uuid) -> String {
         .replace("{token}", &filler)
 }
 
-/// A synthetic, distinct-per-call client address (#37 PR2 finding 2
-/// regression guard): the *existing*, unrelated per-IP admin-token limiter
-/// in `identity.rs` buckets every in-process request with no `ConnectInfo`
-/// under one shared "unknown peer" bucket, and the expanded matrix below
-/// issues far more requests than that bucket's burst allows. Each probe
-/// gets its own address so this test exercises the token-policy matrix,
-/// not an unrelated rate limiter it isn't about.
+/// Give each matrix probe a distinct peer so the shared unknown-peer
+/// rate limit cannot mask a token-policy response.
 fn synthetic_peer(seq: u32) -> std::net::SocketAddr {
     std::net::SocketAddr::new(
         std::net::IpAddr::V4(std::net::Ipv4Addr::from(0x0A00_0001u32.wrapping_add(seq))),
@@ -123,28 +118,10 @@ fn stub_app(s: &Store, identity: identity::IdentityState) -> Router {
         .with_state(s.clone())
 }
 
-/// TEST-FIRST (RED before this PR's authentication/authorization layer
-/// existed, every one of these requests 404'd or 401'd with no scope
-/// concept at all): every declared route's token policy is enforced
-/// exactly as declared, for every route in the inventory -- not a sample,
-/// and not only against one "a wrong scope" probe (finding 2: the original
-/// version of this test took only the *first* mismatching scope via
-/// `Iterator::find`, so a route that happened to also admit, say, the
-/// second-tried scope by mistake would never have been caught). For a
-/// `Scope(required)` route this now probes, individually, every one of the
-/// five single-scope tokens (exactly one must admit it), a token holding
-/// all five scopes together (still admitted: extra scopes never revoke the
-/// one that matters), and a token holding every *other* scope but not the
-/// required one (still refused: holding several wrong scopes at once must
-/// not accidentally satisfy the check). `Denied`/`BrowserAdminOnly` routes
-/// refuse all of that -- every single-scope token and the all-five token
-/// alike -- regardless of how many scopes the token holds.
-///
-/// Two independent oracles, not one: the per-attempt audit row
-/// (`admin_token_attempts.outcome`, the authorization decision alone) and
-/// the actual HTTP response (which also depends on route readiness --
-/// finding 1's HEAD/501 bug was invisible to the audit-only oracle alone,
-/// since the outcome is decided before the readiness check runs).
+/// Exercise the policy of every declared route against each single
+/// scope, all scopes, and, for scope-gated routes, all but the required
+/// scope. The per-attempt audit outcome records the authorization decision,
+/// and the HTTP response also checks that route readiness is enforced.
 #[dbtest::test]
 async fn every_route_enforces_its_declared_token_policy(pool: PgPool) {
     let f = fixture(&pool).await;
@@ -985,9 +962,8 @@ async fn demotion_after_authentication_but_before_the_authority_check_still_deni
     // getting back a live principal (owner still Admin at this instant).
     let principal = f.s.authenticate_admin_token(&token).await.unwrap().unwrap();
     assert_eq!(principal.owner_user_id, f.admin.user_id);
-    // Demotion commits in a separate transaction, strictly after that
-    // authentication and before the authorization check below -- the
-    // in-flight-race shape the approved spec calls out explicitly.
+    // Commit the demotion between authentication and authorization to
+    // exercise the live recheck of an in-flight request.
     sqlx::query(
         "UPDATE platform_role_grants SET revoked_at=now() WHERE user_id=$1 AND role='admin'",
     )
@@ -1060,14 +1036,9 @@ async fn head_on_a_get_only_ready_route_succeeds_with_a_correct_completion(pool:
     assert_eq!(completion_status, Some(200));
 }
 
-/// Finding 4: a database error from the live authorization recheck is
-/// reported honestly instead of being collapsed into a misleading 403
-/// "denied". Only the table `access_inner`'s live boundary check
-/// additionally needs (`workspaces`) is dropped here, not
-/// `effective_platform_roles`: dropping that would instead fail
-/// *authentication* itself (identity/session.rs, before this layer ever runs),
-/// which is a different fault than the one this test targets -- the
-/// authentication step below must still succeed.
+/// An error during live workspace authorization returns a server error.
+/// Dropping only `workspaces` keeps token authentication working and makes
+/// the authorization recheck fail.
 #[dbtest::test]
 async fn authorization_infrastructure_errors_are_distinguished_from_denials(pool: PgPool) {
     let f = fixture(&pool).await;
@@ -1118,12 +1089,8 @@ async fn authorization_infrastructure_errors_are_distinguished_from_denials(pool
     assert_eq!(outcome.as_deref(), Some("error"));
 }
 
-/// Finding 3: a per-token admission bound holds even when the same token
-/// is presented from many different client addresses, which the existing
-/// per-IP limiter alone cannot see. A tiny, test-injected per-token rate
-/// (no real-minute wait, no injected clock) exhausts deterministically
-/// within a handful of in-process requests; the replica-wide bound is set
-/// generously high here so only the per-token bound is under test.
+/// The per-token limit applies across distinct client addresses. A low
+/// test rate exhausts it within a few requests, below the replica limit.
 #[dbtest::test]
 async fn per_token_limiter_bounds_one_token_even_across_many_client_addresses(pool: PgPool) {
     let f = fixture(&pool).await;
@@ -1174,11 +1141,8 @@ async fn per_token_limiter_bounds_one_token_even_across_many_client_addresses(po
     );
 }
 
-/// Finding 3: the aggregate per-replica bound applies before a single
-/// request is even authenticated, across distinct valid tokens and distinct
-/// client addresses alike -- the per-IP and per-token limiters cannot see
-/// this shape (many different tokens, each from its own address, none
-/// individually over its own limit).
+/// The replica-wide limit applies before authentication and aggregates
+/// requests across different tokens and client addresses.
 #[dbtest::test]
 async fn replica_limiter_bounds_the_aggregate_before_authentication(pool: PgPool) {
     let f = fixture(&pool).await;
