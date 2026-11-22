@@ -12,7 +12,14 @@ OpenRouter operator price previews state an unusable base rate as unknown even w
 
 ## Upgrade
 
-Check the endpoint paths in `GATEWAY_LOCAL_UPSTREAMS` before upgrading (#758). With `url` 2.5.9, a literal caret (`^`) in a path is serialized as `%5E`. Local upstream approvals reject percent escapes, so either spelling prevents the gateway from starting. If an approval uses a caret, expose the upstream at a caret-free path ending in `/v1`. On the old gateway version, add the new approval alongside the old one and restart to load both. Create a replacement local connection and deployments for the existing models. Carry over pricing and any batch scheduling settings, including updating any metrics URL that uses the old path. Verify the replacement deployments, disable the old deployments, then remove the caret-bearing approval before starting the upgraded gateway. See [connection and deployment management](../management-api.md) and [batch scheduling](../batches.md).
+Check the endpoint paths in `GATEWAY_LOCAL_UPSTREAMS` before upgrading (#758). With `url` 2.5.9, a literal caret (`^`) in a path is serialized as `%5E`. Local upstream approvals reject percent escapes, so either spelling prevents the gateway from starting. If an approval uses a caret, complete these steps on the old gateway version before upgrading.
+
+1. Expose the upstream at a caret-free path ending in `/v1`. Add the new approval alongside the old one and restart the old gateway to load both.
+2. Create a replacement local connection and deployments for the existing models. Before enabling each replacement, copy the old deployment’s routing settings, including residency, priority and weight, publish its pricing, and carry over its batch scheduling settings.
+3. Check the batch metrics URL on **every deployment that will remain active**. Update any URL that relies on the old approval, including URLs on deployments served by other connections.
+4. Enable and exercise each replacement. While both routes are available, confirm from the request’s execution record that the replacement deployment handled it. Once each replacement is verified, disable the old deployments and remove the caret-bearing approval before starting the upgraded gateway.
+
+See [connection and deployment management](../management-api.md) and [batch scheduling](../batches.md).
 
 - **Scheduled-report delivery and tzdb** (#748). After migration 0084, the scheduler reconciles pending civil delivery instants with the bundled timezone rules in bounded batches. UTC accounting periods and existing snapshots are retained. Drain older replicas, run the matching migrator, then apply and verify runtime grants. The migration fences the old report scheduler lease and builds a pending-calendar index. See the [scheduled-report rollout](../operations.md#scheduled-report-rollout-and-rehearsal-102).
 
