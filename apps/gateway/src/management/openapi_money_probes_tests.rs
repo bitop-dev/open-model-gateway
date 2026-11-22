@@ -320,9 +320,9 @@ impl Vx<'_> {
                 .await;
             }
         }
-        // Both filters at their limit in four-byte characters: the whole
-        // percent-encoded query (2 x 2400 bytes plus dates) is within the raw
-        // query bound, so the character limit alone decides (#405 review).
+        // Both filters reach the character limit with four-byte characters. The
+        // percent-encoded query still fits the raw byte limit, isolating the
+        // character check.
         self.probe_query(
             "model and provider filters of 200 four-byte characters each",
             self.auditor,
