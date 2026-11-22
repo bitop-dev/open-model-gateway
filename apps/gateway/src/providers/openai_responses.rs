@@ -292,7 +292,12 @@ impl State {
                 self.output_done(&value)
             }
             "response.output_item.done" if self.started => self.output_item_done(&value),
-            "response.completed" | "response.incomplete" if self.started => {
+            "response.completed" | "response.incomplete" => {
+                // A rejected terminal snapshot still closes the stream.
+                self.done = true;
+                if !self.started {
+                    return Err(InferenceError::InvalidUpstream);
+                }
                 self.terminal(kind, &value, frame)
             }
             // `error` carries the code at the top level; `response.failed`
@@ -526,7 +531,6 @@ impl State {
                 || Some(Ok(response.usage)),
             );
         }
-        self.done = true;
         Ok(vec![
             ChatEvent::Finish(response.finish_reason),
             ChatEvent::Usage(response.usage),
