@@ -110,7 +110,6 @@ async fn enterprise_runtime_allowlist_and_rollback_probes(pool: PgPool) {
     store.apply_runtime_grants().await.unwrap();
     // Idempotent: reapplying after every migration must succeed.
     store.apply_runtime_grants().await.unwrap();
-    report_probe_releases_lease(&pool).await;
     store.verify_runtime_grants().await.unwrap();
     assert!(
         store.is_ready().await,
@@ -194,6 +193,7 @@ async fn enterprise_runtime_allowlist_and_rollback_probes(pool: PgPool) {
         0,
         "rollback-only probe persisted configuration versions or lease terms"
     );
+    report_probe_releases_lease(&pool).await;
     change_notifications_and_leases_run_as_runtime(&pool).await;
     alert_evaluation_runs_as_runtime(&pool).await;
     realtime_accounting_runs_as_runtime(&pool).await;
