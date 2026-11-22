@@ -526,6 +526,7 @@ pub(crate) mod mock {
 
     /// Report DATA immediately but gate its SMTP acknowledgement, so tests
     /// can commit authority changes between two sequential recipients.
+    #[cfg(feature = "integration-tests")]
     pub(crate) async fn serve_gated() -> (
         u16,
         mpsc::UnboundedReceiver<Received>,

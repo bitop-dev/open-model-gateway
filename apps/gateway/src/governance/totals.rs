@@ -329,7 +329,7 @@ pub(crate) async fn verify_in(
 
 /// The former admission-time scan of one scope over `[start, end)`, kept as
 /// the test oracle for the maintained totals.
-#[cfg(test)]
+#[cfg(all(test, feature = "integration-tests"))]
 pub(crate) async fn scan_consumption(
     tx: &mut Transaction<'_, Postgres>,
     workspace: Option<Uuid>,
