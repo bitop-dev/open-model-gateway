@@ -72,7 +72,7 @@ impl Outcome {
         }
     }
 }
-pub(crate) const SELECT_ELIGIBLE: &str = "SELECT i.id FROM unnest($1::uuid[]) WITH ORDINALITY i(id,n) LEFT JOIN LATERAL (SELECT schedule_id,expires_at FROM report_generation_claims WHERE schedule_id=i.id OFFSET 0) c ON true WHERE c.schedule_id IS NULL OR c.expires_at<=$2 ORDER BY c.expires_at NULLS FIRST,i.n LIMIT $3";
+pub(crate) const SELECT_ELIGIBLE: &str = "SELECT i.id FROM unnest($1::uuid[]) WITH ORDINALITY i(id,n) LEFT JOIN LATERAL (SELECT schedule_id,expires_at FROM report_generation_claims WHERE schedule_id=i.id OFFSET 0) c ON true WHERE c.schedule_id IS NULL OR c.expires_at<=$2 ORDER BY i.n LIMIT $3";
 const PER_TICK: i64 = 8;
 pub(crate) const CALENDAR_PAGE: i64 = 128;
 const CALENDAR_PAGES_PER_PASS: usize = 16;
@@ -545,6 +545,14 @@ async fn select_tick_with_clock(
         .bind(PER_TICK)
         .fetch_all(&mut *tx)
         .await?;
+    // A full tick stops at the last selected key. Selection follows the index
+    // order so a missed claim advances the scan without skipping the eligible tail.
+    let next_frontier = match ids.last() {
+        Some(last) if ids.len() == PER_TICK as usize => {
+            candidates.iter().find(|(_, id)| id == last)
+        }
+        _ => candidates.last(),
+    };
     // Backlog metrics are deliberately saturated, never an unbounded COUNT.
     let backlog:i64=sqlx::query_scalar("SELECT count(*) FROM (SELECT 1 FROM report_schedules WHERE state='active' AND deleted_at IS NULL AND coalesce(next_run_at,'0001-01-01 00:00:00+00'::timestamptz)<=$1 ORDER BY coalesce(next_run_at,'0001-01-01 00:00:00+00'::timestamptz),id LIMIT 1025) bounded")
         .bind(cutoff).fetch_one(&mut *tx).await?;
@@ -554,7 +562,7 @@ async fn select_tick_with_clock(
     *store
         .report_dispatch
         .lock()
-        .unwrap_or_else(|e| e.into_inner()) = candidates.last().copied();
+        .unwrap_or_else(|e| e.into_inner()) = next_frontier.copied();
     crate::metrics::METRICS.set_report_queue(backlog.min(1024), backlog > 1024, lag.unwrap_or(0));
     Ok((pending, ids))
 }
