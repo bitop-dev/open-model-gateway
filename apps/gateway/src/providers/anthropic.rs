@@ -429,6 +429,7 @@ impl State {
         }
         let mut events = vec![];
         if value["type"] == "error" {
+            self.done = true;
             return Err(stream_error(&value, self.messages));
         }
         match value["type"].as_str() {
@@ -448,8 +449,11 @@ impl State {
             Some("message_delta") if self.started && !self.finished && self.active.is_none() => {
                 self.message_delta(&value, &mut events)?;
             }
-            Some("message_stop") if self.finished => {
+            Some("message_stop") => {
                 self.done = true;
+                if !self.finished {
+                    return Err(InferenceError::InvalidUpstream);
+                }
                 events.push(ChatEvent::Usage(self.usage));
                 events.push(ChatEvent::Done);
             }
