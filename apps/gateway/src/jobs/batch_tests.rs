@@ -259,6 +259,13 @@ impl ProviderAdapter for Fake {
                     usage: cached,
                 }))
             }
+            "oversized-result" => Ok(ProviderOutput::Complete(ChatResponse {
+                messages_content: None,
+                content: Some("\0".repeat(super::io::RESULT_LINE_BYTES / 6)),
+                tool_calls: vec![],
+                finish_reason: FinishReason::Stop,
+                usage: usage(10, 5),
+            })),
             "fail" => Err(InferenceError::UpstreamUnavailable),
             "busy" => Err(InferenceError::Busy),
             "slow" => {
@@ -3160,8 +3167,10 @@ async fn memoized_refusal_classification_stays_per_line(pool: PgPool) {
 }
 
 mod bedrock;
+mod durable;
 mod envelope;
 mod fence;
+mod http_support;
 
 /// Streaming classification must not change the non-stream classes that drive
 /// explicit line retries: OpenAI invalid output is not retryable; OpenRouter's
