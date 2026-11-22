@@ -361,6 +361,84 @@ async fn check(
     }
 }
 
+#[dbtest::test]
+async fn anthropic_stop_reason_controls_stream_success_and_settlement(pool: PgPool) {
+    let kind = Kind::Anthropic;
+    let w = world(pool, kind, false).await;
+    let (content, _, stop) = kind.valid();
+    let wire = |reason| {
+        let delta = sse(&[
+            json!({"type":"content_block_stop","index":0}),
+            json!({
+                "type":"message_delta",
+                "delta":{"stop_reason":reason,"stop_sequence":null},
+                "usage":{"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}
+            }),
+        ]);
+        [content.as_slice(), &delta, &stop].concat()
+    };
+    let invalid = wire("unknown_reason");
+    let valid = wire("end_turn");
+
+    for client in clients(kind) {
+        let reply = w.ask(client, vec![Step::Bytes(invalid.clone())]).await;
+        let mut problems = Vec::new();
+        check(
+            &w,
+            client,
+            &reply,
+            InferenceError::InvalidUpstream,
+            None,
+            "invalid Anthropic stop reason",
+            &mut problems,
+        )
+        .await;
+        assert!(problems.is_empty(), "{client:?}: {problems:#?}");
+        assert!(reply.body.contains("Hello"), "{client:?}");
+        let events: Vec<Value> = reply
+            .body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect();
+        assert_eq!(
+            events.iter().filter(|e| e.get("error").is_some()).count(),
+            1
+        );
+        assert!(
+            events
+                .iter()
+                .all(|e| { e["usage"].is_null() && e["choices"][0]["finish_reason"].is_null() })
+        );
+
+        let reply = w.ask(client, vec![Step::Bytes(valid.clone())]).await;
+        assert_eq!(reply.status, 200, "{client:?}");
+        let terminal = if client == Client::Messages {
+            "event: message_stop"
+        } else {
+            "data: [DONE]"
+        };
+        assert_eq!(
+            reply.body.lines().filter(|line| *line == terminal).count(),
+            1
+        );
+        assert_eq!(
+            recorded(&w.f.store.pool, w.deployment, reply.id).await,
+            Recorded {
+                state: "succeeded".into(),
+                error_code: None,
+                input: Some(4),
+                output: Some(2),
+                reservation: "settled".into(),
+                actual: Some(6),
+                ledger: vec!["hold".into(), "settlement".into()],
+                health_failures: 0,
+            },
+            "{client:?}"
+        );
+    }
+}
+
 /// Every in-stream error name, each client protocol, before and after
 /// content: the 200 ends in the class the same error has as an HTTP response,
 /// and nothing about settlement changes.
