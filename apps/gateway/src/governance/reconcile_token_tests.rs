@@ -1,13 +1,6 @@
-//! #37 PR2 coordinator review (blocking): `resolve_usage`'s caller
-//! authenticates a request's credential (browser session or admin token) in
-//! its own transaction, which commits before `resolve_usage` ever opens its
-//! own. An admin token revoked, or expired, between those two transactions
-//! must still refuse the write here -- the *second* transaction -- not
-//! merely at the first (already-committed) authentication. These tests
-//! exercise the real `governance::resolve_usage` path end to end (not just
-//! the `management::resources` helper it now shares), per the coordinator's
-//! explicit instruction not to rely solely on that helper's own test
-//! coverage to stand in for this one.
+//! The inference reconciliation write checks the credential again in its own
+//! transaction. These tests use `resolve_usage` to prove that a token revoked
+//! or expired after the initial authentication transaction cannot settle usage.
 use super::*;
 use crate::{
     admin_tokens,

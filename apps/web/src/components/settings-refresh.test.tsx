@@ -64,7 +64,7 @@ describe("authoritative settings refresh", () => {
     const view = (value: string) => <QueryClientProvider client={c}><SettingsForm fields={fields(value)} writable={false} onSave={vi.fn()} /></QueryClientProvider>;
     const { rerender } = render(view("12.34"));
     rerender(view("100.00"));
-    // Read-only settings are a description list, not disabled inputs (review rule 12).
+    // The description list shows the refreshed value in read-only mode.
     await waitFor(() => expect(screen.getByText("100.00")).toBeTruthy());
     expect(screen.queryByRole("textbox")).toBeNull();
     expect(screen.queryByRole("button", { name: /Save/ })).toBeNull();

@@ -5,13 +5,9 @@ import ts from "typescript";
 import { describe, expect, it } from "vitest";
 
 /*
- * Comments state invariants, not review history (AGENTS.md, #595). A comment
- * that records who asked for a change and when ("#89 review item 6", "found in
- * the review of #37") goes stale and hands the next agent a justification to
- * copy instead of a rule to follow; git history and the PR record why. This
- * check refuses such comments in the production sources of `apps/web/src`
- * (every `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs` file except tests, which
- * are out of scope, and `.d.ts`).
+ * Source comments explain the behavior the code implements or proves.
+ * The PR and git history record how the code changed. This check scans
+ * `apps/web/src`, including test sources, and excludes `.d.ts` declarations.
  *
  * Comments are read from the TypeScript parser's token stream (the comment
  * ranges around every token), not by line patterns: a string, template, regular
@@ -203,7 +199,7 @@ function scan(rules: Rules, file: string, text: string): { comments: number; hit
 // ---- the tree ----------------------------------------------------------
 
 const SOURCE_FILE = /\.[cm]?[jt]sx?$/;
-const productionSource = (path: string) => SOURCE_FILE.test(path) && !/\.test\.[cm]?[jt]sx?$/.test(path) && !/\.d\.ts$/.test(path);
+const sourceFile = (path: string) => SOURCE_FILE.test(path) && !path.endsWith(".d.ts");
 
 function walk(dir: string, out: string[] = []): string[] {
   for (const name of readdirSync(dir)) {
@@ -217,7 +213,7 @@ function walk(dir: string, out: string[] = []): string[] {
 const rel = (path: string) => relative(web, path).split(sep).join("/");
 
 function scanTree(rules: Rules) {
-  const files = walk(join(web, "src")).filter(productionSource);
+  const files = walk(join(web, "src")).filter(sourceFile);
   let comments = 0;
   const hits: Hit[] = [];
   for (const path of files) {
@@ -355,13 +351,12 @@ describe("comments state invariants, not review history", () => {
     }
   });
 
-  it("finds no review history in the production sources", () => {
+  it("finds no review history in source files", () => {
     const { files, comments, hits } = scanTree(rules);
-    // A floor, so a walk that finds nothing cannot pass.
-    // About 90% of what the tree held when the check landed (221 files, 2,272 comments).
+    // A floor so a walk that misses much of src cannot pass.
     expect(
-      files >= 199 && comments >= 2040,
-      `read ${files} production files and ${comments} comments; the floor is 199 files and 2,040 comments`,
+      files >= 300 && comments >= 2040,
+      `read ${files} source files and ${comments} comments; the floor is 300 files and 2,040 comments`,
     ).toBe(true);
     for (const [file, text, reason] of ALLOWED) {
       expect(
@@ -376,5 +371,5 @@ describe("comments state invariants, not review history", () => {
       refused,
       `${refused.length} comment(s) record review history; state the invariant instead (git history and the PR hold the rest)`,
     ).toEqual([]);
-  });
+  }, 20_000);
 });

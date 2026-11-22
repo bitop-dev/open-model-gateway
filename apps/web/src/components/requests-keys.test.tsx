@@ -201,7 +201,7 @@ describe("Effective access", () => {
     expect(html).not.toContain(">This key<");
     const card = markup(<AccessCard workspace={team} />, [[`${ws}/access`, access]]);
     expect(card).toContain("1 available · 1 unavailable"); expect(card).not.toContain("partly");
-    expect(card).toMatch(/<a[^>]*href="\/workspaces\/team\/settings\?tab=access"[^>]*>See why/); expect(card).not.toContain("see why"); // one header link (review #41), to the Access tab
+    expect(card).toMatch(/<a[^>]*href="\/workspaces\/team\/settings\?tab=access"[^>]*>See why/); expect(card).not.toContain("see why"); // The header links to the Access tab for details.
     // Layers are collapsed under "How limits combine", after the per-model reasons.
     expect(html.indexOf("Why can&#x27;t I use this model?")).toBeLessThan(html.indexOf("How limits combine"));
   });

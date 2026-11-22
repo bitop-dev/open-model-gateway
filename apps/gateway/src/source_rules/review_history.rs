@@ -1,20 +1,10 @@
-//! Comments state invariants, not review history (AGENTS.md, #595). A comment
-//! that records who asked for a change and when ("#98 PR 2 review item 5:",
-//! "found in the review of #37") goes stale and hands the next agent a
-//! justification to copy instead of a rule to follow; git history and the PR
-//! record why. This scan refuses such comments in the production sources of
-//! the crate (`lib.rs` and `main.rs` and every module below them, as
-//! [`super::tree`] reads them; `cfg(test)` code is out of scope, so are
-//! `tests/`, `benches/` and files only a test build reaches).
+//! Source comments explain the behavior the code implements or proves.
+//! The PR and git history record how the code changed. This scan reads all
+//! Rust files in `apps/gateway/src`, including inline and file-based tests.
 //!
-//! Comments are read from the source text with a small Rust lexer, not by
-//! line patterns: a string, raw string, byte string or character literal that
-//! holds `//` or the words is not a comment; every `//`, `///`, `//!`, `/* */`,
-//! `/** */` and `/*! */` is, doc comments included (`syn` keeps those as
-//! attributes and drops the others, so it cannot be the reader). Items `syn`
-//! prunes as test-only are located by span and their comments skipped.
-//! `#[doc = "..."]` written as an attribute is a string, not a comment, and is
-//! not read.
+//! A lexer reads line, block and doc comments directly from the source.
+//! It skips string, raw string, byte string and character literals, including
+//! text assigned with `#[doc = "..."]`.
 //!
 //! The patterns live in `review_history.patterns`, shared with the web check
 //! (`apps/web/src/lib/review-history.test.ts`); the format, what is refused and
@@ -26,13 +16,8 @@
 //! [`ALLOWED`] with its reason; a stale entry fails. The list is empty.
 //!
 //! Cannot see: history written without one of the phrasings (a free-form
-//! "after the last round of changes"), a comment inside a macro invocation
-//! that the macro turns into code, history in a string that becomes a doc
-//! (`#[doc = ...]`), and comments in non-Rust files (SQL migrations, YAML,
-//! docs).
-use std::collections::BTreeSet;
-
-use super::tree::{dropped_spans, production, src_dir};
+//! "after the last round of changes") or comments outside the Rust source tree.
+use super::tree::src_dir;
 
 const PATTERNS: &str = include_str!("review_history.patterns");
 
@@ -467,20 +452,9 @@ struct Hit {
     text: String,
 }
 
-/// The refused comments of one production file's text, leaving out comments
-/// inside items a production build drops (`cfg(test)`, `#[test]`).
+/// The refused comments of one Rust source file.
 fn scan(rules: &Rules, file: &str, source: &str) -> (usize, Vec<Hit>) {
-    let parsed = syn::parse_file(source).unwrap_or_else(|e| panic!("{file}: {e}"));
-    let dropped = dropped_spans(&parsed);
-    let all = comments(source);
-    let kept: Vec<Comment> = all
-        .into_iter()
-        .filter(|c| {
-            let start = (c.line, c.column);
-            !dropped.iter().any(|(a, b)| *a <= start && start <= *b)
-        })
-        .collect();
-    let blocks = blocks(kept);
+    let blocks = blocks(comments(source));
     let count = blocks.len();
     let hits = blocks
         .into_iter()
@@ -503,20 +477,38 @@ fn is_allowed(hit: &Hit) -> bool {
         .any(|(file, text, _)| *file == hit.file && *text == hit.text)
 }
 
-/// (files, comment blocks, hits) of the production tree.
+/// (files, comment blocks, hits) of the crate's src directory.
 fn scan_tree(rules: &Rules) -> (usize, usize, Vec<Hit>) {
     let src = src_dir();
-    let mut files = BTreeSet::new();
-    for entry in ["lib.rs", "main.rs"] {
-        for source in production(entry) {
-            files.insert(source.path);
+    let mut files = Vec::new();
+    let mut dirs = vec![src.clone()];
+    while let Some(dir) = dirs.pop() {
+        for entry in dir
+            .read_dir()
+            .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        {
+            let entry = entry.unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+            let path = entry.path();
+            let kind = entry
+                .file_type()
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            if kind.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
         }
     }
+    files.sort();
     let (mut blocks, mut hits) = (0, Vec::new());
-    for file in &files {
-        let text =
-            std::fs::read_to_string(src.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
-        let (count, found) = scan(rules, file, &text);
+    for path in &files {
+        let file = path
+            .strip_prefix(&src)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{file}: {e}"));
+        let (count, found) = scan(rules, &file, &text);
         blocks += count;
         hits.extend(found);
     }
@@ -700,47 +692,47 @@ fn f() -> usize {
     }
 
     #[test]
-    fn test_only_code_is_out_of_scope_and_the_rest_is_not() {
+    fn test_and_production_comments_are_both_read() {
         let rules = rules();
         let planted = "// #98 PR 2 review item 5: planted";
         for (source, expected) in [
             (
                 format!("#[cfg(test)]\nmod tests {{\n    {planted}\n    fn t() {{}}\n}}\n"),
-                0,
+                1,
             ),
-            (format!("#[cfg(test)] mod tests {{ /* {planted} */ }}\n"), 0),
+            (format!("#[cfg(test)] mod tests {{ /* {planted} */ }}\n"), 1),
             (
                 format!("#[cfg(test)]\n/// {planted}\nfn helper() {{}}\n"),
-                0,
+                1,
             ),
-            (format!("#[test]\nfn t() {{\n    {planted}\n}}\n"), 0),
+            (format!("#[test]\nfn t() {{\n    {planted}\n}}\n"), 1),
             (
                 format!("#[tokio::test]\nasync fn t() {{\n    {planted}\n}}\n"),
-                0,
+                1,
             ),
             (
                 format!("#[cfg(all(test, feature = \"x\"))]\nmod t {{\n    {planted}\n}}\n"),
-                0,
+                1,
             ),
             (
                 format!(
                     "struct S;\nimpl S {{\n    #[cfg(test)]\n    fn t(&self) {{\n        {planted}\n    }}\n}}\n"
                 ),
-                0,
+                1,
             ),
             (
                 format!(
                     "trait T {{\n    #[cfg(test)]\n    fn t(&self) {{\n        {planted}\n    }}\n}}\n"
                 ),
-                0,
+                1,
             ),
             (
                 format!(
                     "mod m {{\n    #[cfg(test)]\n    mod tests {{\n        {planted}\n    }}\n}}\n"
                 ),
-                0,
+                1,
             ),
-            // Production code that merely sits next to or around them.
+            // Production comments are still read beside test modules.
             (
                 format!("#[cfg(test)]\nmod tests {{}}\n{planted}\nfn f() {{}}\n"),
                 1,
@@ -775,7 +767,7 @@ fn f() -> usize {
                 format!(
                     "fn f() {{\n    {planted}\n}}\n#[cfg(test)]\nmod tests {{\n    {planted}\n}}\n"
                 ),
-                1,
+                2,
             ),
         ] {
             let (_, hits) = scan(&rules, "scope.rs", &source);
@@ -784,7 +776,7 @@ fn f() -> usize {
     }
 
     #[test]
-    fn a_doc_comment_before_a_test_only_attribute_goes_with_the_item() {
+    fn doc_comments_are_read_on_both_test_and_production_items() {
         let rules = rules();
         for source in [
             "/// #98 PR 2 review item 5 planted\n#[cfg(test)]\nfn f() {}\n",
@@ -793,7 +785,7 @@ fn f() -> usize {
             "/// #98 PR 2 review item 5 planted\n#[test]\nfn f() {}\n",
         ] {
             let (_, hits) = scan(&rules, "doc_before.rs", source);
-            assert!(hits.is_empty(), "{source:?}: {hits:?}");
+            assert_eq!(hits.len(), 1, "{source:?}: {hits:?}");
         }
         // The same doc comment on a production item is read.
         let (_, hits) = scan(
@@ -826,14 +818,6 @@ fn f() -> usize {
     }
 
     #[test]
-    fn spans_carry_positions() {
-        // `proc-macro2/span-locations` is on for tests: with it off every
-        // position is 0:0 and the test-only items would never be excluded.
-        let file = syn::parse_file("fn f() {}\n#[cfg(test)]\nmod t {\n}\n").unwrap();
-        assert_eq!(dropped_spans(&file), vec![((2, 0), (4, 1))]);
-    }
-
-    #[test]
     fn the_allowlist_matches_exactly_and_a_stale_entry_fails() {
         let hit = |file: &str, text: &str| Hit {
             file: file.to_owned(),
@@ -853,14 +837,13 @@ fn f() -> usize {
     }
 
     #[test]
-    fn production_comments_state_invariants_not_review_history() {
+    fn source_comments_state_invariants_without_review_history() {
         let rules = rules();
         let (files, blocks, hits) = scan_tree(&rules);
-        // A floor, about 90% of what the tree held when the check landed (261
-        // files, 4,313 comments), so a walk that finds nothing cannot pass.
+        // A floor so a walk that misses much of src cannot pass.
         assert!(
-            files >= 235 && blocks >= 3_880,
-            "read {files} production files and {blocks} comments; the floor is 235 files and 3,880 comments"
+            files >= 500 && blocks >= 3_880,
+            "read {files} Rust files and {blocks} comments; the floor is 500 files and 3,880 comments"
         );
         // Every allowlist entry must still match a comment.
         let hits_all: Vec<&Hit> = hits.iter().collect();
