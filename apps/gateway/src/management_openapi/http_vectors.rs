@@ -1104,12 +1104,13 @@ fn straddles(
     notes: &mut Notes,
     mut confirms: impl FnMut(&str, &Value, Option<&Value>, &str, &str) -> Result<bool>,
 ) -> Result<bool> {
+    let mut remaining_variant_bytes = 64 * 1024;
     let patterns: Vec<_> = strings(nodes, "pattern")
         .into_iter()
         .map(|p| {
             let width = pattern_width(p);
             let wider = width
-                .map(|w| wider_patterns(p, w.chars))
+                .map(|w| wider_patterns(p, w.chars, &mut remaining_variant_bytes))
                 .transpose()?
                 .unwrap_or_default();
             Ok((p, width, wider))
@@ -1784,6 +1785,14 @@ pub(super) fn query_plan(
                 &mut notes,
                 |key, bound, replacement, accepted, refused| {
                     let accepted = wire_value(schema, accepted)?;
+                    if !accepted.is_string() {
+                        return Ok(false);
+                    }
+                    if let ("pattern", Some(pattern)) = (key, bound.as_str())
+                        && !super::validation::pattern_validator(pattern)?.is_valid(&accepted)
+                    {
+                        return Ok(false);
+                    }
                     for variant in supplied_boundaries::relaxations(
                         document,
                         schema,

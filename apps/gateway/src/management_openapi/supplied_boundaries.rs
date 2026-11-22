@@ -211,7 +211,11 @@ pub(super) fn pattern_width(pattern: &str) -> Option<PatternWidth> {
 
 /// Widen a single variable-count range by one repetition. Source spans
 /// preserve the repeated atom, surrounding alternatives, anchors and flags.
-pub(super) fn wider_patterns(pattern: &str, width: usize) -> Result<Vec<(String, usize)>> {
+pub(super) fn wider_patterns(
+    pattern: &str,
+    width: usize,
+    remaining_variant_bytes: &mut usize,
+) -> Result<Vec<(String, usize)>> {
     use regex_syntax::ast::{Ast, RepetitionKind, RepetitionRange, parse::Parser};
     let ast = Parser::new().parse(pattern)?;
     let mut pending = vec![(&ast, false)];
@@ -227,13 +231,18 @@ pub(super) fn wider_patterns(pattern: &str, width: usize) -> Result<Vec<(String,
                     && min < max
                     && let Some(next) = max.checked_add(1)
                 {
-                    let mut variant = pattern.to_owned();
                     let span = &rep.op.span;
                     let suffix = if rep.greedy { "" } else { "?" };
-                    variant.replace_range(
-                        span.start.offset..span.end.offset,
-                        &format!("{{{min},{next}}}{suffix}"),
-                    );
+                    let replacement = format!("{{{min},{next}}}{suffix}");
+                    let range = span.start.offset..span.end.offset;
+                    let size = pattern.len() - range.len() + replacement.len();
+                    // Charge every attempted variant before allocating or parsing it.
+                    *remaining_variant_bytes =
+                        remaining_variant_bytes.checked_sub(size).ok_or_else(|| {
+                            anyhow::anyhow!("supplied boundary regex derivation budget exceeded")
+                        })?;
+                    let mut variant = pattern.to_owned();
+                    variant.replace_range(range, &replacement);
                     if let Some(new_width) = pattern_width(&variant)
                         && new_width.chars > width
                     {
