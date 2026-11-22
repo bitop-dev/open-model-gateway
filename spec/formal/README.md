@@ -75,7 +75,7 @@ Three different "leases" exist:
   the 0029 SQL ([`w.expires_at>clock_timestamp() FOR SHARE`](../../apps/gateway/enterprise_migrations/0029_work_leases.sql#L72)) and is held until commit. The money
   path itself uses none: reconciliation is a `SKIP LOCKED` queue on every replica.
 * A third: the gateway-run batch runner claim (`async_jobs.runner_id` / `runner_epoch` /
-  `runner_lease_until`, [`runner_epoch=runner_epoch+1`](../../apps/gateway/src/jobs/store.rs#L474)). It was unfenced when this model was written and
+  `runner_lease_until`, [`runner_epoch=runner_epoch+1`](../../apps/gateway/src/jobs/store.rs#L507)). It was unfenced when this model was written and
   is fenced since 0081 (#638): see finding 1.
 
 ## 2. What is modelled, and what is not

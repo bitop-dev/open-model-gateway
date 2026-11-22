@@ -46,6 +46,8 @@ pub(crate) enum FenceError {
     Stale,
     /// A write failed and was not applied. Counted where it ran.
     Storage,
+    /// Result file locked by a concurrent operation. The batch can retry.
+    FileBusy,
     /// COMMIT did not return a successful acknowledgement. Counted where it ran.
     Unknown,
 }
@@ -218,7 +220,14 @@ impl BatchFence {
         f: &Finished<'_>,
     ) -> FenceResult<JobRow> {
         let mut tx = self.begin(store, Hold::Update).await?;
-        let row = finish_batch_tx(&mut tx, self.job, f).await?;
+        let row = finish_batch_tx(&mut tx, self.job, f)
+            .await
+            .map_err(|error| match &error {
+                sqlx::Error::Database(e) if e.code().as_deref() == Some("55P03") => {
+                    FenceError::FileBusy
+                }
+                _ => FenceError::Storage,
+            })?;
         // An error at COMMIT cannot authorize cleanup. The sweeper can
         // check whether the job links actually committed.
         tx.commit().await.map_err(|e| {

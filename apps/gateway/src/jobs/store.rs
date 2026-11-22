@@ -431,11 +431,13 @@ pub(super) async fn finish_batch_tx(
     ids.sort_unstable();
     ids.dedup();
     if !ids.is_empty() {
+        // Rekey holds its file lock across object I/O. Keep the job lock
+        // available for takeover by failing promptly on a busy result.
         let files: Vec<Uuid> = sqlx::query_scalar(
             "SELECT id FROM stored_files WHERE id=ANY($1) AND workspace_id=$2
              AND api_purpose='batch_output' AND committed_at IS NOT NULL
              AND deleted_at IS NULL AND last_delete_attempt_at IS NULL
-             ORDER BY id FOR NO KEY UPDATE",
+             ORDER BY id FOR NO KEY UPDATE NOWAIT",
         )
         .bind(&ids)
         .bind(job.workspace_id)

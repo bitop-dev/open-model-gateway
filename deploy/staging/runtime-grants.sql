@@ -343,9 +343,14 @@ GRANT EXECUTE ON FUNCTION public.valid_model_protocols_base(text[]),
 -- filename/content type. Identity, ownership, purpose and backend are fixed (the
 -- key id changes only through `files rekey`); size/sha256/committed_at are written once and deleted rows are final (trigger).
 -- Batch finalization locks result rows against deletion claims. The sweeper
--- checks the output/error references using the existing SELECT on async_jobs.
+-- checks indexed output/error references using the existing SELECT on async_jobs.
+-- The batch result marker is written only by the job trigger (0085).
 -- Settings: per-group toggles, retention and the last storage health check.
-GRANT SELECT,INSERT ON public.stored_files TO gateway_runtime;
+GRANT SELECT ON public.stored_files TO gateway_runtime;
+GRANT INSERT(id,object_key,purpose,workspace_id,created_by_user_id,created_by_api_key_id,
+ filename,content_type,size_bytes,sha256,backend,encryption_key_id,created_at,committed_at,
+ expires_at,deleted_at,delete_attempts,last_delete_attempt_at,last_delete_error,api_purpose,
+ reserved_bytes) ON public.stored_files TO gateway_runtime;
 GRANT UPDATE(size_bytes,sha256,committed_at,expires_at,deleted_at,filename,content_type,
  delete_attempts,last_delete_attempt_at,last_delete_error) ON public.stored_files TO gateway_runtime;
 -- `files rekey` (#35) records the master key an object was re-wrapped under.
