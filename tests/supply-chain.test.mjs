@@ -1640,13 +1640,15 @@ function probeFixture() {
     GITHUB_REPOSITORY: "bitop-dev/open-model-gateway", IMAGE: "ghcr.io/bitop-dev/open-model-gateway", GITHUB_ACTOR: "probe-fixture",
     DIGEST: `sha256:${"b".repeat(64)}`, CHILD: `sha256:${"c".repeat(64)}`,
     FIXTURE_DIR: dir,
+    FIXTURE_PRIMARY_BUNDLE: JSON.stringify(probeBundle()) + "\n",
+    FIXTURE_SECONDARY_BUNDLE: JSON.stringify(probeBundle("fixture-second")) + "\n",
     REPORTED_VERSION: `open-model-gateway ${readFileSync(join(root, "apps/gateway/Cargo.toml"), "utf8").match(/^version = "([^"]+)"$/m)[1]}`,
   };
   const mock = `#!${process.execPath}
 const fs = require('node:fs');
 const path = require('node:path');
 const e = process.env, a = process.argv.slice(2), command = path.basename(process.argv[1]);
-fs.appendFileSync(path.join(e.FIXTURE_DIR, 'calls'), JSON.stringify([command, ...a]) + '\\n');
+fs.appendFileSync(path.join(e.FIXTURE_DIR, 'calls'), [a.length + 1, command, ...a, ''].join('\\0'));
 const fail = (message, code = 1) => { console.error(message); process.exit(code); };
 if (command === 'docker') {
   if (a[0] === 'login') {
@@ -1719,7 +1721,7 @@ fail() {
 }
 
 # Record the invocation before any local refusal so a premature call is observable.
-jq -nc --args '["cosign", $ARGS.positional[]]' -- "$@" >>"$FIXTURE_DIR/calls"
+printf '%s\\0' "$(($# + 1))" cosign "$@" >>"$FIXTURE_DIR/calls"
 
 artifact=\${!#}
 bundle_path=
@@ -1739,25 +1741,29 @@ files=(*)
 if [[ $bundle_path != ./bundle.json || \${#files[@]} != 1 || \${files[0]} != bundle.json ]]; then
   fail 'bundle verification needs a fresh isolated directory'
 fi
-# GNU and BSD stat use different format flags.
-modes=$(stat -c '%a' . "$bundle_path" 2>/dev/null || stat -f '%Lp' . "$bundle_path")
+# Replace the command-substitution shell with stat. GNU and BSD use different flags.
+if ! modes=$(exec stat -c '%a' . "$bundle_path" 2>/dev/null); then
+  modes=$(exec stat -f '%Lp' . "$bundle_path")
+fi
 [[ $modes == $'700\\n600' ]] || fail 'bundle data is not private'
 if [[ ! $artifact =~ ^sha256:[0-9a-f]{64}$ || -e $artifact ]]; then
   fail 'expected a digest, not a file'
 fi
 
-# Read the validated bundle once for the metadata record and payload check.
+# Read the exact bytes, including the final newline. A NUL is invalid JSON.
+if IFS= read -r -d '' bundle < "$bundle_path"; then
+  fail 'fixture tampered payload or bad digest'
+fi
+# Both canonical fixture bundles have accepted payloads. Parse any other
+# bundle so the fixture still checks the payload in noncanonical JSON.
+valid=true
+if [[ $bundle != "$FIXTURE_PRIMARY_BUNDLE" && $bundle != "$FIXTURE_SECONDARY_BUNDLE" ]]; then
+  valid=$(jq -Rs '
+    fromjson | .dsseEnvelope.payload | . == "fixture-payload" or . == "fixture-second"
+  ' <<<"$bundle")
+fi
 cd -P .
-records=$(jq -nc --arg cwd "$PWD" --rawfile bundle "$bundle_path" \\
-  --arg artifact "$artifact" --arg identity "$identity" --arg issuer "$issuer" '
-  {$cwd, $bundle, $artifact, $identity, $issuer},
-  ($bundle | fromjson | .dsseEnvelope.payload | . == "fixture-payload" or . == "fixture-second")
-')
-{
-  IFS= read -r blob
-  IFS= read -r valid
-} <<<"$records"
-printf '%s\\n' "$blob" >>"\${FIXTURE_DIR}/blob-calls"
+printf '%s\\0' 5 "$PWD" "$bundle" "$artifact" "$identity" "$issuer" >>"$FIXTURE_DIR/blob-calls"
 [[ $valid == true ]] || fail 'fixture tampered payload or bad digest'
 
 if [[ $artifact != *"$CHILD" && $identity != *wrong-workflow* && $issuer != *wrong-issuer* ]]; then
@@ -1798,7 +1804,7 @@ fail "\${ERROR_PREFIX-Error: }\${message}\${ERROR_SUFFIX:-}"$'\\n'"\${LOGGER_PRE
     annotations: { "vnd.docker.reference.type": "attestation-manifest", "vnd.docker.reference.digest": env.CHILD },
   }] };
   writeFileSync(join(dir, "index.json"), JSON.stringify(index));
-  writeFileSync(join(dir, "download.jsonl"), JSON.stringify(probeBundle()) + "\n");
+  writeFileSync(join(dir, "download.jsonl"), env.FIXTURE_PRIMARY_BUNDLE);
   writeFileSync(env.GITHUB_ENV, ""); writeFileSync(env.GITHUB_OUTPUT, "");
   const run = (script, overrides = {}, cwd = root) => {
     const result = runBash(["--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script], {
@@ -1808,14 +1814,33 @@ fail "\${ERROR_PREFIX-Error: }\${message}\${ERROR_SUFFIX:-}"$'\\n'"\${LOGGER_PRE
     assert.equal(result.signal, null, result.stderr);
     return result;
   };
-  const calls = () => existsSync(join(dir, "calls")) ? readFileSync(join(dir, "calls"), "utf8").trim().split("\n").filter(Boolean).map(JSON.parse) : [];
+  // A field count and NUL separators preserve empty fields and newlines
+  // without asking every offline invocation to start a JSON encoder.
+  const readRecords = file => {
+    const path = join(dir, file);
+    if (!existsSync(path)) return [];
+    const fields = readFileSync(path, "utf8").split("\0");
+    assert.equal(fields.pop(), "", "unterminated fixture log record");
+    const records = [];
+    for (let offset = 0; offset < fields.length;) {
+      const count = Number(fields[offset++]);
+      assert.ok(Number.isSafeInteger(count) && count > 0 && offset + count <= fields.length, "invalid fixture log field count");
+      records.push(fields.slice(offset, offset + count));
+      offset += count;
+    }
+    return records;
+  };
+  const calls = () => readRecords("calls");
+  const blobCalls = () => readRecords("blob-calls").map(([cwd, bundle, artifact, identity, issuer]) => ({
+    cwd, bundle, artifact, identity, issuer,
+  }));
   const authenticate = script => {
     const result = run(script, { GITHUB_TOKEN: "fixture-read-token" });
     const match = [...readFileSync(env.GITHUB_ENV, "utf8").matchAll(/^DOCKER_CONFIG=(.+)$/gm)].at(-1);
     if (match) env.DOCKER_CONFIG = match[1];
     return result;
   };
-  return { dir, env, run, calls, authenticate, index, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  return { dir, env, run, calls, blobCalls, authenticate, index, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
 test("actual probe branch/digest guards refuse main, tags, invalid SHAs and reusable activation before credentials (#375)", () => {
@@ -1965,9 +1990,14 @@ test("collapsed child discovery 'no signatures found' is never artifact-binding 
 test("the offline verifier records attempts even when its inputs are refused", () => {
   const f = probeFixture();
   try {
-    const result = f.run('cosign verify-blob --bundle ./bundle.json "$DIGEST"', {}, f.dir);
-    assert.notEqual(result.status, 0);
-    assert.deepEqual(f.calls(), [["cosign", "verify-blob", "--bundle", "./bundle.json", f.env.DIGEST]]);
+    const identity = 'quoted "subject"\nwith a backslash \\';
+    const result = f.run('cosign verify-blob --bundle ./bundle.json --certificate-identity "$IDENTITY" --certificate-oidc-issuer "" "$DIGEST"',
+      { IDENTITY: identity }, f.dir);
+    assert.equal(result.status, 1);
+    assert.equal(result.stderr, "bundle verification needs a fresh isolated directory\n");
+    assert.deepEqual(f.calls(), [
+      ["cosign", "verify-blob", "--bundle", "./bundle.json", "--certificate-identity", identity, "--certificate-oidc-issuer", "", f.env.DIGEST],
+    ]);
   } finally { f.cleanup(); }
 });
 
@@ -1997,7 +2027,9 @@ test("download gate refuses empty, legacy, malformed, wrong-media, oversized and
 
 test("root bundle download accepts exactly one MiB but rejects even one extra byte (#375)", () => {
   const script = probeStep(publicationData().image, "probe-verify", "Verify exact root and expected refusals").run;
-  const bundle = JSON.stringify(probeBundle());
+  const { verificationMaterial, ...rest } = probeBundle();
+  // Exercise the payload parser with a different field order.
+  const bundle = JSON.stringify({ verificationMaterial, ...rest });
   for (const extra of ["", " ", "\0"]) {
     const f = probeFixture();
     try {
@@ -2027,8 +2059,9 @@ test("all four local checks reuse each validated root bundle in a fresh private 
       const calls = f.calls().filter(c => c[0] === "cosign");
       assert.equal(calls.filter(c => c[1] === "download").length, 1);
       assert.equal(calls.filter(c => c[1] === "verify").length, 1);
+      assert.equal(calls.filter(c => c[1] === "verify-blob").length, 4 * count);
       assert.ok(calls.filter(c => c[1] !== "verify-blob").every(c => c.at(-1) === f.env.IMAGE + "@" + f.env.DIGEST));
-      const local = readFileSync(join(f.dir, "blob-calls"), "utf8").trim().split("\n").map(JSON.parse);
+      const local = f.blobCalls();
       assert.equal(local.length, 4 * count);
       assert.equal(new Set(local.map(c => c.cwd)).size, count);
       const identity = `https://github.com/${f.env.GITHUB_REPOSITORY}/.github/workflows/image.yml@${f.env.GITHUB_REF}`;
