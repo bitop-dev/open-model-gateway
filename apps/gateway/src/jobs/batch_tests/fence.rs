@@ -373,13 +373,20 @@ async fn a_stale_claim_writes_nothing_and_a_current_one_everything(pool: PgPool)
         "only the takeover's own interruption is counted"
     );
     // Only the matching running attempt can commit the segment and progress.
+    let first_execution = Uuid::new_v4();
     let execution = Uuid::new_v4();
     let file = job.work_file_id.unwrap();
     assert!(
-        new.claim_line(s, job.workspace_id, 1, execution)
+        new.claim_line(s, job.workspace_id, 1, first_execution)
             .await
             .unwrap()
     );
+    assert!(
+        new.fail_line(s, 1, Some(503), Some("unavailable"), false)
+            .await
+            .unwrap()
+    );
+    assert!(new.retry_line(s, 1, 1, execution).await.unwrap());
     let record = |execution| {
         new.insert_segment(
             s,
@@ -389,7 +396,7 @@ async fn a_stale_claim_writes_nothing_and_a_current_one_everything(pool: PgPool)
         )
     };
     assert!(matches!(
-        record(Uuid::new_v4()).await,
+        record(first_execution).await,
         Err(FenceError::Storage)
     ));
     assert_eq!(w.reload(&job).await.request_completed, Some(0));
@@ -665,47 +672,49 @@ async fn a_takeover_between_the_result_files_and_finishing_leaves_no_duplicate_f
     consistent(&w.f).await;
 }
 
-/// A line recorded `succeeded` whose result was still in the old run's
-/// buffer when the batch was taken over has no stored result: it is reported
-/// unavailable and counted failed, so counters and error file agree.
+/// The next owner can read a completed line's segment while it interrupts
+/// the line whose provider call is still in flight.
 #[dbtest::test]
-async fn a_result_still_buffered_at_takeover_is_counted_with_the_error_file(pool: PgPool) {
+async fn a_committed_result_survives_takeover_with_another_line_in_flight(pool: PgPool) {
     let (w, job) = batch(pool, &[("a", "plain"), ("b", "hold-b")]).await;
     let held = w.openai.gate("hold-b");
     let old = start(&w);
     held.entered.notified().await;
-    // Line a finished before b started: succeeded, its record buffered.
-    let state: String =
-        sqlx::query_scalar("SELECT state FROM batch_lines WHERE job_id=$1 AND line_no=0")
+    let state: (String, Option<i32>) =
+        sqlx::query_as("SELECT state,segment FROM batch_lines WHERE job_id=$1 AND line_no=0")
             .bind(job.id)
             .fetch_one(&w.f.store.pool)
             .await
             .unwrap();
-    assert_eq!(state, "succeeded");
-    assert_eq!(segments(&w, &job).await, 0);
+    assert_eq!(state, ("succeeded".into(), Some(0)));
+    assert_eq!(segments(&w, &job).await, 1);
     lapse(&w, &job).await;
     assert!(Runner::new(w.jobs.clone()).run_next().await.unwrap());
     let done = w.reload(&job).await;
+    let output = w
+        .read(w.f.principal.workspace_id, done.output_file_id)
+        .await;
     let errors = w.read(w.f.principal.workspace_id, done.error_file_id).await;
-    assert_eq!(done.output_file_id, None);
-    assert_eq!(errors.len(), 2);
-    assert!(
-        errors
-            .iter()
-            .all(|e| e["error"]["code"] == "result_unavailable")
-    );
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0]["custom_id"], "a");
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0]["custom_id"], "b");
+    assert_eq!(errors[0]["error"]["code"], "result_unavailable");
     assert_eq!(
         (
             done.request_total,
             done.request_completed,
             done.request_failed
         ),
-        (Some(2), Some(0), Some(2)),
-        "a line with no stored result is not counted completed"
+        (Some(2), Some(1), Some(1))
     );
     held.release.notify_one();
     assert!(matches!(old.await.unwrap(), Ok(true)));
-    assert_eq!(segments(&w, &job).await, 0);
+    assert_eq!(
+        segments(&w, &job).await,
+        0,
+        "finalization deleted the segment"
+    );
     consistent(&w.f).await;
 }
 

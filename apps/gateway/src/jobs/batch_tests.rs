@@ -3159,8 +3159,8 @@ async fn memoized_refusal_classification_stays_per_line(pool: PgPool) {
     consistent(f).await;
 }
 
-mod durable;
 mod bedrock;
+mod durable;
 mod envelope;
 mod fence;
 mod http_support;

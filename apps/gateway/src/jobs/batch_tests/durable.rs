@@ -46,35 +46,73 @@ fn loopback_engine(store: &crate::store::Store, base: &str) -> Engine {
     Engine::new(Arc::new(store.clone()), registry, EngineLimits::default()).unwrap()
 }
 
+fn loopback_jobs(store: crate::store::Store, engine: Engine, files: FileStoreRuntime) -> Jobs {
+    Jobs::with(
+        store,
+        engine.registry().clone(),
+        JobLimits {
+            batch_concurrency: 1,
+            ..JobLimits::default()
+        },
+    )
+    .with_engine(engine)
+    .with_files(Some(files))
+}
+
 #[tokio::test]
 #[ignore = "child process of the batch crash tests"]
 async fn crash_worker() {
+    let pool = runtime_pool(
+        std::env::var("DATABASE_URL")
+            .unwrap()
+            .parse::<sqlx::postgres::PgConnectOptions>()
+            .unwrap(),
+        &std::env::var("BATCH_TEST_DB").unwrap(),
+    )
+    .await;
     let dir = std::env::var("BATCH_TEST_DIR").unwrap();
-    let db = std::env::var("BATCH_TEST_DB").unwrap();
-    assert!(db.starts_with("_sqlx_test_"));
-    let options = std::env::var("DATABASE_URL")
-        .unwrap()
-        .parse::<sqlx::postgres::PgConnectOptions>()
-        .unwrap()
-        .database(&db);
-    let pool = PgPool::connect_with(options).await.unwrap();
     let store = crate::store::Store::new(pool);
     let engine = loopback_engine(&store, &std::env::var("BATCH_TEST_UPSTREAM").unwrap());
-    let jobs = Jobs::new(store, &engine).with_files(Some(local_files(dir.as_ref()).await));
+    let jobs = loopback_jobs(store, engine, local_files(dir.as_ref()).await);
     jobs.finalize_hold.arm();
     assert!(Runner::new(jobs).run_next().await.unwrap());
+}
+
+async fn runtime_pool(options: sqlx::postgres::PgConnectOptions, db: &str) -> PgPool {
+    assert!(db.starts_with("_sqlx_test_"));
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::Executor::execute(conn, "SET ROLE gateway_runtime").await?;
+                Ok(())
+            })
+        })
+        .connect_with(options.database(db))
+        .await
+        .unwrap();
+    assert!(sqlx::query_scalar::<_, bool>(
+        "SELECT current_user='gateway_runtime' AND NOT (rolsuper OR rolbypassrls) FROM pg_roles WHERE rolname=current_user"
+    ).fetch_one(&pool).await.unwrap());
+    pool
 }
 
 fn start_process(w: &World, dir: &std::path::Path, upstream: &Server) -> tokio::process::Child {
     let module = module_path!().split_once("::").unwrap().1;
     tokio::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--ignored", "--exact", &format!("{module}::crash_worker")])
+        .args([
+            "--ignored",
+            "--exact",
+            "--nocapture",
+            &format!("{module}::crash_worker"),
+        ])
         .env(
             "BATCH_TEST_DB",
             w.f.store.pool.connect_options().get_database().unwrap(),
         )
         .env("BATCH_TEST_DIR", dir)
         .env("BATCH_TEST_UPSTREAM", &upstream.base)
+        // The parent shard's libtest output must contain just its own summary.
+        .stdout(std::process::Stdio::null())
         .kill_on_drop(true)
         .spawn()
         .unwrap()
@@ -83,14 +121,22 @@ fn start_process(w: &World, dir: &std::path::Path, upstream: &Server) -> tokio::
 async fn run_case(pool: PgPool, fault: Option<(Boundary, Loss)>) {
     let size = if fault.is_some() { 1 } else { 32 };
     let before = matches!(fault, Some((Boundary::BeforeCommit, _)));
-    let mut w = world(pool, false, false, 1).await;
+    let mut w = world(pool.clone(), false, false, 1).await;
+    sqlx::raw_sql(include_str!(
+        "../../../tests/common/ensure_runtime_role.sql"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    w.f.store.apply_runtime_grants().await.unwrap();
+    let options = pool.connect_options();
+    let runtime = runtime_pool((*options).clone(), options.get_database().unwrap()).await;
+    let store = crate::store::Store::new(runtime);
+
     let dir = tempfile::tempdir().unwrap();
     let crash = matches!(fault, Some((_, Loss::Crash)));
-    if crash {
-        let runtime = local_files(dir.path()).await;
-        w.jobs = w.jobs.with_files(Some(runtime.clone()));
-        w.files = crate::filestore::FileStorage::new(w.f.store.clone(), runtime);
-    }
+    let files = local_files(dir.path()).await;
+    w.files = crate::filestore::FileStorage::new(store.clone(), files.clone());
     let input: Vec<_> = (0..size)
         .map(|n| chat_line(&n.to_string(), "company/smart", "test"))
         .collect();
@@ -101,9 +147,9 @@ async fn run_case(pool: PgPool, fault: Option<(Boundary, Loss)>) {
         seen.fetch_add(1, Ordering::SeqCst);
         async { axum::Json(json!({"id":"chatcmpl-test","model":"smart","choices":[{"index":0,"message":{"role":"assistant","content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}})) }
     })).await;
-    let engine = loopback_engine(&w.f.store, &upstream.base);
+    let engine = loopback_engine(&store, &upstream.base);
     let gateway = Server::start(
-        crate::http::router_with_engine(w.f.store.clone(), None, engine.clone())
+        crate::http::router_with_engine(store.clone(), None, engine.clone())
             .layer(axum::Extension(w.files.runtime().clone())),
     )
     .await;
@@ -119,7 +165,7 @@ async fn run_case(pool: PgPool, fault: Option<(Boundary, Loss)>) {
     )
     .await
     .unwrap();
-    w.jobs = w.jobs.with_engine(engine);
+    w.jobs = loopback_jobs(store, engine, files);
     let mut lock = w.f.store.pool.begin().await.unwrap();
     if before {
         sqlx::query("LOCK TABLE stored_files IN SHARE MODE")
@@ -163,6 +209,26 @@ async fn run_case(pool: PgPool, fault: Option<(Boundary, Loss)>) {
             assert_eq!(row, ("running".into(), None, 0));
         } else {
             assert_eq!(row, ("succeeded".into(), Some(0), 1));
+            let segment: Uuid = sqlx::query_scalar(
+                "SELECT f.id FROM stored_files f JOIN batch_segments s ON s.file_id=f.id
+                 WHERE s.job_id=$1 AND s.seq=0 AND f.committed_at IS NOT NULL
+                   AND f.deleted_at IS NULL AND f.api_purpose IS NULL",
+            )
+            .bind(job.id)
+            .fetch_one(&w.f.store.pool)
+            .await
+            .unwrap();
+            let segment = crate::filestore::files::public_id(segment);
+            assert_eq!(
+                client
+                    .get(format!("{}/v1/files/{segment}/content", gateway.base))
+                    .header("authorization", &auth)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                reqwest::StatusCode::NOT_FOUND
+            );
         }
         if let Loss::Crash = loss {
             let child = process.as_mut().unwrap();
@@ -247,6 +313,22 @@ async fn run_case(pool: PgPool, fault: Option<(Boundary, Loss)>) {
         .collect();
     for n in 0..size {
         assert!(ids.contains(n.to_string().as_str()));
+    }
+    let other = crate::jobs::db_tests::bearer(&w.f, w.f.team.workspace_id).await;
+    for path in [
+        format!("/v1/batches/{id}"),
+        format!("/v1/files/{file}/content"),
+    ] {
+        assert_eq!(
+            client
+                .get(format!("{}{path}", gateway.base))
+                .header("authorization", &other)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::NOT_FOUND
+        );
     }
     if before {
         assert_eq!(records[0]["error"]["code"], "result_unavailable");
