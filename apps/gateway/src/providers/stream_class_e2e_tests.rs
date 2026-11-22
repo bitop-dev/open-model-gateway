@@ -525,7 +525,7 @@ async fn responses_terminal_status_mismatch_preserves_valid_usage(pool: PgPool) 
             ),
             (
                 "cache evidence exceeds partial total",
-                r#","usage":{"output_tokens":2,"input_tokens_details":{"cached_tokens":5000},"total_tokens":2}"#,
+                r#","usage":{"output_tokens":2,"input_tokens_details":{"cached_tokens":5000},"total_tokens":5001}"#,
                 None,
                 None,
                 0,
@@ -536,6 +536,20 @@ async fn responses_terminal_status_mismatch_preserves_valid_usage(pool: PgPool) 
                 None,
                 Some(2),
                 5002,
+            ),
+            (
+                "object-valued count",
+                r#","usage":{"input_tokens":{"count":3},"output_tokens":2}"#,
+                None,
+                None,
+                0,
+            ),
+            (
+                "conflicting reasoning fields",
+                r#","usage":{"input_tokens":3,"output_tokens":2,"output_tokens_details":{"reasoning_tokens":1},"completion_tokens_details":{"reasoning_tokens":2}}"#,
+                Some(3),
+                Some(2),
+                5,
             ),
             (
                 "duplicate count",
@@ -608,6 +622,16 @@ async fn responses_terminal_status_mismatch_preserves_valid_usage(pool: PgPool) 
             .fetch_one(&w.f.store.pool)
             .await
             .unwrap();
+            if label == "conflicting reasoning fields" {
+                let telemetry: (Option<i64>, Option<String>) = sqlx::query_as(
+                    "SELECT reasoning_tokens,reported_upstream_model FROM inference_executions WHERE root_request_id=$1",
+                )
+                .bind(reply.id)
+                .fetch_one(&w.f.store.pool)
+                .await
+                .unwrap();
+                assert_eq!(telemetry, (Some(1), Some("served".into())), "{at}");
+            }
             assert!(admitted > 0, "{at}: the fixture must reserve money");
             let got = (
                 reserved_input,
