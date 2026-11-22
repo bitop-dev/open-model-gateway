@@ -109,7 +109,7 @@ pub(crate) fn sse(frames: &[Value]) -> Vec<u8> {
 fn chunk(delta: Value, reason: Value) -> Value {
     json!({"id":"c","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":delta,"finish_reason":reason}]})
 }
-fn responses_complete() -> Value {
+pub(super) fn responses_complete() -> Value {
     json!({"id":"private","object":"response","model":"served","status":"completed","output":[{"id":"m","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Hello","annotations":[]}]}],"usage":{"input_tokens":3,"output_tokens":2}})
 }
 
