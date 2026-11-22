@@ -277,7 +277,7 @@ const overview: PlatformOverviewData = { setup: { connections: 1, enabled_connec
 describe("Admin overview", () => {
   const path = `${platformPath}/overview`;
   it("shows the setup checklist with progress and per-step actions, then server-only glance numbers", () => {
-    // Spend and requests cover this month, like Usage & costs (review #25), from the platform usage overview.
+    // The dashboard reads this month’s spend and requests from the platform usage overview.
     const month = `${platformPath}/usage/overview?${usageQuery(usagePeriod({}))}`, usage = { tiles: { spend: { value: "9007199254740993" }, requests: { attempts: "12345678901234567890" } } };
     const html = markup(<PlatformOverview session={admin} />, [[path, overview], [month, usage]]);
     expect(html).toContain("Spend this month"); expect(html).toContain("Requests this month"); expect(html).toContain("Includes retries");
@@ -338,10 +338,10 @@ describe("Model and connection record pages", () => {
     for (const card of ["Overview", "Routes", "Pricing", "Routing policy", "Availability", "Protocols", "Usage"]) expect(html).toContain(`>${card}</h2>`);
     for (const id of ["overview", "routes", "pricing", "routing", "availability", "protocols", "usage"]) expect(html).toContain(`href="#${id}"`);
     expect(html).not.toContain('role="tab"'); expect(html).toContain('aria-label="On this page"');
-    for (const tile of ["Type", "Input / output price", "Context ceilings", "Routes"]) expect(html).toContain(tile); expect(html).toContain('data-columns="4"'); // "Created" moved to Overview (review #47)
+    for (const tile of ["Type", "Input / output price", "Context ceilings", "Routes"]) expect(html).toContain(tile); expect(html).toContain('data-columns="4"'); // The summary has four tiles.
     expect(html).toContain("Text → Text"); expect(html).toContain("1 of 2 enabled"); expect(html).toContain("POST"); expect(html).toContain("/v1/chat/completions"); expect(html).toContain("Not enabled for this model: Responses, Messages");
     expect(html).toContain("Set prices"); expect(html).toContain("2 of 4 done"); expect(html).toContain("Back to Models");
-    // Sections read as description lists with their own Edit; no inline forms (review #22).
+    // Each read-only section has its own Edit action.
     for (const label of ["Edit model details", "Edit routing policy", "Edit availability"]) expect(html).toContain(`aria-label="${label}"`);
     expect(html).not.toContain("<select"); expect(html).not.toContain("Save settings");
     const routes = markup(<ModelDetail session={admin} id={model.id} tab="routes" onTabChange={() => {}} />, [[`${platformPath}/models/${model.id}`, { ...model, readiness }]]);
