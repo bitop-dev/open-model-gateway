@@ -5,6 +5,7 @@
 //! Nothing here logs or stores content; error messages are fixed strings that
 //! never echo client or provider text.
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::types::*;
@@ -57,6 +58,19 @@ impl Lines {
 /// Blank lines (only whitespace) are skipped, never counted.
 pub(crate) fn is_blank(line: &[u8]) -> bool {
     line.iter().all(u8::is_ascii_whitespace)
+}
+
+/// Weighted routing uses the parent execution ID and the zero-based index
+/// among nonblank input lines. The seed is independent of child attempt IDs
+/// and is reconstructed on dispatch, including after a worker change.
+pub(super) fn routing_seed(batch: Uuid, line: u32) -> Uuid {
+    let mut hash = Sha256::new();
+    hash.update(batch.as_bytes());
+    hash.update(line.to_be_bytes());
+    let digest = hash.finalize();
+    let mut seed = [0; 16];
+    seed.copy_from_slice(&digest[..16]);
+    Uuid::from_bytes(seed)
 }
 
 /// Why an input line is invalid: a stable code and a fixed message.
@@ -130,7 +144,7 @@ pub(crate) struct LinePlan {
     pub deployment: Uuid,
     pub price: Uuid,
     /// The line's resolved output maximum, computed once at plan time from
-    /// this same pinned price (`governance::batch::preview_line`). Before
+    /// this same pinned price (`governance::batch::LinePricing`). Before
     /// dispatch (`jobs::runner`), this is copied onto the still-omitted
     /// request so the engine's pre-admission `validate_chat_request` and
     /// the real upstream attempt see the same bound planning already
