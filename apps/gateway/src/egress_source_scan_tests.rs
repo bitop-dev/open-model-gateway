@@ -415,9 +415,8 @@ impl AwsTransport {
                 };
                 text(call.func.to_token_stream()) == "Client : : from_conf"
                     && call.args.len() == 1
-                    && text(call.args[0].to_token_stream()).ends_with(
-                        " . http_client ( transport : : client ( settings . ca_bundle . as_ref ( ) ) ? ) . build ( )",
-                    )
+                    && text(call.args[0].to_token_stream())
+                        == "builder . http_client ( transport : : client ( settings . ca_bundle . as_ref ( ) ) ? ) . build ( )"
             }
         }
     }
@@ -480,6 +479,10 @@ fn aws_transport_must_be_set_on_the_sanctioned_expression() {
         "Client::from_conf(builder.http_client(transport::client(settings.ca_bundle.as_ref())?).build())"
     ));
     assert!(!matches(S3_TRANSPORT, "Client::from_conf(builder.build())"));
+    assert!(!matches(
+        S3_TRANSPORT,
+        "Client::from_conf(std::convert::identity(builder).http_client(transport::client(settings.ca_bundle.as_ref())?).build())"
+    ));
     for reason in [S3_TRANSPORT, BEDROCK_CLIENT] {
         assert!(!matches(reason, "Client::from_conf(shared.into())"));
     }
