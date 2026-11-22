@@ -444,13 +444,31 @@ fn strict_subset_and_unknown_usage() {
 }
 #[test]
 fn tool_deltas_and_ordering() {
-    let mut state = State::default();
-    state.push(stream()[0].clone()).unwrap();
-    let events = state.push(json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call","name":"weather","input":{}}})).unwrap();
-    assert!(matches!(&events[0], ChatEvent::Delta { tool_calls, .. } if tool_calls[0].index == 0));
-    for part in ["{\"city\":", "\"東京\"}"] {
-        state.push(json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":part}})).unwrap();
-    }
+    let open_tool = || {
+        let mut state = State::default();
+        state.push(stream()[0].clone()).unwrap();
+        let events = state.push(json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call","name":"weather","input":{}}})).unwrap();
+        assert!(
+            matches!(&events[0], ChatEvent::Delta { tool_calls, .. } if tool_calls[0].index == 0)
+        );
+        for part in ["{\"city\":", "\"東京\"}"] {
+            state.push(json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":part}})).unwrap();
+        }
+        state
+    };
+    let mut rejected = open_tool();
+    assert_eq!(
+        rejected.push(json!({"type":"message_stop"})).err(),
+        Some(InferenceError::InvalidUpstream)
+    );
+    assert_eq!(
+        rejected
+            .push(json!({"type":"content_block_stop","index":0}))
+            .err(),
+        Some(InferenceError::InvalidUpstream)
+    );
+
+    let mut state = open_tool();
     state
         .push(json!({"type":"content_block_stop","index":0}))
         .unwrap();

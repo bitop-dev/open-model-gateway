@@ -866,6 +866,7 @@ fn a_terminal_pushed_after_the_terminal_is_refused() {
         }
         for late in [
             built.events.last().unwrap().clone(),
+            json!({"type":"error","code":"rate_limit_exceeded"}),
             json!({"type":"response.in_progress"}),
             json!({"type":"response.output_text.delta","output_index":0,"item_id":"msg_0","content_index":0,"delta":"late"}),
             json!({"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded"}}}),

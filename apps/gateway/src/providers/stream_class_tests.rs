@@ -387,7 +387,9 @@ async fn a_complete_stream_completes() {
     }
 }
 
-pub(super) fn terminal_order_cases(kind: Kind) -> Vec<(&'static str, Vec<u8>, bool)> {
+pub(super) fn terminal_order_cases(
+    kind: Kind,
+) -> Vec<(&'static str, Vec<u8>, Option<InferenceError>)> {
     let (content, rest, terminal) = kind.valid();
     let (error_name, delta) = match kind {
         Kind::Responses => (
@@ -404,7 +406,7 @@ pub(super) fn terminal_order_cases(kind: Kind) -> Vec<(&'static str, Vec<u8>, bo
     let mut cases = vec![(
         "late delta",
         [complete.clone(), sse(&[delta])].concat(),
-        false,
+        None,
     )];
     for frame in kind.errors(error_name) {
         let label = if frame["type"] == "response.failed" {
@@ -413,11 +415,18 @@ pub(super) fn terminal_order_cases(kind: Kind) -> Vec<(&'static str, Vec<u8>, bo
             "error"
         };
         let error = sse(&[frame]);
-        cases.push((label, [complete.clone(), error.clone()].concat(), false));
+        cases.push((label, [complete.clone(), error.clone()].concat(), None));
         cases.push((
             label,
             [content.clone(), rest.clone(), error, terminal.clone()].concat(),
-            true,
+            Some(InferenceError::Busy),
+        ));
+    }
+    if kind == Kind::Anthropic {
+        cases.push((
+            "premature stop before valid ending",
+            [content, terminal.clone(), rest, terminal].concat(),
+            Some(InferenceError::InvalidUpstream),
         ));
     }
     if kind == Kind::Responses {
@@ -430,7 +439,7 @@ pub(super) fn terminal_order_cases(kind: Kind) -> Vec<(&'static str, Vec<u8>, bo
                 sse(&[json!({"type":"response.completed","response":later})]),
             ]
             .concat(),
-            false,
+            None,
         ));
     }
     cases
@@ -446,10 +455,11 @@ async fn the_driver_ends_at_the_first_terminal_frame() {
             )
             .await
             .unwrap_or_else(|_| panic!("{kind:?} {label}: driver waited for upstream EOF"));
-            if failed {
-                let Outcome::Failed(events, InferenceError::Busy) = outcome else {
+            if let Some(expected) = failed {
+                let Outcome::Failed(events, error) = outcome else {
                     panic!("{kind:?} {label}: {outcome:?}");
                 };
+                assert_eq!(error, expected);
                 assert_eq!(delivered_text(&events), "Hello");
                 assert!(
                     !events

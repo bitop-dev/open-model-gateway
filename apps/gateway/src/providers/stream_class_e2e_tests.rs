@@ -197,6 +197,21 @@ async fn call(base: &str, token: &str, client: Client) -> Reply {
     }
 }
 impl World {
+    async fn ask_hanging(&self, client: Client, wire: Vec<u8>, at: &str) -> Reply {
+        let dropped = Arc::new(Notify::new());
+        let reply = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.ask(client, vec![Step::BytesThenHang(wire, dropped.clone())]),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{at}: gateway waited for upstream EOF"));
+        tokio::time::timeout(Duration::from_secs(5), dropped.notified())
+            .await
+            .unwrap_or_else(|_| panic!("{at}: upstream body stayed open"));
+
+        reply
+    }
+
     async fn ask(&self, client: Client, steps: Vec<Step>) -> Reply {
         *self.script.lock().unwrap() = steps;
         sqlx::query("DELETE FROM deployment_health")
@@ -468,17 +483,8 @@ async fn terminal_order(pool: PgPool, kind: Kind, client: Client, input: i64, te
     let w = world(pool, kind, false).await;
     let terminal_line = format!("event: {terminal}");
     for (label, wire, failed) in terminal_order_cases(kind) {
-        let at = format!("{kind:?} {label}, failed={failed}");
-        let dropped = Arc::new(Notify::new());
-        let reply = tokio::time::timeout(
-            Duration::from_secs(5),
-            w.ask(client, vec![Step::BytesThenHang(wire, dropped.clone())]),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("{at}: gateway waited for upstream EOF"));
-        tokio::time::timeout(Duration::from_secs(5), dropped.notified())
-            .await
-            .unwrap_or_else(|_| panic!("{at}: upstream body stayed open"));
+        let at = format!("{kind:?} {label}, error={failed:?}");
+        let reply = w.ask_hanging(client, wire, &at).await;
 
         assert_eq!(reply.status, 200, "{at}");
         assert!(reply.body.contains("Hello"), "{at}");
@@ -489,17 +495,13 @@ async fn terminal_order(pool: PgPool, kind: Kind, client: Client, input: i64, te
                 .lines()
                 .filter(|line| *line == terminal_line)
                 .count(),
-            usize::from(!failed),
+            usize::from(failed.is_none()),
             "{at}"
         );
         let got = recorded(&w.f.store.pool, w.deployment, reply.id).await;
-        if failed {
-            assert_eq!(
-                told(client, &reply.body),
-                shown(client, InferenceError::Busy),
-                "{at}"
-            );
-            assert_eq!(got, failed_with(InferenceError::Busy, None), "{at}");
+        if let Some(expected) = failed {
+            assert_eq!(told(client, &reply.body), shown(client, expected), "{at}");
+            assert_eq!(got, failed_with(expected, None), "{at}");
         } else {
             assert_eq!(last_event(&reply.body)["type"], terminal, "{at}");
             assert_eq!(got.state, "succeeded", "{at}");
@@ -525,7 +527,7 @@ async fn terminal_order(pool: PgPool, kind: Kind, client: Client, input: i64, te
 async fn responses_terminal_status_mismatch_preserves_valid_usage(pool: PgPool) {
     let kind = Kind::Responses;
     let w = world(pool, kind, false).await;
-    let (content, rest, _) = kind.valid();
+    let (content, rest, late_completion) = kind.valid();
     let prefix = [content, rest].concat();
     let snapshot = responses_complete();
     let class = InferenceError::InvalidUpstream;
@@ -661,9 +663,9 @@ async fn responses_terminal_status_mismatch_preserves_valid_usage(pool: PgPool) 
             let terminal =
                 format!("data: {{\"type\":\"{event}\",\"response\":{wire_snapshot}{usage}}}}}\n\n")
                     .into_bytes();
-            let steps = vec![Step::Bytes([prefix.clone(), terminal].concat())];
-            let reply = w.ask(Client::Responses, steps).await;
             let at = format!("{event} with {status} snapshot and {label} usage");
+            let wire = [prefix.clone(), terminal, late_completion.clone()].concat();
+            let reply = w.ask_hanging(Client::Responses, wire, &at).await;
             assert_eq!(reply.status, 200, "{at}");
             assert_eq!(last_event(&reply.body)["type"], "error", "{at}");
             assert_eq!(told(Client::Responses, &reply.body), class.code(), "{at}");
