@@ -531,6 +531,55 @@ async fn many_unknowns(f: &Fixture, price: Uuid, count: i32) {
 }
 
 #[dbtest::test]
+async fn free_price_batches_reservations_and_ledger(pool: PgPool) {
+    let f = fixture(pool).await;
+    let free = f.price(0).await;
+    many_unknowns(&f, free, 2).await;
+    // The accounting triggers use transition tables. A multi-row page must
+    // let them aggregate the deltas before updating the shared budget rows.
+    sqlx::raw_sql(
+        "CREATE TABLE free_price_write_sizes (target text NOT NULL, size bigint NOT NULL);
+         CREATE FUNCTION record_free_price_write_size() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+          INSERT INTO free_price_write_sizes SELECT TG_TABLE_NAME, count(*) FROM written;
+          RETURN NULL;
+         END $$;
+         CREATE TRIGGER record_free_price_write_size AFTER UPDATE ON governance_reservations
+         REFERENCING NEW TABLE AS written FOR EACH STATEMENT
+         EXECUTE FUNCTION record_free_price_write_size();
+         CREATE TRIGGER record_free_price_write_size AFTER INSERT ON monetary_ledger
+         REFERENCING NEW TABLE AS written FOR EACH STATEMENT
+         EXECUTE FUNCTION record_free_price_write_size();",
+    )
+    .execute(&f.store.pool)
+    .await
+    .unwrap();
+
+    let (status, result) = call(
+        &f,
+        &user(f.owner, true),
+        "POST",
+        PATH,
+        json!({"apply":true,"expected_count":"2","reason":"confirmed free price"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["resolved_count"], "2");
+    let sizes: Vec<(String, i64)> =
+        sqlx::query_as("SELECT target, size FROM free_price_write_sizes ORDER BY target")
+            .fetch_all(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        sizes,
+        [
+            ("governance_reservations".into(), 2),
+            ("monetary_ledger".into(), 2)
+        ]
+    );
+}
+
+#[dbtest::test]
 async fn free_price_large_bucket_makes_bounded_progress(pool: PgPool) {
     let f = fixture(pool).await;
     let free = f.price(0).await;
