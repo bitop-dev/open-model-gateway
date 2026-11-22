@@ -517,3 +517,30 @@ fn luna_opaque_reasoning_items_are_accepted_and_not_text() {
     assert_eq!(text, "final_answer.");
     assert!(finished);
 }
+#[tokio::test]
+async fn rejected_terminal_takes_accounting_from_the_original_frame() {
+    let frame = json!({
+        "type": "response.completed",
+        "response": {
+            "status": "incomplete", "model": "wire-model",
+            "usage": {"input_tokens": 3, "output_tokens": 2,
+                      "input_tokens_details": {"cached_tokens": 1}}
+        }
+    });
+    let bytes = serde_json::to_vec(&frame).unwrap();
+    let mut event = frame;
+    event["response"]["usage"]["input_tokens"] = json!(7);
+    event["response"]["usage"]["input_tokens_details"]["cached_tokens"] = json!(4);
+    event["response"]["model"] = json!("other-model");
+
+    let mut state = State::default();
+    state.push(json!({"type":"response.created"})).unwrap();
+    let (result, observed) =
+        crate::inference::evidence::capture(async { state.push_frame(event, &bytes) }).await;
+    assert!(matches!(result, Err(InferenceError::InvalidUpstream)));
+    let observed = observed.unwrap();
+    assert_eq!(observed.input_tokens, Some(3));
+    assert_eq!(observed.output_tokens, Some(2));
+    assert_eq!(observed.billing.unwrap().cache_read_input_tokens, Some(1));
+    assert_eq!(observed.reported_model.unwrap().as_str(), "wire-model");
+}

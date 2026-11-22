@@ -213,12 +213,23 @@ impl Decoder {
     }
 }
 pub(super) fn frames(response: reqwest::Response) -> impl Stream<Item = Result<Value>> + Send {
+    frames_with(response, |data| frame_json(&data))
+}
+
+pub(super) fn frame_json(data: &[u8]) -> Result<Value> {
+    serde_json::from_slice(data).map_err(|_| InferenceError::InvalidUpstream)
+}
+
+pub(super) fn frames_with<T: Send>(
+    response: reqwest::Response,
+    decode: impl Fn(Vec<u8>) -> Result<T> + Send,
+) -> impl Stream<Item = Result<T>> + Send {
     async_stream::try_stream! {
         let mut stream = response.bytes_stream(); let mut decoder = Decoder::default();
         while let Some(chunk) = stream.next().await {
             for byte in chunk.map_err(transport)?.iter() {
                 if let Some(data) = decoder.push(*byte)? {
-                    yield serde_json::from_slice::<Value>(&data).map_err(|_| InferenceError::InvalidUpstream)?;
+                    yield decode(data)?;
                 }
             }
         }

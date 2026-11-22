@@ -13,7 +13,9 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::stream_class_tests::{Kind, NAMES, Step, http_class, response, serve, sse};
+use super::stream_class_tests::{
+    Kind, NAMES, Step, http_class, response, responses_complete, serve, sse,
+};
 use crate::{
     billing::v3::Meter,
     governance::tests::db::{Fixture, fixture},
@@ -439,6 +441,228 @@ per_kind! {
     openai_responses: Kind::Responses,
     openrouter: Kind::OpenRouter,
     local: Kind::Local,
+}
+
+#[dbtest::test]
+async fn responses_terminal_status_mismatch_preserves_valid_usage(pool: PgPool) {
+    let kind = Kind::Responses;
+    let w = world(pool, kind, false).await;
+    let (content, rest, _) = kind.valid();
+    let prefix = [content, rest].concat();
+    let snapshot = responses_complete();
+    let class = InferenceError::InvalidUpstream;
+    let mut problems = Vec::new();
+    for (event, status) in [
+        ("response.incomplete", "completed"),
+        ("response.completed", "incomplete"),
+    ] {
+        let mut snapshot = snapshot.clone();
+        snapshot["status"] = json!(status);
+        if status == "incomplete" {
+            snapshot["incomplete_details"] = json!({"reason":"max_output_tokens"});
+        }
+        snapshot.as_object_mut().unwrap().remove("usage");
+        let mut wire_snapshot = snapshot.to_string();
+        wire_snapshot.pop(); // Append raw fields before the closing brace.
+        // The fixture prices input and output at one micro-USD per token.
+        for (label, usage, input, output, expected_floor) in [
+            (
+                "reported",
+                r#","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}"#,
+                Some(3),
+                Some(2),
+                5,
+            ),
+            (
+                "partial input",
+                r#","usage":{"input_tokens":3,"total_tokens":5}"#,
+                Some(3),
+                None,
+                3,
+            ),
+            (
+                "partial output",
+                r#","usage":{"output_tokens":2,"total_tokens":5}"#,
+                None,
+                Some(2),
+                2,
+            ),
+            (
+                "explicit zeros",
+                r#","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}"#,
+                Some(0),
+                Some(0),
+                0,
+            ),
+            ("missing", "", None, None, 0),
+            (
+                "total only",
+                r#","usage":{"total_tokens":5}"#,
+                None,
+                None,
+                0,
+            ),
+            (
+                "invalid",
+                r#","usage":{"input_tokens":3,"output_tokens":-2}"#,
+                None,
+                None,
+                0,
+            ),
+            (
+                "contradictory total",
+                r#","usage":{"input_tokens":5000,"output_tokens":2,"total_tokens":5001}"#,
+                None,
+                None,
+                0,
+            ),
+            (
+                "impossible partial",
+                r#","usage":{"output_tokens":2,"total_tokens":1}"#,
+                None,
+                None,
+                0,
+            ),
+            (
+                "cache evidence exceeds partial total",
+                r#","usage":{"output_tokens":2,"input_tokens_details":{"cached_tokens":5000},"total_tokens":5001}"#,
+                None,
+                None,
+                0,
+            ),
+            (
+                "cache evidence fits partial total",
+                r#","usage":{"output_tokens":2,"input_tokens_details":{"cached_tokens":5000},"total_tokens":5002}"#,
+                None,
+                Some(2),
+                5002,
+            ),
+            (
+                "object-valued count",
+                r#","usage":{"input_tokens":{"count":3},"output_tokens":2}"#,
+                None,
+                None,
+                0,
+            ),
+            (
+                "conflicting reasoning fields",
+                r#","usage":{"input_tokens":3,"output_tokens":2,"output_tokens_details":{"reasoning_tokens":1},"completion_tokens_details":{"reasoning_tokens":2}}"#,
+                Some(3),
+                Some(2),
+                5,
+            ),
+            (
+                "duplicate count",
+                r#","usage":{"input_tokens":null,"input_\u0074okens":5000,"output_tokens":2,"total_tokens":5002}"#,
+                None,
+                None,
+                0,
+            ),
+            (
+                "duplicate usage",
+                r#","usage":null,"usage":{"input_tokens":3,"output_tokens":2}"#,
+                None,
+                None,
+                0,
+            ),
+            (
+                "duplicate cache count",
+                r#","usage":{"input_tokens":3,"output_tokens":2,"input_tokens_details":{"cached_tokens":0,"cached_tokens":1}}"#,
+                None,
+                None,
+                0,
+            ),
+            (
+                "above admission bounds",
+                r#","usage":{"input_tokens":5000,"output_tokens":2,"total_tokens":5002}"#,
+                Some(5000),
+                Some(2),
+                5002,
+            ),
+        ] {
+            let terminal =
+                format!("data: {{\"type\":\"{event}\",\"response\":{wire_snapshot}{usage}}}}}\n\n")
+                    .into_bytes();
+            let steps = vec![Step::Bytes([prefix.clone(), terminal].concat())];
+            let reply = w.ask(Client::Responses, steps).await;
+            let at = format!("{event} with {status} snapshot and {label} usage");
+            assert_eq!(reply.status, 200, "{at}");
+            assert_eq!(last_event(&reply.body)["type"], "error", "{at}");
+            assert_eq!(told(Client::Responses, &reply.body), class.code(), "{at}");
+            for event in ["response.completed", "response.incomplete", "[DONE]"] {
+                assert!(!reply.body.contains(event), "{at}: unexpected {event}");
+            }
+            let got = recorded(&w.f.store.pool, w.deployment, reply.id).await;
+            let want = Recorded {
+                input,
+                output,
+                ..failed_with(class, None)
+            };
+            if got != want {
+                problems.push(format!("{at}: recorded {got:?}, want {want:?}"));
+            }
+            type AccountingRow = (
+                i64,
+                i64,
+                Option<i64>,
+                Option<i64>,
+                Option<i64>,
+                Option<i64>,
+                i64,
+            );
+            let (held, admitted, reserved_input, reserved_output, ledger_input, ledger_output, floor): AccountingRow = sqlx::query_as(
+                "SELECT r.held_microusd,h.amount_microusd,r.input_tokens,r.output_tokens,u.input_tokens,u.output_tokens,u.amount_microusd
+                 FROM inference_executions e
+                 JOIN governance_reservations r ON r.execution_id=e.id AND r.admitted_at=e.started_at
+                 JOIN monetary_ledger h ON h.execution_id=e.id AND h.admitted_at=e.started_at AND h.kind='hold'
+                 JOIN monetary_ledger u ON u.execution_id=e.id AND u.admitted_at=e.started_at AND u.kind='unknown'
+                 WHERE e.root_request_id=$1",
+            )
+            .bind(reply.id)
+            .fetch_one(&w.f.store.pool)
+            .await
+            .unwrap();
+            if label == "conflicting reasoning fields" {
+                let telemetry: (Option<i64>, Option<String>) = sqlx::query_as(
+                    "SELECT reasoning_tokens,reported_upstream_model FROM inference_executions WHERE root_request_id=$1",
+                )
+                .bind(reply.id)
+                .fetch_one(&w.f.store.pool)
+                .await
+                .unwrap();
+                assert_eq!(telemetry, (Some(1), Some("served".into())), "{at}");
+            }
+            assert!(admitted > 0, "{at}: the fixture must reserve money");
+            let got = (
+                reserved_input,
+                reserved_output,
+                ledger_input,
+                ledger_output,
+                floor,
+                held,
+            );
+            let want = (
+                input,
+                output,
+                input,
+                output,
+                expected_floor,
+                admitted.max(expected_floor),
+            );
+            if got != want {
+                problems.push(format!(
+                    "{at}: reservation and ledger {got:?}, want {want:?}"
+                ));
+            }
+            if label == "above admission bounds" {
+                assert!(
+                    held > admitted,
+                    "{at}: the known floor must increase the hold"
+                );
+            }
+        }
+    }
+    assert!(problems.is_empty(), "{problems:#?}");
 }
 
 /// #622: a reset or a body that ends before the terminal frame (including

@@ -95,11 +95,29 @@ pub(crate) fn inclusive(
     object(value)?;
     object(&value[details_key])?;
     let details = &value[details_key];
-    let write = count(&details[write_key])?;
     let output = count(&value[output_key])?;
-    let mut usage = checked(
+    let mut usage = inclusive_counts(
+        count(&value[input_key])?,
+        output,
+        count(&details["cached_tokens"])?,
+        count(&details[write_key])?,
+    )?;
+    usage.reasoning_tokens = reasoning_tokens(value, output);
+    Ok(usage)
+}
+
+pub(super) fn inclusive_counts(
+    input: Option<u64>,
+    output: Option<u64>,
+    read: Option<u64>,
+    write: Option<u64>,
+) -> Result<Usage> {
+    if output.is_some_and(|n| n > i64::MAX as u64) {
+        return Err(InferenceError::InvalidUpstream);
+    }
+    checked(
         BillingUsage {
-            cache_read_input_tokens: count(&details["cached_tokens"])?,
+            cache_read_input_tokens: read,
             cache_write_input_tokens: write,
             cache_write_default_input_tokens: write,
             // This profile's writes have no Anthropic TTL pricing categories.
@@ -108,11 +126,9 @@ pub(crate) fn inclusive(
             ..BillingUsage::default()
         },
         true,
-        count(&value[input_key])?,
+        input,
         output,
-    )?;
-    usage.reasoning_tokens = reasoning_tokens(value, output);
-    Ok(usage)
+    )
 }
 /// Telemetry only (Logs): reasoning tokens reported inside the output details
 /// (`completion_tokens_details` for Chat Completions, `output_tokens_details`
@@ -131,7 +147,7 @@ pub(crate) fn top_level_reasoning_tokens(value: &Value, output: Option<u64>) -> 
         .as_u64()
         .filter(|n| plausible_reasoning(*n, output))
 }
-fn plausible_reasoning(n: u64, output: Option<u64>) -> bool {
+pub(super) fn plausible_reasoning(n: u64, output: Option<u64>) -> bool {
     n <= i64::MAX as u64 && output.is_none_or(|o| n <= o)
 }
 /// Telemetry only (Logs): the model id the provider reports having served
