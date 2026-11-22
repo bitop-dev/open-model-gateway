@@ -76,7 +76,7 @@ DO $$ DECLARE r record; t text; BEGIN
   IF has_column_privilege('gateway_runtime','public.async_job_files',t,'UPDATE') THEN RAISE EXCEPTION 'mutable async job file: %',t; END IF;
  END LOOP;
  IF has_column_privilege('gateway_runtime','public.governance_reservations','request_count','UPDATE') OR has_column_privilege('gateway_runtime','public.governance_reservations','admitted_at','UPDATE') THEN RAISE EXCEPTION 'mutable reservation admission snapshot'; END IF;
- IF (SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'async_job%' AND tgenabled='O' AND NOT tgisinternal)<>7 THEN RAISE EXCEPTION 'async job guards missing or disabled'; END IF;
+ IF (SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'async_job%' AND tgenabled='O' AND NOT tgisinternal)<>8 THEN RAISE EXCEPTION 'async job guards missing or disabled'; END IF;
  IF has_table_privilege('gateway_runtime','public.installation_settings','INSERT,DELETE,TRUNCATE') OR has_column_privilege('gateway_runtime','public.installation_settings','singleton','UPDATE') THEN RAISE EXCEPTION 'installation settings row replaceable'; END IF;
  -- Installation logo (0023): a reviewed column set, guarded by a trigger.
  IF NOT has_column_privilege('gateway_runtime','public.installation_settings','branding_logo_file_id','UPDATE') THEN RAISE EXCEPTION 'installation logo not maintainable by runtime'; END IF;
@@ -1020,6 +1020,12 @@ BEGIN
   BEGIN UPDATE batch_segments SET lines=2 WHERE job_id=bj; RAISE EXCEPTION 'batch segment rewrite allowed'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
   BEGIN UPDATE async_jobs SET batch_mode='native' WHERE id=bj; RAISE EXCEPTION 'batch mode rewrite allowed'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
   UPDATE async_jobs SET state='completed',upstream_status='completed',output_file_id=coalesce(output_file_id,fo),completed_at=coalesce(completed_at,clock_timestamp()),runner_lease_until=NULL WHERE id=bj AND state IN('queued','in_progress');
+  IF NOT EXISTS(SELECT FROM stored_files WHERE id=fo AND batch_result_linked) THEN RAISE EXCEPTION 'batch result link was not marked'; END IF;
+  IF has_column_privilege('public.stored_files','batch_result_linked','INSERT')
+   OR has_column_privilege('public.stored_files','batch_result_linked','UPDATE')
+   OR has_function_privilege('public.mark_batch_result_linked()','EXECUTE') THEN
+   RAISE EXCEPTION 'batch result marker writable by runtime';
+  END IF;
   BEGIN UPDATE async_jobs SET output_file_id=fin WHERE id=bj; RAISE EXCEPTION 'batch output rewrite allowed'; EXCEPTION WHEN raise_exception THEN IF SQLERRM<>'async job identity is immutable' THEN RAISE; END IF; END;
   UPDATE governance_reservations SET state='settled',actual_microusd=0,input_tokens=0,output_tokens=0 WHERE execution_id=env AND state='pending';
   UPDATE inference_executions SET state='succeeded',input_tokens=0,output_tokens=0,elapsed_ms=1,completed_at=clock_timestamp(),finish_reason='stop' WHERE id=env AND state='started' AND workload_kind='batches';
