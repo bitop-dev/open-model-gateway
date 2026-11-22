@@ -74,7 +74,7 @@ jobs/runner.rs :: impl Runner::finalize :: metrics call :: crate :: metrics :: M
 jobs/runner.rs :: impl Runner::new :: metrics call :: crate :: metrics :: METRICS . set_batch_workers (workers as u64 , 0)
 jobs/runner.rs :: impl Runner::observe_queue :: metrics call :: crate :: metrics :: METRICS . set_batch_queue (mode , n . max (0) as u64)
 jobs/runner.rs :: impl Runner::observe_queue :: metrics call :: crate :: metrics :: METRICS . set_batch_workers (capacity as u64 , capacity . saturating_sub (self . pool . available_permits ()) as u64 ,)
-jobs/runner/line.rs :: impl LineRun::finished :: metrics call :: crate :: metrics :: METRICS . observe_batch_lines ("gateway" , & self . job . provider , c as u64 , f as u64 ,)
+jobs/runner/line.rs :: impl LineRun::finished :: metrics call :: crate :: metrics :: METRICS . observe_batch_lines ("gateway" , & self . job . provider , u64 :: from (success) , u64 :: from (! success) ,)
 jobs/schedule.rs :: impl Scheduler::record_signal :: metrics call :: crate :: metrics :: METRICS . observe_batch_route_pause (p . as_str ())
 jobs/schedule.rs :: observe_metrics :: metrics call :: crate :: metrics :: METRICS . set_batch_paused_routes (& paused . into_iter () . filter_map (| (r , n) | Pause :: parse (& r) . map (| p | (p . as_str () , n . max (0) as u64))) . collect :: < Vec < _ > > () ,)
 jobs/schedule.rs :: observe_metrics :: metrics call :: crate :: metrics :: METRICS . set_batch_route_lines (& lines . into_iter () . map (| (p , w , r) | (p , w . max (0) as u64 , r . max (0) as u64)) . collect :: < Vec < _ > > () ,)
