@@ -1,6 +1,6 @@
-// Report registry tag drift for the upstream Compose and chart defaults.
+// Report registry tag drift for upstream Compose, chart and workflow image pins.
 import { execFileSync } from "node:child_process";
-import { parseStrict, readLocalFromRepo, root, toData } from "../tests/supply-chain/lib.mjs";
+import { actionName, jobsOf, parseStrict, readLocalFromRepo, repoFiles, root, stepsOf, toData } from "../tests/supply-chain/lib.mjs";
 import { checkedComposeFiles, imageTrackingReference, isPinnedImage, upstreamComposeImages } from "../tests/supply-chain/policy.mjs";
 
 const yaml = file => toData(parseStrict(readLocalFromRepo(file), file));
@@ -15,6 +15,34 @@ for (const file of checkedComposeFiles()) {
   }
 }
 pins.push([chart, yaml(chart).cnpg.cluster.image]);
+
+for (const { file, text } of repoFiles()) {
+  if (!file.startsWith(".github/workflows/")) continue;
+  for (const [name, job] of jobsOf(toData(parseStrict(text, file)))) {
+    const location = `${file} job '${name}'`;
+    if (file === ".github/workflows/ci.yml" && Object.hasOwn(job.services ?? {}, "postgres")) {
+      const service = job.services.postgres;
+      pins.push([`${location} services.postgres`, typeof service === "string" ? service : service?.image]);
+    }
+    for (const step of stepsOf(job)) {
+      const action = actionName(step.uses);
+      if (action === "docker/setup-buildx-action") {
+        const options = step.with?.["driver-opts"];
+        const image = typeof options === "string" ? options.match(/^image=(\S+)$/m)?.[1] : undefined;
+        pins.push([`${location} Buildx driver-opts image`, image]);
+      }
+      if (action === "docker/build-push-action" && typeof step.with?.attests === "string") {
+        for (const line of step.with.attests.split("\n")) {
+          const fields = line.split(",").map(field => field.trim());
+          if (fields.includes("type=sbom")) {
+            const generator = fields.find(field => field.startsWith("generator="))?.slice("generator=".length);
+            pins.push([`${location} SBOM generator`, generator]);
+          }
+        }
+      }
+    }
+  }
+}
 
 const lookups = new Map();
 function indexDigest(reference) {
@@ -35,7 +63,7 @@ function indexDigest(reference) {
   return lookups.get(reference);
 }
 
-for (const [file, pinned, trackingTag] of pins) {
+for (const [location, pinned, trackingTag] of pins) {
   try {
     if (typeof pinned !== "string" || !isPinnedImage(pinned)) throw new Error("expected a digest-pinned image");
     const [, digest] = pinned.split("@");
@@ -44,9 +72,9 @@ for (const [file, pinned, trackingTag] of pins) {
     if (indexDigest(pinned) !== digest) throw new Error(`${pinned} did not resolve to its pinned digest`);
     const current = indexDigest(tag);
     if (current !== digest) throw new Error(`${tag} moved from ${digest} to ${current}`);
-    console.log(`${file}: ${tag} matches ${digest} (linux/amd64, linux/arm64)`);
+    console.log(`${location}: ${tag} matches ${digest} (linux/amd64, linux/arm64)`);
   } catch (error) {
-    console.error(`${file}: ${error.message}`);
+    console.error(`${location}: ${error.message}`);
     process.exitCode = 1;
   }
 }
