@@ -42,7 +42,7 @@ use std::{
 
 use async_trait::async_trait;
 use gateway_datetime_compat::UtcInstant;
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::sync::{Semaphore, mpsc};
 
 use super::{
@@ -485,16 +485,14 @@ impl Runner {
                         .await
                         .map_err(|_| InferenceError::Storage)?;
                 while let Some(raw) = reader.next_request().await? {
-                    let record: Value =
-                        serde_json::from_slice(&raw).map_err(|_| InferenceError::Storage)?;
-                    let n = record["n"].as_i64().ok_or(InferenceError::Storage)? as i32;
+                    let (n, is_error, result) = segments::decode_record(&raw)?;
                     if !written.insert(n) {
                         continue;
                     }
-                    if record["e"] == json!(true) {
-                        err.line(&record["r"]).await?;
+                    if is_error {
+                        err.line(&result).await?;
                     } else {
-                        out.line(&record["r"]).await?;
+                        out.line(&result).await?;
                     }
                 }
             }

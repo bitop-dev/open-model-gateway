@@ -268,7 +268,7 @@ money.
    batch's job row is written in its admission transaction ([`insert_batch(&mut tx, job`](../../apps/gateway/src/governance/batch.rs#L374)), with the envelope's final lease (poll
    deadline plus grace), and a video's lease extension and job row are one transaction. A gateway-run
    batch that an earlier release left with an `unknown` envelope now ends `failed` with
-   [`Some(Stop::HoldUnavailable) => Some("hold_unavailable")`](../../apps/gateway/src/jobs/runner.rs#L574) instead of every line failing as a provider configuration error. The text
+   [`Some(Stop::HoldUnavailable) => Some("hold_unavailable")`](../../apps/gateway/src/jobs/runner.rs#L572) instead of every line failing as a provider configuration error. The text
    below is the finding as made. `admit_batch` used `ADMISSION_LEASE_SECONDS = 600`
    (`jobs/batch.rs`), then `insert_batch`, then `hold_until` -> `extend_lease`. If the process dies
    or the extension fails (it only logs) the reconciler marks the envelope `unknown` after 10

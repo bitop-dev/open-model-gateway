@@ -21,6 +21,7 @@ enum Boundary {
 enum Case {
     Fault(Boundary, Loss),
     Group,
+    NestedTakeover,
     Quota,
     FailedCommit { retryable: bool },
     Pressure,
@@ -175,11 +176,13 @@ async fn hold_segment_metadata(
 async fn run_case(pool: PgPool, case: Case) {
     let fault = match case {
         Case::Fault(boundary, loss) => Some((boundary, loss)),
+        Case::NestedTakeover => Some((Boundary::AfterCommit, Loss::Takeover)),
         _ => None,
     };
     let size = match case {
         Case::Fault(..) | Case::FailedCommit { .. } => 3,
         Case::Group => 32,
+        Case::NestedTakeover => 2,
         Case::Pressure => 24,
         Case::Quota => 1,
         Case::Measure(size) => size,
@@ -380,6 +383,11 @@ async fn run_case(pool: PgPool, case: Case) {
             .fetch_one(&w.f.store.pool)
             .await
             .unwrap();
+            let segment = if matches!(case, Case::NestedTakeover) {
+                use_old_segment_format(&w, &job, segment).await
+            } else {
+                segment
+            };
             let segment = crate::filestore::files::public_id(segment);
             assert_eq!(
                 client
@@ -550,6 +558,9 @@ async fn run_case(pool: PgPool, case: Case) {
         );
     } else {
         for record in records {
+            if matches!(case, Case::NestedTakeover) && record["custom_id"] == "0" {
+                assert_eq!(record["response"]["body"]["fixture"], nested_fixture());
+            }
             assert_eq!(
                 record["response"]["body"]["choices"][0]["message"]["content"],
                 "answer"
@@ -742,4 +753,126 @@ async fn check_writer_backpressure(pool: &PgPool, job: Uuid, calls: &AtomicUsize
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(awaiting().await.unwrap(), 13);
     assert_eq!(calls.load(Ordering::SeqCst), 13);
+}
+
+#[sqlx::test(migrations = "./enterprise_migrations")]
+async fn takeover_downloads_a_nested_result_in_an_existing_format_segment(pool: PgPool) {
+    run_case(pool, Case::NestedTakeover).await;
+}
+
+fn nested_fixture() -> Value {
+    (0..124).fold(
+        json!("fixture with [braces], \"quotes\" and \\slashes"),
+        |v, _| json!([v]),
+    )
+}
+
+async fn use_old_segment_format(w: &World, job: &JobRow, original: Uuid) -> Uuid {
+    // Keep real settled executions and progress. Replace only the encrypted
+    // fixture object so it has the old n/e/r serialization and a deep result.
+    let mut records = w.read(job.workspace_id, Some(original)).await;
+    assert_eq!(records.len(), 2);
+    let deep = &mut records.iter_mut().find(|r| r["n"] == 0).unwrap()["r"];
+    deep["response"]["body"]["fixture"] = nested_fixture();
+    let public = serde_json::to_vec(deep).unwrap();
+    assert!(serde_json::from_slice::<Value>(&public).is_ok());
+    let mut encoded = Vec::new();
+    for record in records {
+        serde_json::to_writer(&mut encoded, &record).unwrap();
+        encoded.push(b'\n');
+    }
+    let file = w
+        .files
+        .create(
+            crate::jobs::io::batch_file(
+                true,
+                job.workspace_id,
+                job.api_key_id,
+                job.user_id,
+                "legacy-segment.jsonl".into(),
+            ),
+            Box::pin(futures_util::stream::once(async move {
+                Ok(axum::body::Bytes::from(encoded))
+            })),
+        )
+        .await
+        .unwrap();
+    let mut tx = w.f.store.pool.begin().await.unwrap();
+    sqlx::query("ALTER TABLE batch_segments DISABLE TRIGGER batch_segments_no_update")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query("UPDATE batch_segments SET file_id=$1 WHERE job_id=$2 AND file_id=$3")
+            .bind(file.id)
+            .bind(job.id)
+            .bind(original)
+            .execute(&mut *tx)
+            .await
+            .unwrap()
+            .rows_affected(),
+        1
+    );
+    sqlx::query("ALTER TABLE batch_segments ENABLE TRIGGER batch_segments_no_update")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    w.files
+        .delete(original, Some(job.workspace_id))
+        .await
+        .unwrap();
+    file.id
+}
+
+#[dbtest::test]
+async fn oversized_result_is_downloadable_as_a_public_error(pool: PgPool) {
+    let w = world(pool, false, false, 1).await;
+    let p = w.f.principal;
+    let input = w
+        .upload(
+            &p,
+            &[chat_line("large", "company/smart", "oversized-result")],
+        )
+        .await;
+    let job = w
+        .create(p, &input, BatchEndpoint::ChatCompletions, None)
+        .await
+        .unwrap();
+    assert!(start(&w).await.unwrap().unwrap());
+    let done = w.reload(&job).await;
+    assert_eq!(
+        (done.request_completed, done.request_failed),
+        (Some(0), Some(1))
+    );
+    assert!(done.output_file_id.is_none());
+    let gateway = Server::start(
+        crate::http::router_with_engine(w.f.store.clone(), None, w.jobs.engine.clone().unwrap())
+            .layer(axum::Extension(w.files.runtime().clone())),
+    )
+    .await;
+    let auth = crate::jobs::db_tests::bearer(&w.f, p.workspace_id).await;
+    let file = public_id(done.error_file_id.unwrap());
+    let content = client()
+        .get(format!("{}/v1/files/{file}/content", gateway.base))
+        .header("authorization", auth)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let error: Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(error["custom_id"], "large");
+    assert_eq!(
+        error["response"]["body"]["error"]["code"],
+        "invalid_upstream_response"
+    );
+    assert_eq!(w.openai.executed(), ["oversized-result"]);
+    let cost = crate::governance::batch::batch_cost(&w.f.store, job.id)
+        .await
+        .unwrap();
+    assert_eq!((cost.0, cost.1), (15, 0));
 }

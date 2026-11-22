@@ -1,7 +1,75 @@
 //! Finished lines stored in encrypted result segments as they complete.
 use super::*;
 use crate::jobs::fence::SegmentLines;
+#[cfg(test)]
+use serde_json::json;
 use tokio::time::Instant;
+
+/// serde_json accepts at most 127 nested containers in a public result.
+/// The private record adds exactly one object around that result.
+const RESULT_DEPTH: usize = 127;
+const RECORD_DEPTH: usize = RESULT_DEPTH + 1;
+
+fn result_fits(value: &Value, remaining: usize) -> bool {
+    match value {
+        Value::Array(values) => {
+            remaining > 0 && values.iter().all(|item| result_fits(item, remaining - 1))
+        }
+        Value::Object(values) => {
+            remaining > 0 && values.values().all(|item| result_fits(item, remaining - 1))
+        }
+        _ => true,
+    }
+}
+
+fn check_depth(bytes: &[u8]) -> std::io::Result<()> {
+    let mut depth = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for &byte in bytes {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => quoted = true,
+            b'{' | b'[' => {
+                depth += 1;
+                if depth > RECORD_DEPTH {
+                    return Err(std::io::Error::other("result record exceeds depth limit"));
+                }
+            }
+            b'}' | b']' if depth > 0 => depth -= 1,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Parse the envelope without spending the public result's serde depth budget.
+pub(super) fn decode_record(bytes: &[u8]) -> Result<(i32, bool, Value), InferenceError> {
+    #[derive(serde::Deserialize)]
+    struct Envelope<'a> {
+        n: i32,
+        e: bool,
+        #[serde(borrow)]
+        r: &'a serde_json::value::RawValue,
+    }
+
+    // RawValue's syntax scanner is iterative. Cap its depth before it
+    // buffers nesting, then apply serde's normal validation to the payload.
+    check_depth(bytes).map_err(|_| InferenceError::Storage)?;
+    let record: Envelope<'_> =
+        serde_json::from_slice(bytes).map_err(|_| InferenceError::Storage)?;
+    let result = serde_json::from_str(record.r.get()).map_err(|_| InferenceError::Storage)?;
+    Ok((record.n, record.e, result))
+}
 
 /// A complete JSONL record, including its newline, bounded by the reader limit.
 pub(super) struct Record {
@@ -62,6 +130,11 @@ fn encode_line(
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+    if !result_fits(value, RESULT_DEPTH) {
+        return Err(serde_json::Error::io(std::io::Error::other(
+            "result exceeds depth limit",
+        )));
     }
     let mut out = Bounded {
         bytes: Vec::new(),
@@ -322,6 +395,35 @@ impl Probe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_depth_matches_the_public_result_budget() {
+        let value = (0..RESULT_DEPTH).fold(json!(r#"quoted "["{}\]"#), |v, n| {
+            if n % 2 == 0 {
+                json!([v])
+            } else {
+                json!({"item":v})
+            }
+        });
+        let record = Record::encode(3, Uuid::nil(), false, &value).unwrap();
+        assert!(serde_json::from_slice::<Value>(&record.encoded).is_err());
+        assert_eq!(
+            decode_record(&record.encoded).unwrap(),
+            (3, false, value.clone())
+        );
+
+        let too_deep = json!([value]);
+        assert!(Record::encode(3, Uuid::nil(), false, &too_deep).is_err());
+        let legacy = serde_json::to_vec(&json!({"n":3,"e":false,"r":too_deep})).unwrap();
+        assert!(matches!(
+            decode_record(&legacy),
+            Err(InferenceError::Storage)
+        ));
+        assert!(matches!(
+            decode_record(br#"{"n":3,"e":false,"r":"\uD800"}"#),
+            Err(InferenceError::Storage)
+        ));
+    }
 
     #[test]
     fn encoding_caps_escaped_json_and_the_newline() {

@@ -259,6 +259,13 @@ impl ProviderAdapter for Fake {
                     usage: cached,
                 }))
             }
+            "oversized-result" => Ok(ProviderOutput::Complete(ChatResponse {
+                messages_content: None,
+                content: Some("\0".repeat(super::io::RESULT_LINE_BYTES / 6)),
+                tool_calls: vec![],
+                finish_reason: FinishReason::Stop,
+                usage: usage(10, 5),
+            })),
             "fail" => Err(InferenceError::UpstreamUnavailable),
             "busy" => Err(InferenceError::Busy),
             "slow" => {
