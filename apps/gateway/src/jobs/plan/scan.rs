@@ -100,7 +100,7 @@ impl Jobs {
             state.check_native_encoding(scope.endpoint, &line.request, &resolved);
             state.native_ok &= rejection.is_none();
         }
-        let has_estimate = estimate.is_some();
+        let has_preview = estimate.is_some() || gateway_error.is_some();
         let alternate = if state.native_ok {
             estimate.filter(|route| route.deployment.id != resolved.deployment.id)
         } else {
@@ -133,7 +133,7 @@ impl Jobs {
             None
         };
         let rejection =
-            match state.check_engine(scope.endpoint, line.request, &resolved, pin, has_estimate) {
+            match state.check_engine(scope.endpoint, line.request, &resolved, pin, has_preview) {
                 Ok(pinned_rejection) => rejection.or(pinned_rejection),
                 Err(error) => return Ok(Err(error)),
             };
@@ -326,7 +326,7 @@ impl ScanState {
         mut request: BatchRequest,
         resolved: &Resolved,
         pin: Option<lines::LinePlan>,
-        has_estimate: bool,
+        has_preview: bool,
     ) -> Result<Option<InferenceError>, LineError> {
         let mut rejection = None;
         let coarse_ok = resolved.legacy
@@ -350,7 +350,10 @@ impl ScanState {
                 return Err(LineError::UnsupportedFeature);
             }
         }
-        if !coarse_ok && !has_estimate && self.gateway_unsupported.is_none() {
+        // The model route's capability check is a fallback diagnosis for
+        // this line. A gateway preview can already identify a compatible
+        // route or explain why compatible routes are currently unusable.
+        if !coarse_ok && !has_preview && self.gateway_unsupported.is_none() {
             self.gateway_unsupported = Some(self.physical);
         }
         Ok(rejection)
