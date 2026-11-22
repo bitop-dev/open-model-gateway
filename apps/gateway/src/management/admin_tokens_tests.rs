@@ -2,13 +2,9 @@ use super::*;
 use axum::{body::Body, http::Request};
 use tower::ServiceExt;
 
-/// #37 PR2 item 2: the plaintext creation response carries an explicit
-/// `Cache-Control: no-store`, set by the handler itself rather than only
-/// relying on the global `request_context` middleware default (which the
-/// `call()` test helper bypasses -- it invokes the router directly, not
-/// through the full `axum::serve` stack middleware is layered on in
-/// production -- so a regression here would not otherwise be caught by
-/// this suite's other tests, which all use `call()`).
+/// The handler sets `Cache-Control: no-store` on the plaintext creation
+/// response. Calling the router directly exercises the handler without
+/// the production request-context middleware.
 #[dbtest::test]
 async fn creation_response_sets_no_store_explicitly(pool: PgPool) {
     let f = fixture(&pool).await;

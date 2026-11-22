@@ -60,7 +60,7 @@ fn inference_openapi_vocabulary_covers_every_variant_and_renderer() {
             validate_value(&doc, &schema("OpenAiErrorEnvelope"), &anthropic).is_err(),
             "an Anthropic error validated as an OpenAI error"
         );
-        // Anthropic's shape has no machine code (coordinator decision 5).
+        // Anthropic's error shape omits a machine code.
         assert!(anthropic["error"].get("code").is_none());
     }
     // The management envelope (error.code = HTTP status, error.reason) is neither.
