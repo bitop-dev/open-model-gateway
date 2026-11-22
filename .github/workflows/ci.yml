@@ -43,6 +43,7 @@ jobs:
       # The shipped build (default features, no `integration-tests`): code under
       # cfg(not(feature = "integration-tests")) is not compiled in the run above (#502).
       - run: cargo clippy -p open-model-gateway --bins --lib --locked -- -D warnings
+      - run: cargo clippy -p open-model-gateway --all-targets --locked -- -D warnings
 
   sdk-compat:
     runs-on: ubuntu-24.04

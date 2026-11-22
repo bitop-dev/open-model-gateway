@@ -71,7 +71,7 @@ use dispatch::Dispatch;
 use lanes::{Head, Lane, Pin, Planned, note, permits, spawn_line, wait_reason_without_permits};
 use line::{LineRun, Record, RunState, Stop};
 use repository::LineRepository;
-#[cfg(test)]
+#[cfg(all(test, feature = "integration-tests"))]
 pub(crate) use segments::Probe as SegmentProbe;
 use segments::write_segments;
 
@@ -416,7 +416,7 @@ impl Runner {
             if let Err(e) = published_now {
                 match e {
                     FenceError::Stale => state.lose(),
-                    FenceError::Storage | FenceError::Unknown => {
+                    FenceError::Storage | FenceError::Unknown | FenceError::FileBusy => {
                         tracing::warn!(job_id = %job.id, "batch demand not recorded");
                     }
                 }
@@ -450,7 +450,7 @@ impl Runner {
                 state.lose();
                 return Ok(());
             }
-            Err(FenceError::Storage | FenceError::Unknown) => {
+            Err(FenceError::Storage | FenceError::Unknown | FenceError::FileBusy) => {
                 tracing::warn!(job_id = %job.id, "batch demand not cleared; it goes stale");
             }
         }
@@ -585,11 +585,8 @@ impl Runner {
                 },
             )
             .await;
-        // The result files are removed when the outcome is certain and the
-        // batch does not reference them: the claim ended (zero rows), or the
-        // statement was rolled back. When the connection failed with the
-        // statement possibly sent, the server may still commit it, so the
-        // files stay (a later sweep removes them if it did not).
+        // Clean up files the batch did not link when the outcome is known.
+        // After an unacknowledged commit, the sweeper can check for links.
         let job = match finished {
             Ok(row) => {
                 let unused = [output_file, error_file].map(|f| {
@@ -607,7 +604,11 @@ impl Runner {
                 remove_files(files, job, [output_file, error_file]).await;
                 return Err(InferenceError::Storage.into());
             }
-            Err(FenceError::Unknown) => return Err(InferenceError::Storage.into()),
+            // Deleting a busy result would wait for the same file lock.
+            // Release the job for retry and let the sweeper reclaim the files.
+            Err(FenceError::Unknown | FenceError::FileBusy) => {
+                return Err(InferenceError::Storage.into());
+            }
         };
         let _ = segments;
         self.settle_finished(&job, files, state).await?;

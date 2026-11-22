@@ -1,7 +1,7 @@
 //! Job and job-file rows (migration 0016). Every client lookup is scoped by
 //! the principal's workspace. Metadata only.
 use gateway_datetime_compat::{SignedDuration as TimeDelta, UtcInstant};
-use sqlx::FromRow;
+use sqlx::{FromRow, Postgres, Transaction};
 use uuid::Uuid;
 
 use super::{fence::BatchFence, types::*};
@@ -404,41 +404,74 @@ pub(crate) struct Finished<'a> {
     pub error_file: Option<Uuid>,
     pub counts: Option<RequestCounts>,
 }
-/// The statement that records a batch's terminal state. Parameters: `$1` the
-/// job, then (`fenced`) the runner `$2` and epoch `$3`, then the state, error
-/// code, output file, error file and the three counts.
-pub(crate) fn finish_batch_sql(fenced: bool) -> String {
-    let (guard, n) = if fenced {
-        (" AND runner_id=$2 AND runner_epoch=$3", 3)
-    } else {
-        ("", 1)
-    };
-    format!(
-        "UPDATE async_jobs SET state=${s},upstream_status=${s},error_code=coalesce(error_code,${e}),output_file_id=coalesce(output_file_id,${o}),error_file_id=coalesce(error_file_id,${r}),request_total=coalesce(${t},request_total),request_completed=coalesce(${c},request_completed),request_failed=coalesce(${f},request_failed),completed_at=coalesce(completed_at,clock_timestamp()) WHERE id=$1{guard} AND state IN('queued','in_progress') RETURNING {JOB_COLUMNS}",
-        s = n + 1,
-        e = n + 2,
-        o = n + 3,
-        r = n + 4,
-        t = n + 5,
-        c = n + 6,
-        f = n + 7
-    )
-}
-pub(crate) async fn finish_batch(store: &Store, id: Uuid, f: &Finished<'_>) -> Result<JobRow> {
-    sqlx::query(&finish_batch_sql(false))
-        .bind(id)
-        .bind(f.state.as_str())
-        .bind(f.error_code)
-        .bind(f.output_file)
-        .bind(f.error_file)
-        .bind(f.counts.map(|c| c.total as i32))
-        .bind(f.counts.map(|c| c.completed as i32))
-        .bind(f.counts.map(|c| c.failed as i32))
-        .execute(&store.pool)
+/// Link the results and finish the job while holding the file locks shared
+/// with the sweeper. The job lock precedes the file locks, as it does for
+/// other runner writes. A committed deletion claim makes a result unusable
+/// even while the object still exists.
+pub(super) async fn finish_batch_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    id: Uuid,
+    f: &Finished<'_>,
+) -> Result<JobRow> {
+    let job: JobRow = sqlx::query_as(&format!(
+        "SELECT {JOB_COLUMNS} FROM async_jobs WHERE id=$1 FOR NO KEY UPDATE"
+    ))
+    .bind(id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(job_storage)?;
+    if !matches!(job.state.as_str(), "queued" | "in_progress") {
+        return Ok(job);
+    }
+
+    let mut ids: Vec<Uuid> = [f.output_file, f.error_file]
+        .into_iter()
+        .flatten()
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if !ids.is_empty() {
+        // Rekey holds its file lock across object I/O. Keep the job lock
+        // available for takeover by failing promptly on a busy result.
+        let files: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM stored_files WHERE id=ANY($1) AND workspace_id=$2
+             AND api_purpose='batch_output' AND committed_at IS NOT NULL
+             AND deleted_at IS NULL AND last_delete_attempt_at IS NULL
+             ORDER BY id FOR NO KEY UPDATE NOWAIT",
+        )
+        .bind(&ids)
+        .bind(job.workspace_id)
+        .fetch_all(&mut **tx)
         .await
         .map_err(job_storage)?;
-    reload(store, id).await
+        if files.len() != ids.len() {
+            return Err(job_storage(sqlx::Error::RowNotFound));
+        }
+    }
+
+    sqlx::query_as(&format!(
+        "UPDATE async_jobs SET state=$2,upstream_status=$2,error_code=coalesce(error_code,$3),output_file_id=coalesce(output_file_id,$4),error_file_id=coalesce(error_file_id,$5),request_total=coalesce($6,request_total),request_completed=coalesce($7,request_completed),request_failed=coalesce($8,request_failed),completed_at=coalesce(completed_at,clock_timestamp()) WHERE id=$1 RETURNING {JOB_COLUMNS}"
+    ))
+    .bind(id)
+    .bind(f.state.as_str())
+    .bind(f.error_code)
+    .bind(f.output_file)
+    .bind(f.error_file)
+    .bind(f.counts.map(|c| c.total as i32))
+    .bind(f.counts.map(|c| c.completed as i32))
+    .bind(f.counts.map(|c| c.failed as i32))
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(job_storage)
 }
+
+pub(crate) async fn finish_batch(store: &Store, id: Uuid, f: &Finished<'_>) -> Result<JobRow> {
+    let mut tx = crate::db::begin(&store.pool).await.map_err(job_storage)?;
+    let row = finish_batch_tx(&mut tx, id, f).await?;
+    tx.commit().await.map_err(job_storage)?;
+    Ok(row)
+}
+
 /// Observed provider progress (native): counts and the stall clock. The
 /// gateway counted the lines at admission, so a provider total never replaces
 /// it (OpenAI reports `total: 0` while it is still validating).
