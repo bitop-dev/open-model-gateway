@@ -259,7 +259,8 @@ GRANT INSERT(scope_kind,workspace_id,cost_center_id,created_by,cadence,timezone,
 -- scheduler cursor; configuration_revision itself stays trigger-owned.
 GRANT UPDATE(cadence,timezone,delivery_time,state,deleted_at,recipient_revision) ON public.report_schedules TO gateway_runtime;
 GRANT INSERT(schedule_id,slot,user_id),DELETE ON public.report_schedule_recipients TO gateway_runtime;
-GRANT UPDATE(next_run_at,next_period_end,last_period_end) ON public.report_schedules TO gateway_runtime;
+-- 0084: cursor writes require the active bundled calendar and pinned revision.
+GRANT EXECUTE ON FUNCTION public.omg_report_set_cursor(uuid,bigint,text,timestamptz,timestamptz,timestamptz) TO gateway_runtime;
 -- #102D recent-run/outcome and immutable snapshot/CSV reads reuse these SELECTs
 -- plus installation_settings/alert_deliveries SELECT; no new write authority.
 -- runtime_privileges exercises the live browser handlers under this role.
@@ -445,8 +446,9 @@ GRANT EXECUTE ON FUNCTION public.omg_scope_key(uuid),public.omg_type_key(text),
 GRANT SELECT,UPDATE(version,changed_at) ON public.config_versions TO gateway_runtime;
 GRANT EXECUTE ON FUNCTION public.omg_config_bump(text) TO gateway_runtime;
 -- Work leases (0029): replicas take, renew, fence and release the seeded
--- singleton-job leases through these helpers (FOR SHARE fencing needs an
--- UPDATE column). Lease names are seeded and never created, renamed or
+-- singleton-job leases through these helpers. FOR SHARE fencing and report
+-- management's calendar check need an UPDATE column. The bundle pin is
+-- migration-owned. Lease names are seeded and never created, renamed or
 -- removed at runtime; epochs only move forward (trigger).
 GRANT SELECT,UPDATE(holder,epoch,acquired_at,expires_at,last_completed_at,last_completed_epoch)
  ON public.work_leases TO gateway_runtime;

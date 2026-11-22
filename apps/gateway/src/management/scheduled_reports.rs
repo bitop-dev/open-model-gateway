@@ -318,6 +318,7 @@ async fn create(
     config: Option<settings::SignIn>,
 ) -> ApiResult {
     let mut tx = resources::installation_tx(&s).await?;
+    crate::scheduled_reports::lock_calendar(&mut tx).await?;
     let mut kind = authority(&mut tx, &u, ws, true).await?;
     validate(
         &b.cadence,
@@ -375,6 +376,7 @@ async fn update(
     config: Option<settings::SignIn>,
 ) -> ApiResult {
     let mut tx = resources::installation_tx(&s).await?;
+    crate::scheduled_reports::lock_calendar(&mut tx).await?;
     authority(&mut tx, &u, ws, true).await?;
     let old = row(&mut tx, ws, id).await?;
     if b.cadence.is_none()

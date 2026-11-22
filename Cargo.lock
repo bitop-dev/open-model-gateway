@@ -2592,6 +2592,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "jiff",
+ "jiff-tzdb",
  "jsonschema",
  "lettre",
  "libc",

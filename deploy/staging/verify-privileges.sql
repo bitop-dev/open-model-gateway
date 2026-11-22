@@ -93,17 +93,21 @@ DO $$ DECLARE r record; t text; BEGIN
  FOREACH t IN ARRAY ARRAY['id','scope_kind','workspace_id','cost_center_id','created_by','configuration_revision','created_at','updated_at'] LOOP
   IF has_column_privilege('gateway_runtime','public.report_schedules',t,'UPDATE') THEN RAISE EXCEPTION 'mutable report schedule identity/cursor: %',t; END IF;
  END LOOP;
- FOREACH t IN ARRAY ARRAY['id','configuration_revision','recipient_revision','created_at','updated_at','deleted_at','next_run_at','next_period_end','last_period_end'] LOOP
+ FOREACH t IN ARRAY ARRAY['id','configuration_revision','recipient_revision','created_at','updated_at','deleted_at','next_run_at','next_period_end','last_period_end','cursor_tzdb'] LOOP
   IF has_column_privilege('gateway_runtime','public.report_schedules',t,'INSERT') THEN RAISE EXCEPTION 'report schedule initial state bypass: %',t; END IF;
  END LOOP;
  IF NOT has_column_privilege('gateway_runtime','public.report_schedules','cadence','UPDATE') OR NOT has_column_privilege('gateway_runtime','public.report_schedules','deleted_at','UPDATE') OR NOT has_column_privilege('gateway_runtime','public.report_schedules','recipient_revision','UPDATE') OR NOT has_column_privilege('gateway_runtime','public.report_schedules','created_by','INSERT') THEN RAISE EXCEPTION 'report schedules not maintainable'; END IF;
  IF NOT has_table_privilege('gateway_runtime','public.report_schedule_recipients','SELECT,DELETE') OR NOT has_column_privilege('gateway_runtime','public.report_schedule_recipients','user_id','INSERT') OR has_any_column_privilege('gateway_runtime','public.report_schedule_recipients','UPDATE') OR has_table_privilege('gateway_runtime','public.report_schedule_recipients','TRUNCATE') THEN RAISE EXCEPTION 'report recipient ACL'; END IF;
  IF (SELECT count(*) FROM pg_trigger WHERE tgname IN ('report_schedules_guard','report_schedules_no_delete','report_schedules_no_truncate','report_schedule_recipients_no_update','report_schedule_recipients_no_truncate') AND tgenabled='O' AND NOT tgisinternal)<>5 THEN RAISE EXCEPTION 'report schedule guards missing or disabled'; END IF;
- IF NOT EXISTS(SELECT FROM work_leases WHERE name='report_scheduler') THEN RAISE EXCEPTION 'report scheduler lease missing'; END IF;
+ IF NOT EXISTS(SELECT FROM work_leases WHERE name='report_scheduler' AND report_tzdb IS NOT NULL) THEN RAISE EXCEPTION 'versioned report lease missing'; END IF;
+ IF has_column_privilege('gateway_runtime','public.work_leases','report_tzdb','UPDATE') THEN RAISE EXCEPTION 'runtime can change report calendar pin'; END IF;
+ FOREACH t IN ARRAY ARRAY['next_run_at','next_period_end','last_period_end','cursor_tzdb'] LOOP
+  IF has_column_privilege('gateway_runtime','public.report_schedules',t,'UPDATE') THEN RAISE EXCEPTION 'report cursor bypass: %',t; END IF;
+ END LOOP;
  FOREACH t IN ARRAY ARRAY['report_runs','report_snapshots','report_generation_outcomes'] LOOP
   IF NOT has_table_privilege('gateway_runtime','public.'||t,'SELECT') OR has_table_privilege('gateway_runtime','public.'||t,'INSERT,UPDATE,DELETE,TRUNCATE') OR has_any_column_privilege('gateway_runtime','public.'||t,'UPDATE') THEN RAISE EXCEPTION 'report append-only ACL: %',t; END IF;
  END LOOP;
- IF NOT has_column_privilege('gateway_runtime','public.report_runs','claim_token','INSERT') OR NOT has_column_privilege('gateway_runtime','public.report_snapshots','body','INSERT') OR NOT has_column_privilege('gateway_runtime','public.report_schedules','next_period_end','UPDATE') THEN RAISE EXCEPTION 'report generation not maintainable'; END IF;
+ IF NOT has_column_privilege('gateway_runtime','public.report_runs','claim_token','INSERT') OR NOT has_column_privilege('gateway_runtime','public.report_snapshots','body','INSERT') OR NOT has_function_privilege('gateway_runtime','public.omg_report_set_cursor(uuid,bigint,text,timestamptz,timestamptz,timestamptz)','EXECUTE') THEN RAISE EXCEPTION 'report generation not maintainable'; END IF;
  IF has_column_privilege('gateway_runtime','public.report_runs','created_at','INSERT') OR has_column_privilege('gateway_runtime','public.report_runs','configuration','INSERT') OR has_column_privilege('gateway_runtime','public.report_generation_claims','schedule_id','UPDATE') OR has_table_privilege('gateway_runtime','public.report_generation_claims','DELETE,TRUNCATE') THEN RAISE EXCEPTION 'report lineage bypass'; END IF;
  IF has_column_privilege('gateway_runtime','public.report_snapshots','expires_at','INSERT') THEN RAISE EXCEPTION 'report retention clock bypass'; END IF;
  IF NOT has_column_privilege('gateway_runtime','public.report_generation_outcomes','category','INSERT') OR has_column_privilege('gateway_runtime','public.report_generation_outcomes','created_at','INSERT') THEN RAISE EXCEPTION 'report outcome ACL'; END IF;
@@ -200,7 +204,7 @@ DO $$ DECLARE r record; t text; BEGIN
   IF has_column_privilege('gateway_runtime','public.batch_route_waits',t,'UPDATE') THEN RAISE EXCEPTION 'mutable batch demand identity: %',t; END IF;
  END LOOP;
  IF has_table_privilege('gateway_runtime','public.batch_route_waits','TRUNCATE') THEN RAISE EXCEPTION 'batch demand truncatable'; END IF;
- IF EXISTS(SELECT FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public' AND has_function_privilege('gateway_runtime',p.oid,'EXECUTE') AND p.proname NOT IN ('lock_installation','workspace_model_allowed','valid_model_protocols','valid_i64_string','valid_cache_pricing','valid_billing_usage','valid_cost_components','components_total','valid_meter_usage','valid_meter_variant','valid_price_lines','valid_max_units','valid_model_protocols_base','valid_cost_components_base','valid_price_lines_base','valid_upstream_job_id','rate_reserved_tokens','rate_contribution','omg_scope_key','omg_type_key','omg_scope_lock_audit_order','omg_lock_scopes','omg_admission_locks','omg_lock_scope_rows','omg_catalog_lock_mode','omg_scope_lock_exclusive','omg_config_bump','omg_lease_acquire','omg_lease_fence','omg_lease_complete','omg_lease_release','omg_ensure_partitions','omg_partition_coverage','omg_partition_bounds','omg_month_start','omg_next_month','omg_usage_aggregate','omg_usage_rows','omg_admin_tokens_revoke_owner','omg_admin_tokens_require_read_committed','omg_admin_tokens_require_owner_lock','valid_admin_token_scopes','valid_admin_token_allowlist','alert_webhook_summary','alert_webhook_payload','omg_report_prune_snapshots','alert_delivery_lock_buckets','alert_delivery_recent_count','scrub_access_request_reasons','access_review_item_active','access_review_candidate','access_review_may_decide')) THEN RAISE EXCEPTION 'unexpected executable function'; END IF;
+ IF EXISTS(SELECT FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public' AND has_function_privilege('gateway_runtime',p.oid,'EXECUTE') AND p.proname NOT IN ('lock_installation','workspace_model_allowed','valid_model_protocols','valid_i64_string','valid_cache_pricing','valid_billing_usage','valid_cost_components','components_total','valid_meter_usage','valid_meter_variant','valid_price_lines','valid_max_units','valid_model_protocols_base','valid_cost_components_base','valid_price_lines_base','valid_upstream_job_id','rate_reserved_tokens','rate_contribution','omg_scope_key','omg_type_key','omg_scope_lock_audit_order','omg_lock_scopes','omg_admission_locks','omg_lock_scope_rows','omg_catalog_lock_mode','omg_scope_lock_exclusive','omg_config_bump','omg_lease_acquire','omg_lease_fence','omg_lease_complete','omg_lease_release','omg_ensure_partitions','omg_partition_coverage','omg_partition_bounds','omg_month_start','omg_next_month','omg_usage_aggregate','omg_usage_rows','omg_admin_tokens_revoke_owner','omg_admin_tokens_require_read_committed','omg_admin_tokens_require_owner_lock','valid_admin_token_scopes','valid_admin_token_allowlist','alert_webhook_summary','alert_webhook_payload','omg_report_prune_snapshots','omg_report_set_cursor','alert_delivery_lock_buckets','alert_delivery_recent_count','scrub_access_request_reasons','access_review_item_active','access_review_candidate','access_review_may_decide')) THEN RAISE EXCEPTION 'unexpected executable function'; END IF;
  -- Change notifications (0028): seeded topics, forward-only versions, triggers present.
  IF has_table_privilege('gateway_runtime','public.config_versions','INSERT,DELETE,TRUNCATE') OR has_column_privilege('gateway_runtime','public.config_versions','topic','UPDATE') THEN RAISE EXCEPTION 'configuration topics mutable'; END IF;
  IF NOT has_table_privilege('gateway_runtime','public.config_versions','SELECT') OR NOT has_column_privilege('gateway_runtime','public.config_versions','version','UPDATE') THEN RAISE EXCEPTION 'configuration versions not maintainable by runtime'; END IF;
@@ -210,7 +214,7 @@ DO $$ DECLARE r record; t text; BEGIN
  -- Work leases (0029): seeded names, forward-only epochs, guards present.
  IF has_table_privilege('gateway_runtime','public.work_leases','INSERT,DELETE,TRUNCATE') OR has_column_privilege('gateway_runtime','public.work_leases','name','UPDATE') THEN RAISE EXCEPTION 'work leases creatable, removable or re-keyable'; END IF;
  IF NOT has_table_privilege('gateway_runtime','public.work_leases','SELECT') OR NOT has_column_privilege('gateway_runtime','public.work_leases','epoch','UPDATE') THEN RAISE EXCEPTION 'work leases not usable by runtime'; END IF;
- IF (SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'work\_leases\_%' AND tgenabled='O' AND NOT tgisinternal)<>2 THEN RAISE EXCEPTION 'work lease guards missing or disabled'; END IF;
+ IF (SELECT count(*) FROM pg_trigger WHERE tgrelid='public.work_leases'::regclass AND tgname IN ('work_leases_forward','work_leases_no_truncate','work_leases_report_calendar') AND tgenabled='O' AND NOT tgisinternal)<>3 THEN RAISE EXCEPTION 'work lease guards missing or disabled'; END IF;
  -- History partitions (0030/0031): reached only through the parents; every
  -- partition guarded against TRUNCATE; no default partition; the runtime may
  -- only ask for canonical future months (one-argument SECURITY DEFINER form).
@@ -355,7 +359,11 @@ SET CONSTRAINTS provider_cost_import_complete,provider_cost_mapping_complete DEF
 SELECT lock_installation();
 -- Report probes: runtime may manage configuration/cursors, never immutable
 -- lineage, snapshots, retained tombstones or recipients outside fifty slots.
-DO $$ DECLARE who uuid:=gen_random_uuid(); schedule uuid; col text; BEGIN
+-- Release the report lease lock and discard the report fixtures before other probes.
+SAVEPOINT report_schedule_probe;
+DO $$ DECLARE who uuid:=gen_random_uuid(); schedule uuid; col text; required_bundle text; saved jsonb; BEGIN
+ IF public.omg_lease_acquire('report_scheduler',gen_random_uuid(),30) IS NOT NULL THEN RAISE EXCEPTION 'unversioned report lease acquired'; END IF;
+ SELECT report_tzdb INTO STRICT required_bundle FROM work_leases WHERE name='report_scheduler' FOR SHARE;
  INSERT INTO users(id,email) VALUES(who,'report-acl-'||who||'@example.invalid');
  INSERT INTO report_schedules(scope_kind,created_by,cadence,timezone,delivery_time) VALUES('installation',who,'weekly','UTC','09:00') RETURNING id INTO schedule;
  INSERT INTO report_schedule_recipients(schedule_id,slot,user_id) VALUES(schedule,1,who);
@@ -365,6 +373,18 @@ DO $$ DECLARE who uuid:=gen_random_uuid(); schedule uuid; col text; BEGIN
  IF (SELECT configuration_revision FROM report_schedules WHERE id=schedule)<>2 THEN RAISE EXCEPTION 'report no-op advanced revision'; END IF;
  UPDATE report_schedules SET recipient_revision=recipient_revision+1 WHERE id=schedule;
  IF (SELECT configuration_revision FROM report_schedules WHERE id=schedule)<>3 THEN RAISE EXCEPTION 'report recipient change not versioned'; END IF;
+ PERFORM public.omg_report_set_cursor(schedule,3,required_bundle,'2026-01-01 09:00Z','2026-01-01 00:00Z',NULL);
+ SELECT to_jsonb(s) INTO STRICT saved FROM report_schedules s WHERE id=schedule
+  AND cursor_tzdb=required_bundle AND next_run_at='2026-01-01 09:00Z' AND next_period_end='2026-01-01 00:00Z';
+ BEGIN
+  PERFORM public.omg_report_set_cursor(schedule,3,required_bundle||'-wrong','2026-02-01 09:00Z','2026-02-01 00:00Z','2026-01-01 00:00Z');
+  RAISE EXCEPTION 'wrong report cursor bundle allowed';
+ EXCEPTION WHEN SQLSTATE '55006' THEN
+  IF SQLERRM <> 'report calendar bundle mismatch' THEN RAISE; END IF;
+ END;
+ IF (SELECT to_jsonb(s) FROM report_schedules s WHERE id=schedule) IS DISTINCT FROM saved THEN
+  RAISE EXCEPTION 'wrong report cursor bundle changed the schedule';
+ END IF;
  BEGIN UPDATE report_schedules SET recipient_revision=recipient_revision-1 WHERE id=schedule; RAISE EXCEPTION 'report recipient revision decreased'; EXCEPTION WHEN raise_exception THEN IF SQLERRM NOT LIKE 'report recipient revision must%' THEN RAISE; END IF; END;
  FOREACH col IN ARRAY ARRAY['id','scope_kind','workspace_id','cost_center_id','created_by','configuration_revision','created_at','updated_at'] LOOP
   BEGIN EXECUTE format('UPDATE report_schedules SET %1$I=%1$I WHERE id=$1',col) USING schedule; RAISE EXCEPTION 'report identity/cursor update allowed'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
@@ -380,6 +400,8 @@ DO $$ DECLARE who uuid:=gen_random_uuid(); schedule uuid; col text; BEGIN
  UPDATE report_schedules SET state='paused',deleted_at=clock_timestamp() WHERE id=schedule;
  BEGIN UPDATE report_schedules SET deleted_at=NULL WHERE id=schedule; RAISE EXCEPTION 'deleted schedule resurrected'; EXCEPTION WHEN raise_exception THEN IF SQLERRM NOT LIKE 'immutable report schedule%' THEN RAISE; END IF; END;
 END $$;
+ROLLBACK TO SAVEPOINT report_schedule_probe;
+RELEASE SAVEPOINT report_schedule_probe;
 -- 0065 shared envelopes keep report lineage insert-only. No existing rows
 -- are changed by these refusal probes, including on a live installation.
 DO $$ BEGIN
