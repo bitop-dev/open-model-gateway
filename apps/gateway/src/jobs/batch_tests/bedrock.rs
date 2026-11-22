@@ -175,15 +175,40 @@ async fn failed_tool_result_batch_sends_explicit_bedrock_status(pool: PgPool) {
 
 #[dbtest::test]
 async fn priority_batch_prices_and_dispatches_adaptive_thinking_on_anthropic(pool: PgPool) {
-    adaptive_thinking_batch(pool, "priority").await;
+    adaptive_thinking_batch(pool, "priority", None).await;
 }
 
 #[dbtest::test]
 async fn weighted_batch_prices_and_dispatches_adaptive_thinking_on_anthropic(pool: PgPool) {
-    adaptive_thinking_batch(pool, "weighted").await;
+    adaptive_thinking_batch(pool, "weighted", None).await;
 }
 
-async fn adaptive_thinking_batch(pool: PgPool, strategy: &str) {
+enum BlockedRoute {
+    Residency,
+    Cooldown,
+}
+
+#[dbtest::test]
+async fn priority_batch_refuses_residency_blocked_thinking(pool: PgPool) {
+    adaptive_thinking_batch(pool, "priority", Some(BlockedRoute::Residency)).await;
+}
+
+#[dbtest::test]
+async fn weighted_batch_refuses_residency_blocked_thinking(pool: PgPool) {
+    adaptive_thinking_batch(pool, "weighted", Some(BlockedRoute::Residency)).await;
+}
+
+#[dbtest::test]
+async fn priority_batch_refuses_cooling_thinking(pool: PgPool) {
+    adaptive_thinking_batch(pool, "priority", Some(BlockedRoute::Cooldown)).await;
+}
+
+#[dbtest::test]
+async fn weighted_batch_refuses_cooling_thinking(pool: PgPool) {
+    adaptive_thinking_batch(pool, "weighted", Some(BlockedRoute::Cooldown)).await;
+}
+
+async fn adaptive_thinking_batch(pool: PgPool, strategy: &str, blocked: Option<BlockedRoute>) {
     use crate::providers::{
         anthropic::AnthropicAdapter,
         secrets::{Secret, SecretResolver},
@@ -284,13 +309,16 @@ async fn adaptive_thinking_batch(pool: PgPool, strategy: &str) {
         .timeout(Duration::from_secs(15))
         .build()
         .unwrap();
-    let create = |file: String| {
+    let create = |file: String, mode: Option<&str>| {
+        let mut body =
+            json!({"input_file_id":file,"endpoint":"/v1/messages","completion_window":"24h"});
+        if let Some(mode) = mode {
+            body["metadata"] = json!({"omg_mode": mode});
+        }
         client
             .post(format!("{gateway}/v1/batches"))
             .header("authorization", &auth)
-            .json(
-                &json!({"input_file_id":file,"endpoint":"/v1/messages","completion_window":"24h"}),
-            )
+            .json(&body)
             .send()
     };
     let line = |max| {
@@ -305,7 +333,7 @@ async fn adaptive_thinking_batch(pool: PgPool, strategy: &str) {
     // At the Bedrock ceiling, the only refusal is the unsupported thinking option.
     let file = w.upload(&w.f.principal, &[line(50)]).await;
     let before = admission_rowcounts(&w.f).await;
-    let response = create(file).await.unwrap();
+    let response = create(file, None).await.unwrap();
     assert_eq!(response.status(), 400);
     let body: Value = response.json().await.unwrap();
     assert_eq!(body["error"]["code"], "invalid_batch_input");
@@ -323,8 +351,81 @@ async fn adaptive_thinking_batch(pool: PgPool, strategy: &str) {
         .execute(&pool)
         .await
         .unwrap();
+    if let Some(blocked) = blocked {
+        let (expected_status, code) = match blocked {
+            BlockedRoute::Residency => {
+                sqlx::query("UPDATE deployment_routing SET residency='us' WHERE deployment_id=$1")
+                    .bind(w.claude_deployment)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                sqlx::query(
+                    "UPDATE routing_policies SET required_residency='us' WHERE model_id=$1",
+                )
+                .bind(w.claude)
+                .execute(&pool)
+                .await
+                .unwrap();
+                (404, "model_not_found")
+            }
+            BlockedRoute::Cooldown => {
+                sqlx::query(
+                    "INSERT INTO deployment_health(deployment_id,open_until)
+                     VALUES($1,clock_timestamp()+interval '1 hour')",
+                )
+                .bind(anthropic)
+                .execute(&pool)
+                .await
+                .unwrap();
+                (503, "model_temporarily_unavailable")
+            }
+        };
+        let file = w.upload(&w.f.principal, &[line(40)]).await;
+        for mode in [None, Some("gateway")] {
+            let response = create(file.clone(), mode).await.unwrap();
+            let status = response.status();
+            if matches!(blocked, BlockedRoute::Cooldown) {
+                assert!(response.headers().get("retry-after").is_some(), "{status}");
+            }
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(status, expected_status, "{strategy} {mode:?}: {body}");
+            assert_eq!(body["error"]["code"], code);
+            assert_eq!(admission_rowcounts(&w.f).await, before);
+        }
+        assert!(!runner.run_next().await.unwrap());
+        assert!(bedrock_calls.lock().unwrap().is_empty());
+        assert!(anthropic_calls.lock().unwrap().is_empty());
+
+        let mut compatible = line(40);
+        compatible["body"]
+            .as_object_mut()
+            .unwrap()
+            .remove("thinking");
+        let file = w.upload(&w.f.principal, &[compatible]).await;
+        let response = create(file, None).await.unwrap();
+        let status = response.status();
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(status, 200, "{body}");
+        let id =
+            crate::jobs::types::parse_client_id("batch_", body["id"].as_str().unwrap()).unwrap();
+        let job = store::reload(&w.f.store, id).await.unwrap();
+        assert_eq!(job.mode(), Some(BatchMode::Gateway));
+        assert_eq!(job.deployment_id, w.claude_deployment);
+        assert_eq!(reservation(&w.f, job.execution_id).await.1, Some(280));
+        assert!(runner.run_next().await.unwrap());
+        let job = w.reload(&job).await;
+        assert_eq!(
+            (job.request_completed, job.request_failed),
+            (Some(1), Some(0))
+        );
+        assert_eq!(bedrock_calls.lock().unwrap().len(), 1);
+        assert!(anthropic_calls.lock().unwrap().is_empty());
+        consistent(&w.f).await;
+        return;
+    }
+
     let file = w.upload(&w.f.principal, &[line(51)]).await;
-    let response = create(file).await.unwrap();
+    let response = create(file, None).await.unwrap();
     let status = response.status();
     let body: Value = response.json().await.unwrap();
     assert_eq!(status, 200, "{body}");
@@ -343,7 +444,44 @@ async fn adaptive_thinking_batch(pool: PgPool, strategy: &str) {
     assert!(bedrock_calls.lock().unwrap().is_empty());
     assert!(anthropic_calls.lock().unwrap().is_empty());
 
-    assert!(runner.run_next().await.unwrap());
+    // A compatible route can enter cooldown after admission. The queued
+    // line waits without a child attempt until its route recovers.
+    sqlx::query(
+        "INSERT INTO deployment_health(deployment_id,open_until)
+         VALUES($1,clock_timestamp()+interval '1 hour')",
+    )
+    .bind(anthropic)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let admitted = admission_rowcounts(&w.f).await;
+    let mut run = std::pin::pin!(runner.run_next());
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), &mut run)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT runner_id IS NOT NULL FROM async_jobs WHERE id=$1")
+            .bind(job.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    );
+    assert_eq!(admission_rowcounts(&w.f).await, admitted);
+    assert!(bedrock_calls.lock().unwrap().is_empty());
+    assert!(anthropic_calls.lock().unwrap().is_empty());
+    sqlx::query("DELETE FROM deployment_health WHERE deployment_id=$1")
+        .bind(anthropic)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(20), run)
+            .await
+            .unwrap()
+            .unwrap()
+    );
     let job = w.reload(&job).await;
     assert_eq!(
         (job.request_completed, job.request_failed),
