@@ -37,13 +37,11 @@ struct TelemetryRepository {
     /// Whether `admit` simulates a committed shared-workspace admission.
     shared: AtomicBool,
     fail_finish: AtomicBool,
-    /// Settlement sleeps briefly before returning (#98 PR 2 review item 1):
-    /// proves `upstream.attempt`'s own duration never grows by settlement's.
+    /// A delayed settlement lets the test distinguish the upstream attempt's
+    /// duration from the settlement duration.
     slow_finish: AtomicBool,
-    /// When set, `admit` still marks shared eligibility (if `shared` is
-    /// set) before returning this error - simulating a team-workspace rate
-    /// or budget denial discovered after a committed admission (#98 PR 2
-    /// review item 2).
+    /// When shared eligibility is enabled, mark it before returning this
+    /// error to model a workspace limit denial after committed admission.
     admit_error: Mutex<Option<InferenceError>>,
     finishes: Mutex<Vec<ExecutionFinish>>,
 }
@@ -93,12 +91,8 @@ impl InferenceRepository for TelemetryRepository {
         ] {
             telemetry::mark_phase(phase);
         }
-        // telemetry::mark_shared itself now requires a
-        // governance::SharedEligibilityCommitted token only governance.rs
-        // can construct (#98 PR 2 review item 3), so these engine tests use
-        // the dedicated #[cfg(test)]-only bypass instead: simulating what a
-        // real committed shared-workspace admission does, so these engine
-        // tests can observe exported spans without a real database.
+        // The test-only hook simulates committed shared admission without a
+        // database so these engine tests can observe exported spans.
         if self.shared.load(Ordering::SeqCst) {
             telemetry::mark_shared_for_tests(record.root_request_id, &request.model);
         }
@@ -215,6 +209,7 @@ fn request(stream: bool) -> ChatRequest {
             content: Some("hi".into()),
             tool_calls: vec![],
             tool_call_id: None,
+            tool_result_is_error: false,
         }],
         tools: vec![],
         tool_choice: None,
@@ -681,12 +676,9 @@ async fn a_settlement_write_failure_is_recorded_and_returned() {
     );
 }
 
-/// #98 PR 2 review item 1: `upstream.attempt`'s own duration must end at the
-/// terminal upstream outcome, never grow by a slow settlement write's own
-/// time (settlement has its own, separate duration). A slow
-/// `finish_attempt` (150ms) makes the pre-fix bug - the attempt span's end
-/// timestamp taken only after settlement has already finished - fail this
-/// by a wide, unmistakable margin.
+/// The upstream attempt's duration ends at the terminal upstream outcome.
+/// A delayed `finish_attempt` makes any settlement time included in the
+/// attempt duration visible.
 #[tokio::test]
 async fn the_attempt_span_ends_before_settlement_even_when_settlement_is_slow() {
     let repository = Arc::new(TelemetryRepository::default());
@@ -756,17 +748,10 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
     }
 }
 
-/// #98 PR 2 review item 2: `ExecutionGuard`'s reconciliation log lines pass
-/// `self.log_trace_id.as_deref()` (an `Option<&str>`) as the `trace_id`
-/// field, not `?self.log_trace_id` (`Debug`-formatted `Option<String>`,
-/// which would log `Some("…")` - never matching a Tempo/Loki search by the
-/// bare hex id - and the literal string `"None"` for an untraced request).
-/// Proven directly against `tracing`'s own `Value` impl for `Option<&str>`,
-/// through a dedicated local call site: the shared production call sites
-/// (`inference finalization failed…`) are also hit, unguarded, by several
-/// other tests and by production code, so racing tracing's process-wide
-/// per-callsite interest cache under parallel `cargo test` made capturing
-/// *that* exact call site flaky; this call site exists only here.
+/// The reconciliation log's `Option<&str>` records a bare trace ID when
+/// present and omits the field when absent. A local tracing call site
+/// exercises the same field representation without competing with other
+/// tests for interest in the production call sites.
 #[test]
 fn trace_id_field_is_a_bare_string_when_present_and_absent_when_none() {
     fn emit(trace_id: Option<&str>) {
@@ -801,14 +786,10 @@ fn trace_id_field_is_a_bare_string_when_present_and_absent_when_none() {
     );
 }
 
-/// #98 PR 2 review item 2: an admission denial discovered only after a
-/// committed shared-workspace admission (a team-workspace rate or budget
-/// limit, modelled here by `TelemetryRepository::admit_error`) must still
-/// finish telemetry explicitly with `Outcome::Error` and the denial's own
-/// `error.type`, not fall through to `Drop`'s `cancelled` default: the
-/// early `admission_result...??` return this proves covers both the inner
-/// admission error and (by construction, since both arms of that match now
-/// call `telemetry.finish`) the outer timeout error.
+/// A denial after committed shared-workspace admission exports an error
+/// span with the denial's own error type. This exercises the inner
+/// admission error path, whose telemetry finish shares the early return
+/// with the outer timeout path.
 #[tokio::test]
 async fn an_admission_denial_after_committed_eligibility_still_exports_an_error_outcome() {
     let repository = Arc::new(TelemetryRepository::default());
@@ -853,15 +834,8 @@ async fn an_admission_denial_after_committed_eligibility_still_exports_an_error_
     assert!(spans.iter().any(|s| name(s) == "admission"), "{spans:#?}");
 }
 
-/// #98 PR 2 review item 4: a route plan with no deployment ids (the
-/// `for`/`enumerate` attempt loop runs zero times, its only reachable
-/// trigger: any nonzero number of iterations always returns explicitly on
-/// its last attempt) falls through to the trailing
-/// `Err(InferenceError::Busy)`. Zero iterations also means admission never
-/// ran, so telemetry eligibility is never established either - nothing
-/// exports for this trigger regardless of the fix below, which is checked
-/// structurally instead (see the next test). This is a behavioral sanity
-/// check: the fallback still returns `Busy` and nothing spuriously exports.
+/// An empty route plan skips admission and returns Busy. With no
+/// committed telemetry eligibility, the request exports no span.
 #[tokio::test]
 async fn an_empty_route_plan_still_returns_busy_and_exports_nothing() {
     let repository = Arc::new(TelemetryRepository::default());
@@ -891,30 +865,11 @@ async fn an_empty_route_plan_still_returns_busy_and_exports_nothing() {
     assert!(drain(&mut rx).await.is_empty());
 }
 
-/// #98 PR 2 review item 4 (behavioural, replacing a structural source grep):
-/// the fallback `Err(InferenceError::Busy)` after the attempt loop (reached
-/// only when `plan.deployment_ids` is empty, so the loop runs zero
-/// iterations and no admission - and therefore no telemetry eligibility -
-/// is ever possible for this exact trigger; that is why the test above can
-/// observe the return value but never an exported span either way) must
-/// still call `telemetry.finish(...)` explicitly before returning, like
-/// every other return path in this function, so `Drop` is never the one
-/// deciding this outcome and a real `Busy` is never silently relabelled
-/// `Cancelled` if a future change makes eligibility reachable here.
-///
-/// Nothing ever exports for this trigger (proven above), so the closest
-/// observable is the root span's own fate inside `Context`: an explicit
-/// `telemetry.finish(...)` call records a root span into `Context` before
-/// it is dropped un-exported (no eligibility ever committed), which
-/// `Context::Drop` counts into `gateway_trace_dropped_spans_total` with
-/// `reason="ineligible"`. The pre-fix bug (leaving this return to `Drop`'s
-/// own `Outcome::Cancelled` default) would still increment that same
-/// counter once Drop runs its own `finish` - the metric alone cannot tell
-/// "finished explicitly" apart from "finished by Drop" - so this proves
-/// only that a root span is produced at all for this trigger (never
-/// silently skipped, closing the uncounted-loss gap); item 2's engine test
-/// proves the outcome/error.type labelling itself, on the sibling trigger
-/// that does export.
+/// An empty route plan still records a root span. The request has no
+/// eligible export, so dropping the context counts an ineligible span.
+/// The counter measures the recorded span regardless of how it was
+/// finished. The shared-admission denial test checks the outcome label
+/// on a request that does export.
 #[tokio::test]
 async fn an_empty_route_plan_still_records_its_root_span_before_dropping_it_ineligible() {
     async fn ineligible_drops() -> f64 {

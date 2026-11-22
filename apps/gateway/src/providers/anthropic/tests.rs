@@ -32,6 +32,7 @@ pub(super) fn request(stream: bool) -> ChatRequest {
             content: Some("hello".into()),
             tool_calls: vec![],
             tool_call_id: None,
+            tool_result_is_error: false,
         }],
         tools: vec![],
         tool_choice: None,
@@ -115,6 +116,49 @@ fn in_stream_errors_are_classified_like_the_same_http_error() {
         State::default().push(too_long).err(),
         Some(InferenceError::UpstreamRejected)
     );
+}
+
+#[test]
+fn message_stop_before_start_closes_the_parser() {
+    let mut state = State::default();
+    assert_eq!(
+        state.push(json!({"type":"message_stop"})).err(),
+        Some(InferenceError::InvalidUpstream)
+    );
+    assert_eq!(
+        state.push(stream()[0].clone()).err(),
+        Some(InferenceError::InvalidUpstream)
+    );
+}
+
+#[test]
+fn a_started_message_cannot_finish_after_a_rejected_terminal() {
+    let frames = stream();
+    for (terminal, expected) in [
+        (
+            json!({"type":"error","error":{"type":"rate_limit_error"}}),
+            InferenceError::Busy,
+        ),
+        (
+            json!({"type":"message_stop"}),
+            InferenceError::InvalidUpstream,
+        ),
+    ] {
+        let mut state = State {
+            messages: true,
+            ..State::default()
+        };
+        for frame in &frames[..3] {
+            state.push(frame.clone()).unwrap();
+        }
+        assert_eq!(state.push(terminal).err(), Some(expected));
+        for late in &frames[3..] {
+            assert_eq!(
+                state.push(late.clone()).err(),
+                Some(InferenceError::InvalidUpstream)
+            );
+        }
+    }
 }
 
 #[test]
@@ -413,14 +457,31 @@ fn strict_subset_and_unknown_usage() {
 }
 #[test]
 fn tool_deltas_and_ordering() {
-    let mut state = State::default();
-    state.push(stream()[0].clone()).unwrap();
-    let events = state.push(json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call","name":"weather","input":{}}})).unwrap();
-    assert!(matches!(&events[0], ChatEvent::Delta { tool_calls, .. } if tool_calls[0].index == 0));
-    for part in ["{\"city\":", "\"東京\"}"] {
-        state.push(json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":part}})).unwrap();
-    }
-    assert!(state.push(json!({"type":"message_stop"})).is_err());
+    let open_tool = || {
+        let mut state = State::default();
+        state.push(stream()[0].clone()).unwrap();
+        let events = state.push(json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call","name":"weather","input":{}}})).unwrap();
+        assert!(
+            matches!(&events[0], ChatEvent::Delta { tool_calls, .. } if tool_calls[0].index == 0)
+        );
+        for part in ["{\"city\":", "\"東京\"}"] {
+            state.push(json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":part}})).unwrap();
+        }
+        state
+    };
+    let mut rejected = open_tool();
+    assert_eq!(
+        rejected.push(json!({"type":"message_stop"})).err(),
+        Some(InferenceError::InvalidUpstream)
+    );
+    assert_eq!(
+        rejected
+            .push(json!({"type":"content_block_stop","index":0}))
+            .err(),
+        Some(InferenceError::InvalidUpstream)
+    );
+
+    let mut state = open_tool();
     state
         .push(json!({"type":"content_block_stop","index":0}))
         .unwrap();
@@ -530,4 +591,34 @@ fn thinking_tokens_and_reported_model_are_telemetry_only() {
     let mut v = complete();
     v["model"] = json!("m".repeat(ReportedModel::MAX + 1));
     assert_eq!(decode(&v).unwrap().usage.reported_model, None);
+}
+
+#[cfg(feature = "integration-tests")]
+#[dbtest::test]
+async fn error_tool_sdk_anthropic_preserves_boolean_presence(pool: sqlx::PgPool) {
+    let mock = Mock::new(200, None).await;
+    let adapter = AnthropicAdapter::for_test(Arc::new(Resolver), mock.adapter.base.clone());
+    let mut deployment = target();
+    deployment.credential_ref = "env:FIXTURE_ONLY".into();
+    super::super::contract::assert_error_tool_sdk(pool, Arc::new(adapter), deployment).await;
+    let capture = mock.capture.lock().unwrap();
+    assert_eq!(capture.len(), 6);
+    let expected = super::super::contract::error_tool_result_requests();
+    for (i, ((_, _, body), (_, _, text))) in capture.iter().zip(expected).enumerate() {
+        let results = &body["messages"][2]["content"];
+        assert_eq!(results[0]["tool_use_id"], "second-call");
+        assert_eq!(results[0]["content"], text);
+        assert_eq!(
+            results[0].get("is_error"),
+            match i / 2 {
+                0 => None,
+                1 => Some(&json!(false)),
+                _ => Some(&json!(true)),
+            }
+        );
+        assert_eq!(
+            results[1],
+            json!({"type":"tool_result","tool_use_id":"first-call","content":"unchanged"})
+        );
+    }
 }

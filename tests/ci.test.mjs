@@ -49,7 +49,7 @@ function validateGraph(data) {
   for (const name of dependencies) required(data.jobs[name]);
   for (const name of ["gateway-tests", "gateway-special"]) {
     assert.ok(data.jobs[name].services.postgres);
-    assert.ok(data.jobs[name].env.DATABASE_URL);
+    assert.equal(new URL(data.jobs[name].env.DATABASE_URL).hostname, "127.0.0.1");
     assert.ok(runs(data.jobs[name]).includes("npm ci"));
   }
   assert.deepEqual(runs(data.jobs["gateway-lint"]), [
@@ -163,11 +163,12 @@ test("special probes retain sequential ACL, exact contention/terminal, Docker an
   assert.ok(job, "missing special coverage job");
   assert.deepEqual(runs(job), [
     "npm ci",
+    "node .github/scripts/rust-shards.mjs --check-special-sources",
     "cargo test -p open-model-gateway --all-features --test filestore_s3",
-    "cargo test -p open-model-gateway --all-features --test runtime_privileges",
-    "cargo test -p open-model-gateway --all-features --test runtime_privileges -- --ignored --test-threads=1",
-    "cargo test -p open-model-gateway --all-features --lib management::tests::authz_matrix_tests::key_issuance_contention_tests::key_issuance_contention_measurement -- --ignored --exact",
-    "cargo test -p open-model-gateway --all-features --lib providers::anthropic::terminal_tests::terminal_fidelity_official_sdks_and_priced_http_evidence -- --ignored --exact",
+    "node deploy/spark/test-integration.mjs runtime",
+    "node deploy/spark/test-integration.mjs runtime-ignored",
+    "node deploy/spark/test-integration.mjs key-contention",
+    "node deploy/spark/test-integration.mjs terminal",
     AGE_INSTALL,
     "cargo build -p open-model-gateway --all-features --bin open-model-gateway",
     "python3 tests/backup.test.py",
@@ -183,6 +184,57 @@ test("special probes retain sequential ACL, exact contention/terminal, Docker an
   assert.equal(webRuns.filter(run => run === AGE_INSTALL).length, 1);
   assert.equal(webRuns.filter(run => /\bage\b/.test(run)).length, 1, "no other step touches age");
   assert.ok(webRuns.indexOf(AGE_INSTALL) < webRuns.indexOf("npm run test:staging"));
+});
+
+test("special job validates both source paths before invoking any test", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gateway-special-"));
+  try {
+    const cargo = join(dir, "cargo");
+    const calls = join(dir, "calls");
+    writeFileSync(cargo, `#!${process.execPath}
+      import { appendFileSync } from 'node:fs';
+      appendFileSync(process.env.CALLS, JSON.stringify(process.argv.slice(2)) + '\\n');
+      console.log(process.env.METADATA);
+      if (process.env.FAIL) process.exitCode = 101;`, { mode: 0o755 });
+    const command = runs(loadWorkflow().jobs["gateway-special"])[1].split(" ");
+    assert.equal(command[0], "node");
+    const meta = fixtures();
+    meta.workspace_root = "/repo";
+    for (const t of meta.packages[0].targets) t.src_path = `/repo/apps/gateway/tests/${t.name}.rs`;
+    const valid = JSON.stringify(meta);
+    function mutated(name, change) {
+      const copy = structuredClone(meta);
+      const targets = copy.packages[0].targets;
+      change(targets.find(t => t.name === name), targets);
+      return JSON.stringify(copy);
+    }
+    const runtime = change => mutated("runtime_privileges", change);
+    const scenarios = [
+      [valid],
+      [mutated("filestore_s3", t => { t.src_path = "/repo/elsewhere/tests/filestore_s3.rs"; }), /unexpected filestore_s3 source path/],
+      [runtime(t => { t.src_path = "/repo/apps/gateway/tests/remapped_live.rs"; }), /unexpected runtime_privileges source path/],
+      [runtime(t => { t.kind = ["bin", "test"]; }), /Unsupported Cargo test target kind/],
+      [runtime(t => { t.kind = "test"; }), /Malformed Cargo target identity/],
+      [runtime((t, targets) => targets.push(t)), /expected one gateway test target/],
+      [runtime(t => { t.test = false; }), /expected one gateway test target/],
+      ["{", /SyntaxError/],
+      [valid, /exit=101/, "1"],
+    ];
+    for (const [metadata, error, fail = ""] of scenarios) {
+      writeFileSync(calls, "");
+      const result = spawnSync(process.execPath, command.slice(1), {
+        cwd: root, encoding: "utf8", env: { PATH: dir, CALLS: calls, METADATA: metadata, FAIL: fail },
+      });
+      if (error) {
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, error);
+      } else assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(JSON.parse(readFileSync(calls, "utf8")),
+        ["--color", "never", "metadata", "--no-deps", "--all-features", "--format-version", "1", "--locked"]);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("aggregate executable accepts only the exact dependency set with every result successful", () => {
@@ -209,7 +261,10 @@ test("aggregate executable accepts only the exact dependency set with every resu
 });
 
 // Synthetic Cargo/libtest output only: these tests must never build or run Rust.
-const target = (name, kind = ["test"]) => ({ name, kind, test: true });
+const target = (name, kind = ["test"]) => ({
+  name, kind, test: true, src_path: `/repo/tests/${name}.rs`,
+  doctest: kind.some(k => ["lib", "rlib", "proc-macro"].includes(k)),
+});
 const gateway = "path+file:///repo/apps/gateway#open-model-gateway@0.9.0";
 const fixtures = () => ({
   workspace_members: [gateway, "path+file:///repo/tools/new#new@0.1.0"],
@@ -319,22 +374,24 @@ test("Cargo target invocations preserve package identity, exact multiple filters
   assert.deepEqual(validateRun("running 1 test\ntest result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s\n", { entries: [entry("live")], ignored: ["live"], total: 1 }), { passed: 0, ignored: 1, measured: 0 });
 });
 
-function syntheticCargo({ corrupt = "", failAt = -1, probe = "", probeMutation = "" } = {}) {
+function syntheticCargo({ liveIgnored, corrupt = "", failAt = -1, probe = "", probeMutation = "", extend = () => {} } = {}) {
   const meta = fixtures();
+  extend(meta);
   const calls = [];
   const run = async args => {
     calls.push(args);
     if (calls.length === failAt) throw new Error("cargo failed");
     if (args[0] === "metadata") return JSON.stringify(meta);
-    if (args.includes("--no-run")) return cargoOutput(artifacts(meta));
+    if (args.includes("--no-run")) return cargoOutput(artifacts({ packages: meta.packages.filter(p => p.id === args[args.indexOf("-p") + 1]) }));
     if (args.includes("--doc")) return "doctests passed\n";
     const name = args.includes("--lib") ? "open_model_gateway" : args[args.indexOf("--test") + 1] ?? "binary";
     const terminal = "providers::anthropic::terminal_tests::terminal_fidelity_official_sdks_and_priced_http_evidence";
     const keyContention = "management::tests::authz_matrix_tests::key_issuance_contention_tests::key_issuance_contention_measurement";
-    const runtimeProbes = ["enterprise_runtime_allowlist_and_rollback_probes", "controlled_lock_stall_recovers_on_runtime_http_path"];
+    const runtimeProbes = ["enterprise_runtime_allowlist_and_rollback_probes", "controlled_lock_stall_recovers_on_runtime_http_path", "populated_verifier_both", "populated_verifier_personal", "populated_verifier_scim"];
     let entries = name === "open_model_gateway" ? Array.from({ length: 12 }, (_, i) => entry(i === 11 ? terminal : i === 10 ? keyContention : `m::test_${i}`))
       : name === "runtime_privileges" ? runtimeProbes.map(name => entry(name)) : [entry("normal"), entry("live")];
     let ignored = entries.filter(e => e.name === "live" || e.name === terminal || e.name === keyContention || (name === "runtime_privileges" && runtimeProbes.includes(e.name)));
+    if (name === "custom_name" && liveIgnored) ignored = entries;
     if (name === "open_model_gateway" || name === "runtime_privileges") {
       const mutate = items => items.flatMap(e => e.name !== probe ? [e]
         : probeMutation === "remove" ? []
@@ -362,7 +419,11 @@ test("orchestrator runs selected lib names once after -- --exact, runs doctests 
     const fake = syntheticCargo();
     const logs = [];
     await runShard(shard, 4, fake.run, text => logs.push(text));
-    assert.equal(fake.calls.filter(c => c.includes("--doc")).length, shard === 0 ? 1 : 0);
+    // One doctest run per package with a documented library (the gateway and
+    // the proc macro), each selected like its build: never `--workspace`.
+    assert.deepEqual(fake.calls.filter(c => c.includes("--doc")).map(c => c[c.indexOf("-p") + 1]), shard === 0 ? fixtures().workspace_members : []);
+    assert.deepEqual(fake.calls.filter(c => c.includes("--no-run")).map(c => c.slice(0, 3)), fixtures().workspace_members.map(id => ["test", "-p", id]));
+    assert.ok(!fake.calls.some(c => c.includes("--workspace")), "a workspace build unifies features differently from the -p runs");
     const libRuns = fake.calls.filter(c => c.includes("--lib") && !c.includes("--list") && c[c.indexOf("-p") + 1] === gateway);
     assert.equal(libRuns.length, 1);
     const args = libRuns[0];
@@ -380,6 +441,49 @@ test("orchestrator runs selected lib names once after -- --exact, runs doctests 
   }
 });
 
+test("live source targets require every discovered case to be ignored before shard execution", async () => {
+  const { runShard } = await shards();
+  const extend = meta => {
+    meta.packages[0].targets.push({ ...target("custom_name"), src_path: "/repo/apps/gateway/tests/future_live.rs" });
+  };
+  const bad = syntheticCargo({ extend, liveIgnored: false });
+  await assert.rejects(runShard(0, 4, bad.run, () => {}), /future_live\.rs.*normal/);
+  assert.ok(bad.calls.every(args => !args.includes("--exact") && !args.includes("--doc")));
+  await runShard(0, 4, syntheticCargo({ extend, liveIgnored: true }).run, () => {});
+});
+
+test("orchestrator builds and documents per package with all features, and refuses foreign artifacts and malformed members", async () => {
+  const { runShard } = await shards();
+  const cli = "path+file:///repo/tools/cli#cli@0.1.0";
+  const binOnly = meta => {
+    meta.workspace_members.push(cli);
+    meta.packages.push({ id: cli, name: "cli", targets: [target("cli", ["bin"])] });
+  };
+  const fake = syntheticCargo({ extend: binOnly });
+  await runShard(0, 4, fake.run, () => {});
+  const builds = fake.calls.filter(c => c.includes("--no-run"));
+  const docs = fake.calls.filter(c => c.includes("--doc"));
+  assert.deepEqual(builds.map(c => c[c.indexOf("-p") + 1]), [...fixtures().workspace_members, cli]);
+  // A package with no documented library gets no doctest run (Cargo refuses one).
+  assert.deepEqual(docs.map(c => c[c.indexOf("-p") + 1]), fixtures().workspace_members);
+  for (const call of [...builds, ...docs]) assert.ok(call.includes("--all-features"), call.join(" "));
+  // A package's build must produce only its own test executables.
+  const foreign = syntheticCargo();
+  await assert.rejects(() => runShard(0, 4, async args => {
+    const output = await foreign.run(args);
+    if (!args.includes("--no-run") || args[args.indexOf("-p") + 1] !== gateway) return output;
+    const other = artifacts({ packages: fixtures().packages.slice(1) })[0];
+    return cargoOutput([...output.trimEnd().split("\n").slice(0, -1).map(line => JSON.parse(line)), other]);
+  }, () => {}), /Unexpected\/duplicate Cargo test executable/);
+  for (const members of [[], [gateway, gateway], null]) {
+    const malformed = syntheticCargo({ extend: meta => { meta.workspace_members = members; } });
+    await assert.rejects(() => runShard(0, 4, malformed.run, () => {}), /Malformed Cargo workspace metadata/);
+    assert.ok(!malformed.calls.some(c => c.includes("--no-run")), "refused before any build");
+  }
+  const undocumented = syntheticCargo({ extend: meta => { for (const p of meta.packages) for (const t of p.targets) delete t.doctest; } });
+  await assert.rejects(() => runShard(0, 4, undocumented.run, () => {}), /No workspace package has doctests enabled/);
+});
+
 test("orchestrator rejects each missing, renamed, unignored or non-test dedicated probe before executing tests", async () => {
   const { runShard } = await shards();
   const probes = [
@@ -387,6 +491,7 @@ test("orchestrator rejects each missing, renamed, unignored or non-test dedicate
     "providers::anthropic::terminal_tests::terminal_fidelity_official_sdks_and_priced_http_evidence",
     "enterprise_runtime_allowlist_and_rollback_probes",
     "controlled_lock_stall_recovers_on_runtime_http_path",
+    "populated_verifier_both", "populated_verifier_personal", "populated_verifier_scim",
   ];
   for (const probe of probes) for (const probeMutation of ["remove", "rename", "unignore", "benchmark"]) {
     // Generate all listings from the same mutation: pretty counts stay valid
@@ -475,4 +580,35 @@ test("vendored SDK tests keep every target and all-feature/doc checks in the req
     "cargo clippy --manifest-path vendor/${{ matrix.package }}/Cargo.toml --all-targets -- -D warnings",
     "cargo clippy --manifest-path vendor/${{ matrix.package }}/Cargo.toml --all-features --all-targets -- -D warnings",
   ]);
+});
+
+const promtoolCommand = `set -euo pipefail
+bash .github/scripts/fetch-verified.sh https://github.com/prometheus/prometheus/releases/download/v3.5.1/prometheus-3.5.1.linux-amd64.tar.gz cd6aea0ab214b05838470668dfcee7d01a7d91913509a227b00401ca872423f0 "\${RUNNER_TEMP}/prometheus.tar.gz"
+tar -xzf "\${RUNNER_TEMP}/prometheus.tar.gz" -C "\${RUNNER_TEMP}" prometheus-3.5.1.linux-amd64/promtool
+"\${RUNNER_TEMP}/prometheus-3.5.1.linux-amd64/promtool" check rules deploy/monitoring/prometheus-rules.yml
+"\${RUNNER_TEMP}/prometheus-3.5.1.linux-amd64/promtool" test rules deploy/monitoring/prometheus-rules.test.yml
+`;
+function validatePromtool(data) {
+  required(data.jobs.web);
+  assert.deepEqual(data.permissions, { contents: "read" });
+  assert.equal(data.jobs.web.permissions, undefined);
+  assert.ok(data.jobs.image.needs.includes("web"));
+  assert.equal(data.jobs.web.steps.filter(s => s.run === promtoolCommand).length, 1);
+}
+test("read-only required CI validates example rules with checksum-pinned promtool (#584)", () => {
+  validatePromtool(loadWorkflow());
+});
+test("promtool gate rejects omitted, skipped, optional, altered and write-enabled validation", () => {
+  const original = loadWorkflow();
+  for (const mutate of [
+    d => { d.jobs.web.steps = d.jobs.web.steps.filter(s => s.run !== promtoolCommand); },
+    d => { d.jobs.web.steps.find(s => s.run === promtoolCommand).if = "false"; },
+    d => { d.jobs.web.steps.find(s => s.run === promtoolCommand)["continue-on-error"] = true; },
+    d => { d.jobs.web.steps.find(s => s.run === promtoolCommand).run += "true"; },
+    d => { d.jobs.web.permissions = { contents: "write" }; },
+  ]) {
+    const data = structuredClone(original);
+    mutate(data);
+    assert.throws(() => validatePromtool(data));
+  }
 });

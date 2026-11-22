@@ -19,10 +19,8 @@ async fn create(
     allowlist: Option<&[String]>,
 ) -> Result<NewAdminToken, CreateAdminTokenError> {
     let mut tx = crate::db::begin(pool).await.unwrap();
-    // PR2's documented contract, which the creation guard now REQUIRES
-    // rather than acquiring lazily (adversarial re-review of #37 PR1,
-    // issue 6): take the owner's user-scope lock exclusive up front, in
-    // the same transaction, before creating on it.
+    // The creation guard requires the owner's exclusive user-scope lock
+    // before the insert, held by the same transaction.
     crate::governance::locks::exclusive(&mut tx, [crate::governance::locks::Scope::User(owner)])
         .await
         .unwrap();
@@ -69,7 +67,7 @@ fn scopes(values: &[&str]) -> Vec<String> {
     values.iter().map(|s| s.to_string()).collect()
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn create_returns_plaintext_once_and_authenticate_round_trips(pool: PgPool) {
     let store = Store::new(pool.clone());
     let owner = admin(&pool, "owner@test.invalid").await;
@@ -101,12 +99,8 @@ async fn create_returns_plaintext_once_and_authenticate_round_trips(pool: PgPool
             .await
             .unwrap();
     assert_eq!(stored, created.digest.to_vec());
-    // A wrong secret with the right id does not authenticate. Flip the
-    // last hex digit to a value it provably isn't (pre-existing flake,
-    // found incidentally while running this suite for #37 PR1's
-    // adversarial re-review: replacing it with a fixed '0' was a no-op,
-    // and so a false pass, on the 1-in-16 run where that digit already
-    // was '0').
+    // Change the last hex digit to guarantee a different secret while
+    // keeping the token ID intact.
     let last = created.token.chars().next_back().unwrap();
     let flipped = if last == '0' { '1' } else { '0' };
     let tampered = format!("{}{flipped}", &created.token[..created.token.len() - 1]);
@@ -119,7 +113,7 @@ async fn create_returns_plaintext_once_and_authenticate_round_trips(pool: PgPool
     );
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn create_rejects_invalid_input_before_touching_the_database(pool: PgPool) {
     let owner = admin(&pool, "owner@test.invalid").await;
     assert!(matches!(
@@ -215,7 +209,7 @@ async fn create_rejects_invalid_input_before_touching_the_database(pool: PgPool)
     );
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn create_accepts_a_valid_cidr_allowlist(pool: PgPool) {
     let owner = admin(&pool, "owner@test.invalid").await;
     let list = vec!["10.0.0.0/24".to_string(), "2001:db8::/32".to_string()];
@@ -238,13 +232,10 @@ async fn create_accepts_a_valid_cidr_allowlist(pool: PgPool) {
     assert_eq!(stored.len(), 2);
 }
 
-/// Coordinator review of #37 PR1, issue 5b: each allowlist entry must be
-/// `addr/len`, a parseable IP, `len<=32` (v4) or `len<=128` (v6), with no
-/// host bits set and no IPv4-mapped IPv6 network, checked in Rust before
-/// any database round trip. PostgreSQL's own `cidr` type would reject
-/// most of these too, but as a raw `22P02` `Database` error, not the
-/// typed `InvalidAllowlist` a caller can match on.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// Malformed CIDRs return the typed `InvalidAllowlist` error before a
+/// database call. This covers invalid addresses and prefix lengths,
+/// nonzero host bits, and IPv4-mapped IPv6 networks.
+#[dbtest::test]
 async fn create_rejects_malformed_allowlist_entries_before_touching_the_database(pool: PgPool) {
     let owner = admin(&pool, "cidr@test.invalid").await;
     for bad in [
@@ -287,7 +278,7 @@ async fn create_rejects_malformed_allowlist_entries_before_touching_the_database
 
 /// Every stored entry is the canonical `addr/len` form, not whatever
 /// capitalization/representation the caller happened to send.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn create_canonicalizes_allowlist_entries(pool: PgPool) {
     let owner = admin(&pool, "cidr-canon@test.invalid").await;
     let list = vec!["10.0.0.0/24".to_string(), "2001:DB8::/32".to_string()];
@@ -314,7 +305,7 @@ async fn create_canonicalizes_allowlist_entries(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn database_level_schema_constraints_hold_even_bypassing_the_rust_validator(pool: PgPool) {
     // These exercise migration 0051's CHECK constraints directly: the Rust
     // validator in create_admin_token is a fail-fast gate, not the only one.
@@ -361,9 +352,7 @@ async fn database_level_schema_constraints_hold_even_bypassing_the_rust_validato
                 Some("ARRAY[]::cidr[]"),
             ),
         ),
-        // Adversarial re-review of #37 PR1, issue 4: a zero-length prefix
-        // and a duplicate entry are rejected at the database level too,
-        // not only by Rust's own canonicalization.
+        // Include a zero-length prefix and a duplicate entry in the direct SQL probes.
         (
             "zero-length prefix allowlist",
             insert(
@@ -381,12 +370,9 @@ async fn database_level_schema_constraints_hold_even_bypassing_the_rust_validato
             ),
         ),
     ] {
-        // These negative probes do not hold the owner's scope lock, so
-        // migration 0051's creation guard now refuses them at its own
-        // lock-holding check (OM003) before the row ever reaches the
-        // schema CHECK this test means to exercise (adversarial re-review
-        // of #37 PR1, issue 6); either way the row is refused, which is
-        // all this loop asserts.
+        // These probes omit the owner's scope lock, so the creation guard can
+        // reject the insert before the schema CHECK runs. The loop asserts
+        // that the insert fails.
         let result = sqlx::query(&sql).execute(&pool).await;
         assert!(
             result.is_err(),
@@ -416,7 +402,7 @@ async fn database_level_schema_constraints_hold_even_bypassing_the_rust_validato
     tx.commit().await.unwrap();
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn identity_digest_scopes_expiry_and_allowlist_are_immutable_and_rows_are_never_deleted(
     pool: PgPool,
 ) {
@@ -478,7 +464,7 @@ async fn identity_digest_scopes_expiry_and_allowlist_are_immutable_and_rows_are_
     );
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn revocation_is_final_and_revoke_is_idempotent(pool: PgPool) {
     let store = Store::new(pool.clone());
     let owner = admin(&pool, "owner@test.invalid").await;
@@ -521,19 +507,14 @@ async fn revocation_is_final_and_revoke_is_idempotent(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn lookup_rejects_expired_revoked_and_owner_not_admin(pool: PgPool) {
     let store = Store::new(pool.clone());
     let owner = admin(&pool, "owner@test.invalid").await;
 
-    // expires_at is immutable (by design); an expired fixture needs a
-    // created_at/expires_at pair already in the past. The creation guard
-    // now forces created_at to the real now() unconditionally (adversarial
-    // re-review of #37 PR1, issue 1), so backdating this fixture disables
-    // that one trigger only -- the same way other tests in this
-    // repository backdate a maintained timestamp to seed history (e.g.
-    // `runtime_privileges.rs`'s storage/stored_files fixtures) -- not any
-    // schema CHECK, which this row must still genuinely satisfy.
+    // Seed the expired fixture by disabling only the creation guard, which
+    // sets `created_at` to the current database time. The historical
+    // timestamps still have to satisfy the schema CHECK.
     let raw = GeneratedSecret::generate().unwrap();
     // One transaction: a panic rolls the DISABLE back instead of leaving
     // the guard off for the rest of this test database.
@@ -630,7 +611,7 @@ async fn lookup_rejects_expired_revoked_and_owner_not_admin(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn owner_transitions_revoke_tokens_and_regaining_admin_never_restores_them(pool: PgPool) {
     // Manual demotion of the only admin grant.
     let manual = admin(&pool, "manual@test.invalid").await;
@@ -784,25 +765,13 @@ async fn owner_transitions_revoke_tokens_and_regaining_admin_never_restores_them
     );
 }
 
-/// Coordinator review of #37 PR1: two admin grants of different
-/// provenance (manual + group) can be revoked by concurrent transactions
-/// that share no lock of their own in `omg_admin_tokens_role_lost`. Under
-/// READ COMMITTED, if T1 revokes one grant while T2 concurrently revokes
-/// the other, each trigger's `EXISTS` can still see the other's grant as
-/// active (neither has committed yet from the other's point of view), so
-/// neither revokes the token; if the user later regains admin, the token
-/// comes back to life, which violates finality.
+/// Concurrent revocations of manual and group Admin grants must revoke
+/// the token permanently. Under READ COMMITTED, each transaction could
+/// otherwise see the other's uncommitted grant as still active.
 ///
-/// Migration 0027's `omg_authority_platform_grants` trigger already takes
-/// a transaction-scoped advisory lock (class 72419512, keyed by user) on
-/// any `platform_role_grants.revoked_at` update for a user, which happens
-/// to already serialize exactly this scenario today (verified by hand with
-/// two real `psql` sessions before writing this test). That is a different
-/// migration's incidental coverage, not a property `admin_api_tokens` owns
-/// or that migration 0051 asserts anywhere. This test disables that one
-/// trigger for its duration so it exercises `omg_admin_tokens_role_lost`'s
-/// own correctness in isolation, independent of whether 0027's lock
-/// continues to cover this case.
+/// Disable the separate migration 0027 grants trigger, whose advisory
+/// lock would serialize the revocations. This isolates the migration 0051
+/// role-loss trigger's own concurrency guarantee.
 async fn write_skew_scenario(pool: &PgPool, first_source: &str) {
     let second_source = if first_source == "manual" {
         "group"
@@ -874,14 +843,14 @@ async fn write_skew_scenario(pool: &PgPool, first_source: &str) {
     );
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn concurrent_revocation_of_manual_then_group_admin_grants_still_revokes_the_token(
     pool: PgPool,
 ) {
     write_skew_scenario(&pool, "manual").await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn concurrent_revocation_of_group_then_manual_admin_grants_still_revokes_the_token(
     pool: PgPool,
 ) {
@@ -896,13 +865,10 @@ fn assert_owner_not_admin<T>(result: &Result<T, CreateAdminTokenError>) {
     }
 }
 
-/// Coordinator review of #37 PR1, issue 2: creation was never bound to
-/// live admin status in the database itself (only PR2's future handler was
-/// expected to check it). If the owner is demoted between that check and
-/// the INSERT, the role-loss trigger has already run (nothing left to
-/// revoke), so the new token survives and would come back to life if the
-/// owner regains admin later.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// Creation requires live Admin status at insert time. A grant lost after
+/// an earlier authorization check must not leave a token that becomes
+/// usable on a later regrant.
+#[dbtest::test]
 async fn create_fails_when_the_owner_is_not_currently_an_effective_admin(pool: PgPool) {
     let non_admin = Uuid::new_v4();
     sqlx::query("INSERT INTO users(id,email) VALUES($1,$2)")
@@ -954,7 +920,7 @@ async fn create_fails_when_the_owner_is_not_currently_an_effective_admin(pool: P
 /// either see the owner still admin (and succeed, atomically with respect
 /// to the demotion) or block until the demotion commits and then fail,
 /// never insert a token for an owner who has already lost admin.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn concurrent_demotion_blocks_and_then_fails_a_pending_create(pool: PgPool) {
     let owner = admin(&pool, "race-create@test.invalid").await;
 
@@ -1015,12 +981,9 @@ async fn concurrent_demotion_blocks_and_then_fails_a_pending_create(pool: PgPool
     );
 }
 
-/// Coordinator review of #37 PR1, issue 3: `created_at`/`expires_at` came
-/// from the app's `UtcInstant::now()`, but expiry is enforced against the
-/// database's `clock_timestamp()`. A skewed app clock could let a token
-/// outlive 90 real days, or be created already expired. Both timestamps
-/// must come from one database instant.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// Creation and expiration use the same database instant. App clock skew
+/// must not change the token's lifetime.
+#[dbtest::test]
 async fn created_at_and_expires_at_come_from_the_database_clock_not_the_app(pool: PgPool) {
     let owner = admin(&pool, "clock@test.invalid").await;
     let before: UtcInstant = sqlx::query_scalar("SELECT clock_timestamp()")
@@ -1066,22 +1029,11 @@ fn is_deadlock(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("40P01"))
 }
 
-/// Coordinator review of #37 PR1, follow-up: the `users ... FOR UPDATE`
-/// fix for issue 1 introduced a new deadlock (40P01) that did not exist
-/// before migration 0051.
-///
-/// The manual demotion path (management/directory.rs) locks the owner's
-/// `users` row `FOR UPDATE` first, then updates the grant, which fires
-/// 0027's `BEFORE` trigger `omg_authority_platform_grants` and takes the
-/// user-scope advisory lock (class 72419512). Group-mapping deletion
-/// (directory.rs) updates the grant first (taking the advisory lock
-/// first), and the role-loss `AFTER` trigger then wanted the `users` row
-/// `FOR UPDATE`. T1 holds the row and waits for the advisory lock; T2
-/// holds the advisory lock and waits for the row: a circular wait Postgres
-/// resolves by aborting one side with SQLSTATE 40P01. Before migration
-/// 0051 neither trigger touched the `users` row at all, so this deadlock
-/// is new.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// Concurrent manual and group revocation finish without a deadlock.
+/// Taking the user-scope advisory lock before mutating grants avoids a
+/// cycle between a transaction holding the user row `FOR UPDATE` and one
+/// holding the advisory lock.
+#[dbtest::test]
 async fn concurrent_manual_and_group_revocation_does_not_deadlock(pool: PgPool) {
     let owner = admin(&pool, "deadlock@test.invalid").await;
     let manual_grant: Uuid = sqlx::query_scalar(
@@ -1181,16 +1133,10 @@ async fn concurrent_manual_and_group_revocation_does_not_deadlock(pool: PgPool) 
     );
 }
 
-/// Coordinator review of #37 PR1, follow-up requirement 3: a manual
-/// demotion run the way production code runs it -- `crate::db::begin`
-/// (which sets `omg.scope_lock_audit=on` under `cfg(test)`) with the
-/// user-scope lock pre-acquired up front via `governance::locks::exclusive`
-/// -- must not trip 0027's "authority change without its scope lock taken
-/// up front" audit check when the new admin_api_tokens trigger calls the
-/// same `omg_scope_lock_exclusive` helper a second time (advisory locks are
-/// re-entrant within a transaction, and the audit check only looks at
-/// whether the lock is already held, not who is calling it).
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// Manual demotion can reacquire the already-held user-scope lock from
+/// the token role-loss trigger while scope-lock auditing is active.
+/// Advisory locks are reentrant within the transaction.
+#[dbtest::test]
 async fn manual_demotion_under_scope_lock_audit_mode_does_not_trip_the_audit_check(pool: PgPool) {
     let owner = admin(&pool, "audit@test.invalid").await;
     let token = create(&pool, owner, "t", &scopes(&["platform:read"]), 30, None)
@@ -1227,7 +1173,7 @@ async fn revoked(pool: &PgPool, id: Uuid) -> bool {
         .unwrap()
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn last_use_is_throttled_to_once_per_five_minutes(pool: PgPool) {
     let store = Store::new(pool.clone());
     let owner = admin(&pool, "owner@test.invalid").await;
@@ -1281,7 +1227,7 @@ async fn last_use_is_throttled_to_once_per_five_minutes(pool: PgPool) {
     assert_eq!(third_addr, "198.51.100.9");
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn malformed_tokens_never_reach_the_database(pool: PgPool) {
     let store = Store::new(pool.clone());
     pool.close().await;
@@ -1292,7 +1238,7 @@ async fn malformed_tokens_never_reach_the_database(pool: PgPool) {
     }
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn owner_restrict_prevents_removing_a_user_with_live_tokens(pool: PgPool) {
     let owner = admin(&pool, "owner@test.invalid").await;
     let created = create(&pool, owner, "n", &scopes(&["platform:read"]), 30, None)
@@ -1309,18 +1255,10 @@ async fn owner_restrict_prevents_removing_a_user_with_live_tokens(pool: PgPool) 
     let _ = created.digest; // silence unused-field lints on this struct's other field
 }
 
-/// Coordinator review of #37 PR1, issue 1 (HIGH): the creation guard's
-/// `omg_scope_lock_exclusive` serializes with a concurrent demotion, but
-/// does not refresh an already-established REPEATABLE READ/SERIALIZABLE
-/// snapshot. Repro: S1 opens a snapshot that observes the owner as a
-/// currently effective admin; S2 revokes the owner's only admin grant and
-/// commits; S1 then tries to create a token inside its stale snapshot.
-/// Before the fix this `INSERT` succeeds even though the owner's admin
-/// status was already gone (and committed) by the time of the insert: the
-/// token is never revoked, and would become usable again if Admin is
-/// re-granted. Bypasses the Rust helper (raw SQL against the trigger
-/// directly), since the snapshot has to be established and held on a
-/// specific transaction object the test controls.
+/// The creation guard refuses REPEATABLE READ and SERIALIZABLE snapshots
+/// that still see a grant after another transaction has revoked it.
+/// The user-scope lock serializes writes but cannot refresh an established
+/// snapshot. Raw SQL lets the test keep that snapshot on a single connection.
 async fn isolation_guard_refuses_a_stale_snapshot(pool: &PgPool, setup: &'static str, label: &str) {
     let owner = admin(pool, &format!("stale-{label}@test.invalid")).await;
     let mut tx = crate::db::begin_with_setup(pool, setup).await.unwrap();
@@ -1369,7 +1307,7 @@ async fn isolation_guard_refuses_a_stale_snapshot(pool: &PgPool, setup: &'static
     );
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn creation_guard_refuses_a_stale_repeatable_read_snapshot(pool: PgPool) {
     isolation_guard_refuses_a_stale_snapshot(
         &pool,
@@ -1379,7 +1317,7 @@ async fn creation_guard_refuses_a_stale_repeatable_read_snapshot(pool: PgPool) {
     .await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn creation_guard_refuses_a_stale_serializable_snapshot(pool: PgPool) {
     isolation_guard_refuses_a_stale_snapshot(
         &pool,
@@ -1391,7 +1329,7 @@ async fn creation_guard_refuses_a_stale_serializable_snapshot(pool: PgPool) {
 
 /// The common case (the gateway's own isolation level) is unaffected: a
 /// plain READ COMMITTED creation still works.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn creation_guard_allows_read_committed(pool: PgPool) {
     let owner = admin(&pool, "read-committed@test.invalid").await;
     let mut tx = crate::db::begin(&pool).await.unwrap();
@@ -1423,9 +1361,7 @@ async fn role_loss_guard_refuses_elevated_isolation(
 ) {
     let owner = admin(pool, &format!("role-loss-stale-{label}@test.invalid")).await;
     let mut tx = crate::db::begin_with_setup(pool, setup).await.unwrap();
-    // The role-loss trigger is deferred to commit (coordinator review
-    // issue 3), so its own refusal now surfaces at COMMIT, not at the
-    // UPDATE statement itself.
+    // The deferred role-loss trigger reports its refusal at commit.
     sqlx::query(
         "UPDATE platform_role_grants SET revoked_at=now() WHERE user_id=$1 AND role='admin'",
     )
@@ -1440,7 +1376,7 @@ async fn role_loss_guard_refuses_elevated_isolation(
     );
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn role_loss_guard_refuses_repeatable_read(pool: PgPool) {
     role_loss_guard_refuses_elevated_isolation(
         &pool,
@@ -1450,7 +1386,7 @@ async fn role_loss_guard_refuses_repeatable_read(pool: PgPool) {
     .await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn role_loss_guard_refuses_serializable(pool: PgPool) {
     role_loss_guard_refuses_elevated_isolation(
         &pool,
@@ -1460,7 +1396,7 @@ async fn role_loss_guard_refuses_serializable(pool: PgPool) {
     .await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn role_loss_guard_allows_read_committed(pool: PgPool) {
     let owner = admin(&pool, "role-loss-rc@test.invalid").await;
     let mut tx = crate::db::begin(&pool).await.unwrap();
@@ -1474,18 +1410,10 @@ async fn role_loss_guard_allows_read_committed(pool: PgPool) {
     tx.commit().await.unwrap();
 }
 
-/// Coordinator review of #37 PR1, issue 2 (HIGH): PR2's handler is
-/// documented to hold `governance::locks::exclusive(Scope::User(owner))`
-/// in its own transaction before calling `create_admin_token`, exactly as
-/// this test does. Before the fix this ran `create_admin_token` on a
-/// *different* connection (`&self.pool`); its `INSERT`'s owner-admin guard
-/// trigger then tried to take that exact same transaction-scoped advisory
-/// lock, which blocked until the caller's own transaction ended -- but the
-/// caller could not end its transaction until this call returned. Running
-/// on the caller's own `tx`, as it does now, makes the trigger's lock
-/// acquisition re-entrant (free) instead, so this returns immediately.
-/// Bounded with a timeout so a regression cannot hang the whole suite.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// Creation completes on the caller's transaction when it already holds
+/// the owner's exclusive user-scope lock. A separate connection would
+/// wait for the caller's lock while the caller waits for creation.
+#[dbtest::test]
 async fn create_must_not_hang_when_the_caller_already_holds_the_owners_scope_lock(pool: PgPool) {
     let owner = admin(&pool, "hang-create@test.invalid").await;
     let mut tx = crate::db::begin(&pool).await.unwrap();
@@ -1504,12 +1432,9 @@ async fn create_must_not_hang_when_the_caller_already_holds_the_owners_scope_loc
     assert!(!revoked(&pool, created.id).await);
 }
 
-/// Coordinator review of #37 PR1, issue 2 (HIGH), companion requirement:
-/// `revoke_admin_token` must run on the caller's own transaction too (so
-/// it is atomic with whatever else that transaction does, e.g. audit
-/// insertion, and rolls back with it), not commit on a separate
-/// connection the instant it is called.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// Token revocation shares the caller's transaction so it rolls back with
+/// the other writes, such as the audit event.
+#[dbtest::test]
 async fn revoke_runs_on_the_callers_transaction_and_rolls_back_with_it(pool: PgPool) {
     let owner = admin(&pool, "revoke-tx@test.invalid").await;
     let token = create(&pool, owner, "n", &scopes(&["platform:read"]), 30, None)
@@ -1529,20 +1454,11 @@ async fn revoke_runs_on_the_callers_transaction_and_rolls_back_with_it(pool: PgP
     assert!(revoked(&pool, token.id).await);
 }
 
-/// Coordinator review of #37 PR1, issue 3 (MEDIUM): a routine group
-/// re-sync must not destroy tokens for an admin who never actually lost
-/// Admin. `lifecycle::apply_group_grants` revokes stale group grants in
-/// one statement, then inserts the replacements in the next -- for
-/// example, an operator recreating an IdP group mapping (delete + insert
-/// with a new id, same group value and role, the practical effect of
-/// renaming it in the UI): the old mapping row is gone, so the grant tied
-/// to its id is revoked by the first statement, and a fresh grant tied to
-/// the new mapping's id is inserted by the very next statement, in the
-/// same transaction. Before the fix, the immediate (`AFTER ROW`)
-/// role-loss trigger fires at the end of the first statement, before the
-/// replacement exists, and revokes every token the user owns, even though
-/// they never lost Admin.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// Replacing a group-sourced Admin grant within one transaction preserves
+/// the token. The role-loss trigger evaluates the final grant set at
+/// commit, after the stale grant has been revoked and its replacement
+/// inserted.
+#[dbtest::test]
 async fn a_group_mapping_recreation_that_replaces_the_grant_does_not_destroy_the_token(
     pool: PgPool,
 ) {
@@ -1604,7 +1520,7 @@ async fn a_group_mapping_recreation_that_replaces_the_grant_does_not_destroy_the
 /// Companion to the above: a real group grant loss with no replacement
 /// (the user's claimed groups no longer include the admin group at all)
 /// must still revoke the owner's tokens, once the transaction commits.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn a_real_group_grant_loss_with_no_replacement_still_revokes_at_commit(pool: PgPool) {
     let owner = Uuid::new_v4();
     sqlx::query("INSERT INTO users(id,email) VALUES($1,'group-loss@test.invalid')")
@@ -1641,16 +1557,11 @@ async fn a_real_group_grant_loss_with_no_replacement_still_revokes_at_commit(poo
     );
 }
 
-/// Coordinator review of #37 PR1, issue 4 (MEDIUM): migration 0027 treats
-/// `UPDATE OF revoked_at,user_id,role OR DELETE` on `platform_role_grants`
-/// as authority changes, but 0051's role-loss trigger only watched
-/// `revoked_at`. These three shapes left a token unrevoked and usable
-/// again after a re-grant, even though the owner's only `admin` row was
-/// gone. The runtime role itself has none of these three privileges
-/// (verified in `verify-privileges.sql`); these tests run as the
-/// migrator/owner role to exercise the trigger directly, the same way a
-/// human operator with direct database access could.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// Changing the Admin grant's role, deleting it, or moving it to a different
+/// user revokes the original owner's tokens when they lose Admin. These
+/// tests use the migrator role to exercise mutations the runtime cannot
+/// perform directly.
+#[dbtest::test]
 async fn changing_the_role_away_from_admin_revokes_owned_tokens(pool: PgPool) {
     let owner = admin(&pool, "role-change@test.invalid").await;
     let token = create(&pool, owner, "n", &scopes(&["platform:read"]), 30, None)
@@ -1667,7 +1578,7 @@ async fn changing_the_role_away_from_admin_revokes_owned_tokens(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn deleting_the_grant_row_revokes_owned_tokens(pool: PgPool) {
     let owner = admin(&pool, "grant-delete@test.invalid").await;
     let token = create(&pool, owner, "n", &scopes(&["platform:read"]), 30, None)
@@ -1684,7 +1595,7 @@ async fn deleting_the_grant_row_revokes_owned_tokens(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn moving_the_grant_to_another_user_revokes_the_original_owners_tokens(pool: PgPool) {
     let owner = admin(&pool, "grant-move-from@test.invalid").await;
     // A plain user with no grant of its own, so the moved row does not
@@ -1710,15 +1621,10 @@ async fn moving_the_grant_to_another_user_revokes_the_original_owners_tokens(poo
     );
 }
 
-/// Adversarial re-review of #37 PR1, issue 6: the lock-holding contract
-/// ("PR2's handler must already hold the owner's user-scope lock
-/// exclusive before calling create_admin_token") was documentation only --
-/// nothing enforced it, so a caller that forgot it still got a working
-/// INSERT. The creation guard now checks `pg_locks` directly and refuses
-/// with a dedicated SQLSTATE (`OM003`, mapped to
-/// `CreateAdminTokenError::OwnerLockNotHeld`) instead of acquiring the
-/// lock lazily.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// The insert guard requires the caller to hold the owner's exclusive
+/// user-scope lock already. A missing lock returns SQLSTATE `OM003`,
+/// which maps to `CreateAdminTokenError::OwnerLockNotHeld`.
+#[dbtest::test]
 async fn create_without_the_owners_scope_lock_held_is_refused_with_om003(pool: PgPool) {
     let owner = admin(&pool, "no-lock@test.invalid").await;
     let mut tx = crate::db::begin(&pool).await.unwrap();
@@ -1742,7 +1648,7 @@ async fn create_without_the_owners_scope_lock_held_is_refused_with_om003(pool: P
 
 /// Companion to the above: with the lock correctly taken up front, in the
 /// same transaction, creation succeeds exactly as before.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn create_with_the_owners_scope_lock_held_succeeds(pool: PgPool) {
     let owner = admin(&pool, "with-lock@test.invalid").await;
     let mut tx = crate::db::begin(&pool).await.unwrap();
@@ -1756,18 +1662,10 @@ async fn create_with_the_owners_scope_lock_held_succeeds(pool: PgPool) {
     assert!(!revoked(&pool, created.id).await);
 }
 
-/// Adversarial re-review of #37 PR1, issue 1 (MEDIUM, BLOCKING): the
-/// runtime had a whole-row INSERT and the Rust insert supplied
-/// `created_at` itself, so the 1-90 day CHECK was measured against a
-/// caller-chosen `created_at`: `created_at => now()+10 years, expires_at
-/// => created_at+90 days` passed the CHECK as written and left the token
-/// practically unexpiring (`authenticate_admin_token` only ever compares
-/// `expires_at` against the current instant). The creation guard now
-/// forces `created_at` to the database's own `now()` unconditionally
-/// (before the CHECK ever runs), so the identical attack row is measured
-/// against the real creation instant instead and fails the ordinary
-/// 1-90-day bound.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// A caller-supplied future creation time cannot extend the token lifetime.
+/// The creation guard stamps the database time before the expiry CHECK
+/// compares it with the requested expiry.
+#[dbtest::test]
 async fn a_forged_future_created_at_cannot_make_a_token_practically_unexpiring(pool: PgPool) {
     let owner = admin(&pool, "lifetime-bypass@test.invalid").await;
     let mut tx = crate::db::begin(&pool).await.unwrap();
@@ -1796,12 +1694,8 @@ async fn a_forged_future_created_at_cannot_make_a_token_practically_unexpiring(p
     );
 }
 
-/// Coordinator decision (#37 PR1, issue 2): an admin token's last-use
-/// address is kept -- it helps investigate misuse of a high-risk
-/// credential -- until the token is revoked or its owner is cleaned up,
-/// whichever comes first. Cleanup scrubs it the same way it scrubs every
-/// other address/identity copy on the account (docs/identity.md).
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// Owner cleanup revokes the token and scrubs its recorded last-use address.
+#[dbtest::test]
 async fn cleanup_scrubs_the_last_used_address(pool: PgPool) {
     let store = Store::new(pool.clone());
     let owner = admin(&pool, "cleanup-scrub@test.invalid").await;
@@ -1839,10 +1733,9 @@ async fn cleanup_scrubs_the_last_used_address(pool: PgPool) {
     );
 }
 
-/// Adversarial re-review of #37 PR1, issue 5: `AdminTokenPrincipal` must
-/// carry the token's own canonical allowlist, not silently omit it, so a
-/// future PR2 handler cannot forget to enforce it before dispatch.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// Authentication returns the token's canonical IP allowlist on the principal
+/// so the caller can enforce it before dispatch.
+#[dbtest::test]
 async fn authenticate_returns_the_tokens_canonical_ip_allowlist(pool: PgPool) {
     let store = Store::new(pool.clone());
     let owner = admin(&pool, "principal-allowlist@test.invalid").await;

@@ -8,7 +8,7 @@ use std::{
 use async_trait::async_trait;
 use aws_sdk_bedrockruntime::{
     Client,
-    config::{BehaviorVersion, Region, retry::RetryConfig, timeout::TimeoutConfig},
+    config::{Region, retry::RetryConfig, timeout::TimeoutConfig},
     error::{ProvideErrorMetadata, SdkError},
     types as aws,
 };
@@ -123,7 +123,7 @@ impl BedrockAdapter {
         let mut builder = aws_sdk_bedrockruntime::Config::builder();
         builder.set_endpoint_url(plan.endpoint.clone());
         builder
-            .behavior_version(BehaviorVersion::v2026_01_12())
+            .behavior_version(auth::sdk_behavior_version())
             .region(Region::new(plan.region.clone()))
             .credentials_provider(credentials)
             .http_client(self.http.clone())
@@ -437,6 +437,12 @@ impl Turns {
             aws::ToolResultBlock::builder()
                 .tool_use_id(id)
                 .content(aws::ToolResultContentBlock::Text(text.clone()))
+                // Bedrock evaluates status support for the selected model or profile.
+                .set_status(
+                    message
+                        .tool_result_is_error
+                        .then_some(aws::ToolResultStatus::Error),
+                )
                 .build()
                 .map_err(|_| invalid())?,
         ));

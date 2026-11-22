@@ -383,7 +383,11 @@ async fn run(cli: Cli, process_start_unix_nano: u64) -> Result<()> {
             )
         })
         .transpose()?;
-    let pool = config.connect().await?;
+    let pool = if matches!(cli.command, Some(Command::BootstrapDev)) {
+        config.connect_bootstrap_dev().await?
+    } else {
+        config.connect().await?
+    };
     // Reports, usage and logs only (never admission, settlement or writes).
     let provider_secrets = EnvSecrets::new(config.secret_env_allowlist.clone());
     let smtp_secrets = EnvSecrets::new(config.smtp_env_allowlist.clone());

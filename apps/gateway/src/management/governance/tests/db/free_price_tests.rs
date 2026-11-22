@@ -23,7 +23,7 @@ async fn unknown(f: &Fixture, price: Option<Uuid>, held: Option<i64>) -> Uuid {
     id
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn free_price_preview_apply_preserves_null_and_audits(pool: PgPool) {
     let f = fixture(pool).await;
     let free = f.price(0).await;
@@ -82,7 +82,7 @@ async fn free_price_preview_apply_preserves_null_and_audits(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn free_price_selection_refusals_and_concurrency(pool: PgPool) {
     let f = fixture(pool).await;
     let priced = f.price(1_000_000).await;
@@ -202,7 +202,7 @@ async fn v3(f: &Fixture, mutate: impl FnOnce(&mut Vec<Value>)) -> Uuid {
     id
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn free_price_v3_missing_unknown_priced_and_selectors(pool: PgPool) {
     let f = fixture(pool).await;
     let free = v3(&f, |_| {}).await;
@@ -244,7 +244,7 @@ async fn free_price_v3_missing_unknown_priced_and_selectors(pool: PgPool) {
     assert_eq!(settled, vec![eligible]);
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn free_price_resolution_unblocks_history_archive(pool: PgPool) {
     use crate::archive::{Group, Month, Refusal, Request, archive_as_of};
     use gateway_datetime_compat::UtcInstant;
@@ -298,7 +298,7 @@ async fn free_price_resolution_unblocks_history_archive(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn free_price_rechecks_role_after_authority_lock_wait(pool: PgPool) {
     use crate::governance::locks::{self, Scope};
     let f = fixture(pool).await;
@@ -356,7 +356,7 @@ async fn free_price_rechecks_role_after_authority_lock_wait(pool: PgPool) {
     assert_eq!(state, "unknown");
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn free_price_v2_cache_and_pinned_batch_tier(pool: PgPool) {
     let f = fixture(pool).await;
     let na = json!({"status":"not_applicable"});
@@ -443,7 +443,7 @@ async fn free_price_v2_cache_and_pinned_batch_tier(pool: PgPool) {
     }
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn free_price_native_job_requires_terminal_gateway_record(pool: PgPool) {
     let f = fixture(pool).await;
     let free = v3(&f, |_| {}).await;
@@ -484,7 +484,7 @@ async fn free_price_native_job_requires_terminal_gateway_record(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn free_price_variants_require_free_default_coverage(pool: PgPool) {
     let f = fixture(pool).await;
     let admin = user(f.owner, true);
@@ -530,7 +530,56 @@ async fn many_unknowns(f: &Fixture, price: Uuid, count: i32) {
         .bind(f.principal.workspace_id).bind(f.principal.key_id).bind(f.deployment).bind(price).bind(count).execute(&f.store.pool).await.unwrap();
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
+async fn free_price_batches_reservations_and_ledger(pool: PgPool) {
+    let f = fixture(pool).await;
+    let free = f.price(0).await;
+    many_unknowns(&f, free, 2).await;
+    // The accounting triggers use transition tables. A multi-row page must
+    // let them aggregate the deltas before updating the shared budget rows.
+    sqlx::raw_sql(
+        "CREATE TABLE free_price_write_sizes (target text NOT NULL, size bigint NOT NULL);
+         CREATE FUNCTION record_free_price_write_size() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+          INSERT INTO free_price_write_sizes SELECT TG_TABLE_NAME, count(*) FROM written;
+          RETURN NULL;
+         END $$;
+         CREATE TRIGGER record_free_price_write_size AFTER UPDATE ON governance_reservations
+         REFERENCING NEW TABLE AS written FOR EACH STATEMENT
+         EXECUTE FUNCTION record_free_price_write_size();
+         CREATE TRIGGER record_free_price_write_size AFTER INSERT ON monetary_ledger
+         REFERENCING NEW TABLE AS written FOR EACH STATEMENT
+         EXECUTE FUNCTION record_free_price_write_size();",
+    )
+    .execute(&f.store.pool)
+    .await
+    .unwrap();
+
+    let (status, result) = call(
+        &f,
+        &user(f.owner, true),
+        "POST",
+        PATH,
+        json!({"apply":true,"expected_count":"2","reason":"confirmed free price"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["resolved_count"], "2");
+    let sizes: Vec<(String, i64)> =
+        sqlx::query_as("SELECT target, size FROM free_price_write_sizes ORDER BY target")
+            .fetch_all(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        sizes,
+        [
+            ("governance_reservations".into(), 2),
+            ("monetary_ledger".into(), 2)
+        ]
+    );
+}
+
+#[dbtest::test]
 async fn free_price_large_bucket_makes_bounded_progress(pool: PgPool) {
     let f = fixture(pool).await;
     let free = f.price(0).await;

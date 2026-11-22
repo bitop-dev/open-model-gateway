@@ -1,13 +1,6 @@
-//! #37 PR2 item 1: transaction-level admin-token and owner revalidation.
-//!
-//! Deterministic two-connection concurrency tests: no sleep is ever used to
-//! *decide* ordering. Each blocking assertion polls `pg_stat_activity` /
-//! `pg_blocking_pids` for the real wait state, bounded by a timeout, and
-//! only the poll *interval* uses a short sleep. These exercise the
-//! transaction-level revalidation `resources::platform_write`/
-//! `revalidate_admin_token` must perform (middleware preflight is a
-//! lock-free snapshot taken before the handler's own transaction, and is
-//! therefore not enough on its own).
+//! These tests exercise transaction-level revalidation of admin tokens and
+//! their owners after middleware authentication. To establish ordering,
+//! the tests poll PostgreSQL wait state and blocking PIDs with a timeout.
 use super::*;
 use crate::{admin_tokens, governance::locks, identity::AdminTokenContext};
 use std::time::Duration;
@@ -59,13 +52,8 @@ async fn backend_pid(tx: &mut Transaction<'_, Postgres>) -> i32 {
         .unwrap()
 }
 
-/// Which `pg_locks` wait this test expects to find the waiter blocked on
-/// (#37 PR2 review: the previous `wait_until_blocked_by` accepted *any*
-/// backend blocked by *any* other backend, so it could not actually tell
-/// a token-row wait from an unrelated advisory wait, or even from a
-/// different test's leftover connection -- a guard could be deleted
-/// entirely and this helper would still report "blocked" as long as
-/// something, anything, was waiting on the holder for any reason).
+/// The expected lock wait distinguishes the token row from the owner's
+/// advisory lock. The probe matches the expected holder and waiter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExpectedWait {
     /// A plain row lock conflict on `admin_api_tokens` (the token's own
@@ -171,7 +159,7 @@ async fn token_revoked(pool: &PgPool, token_id: Uuid) -> bool {
 /// handler transaction => no write." A token already revoked and committed
 /// before the handler's own transaction starts must fail transaction-level
 /// revalidation -- middleware preflight alone cannot see this.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn revoked_token_fails_handler_revalidation_once_committed(pool: PgPool) {
     let f = fixture(&pool).await;
     let token_id = mint(&pool, f.admin.user_id, &["catalog:write"]).await;
@@ -195,7 +183,7 @@ async fn revoked_token_fails_handler_revalidation_once_committed(pool: PgPool) {
 /// Required behaviour: "owner demoted after preflight but before handler
 /// transaction => no write," in the ordering where the demotion already
 /// committed. Migration 0051's deferred trigger also revokes the token.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn owner_demotion_committed_before_the_check_fails_the_mutation(pool: PgPool) {
     let f = fixture(&pool).await;
     let token_id = mint(&pool, f.admin.user_id, &["catalog:write"]).await;
@@ -223,7 +211,7 @@ async fn owner_demotion_committed_before_the_check_fails_the_mutation(pool: PgPo
 /// SHARE` row lock taken by `revalidate_admin_token`) must let a
 /// concurrent, in-flight explicit revoke block until it commits, then
 /// finish and commit *before* the revoke can.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn a_mutation_holding_its_locks_finishes_before_a_concurrent_explicit_revoke_commits(
     pool: PgPool,
 ) {
@@ -248,9 +236,8 @@ async fn a_mutation_holding_its_locks_finishes_before_a_concurrent_explicit_revo
     let (pid_tx, pid_rx) = tokio::sync::oneshot::channel();
     let revoke_task = tokio::spawn(async move {
         let mut tx_b = crate::db::begin(&pool_b).await.unwrap();
-        // Captured from inside B's own transaction, before it ever issues
-        // the blocking `UPDATE` below, so the probe polls for exactly this
-        // backend rather than "any blocked backend" (#37 PR2 review).
+        // Capture the waiter PID before its blocking update so the probe can
+        // identify this transaction's wait.
         let pid_b = backend_pid(&mut tx_b).await;
         let _ = pid_tx.send(pid_b);
         admin_tokens::revoke_admin_token(&mut tx_b, token_id)
@@ -286,7 +273,7 @@ async fn a_mutation_holding_its_locks_finishes_before_a_concurrent_explicit_revo
 /// migration 0027/0051) blocks on a handler transaction already holding it
 /// shared, and only proceeds -- revoking the token -- after that handler
 /// transaction commits.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn a_mutation_holding_its_locks_finishes_before_a_concurrent_demotion_commits(pool: PgPool) {
     let f = fixture(&pool).await;
     let token_id = mint(&pool, f.admin.user_id, &["catalog:write"]).await;
@@ -339,7 +326,7 @@ async fn a_mutation_holding_its_locks_finishes_before_a_concurrent_demotion_comm
 /// mode, one round trip per transaction), never a separate earlier shared
 /// acquisition that could be requested in the opposite order by the other
 /// transaction.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn cross_admin_membership_changes_via_tokens_do_not_deadlock(pool: PgPool) {
     let f = fixture(&pool).await;
     let admin_b = user(&pool, "admin_b", "admin").await;
@@ -439,7 +426,7 @@ async fn bounded_bearer_delete(app: &Router, path: &str, token: &str) -> StatusC
 /// authentication (401), exactly as `authz_admin_token_tests.rs` asserts
 /// for every other revoked-token case. Both requests are bounded by a
 /// timeout, like every other concurrency assertion in this file.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn self_demotion_via_own_token_commits_then_the_token_is_revoked_next_request_401(
     pool: PgPool,
 ) {
@@ -499,7 +486,7 @@ async fn self_demotion_via_own_token_commits_then_the_token_is_revoked_next_requ
 /// survivor stays Admin with a live token), and exactly one
 /// token-attributed `role.revoked` audit row exists, correctly
 /// attributing the winner's token against the loser as its target.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn cross_admin_role_demotion_via_tokens_is_bounded_and_the_loser_is_refused(pool: PgPool) {
     let f = fixture(&pool).await;
     let admin_b = user(&pool, "admin_b", "admin").await;

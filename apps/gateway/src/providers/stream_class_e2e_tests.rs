@@ -6,14 +6,20 @@
 //! each client protocol sees, the recorded execution, the reservation and the
 //! routing-health observation. The adapters' own parsing is
 //! `stream_class_tests`; Bedrock's is `bedrock::stream_error_tests`.
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use axum::{Router, body::Bytes};
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use tokio::sync::Notify;
 use uuid::Uuid;
 
-use super::stream_class_tests::{Kind, NAMES, Step, http_class, response, serve, sse};
+use super::stream_class_tests::{
+    Kind, NAMES, Step, http_class, response, responses_complete, serve, sse, terminal_order_cases,
+};
 use crate::{
     billing::v3::Meter,
     governance::tests::db::{Fixture, fixture},
@@ -191,6 +197,21 @@ async fn call(base: &str, token: &str, client: Client) -> Reply {
     }
 }
 impl World {
+    async fn ask_hanging(&self, client: Client, wire: Vec<u8>, at: &str) -> Reply {
+        let dropped = Arc::new(Notify::new());
+        let reply = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.ask(client, vec![Step::BytesThenHang(wire, dropped.clone())]),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{at}: gateway waited for upstream EOF"));
+        tokio::time::timeout(Duration::from_secs(5), dropped.notified())
+            .await
+            .unwrap_or_else(|_| panic!("{at}: upstream body stayed open"));
+
+        reply
+    }
+
     async fn ask(&self, client: Client, steps: Vec<Step>) -> Reply {
         *self.script.lock().unwrap() = steps;
         sqlx::query("DELETE FROM deployment_health")
@@ -406,27 +427,27 @@ macro_rules! per_kind {
     ($($name:ident: $kind:expr,)*) => {$(
         mod $name {
             use super::*;
-            #[sqlx::test(migrations = "./enterprise_migrations")]
+            #[dbtest::test]
             async fn in_stream_errors_end_with_the_class_of_the_same_http_error(pool: PgPool) {
                 in_stream_errors(pool, $kind, false, NAMES_UNDER_TEST).await;
             }
-            #[sqlx::test(migrations = "./enterprise_migrations")]
+            #[dbtest::test]
             async fn in_stream_rejections_on_a_free_price_never_settle_as_a_known_zero(pool: PgPool) {
                 in_stream_errors(pool, $kind, true, REJECTIONS).await;
             }
-            #[sqlx::test(migrations = "./enterprise_migrations")]
+            #[dbtest::test]
             async fn transport_failures_inside_a_stream_are_unavailable_and_count(pool: PgPool) {
                 transport_failures(pool, $kind).await;
             }
-            #[sqlx::test(migrations = "./enterprise_migrations")]
+            #[dbtest::test]
             async fn a_failed_stream_is_never_failed_over(pool: PgPool) {
                 never_failed_over(pool, $kind).await;
             }
-            #[sqlx::test(migrations = "./enterprise_migrations")]
+            #[dbtest::test]
             async fn the_breaker_follows_the_class_of_in_stream_failures(pool: PgPool) {
                 breaker(pool, $kind).await;
             }
-            #[sqlx::test(migrations = "./enterprise_migrations")]
+            #[dbtest::test]
             async fn a_client_that_goes_away_mid_stream_is_not_a_provider_failure(pool: PgPool) {
                 client_drop(pool, $kind).await;
             }
@@ -439,6 +460,305 @@ per_kind! {
     openai_responses: Kind::Responses,
     openrouter: Kind::OpenRouter,
     local: Kind::Local,
+}
+
+#[dbtest::test]
+async fn responses_first_terminal_wins_and_closes_the_upstream_body(pool: PgPool) {
+    terminal_order(pool, Kind::Responses, Client::Responses, 3).await;
+}
+
+#[dbtest::test]
+async fn anthropic_first_terminal_wins_and_closes_the_upstream_body(pool: PgPool) {
+    terminal_order(pool, Kind::Anthropic, Client::Messages, 4).await;
+}
+
+#[dbtest::test]
+async fn anthropic_chat_first_terminal_wins_and_closes_the_upstream_body(pool: PgPool) {
+    terminal_order(pool, Kind::Anthropic, Client::Chat, 4).await;
+}
+
+async fn terminal_order(pool: PgPool, kind: Kind, client: Client, input: i64) {
+    let w = world(pool, kind, false).await;
+    let terminal_line = match client {
+        Client::Chat => "data: [DONE]",
+        Client::Messages => "event: message_stop",
+        Client::Responses => "event: response.completed",
+    };
+    for (label, wire, failed) in terminal_order_cases(kind) {
+        let at = format!("{kind:?} {label}, error={failed:?}");
+        let reply = w.ask_hanging(client, wire, &at).await;
+
+        assert_eq!(reply.status, 200, "{at}");
+        assert!(reply.body.contains("Hello"), "{at}");
+        assert!(!reply.body.contains("late text"), "{at}");
+        assert_eq!(
+            reply
+                .body
+                .lines()
+                .filter(|line| *line == terminal_line)
+                .count(),
+            usize::from(failed.is_none()),
+            "{at}"
+        );
+        let got = recorded(&w.f.store.pool, w.deployment, reply.id).await;
+        if let Some(expected) = failed {
+            assert_eq!(told(client, &reply.body), shown(client, expected), "{at}");
+            assert_eq!(got, failed_with(expected, None), "{at}");
+        } else {
+            match client {
+                Client::Chat => assert_eq!(
+                    reply.body.trim_end().lines().last(),
+                    Some(terminal_line),
+                    "{at}"
+                ),
+                Client::Messages => {
+                    assert_eq!(last_event(&reply.body)["type"], "message_stop", "{at}")
+                }
+                Client::Responses => assert_eq!(
+                    last_event(&reply.body)["type"],
+                    "response.completed",
+                    "{at}"
+                ),
+            }
+            assert_eq!(got.state, "succeeded", "{at}");
+            assert_eq!(got.error_code, None, "{at}");
+            assert_eq!((got.input, got.output), (Some(input), Some(2)), "{at}");
+            assert_eq!(got.reservation, "settled", "{at}");
+            assert_eq!(got.actual, Some(input + 2), "{at}");
+            assert_eq!(got.ledger, ["hold", "settlement"], "{at}");
+            if client == Client::Responses {
+                assert_eq!(
+                    last_event(&reply.body)["response"]["usage"],
+                    json!({
+                        "input_tokens": input, "output_tokens": 2, "total_tokens": input + 2
+                    }),
+                    "{at}"
+                );
+            }
+        }
+    }
+}
+
+#[dbtest::test]
+async fn responses_terminal_status_mismatch_preserves_valid_usage(pool: PgPool) {
+    let kind = Kind::Responses;
+    let w = world(pool, kind, false).await;
+    let (content, rest, late_completion) = kind.valid();
+    let prefix = [content, rest].concat();
+    let snapshot = responses_complete();
+    let class = InferenceError::InvalidUpstream;
+    let mut problems = Vec::new();
+    for (event, status) in [
+        ("response.incomplete", "completed"),
+        ("response.completed", "incomplete"),
+    ] {
+        let mut snapshot = snapshot.clone();
+        snapshot["status"] = json!(status);
+        if status == "incomplete" {
+            snapshot["incomplete_details"] = json!({"reason":"max_output_tokens"});
+        }
+        snapshot.as_object_mut().unwrap().remove("usage");
+        let mut wire_snapshot = snapshot.to_string();
+        wire_snapshot.pop(); // Append raw fields before the closing brace.
+        // The fixture prices input and output at one micro-USD per token.
+        for (label, usage, input, output, expected_floor) in [
+            (
+                "reported",
+                r#","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}"#,
+                Some(3),
+                Some(2),
+                5,
+            ),
+            (
+                "partial input",
+                r#","usage":{"input_tokens":3,"total_tokens":5}"#,
+                Some(3),
+                None,
+                3,
+            ),
+            (
+                "partial output",
+                r#","usage":{"output_tokens":2,"total_tokens":5}"#,
+                None,
+                Some(2),
+                2,
+            ),
+            (
+                "explicit zeros",
+                r#","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}"#,
+                Some(0),
+                Some(0),
+                0,
+            ),
+            ("missing", "", None, None, 0),
+            (
+                "total only",
+                r#","usage":{"total_tokens":5}"#,
+                None,
+                None,
+                0,
+            ),
+            (
+                "invalid",
+                r#","usage":{"input_tokens":3,"output_tokens":-2}"#,
+                None,
+                None,
+                0,
+            ),
+            (
+                "contradictory total",
+                r#","usage":{"input_tokens":5000,"output_tokens":2,"total_tokens":5001}"#,
+                None,
+                None,
+                0,
+            ),
+            (
+                "impossible partial",
+                r#","usage":{"output_tokens":2,"total_tokens":1}"#,
+                None,
+                None,
+                0,
+            ),
+            (
+                "cache evidence exceeds partial total",
+                r#","usage":{"output_tokens":2,"input_tokens_details":{"cached_tokens":5000},"total_tokens":5001}"#,
+                None,
+                None,
+                0,
+            ),
+            (
+                "cache evidence fits partial total",
+                r#","usage":{"output_tokens":2,"input_tokens_details":{"cached_tokens":5000},"total_tokens":5002}"#,
+                None,
+                Some(2),
+                5002,
+            ),
+            (
+                "object-valued count",
+                r#","usage":{"input_tokens":{"count":3},"output_tokens":2}"#,
+                None,
+                None,
+                0,
+            ),
+            (
+                "conflicting reasoning fields",
+                r#","usage":{"input_tokens":3,"output_tokens":2,"output_tokens_details":{"reasoning_tokens":1},"completion_tokens_details":{"reasoning_tokens":2}}"#,
+                Some(3),
+                Some(2),
+                5,
+            ),
+            (
+                "duplicate count",
+                r#","usage":{"input_tokens":null,"input_\u0074okens":5000,"output_tokens":2,"total_tokens":5002}"#,
+                None,
+                None,
+                0,
+            ),
+            (
+                "duplicate usage",
+                r#","usage":null,"usage":{"input_tokens":3,"output_tokens":2}"#,
+                None,
+                None,
+                0,
+            ),
+            (
+                "duplicate cache count",
+                r#","usage":{"input_tokens":3,"output_tokens":2,"input_tokens_details":{"cached_tokens":0,"cached_tokens":1}}"#,
+                None,
+                None,
+                0,
+            ),
+            (
+                "above admission bounds",
+                r#","usage":{"input_tokens":5000,"output_tokens":2,"total_tokens":5002}"#,
+                Some(5000),
+                Some(2),
+                5002,
+            ),
+        ] {
+            let terminal =
+                format!("data: {{\"type\":\"{event}\",\"response\":{wire_snapshot}{usage}}}}}\n\n")
+                    .into_bytes();
+            let at = format!("{event} with {status} snapshot and {label} usage");
+            let wire = [prefix.clone(), terminal, late_completion.clone()].concat();
+            let reply = w.ask_hanging(Client::Responses, wire, &at).await;
+            assert_eq!(reply.status, 200, "{at}");
+            assert_eq!(last_event(&reply.body)["type"], "error", "{at}");
+            assert_eq!(told(Client::Responses, &reply.body), class.code(), "{at}");
+            for event in ["response.completed", "response.incomplete", "[DONE]"] {
+                assert!(!reply.body.contains(event), "{at}: unexpected {event}");
+            }
+            let got = recorded(&w.f.store.pool, w.deployment, reply.id).await;
+            let want = Recorded {
+                input,
+                output,
+                ..failed_with(class, None)
+            };
+            if got != want {
+                problems.push(format!("{at}: recorded {got:?}, want {want:?}"));
+            }
+            type AccountingRow = (
+                i64,
+                i64,
+                Option<i64>,
+                Option<i64>,
+                Option<i64>,
+                Option<i64>,
+                i64,
+            );
+            let (held, admitted, reserved_input, reserved_output, ledger_input, ledger_output, floor): AccountingRow = sqlx::query_as(
+                "SELECT r.held_microusd,h.amount_microusd,r.input_tokens,r.output_tokens,u.input_tokens,u.output_tokens,u.amount_microusd
+                 FROM inference_executions e
+                 JOIN governance_reservations r ON r.execution_id=e.id AND r.admitted_at=e.started_at
+                 JOIN monetary_ledger h ON h.execution_id=e.id AND h.admitted_at=e.started_at AND h.kind='hold'
+                 JOIN monetary_ledger u ON u.execution_id=e.id AND u.admitted_at=e.started_at AND u.kind='unknown'
+                 WHERE e.root_request_id=$1",
+            )
+            .bind(reply.id)
+            .fetch_one(&w.f.store.pool)
+            .await
+            .unwrap();
+            if label == "conflicting reasoning fields" {
+                let telemetry: (Option<i64>, Option<String>) = sqlx::query_as(
+                    "SELECT reasoning_tokens,reported_upstream_model FROM inference_executions WHERE root_request_id=$1",
+                )
+                .bind(reply.id)
+                .fetch_one(&w.f.store.pool)
+                .await
+                .unwrap();
+                assert_eq!(telemetry, (Some(1), Some("served".into())), "{at}");
+            }
+            assert!(admitted > 0, "{at}: the fixture must reserve money");
+            let got = (
+                reserved_input,
+                reserved_output,
+                ledger_input,
+                ledger_output,
+                floor,
+                held,
+            );
+            let want = (
+                input,
+                output,
+                input,
+                output,
+                expected_floor,
+                admitted.max(expected_floor),
+            );
+            if got != want {
+                problems.push(format!(
+                    "{at}: reservation and ledger {got:?}, want {want:?}"
+                ));
+            }
+            if label == "above admission bounds" {
+                assert!(
+                    held > admitted,
+                    "{at}: the known floor must increase the hold"
+                );
+            }
+        }
+    }
+    assert!(problems.is_empty(), "{problems:#?}");
 }
 
 /// #622: a reset or a body that ends before the terminal frame (including
@@ -749,7 +1069,8 @@ async fn client_drop(pool: PgPool, kind: Kind) {
             .execute(&w.f.store.pool)
             .await
             .unwrap();
-        *w.script.lock().unwrap() = vec![Step::Bytes(content.clone()), Step::Hang];
+        let dropped = Arc::new(Notify::new());
+        *w.script.lock().unwrap() = vec![Step::BytesThenHang(content.clone(), dropped.clone())];
         let mut response = client_request(&w.base, client)
             .bearer_auth(&w.token)
             .send()
@@ -760,9 +1081,24 @@ async fn client_drop(pool: PgPool, kind: Kind) {
             .unwrap()
             .parse()
             .unwrap();
-        // The client has the start of the stream, then goes away.
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), response.chunk()).await;
+        // Wait for actual upstream content before disconnecting the client.
+        let at = format!("{kind:?} {client:?}");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await.unwrap() {
+                body.extend_from_slice(&chunk);
+                if body.windows(5).any(|bytes| bytes == b"Hello") {
+                    return;
+                }
+            }
+            panic!("{at}: no upstream content before EOF");
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{at}: no upstream content"));
         drop(response);
+        tokio::time::timeout(Duration::from_secs(5), dropped.notified())
+            .await
+            .unwrap_or_else(|_| panic!("{at}: upstream body stayed open after disconnect"));
         let mut state = String::new();
         for _ in 0..100 {
             state = sqlx::query_scalar(
@@ -777,7 +1113,6 @@ async fn client_drop(pool: PgPool, kind: Kind) {
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        let at = format!("{kind:?} {client:?}");
         assert_eq!(state, "cancelled", "{at}");
         // Give a wrongly recorded health observation time to land.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -797,7 +1132,7 @@ async fn client_drop(pool: PgPool, kind: Kind) {
 /// Named errors in non-stream 200 bodies retain the prior class and therefore
 /// do not gain Busy's unconditional failover. An ambiguous OpenRouter error
 /// may still fail over under its existing opt-in policy.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn non_stream_200_errors_do_not_gain_failover(pool: PgPool) {
     let mut f = fixture(pool).await;
     let token = issue_key(&mut f).await;

@@ -2,14 +2,10 @@ use super::*;
 use axum::{body::Body, http::Request};
 use tower::ServiceExt;
 
-/// #37 PR2 item 2: the plaintext creation response carries an explicit
-/// `Cache-Control: no-store`, set by the handler itself rather than only
-/// relying on the global `request_context` middleware default (which the
-/// `call()` test helper bypasses -- it invokes the router directly, not
-/// through the full `axum::serve` stack middleware is layered on in
-/// production -- so a regression here would not otherwise be caught by
-/// this suite's other tests, which all use `call()`).
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// The handler sets `Cache-Control: no-store` on the plaintext creation
+/// response. Calling the router directly exercises the handler without
+/// the production request-context middleware.
+#[dbtest::test]
 async fn creation_response_sets_no_store_explicitly(pool: PgPool) {
     let f = fixture(&pool).await;
     let response = routes()
@@ -37,7 +33,7 @@ async fn creation_response_sets_no_store_explicitly(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn admin_lists_creates_and_revokes_tokens(pool: PgPool) {
     let f = fixture(&pool).await;
     // List starts empty.
@@ -133,7 +129,7 @@ async fn admin_lists_creates_and_revokes_tokens(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn auditor_cannot_manage_admin_tokens_and_creation_is_only_for_oneself(pool: PgPool) {
     let f = fixture(&pool).await;
     for method in ["GET", "POST"] {
@@ -166,7 +162,7 @@ async fn auditor_cannot_manage_admin_tokens_and_creation_is_only_for_oneself(poo
     assert_eq!(owner, f.admin.user_id);
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn invalid_creation_input_is_rejected(pool: PgPool) {
     let f = fixture(&pool).await;
     for body in [

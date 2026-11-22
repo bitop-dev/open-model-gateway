@@ -1,11 +1,7 @@
-//! RED tests for the OIDC group-mapping preview (#89, review round 2):
-//! preview must predict exactly what the real write path (PATCH/DELETE plus
-//! `lifecycle::apply_group_grants`/`synchronize_scim_groups`, the same
-//! predicates the preview evaluator reuses) then does -- both the
-//! management write's own immediate, unconditional revocation and the net
-//! effective-role change a later sign-in/SCIM reconciliation produces --
-//! while itself never writing anything. See `apps/gateway/src/lifecycle.rs`
-//! and `apps/gateway/src/management/group_mapping_preview.rs`.
+//! The OIDC group-mapping preview predicts the effects of PATCH or DELETE
+//! and subsequent OIDC sign-in or SCIM reconciliation. These tests compare
+//! its reported revocations and effective-role changes with the write
+//! paths and check that previewing leaves persisted state untouched.
 use super::*;
 use crate::identity::{AdminTokenContext, tests::MockProvider};
 
@@ -166,7 +162,7 @@ fn entry_for(list: &Value, user: Uuid) -> &Value {
         .unwrap_or_else(|| panic!("{user} not found in {list}"))
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn preview_predicts_scim_platform_role_gain_exactly_matching_apply(pool: PgPool) {
     let f = fixture(&pool).await;
     let issuer = "https://idp.example.test";
@@ -238,20 +234,18 @@ async fn preview_predicts_scim_platform_role_gain_exactly_matching_apply(pool: P
     }
 }
 
-/// Review item 1: PATCH renaming a group (same target/role) immediately
-/// revokes every existing grant from the old mapping, independent of
-/// whether the renamed definition would recreate it. Review item 3: a
-/// revoked key never reactivates even once the grant is restored.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// Renaming a mapping revokes the grants tied to the old group immediately.
+/// Reconciliation may restore the grant from the renamed mapping. A revoked
+/// key stays revoked even after the grant is restored.
+#[dbtest::test]
 async fn renaming_a_mapping_shows_the_immediate_revoke_even_when_reconciliation_restores_the_same_role(
     pool: PgPool,
 ) {
     let f = fixture(&pool).await;
     let issuer = "https://idp.example.test";
     let holder = inert_user(&pool, "holder@example.test").await;
-    // Live platform entitlement: `effective_workspace_memberships` requires
-    // it (review #89 item 4), so without it the workspace effect is
-    // trivially None->None and this test would prove nothing.
+    // A live platform entitlement lets the user's workspace membership take
+    // effect so the test can observe its loss.
     sqlx::query("INSERT INTO platform_role_grants(user_id,role,source) VALUES($1,'user','manual')")
         .bind(holder)
         .execute(&pool)
@@ -373,17 +367,14 @@ async fn renaming_a_mapping_shows_the_immediate_revoke_even_when_reconciliation_
     );
 }
 
-/// Review item 2: a manual `member` grant plus a group-sourced `admin`
-/// grant is effectively `admin` by precedence; deleting the mapping is an
-/// admin -> member downgrade, shown in the diff even though no roster
-/// reconciliation is involved (workspace revocation is immediate).
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// A group-sourced Admin grant takes precedence over a manual Member grant.
+/// Deleting the mapping produces an immediate Admin-to-Member downgrade.
+#[dbtest::test]
 async fn deleting_a_mapping_shows_the_effective_precedence_downgrade(pool: PgPool) {
     let f = fixture(&pool).await;
     let issuer = "https://idp.example.test";
     let holder = inert_user(&pool, "holder2@example.test").await;
-    // Live platform entitlement: `effective_workspace_memberships` requires
-    // it (review #89 item 4).
+    // Effective workspace membership requires a live platform entitlement.
     sqlx::query("INSERT INTO platform_role_grants(user_id,role,source) VALUES($1,'user','manual')")
         .bind(holder)
         .execute(&pool)
@@ -434,10 +425,9 @@ async fn deleting_a_mapping_shows_the_effective_precedence_downgrade(pool: PgPoo
     assert_eq!(role, "member", "matches the previewed downgrade exactly");
 }
 
-/// Review item 3: a user suspended for entitlement loss, still inside its
-/// grace window, is shown as reactivated/gained -- matching what
-/// `synchronize_scim_groups` then actually does.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// The preview shows reactivation and a gain for an entitlement-loss
+/// suspension still within its grace window, matching SCIM reconciliation.
+#[dbtest::test]
 async fn a_user_suspended_for_entitlement_loss_in_grace_is_shown_as_reactivated(pool: PgPool) {
     let f = fixture(&pool).await;
     let issuer = "https://idp.example.test";
@@ -491,8 +481,8 @@ async fn a_user_suspended_for_entitlement_loss_in_grace_is_shown_as_reactivated(
     );
 }
 
-/// Review item 4: SCIM roster matching is exact, never case-folded.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// SCIM roster matching requires an exact match, including case.
+#[dbtest::test]
 async fn roster_matching_is_exact_case_sensitive(pool: PgPool) {
     let f = fixture(&pool).await;
     let user = inert_user(&pool, "case@example.test").await;
@@ -513,9 +503,8 @@ async fn roster_matching_is_exact_case_sensitive(pool: PgPool) {
     assert_eq!(preview["diff"]["platform_role_gained"], json!([]));
 }
 
-/// Review item 5: beyond the (test-lowered) roster cap, the whole preview
-/// is marked incomplete instead of silently undercounting.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// Exceeding the lowered roster cap marks the entire preview incomplete.
+#[dbtest::test]
 async fn roster_overflow_marks_the_preview_incomplete(pool: PgPool) {
     let f = fixture(&pool).await;
     let a = inert_user(&pool, "o1@example.test").await;
@@ -548,7 +537,7 @@ async fn roster_overflow_marks_the_preview_incomplete(pool: PgPool) {
 /// a loss for any existing holder, capped-out or not -- the real
 /// unchanged write revokes nothing, and reconciliation re-derives exactly
 /// the same grants for every one of them.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn an_unchanged_patch_on_an_overflowing_mapping_shows_no_losses(pool: PgPool) {
     let f = fixture(&pool).await;
     let issuer = "https://idp.example.test";
@@ -646,7 +635,7 @@ async fn an_unchanged_patch_on_an_overflowing_mapping_shows_no_losses(pool: PgPo
 /// SCIM group exceeds the (test-lowered) roster cap must show every
 /// existing holder gaining the new role, including the capped-out one --
 /// never a false suspension or loss.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn a_role_upgrade_on_an_overflowing_mapping_never_shows_a_false_loss(pool: PgPool) {
     let f = fixture(&pool).await;
     let issuer = "https://idp.example.test";
@@ -751,9 +740,8 @@ async fn a_role_upgrade_on_an_overflowing_mapping_never_shows_a_false_loss(pool:
     }
 }
 
-/// Review item 7: a user who already holds the role via a manual grant
-/// does not appear to "gain" anything -- the net effective role is unchanged.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// The preview reports no gain when a manual grant already supplies the role.
+#[dbtest::test]
 async fn a_user_already_entitled_via_another_source_does_not_appear_to_gain(pool: PgPool) {
     let f = fixture(&pool).await;
     let user = inert_user(&pool, "already@example.test").await;
@@ -780,8 +768,8 @@ async fn a_user_already_entitled_via_another_source_does_not_appear_to_gain(pool
     );
 }
 
-/// Review item 6: `If-Match` refuses a mapping changed between review and apply.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// If-Match refuses an apply if the mapping changed since the preview.
+#[dbtest::test]
 async fn concurrent_edit_between_preview_and_apply_is_refused(pool: PgPool) {
     let f = fixture(&pool).await;
     let issuer = "https://idp.example.test";
@@ -892,8 +880,8 @@ async fn concurrent_edit_between_preview_and_apply_is_refused(pool: PgPool) {
     );
 }
 
-/// Review item 7 (standard review): never a personal workspace row.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// Previewing a mapping targeting a personal workspace returns 404.
+#[dbtest::test]
 async fn preview_never_names_a_personal_workspace(pool: PgPool) {
     let f = fixture(&pool).await;
     let user = inert_user(&pool, "personal@example.test").await;
@@ -911,7 +899,7 @@ async fn preview_never_names_a_personal_workspace(pool: PgPool) {
     assert_eq!(status, StatusCode::NOT_FOUND, "{preview}");
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn preview_bounds_each_list_to_200_and_reports_the_true_total(pool: PgPool) {
     let f = fixture(&pool).await;
     let issuer = "https://idp.example.test";
@@ -957,7 +945,7 @@ async fn preview_bounds_each_list_to_200_and_reports_the_true_total(pool: PgPool
     assert_eq!(preview["counts"]["truncated"], true);
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn preview_rejects_an_unknown_field_the_same_way_create_does(pool: PgPool) {
     let f = fixture(&pool).await;
     assert_eq!(
@@ -987,7 +975,7 @@ async fn preview_rejects_an_unknown_field_the_same_way_create_does(pool: PgPool)
     );
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn authority_matrix_admin_only_browser_only(pool: PgPool) {
     let f = fixture(&pool).await;
     let body = json!({"issuer":"https://idp.example.test","group_value":"g","target_kind":"platform","platform_role":"user","enabled":false});
@@ -1015,10 +1003,8 @@ async fn authority_matrix_admin_only_browser_only(pool: PgPool) {
     );
 }
 
-/// [`call`] plus a real `Extension<settings::SignIn>` layer, for the
-/// configured-issuer tests (review #89 item 2): the test harness's plain
-/// `call` never layers it, which is also the "no sign-in state configured"
-/// case `configured_scim_issuer` must tolerate.
+/// Adds configured sign-in state to the usual `call` harness so preview can
+/// resolve the SCIM issuer. The plain harness exercises absent sign-in state.
 async fn call_with_sign_in(
     s: &Store,
     u: &BrowserPrincipal,
@@ -1050,23 +1036,12 @@ async fn call_with_sign_in(
     )
 }
 
-/// Review #89 item 2: a mapping stored under an issuer SCIM is not bound
-/// to must never trust `scim_groups` membership, even when `group_value`
-/// matches a real SCIM group pushed under the actual configured issuer.
-/// This exercises the *existing*-mapping delete preview (bypassing
-/// `validate_mapping`, exactly like the real `DELETE` write path does)
-/// rather than proposing a brand-new mapping: the test harness's real OIDC
-/// issuer is necessarily a loopback `http://` address (`MockProvider`
-/// binds an ephemeral local port), which `validate_mapping` legitimately
-/// refuses outside `GATEWAY_ENV=development` for any *freshly proposed*
-/// mapping -- that refusal is the intended production behavior, not a bug
-/// to route around by weakening validation. A stored row's own issuer is
-/// never re-validated on read, so both scenarios can use it. Beyond the
-/// `membership_basis` label itself, the matching case's `complete:false`
-/// (the group has more members than the test's lowered `ROSTER_LIMIT`)
-/// proves the SCIM table was actually queried -- not just a differently-
-/// labeled but still-empty roster.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// The delete preview uses SCIM membership only for the configured issuer,
+/// even when another issuer has the same group name. Stored mappings let
+/// the test compare issuers without proposing the mock provider's loopback
+/// HTTP URL as a new mapping. In the matching case, exceeding the lowered
+/// roster cap confirms the preview actually read the SCIM membership.
+#[dbtest::test]
 async fn scim_roster_is_never_trusted_for_a_different_issuer(pool: PgPool) {
     let f = fixture(&pool).await;
     let mock = MockProvider::start(None).await;
@@ -1092,11 +1067,8 @@ async fn scim_roster_is_never_trusted_for_a_different_issuer(pool: PgPool) {
     scim_group(&pool, "staff", &members).await;
     let foreign_issuer = "https://not-the-configured-issuer.example.test";
 
-    // A brand-new mapping proposed under the foreign (but otherwise
-    // valid HTTPS) issuer, enabled and targeting the real SCIM group: a
-    // false "gained" here would prove roster trust leaked across
-    // issuers, not merely that the proposal was disabled (round 5 LOW
-    // finding -- create/edit coverage, not just delete-mode).
+    // An enabled mapping proposed under a foreign HTTPS issuer cannot gain
+    // members from the real issuer's SCIM roster, even for the same group name.
     let (status, created_preview) = call_with_sign_in(
         &f.s,
         &f.admin,
@@ -1114,10 +1086,8 @@ async fn scim_roster_is_never_trusted_for_a_different_issuer(pool: PgPool) {
     assert_eq!(created_preview["complete"], true, "{created_preview}");
     assert_eq!(created_preview["diff"]["platform_role_gained"], json!([]));
 
-    // The same issuer isolation for an *edit* of an existing mapping
-    // (merge semantics, review #89 round 5): a partial patch that only
-    // changes `issuer` keeps the enabled platform/staff definition that
-    // would otherwise show every SCIM member as gained.
+    // Patching only the issuer preserves the enabled platform/staff definition.
+    // The change still removes access to the configured issuer's SCIM roster.
     let edited_map = Uuid::new_v4();
     sqlx::query("INSERT INTO oidc_group_mappings(id,issuer,group_value,target_kind,platform_role,enabled) VALUES($1,$2,'staff','platform','user',true)")
         .bind(edited_map)
@@ -1197,10 +1167,8 @@ async fn scim_roster_is_never_trusted_for_a_different_issuer(pool: PgPool) {
     );
 }
 
-/// Review #89 item 1: an ordinary active user (`NULL` `disable_reason`/
-/// `cleanup_due_at`, the common case) must preview cleanly -- a prior bug
-/// decoded that `NULL` boolean expression into a non-optional Rust `bool`.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// The preview handles an active user with NULL suspension and cleanup fields.
+#[dbtest::test]
 async fn an_ordinary_active_user_is_previewed_without_error(pool: PgPool) {
     let f = fixture(&pool).await;
     let user = inert_user(&pool, "ordinary@example.test").await;
@@ -1217,11 +1185,10 @@ async fn an_ordinary_active_user_is_previewed_without_error(pool: PgPool) {
     assert!(users_in(&preview["diff"]["platform_role_gained"]).contains(&user));
 }
 
-/// Review #89 item 4: an administratively suspended user (any reason other
-/// than entitlement loss) never shows as gaining, and neither does one
-/// whose entitlement-loss grace window already expired -- neither
-/// `synchronize_groups` nor `synchronize_scim_groups` would lift either.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// A preview gain requires the suspension to be recoverable. Neither an
+/// administrative suspension nor an expired entitlement-loss grace period
+/// qualifies under OIDC or SCIM reconciliation.
+#[dbtest::test]
 async fn suspended_users_outside_the_real_reactivation_condition_never_gain(pool: PgPool) {
     let f = fixture(&pool).await;
     let manual = inert_user(&pool, "manual-suspend@example.test").await;
@@ -1248,11 +1215,9 @@ async fn suspended_users_outside_the_real_reactivation_condition_never_gain(pool
     assert!(!gained.contains(&expired), "{preview}");
 }
 
-/// Review #89 item 4: workspace membership requires live platform
-/// entitlement (`effective_workspace_memberships` joins
-/// `effective_platform_roles`) -- a user with no platform grant at all
-/// never shows as gaining a workspace.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// Workspace membership requires live platform entitlement. A user without
+/// a platform grant cannot appear as gaining access to a workspace.
+#[dbtest::test]
 async fn workspace_gain_requires_live_platform_entitlement(pool: PgPool) {
     let f = fixture(&pool).await;
     let user = inert_user(&pool, "no-platform-role@example.test").await;
@@ -1272,13 +1237,10 @@ async fn workspace_gain_requires_live_platform_entitlement(pool: PgPool) {
     );
 }
 
-/// Adversarial finding (lifecycle.rs, MEDIUM) scenario A: turning a user's
-/// *sole* platform mapping into a workspace mapping must never show a
-/// workspace gain -- applying the edit immediately suspends them for
-/// entitlement loss (their only platform grant is gone), so reconciliation
-/// can never give them effective workspace access, whatever group grant
-/// row it mechanically inserts.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// Switching a user's sole platform mapping to a workspace mapping removes
+/// platform entitlement. Any workspace grant later inserted by reconciliation
+/// cannot grant effective workspace access while the user is suspended.
+#[dbtest::test]
 async fn changing_a_sole_platform_mapping_into_a_workspace_mapping_shows_no_workspace_gain(
     pool: PgPool,
 ) {
@@ -1303,11 +1265,9 @@ async fn changing_a_sole_platform_mapping_into_a_workspace_mapping_shows_no_work
         .unwrap();
     scim_group(&pool, "staff", &[user]).await;
 
-    // `platform_role` must be sent explicitly as `null`: merge semantics
-    // (review #89 round 5) keep an omitted field at its stored value, and
-    // a workspace-target mapping with a leftover `platform_role` fails
-    // validation (the same way a real `PATCH` would), so this exercises
-    // the intended "switch target kind" path instead of an accidental 400.
+    // A partial PATCH preserves omitted fields. Clear `platform_role` with
+    // explicit null to make the proposed workspace mapping valid and reach the
+    // target-switch preview.
     let (status, preview) = call(
         &f.s,
         &f.admin,
@@ -1373,7 +1333,7 @@ async fn changing_a_sole_platform_mapping_into_a_workspace_mapping_shows_no_work
 /// in place -- merge semantics keep an absent field at its current value
 /// -- which `validate_mapping` refuses for a workspace-target mapping,
 /// exactly as it would for the real `PATCH`.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn previewing_a_patch_the_real_patch_would_reject_returns_the_same_status(pool: PgPool) {
     let f = fixture(&pool).await;
     let issuer = "https://idp.example.test";
@@ -1423,7 +1383,7 @@ async fn previewing_a_patch_the_real_patch_would_reject_returns_the_same_status(
 /// value, never reinterpreted as a full replacement that would otherwise
 /// fail validation (a workspace mapping with no `workspace_id`) or silently
 /// drop the existing workspace/role.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn a_partial_patch_naming_only_enabled_previews_correctly(pool: PgPool) {
     let f = fixture(&pool).await;
     let issuer = "https://idp.example.test";
@@ -1507,13 +1467,10 @@ async fn a_partial_patch_naming_only_enabled_previews_correctly(pool: PgPool) {
     );
 }
 
-/// Adversarial finding (lifecycle.rs, MEDIUM) scenario B: an
-/// entitlement-loss-suspended user who still holds another, unrelated
-/// platform grant reactivates the instant reconciliation runs -- the
-/// workspace "after" state must reflect that reactivation (derived from
-/// the same real predicate `preview_platform_effect` uses), not the
-/// user's current (suspended) `disabled_at`.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// Reconciliation reactivates an entitlement-loss-suspended user who still
+/// has an unrelated platform grant. The preview uses that reactivated state
+/// to compute the resulting workspace access.
+#[dbtest::test]
 async fn entitlement_loss_suspended_user_with_a_surviving_platform_grant_shows_workspace_gain(
     pool: PgPool,
 ) {
@@ -1585,13 +1542,10 @@ async fn entitlement_loss_suspended_user_with_a_surviving_platform_grant_shows_w
     );
 }
 
-/// Adversarial finding (lifecycle.rs, round 6, MEDIUM): deleting a user's
-/// *sole* platform mapping must show the cascading loss of every other,
-/// unrelated shared-workspace membership they hold -- a manual Team
-/// membership is only reachable with live platform entitlement
-/// (`effective_workspace_memberships`), and losing the only platform grant
-/// suspends the user outright, whatever the grant row itself survives as.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// Deleting the sole platform mapping removes effective access to unrelated
+/// shared workspaces too. The account loses platform entitlement even when
+/// its manual Team grant row survives.
+#[dbtest::test]
 async fn deleting_a_sole_platform_mapping_shows_the_cascading_loss_of_an_unrelated_team_membership(
     pool: PgPool,
 ) {
@@ -1671,9 +1625,9 @@ async fn deleting_a_sole_platform_mapping_shows_the_cascading_loss_of_an_unrelat
     );
 }
 
-/// The same adversarial finding, exercised through an *edit* (disabling
-/// the mapping, not deleting it) instead of a delete.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// Disabling the sole platform mapping removes effective access to an
+/// unrelated Project as well.
+#[dbtest::test]
 async fn editing_a_sole_platform_mapping_to_disabled_shows_the_cascading_loss_of_an_unrelated_project_membership(
     pool: PgPool,
 ) {
@@ -1753,11 +1707,10 @@ async fn editing_a_sole_platform_mapping_to_disabled_shows_the_cascading_loss_of
     );
 }
 
-/// Review #89 item 3: renaming/deleting a mapping that is a user's sole
-/// platform entitlement suspends them and revokes *every* key they hold
-/// (any workspace, `directory::revoke_human_credentials`), not only keys in
-/// a workspace this mapping happens to also touch. Counted once, distinct.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// Renaming or deleting a user's sole platform mapping suspends the user
+/// and revokes their keys across all workspaces. The preview counts each
+/// revoked key once.
+#[dbtest::test]
 async fn immediate_key_count_includes_entitlement_loss_revocations(pool: PgPool) {
     let f = fixture(&pool).await;
     let issuer = "https://idp.example.test";
@@ -1850,12 +1803,9 @@ async fn immediate_key_count_includes_entitlement_loss_revocations(pool: PgPool)
     );
 }
 
-/// Review #89 item 5: `If-Match` accepts only one well-formed
-/// `"<64 lowercase hex>"` header; anything else (non-hex, uppercase,
-/// unbalanced/repeated quotes, non-UTF8 bytes, duplicated headers) is a
-/// `400`, never silently treated as absent or loosely matched. A single
-/// well-formed but non-matching digest is still a `412`, not a `400`.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// If-Match accepts a single quoted digest of 64 lowercase hex digits.
+/// Invalid or duplicate headers return 400. A valid stale digest returns 412.
+#[dbtest::test]
 async fn malformed_or_duplicate_if_match_headers_are_refused(pool: PgPool) {
     let f = fixture(&pool).await;
     let (status, created) = call(

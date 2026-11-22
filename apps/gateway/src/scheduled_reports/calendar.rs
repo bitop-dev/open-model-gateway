@@ -1,6 +1,10 @@
 //! UTC accounting periods; IANA civil time affects only the due instant.
 use gateway_datetime_compat::{CalendarDate, SignedDuration as TimeDelta, UtcInstant};
-use jiff::tz::TimeZone;
+use jiff::tz::{TimeZone, TimeZoneDatabase};
+use std::sync::LazyLock;
+
+pub(crate) const TZDB_VERSION: &str = jiff_tzdb::VERSION;
+static TZDB: LazyLock<TimeZoneDatabase> = LazyLock::new(TimeZoneDatabase::bundled);
 
 #[derive(Clone, Debug)]
 pub(crate) struct Calendar {
@@ -26,7 +30,7 @@ impl Calendar {
         let minutes = crate::jobs::schedule::parse_hhmm(time).ok_or_else(invalid)?;
         Ok(Self {
             monthly: cadence == "monthly",
-            zone: TimeZone::get(zone).map_err(|_| invalid())?,
+            zone: TZDB.get(zone).map_err(|_| invalid())?,
             hour: (minutes / 60) as i8,
             minute: (minutes % 60) as i8,
         })
@@ -61,7 +65,7 @@ impl Calendar {
     /// shifts gaps forward by their size and chooses the earlier fold only.
     pub(crate) fn delivery_after(&self, end: UtcInstant) -> Result<UtcInstant, sqlx::Error> {
         let ts = jiff::Timestamp::from_second(end.timestamp()).map_err(|_| invalid())?;
-        let local = ts.to_zoned(self.zone.clone());
+        let local = ts.to_zoned_datetime(self.zone.clone());
         let mut d = CalendarDate::from_ymd_opt(
             i32::from(local.year()),
             local.month() as u32,
@@ -81,7 +85,7 @@ impl Calendar {
                 0,
             )
             .map_err(|_| invalid())?;
-            let zoned = self.zone.to_zoned(civil).map_err(|_| invalid())?;
+            let zoned = self.zone.to_zoned_datetime(civil).map_err(|_| invalid())?;
             let due =
                 UtcInstant::from_timestamp(zoned.timestamp().as_second(), 0).ok_or_else(invalid)?;
             if due > end {

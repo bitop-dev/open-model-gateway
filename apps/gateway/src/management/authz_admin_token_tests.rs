@@ -79,13 +79,8 @@ fn concrete_path(path: &str, team: Uuid) -> String {
         .replace("{token}", &filler)
 }
 
-/// A synthetic, distinct-per-call client address (#37 PR2 finding 2
-/// regression guard): the *existing*, unrelated per-IP admin-token limiter
-/// in `identity.rs` buckets every in-process request with no `ConnectInfo`
-/// under one shared "unknown peer" bucket, and the expanded matrix below
-/// issues far more requests than that bucket's burst allows. Each probe
-/// gets its own address so this test exercises the token-policy matrix,
-/// not an unrelated rate limiter it isn't about.
+/// Give each matrix probe a distinct peer so the shared unknown-peer
+/// rate limit cannot mask a token-policy response.
 fn synthetic_peer(seq: u32) -> std::net::SocketAddr {
     std::net::SocketAddr::new(
         std::net::IpAddr::V4(std::net::Ipv4Addr::from(0x0A00_0001u32.wrapping_add(seq))),
@@ -123,29 +118,11 @@ fn stub_app(s: &Store, identity: identity::IdentityState) -> Router {
         .with_state(s.clone())
 }
 
-/// TEST-FIRST (RED before this PR's authentication/authorization layer
-/// existed, every one of these requests 404'd or 401'd with no scope
-/// concept at all): every declared route's token policy is enforced
-/// exactly as declared, for every route in the inventory -- not a sample,
-/// and not only against one "a wrong scope" probe (finding 2: the original
-/// version of this test took only the *first* mismatching scope via
-/// `Iterator::find`, so a route that happened to also admit, say, the
-/// second-tried scope by mistake would never have been caught). For a
-/// `Scope(required)` route this now probes, individually, every one of the
-/// five single-scope tokens (exactly one must admit it), a token holding
-/// all five scopes together (still admitted: extra scopes never revoke the
-/// one that matters), and a token holding every *other* scope but not the
-/// required one (still refused: holding several wrong scopes at once must
-/// not accidentally satisfy the check). `Denied`/`BrowserAdminOnly` routes
-/// refuse all of that -- every single-scope token and the all-five token
-/// alike -- regardless of how many scopes the token holds.
-///
-/// Two independent oracles, not one: the per-attempt audit row
-/// (`admin_token_attempts.outcome`, the authorization decision alone) and
-/// the actual HTTP response (which also depends on route readiness --
-/// finding 1's HEAD/501 bug was invisible to the audit-only oracle alone,
-/// since the outcome is decided before the readiness check runs).
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// Exercise the policy of every declared route against each single
+/// scope, all scopes, and, for scope-gated routes, all but the required
+/// scope. The per-attempt audit outcome records the authorization decision,
+/// and the HTTP response also checks that route readiness is enforced.
+#[dbtest::test]
 async fn every_route_enforces_its_declared_token_policy(pool: PgPool) {
     let f = fixture(&pool).await;
     let mock = MockProvider::start(None).await;
@@ -266,7 +243,7 @@ async fn every_route_enforces_its_declared_token_policy(pool: PgPool) {
 /// 403", it genuinely serves the request. Also proves mutations need no
 /// CSRF token or Origin header for an admin token (unlike a browser
 /// session, exercised everywhere else in this file).
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn positive_controls_per_scope_reach_a_real_handler(pool: PgPool) {
     let mut f = fixture(&pool).await;
     f.s = f.s.with_secret_allowlists(
@@ -343,7 +320,7 @@ async fn positive_controls_per_scope_reach_a_real_handler(pool: PgPool) {
 /// through the full router, and an unmapped route denies them too (the
 /// same "undeclared route" guarantee the browser-session matrix proves
 /// above, now for a token).
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn denied_and_undeclared_routes_refuse_a_token_through_the_full_router(pool: PgPool) {
     let f = fixture(&pool).await;
     let mock = MockProvider::start(None).await;
@@ -405,7 +382,7 @@ async fn denied_and_undeclared_routes_refuse_a_token_through_the_full_router(poo
 }
 
 /// #101 A: hold review uses the real router, not just the declared-policy stub.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn hold_queue_admin_tokens_are_platform_read_only(pool: PgPool) {
     let f = fixture(&pool).await;
     let mock = MockProvider::start(None).await;
@@ -462,7 +439,7 @@ async fn hold_queue_admin_tokens_are_platform_read_only(pool: PgPool) {
 
 /// Credential ambiguity, in both directions, before either credential is
 /// examined: no fallback.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn credential_selection_refuses_ambiguity_with_no_fallback(pool: PgPool) {
     let f = fixture(&pool).await;
     let mock = MockProvider::start(None).await;
@@ -597,7 +574,7 @@ async fn credential_selection_refuses_ambiguity_with_no_fallback(pool: PgPool) {
 /// header -- the explicit exemption -- while the same route still enforces
 /// exact CSRF for a browser session, proving the exemption is narrow (only
 /// a successfully authenticated token), not a general relaxation.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn csrf_exemption_is_only_for_an_authenticated_admin_token(pool: PgPool) {
     let mut f = fixture(&pool).await;
     f.s = f.s.with_secret_allowlists(
@@ -657,7 +634,7 @@ async fn csrf_exemption_is_only_for_an_authenticated_admin_token(pool: PgPool) {
 /// untrusted `X-Forwarded-For` entry. Exercised on a real TCP listener so
 /// there is a genuine peer address, with `GATEWAY_TRUSTED_PROXIES`
 /// configured on this test's own `IdentityState`.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn ip_allowlist_follows_the_trusted_proxy_chain_and_fails_closed(pool: PgPool) {
     let f = fixture(&pool).await;
     let mock = MockProvider::start(None).await;
@@ -744,7 +721,7 @@ async fn ip_allowlist_follows_the_trusted_proxy_chain_and_fails_closed(pool: PgP
 /// start record before dispatch and a completion record before returning,
 /// correlated by request id, carrying only the typed, non-sensitive facts
 /// the spec names -- never the raw path, a body, a name or a credential.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn audit_records_capture_the_declared_facts_only(pool: PgPool) {
     let mut f = fixture(&pool).await;
     f.s = f.s.with_secret_allowlists(
@@ -859,7 +836,7 @@ async fn audit_records_capture_the_declared_facts_only(pool: PgPool) {
 /// cannot be written, the request never reaches the handler (the business
 /// row is never created), and the caller sees a transparent failure, not a
 /// silently unaudited success.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn audit_failure_prevents_dispatch(pool: PgPool) {
     let f = fixture(&pool).await;
     let mock = MockProvider::start(None).await;
@@ -909,7 +886,7 @@ async fn audit_failure_prevents_dispatch(pool: PgPool) {
 /// revoked in another transaction must fail: there is no positive
 /// authorization cache anywhere in this path. Real PostgreSQL, two
 /// connections, no injected principal.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn revocation_committed_between_authentication_and_reuse_is_observed_immediately(
     pool: PgPool,
 ) {
@@ -977,7 +954,7 @@ async fn revocation_committed_between_authentication_and_reuse_is_observed_immed
 /// returned a live principal for this request but *before*
 /// `database_access`'s own independent live role check runs, the second
 /// check still denies -- nothing upstream of it is trusted as a cache.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn demotion_after_authentication_but_before_the_authority_check_still_denies(pool: PgPool) {
     let f = fixture(&pool).await;
     let (_, token) = mint(&pool, f.admin.user_id, &["platform:read"], None).await;
@@ -985,9 +962,8 @@ async fn demotion_after_authentication_but_before_the_authority_check_still_deni
     // getting back a live principal (owner still Admin at this instant).
     let principal = f.s.authenticate_admin_token(&token).await.unwrap().unwrap();
     assert_eq!(principal.owner_user_id, f.admin.user_id);
-    // Demotion commits in a separate transaction, strictly after that
-    // authentication and before the authorization check below -- the
-    // in-flight-race shape the approved spec calls out explicitly.
+    // Commit the demotion between authentication and authorization to
+    // exercise the live recheck of an in-flight request.
     sqlx::query(
         "UPDATE platform_role_grants SET revoked_at=now() WHERE user_id=$1 AND role='admin'",
     )
@@ -1017,7 +993,7 @@ async fn demotion_after_authentication_but_before_the_authority_check_still_deni
 /// own HEAD->GET fallback already resolved the Access/TokenPolicy decision
 /// correctly before this fix; only the separate `TOKEN_READY_ROUTES`
 /// readiness lookup had its own, un-mirrored exact-method comparison.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn head_on_a_get_only_ready_route_succeeds_with_a_correct_completion(pool: PgPool) {
     let f = fixture(&pool).await;
     let mock = MockProvider::start(None).await;
@@ -1060,15 +1036,10 @@ async fn head_on_a_get_only_ready_route_succeeds_with_a_correct_completion(pool:
     assert_eq!(completion_status, Some(200));
 }
 
-/// Finding 4: a database error from the live authorization recheck is
-/// reported honestly instead of being collapsed into a misleading 403
-/// "denied". Only the table `access_inner`'s live boundary check
-/// additionally needs (`workspaces`) is dropped here, not
-/// `effective_platform_roles`: dropping that would instead fail
-/// *authentication* itself (identity/session.rs, before this layer ever runs),
-/// which is a different fault than the one this test targets -- the
-/// authentication step below must still succeed.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// An error during live workspace authorization returns a server error.
+/// Dropping only `workspaces` keeps token authentication working and makes
+/// the authorization recheck fail.
+#[dbtest::test]
 async fn authorization_infrastructure_errors_are_distinguished_from_denials(pool: PgPool) {
     let f = fixture(&pool).await;
     let mock = MockProvider::start(None).await;
@@ -1118,13 +1089,9 @@ async fn authorization_infrastructure_errors_are_distinguished_from_denials(pool
     assert_eq!(outcome.as_deref(), Some("error"));
 }
 
-/// Finding 3: a per-token admission bound holds even when the same token
-/// is presented from many different client addresses, which the existing
-/// per-IP limiter alone cannot see. A tiny, test-injected per-token rate
-/// (no real-minute wait, no injected clock) exhausts deterministically
-/// within a handful of in-process requests; the replica-wide bound is set
-/// generously high here so only the per-token bound is under test.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// The per-token limit applies across distinct client addresses. A low
+/// test rate exhausts it within a few requests, below the replica limit.
+#[dbtest::test]
 async fn per_token_limiter_bounds_one_token_even_across_many_client_addresses(pool: PgPool) {
     let f = fixture(&pool).await;
     let mock = MockProvider::start(None).await;
@@ -1174,12 +1141,9 @@ async fn per_token_limiter_bounds_one_token_even_across_many_client_addresses(po
     );
 }
 
-/// Finding 3: the aggregate per-replica bound applies before a single
-/// request is even authenticated, across distinct valid tokens and distinct
-/// client addresses alike -- the per-IP and per-token limiters cannot see
-/// this shape (many different tokens, each from its own address, none
-/// individually over its own limit).
-#[sqlx::test(migrations = "./enterprise_migrations")]
+/// The replica-wide limit applies before authentication and aggregates
+/// requests across different tokens and client addresses.
+#[dbtest::test]
 async fn replica_limiter_bounds_the_aggregate_before_authentication(pool: PgPool) {
     let f = fixture(&pool).await;
     let mock = MockProvider::start(None).await;
@@ -1226,7 +1190,7 @@ async fn replica_limiter_bounds_the_aggregate_before_authentication(pool: PgPool
     );
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn completion_audit_failure_reports_uncertainty_after_committed_mutation(pool: PgPool) {
     let mut f = fixture(&pool).await;
     f.s = f.s.with_secret_allowlists(
@@ -1315,7 +1279,7 @@ async fn completion_audit_failure_reports_uncertainty_after_committed_mutation(p
     assert!(!message.contains(&token));
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn completion_audit_failure_before_dispatch_reports_no_action(pool: PgPool) {
     let mut f = fixture(&pool).await;
     f.s = f.s.with_secret_allowlists(
@@ -1389,7 +1353,7 @@ async fn completion_audit_failure_before_dispatch_reports_no_action(pool: PgPool
 /// refusal is a 429 with `Retry-After` only after authentication, route access
 /// and authority (401/403/404 first), and an admin token can neither read the
 /// view nor issue keys.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn key_issuance_budget_and_view_follow_real_router_authorization(pool: PgPool) {
     let f = fixture(&pool).await;
     sqlx::query("UPDATE workspace_type_policies SET key_issuances_per_holder=1 WHERE kind='team'")
@@ -1569,7 +1533,7 @@ async fn key_issuance_budget_and_view_follow_real_router_authorization(pool: PgP
 /// `platform:read` token against `/workspaces/{alexPersonal}/keys` and
 /// `/requests` are this second case: unchanged, because they already match
 /// what an unknown workspace id gets from the same `Denied` routes.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn admin_token_principals_hide_foreign_personal_like_unknown(pool: PgPool) {
     let f = fixture(&pool).await;
     // Real fixture rows for every non-`ws` path parameter (`{model}`,

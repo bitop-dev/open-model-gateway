@@ -1,8 +1,7 @@
 // Example monitoring files (deploy/monitoring): the Prometheus rules and the
 // Grafana dashboard parse, name only metric families and labels the gateway
 // exports (apps/gateway/src/metrics_export.rs), and cover the accounting
-// failure counter (#528). promtool is not run here or in CI (#584); check the
-// rules with `promtool check rules` before deploying them.
+// failure counter (#528). CI also exercises the rules with pinned promtool.
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -68,10 +67,12 @@ test("every gateway metric and label in the rules and dashboard is exported", ()
   }
 });
 
-test("rule names are unique and every rule has a severity and a summary", () => {
-  const names = allRules.map(rule => rule.alert);
+test("rule names are unique and every alert has a severity and a summary", () => {
+  const names = allRules.map(rule => rule.alert ?? rule.record);
   assert.equal(new Set(names).size, names.length);
   for (const rule of allRules) {
+    assert.notEqual(Boolean(rule.alert), Boolean(rule.record), "expected one alert or recording rule name");
+    if (rule.record) continue;
     assert.ok(["info", "warning", "critical"].includes(rule.labels?.severity), `${rule.alert} severity`);
     assert.ok(rule.annotations?.summary, `${rule.alert} summary`);
   }
@@ -87,12 +88,20 @@ test("accounting failures alert, split by settlement stage (#528)", () => {
     "route_lookup",
   ]);
   const settlement = "explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement";
-  // increase() plus the series that did not exist 10 minutes ago: a series
-  // exists only after a failure, so a new one is the first failure, which
-  // rate() and increase() cannot see.
-  const failures = matcher =>
-    `sum by (stage, cause) ( increase(gateway_accounting_failures_total{${matcher}}[10m]) or ` +
-    `(gateway_accounting_failures_total{${matcher}} unless gateway_accounting_failures_total{${matcher}} offset 10m) ) > 0`;
+  const accounting = rules.groups.find(group => group.name === "open-model-gateway.accounting");
+  const [presence, firstObservation] = accounting.rules;
+  assert.equal(accounting.interval, "30s");
+  assert.equal(presence.record, "instance_stage_cause:accounting_failure_series:present");
+  assert.equal(squash(presence.expr), "((gateway_accounting_failures_total > bool 0) " +
+    "or (0 * present_over_time(gateway_accounting_failures_total[20m]))) and ignoring(stage, cause) (up == 1)");
+  assert.equal(firstObservation.record, "instance_stage_cause:accounting_failure_series:first_observed");
+  assert.equal(squash(firstObservation.expr), `gateway_accounting_failures_total and (last_over_time(${presence.record}[20m] offset 30s) == 0)`);
+  const failures = matcher => {
+    const counter = `gateway_accounting_failures_total{${matcher}}`;
+    return `sum by (stage, cause) ( increase(${counter}[10m]) > 0 or ` +
+      `(${counter} unless present_over_time(${counter}[10m] offset 10m)) or ` +
+      `last_over_time(${firstObservation.record}{${matcher}}[10m]) ) > 0`;
+  };
   const expected = {
     GatewayAccountingFailures: { expr: failures(`stage!~"${settlement}"`), for: "5m", severity: "warning" },
     GatewaySettlementAccountingFailures: { expr: failures(`stage=~"${settlement}"`), for: undefined, severity: "critical" },
@@ -117,10 +126,10 @@ test("accounting failures alert, split by settlement stage (#528)", () => {
   assert.match(read("docs/operations.md"), /^### Accounting failures$/m);
 });
 
-test("the docs do not claim CI validates the rules with promtool (#528)", () => {
+test("the docs describe CI promtool syntax and accounting behavior validation (#584)", () => {
   const docs = read("docs/operations.md");
-  assert.doesNotMatch(docs, /validated with `promtool/);
-  assert.match(docs, /`promtool check rules` before deploying them; it is not run in CI \(#584\)/);
+  assert.match(docs, /CI validates them with version- and SHA-256-pinned `promtool check rules`/);
+  assert.match(docs, /`promtool test rules`/);
 });
 
 test("dashboard panel ids are unique and panels do not overlap", () => {

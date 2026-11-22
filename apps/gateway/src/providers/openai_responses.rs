@@ -4,6 +4,8 @@ use crate::inference::{error::InferenceError, types::*};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 
+mod evidence;
+
 pub(super) async fn execute(
     adapter: &OpenAiAdapter,
     target: &Deployment,
@@ -38,10 +40,19 @@ pub(super) async fn execute(
     check_sse(&response)?;
     Ok(ProviderOutput::Stream(Box::pin(
         async_stream::try_stream! {
-            let frames = frames(response); futures_util::pin_mut!(frames);
+            let frames = frames_with(response, |frame| Ok((frame_json(&frame)?, frame)));
+            futures_util::pin_mut!(frames);
             let mut state = State::default();
-            while let Some(value) = frames.next().await {
-                for event in state.push(value?)? { let done = matches!(event, ChatEvent::Done); yield event; if done { return; } }
+            while let Some(frame) = frames.next().await {
+                let events = {
+                    let (value, bytes) = frame?;
+                    state.push_frame(value, &bytes)?
+                };
+                for event in events {
+                    let done = matches!(event, ChatEvent::Done);
+                    yield event;
+                    if done { return; }
+                }
             }
         },
     )))
@@ -104,14 +115,18 @@ fn usage(value: &Value) -> Result<Usage> {
         "cache_write_tokens",
     )
 }
-/// Structural failure still fails, but a valid usage object is kept as evidence.
 fn decode(value: &Value) -> Result<ChatResponse> {
-    crate::inference::evidence::preserve(decode_shape(value), || {
+    preserve_usage_on_error(value, decode_shape(value))
+}
+
+fn preserve_usage_on_error<T>(value: &Value, result: Result<T>) -> Result<T> {
+    crate::inference::evidence::preserve(result, || {
         value["usage"].is_object().then(|| {
             usage(&value["usage"]).map(|u| super::metering::with_model(u, &value["model"]))
         })
     })
 }
+
 /// Responses message `phase` labels assistant text: `commentary` (preamble) or
 /// `final_answer`. Both are assistant output text, kept in output order; any
 /// other phase is an unsupported capability and fails rather than being dropped.
@@ -230,6 +245,7 @@ fn decode_shape(value: &Value) -> Result<ChatResponse> {
 #[derive(Default)]
 struct State {
     started: bool,
+    done: bool,
     items: std::collections::BTreeMap<u64, Value>,
     bytes: usize,
     text: String,
@@ -247,7 +263,16 @@ fn stream_error(error: &Value) -> InferenceError {
     super::stream_error::classify(error, status_error)
 }
 impl State {
+    #[cfg(test)]
     fn push(&mut self, value: Value) -> Result<Vec<ChatEvent>> {
+        let frame = serde_json::to_vec(&value).unwrap();
+        self.push_frame(value, &frame)
+    }
+
+    fn push_frame(&mut self, value: Value, frame: &[u8]) -> Result<Vec<ChatEvent>> {
+        if self.done {
+            return Err(InferenceError::InvalidUpstream);
+        }
         let kind = string(&value["type"])?;
         match kind {
             "response.created" => self.created(),
@@ -267,14 +292,26 @@ impl State {
                 self.output_done(&value)
             }
             "response.output_item.done" if self.started => self.output_item_done(&value),
-            "response.completed" | "response.incomplete" if self.started => {
-                self.terminal(kind, &value)
+            "response.completed" | "response.incomplete" => {
+                // A rejected terminal snapshot still closes the stream.
+                self.done = true;
+                if !self.started {
+                    return Err(InferenceError::InvalidUpstream);
+                }
+                self.terminal(kind, &value, frame)
             }
             // `error` carries the code at the top level; `response.failed`
             // carries it in the response's `error`. Neither needs a started
             // response: a provider failure is reported whenever it happens.
-            "error" => Err(stream_error(&value)),
-            "response.failed" => Err(stream_error(&value["response"]["error"])),
+            "error" | "response.failed" => {
+                self.done = true;
+                let error = if kind == "error" {
+                    &value
+                } else {
+                    &value["response"]["error"]
+                };
+                Err(stream_error(error))
+            }
             _ => Err(InferenceError::InvalidUpstream),
         }
     }
@@ -467,15 +504,19 @@ impl State {
         }
         Ok(vec![])
     }
-    fn terminal(&self, kind: &str, value: &Value) -> Result<Vec<ChatEvent>> {
-        if (kind == "response.completed" && value["response"]["status"] != "completed")
-            || (kind == "response.incomplete" && value["response"]["status"] != "incomplete")
+    fn terminal(&mut self, kind: &str, value: &Value, frame: &[u8]) -> Result<Vec<ChatEvent>> {
+        let snapshot = &value["response"];
+        if (kind == "response.completed" && snapshot["status"] != "completed")
+            || (kind == "response.incomplete" && snapshot["status"] != "incomplete")
         {
-            return Err(InferenceError::InvalidUpstream);
+            return crate::inference::evidence::preserve(
+                Err(InferenceError::InvalidUpstream),
+                || Some(evidence::mismatch_usage(frame)),
+            );
         }
-        let response = decode(&value["response"])?;
+        let response = decode(snapshot)?;
         if self.stopped.len() != self.items.len()
-            || value["response"]["output"].as_array().map(Vec::len) != Some(self.items.len())
+            || snapshot["output"].as_array().map(Vec::len) != Some(self.items.len())
             || response.content.as_deref().unwrap_or("") != self.text
             || response.tool_calls.len() != self.calls.len()
             || response

@@ -928,7 +928,7 @@ pub(super) async fn pinned(g: &Gateway, pool: &PgPool, mail_port: u16) {
             (true, false),
         ),
     ]);
-    // The URL is parsed by `reqwest::Url` (url 2.5.8 host.rs, idna with
+    // The URL is parsed by `reqwest::Url` (the url crate’s host parser, idna with
     // `DnsLength::Ignore`), which accepts an ASCII host label of 64 or more
     // characters; the schema's pattern caps a label at 63, so it refuses it.
     // Pinned as a documented divergence, for both URL fields.

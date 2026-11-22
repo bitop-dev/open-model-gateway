@@ -656,7 +656,8 @@ fn check_output(
             "an unpriced line was priced in the draft: {l}"
         );
         prop_assert!(
-            draft.iter().any(|p| p["meter"] == l["meter"]),
+            draft.iter().any(|p| p["meter"] == l["meter"]
+                && (!l["min_prompt_tokens"].is_null() || p["unknown"] == true)),
             "an unpriced meter with no draft line: {l}"
         );
     }
@@ -685,7 +686,12 @@ fn check_output(
     } else {
         prop_assert_eq!(out["needs_review"] == true, review);
     }
-    for w in out["warnings"].as_array().unwrap() {
+    let warnings = out["warnings"].as_array().unwrap();
+    let unique: std::collections::BTreeSet<_> = warnings.iter().map(str_of).collect();
+    prop_assert_eq!(warnings.len(), unique.len(), "duplicate warnings");
+    prop_assert!(warnings.len() <= 64);
+    prop_assert!(lines(out).len() <= 64);
+    for w in warnings {
         let w = str_of(w);
         prop_assert!(
             !w.is_empty() && w.len() <= 600,
@@ -855,14 +861,24 @@ fn check_line_amounts(out: &Value, model: &Value) -> Result<(), TestCaseError> {
         .iter()
         .filter(|l| l["microusd_per_batch"].is_string())
     {
+        let unknown_base = lines(out).iter().any(|base| {
+            base["meter"] == l["meter"]
+                && base["min_prompt_tokens"].is_null()
+                && base["microusd_per_batch"].is_null()
+                && base["not_applicable"] != true
+        });
         prop_assert!(
-            draft.iter().any(|p| {
-                p["meter"] == l["meter"]
-                    && p["variant"] == l["variant"]
-                    && p["min_prompt_tokens"] == l["min_prompt_tokens"]
-                    && p["microusd_per_batch"] == l["microusd_per_batch"]
-                    && p["batch"] == l["batch"]
-            }),
+            (unknown_base
+                && draft
+                    .iter()
+                    .any(|p| p["meter"] == l["meter"] && p["unknown"] == true))
+                || draft.iter().any(|p| {
+                    p["meter"] == l["meter"]
+                        && p["variant"] == l["variant"]
+                        && p["min_prompt_tokens"] == l["min_prompt_tokens"]
+                        && p["microusd_per_batch"] == l["microusd_per_batch"]
+                        && p["batch"] == l["batch"]
+                }),
             "priced line {} is missing from the draft",
             l
         );
@@ -940,7 +956,39 @@ fn check_generation_prices(out: &Value, model: &Value) -> Result<(), TestCaseErr
             .unwrap_or_else(|| panic!("no base line for {meter}"));
         let rate = &model["pricing"][key];
         let always_priced = matches!(meter, "input_tokens" | "output_tokens");
-        if rate.is_null() && !always_priced {
+        let expected_tiers: std::collections::BTreeMap<_, _> = model["pricing"]["overrides"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|tier| {
+                let fields = tier.as_object()?;
+                let threshold = i32::try_from(tier["min_prompt_tokens"].as_u64()?).ok()?;
+                (threshold > 0
+                    && !tier[key].is_null()
+                    && fields.keys().all(|key| !key.starts_with("utc_")))
+                .then_some((threshold, &tier[key]))
+            })
+            .collect();
+        for (threshold, rate) in &expected_tiers {
+            let tier = lines(out)
+                .iter()
+                .find(|tier| tier["meter"] == meter && tier["min_prompt_tokens"] == *threshold);
+            prop_assert!(tier.is_some(), "missing {meter} tier at {threshold}");
+            let actual = tier.unwrap()["microusd_per_batch"]
+                .as_str()
+                .map(|amount| amount.parse::<i64>().unwrap());
+            let expected = rate.as_str().and_then(|rate| reference(rate, 1_000_000));
+            if expected.as_ref().is_none_or(|rate| !rate.wide) {
+                prop_assert_eq!(
+                    actual,
+                    expected.and_then(|rate| rate.amount),
+                    "{} tier at {}",
+                    meter,
+                    threshold,
+                );
+            }
+        }
+        if rate.is_null() && !always_priced && expected_tiers.is_empty() {
             prop_assert!(
                 line["not_applicable"] == true && line["needs_review"] == true,
                 "{line}"
@@ -981,17 +1029,13 @@ fn check_generation_prices(out: &Value, model: &Value) -> Result<(), TestCaseErr
         }
         if amount.is_none() {
             prop_assert!(line["needs_review"] == true, "{line}");
-            // The draft states the meter `unknown`, or carries only a prompt-size
-            // tier for it (see `a_tier_without_a_base_price_is_stated_unknown`);
-            // `check_output` already requires some draft line and the review flag.
+            // A tier cannot supply an unusable base; the draft explicitly
+            // states the meter unknown and keeps the tier only for review.
             let draft = out["draft"]["price_lines"].as_array().unwrap();
             prop_assert!(
                 draft
                     .iter()
-                    .any(|p| p["meter"] == meter && p["unknown"] == true)
-                    || draft
-                        .iter()
-                        .any(|p| p["meter"] == meter && !p["min_prompt_tokens"].is_null()),
+                    .any(|p| p["meter"] == meter && p["unknown"] == true),
                 "no unknown draft line for {meter}"
             );
         }
@@ -1144,12 +1188,12 @@ proptest! {
         check_output(&out, Some(&model), false)?;
         let endpoints = body["endpoints"].as_array().or(body["data"]["endpoints"].as_array()).unwrap();
         let mut best: std::collections::BTreeMap<Option<String>, i64> = Default::default();
-        let mut skipped = 0;
+        let mut skipped_units = std::collections::BTreeSet::new();
         let mut ambiguous = false;
         for e in endpoints {
             for p in e["pricing"].as_array().unwrap() {
                 if p["billable"] != "output_image" || p["unit"] != "image" {
-                    skipped += 1;
+                    skipped_units.insert(p["unit"].as_str().unwrap().chars().filter(|c| c.is_ascii_alphanumeric()).take(32).collect::<String>());
                     continue;
                 }
                 let text = p["cost_usd"].to_string();
@@ -1178,7 +1222,7 @@ proptest! {
         }
         let unit_warnings = out["warnings"].as_array().unwrap().iter()
             .filter(|w| str_of(w).contains("cannot be represented and was ignored")).count();
-        prop_assert_eq!(unit_warnings, skipped);
+        prop_assert_eq!(unit_warnings, skipped_units.len());
     }
 
     /// An image-endpoints body that is not a whole JSON document (truncated
@@ -1325,11 +1369,12 @@ fn sum(parts: [Cost; 3]) -> Cost {
 }
 
 /// The comparable list price: 10^6 input and output tokens plus one request;
-/// an unusable or missing prompt price excludes the endpoint.
+/// an unusable or missing token rate, or an unusable request fee, excludes the
+/// endpoint. A missing request fee is none.
 fn list_cost(pricing: &Value) -> Cost {
     sum([
         part(pricing, "prompt", 1_000_000, true),
-        part(pricing, "completion", 1_000_000, false),
+        part(pricing, "completion", 1_000_000, true),
         part(pricing, "request", 1, false),
     ])
 }
@@ -1337,8 +1382,8 @@ fn list_cost(pricing: &Value) -> Cost {
 /// The list cost of one recorded attempt.
 fn attempt_cost(pricing: &Value, input: u64, output: u64) -> Cost {
     sum([
-        part(pricing, "prompt", input, false),
-        part(pricing, "completion", output, false),
+        part(pricing, "prompt", input, true),
+        part(pricing, "completion", output, true),
         part(pricing, "request", 1, false),
     ])
 }
@@ -1351,7 +1396,7 @@ struct Chosen {
 
 /// Which endpoint the code must name: evidence first (most matching attempts,
 /// then the dearest, the last of equals), else the cheapest of those reported
-/// up (status absent, not an integer, or 0), the first of equals. `Err` when
+/// up (status absent or integer 0), the first of equals. `Err` when
 /// some price is one the production arithmetic may legitimately refuse.
 fn oracle(list: &[Value], evidence: &[Evidence]) -> Result<Option<Chosen>, ()> {
     let mut priced = vec![];
@@ -1383,11 +1428,11 @@ fn oracle(list: &[Value], evidence: &[Evidence]) -> Result<Option<Chosen>, ()> {
             matched,
         }));
     }
-    let up = |i: usize| list[i]["status"].as_i64().is_none_or(|s| s == 0);
+    let up = |i: usize| list[i].get("status").is_none_or(|s| s.as_i64() == Some(0));
     let pool: Vec<&(usize, i64)> = if priced.iter().any(|(i, _)| up(*i)) {
         priced.iter().filter(|(i, _)| up(*i)).collect()
     } else {
-        priced.iter().collect()
+        return Ok(None);
     };
     let mut cheapest: Option<(usize, i64)> = None;
     for (i, c) in pool {
@@ -1414,10 +1459,16 @@ fn effective(model: &Value, endpoint: &Value) -> Value {
         pricing["overrides"] = model["pricing"]["overrides"].clone();
     }
     priced["pricing"] = pricing;
-    if let Some(n) = endpoint["context_length"].as_u64() {
+    if let Some(n) = endpoint["context_length"]
+        .as_u64()
+        .filter(|n| (1..=i32::MAX as u64).contains(n))
+    {
         priced["context_length"] = json!(n);
     }
-    if let Some(n) = endpoint["max_completion_tokens"].as_u64() {
+    if let Some(n) = endpoint["max_completion_tokens"]
+        .as_u64()
+        .filter(|n| (1..=i32::MAX as u64).contains(n))
+    {
         if !priced["top_provider"].is_object() {
             priced["top_provider"] = json!({});
         }
@@ -1442,7 +1493,7 @@ proptest! {
     /// sides. The named provider must be the oracle's: a matching attempt wins
     /// (`evidence`, with `matched_attempts > 0`, most matches then dearest),
     /// else the cheapest endpoint reported up (`cheapest`), skipping endpoints
-    /// whose prompt price is missing or unusable; no usable endpoint means the
+    /// with any missing or unusable compared rate; no usable endpoint means the
     /// catalog's own price. The mapped draft then passes the full output check
     /// against the model it was actually priced from.
     #[test]
@@ -1510,8 +1561,9 @@ proptest! {
                     prop_assert!(out.get("endpoint").is_none(), "{}", out["endpoint"]);
                 } else {
                     prop_assert_eq!(&out["endpoint"], &json!({"selection": "catalog"}));
+                    prop_assert_eq!(&out["needs_review"], &json!(true));
                 }
-                check_output(&out, Some(&model), false)?;
+                check_output(&out, Some(&model), workload != WorkloadKind::Images)?;
             }
         }
     }
@@ -1602,18 +1654,8 @@ fn a_catalog_entry_without_prices_maps_to_unknown_not_free() {
     }
 }
 
-/// FINDING: a prompt-size tier priced for a meter whose base rate is unusable
-/// leaves the meter with only the tier line. `draft_price_lines` adds the
-/// explicit `unknown` line only when the meter has no line at all, so the draft
-/// states nothing for prompts at or below the threshold (it validates and
-/// displays as "Free (prompt > 1 tokens)"). Downstream this is fail-closed
-/// (`bounds.rs` treats a group with no base line as unknown, `tier()` is
-/// `Unpriced` for small prompts) and the mapped output is flagged
-/// `needs_review`, so nothing is charged as free; but the draft is less honest
-/// than its comment says ("an explicit unknown line for each meter whose price
-/// the catalog does not give").
+/// An unusable base stays explicit unknown, even when a tier is priced.
 #[test]
-#[ignore = "#635: a tier-only meter gets no explicit unknown base line in the draft"]
 fn a_tier_without_a_base_price_is_stated_unknown() {
     let model = json!({"id": "v/m", "pricing": {
         "input_cache_write": "1e400",
@@ -1640,9 +1682,8 @@ fn a_tier_without_a_base_price_is_stated_unknown() {
 #[test]
 fn a_malformed_top_provider_is_not_a_panic() {
     for tp in [json!("x"), json!(5), json!([]), json!(true)] {
-        let model =
-            json!({"id": "v/m", "pricing": {"prompt": "1", "completion": "2"}, "top_provider": tp});
-        let endpoints = json!({"endpoints": [{"pricing": {"prompt": "1", "completion": "2"}, "max_completion_tokens": 100}]});
+        let model = json!({"id": "v/m", "pricing": {"prompt": "1", "completion": "2", "request": "0"}, "top_provider": tp});
+        let endpoints = json!({"endpoints": [{"pricing": {"prompt": "1", "completion": "2", "request": "0"}, "max_completion_tokens": 100}]});
         let out = map_with_endpoints(
             &model,
             WorkloadKind::Generation,
@@ -1664,9 +1705,7 @@ proptest! {
     /// The strict form of #635 over any catalog entry and workload, not only
     /// the single example: an unpriced base line is stated `unknown` in the
     /// draft, even when a prompt-size tier of the same meter is priced.
-    /// Un-ignore with the fix.
     #[test]
-    #[ignore = "#635: a tier-only meter gets no explicit unknown base line in the draft"]
     fn an_unpriced_base_is_stated_unknown_for_any_catalog_entry(model in any_model(), workload in workload()) {
         let out = map(&model, workload, None);
         let draft = out["draft"]["price_lines"].as_array().unwrap();

@@ -1,13 +1,6 @@
-//! #37 PR2 coordinator review (blocking): `resolve_usage`'s caller
-//! authenticates a request's credential (browser session or admin token) in
-//! its own transaction, which commits before `resolve_usage` ever opens its
-//! own. An admin token revoked, or expired, between those two transactions
-//! must still refuse the write here -- the *second* transaction -- not
-//! merely at the first (already-committed) authentication. These tests
-//! exercise the real `governance::resolve_usage` path end to end (not just
-//! the `management::resources` helper it now shares), per the coordinator's
-//! explicit instruction not to rely solely on that helper's own test
-//! coverage to stand in for this one.
+//! The inference reconciliation write checks the credential again in its own
+//! transaction. These tests use `resolve_usage` to prove that a token revoked
+//! or expired after the initial authentication transaction cannot settle usage.
 use super::*;
 use crate::{
     admin_tokens,
@@ -55,7 +48,7 @@ async fn reconciled_count(pool: &sqlx::PgPool, execution: Uuid) -> i64 {
 /// needed to reproduce this: the revoke is fully committed before
 /// `resolve_usage` is even called, exactly reproducing "revoked between
 /// tx1's commit and tx2" with no timing dependency at all.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn revoked_token_between_authentication_and_the_write_transaction_is_refused(
     pool: sqlx::PgPool,
 ) {
@@ -122,7 +115,7 @@ async fn revoked_token_between_authentication_and_the_write_transaction_is_refus
 /// lookup_rejects_expired_revoked_and_owner_not_admin` already uses, not a
 /// bypass of the immutability/finality/no-delete triggers this fix
 /// actually depends on.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn expired_token_between_authentication_and_the_write_transaction_is_refused(
     pool: sqlx::PgPool,
 ) {
@@ -181,7 +174,7 @@ async fn expired_token_between_authentication_and_the_write_transaction_is_refus
 /// `resolve_usage`'s successful audit row carries the authenticating
 /// token's id; the same call with a plain browser actor (`From<Uuid>`)
 /// carries none, exactly as before this fix.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn successful_reconciliation_audit_carries_the_token_id_browser_audit_stays_null(
     pool: sqlx::PgPool,
 ) {
@@ -255,7 +248,7 @@ async fn successful_reconciliation_audit_carries_the_token_id_browser_audit_stay
 /// now holds `FOR SHARE` across its own write -- blocks a concurrent
 /// explicit revoke until the holder commits, deterministically (polling
 /// `pg_blocking_pids`, never a sleep used to decide ordering).
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn token_row_live_for_share_blocks_a_concurrent_explicit_revoke_until_commit(
     pool: sqlx::PgPool,
 ) {

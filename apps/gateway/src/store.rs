@@ -36,6 +36,8 @@ pub struct Store {
     /// Advisory report scan frontier; reset on restart/failover. No authority
     /// or claim ownership depends on this per-process keyset cursor.
     pub(crate) report_dispatch: std::sync::Arc<std::sync::Mutex<Option<ReportScanFrontier>>>,
+    pub(crate) report_calendar_scan:
+        std::sync::Arc<std::sync::Mutex<Option<crate::scheduled_reports::CalendarScanKey>>>,
     /// Admission protocol (`GATEWAY_ADMISSION_MODE`, see
     /// `governance::locks`): scoped locks (default) or the former
     /// installation row lock.
@@ -378,6 +380,7 @@ impl Store {
             lock_gates: std::sync::Arc::new(gates),
             alert_dispatch: Default::default(),
             report_dispatch: Default::default(),
+            report_calendar_scan: Default::default(),
             admission_mode: mode,
             reporting: None,
             reporting_max_lag: std::time::Duration::from_secs(30),
@@ -780,7 +783,7 @@ mod tests {
         sqlx::query("INSERT INTO deployment_prices(id,deployment_id,input_token_limit,output_token_limit,pricing_version,price_lines,max_units) VALUES($1,$2,100,10,3,'[{\"meter\":\"requests\",\"not_applicable\":true}]','{}')").bind(uuid::Uuid::new_v4()).bind(deployment).execute(&pool).await.unwrap();
     }
 
-    #[sqlx::test(migrations = "./enterprise_migrations")]
+    #[dbtest::test]
     async fn unrelated_public_relations_are_rejected_without_modification(pool: PgPool) {
         let store = Store::new(pool.clone());
         assert!(store.is_ready().await);
@@ -832,7 +835,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrations = "./enterprise_migrations")]
+    #[dbtest::test]
     async fn capabilities_cache_shapes_and_provider_auth_modes_are_database_invariants(
         pool: PgPool,
     ) {

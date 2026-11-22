@@ -24,7 +24,7 @@ pub(super) async fn configured_call(
     (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn scheduled_reports_review_pause_survives_recipient_authority_loss(pool: PgPool) {
     let f = fixture(&pool).await;
     let mock = crate::identity::tests::MockProvider::start(None).await;
@@ -100,7 +100,7 @@ async fn scheduled_reports_review_pause_survives_recipient_authority_loss(pool: 
     }
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn scheduled_reports_review_revision_tracks_configuration_not_noops(pool: PgPool) {
     let f = fixture(&pool).await;
     let recipient = user(&pool, "revision-recipient", "user").await;
@@ -136,7 +136,7 @@ async fn scheduled_reports_review_revision_tracks_configuration_not_noops(pool: 
     }
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn scheduled_reports_review_pagination_order_bounds_and_scope_safety(pool: PgPool) {
     let f = fixture(&pool).await;
     let foreign_personal =
@@ -312,4 +312,94 @@ fn page_ids(value: &Value) -> Vec<Uuid> {
         .iter()
         .map(|v| v["id"].as_str().unwrap().parse().unwrap())
         .collect()
+}
+
+#[dbtest::test]
+async fn scheduled_reports_management_serializes_before_schedule_lock(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let id = create(&f, &f.admin, PLATFORM, &[f.admin.user_id]).await;
+    let path = format!("{PLATFORM}/{id}");
+    let mut blocker = crate::db::begin(&pool).await.unwrap();
+    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    sqlx::query("SELECT 1 FROM report_schedules WHERE id=$1 FOR UPDATE")
+        .bind(id)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let patch_path = path.clone();
+    let store = f.s.clone();
+    let admin = f.admin.clone();
+    let patch = tokio::spawn(async move {
+        call(
+            &store,
+            &admin,
+            "PATCH",
+            &patch_path,
+            json!({"delivery_time":"09:30"}),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)) AND query LIKE 'UPDATE report_schedules SET cadence=%')")
+                .bind(blocker_pid).fetch_one(&pool).await.unwrap();
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.expect("management never attempted the schedule write");
+
+    let mut upgrade = crate::db::begin_with_setup(&pool, "SET LOCAL lock_timeout='100ms'")
+        .await
+        .unwrap();
+    let pin = "UPDATE work_leases SET report_tzdb=$1,expires_at='-infinity' WHERE name='report_scheduler'";
+    let error = sqlx::query(pin)
+        .bind("2026g")
+        .execute(&mut *upgrade)
+        .await
+        .expect_err("management must lock the pin before taking schedule row locks");
+    assert_eq!(
+        error.as_database_error().unwrap().code().as_deref(),
+        Some("55P03")
+    );
+    upgrade.rollback().await.unwrap();
+    blocker.commit().await.unwrap();
+    let (status, saved) = patch.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["configuration_revision"], "2");
+
+    sqlx::query(pin).bind("2026g").execute(&pool).await.unwrap();
+    assert_eq!(
+        call(
+            &f.s,
+            &f.admin,
+            "PATCH",
+            &path,
+            json!({"delivery_time":"10:00"})
+        )
+        .await
+        .0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        call(&f.s, &f.admin, "POST", PLATFORM, input(&[f.admin.user_id]))
+            .await
+            .0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        call(&f.s, &f.admin, "GET", &path, Value::Null).await.1,
+        saved
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM report_schedules")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
 }

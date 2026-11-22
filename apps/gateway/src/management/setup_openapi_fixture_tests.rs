@@ -964,8 +964,35 @@ fn limits(
 ) -> Value {
     json!({"requests_per_minute":rpm,"tokens_per_minute":tpm,"concurrent_requests":concurrent,"concurrent_jobs":jobs,"storage_bytes":storage,"key_issuances_per_holder":holder,"key_issuances_per_workspace":workspace,"budgets":budgets})
 }
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn management_openapi_slice3_fixtures(pool: PgPool) {
+    slice3_fixtures(pool, 0).await.finish(SLICE3_AREAS);
+}
+#[dbtest::test]
+async fn management_openapi_slice3_fixtures_shard_2(pool: PgPool) {
+    slice3_fixtures(pool, 1).await.finish(SLICE3_AREAS);
+}
+#[dbtest::test]
+async fn management_openapi_slice3_fixtures_shard_3(pool: PgPool) {
+    slice3_fixtures(pool, 2).await.finish(SLICE3_AREAS);
+}
+#[dbtest::test]
+async fn management_openapi_slice3_fixtures_shard_4(pool: PgPool) {
+    slice3_fixtures(pool, 3).await.finish(SLICE3_AREAS);
+}
+#[dbtest::test]
+async fn management_openapi_slice3_fixtures_shard_5(pool: PgPool) {
+    slice3_fixtures(pool, 4).await.finish(SLICE3_AREAS);
+}
+#[dbtest::test]
+async fn management_openapi_slice3_fixtures_shard_6(pool: PgPool) {
+    slice3_fixtures(pool, 5).await.finish(SLICE3_AREAS);
+}
+/// The slice 3 journey as shard `shard` of [`SLICE3_SHARDS`] parallel runs (see
+/// `PositiveFixtures::sharded`): the completed observations are returned for the
+/// coverage gate, which the calling test applies.
+const SLICE3_SHARDS: usize = 6;
+async fn slice3_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
     let mut f = fixture(&pool).await;
     f.s = f.s.with_secret_allowlists(
         crate::providers::secrets::EnvSecrets::from_lookup(["CONTRACT_REFERENCE".into()], |_| None),
@@ -989,7 +1016,7 @@ async fn management_openapi_slice3_fixtures(pool: PgPool) {
     // ceilings and prices, and each non-chat workload's units are all real
     // catalog shapes.
     let catalog_models = json!({"data":[
-        {"id":"contract/model","context_length":8192,"top_provider":{"max_completion_tokens":1024},"pricing":{"prompt":"0.000000123","completion":"0.000000456"}},
+        {"id":"contract/model","context_length":8192,"top_provider":{"max_completion_tokens":1024},"pricing":{"prompt":"0.000000123","completion":"0.000000456","request":"0"}},
         {"id":"contract/catalog-only","context_length":8192,"top_provider":{"max_completion_tokens":1024},"pricing":{"prompt":"0.000000123","completion":"0.000000456","input_cache_read":"0.00000001","input_cache_write":"0.000000125","input_cache_write_1h":"0.0000002","overrides":[{"min_prompt_tokens":4000,"prompt":"0.0000005","completion":"0.0000025","input_cache_read":"0.00000005","input_cache_write":"0.000000625","input_cache_write_1h":"0.000001"}]}},
         {"id":"contract/bare","pricing":{}},
         {"id":"contract/embed","context_length":8192,"pricing":{"prompt":"0.00000002"}},
@@ -1000,7 +1027,7 @@ async fn management_openapi_slice3_fixtures(pool: PgPool) {
         {"id":"contract/tts-minute","pricing":{"prompt":"0.000015","completion":"0.0001"}},
         {"id":"contract/tts-hour","pricing":{"prompt":"0.000015","completion":"0.0000000025"}}
     ]});
-    let model_endpoints = json!({"data":{"id":"contract/model","endpoints":[{"provider_name":"Contract Cheap","status":0,"pricing":{"prompt":"0.000000123","completion":"0.000000456"}},{"provider_name":"Contract Dear","status":0,"pricing":{"prompt":"0.000000246","completion":"0.000000912"}}]}});
+    let model_endpoints = json!({"data":{"id":"contract/model","endpoints":[{"provider_name":"Contract Cheap","status":0,"pricing":{"prompt":"0.000000123","completion":"0.000000456","request":"0"}},{"provider_name":"Contract Dear","status":0,"pricing":{"prompt":"0.000000246","completion":"0.000000912","request":"0"}}]}});
     let image_endpoints = json!({"data":{"endpoints":[{"pricing":[{"billable":"output_image","unit":"image","cost_usd":0.041,"variant":"768"},{"billable":"output_image","unit":"image","cost_usd":0.06,"variant":"1024"}]}]}});
     // An image model priced per size with more sizes than a price may carry (64
     // valued lines): the draft's own lines fail PriceLines validation, so the
@@ -1056,7 +1083,7 @@ async fn management_openapi_slice3_fixtures(pool: PgPool) {
             .unwrap(),
         base,
         actor: &admin,
-        observed: Default::default(),
+        observed: PositiveFixtures::sharded(shard, SLICE3_SHARDS),
     };
     let ws_policy = format!("/api/v1/workspaces/{}/policy", f.team);
     // Policy layers, state A: nothing configured anywhere (every limit absent).
@@ -1072,6 +1099,19 @@ async fn management_openapi_slice3_fixtures(pool: PgPool) {
             Some(json!({"name":"Contract catalog","description":"Live defaults"})),
         )
         .await);
+    // A catalog without a description, listed and removed again: the listing's
+    // null branch is observed by the journey itself, not only by the shard that
+    // happens to send the vector that creates one.
+    let bare = id(&j
+        .request(
+            "POST",
+            "/api/v1/platform/catalogs",
+            Some(json!({"name":"Contract bare catalog","description":null})),
+        )
+        .await);
+    j.request("GET", "/api/v1/platform/catalogs", None).await;
+    j.request("DELETE", &format!("/api/v1/platform/catalogs/{bare}"), None)
+        .await;
     let provider = id(&j.request("POST", "/api/v1/platform/providers", Some(json!({"name":"Contract reference","provider":"openrouter","credential_ref":"env:CONTRACT_REFERENCE","enabled":true}))).await);
     // A connection nothing uses, so its deletion is observed without touching the route fixtures.
     let disposable = id(&j.request("POST", "/api/v1/platform/providers", Some(json!({"name":"Contract disposable","provider":"openrouter","credential_ref":"env:CONTRACT_REFERENCE","enabled":false}))).await);
@@ -4508,7 +4548,7 @@ async fn management_openapi_slice3_fixtures(pool: PgPool) {
         j.observed
             .record_failure(&anyhow::anyhow!("pinned probe verdict moved: {moved}"));
     }
-    j.observed.finish(SLICE3_AREAS);
+    j.observed
 }
 
 #[test]

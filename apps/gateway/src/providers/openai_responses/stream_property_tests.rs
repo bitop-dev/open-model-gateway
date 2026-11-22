@@ -17,9 +17,7 @@
 //!   sees at most one terminal and nothing after it. Frames running out before
 //!   a terminal is `framing::frames`' final `Err(TRANSPORT)` (a transport
 //!   failure, `UpstreamUnavailable`), never a success; the parser fabricates nothing for a truncated stream.
-//!   `State` itself has no "terminated" flag: a second terminal pushed after
-//!   the first would re-emit (pinned by an ignored finding below; unreachable
-//!   through `execute`).
+//!   After emitting `Done`, `State` refuses every frame with `InvalidUpstream`.
 //! * Reconciliation. `Done` is emitted only when the terminal snapshot equals
 //!   what was streamed: the text deltas concatenate to the snapshot's message
 //!   text, and the streamed tool calls (ids, names, argument fragments) equal
@@ -853,30 +851,105 @@ fn upstream_failure_events_are_classified_by_their_code() {
     }
 }
 
-/// FINDING: `State` has no terminated flag (the Anthropic parser has `done`
-/// and refuses every later frame). A second `response.completed` pushed after
-/// the first re-emits Finish, Usage and Done. `execute` returns at the first
-/// `Done` and never pushes again, so no stream reaches this today; the guard
-/// belongs in the parser, as in `anthropic::State`.
 #[test]
-#[ignore = "#636: openai_responses::State re-emits Finish/Usage/Done for a second terminal (unreachable via execute)"]
 fn a_terminal_pushed_after_the_terminal_is_refused() {
-    let built = build(&Spec {
-        items: vec![],
-        end: End::Completed,
-        usage: None,
-        in_progress: false,
-    });
-    let mut state = State::default();
-    for e in &built.events {
-        state.push(e.clone()).unwrap();
+    for end in [End::Completed, End::Length, End::Filter] {
+        let built = build(&Spec {
+            items: vec![],
+            end,
+            usage: None,
+            in_progress: false,
+        });
+        let mut state = State::default();
+        for event in &built.events {
+            state.push(event.clone()).unwrap();
+        }
+        for late in [
+            built.events.last().unwrap().clone(),
+            json!({"type":"error","code":"rate_limit_exceeded"}),
+            json!({"type":"response.in_progress"}),
+            json!({"type":"response.output_text.delta","output_index":0,"item_id":"msg_0","content_index":0,"delta":"late"}),
+            json!({"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded"}}}),
+        ] {
+            assert!(matches!(
+                state.push(late),
+                Err(InferenceError::InvalidUpstream)
+            ));
+        }
     }
-    let again = state.push(built.events.last().unwrap().clone());
-    assert!(
-        again.as_ref().map_or(true, |events| events.is_empty()),
-        "re-emitted {} events",
-        again.map_or(0, |e| e.len())
-    );
+}
+
+#[test]
+fn a_response_cannot_start_after_a_provider_failure() {
+    for event in [
+        json!({"type":"error","code":"rate_limit_exceeded"}),
+        json!({"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded"}}}),
+    ] {
+        let mut state = State::default();
+        assert!(state.push(event).is_err());
+        assert!(matches!(
+            state.push(json!({"type":"response.created"})),
+            Err(InferenceError::InvalidUpstream)
+        ));
+    }
+}
+
+#[test]
+fn response_terminal_before_start_closes_the_parser() {
+    for (event, status) in [
+        ("response.completed", "completed"),
+        ("response.incomplete", "incomplete"),
+    ] {
+        let mut state = State::default();
+        assert_eq!(
+            state
+                .push(json!({"type":event,"response":{"status":status,"output":[]}}))
+                .err(),
+            Some(InferenceError::InvalidUpstream)
+        );
+        assert_eq!(
+            state.push(json!({"type":"response.created"})).err(),
+            Some(InferenceError::InvalidUpstream)
+        );
+    }
+}
+
+#[test]
+fn a_started_response_cannot_complete_after_a_rejected_terminal() {
+    let response = json!({"status":"completed","output":[]});
+    let completed = json!({"type":"response.completed","response":response});
+    for (terminal, expected) in [
+        (
+            json!({"type":"response.failed","response":{"status":"failed","error":{"code":"rate_limit_exceeded"}}}),
+            InferenceError::Busy,
+        ),
+        (
+            json!({"type":"error","code":"rate_limit_exceeded"}),
+            InferenceError::Busy,
+        ),
+        (
+            json!({"type":"response.completed","response":{"status":"incomplete","output":[]}}),
+            InferenceError::InvalidUpstream,
+        ),
+        (
+            json!({"type":"response.incomplete","response":response}),
+            InferenceError::InvalidUpstream,
+        ),
+        (
+            // The snapshot decodes, but its item was never streamed.
+            json!({"type":"response.completed","response":super::super::stream_class_tests::responses_complete()}),
+            InferenceError::InvalidUpstream,
+        ),
+    ] {
+        let mut state = State::default();
+        state.push(json!({"type":"response.created"})).unwrap();
+        assert_eq!(state.push(terminal.clone()).err(), Some(expected));
+        assert_eq!(
+            state.push(completed.clone()).err(),
+            Some(InferenceError::InvalidUpstream),
+            "{terminal}"
+        );
+    }
 }
 
 // ---- deterministic sweeps ----------------------------------------------------

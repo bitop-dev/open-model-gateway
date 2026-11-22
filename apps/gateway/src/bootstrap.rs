@@ -1,5 +1,5 @@
 use crate::{auth::NewApiKey, config::Environment, lifecycle, store::Store};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result};
 use uuid::Uuid;
 
 /// Printed once by the explicit development CLI; never sent to structured logs.
@@ -45,11 +45,82 @@ pub async fn provision_user(store: &Store, email: &str, platform_admin: bool) ->
     Ok(id)
 }
 
-pub async fn seed(store: &Store, environment: Environment) -> Result<Option<DevelopmentKeys>> {
-    if environment != Environment::Development {
-        bail!("bootstrap-dev requires GATEWAY_ENV=development");
+/// Development fixtures require an explicitly local database, before any connection.
+pub(crate) fn dev_connect_options(
+    environment: Environment,
+    database_url: &str,
+) -> Result<sqlx::postgres::PgConnectOptions> {
+    use sqlx::ConnectOptions;
+
+    let url = reqwest::Url::parse(database_url)
+        .map_err(|_| anyhow::anyhow!("invalid development database configuration"))?;
+    let mut options = sqlx::postgres::PgConnectOptions::from_url(&url)
+        .map_err(|_| anyhow::anyhow!("invalid development database configuration"))?;
+    ensure_dev_config(environment, &options)?;
+    let explicit_database = url
+        .query_pairs()
+        .filter(|(key, _)| key == "dbname")
+        .last()
+        .map_or_else(
+            || !url.path().trim_start_matches('/').is_empty(),
+            |(_, name)| !name.is_empty(),
+        );
+    anyhow::ensure!(
+        explicit_database,
+        "bootstrap-dev requires a database name in DATABASE_URL"
+    );
+    if options.get_host() == "[::1]" {
+        options = options.host("::1");
     }
+    Ok(options)
+}
+
+fn ensure_dev_config(
+    environment: Environment,
+    options: &sqlx::postgres::PgConnectOptions,
+) -> Result<()> {
+    anyhow::ensure!(
+        environment == Environment::Development,
+        "bootstrap-dev requires GATEWAY_ENV=development"
+    );
+    anyhow::ensure!(
+        options.get_socket().is_none()
+            && matches!(options.get_host(), "127.0.0.1" | "::1" | "[::1]"),
+        "bootstrap-dev requires a loopback database (127.0.0.1 or ::1)"
+    );
+    Ok(())
+}
+
+pub(crate) async fn ensure_empty(tx: &mut sqlx::PgConnection) -> Result<()> {
+    let occupied: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users) OR EXISTS(SELECT 1 FROM workspaces) OR EXISTS(SELECT 1 FROM inference_executions)").fetch_one(&mut *tx).await?;
+    anyhow::ensure!(
+        !occupied,
+        "Local bootstrap requires an empty dedicated installation; existing identities/history are never replaced"
+    );
+    Ok(())
+}
+
+async fn ensure_selected_database(conn: &mut sqlx::PgConnection, selected: &str) -> Result<()> {
+    let connected: String =
+        sqlx::query_scalar("SELECT pg_catalog.current_database()::pg_catalog.text")
+            .fetch_one(conn)
+            .await?;
+    anyhow::ensure!(
+        connected == selected,
+        "bootstrap-dev connected to a database other than the one selected in DATABASE_URL"
+    );
+    Ok(())
+}
+
+pub async fn seed(store: &Store, environment: Environment) -> Result<Option<DevelopmentKeys>> {
+    let options = store.pool.connect_options();
+    ensure_dev_config(environment, &options)?;
+    let selected = options
+        .get_database()
+        .filter(|name| !name.is_empty())
+        .context("bootstrap-dev requires a database name in DATABASE_URL")?;
     let mut tx = crate::db::begin(&store.pool).await?;
+    ensure_selected_database(&mut tx, selected).await?;
     // Seeds the global catalog (providers, models, deployments): the
     // exclusive catalog lock, then the installation row.
     sqlx::query("SELECT pg_advisory_xact_lock(72419502)")
@@ -59,7 +130,7 @@ pub async fn seed(store: &Store, environment: Environment) -> Result<Option<Deve
         .execute(&mut *tx)
         .await?;
     let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM users WHERE email='developer@local.invalid')",
+        "SELECT EXISTS(SELECT 1 FROM audit_events a JOIN users u ON u.id=a.actor_user_id WHERE a.action='installation.bootstrap_dev' AND u.email='developer@local.invalid')",
     )
     .fetch_one(&mut *tx)
     .await?;
@@ -67,6 +138,7 @@ pub async fn seed(store: &Store, environment: Environment) -> Result<Option<Deve
         tx.commit().await?;
         return Ok(None);
     }
+    ensure_empty(&mut tx).await?;
     let installation_id: Uuid = sqlx::query_scalar("SELECT id FROM installation WHERE singleton")
         .fetch_one(&mut *tx)
         .await?;
@@ -134,10 +206,63 @@ pub async fn seed(store: &Store, environment: Environment) -> Result<Option<Deve
     }))
 }
 
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[tokio::test]
+    async fn development_bootstrap_normalizes_ipv6_for_tcp_connection() {
+        let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let options = dev_connect_options(
+            Environment::Development,
+            &format!("postgres://gateway@[::1]:{port}/db"),
+        )
+        .unwrap();
+        let socket = tokio::net::TcpStream::connect((options.get_host(), options.get_port()))
+            .await
+            .unwrap();
+        assert!(socket.peer_addr().unwrap().is_ipv6());
+    }
+
+    #[test]
+    fn development_bootstrap_accepts_only_explicit_loopback_options() {
+        for url in ["postgres://user@127.0.0.1/db", "postgres://user@[::1]/db"] {
+            let options = sqlx::postgres::PgConnectOptions::from_str(url).unwrap();
+            assert!(ensure_dev_config(Environment::Development, &options).is_ok());
+            assert!(ensure_dev_config(Environment::Production, &options).is_err());
+        }
+        for url in [
+            "postgres://user@example.invalid/db",
+            "postgres://user@localhost/db",
+            "postgres://user@127.0.0.1/db?host=/unused-socket-directory",
+            "postgres://user@127.0.0.1/db?host=example.invalid",
+            "postgres://user@127.0.0.1/db?hostaddr=192.0.2.1",
+        ] {
+            let options = sqlx::postgres::PgConnectOptions::from_str(url).unwrap();
+            assert!(ensure_dev_config(Environment::Development, &options).is_err());
+        }
+    }
+}
+
 #[cfg(all(test, feature = "integration-tests"))]
 mod tests {
     use super::*;
-    #[sqlx::test(migrations = "./enterprise_migrations")]
+
+    #[dbtest::test]
+    async fn bootstrap_refuses_a_different_connected_database(pool: sqlx::PgPool) {
+        let options = pool.connect_options();
+        let selected = options.get_database().unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(ensure_selected_database(&mut conn, selected).await.is_ok());
+        let error = ensure_selected_database(&mut conn, &format!("{selected}_other"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("other than the one selected"));
+    }
+
+    #[dbtest::test]
     async fn operator_grants_are_explicit_audited_idempotent_and_do_not_create_personal_workspaces(
         pool: sqlx::PgPool,
     ) {
@@ -179,7 +304,22 @@ mod tests {
                 .is_err()
         );
     }
-    #[sqlx::test(migrations = "./enterprise_migrations")]
+    #[dbtest::test]
+    async fn dev_bootstrap_never_adopts_existing_developer_email(pool: sqlx::PgPool) {
+        let store = Store::new(pool.clone());
+        let email = "developer@local.invalid";
+        sqlx::query("INSERT INTO users(id,email) VALUES($1,$2)")
+            .bind(Uuid::new_v4())
+            .bind(email)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let error = seed(&store, Environment::Development).await.err().unwrap();
+        assert!(error.to_string().contains("requires an empty"));
+        let counts: (i64,i64,i64) = sqlx::query_as("SELECT (SELECT count(*) FROM api_keys),(SELECT count(*) FROM platform_role_grants),(SELECT count(*) FROM audit_events)").fetch_one(&pool).await.unwrap();
+        assert_eq!(counts, (0, 0, 0));
+    }
+    #[dbtest::test]
     async fn dev_bootstrap_is_environment_gated_and_never_rotates_existing_credentials(
         pool: sqlx::PgPool,
     ) {

@@ -4,28 +4,30 @@ import { act, cleanup, render, screen, waitFor, within } from "@testing-library/
 import { createBrowserHistory, createRootRoute, createRoute, createRouter, Link, Outlet, RouterProvider } from "@tanstack/react-router";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { ProviderCostImportFlow, ProviderCostManager, ProviderCostWorkflow } from "../pages/usage/provider-cost-manager";
 import { ProviderReconciliations } from "../pages/usage/provider-reconciliations";
+import { Tabs, TabsList, Tab } from "./ui/tabs/tabs";
 import { admin, auditor, session, testClient } from "../lib/test-fixtures";
 
 const root = "/api/v1/platform", imports = `${root}/provider-cost-imports`, mappings = `${root}/provider-cost-mappings`;
 const report = { id: "import", account_id: "account", provider: "anthropic", period_start: "2026-10-01T00:00:00Z", period_end: "2026-10-02T00:00:00Z", supersedes: "previous", line_count: 2 };
 const binding = { provider_workspace_id: "already-mapped", connection_id: "connection", deployment_id: null, workspace_id: null, effective_start: report.period_start, effective_end: report.period_end, exclusive: false, non_omg_traffic: true, attested: true, evidence_reference: "old-proof", model_mappings: [] };
-function serve(options: { refusal?: number; conflict?: number; modelMappings?: { provider_model: string; upstream_model: string }[] } = {}) {
+function serve(options: { reports?: Promise<Response>; latestAfterSave?: string; refusal?: number; conflict?: number; modelMappings?: { provider_model: string; upstream_model: string }[] } = {}) {
   let latest = "mapping-old";
   const fetch = vi.fn().mockImplementation((url: string, init: RequestInit) => {
     if (init.method === "POST") {
       if (url === imports && options.refusal) return Promise.resolve(Response.json({ error: { message: '<script>parse refusal</script> Exact refusal.' } }, { status: options.refusal }));
       if (url === mappings && options.conflict) { latest = "mapping-concurrent"; return Promise.resolve(Response.json({ error: { message: "Overlapping coverage or invalid supersession; select the current exact revision" } }, { status: options.conflict })); }
-      if (url === mappings) latest = "mapping-new";
+      if (url === mappings) latest = options.latestAfterSave ?? "mapping-new";
       return Promise.resolve(Response.json({ id: url === imports ? "import" : url === mappings ? "mapping-new" : "frozen-new" }));
     }
     let data: unknown = { data: [] };
-    if (url.startsWith(`${imports}?`)) data = { data: [report] };
+    if (url.startsWith(`${imports}?`)) return options.reports ?? Promise.resolve(Response.json({ data: [report] }));
     if (url === `${imports}/import/lines?limit=200&offset=0`) data = { data: [
       { amount_microusd: "-9007199254740993", dimensions: { workspace_id: null, model: "claude" } },
       { amount_microusd: "-2", dimensions: { workspace_id: "already-mapped" } },
     ] };
-    if (url.startsWith(`${mappings}?`)) data = { data: [{ id: latest, account_id: "account", supersedes: latest === "mapping-concurrent" ? "mapping-old" : null }] };
+    if (url.startsWith(`${mappings}?`)) data = { data: [{ id: latest, account_id: "account", supersedes: latest === "mapping-later" ? "mapping-new" : latest === "mapping-concurrent" ? "mapping-old" : null }] };
     if (url === `${mappings}/${latest}`) data = { id: latest, account_id: "account", evidence_reference: "old-revision-proof", bindings: [{ ...binding, model_mappings: options.modelMappings ?? [], binding_number: 1 }] };
     if (url.startsWith(`${root}/providers?`)) data = { data: [{ id: "connection", name: "Anthropic connection", provider: "anthropic" }, { id: "other", name: "Other provider", provider: "openai" }] };
     return Promise.resolve(Response.json(data));
@@ -38,6 +40,36 @@ function renderView(viewer = admin, client = testClient()) {
   return userEvent.setup({ applyAccept: false });
 }
 async function open(client = testClient()) { const user = renderView(admin, client); await user.click(screen.getByRole("button", { name: "Upload & manage" })); return user; }
+async function selectExistingImport(user: ReturnType<typeof userEvent.setup>) {
+  const select = screen.getByLabelText<HTMLSelectElement>("Existing import");
+  await waitFor(() => {
+    expect(select.disabled).toBe(false);
+    expect(Array.from(select.options, option => option.value)).toContain(report.id);
+  });
+  await user.selectOptions(select, report.id);
+}
+async function openRetainedMapping(client = testClient()) {
+  document.cookie = "omg_csrf=test-csrf; path=/";
+  render(<QueryClientProvider client={client}><ProviderCostManager session={admin} onOpen={vi.fn()} onClose={vi.fn()} /></QueryClientProvider>);
+  const user = userEvent.setup();
+  await selectExistingImport(user);
+  await user.click(screen.getByRole("tab", { name: "Mappings" }));
+  return user;
+}
+function renderSelectedMapping() {
+  document.cookie = "omg_csrf=test-csrf; path=/";
+  render(
+    <QueryClientProvider client={testClient()}>
+      <ProviderCostWorkflow>
+        <Tabs defaultValue="mappings">
+          <TabsList><Tab value="mappings">Mappings</Tab><Tab value="freeze">Freeze snapshot</Tab></TabsList>
+          <ProviderCostImportFlow report={report} onMapping={vi.fn()} onOpen={vi.fn()} />
+        </Tabs>
+      </ProviderCostWorkflow>
+    </QueryClientProvider>,
+  );
+  return userEvent.setup();
+}
 async function upload(user: ReturnType<typeof userEvent.setup>) {
   const file = new File([' {"pages":[], "pages":[]}\r\n'], "report.json", { type: "application/json" });
   await user.upload(screen.getByLabelText("Anthropic report JSON"), file);
@@ -83,27 +115,52 @@ describe("Admin provider-cost writes", () => {
     expect(document.querySelector("script")).toBeNull(); expect(screen.queryByText("Import resolved: import")).toBeNull();
     expect(fetch.mock.calls.filter(([, init]) => init.method === "POST")).toHaveLength(1);
   });
-  it("lists default/unmapped dimensions, preserves existing bindings, attests a revision and freezes explicit IDs", async () => {
-    const fetch = serve(), user = await open(); await upload(user);
-    await user.click(screen.getByRole("tab", { name: "Mappings" }));
+  it("lists default/unmapped dimensions and attests a replacement preserving existing bindings", async () => {
+    // Import selection and save-to-freeze continuity are covered below. Mount
+    // the selected import workflow with its real controller and query reads.
+    const fetch = serve(), user = renderSelectedMapping();
     const table = await screen.findByRole("table", { name: "Provider dimensions" });
-    expect(table.textContent).toContain("Provider default / missing identifier"); expect(table.textContent).toContain("Unmapped"); expect(table.textContent).toContain("Mapped");
-    await user.selectOptions(screen.getByLabelText("Provider workspace dimension"), "0");
-    await user.selectOptions(screen.getByLabelText("Gateway connection"), "connection");
-    expect(screen.queryByRole("option", { name: "Other provider" })).toBeNull();
-    await user.type(screen.getByLabelText("Binding evidence reference"), "finance:attestation");
-    const stage = screen.getByRole("button", { name: "Apply binding to draft" });
+    const panel = within(screen.getByRole("tabpanel", { name: "Mappings" }));
+    for (const [dimension, coverage] of [["Provider default / missing identifier", "Unmapped"], ["already-mapped", "Mapped"]]) {
+      const row = within(table).getByText(dimension, { selector: "th" }).closest("tr")!;
+      expect(within(row).getByText(coverage, { exact: true })).toBeTruthy();
+    }
+    expect((panel.getByLabelText("Provider workspace dimension") as HTMLSelectElement).value).toBe("0");
+    await user.selectOptions(panel.getByLabelText("Gateway connection"), "connection");
+    expect(panel.queryByRole("option", { name: "Other provider" })).toBeNull();
+    await user.click(panel.getByLabelText("Binding evidence reference"));
+    await user.paste("finance:attestation");
+    const stage = panel.getByRole("button", { name: "Apply binding to draft" });
     expect(stage.hasAttribute("disabled")).toBe(true);
-    await user.click(screen.getByRole("checkbox", { name: "I attest this binding and its effective coverage" }));
+    await user.click(panel.getByLabelText("I attest this binding and its effective coverage", { selector: '[role="checkbox"]' }));
     await user.click(stage);
-    await user.type(screen.getByLabelText("Mapping revision evidence reference"), "finance:revision");
-    await user.click(screen.getByRole("checkbox", { name: "I confirm the whole replacement mapping revision" }));
-    await user.click(screen.getByRole("button", { name: "Save mapping revision" }));
+    await user.click(panel.getByLabelText("Mapping revision evidence reference"));
+    await user.paste("finance:revision");
+    await user.click(panel.getByLabelText("I confirm the whole replacement mapping revision", { selector: '[role="checkbox"]' }));
+    await user.click(panel.getByRole("button", { name: "Save mapping revision" }));
     await screen.findByText("Saved mapping revision: mapping-new");
     const body = JSON.parse(fetch.mock.calls.find(([url, init]) => url === mappings && init.method === "POST")![1].body);
     expect(body).toMatchObject({ account_id: "account", supersedes: "mapping-old", evidence_reference: "finance:revision" });
     expect(body.bindings).toHaveLength(2); expect(body.bindings[0]).toEqual(binding);
     expect(body.bindings[1]).toEqual({ ...binding, provider_workspace_id: null, non_omg_traffic: false, evidence_reference: "finance:attestation" });
+  });
+  it("hands a newly saved mapping revision to freeze with exact import and mapping IDs", async () => {
+    let releaseReports!: (response: Response) => void;
+    const reports = new Promise<Response>(resolve => { releaseReports = resolve; });
+    const fetch = serve({ reports, latestAfterSave: "mapping-later" }), user = await open();
+    expect(screen.getByLabelText<HTMLSelectElement>("Existing import").disabled).toBe(true);
+    const selecting = selectExistingImport(user);
+    releaseReports(Response.json({ data: [report] }));
+    await selecting;
+    await user.click(screen.getByRole("tab", { name: "Mappings" }));
+    expect((await screen.findByRole("table", { name: "Whole mapping draft" })).textContent).toContain("already-mapped");
+    await user.type(screen.getByLabelText("Mapping revision evidence reference"), "finance:revision");
+    await user.click(screen.getByRole("checkbox", { name: "I confirm the whole replacement mapping revision" }));
+    await user.click(screen.getByRole("button", { name: "Save mapping revision" }));
+    await screen.findByText("Saved mapping revision: mapping-new");
+    expect(JSON.parse(fetch.mock.calls.find(([url, init]) => url === mappings && init.method === "POST")![1].body)).toEqual({ account_id: "account", supersedes: "mapping-old", evidence_reference: "finance:revision", bindings: [binding] });
+    await user.click(screen.getByRole("button", { name: "Reload latest mapping and discard draft" }));
+    await screen.findByText("Base mapping revision: mapping-later");
     await user.click(screen.getByRole("tab", { name: "Freeze snapshot" }));
     expect(screen.getByText(/Mapping revision: mapping-new/)).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Freeze reconciliation" }));
@@ -112,15 +169,15 @@ describe("Admin provider-cost writes", () => {
     expect(screen.getByRole("button", { name: "Open snapshot frozen-new" })).toBeTruthy();
   });
   it("edits and removes bindings explicitly and retains the saved revision after changing tabs", async () => {
-    const fetch = serve(), user = await open(); await upload(user);
-    await user.click(screen.getByRole("tab", { name: "Mappings" }));
+    const fetch = serve(), user = renderSelectedMapping();
     await user.click(await screen.findByRole("button", { name: "Edit binding 1" }));
     await user.clear(screen.getByLabelText("Binding evidence reference"));
-    await user.type(screen.getByLabelText("Binding evidence reference"), "revised-proof");
-    await user.click(screen.getByRole("checkbox", { name: "I attest this binding and its effective coverage" }));
+    await user.paste("revised-proof");
+    await user.click(screen.getByLabelText("I attest this binding and its effective coverage", { selector: '[role="checkbox"]' }));
     await user.click(screen.getByRole("button", { name: "Apply binding to draft" }));
-    await user.type(screen.getByLabelText("Mapping revision evidence reference"), "revision-proof");
-    await user.click(screen.getByRole("checkbox", { name: "I confirm the whole replacement mapping revision" }));
+    await user.click(screen.getByLabelText("Mapping revision evidence reference"));
+    await user.paste("revision-proof");
+    await user.click(screen.getByLabelText("I confirm the whole replacement mapping revision", { selector: '[role="checkbox"]' }));
     await user.click(screen.getByRole("button", { name: "Save mapping revision" }));
     await screen.findByText("Saved mapping revision: mapping-new");
     const body = JSON.parse(fetch.mock.calls.find(([url, init]) => url === mappings && init.method === "POST")![1].body);
@@ -300,11 +357,12 @@ describe("Admin provider-cost writes", () => {
     expect(client.getQueryCache().findAll().some(q => (q.state.data as { id?: string } | undefined)?.id === "cancelled-result")).toBe(false);
   });
   it("retains unapplied binding fields across tabs and warns before discarding them", async () => {
-    serve(); const user = await open(new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })); await upload(user);
-    await user.click(screen.getByRole("tab", { name: "Mappings" }));
+    serve(); const user = await openRetainedMapping(new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } }));
     await user.selectOptions(await screen.findByLabelText("Gateway connection"), "connection");
-    await user.type(screen.getByLabelText("Binding evidence reference"), "partial-evidence");
-    await user.type(screen.getByLabelText("Deployment ID (optional)"), "partial-deployment");
+    await user.click(screen.getByLabelText("Binding evidence reference"));
+    await user.paste("partial-evidence");
+    await user.click(screen.getByLabelText("Deployment ID (optional)"));
+    await user.paste("partial-deployment");
     await user.click(screen.getByRole("tab", { name: "Freeze snapshot" }));
     expect(document.querySelector('[data-dirty="true"]')).not.toBeNull();
     await user.click(screen.getByRole("tab", { name: "Mappings" }));

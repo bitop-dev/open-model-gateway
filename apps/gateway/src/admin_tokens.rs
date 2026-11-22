@@ -633,9 +633,7 @@ mod tests {
 
     #[test]
     fn allowlist_entries_are_bounded_one_to_thirty_two() {
-        // Distinct networks (adversarial re-review of #37 PR1, issue 4:
-        // duplicates are now rejected on their own, so the cardinality
-        // bound needs `count` genuinely different entries to isolate it).
+        // Distinct networks isolate the cardinality limit from duplicate rejection.
         let n = |count: usize| {
             (0..count)
                 .map(|i| format!("10.0.{i}.0/24"))
@@ -667,12 +665,8 @@ mod tests {
         );
     }
 
-    /// Adversarial re-review of #37 PR1, issue 4: `0.0.0.0/0`/`::/0` would
-    /// stand for "every address", silently defeating the whole point of
-    /// supplying an allowlist (and is indistinguishable from not
-    /// restricting the token at all, which is already spelled by omitting
-    /// the field). Rejected outright, for both address families, alone or
-    /// alongside another entry.
+    /// A zero-length prefix allows every address. Reject it for both address
+    /// families, either alone or alongside a narrower network.
     #[test]
     fn allowlist_rejects_a_zero_length_prefix_in_either_family() {
         for bad in ["0.0.0.0/0", "::/0"] {
@@ -689,9 +683,7 @@ mod tests {
         assert!(canonical_allowlist(&["0.0.0.0".to_string()]).is_some());
     }
 
-    /// Adversarial re-review of #37 PR1, issue 4: a duplicate entry,
-    /// including two differently-represented forms of the same network,
-    /// is rejected rather than silently collapsed.
+    /// Duplicate networks are rejected even when written in different forms.
     #[test]
     fn allowlist_rejects_duplicate_entries_after_canonicalization() {
         assert!(

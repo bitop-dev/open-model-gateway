@@ -117,6 +117,7 @@ impl SecretResolver for Resolver {
 }
 
 struct Gateway {
+    engine: Engine,
     addr: std::net::SocketAddr,
     keys: DevelopmentKeys,
     mock: Mock,
@@ -175,11 +176,12 @@ async fn gateway(pool: PgPool, init: Init, replies: Vec<Reply>, limits: Realtime
         .unwrap()
         .with_realtime_limits(limits)
         .unwrap();
-    let router = http::router_with_engine(store, None, engine);
+    let router = http::router_with_engine(store, None, engine.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     Gateway {
+        engine,
         addr,
         keys,
         mock,
@@ -312,7 +314,7 @@ fn limits() -> RealtimeLimits {
     RealtimeLimits::default()
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn responses_settle_individually_and_the_session_sums_them(pool: PgPool) {
     let u = usage(10, 4, 20, 5, 10, 40);
     let g = gateway(
@@ -434,7 +436,7 @@ async fn responses_settle_individually_and_the_session_sums_them(pool: PgPool) {
 /// actual context: holds stay above each response's cost and far below a
 /// 32k window (which this budget could not admit even once), and the session
 /// settles as known, not unbounded.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn a_growing_session_settles_known_with_context_sized_holds(pool: PgPool) {
     const CONTEXT: u64 = 32_000;
     const TURN: &str = "x";
@@ -535,7 +537,7 @@ async fn a_growing_session_settles_known_with_context_sized_holds(pool: PgPool) 
     );
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn unknown_usage_retains_the_window_hold(pool: PgPool) {
     let g = gateway(pool, Init::Safe, vec![Reply::NoUsage], limits()).await;
     let mut client = g.connect().await;
@@ -559,7 +561,7 @@ async fn unknown_usage_retains_the_window_hold(pool: PgPool) {
     assert_eq!(g.ledger(id).await[1], ("unknown".into(), Some(0)));
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn client_disconnect_closes_upstream_and_keeps_the_hold(pool: PgPool) {
     let g = gateway(pool, Init::Safe, vec![Reply::Hang], limits()).await;
     let mut client = g.connect().await;
@@ -576,14 +578,25 @@ async fn client_disconnect_closes_upstream_and_keeps_the_hold(pool: PgPool) {
     assert_eq!(row["finish_reason"], "cancelled");
     assert_eq!(row["reservation"], "unknown");
     assert_eq!(row["held"], hold(expected_bounds(&g, &[])[0], 1000));
-    let responses = g.responses(row["id"].as_str().unwrap()).await;
+    assert_eq!(row["actual"], Value::Null);
+    assert_eq!(row["input_tokens"], Value::Null);
+    assert_eq!(row["output_tokens"], Value::Null);
+    let id = row["id"].as_str().unwrap();
+    assert_eq!(
+        g.ledger(id).await,
+        [
+            ("hold".into(), Some(ADMISSION)),
+            ("unknown".into(), Some(0))
+        ]
+    );
+    let responses = g.responses(id).await;
     assert_eq!(
         (responses.len(), responses[0]["state"].as_str()),
         (1, Some("unknown"))
     );
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn budget_exhaustion_sends_an_error_event_and_closes(pool: PgPool) {
     let u = usage(10, 4, 20, 5, 10, 40);
     let g = gateway(
@@ -652,7 +665,7 @@ async fn budget_exhaustion_sends_an_error_event_and_closes(pool: PgPool) {
 /// it as authentication would (`authentication_error`, never
 /// `model_not_found`), with an error event and a policy close; nothing more
 /// is forwarded.
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn a_key_revoked_mid_session_closes_with_an_authentication_error(pool: PgPool) {
     let u = usage(10, 4, 20, 5, 10, 40);
     let g = gateway(pool, Init::Safe, vec![Reply::Done(u)], limits()).await;
@@ -707,7 +720,7 @@ async fn a_key_revoked_mid_session_closes_with_an_authentication_error(pool: PgP
     assert_eq!(g.refused(request).await, 401);
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn unsupported_events_are_refused_with_an_error_and_never_forwarded(pool: PgPool) {
     let g = gateway(pool, Init::Safe, vec![], limits()).await;
     for event in [
@@ -745,7 +758,7 @@ async fn unsupported_events_are_refused_with_an_error_and_never_forwarded(pool: 
     );
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn handshake_auth_and_capability_failures_are_http_errors(pool: PgPool) {
     let g = gateway(pool, Init::Safe, vec![], limits()).await;
     // No key, both forms, an invalid key, a header key with x-api-key.
@@ -839,7 +852,7 @@ async fn handshake_auth_and_capability_failures_are_http_errors(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn a_session_is_one_in_flight_request_and_upstream_failures_are_not_clean(pool: PgPool) {
     let g = gateway(pool, Init::Safe, vec![], limits()).await;
     sqlx::query(
@@ -877,7 +890,7 @@ async fn a_session_is_one_in_flight_request_and_upstream_failures_are_not_clean(
     assert_eq!(g.refused(rejected).await, 400);
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn a_rejected_request_keeps_its_window_for_the_next_one(pool: PgPool) {
     let g = gateway(
         pool,
@@ -922,7 +935,7 @@ async fn a_rejected_request_keeps_its_window_for_the_next_one(pool: PgPool) {
     assert_eq!(responses[0]["unbounded"], false);
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn event_rate_and_message_size_caps_close_with_an_error(pool: PgPool) {
     let tight = RealtimeLimits {
         max_events_per_second: 1,
@@ -1095,17 +1108,17 @@ async fn cap_closes_an_in_flight_session(pool: PgPool, trip: Trip) {
     }
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn the_event_rate_cap_cancels_an_in_flight_session_and_keeps_the_hold(pool: PgPool) {
     cap_closes_an_in_flight_session(pool, Trip::Rate).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn an_oversized_frame_cancels_an_in_flight_session_and_keeps_the_hold(pool: PgPool) {
     cap_closes_an_in_flight_session(pool, Trip::Frame).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn an_oversized_fragmented_message_cancels_an_in_flight_session_and_keeps_the_hold(
     pool: PgPool,
 ) {
@@ -1201,22 +1214,22 @@ async fn client_leaves_an_idle_session(pool: PgPool, how: Leave) {
     );
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn an_invalid_utf8_text_frame_fails_an_idle_session(pool: PgPool) {
     client_leaves_an_idle_session(pool, Leave::InvalidUtf8).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn a_stray_continuation_frame_fails_an_idle_session(pool: PgPool) {
     client_leaves_an_idle_session(pool, Leave::StrayContinuation).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn a_dropped_connection_cancels_an_idle_session(pool: PgPool) {
     client_leaves_an_idle_session(pool, Leave::Drop).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn a_clean_close_ends_an_idle_session_as_a_stop(pool: PgPool) {
     let g = gateway(pool, Init::Safe, vec![], limits()).await;
     let mut client = g.connect().await;
@@ -1271,12 +1284,12 @@ async fn client_fault_fails_an_in_flight_session(pool: PgPool, how: Leave) {
     );
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn an_invalid_utf8_text_frame_fails_an_in_flight_session(pool: PgPool) {
     client_fault_fails_an_in_flight_session(pool, Leave::InvalidUtf8).await;
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn a_stray_continuation_frame_fails_an_in_flight_session(pool: PgPool) {
     client_fault_fails_an_in_flight_session(pool, Leave::StrayContinuation).await;
 }
@@ -1404,3 +1417,4 @@ pub(crate) async fn inference_openapi_handshake_fixtures(
     let _ = g.finished().await;
     g.pool.close().await;
 }
+mod settlement_drop;

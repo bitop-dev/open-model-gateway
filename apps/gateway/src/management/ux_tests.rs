@@ -64,7 +64,7 @@ async fn get(f: &Fixture, u: &BrowserPrincipal, path: &str) -> (StatusCode, Valu
     call(&f.s, u, "GET", path, json!({})).await
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn me_summary_and_keys_are_own_scope_only(pool: PgPool) {
     let f = fixture(&pool).await;
     let r = route(&pool, "home-model", "openai").await;
@@ -173,7 +173,7 @@ async fn me_summary_and_keys_are_own_scope_only(pool: PgPool) {
     assert_eq!(admin["totals"]["current"]["known_cost_microusd"], "0");
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn keys_disable_reversibly_revoked_never_and_stats_follow_lineage(pool: PgPool) {
     let f = fixture(&pool).await;
     let r = route(&pool, "stats-model", "openai").await;
@@ -335,7 +335,7 @@ async fn keys_disable_reversibly_revoked_never_and_stats_follow_lineage(pool: Pg
     }
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn request_logs_group_attempts_paginate_and_respect_privacy(pool: PgPool) {
     let f = fixture(&pool).await;
     let r = route(&pool, "log-model", "openrouter").await;
@@ -494,7 +494,7 @@ async fn request_logs_group_attempts_paginate_and_respect_privacy(pool: PgPool) 
     }
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn usage_overview_and_explore_are_exact_scoped_and_bounded(pool: PgPool) {
     let f = fixture(&pool).await;
     let r = route(&pool, "alpha", "openai").await;
@@ -702,14 +702,14 @@ fn reasons(v: &Value, name: &str) -> Vec<String> {
         .collect()
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn access_layers_explain_why_models_are_unavailable(pool: PgPool) {
     let f = fixture(&pool).await;
     let ra = route(&pool, "acc-a", "openai").await;
     let rb = route(&pool, "acc-b", "openai").await;
     let rc = route(&pool, "acc-c", "openai").await;
     route(&pool, "acc-d", "openai").await;
-    route(&pool, "acc-e", "openai").await;
+    model(&pool, "acc-e").await;
     enable(&pool, &ra).await;
     enable(&pool, &rb).await;
     enable(&pool, &rc).await;
@@ -784,6 +784,20 @@ async fn access_layers_explain_why_models_are_unavailable(pool: PgPool) {
     assert!(reasons(&v, "acc-a").is_empty());
     assert!(reasons(&v, "acc-d").contains(&"key_restriction".to_owned()));
     assert_eq!(v["layers"][3]["restriction"]["mode"], "restricted");
+    // A disabled second deployment still counts toward the total route count.
+    sqlx::query(
+        "INSERT INTO deployments(id,model_id,provider_connection_id,upstream_model)
+         SELECT gen_random_uuid(),model_id,provider_connection_id,'not-serving'
+         FROM deployments WHERE id=$1",
+    )
+    .bind(ra.deployment)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (status, v) = get(&f, &f.member, &kpath).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reasons(&v, "acc-a"), ["some_routes_unavailable"]);
+    assert_eq!(v["summary"]["partial"], 1);
     crate::governance::set_test_budget(&pool, "local", None, Some(f.team), None, "day", Some(10))
         .await;
     attempt(&pool, &ra, simple(f.team, id(&k), "acc-a", "now()", 10)).await;
@@ -793,7 +807,7 @@ async fn access_layers_explain_why_models_are_unavailable(pool: PgPool) {
         .unwrap()
         .iter()
         .find(|m| m["public_name"] == "acc-a")
-        .unwrap()["reasons"][0]
+        .unwrap()["reasons"][1]
         .clone();
     assert_eq!(
         a_reason,
@@ -832,7 +846,7 @@ async fn access_layers_explain_why_models_are_unavailable(pool: PgPool) {
     assert_eq!(v["layers"][0]["layer"], "type_default");
 }
 
-#[sqlx::test(migrations = "./enterprise_migrations")]
+#[dbtest::test]
 async fn model_catalog_filters_route_detail_and_workspace_catalog(pool: PgPool) {
     let f = fixture(&pool).await;
     let chat = route(&pool, "cat-chat", "openai").await;
