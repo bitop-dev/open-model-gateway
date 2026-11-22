@@ -50,6 +50,8 @@ hex = "0.4"
 # Batch scheduling time windows (IANA zones, DST): the bundled tz database, so
 # window evaluation never depends on the host's zoneinfo.
 jiff = { version = "=1.0.1", default-features = false, features = ["std", "tzdb-bundle-always"] }
+# Share Jiff's bundled data version with the report scheduler.
+jiff-tzdb = "1"
 # SMTP delivery (invitations, alerts): rustls, async, one connection per message (no pool).
 lettre = { version = "=0.11.24", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"] }
 percent-encoding = "2"

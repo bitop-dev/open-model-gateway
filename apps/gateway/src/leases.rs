@@ -216,16 +216,25 @@ impl Leases {
             // goes through this comparison.
             let was_held = self.held(lease).is_some();
             let sent = Instant::now();
-            let acquired: Result<Option<i64>, sqlx::Error> = tokio::time::timeout(
-                Duration::from_secs(5),
-                sqlx::query_scalar("SELECT omg_lease_acquire($1,$2,$3)")
-                    .bind(lease.as_str())
-                    .bind(self.holder)
-                    .bind(self.ttl.as_secs().clamp(1, 3600) as i32)
-                    .fetch_one(pool),
-            )
-            .await
-            .unwrap_or(Err(sqlx::Error::PoolTimedOut));
+            let is_report = lease == Lease::ReportScheduler;
+            let sql = if is_report {
+                "SELECT omg_lease_acquire($1,$2,$3) FROM set_config('gateway.report_tzdb',$4,true)"
+            } else {
+                "SELECT omg_lease_acquire($1,$2,$3)"
+            };
+            let query = sqlx::query_scalar(sql)
+                .bind(lease.as_str())
+                .bind(self.holder)
+                .bind(self.ttl.as_secs().clamp(1, 3600) as i32);
+            let query = if is_report {
+                query.bind(crate::scheduled_reports::calendar::TZDB_VERSION)
+            } else {
+                query
+            };
+            let acquired: Result<Option<i64>, sqlx::Error> =
+                tokio::time::timeout(Duration::from_secs(5), query.fetch_one(pool))
+                    .await
+                    .unwrap_or(Err(sqlx::Error::PoolTimedOut));
             let mut slot = self.terms[lease.index()]
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());

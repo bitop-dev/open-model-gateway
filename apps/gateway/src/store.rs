@@ -36,6 +36,8 @@ pub struct Store {
     /// Advisory report scan frontier; reset on restart/failover. No authority
     /// or claim ownership depends on this per-process keyset cursor.
     pub(crate) report_dispatch: std::sync::Arc<std::sync::Mutex<Option<ReportScanFrontier>>>,
+    pub(crate) report_calendar_scan:
+        std::sync::Arc<std::sync::Mutex<Option<crate::scheduled_reports::CalendarScanKey>>>,
     /// Admission protocol (`GATEWAY_ADMISSION_MODE`, see
     /// `governance::locks`): scoped locks (default) or the former
     /// installation row lock.
@@ -378,6 +380,7 @@ impl Store {
             lock_gates: std::sync::Arc::new(gates),
             alert_dispatch: Default::default(),
             report_dispatch: Default::default(),
+            report_calendar_scan: Default::default(),
             admission_mode: mode,
             reporting: None,
             reporting_max_lag: std::time::Duration::from_secs(30),
