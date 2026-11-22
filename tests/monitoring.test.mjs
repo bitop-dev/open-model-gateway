@@ -67,10 +67,12 @@ test("every gateway metric and label in the rules and dashboard is exported", ()
   }
 });
 
-test("rule names are unique and every rule has a severity and a summary", () => {
-  const names = allRules.map(rule => rule.alert);
+test("rule names are unique and every alert has a severity and a summary", () => {
+  const names = allRules.map(rule => rule.alert ?? rule.record);
   assert.equal(new Set(names).size, names.length);
   for (const rule of allRules) {
+    assert.notEqual(Boolean(rule.alert), Boolean(rule.record), "expected one alert or recording rule name");
+    if (rule.record) continue;
     assert.ok(["info", "warning", "critical"].includes(rule.labels?.severity), `${rule.alert} severity`);
     assert.ok(rule.annotations?.summary, `${rule.alert} summary`);
   }
@@ -86,11 +88,19 @@ test("accounting failures alert, split by settlement stage (#528)", () => {
     "route_lookup",
   ]);
   const settlement = "explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement";
+  const accounting = rules.groups.find(group => group.name === "open-model-gateway.accounting");
+  const [presence, firstObservation] = accounting.rules;
+  assert.equal(accounting.interval, "30s");
+  assert.equal(presence.record, "instance_stage_cause:accounting_failure_series:present");
+  assert.equal(squash(presence.expr), "((gateway_accounting_failures_total > bool 0) " +
+    "or (0 * present_over_time(gateway_accounting_failures_total[20m]))) and ignoring(stage, cause) (up == 1)");
+  assert.equal(firstObservation.record, "instance_stage_cause:accounting_failure_series:first_observed");
+  assert.equal(squash(firstObservation.expr), `gateway_accounting_failures_total and (last_over_time(${presence.record}[20m] offset 30s) == 0)`);
   const failures = matcher => {
     const counter = `gateway_accounting_failures_total{${matcher}}`;
     return `sum by (stage, cause) ( increase(${counter}[10m]) > 0 or ` +
       `(${counter} unless present_over_time(${counter}[10m] offset 10m)) or ` +
-      `(${counter} and (count_over_time(${counter}[10m]) < ignoring(stage, cause) group_left sum_over_time(up[10m]))) ) > 0`;
+      `(${counter} and present_over_time(${firstObservation.record}{${matcher}}[10m])) ) > 0`;
   };
   const expected = {
     GatewayAccountingFailures: { expr: failures(`stage!~"${settlement}"`), for: "5m", severity: "warning" },

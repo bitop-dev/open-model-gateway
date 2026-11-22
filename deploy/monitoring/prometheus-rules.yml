@@ -41,13 +41,14 @@ groups:
           description: "A delivery failed or exhausted retries within the last 24 hours (by completion time, including expired-delivery cleanup). Check incident History, relay availability and SMTP configuration. Use an independent operational channel; do not feed this back into gateway email incidents. Crash recovery can duplicate accepted mail."
 
   - name: open-model-gateway.accounting
+    interval: 30s
     rules:
       # Accounting failures (#389, docs/operations.md#accounting-failures): each
       # one is a `503 accounting_unavailable` or a settlement that did not finish.
       # A series starts at 1 on its first failure. A successful scrape without
       # that series shows it was not yet exported, even if an earlier process
-      # at the same target exported it. Compare sample counts per scrape target:
-      # a failed scrape contributes 0 to up and no counter sample.
+      # at the same target exported it. Remember absence only on a healthy
+      # target; a failed scrape gives no information about the counter.
       # With no older samples in the offset window, treat the series as new.
       # A long scrape outage can therefore re-fire an unchanged counter once.
       # Filter zero increases so they cannot mask either first-failure term.
@@ -67,6 +68,19 @@ groups:
       # authentication) refuses, delays or retries work but holds no money
       # beyond what its own settlement later releases: a warning after 5
       # minutes pending. The alert clears once the failure leaves the window.
+      # Store 1 or 0 for recently seen series on healthy targets. Leave a gap
+      # on scrape failure so the previous successful observation survives it.
+      - record: instance_stage_cause:accounting_failure_series:present
+        expr: |
+          ((gateway_accounting_failures_total > bool 0)
+            or (0 * present_over_time(gateway_accounting_failures_total[20m])))
+            and ignoring(stage, cause) (up == 1)
+      # An observed 0 followed by a positive counter identifies one first
+      # failure. The offset excludes this evaluation's presence sample.
+      - record: instance_stage_cause:accounting_failure_series:first_observed
+        expr: |
+          gateway_accounting_failures_total
+            and (last_over_time(instance_stage_cause:accounting_failure_series:present[20m] offset 30s) == 0)
       - alert: GatewayAccountingFailures
         expr: |
           sum by (stage, cause) (
@@ -75,8 +89,7 @@ groups:
               (gateway_accounting_failures_total{stage!~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"} unless present_over_time(gateway_accounting_failures_total{stage!~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"}[10m] offset 10m))
             or
               (gateway_accounting_failures_total{stage!~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"}
-                and (count_over_time(gateway_accounting_failures_total{stage!~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"}[10m])
-                  < ignoring(stage, cause) group_left sum_over_time(up[10m])))
+                and present_over_time(instance_stage_cause:accounting_failure_series:first_observed{stage!~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"}[10m]))
           ) > 0
         for: 5m
         labels: {severity: warning}
@@ -92,8 +105,7 @@ groups:
               (gateway_accounting_failures_total{stage=~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"} unless present_over_time(gateway_accounting_failures_total{stage=~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"}[10m] offset 10m))
             or
               (gateway_accounting_failures_total{stage=~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"}
-                and (count_over_time(gateway_accounting_failures_total{stage=~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"}[10m])
-                  < ignoring(stage, cause) group_left sum_over_time(up[10m])))
+                and present_over_time(instance_stage_cause:accounting_failure_series:first_observed{stage=~"explicit_settlement|cancellation_settlement|realtime_settlement|job_settlement"}[10m]))
           ) > 0
         labels: {severity: critical}
         annotations:

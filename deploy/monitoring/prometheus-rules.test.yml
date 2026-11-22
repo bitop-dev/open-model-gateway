@@ -1,7 +1,7 @@
 # Run with promtool test rules; CI pins the executable and verifies its archive.
 rule_files:
   - prometheus-rules.yml
-evaluation_interval: 1m
+evaluation_interval: 30s
 tests:
   - name: missing accounting series never fires
     interval: 1m
@@ -405,3 +405,74 @@ tests:
       - eval_time: 11m
         alertname: GatewayMetricsDown
         exp_alerts: []
+  - name: a scrape outage between restart and first observed failure
+    interval: 15s
+    input_series:
+      # At 20m the restarted target omits the counter. From 28m15s its
+      # scrapes fail, then at 34m the counter is first observed again.
+      - series: up{job="open-model-gateway",instance="gateway-a"}
+        values: 1+0x112 0+0x22 1+0x43 0+0x7 1+0x15
+      - series: gateway_accounting_failures_total{job="open-model-gateway",instance="gateway-a",stage="route_lookup",cause="deadline_in_database"}
+        values: 1+0x79 stale _x54 1+0x43 stale _x7 1+0x15
+      - series: gateway_accounting_failures_total{job="open-model-gateway",instance="gateway-a",stage="explicit_settlement",cause="deadline_in_database"}
+        values: 1+0x79 stale _x54 1+0x43 stale _x7 1+0x15
+    alert_rule_test:
+      - eval_time: 33m30s
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: []
+      - eval_time: 33m30s
+        alertname: GatewayAccountingFailures
+        exp_alerts: []
+      - eval_time: 34m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: [*explicit_settlement_alert]
+      - eval_time: 34m
+        alertname: GatewayAccountingFailures
+        exp_alerts: []
+      - eval_time: 38m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: [*explicit_settlement_alert]
+      - eval_time: 38m
+        alertname: GatewayAccountingFailures
+        exp_alerts: []
+      - eval_time: 38m30s
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: [*explicit_settlement_alert]
+      - eval_time: 38m30s
+        alertname: GatewayAccountingFailures
+        exp_alerts: []
+      - eval_time: 39m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: [*explicit_settlement_alert]
+      - eval_time: 39m
+        alertname: GatewayAccountingFailures
+        exp_alerts: [*route_lookup_alert]
+      - eval_time: 40m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: [*explicit_settlement_alert]
+      - eval_time: 40m
+        alertname: GatewayAccountingFailures
+        exp_alerts: [*route_lookup_alert]
+      - eval_time: 43m30s
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: [*explicit_settlement_alert]
+      - eval_time: 43m30s
+        alertname: GatewayAccountingFailures
+        exp_alerts: [*route_lookup_alert]
+      - eval_time: 44m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: []
+      - eval_time: 44m
+        alertname: GatewayAccountingFailures
+        exp_alerts: []
+      # A second outage begins at 45m. At 47m the same counter returns.
+      - eval_time: 47m
+        alertname: GatewaySettlementAccountingFailures
+        exp_alerts: []
+    promql_expr_test:
+      - expr: sum(count_over_time(instance_stage_cause:accounting_failure_series:first_observed[15m]))
+        eval_time: 47m
+        exp_samples:
+          # One first observation for each of the two counters.
+          - labels: '{}'
+            value: 2
