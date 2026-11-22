@@ -236,12 +236,15 @@ pub(crate) struct FinalizeHold {
 }
 #[cfg(test)]
 impl FinalizeHold {
+    #[cfg(feature = "integration-tests")]
     pub(crate) fn arm(&self) {
         self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
     }
+    #[cfg(feature = "integration-tests")]
     pub(crate) async fn reached(&self) {
         self.reached.notified().await;
     }
+    #[cfg(feature = "integration-tests")]
     pub(crate) fn release(&self) {
         self.go.notify_one();
     }

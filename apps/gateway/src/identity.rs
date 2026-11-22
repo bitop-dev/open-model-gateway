@@ -193,7 +193,7 @@ impl IdentityState {
     /// Test-only: a copy with an explicit `GATEWAY_TRUSTED_PROXIES` policy,
     /// for admin-token IP-allowlist tests that need a trusted proxy chain
     /// (`management::authz_matrix_tests`, outside this module's own tree).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "integration-tests"))]
     pub(crate) fn with_trusted_proxies(mut self, proxies: throttle::TrustedProxies) -> Self {
         self.trusted_proxies = proxies;
         self
