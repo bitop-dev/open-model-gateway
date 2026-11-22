@@ -1078,55 +1078,79 @@ fn string_bounds(
 
 const STRADDLE: &str = "supplied candidates must straddle the boundary: include a value the schema accepts and one it refuses that differs from it by ONE character added, removed or changed";
 
-/// Do the `(candidate, schema verdict)` pairs hold an accepted value and a
-/// refused one within edit distance 1 of it? Two candidates far apart (`0` and
-/// sixteen digits) prove nothing about WHERE the boundary lies.
-fn straddles(nodes: &[&Value], verdicts: &[(String, bool)], notes: &mut Notes) -> bool {
-    // For anchored patterns with a finite maximum, require the length edge.
-    // HIR literals are UTF-8 bytes, but JSON Schema measures Unicode scalars.
-    fn width(hir: &regex_syntax::hir::Hir) -> Option<usize> {
-        use regex_syntax::hir::HirKind::*;
-        match hir.kind() {
-            Empty | Look(_) => Some(0),
-            Literal(lit) => Some(std::str::from_utf8(&lit.0).ok()?.chars().count()),
-            Class(_) => Some(1),
-            Capture(c) => width(&c.sub),
-            Repetition(r) => width(&r.sub)?.checked_mul(r.max? as usize),
+#[path = "supplied_boundaries.rs"]
+mod supplied_boundaries;
+
+/// Maximum Unicode scalar count, and the fewest UTF-8 bytes a match of
+/// that width can occupy. A byte edge can stand in for the character edge
+/// only when the byte budget makes the latter unreachable.
+#[derive(Clone, Copy)]
+struct PatternWidth {
+    chars: usize,
+    min_bytes: usize,
+}
+
+fn pattern_width(pattern: &str) -> Option<PatternWidth> {
+    use regex_syntax::hir::{Hir, HirKind::*, Look};
+    fn width(hir: &Hir) -> Option<PatternWidth> {
+        let (chars, min_bytes) = match hir.kind() {
+            Empty | Look(_) => (0, 0),
+            Literal(lit) => (
+                std::str::from_utf8(&lit.0).ok()?.chars().count(),
+                lit.0.len(),
+            ),
+            Class(class) => (1, class.minimum_len()?),
+            Capture(c) => return width(&c.sub),
+            Repetition(r) => {
+                let sub = width(&r.sub)?;
+                let n = r.max? as usize;
+                (sub.chars.checked_mul(n)?, sub.min_bytes.checked_mul(n)?)
+            }
             Concat(parts) => parts
                 .iter()
-                .try_fold(0usize, |n, p| n.checked_add(width(p)?)),
-            Alternation(parts) => parts
-                .iter()
-                .map(width)
-                .collect::<Option<Vec<_>>>()?
-                .into_iter()
-                .max(),
-        }
-    }
-    let maximum = strings(nodes, "pattern")
-        .into_iter()
-        .filter_map(|p| {
-            let hir = regex_syntax::Parser::new().parse(p).ok()?;
-            use regex_syntax::hir::Look;
-            let props = hir.properties();
-            if !props.look_set_prefix().contains(Look::Start)
-                || !props.look_set_suffix().contains(Look::End)
-            {
-                return None;
+                .try_fold((0usize, 0usize), |(chars, bytes), part| {
+                    let sub = width(part)?;
+                    Some((
+                        chars.checked_add(sub.chars)?,
+                        bytes.checked_add(sub.min_bytes)?,
+                    ))
+                })?,
+            Alternation(parts) => {
+                return parts
+                    .iter()
+                    .map(width)
+                    .collect::<Option<Vec<_>>>()?
+                    .into_iter()
+                    .max_by_key(|w| (w.chars, std::cmp::Reverse(w.min_bytes)));
             }
-            width(&hir)
-        })
-        .min();
-    let maximum = maximum.map(|width| {
-        let cap = nodes
-            .iter()
-            .flat_map(|node| [node["maxLength"].as_u64(), node[MAX_BYTES].as_u64()])
-            .flatten()
-            .filter_map(|n| usize::try_from(n).ok())
-            .fold(width, usize::min);
-        notes.dominated_patterns += usize::from(cap < width);
-        cap
-    });
+        };
+        Some(PatternWidth { chars, min_bytes })
+    }
+    let hir = regex_syntax::Parser::new().parse(pattern).ok()?;
+    let props = hir.properties();
+    (props.look_set_prefix().contains(Look::Start) && props.look_set_suffix().contains(Look::End))
+        .then(|| width(&hir))
+        .flatten()
+}
+
+/// An adjacent accepted/refused pair at the effective limit. Byte caps and
+/// JSON Schema character limits use different units for the same candidate.
+fn straddles(
+    nodes: &[&Value],
+    verdicts: &[(String, bool)],
+    notes: &mut Notes,
+    mut confirms: impl FnMut(&str, &Value, &str, &str) -> Result<bool>,
+) -> Result<bool> {
+    let patterns: Vec<_> = strings(nodes, "pattern")
+        .into_iter()
+        .map(|p| (p, pattern_width(p)))
+        .collect();
+    let maximum = patterns
+        .iter()
+        .filter_map(|(_, w)| *w)
+        .min_by_key(|w| (w.chars, std::cmp::Reverse(w.min_bytes)));
+    let char_cap = distinct_u64(nodes, "maxLength").first().copied();
+    let byte_cap = distinct_u64(nodes, MAX_BYTES).first().copied();
     fn one_edit(a: &str, b: &str) -> bool {
         let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
         let (short, long) = if a.len() <= b.len() {
@@ -1146,13 +1170,77 @@ fn straddles(nodes: &[&Value], verdicts: &[(String, bool)], notes: &mut Notes) -
             _ => false,
         }
     }
-    verdicts.iter().any(|(accepted, ok)| {
-        *ok && verdicts.iter().any(|(refused, ok)| {
-            !*ok && maximum.is_none_or(|max| {
-                accepted.chars().count() == max && refused.chars().count() == max.saturating_add(1)
-            }) && one_edit(accepted, refused)
-        })
-    })
+    for (accepted, _) in verdicts.iter().filter(|(_, ok)| *ok) {
+        for (refused, _) in verdicts.iter().filter(|(_, ok)| !*ok) {
+            if !one_edit(accepted, refused) {
+                continue;
+            }
+            if let Some(width) = maximum {
+                let edge = char_cap.unwrap_or(u64::MAX).min(width.chars as u64);
+                let at = accepted.chars().count() as u64;
+                let over = refused.chars().count() as u64;
+                let min_bytes = if edge == width.chars as u64 {
+                    width.min_bytes as u64
+                } else {
+                    edge
+                };
+                if at < edge
+                    && over <= edge
+                    && let Some(cap) = byte_cap
+                    && cap < min_bytes
+                    && accepted.len() as u64 == cap
+                    && refused.len() as u64 > cap
+                    && confirms(MAX_BYTES, &json!(cap), accepted, refused)?
+                {
+                    notes.dominated_patterns += 1;
+                    return Ok(true);
+                }
+                if at != edge || over != edge + 1 {
+                    continue;
+                }
+                if edge < width.chars as u64 {
+                    if confirms("maxLength", &json!(edge), accepted, refused)? {
+                        notes.dominated_patterns += 1;
+                        return Ok(true);
+                    }
+                    continue;
+                }
+            }
+            if patterns.is_empty() {
+                return Ok(true);
+            }
+            // A supplied value can also witness an explicit cap beside an
+            // unbounded pattern (for example a printable name with maxLength).
+            if maximum.is_none() {
+                for (key, limit, at, over) in [
+                    (
+                        "maxLength",
+                        char_cap,
+                        accepted.chars().count(),
+                        refused.chars().count(),
+                    ),
+                    (MAX_BYTES, byte_cap, accepted.len(), refused.len()),
+                ] {
+                    if let Some(cap) = limit
+                        && at as u64 == cap
+                        && over as u64 > cap
+                        && confirms(key, &json!(cap), accepted, refused)?
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+            for (pattern, width) in &patterns {
+                if maximum.is_none_or(|max| width.is_some_and(|w| w.chars == max.chars))
+                    && !super::validation::pattern_validator(pattern)?.is_valid(&json!(refused))
+                    && confirms("pattern", &json!(pattern), accepted, refused)?
+                {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// The candidates of one location and the decisive kinds it could not produce.
@@ -1642,7 +1730,7 @@ pub(super) fn query_plan(
             // A numeric-looking value may already satisfy a string arm.
             if !typed.is_string()
                 && kinds.contains("string")
-                && valid(document, schema, &json!(raw))?
+                && accepts(document, schema, &json!(raw))?
             {
                 return Ok(json!(raw));
             }
@@ -1652,7 +1740,7 @@ pub(super) fn query_plan(
         nodes.clear();
         applicable(document, schema, &typed, &mut nodes, 0)?;
         ensure!(
-            valid(document, schema, &typed)?,
+            accepts(document, schema, &typed)?,
             "the valid base value of a query parameter must satisfy its schema"
         );
         let mut seen = BTreeSet::from([raw.to_owned()]);
@@ -1686,7 +1774,7 @@ pub(super) fn query_plan(
                 .iter()
                 .map(|v| Ok((v.to_string(), accepts(document, schema, &wire_value(v)?)?)))
                 .collect::<Result<Vec<_>>>()?;
-            if !straddles(&nodes, &verdicts, &mut notes) {
+            if !straddles(&nodes, &verdicts, &mut notes, |_, _, _, _| Ok(true))? {
                 notes
                     .problems
                     .push(format!("query parameter {name}: {STRADDLE}"));
@@ -2411,14 +2499,38 @@ impl Walk<'_> {
         if !supplied.is_empty() {
             self.candidates_used.insert(here.clone());
             let mut verdicts = Vec::new();
+            let patterned = nodes.iter().any(|node| node.get("pattern").is_some());
             for candidate in &supplied {
                 let leaf = accepts(self.document, schema, candidate)?;
                 let body = set(&self.valid_body, path, Some(candidate.clone()));
-                if accepts(self.document, self.root_schema, &body)? == leaf {
+                if (!patterned || candidate.is_string())
+                    && accepts(self.document, self.root_schema, &body)? == leaf
+                {
                     verdicts.push((render(candidate), leaf));
                 }
             }
-            if !straddles(&nodes, &verdicts, &mut self.notes) {
+            if !straddles(
+                &nodes,
+                &verdicts,
+                &mut self.notes,
+                |key, bound, accepted, refused| {
+                    let accepted = set(&self.valid_body, path, Some(json!(accepted)));
+                    let body = set(&self.valid_body, path, Some(json!(refused)));
+                    for schema in supplied_boundaries::relaxations(
+                        self.document,
+                        self.root_schema,
+                        &accepted,
+                        path,
+                        (key, bound),
+                        0,
+                    )? {
+                        if accepts(self.document, &schema, &body)? {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                },
+            )? {
                 self.notes.problems.push(format!("{here}: {STRADDLE}"));
             }
             for candidate in supplied {

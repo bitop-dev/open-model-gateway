@@ -38,6 +38,9 @@ fn email_candidates() -> Vec<(&'static str, Value)> {
     let mut all = vec![
         ("/host", json!("127.0.0.1")),
         ("/host", json!("127.0.0.1/")),
+        // Both parse as IP addresses. Only the first permits plaintext SMTP.
+        ("/host", json!("::1")),
+        ("/host", json!("::")),
         ("/tls", json!("none")),
         ("/tls", json!("nonee")),
         ("/username", json!("u".repeat(256))),

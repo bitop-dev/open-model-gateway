@@ -3155,3 +3155,194 @@ async fn boundary_review_query_uses_typed_value_to_select_the_integer_arm() {
         "{text}"
     );
 }
+
+#[test]
+fn supplied_counterfactual_preserves_whole_request_refusals() {
+    let digits = json!({"type":"string","pattern":"^(0|[1-9][0-9]{0,14})$"});
+    let mut document = body_only(json!({
+        "$ref":"#/components/schemas/Object",
+        "allOf":[{"$ref":"#/components/schemas/Guard"}]
+    }));
+    document["components"]["schemas"] = json!({
+        "Object":{"type":"object","properties":{"n":{"$ref":"#/components/schemas/Digits"}}},
+        "Digits":digits,
+        "Guard":{"not":{"properties":{"n":{"const":"1".repeat(16)}}}}
+    });
+    let plan = |doc: &Value, digit: &str| {
+        super::http_vectors::body_plan(
+            doc,
+            &doc["paths"][TEMPLATE]["post"],
+            &json!({"n":"1"}),
+            &[],
+            &[
+                ("/n".into(), json!(digit.repeat(15))),
+                ("/n".into(), json!(digit.repeat(16))),
+            ],
+        )
+    };
+    let original = &document["paths"][TEMPLATE]["post"]["requestBody"]["content"]["application/json"]
+        ["schema"];
+    let mut wider = document.clone();
+    wider["components"]["schemas"]["Digits"]["pattern"] = json!("^(0|[1-9][0-9]{0,15})$");
+    for digit in ["1", "2"] {
+        for (n, before, after) in [(15, true, true), (16, false, digit == "2")] {
+            let body = json!({"n":digit.repeat(n)});
+            assert_eq!(
+                super::http_vectors::accepts(&document, original, &body).unwrap(),
+                before
+            );
+            assert_eq!(
+                super::http_vectors::accepts(&wider, original, &body).unwrap(),
+                after
+            );
+        }
+    }
+    assert!(
+        plan(&document, "1")
+            .err()
+            .expect("the root guard still refuses sixteen ones")
+            .to_string()
+            .contains("straddle")
+    );
+    plan(&document, "2").unwrap();
+    document["components"]["schemas"]["Guard"] = json!({"not":{"properties":{"n":{
+        "const":"1".repeat(16),"not":{"$ref":"#/components/schemas/Digits"}
+    }}}});
+    assert!(plan(&document, "1").is_err());
+    plan(&document, "2").unwrap();
+    // An independent conjunct references the very same component.
+    document["components"]["schemas"]["Guard"] =
+        json!({"properties":{"n":{"$ref":"#/components/schemas/Digits"}}});
+    assert!(plan(&document, "2").is_err());
+}
+
+#[test]
+fn supplied_counterfactual_measures_byte_edges_in_bytes() {
+    let schema = json!({"type":"string","pattern":"^(é|é{2,8})$","x-omg-max-bytes":4});
+    let document = body_only(schema);
+    let plan = |left, right| {
+        super::http_vectors::body_plan(
+            &document,
+            &document["paths"][TEMPLATE]["post"],
+            &json!("é"),
+            &[],
+            &[
+                ("(root)".into(), json!(left)),
+                ("(root)".into(), json!(right)),
+            ],
+        )
+    };
+    assert!(plan("é", "éx").is_err());
+    assert_eq!(plan("éé", "ééé").unwrap().notes.dominated_patterns, 1);
+    let mixed = body_only(json!({"type":"string","pattern":"^[aé]{1,8}$","x-omg-max-bytes":10}));
+    let check = |left: &str, right: &str| {
+        super::http_vectors::body_plan(
+            &mixed,
+            &mixed["paths"][TEMPLATE]["post"],
+            &json!("a"),
+            &[],
+            &[
+                ("(root)".into(), json!(left)),
+                ("(root)".into(), json!(right)),
+            ],
+        )
+    };
+    // The byte cap can be crossed early, but eight ASCII characters still fit.
+    assert!(check("ééééé", "éééééé").is_err());
+    assert_eq!(
+        check("aaaaaaaa", "aaaaaaaaa")
+            .unwrap()
+            .notes
+            .dominated_patterns,
+        0
+    );
+}
+
+#[tokio::test]
+async fn supplied_counterfactual_query_coercion_uses_byte_aware_verdicts() {
+    let mut document = query_document();
+    let op = &mut document["paths"][TEMPLATE]["get"];
+    op["parameters"] = json!([parameter(
+        "limit",
+        false,
+        json!({"oneOf":[
+            {"type":"integer","minimum":1,"maximum":4242},{"type":"string","x-omg-max-bytes":1}
+        ]})
+    )]);
+    let plan = |base: &str| {
+        query_cases(
+            &document,
+            &document["paths"][TEMPLATE]["get"],
+            &[("limit".into(), base.into())],
+            &[],
+        )
+    };
+    assert!(plan("4243").is_err());
+    assert!(plan("ab").is_err());
+    // The exact one-byte spelling is the base request and is deduplicated.
+    let string_cases = plan("1").unwrap();
+    assert!(string_cases.iter().any(|c| c.kind == "maxBytes+1"));
+    assert!(string_cases.iter().all(|c| c.kind != "maximum+1"));
+    let app = Router::new().route(
+        TEMPLATE,
+        get(
+            |Query(q): Query<std::collections::HashMap<String, String>>| async move {
+                if q.get("limit").is_none_or(|s| {
+                    s.len() <= 1
+                        || s.parse::<i64>()
+                            .is_ok_and(|n| n.to_string() == *s && (1..=4242).contains(&n))
+                }) {
+                    StatusCode::OK
+                } else {
+                    StatusCode::BAD_REQUEST
+                }
+            },
+        ),
+    );
+    let seen = std::sync::Mutex::new(Vec::new());
+    run_query(
+        &document,
+        "GET",
+        TEMPLATE,
+        &[],
+        &async || ((), vec![("limit".into(), "10".into())]),
+        &async |_: &(), query: String| {
+            let request = Request::builder()
+                .uri(format!("{TEMPLATE}?{query}"))
+                .body(Body::empty())
+                .unwrap();
+            let captured = exchange(&app, "GET", request).await;
+            seen.lock().unwrap().push((query, captured.status));
+            Probe::from(captured)
+        },
+    )
+    .await
+    .unwrap();
+    let seen = seen.into_inner().unwrap();
+    assert!(seen.contains(&("limit=4242".into(), StatusCode::OK)));
+    assert!(seen.contains(&("limit=4243".into(), StatusCode::BAD_REQUEST)));
+}
+
+#[test]
+fn supplied_counterfactual_follows_array_and_map_use_sites() {
+    let digits = json!({"type":"string","pattern":"^[1-9]{1,15}$"});
+    for map in [
+        json!({"type":"object","patternProperties":{"^n":digits}}),
+        json!({"type":"object","additionalProperties":digits}),
+    ] {
+        let document =
+            body_only(json!({"type":"array","prefixItems":[{"type":"integer"}],"items":map}));
+        let plan = super::http_vectors::body_plan(
+            &document,
+            &document["paths"][TEMPLATE]["post"],
+            &json!([1,{"n":"2","next":"3"}]),
+            &[],
+            &[
+                ("/1/n".into(), json!("2".repeat(15))),
+                ("/1/n".into(), json!("2".repeat(16))),
+            ],
+        )
+        .unwrap();
+        assert!(plan.cases.iter().any(|case| !case.accept && case.body == json!([1,{"n":"2".repeat(16),"next":"3"}])));
+    }
+}
