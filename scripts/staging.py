@@ -145,7 +145,8 @@ def main():
         return path
 
     if args.command == "build":
-        run(["build", "gateway"])
+        image = env.get("GATEWAY_IMAGE") or "open-model-gateway:staging"
+        subprocess.run(["docker", "build", "--load", "--tag", image, "."], cwd=ROOT, env=env, check=True)
     elif args.command == "db":
         run(["up", "-d", "--wait", "--wait-timeout", "120", "postgres"])
     elif args.command == "migrate":
