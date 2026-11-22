@@ -36,6 +36,8 @@ disallowed-methods = [
   { path = "aws_sdk_s3::config::Builder::build", reason = "use the gateway SDK transport built on crate::egress::client_builder (#571)" },
   { path = "aws_sdk_bedrockruntime::Client::new", reason = "use the gateway SDK transport built on crate::egress::client_builder (#571)" },
   { path = "aws_sdk_s3::Client::new", reason = "use the gateway SDK transport built on crate::egress::client_builder (#571)" },
+  { path = "aws_sdk_bedrockruntime::Client::from_conf", reason = "construct clients from the config with the gateway transport built on crate::egress::client_builder (#571)" },
+  { path = "aws_sdk_s3::Client::from_conf", reason = "construct clients from the config with the gateway transport built on crate::egress::client_builder (#571)" },
   { path = "aws_sdk_bedrockruntime::Config::new", reason = "use the gateway SDK transport built on crate::egress::client_builder (#571)" },
   { path = "aws_sdk_s3::Config::new", reason = "use the gateway SDK transport built on crate::egress::client_builder (#571)" },
   { path = "aws_sdk_bedrockruntime::client::customize::CustomizableOperation::config_override", reason = "use the gateway SDK transport built on crate::egress::client_builder (#571)" },

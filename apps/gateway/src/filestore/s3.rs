@@ -381,11 +381,7 @@ impl S3Backend {
         };
         let mut builder = aws_sdk_s3::Config::builder();
         builder.set_endpoint_url(settings.endpoint.clone());
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "S3 installs the gateway transport"
-        )]
-        let config = builder
+        let builder = builder
             .behavior_version(aws_auth::sdk_behavior_version())
             .region(Region::new(settings.region.clone()))
             .credentials_provider(credentials)
@@ -417,11 +413,18 @@ impl S3Backend {
             .force_path_style(settings.path_style)
             .disable_s3_express_session_auth(true)
             .disable_multi_region_access_points(true)
-            .use_arn_region(false)
-            .http_client(transport::client(settings.ca_bundle.as_ref())?)
-            .build();
+            .use_arn_region(false);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "S3 installs the gateway transport"
+        )]
+        let client = Client::from_conf(
+            builder
+                .http_client(transport::client(settings.ca_bundle.as_ref())?)
+                .build(),
+        );
         Ok(Self {
-            client: Client::from_conf(config),
+            client,
             bucket: settings.bucket.clone(),
             prefix: settings.prefix.clone(),
         })

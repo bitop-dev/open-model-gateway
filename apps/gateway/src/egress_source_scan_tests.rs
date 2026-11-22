@@ -390,12 +390,14 @@ fn level_of(
 
 const S3_TRANSPORT: &str = "S3 installs the gateway transport";
 const BEDROCK_TRANSPORT: &str = "Bedrock installs the gateway transport";
+const BEDROCK_CLIENT: &str = "Bedrock uses its service config";
 const BEDROCK_STREAM_TRANSPORT: &str = "Bedrock streaming installs the gateway transport";
 const STS_EXCEPTION: &str = "EGR-3: regional STS AssumeRole uses the SDK credential transport";
 
 enum AwsTransport {
     GatewayTail(&'static str),
-    Sts,
+    S3Client,
+    Exact(&'static str),
 }
 
 impl AwsTransport {
@@ -406,7 +408,17 @@ impl AwsTransport {
         let expression = text(init.expr.to_token_stream());
         match self {
             Self::GatewayTail(tail) => expression.ends_with(tail),
-            Self::Sts => expression == "builder . build ( )",
+            Self::Exact(expected) => expression == *expected,
+            Self::S3Client => {
+                let syn::Expr::Call(call) = init.expr.as_ref() else {
+                    return false;
+                };
+                text(call.func.to_token_stream()) == "Client : : from_conf"
+                    && call.args.len() == 1
+                    && text(call.args[0].to_token_stream()).ends_with(
+                        " . http_client ( transport : : client ( settings . ca_bundle . as_ref ( ) ) ? ) . build ( )",
+                    )
+            }
         }
     }
 }
@@ -415,14 +427,17 @@ impl AwsTransport {
 // builder settings can change; the final transport assignment must stay explicit.
 fn aws_transport(reason: &str) -> Option<AwsTransport> {
     let tail = match reason {
-        S3_TRANSPORT => {
-            " . http_client ( transport : : client ( settings . ca_bundle . as_ref ( ) ) ? ) . build ( )"
+        S3_TRANSPORT => return Some(AwsTransport::S3Client),
+        BEDROCK_CLIENT => {
+            return Some(AwsTransport::Exact(
+                "Client : : from_conf ( self . service_config ( plan , credentials ) )",
+            ));
         }
         BEDROCK_TRANSPORT => " . http_client ( self . http . clone ( ) ) . build ( )",
         BEDROCK_STREAM_TRANSPORT => {
             " . config_override ( aws_sdk_bedrockruntime : : Config : : builder ( ) . http_client ( self . streaming_http . clone ( ) ) , )"
         }
-        STS_EXCEPTION => return Some(AwsTransport::Sts),
+        STS_EXCEPTION => return Some(AwsTransport::Exact("builder . build ( )")),
         _ => return None,
     };
     Some(AwsTransport::GatewayTail(tail))
@@ -460,6 +475,18 @@ fn aws_transport_must_be_set_on_the_sanctioned_expression() {
         BEDROCK_STREAM_TRANSPORT,
         "operation.config_override(aws_sdk_bedrockruntime::Config::builder())"
     ));
+    assert!(matches(
+        S3_TRANSPORT,
+        "Client::from_conf(builder.http_client(transport::client(settings.ca_bundle.as_ref())?).build())"
+    ));
+    assert!(!matches(S3_TRANSPORT, "Client::from_conf(builder.build())"));
+    for reason in [S3_TRANSPORT, BEDROCK_CLIENT] {
+        assert!(!matches(reason, "Client::from_conf(shared.into())"));
+    }
+    assert!(matches(
+        BEDROCK_CLIENT,
+        "Client::from_conf(self.service_config(plan, credentials))"
+    ));
     assert!(matches(STS_EXCEPTION, "builder.build()"));
     assert!(!matches(STS_EXCEPTION, "other.build()"));
 }
@@ -487,6 +514,7 @@ fn sanctioned(name: &str) -> Vec<Finding> {
     match name {
         "filestore/s3.rs" => vec![aws_config("new", S3_TRANSPORT)],
         "providers/bedrock.rs" => vec![
+            aws_config("client", BEDROCK_CLIENT),
             aws_config("service_config", BEDROCK_TRANSPORT),
             aws_config("execute", BEDROCK_STREAM_TRANSPORT),
         ],
@@ -674,6 +702,8 @@ const AWS_CONFIG_METHODS: &[&str] = &[
     "aws_sdk_s3::config::Builder::build",
     "aws_sdk_bedrockruntime::Client::new",
     "aws_sdk_s3::Client::new",
+    "aws_sdk_bedrockruntime::Client::from_conf",
+    "aws_sdk_s3::Client::from_conf",
     "aws_sdk_bedrockruntime::Config::new",
     "aws_sdk_s3::Config::new",
     "aws_sdk_bedrockruntime::client::customize::CustomizableOperation::config_override",

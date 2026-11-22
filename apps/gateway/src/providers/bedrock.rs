@@ -102,6 +102,7 @@ impl BedrockAdapter {
             return client.clone();
         }
         let credentials = auth::credentials(&plan.auth, &plan.region).await;
+        #[expect(clippy::disallowed_methods, reason = "Bedrock uses its service config")]
         let client = Client::from_conf(self.service_config(plan, credentials));
         // Bound cache cardinality even if catalog configuration changes repeatedly. Evicting
         // keeps a reused client (and its credential cache) for the current configuration.
