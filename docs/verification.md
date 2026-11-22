@@ -9,6 +9,7 @@ Run from the repository root. None of them make paid provider calls or touch the
 | `cargo fmt --all -- --check` | Formatting | Rust |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | Lints, with the `integration-tests` feature on and test code included | Rust |
 | `cargo clippy -p open-model-gateway --bins --lib --locked -- -D warnings` | Lints the shipped build: the gateway library and binary with default features, so code compiled only without `integration-tests` is linted too (#502). Test code is not included | Rust |
+| `cargo clippy -p open-model-gateway --all-targets --locked -- -D warnings` | Lints all gateway targets with default features, including the test build without `integration-tests` (#578) | Rust |
 | `cargo test --workspace --all-features` | Unit, mock-provider contract, SDK and real-PostgreSQL integration tests (SQLx creates disposable databases) | `DATABASE_URL` to the disposable cluster, e.g. `postgres://gateway:gateway@127.0.0.1:54339/gateway`; `npm ci` for the SDK tests |
 | `node deploy/spark/test-integration.mjs runtime-ignored` | Five exact runtime-role ACL probes | Disposable cluster only |
 | `node deploy/spark/test-integration.mjs terminal` | Anthropic terminal fidelity, ordinary SDKs, runtime-role settlement/unknown holds and cancellation | Disposable cluster only; changes maintenance-database ACLs. Run sequentially after the runtime ACL probe, never via an unrestricted ignored-test sweep; requires `npm ci` |
@@ -339,7 +340,6 @@ The thresholds are Clippy's, so a toolchain bump may change which functions offe
 - A `#[cfg(test)]` line inside a block comment, a string literal or a macro body can confuse the line counter. Every such case found so far had to be constructed on purpose.
 - A `mod x;` declared inside an inline module (not at the start of a line) is not followed when deciding which files are test-only or declared by production code.
 - Clippy does not see a long body moved into a `macro_rules!`, or a long closure or block in a `static` or `const` initialiser.
-- Clippy lints the all-feature build with tests and the default-feature library and binary. Test code compiled only without `integration-tests` is not linted.
 - An `allow` of a whole Clippy group (`clippy::pedantic`, `clippy::nursery`, `clippy::all`) placed after the crate line could switch the lints off without naming them.
 - Only `apps/gateway/src` is covered. Other crates and `build.rs` are not.
 

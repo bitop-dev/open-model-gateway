@@ -35,7 +35,7 @@ pub(crate) enum TokenScope {
     SettingsWrite,
 }
 impl TokenScope {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "integration-tests"))]
     pub(crate) const ALL: [Self; 5] = [
         Self::PlatformRead,
         Self::CatalogWrite,
