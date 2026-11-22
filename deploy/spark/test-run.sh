@@ -281,6 +281,7 @@ suite_lib() {
   local bad=0 names index
   prepare_npm lib || return 1
   step lib build "${LIB[@]}" --no-run || return 1
+  step lib ignored-probes node "$OMG_SCRIPTS/test-integration.mjs" lib-preflight || return 1
   wait_db || return 1
   db_marker
   extra_args || return 1
@@ -303,19 +304,6 @@ suite_lib() {
   return "$bad"
 }
 
-exact_probe() { # a dedicated exact test must run once; libtest succeeds even if the name matches nothing
-  local out code
-  out=$(mktemp "$OMG_TMP/exact-probe.XXXXXX") || return 1
-  "$@" 2>&1 | tee "$out"
-  code=$?
-  if ! awk '/^test result: / { results++; if ($0 ~ /^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out(; finished in [0-9.]+s)?$/) ok++ } END { exit !(results == 1 && ok == 1) }' "$out"; then
-    echo "expected exactly one passing probe"
-    code=1
-  fi
-  rm -f "$out"
-  return "$code"
-}
-
 workspace_targets() {
   DATETIME_PG_URL="$DATABASE_URL" node "$OMG_SCRIPTS/test-integration.mjs" workspace
 }
@@ -332,8 +320,8 @@ suite_integration() {
   step integration targets with_loopback_db node "$OMG_SCRIPTS/test-integration.mjs" gateway || return 1
   step integration runtime-privileges with_loopback_db node "$OMG_SCRIPTS/test-integration.mjs" runtime || bad=1
   step integration runtime-privileges-ignored with_loopback_db node "$OMG_SCRIPTS/test-integration.mjs" runtime-ignored || bad=1
-  step integration key-issuance-contention exact_probe with_loopback_db env RUST_TEST_NOCAPTURE=1 cargo test -p open-model-gateway --all-features --lib management::tests::authz_matrix_tests::key_issuance_contention_tests::key_issuance_contention_measurement -- --ignored --exact || bad=1
-  step integration anthropic-terminal exact_probe with_loopback_db cargo test -p open-model-gateway --all-features --lib providers::anthropic::terminal_tests::terminal_fidelity_official_sdks_and_priced_http_evidence -- --ignored --exact || bad=1
+  step integration key-issuance-contention with_loopback_db env RUST_TEST_NOCAPTURE=1 node "$OMG_SCRIPTS/test-integration.mjs" key-contention || bad=1
+  step integration anthropic-terminal with_loopback_db node "$OMG_SCRIPTS/test-integration.mjs" terminal || bad=1
   step integration tools with_loopback_db workspace_targets || bad=1
   step integration doctests with_loopback_db cargo test -p open-model-gateway --all-features --doc || bad=1
   return "$bad"

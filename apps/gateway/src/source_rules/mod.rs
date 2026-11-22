@@ -8,6 +8,7 @@
 mod tree;
 mod engine_no_provider_switch;
 mod governance_locks;
+mod live_tests;
 mod log_fields;
 mod money_float;
 mod review_history;
