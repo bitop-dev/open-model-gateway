@@ -209,7 +209,7 @@ impl BatchFence {
     }
 
     /// Lines finished since the last call.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "integration-tests"))]
     pub(crate) async fn progress(
         &self,
         store: &Store,
