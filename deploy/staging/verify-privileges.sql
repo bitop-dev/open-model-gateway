@@ -1007,11 +1007,12 @@ BEGIN
   UPDATE governance_reservations SET held_microusd=held_microusd-5 WHERE execution_id=env AND state='pending' AND held_microusd>=5;
   UPDATE batch_lines SET state='failed',status_code=429,error_code='rate_limit_error',finished_at=clock_timestamp() WHERE job_id=bj AND line_no=0 AND state='running';
   UPDATE batch_lines SET state='running',attempts=attempts+1,execution_id=gen_random_uuid(),status_code=NULL,error_code=NULL,finished_at=NULL WHERE job_id=bj AND line_no=0 AND state='failed' AND attempts=1 AND segment IS NULL;
-  UPDATE batch_lines SET state='succeeded',status_code=200,finished_at=clock_timestamp() WHERE job_id=bj AND line_no=0 AND state='running';
-  UPDATE async_jobs SET request_completed=coalesce(request_completed,0)+1,request_failed=coalesce(request_failed,0)+0,last_progress_at=clock_timestamp() WHERE id=bj;
+  UPDATE batch_lines SET awaiting_segment=true WHERE job_id=bj AND line_no=0 AND state='running';
+  IF EXISTS (SELECT FROM batch_lines WHERE job_id=bj AND state='succeeded') THEN RAISE EXCEPTION 'staging reported a success'; END IF;
   INSERT INTO batch_segments(job_id,workspace_id,seq,file_id,lines) SELECT bj,ws,coalesce(max(seq)+1,0),fs,1 FROM batch_segments WHERE job_id=bj;
-  UPDATE batch_lines SET segment=0 WHERE job_id=bj AND line_no=ANY(ARRAY[0]) AND segment IS NULL AND state<>'running';
-  UPDATE batch_lines SET state='interrupted',error_code='interrupted',finished_at=clock_timestamp() WHERE job_id=bj AND state='running';
+  UPDATE batch_lines SET state='succeeded',awaiting_segment=false,segment=0,status_code=200,finished_at=clock_timestamp() WHERE job_id=bj AND line_no=0 AND state='running' AND awaiting_segment AND segment IS NULL;
+  UPDATE async_jobs SET request_completed=coalesce(request_completed,0)+1,request_failed=coalesce(request_failed,0)+0,last_progress_at=clock_timestamp() WHERE id=bj;
+  UPDATE batch_lines SET state='interrupted',awaiting_segment=false,error_code='interrupted',finished_at=clock_timestamp() WHERE job_id=bj AND state='running';
   PERFORM seq,file_id FROM batch_segments WHERE job_id=bj ORDER BY seq;
   PERFORM coalesce(sum(r.actual_microusd) FILTER(WHERE r.state='settled'),0) FROM governance_reservations r WHERE r.execution_id IN (SELECT e2.id FROM inference_executions e2 WHERE e2.batch_job_id=bj);
   BEGIN UPDATE batch_lines SET state='running' WHERE job_id=bj AND line_no=0; RAISE EXCEPTION 'finished batch line restarted'; EXCEPTION WHEN raise_exception THEN IF SQLERRM NOT LIKE 'invalid batch line transition%' THEN RAISE; END IF; END;

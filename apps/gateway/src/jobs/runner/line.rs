@@ -119,14 +119,13 @@ impl RunState {
 /// One finished line for the segment writer.
 pub(super) struct Record {
     pub(super) line: i32,
-    pub(super) error: bool,
+    pub(super) execution: Option<Uuid>,
     pub(super) value: Value,
 }
 
 pub(super) struct LineRun {
     pub(super) store: Store,
     pub(super) engine: Engine,
-    pub(super) files: crate::filestore::FileStorage,
     pub(super) repository: Arc<LineRepository>,
     pub(super) scheduler: Arc<Scheduler>,
     pub(super) job: JobRow,
@@ -144,7 +143,7 @@ impl LineRun {
         let _ = records
             .send(Record {
                 line,
-                error: true,
+                execution: None,
                 value,
             })
             .await;
@@ -161,22 +160,17 @@ impl LineRun {
             .fence
             .fail_line(&self.store, line, status, code, true)
             .await;
-        self.finished(line, execution, false, result);
+        self.finished(line, execution, result);
     }
 
-    fn finished(&self, line: i32, execution: Uuid, success: bool, result: FenceResult<bool>) {
+    fn finished(&self, line: i32, execution: Uuid, result: FenceResult<bool>) {
         match self.state.written(result) {
             Ok(Some(true)) => {
                 #[cfg(test)]
                 if self.state.soft_loss.swap(false, Ordering::SeqCst) {
                     self.state.lost.store(true, Ordering::SeqCst);
                 }
-                crate::metrics::METRICS.observe_batch_lines(
-                    "gateway",
-                    &self.job.provider,
-                    u64::from(success),
-                    u64::from(!success),
-                );
+                crate::metrics::METRICS.observe_batch_lines("gateway", &self.job.provider, 0, 1);
             }
             Ok(Some(false)) => {}
             Ok(None) => {
@@ -223,7 +217,7 @@ impl LineRun {
                     match lines::response_body(self.endpoint, execution, &model, response) {
                         Ok(body) => {
                             let value = lines::success_line(&line.custom_id, Some(execution), body);
-                            self.store_success(n, execution, value).await;
+                            self.queue_success(&records, n, execution, value).await;
                         }
                         Err(e) => self.fail(n, &line.custom_id, execution, e, &records).await,
                     }
@@ -287,29 +281,43 @@ impl LineRun {
         }
     }
 
-    /// Keep the route permit until the durable segment and success counter commit.
-    async fn store_success(&self, line: i32, execution: Uuid, value: Value) {
-        let record = Record {
-            line,
-            error: false,
-            value,
-        };
-        let result = match segments::encode_record(&record) {
-            Ok(body) => {
-                segments::store_segment(
-                    &self.store,
-                    &self.files,
-                    &self.job,
-                    &self.state,
-                    execution,
-                    body,
-                    super::super::fence::SegmentLines::Success { line, execution },
-                )
-                .await
-            }
-            Err(_) => Err(FenceError::Storage),
-        };
-        self.finished(line, execution, true, result.map(|()| true));
+    /// Release route capacity separately from publication. The task holds
+    /// its worker permits through the bounded channel send for backpressure.
+    async fn queue_success(
+        &self,
+        records: &mpsc::Sender<Record>,
+        line: i32,
+        execution: Uuid,
+        value: Value,
+    ) {
+        let ready = self
+            .state
+            .fence
+            .await_segment(&self.store, line, execution)
+            .await;
+        if !matches!(ready, Ok(true)) {
+            self.finished(
+                line,
+                execution,
+                ready.and_then(|_| Err(FenceError::Storage)),
+            );
+            return;
+        }
+        #[cfg(test)]
+        if self.state.soft_loss.swap(false, Ordering::SeqCst) {
+            self.state.lost.store(true, Ordering::SeqCst);
+        }
+        if records
+            .send(Record {
+                line,
+                execution: Some(execution),
+                value,
+            })
+            .await
+            .is_err()
+        {
+            self.state.lost.store(true, Ordering::SeqCst);
+        }
     }
 
     async fn fail(

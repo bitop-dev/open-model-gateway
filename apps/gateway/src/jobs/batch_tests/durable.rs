@@ -17,6 +17,14 @@ enum Boundary {
     AfterCommit,
 }
 
+#[derive(Clone, Copy)]
+enum Case {
+    Fault(Boundary, Loss),
+    Group,
+    Quota,
+    Measure(usize),
+}
+
 // A fresh worker process reopens the same encrypted files and disposable database.
 async fn local_files(dir: &std::path::Path) -> FileStoreRuntime {
     use base64::Engine as _;
@@ -118,10 +126,67 @@ fn start_process(w: &World, dir: &std::path::Path, upstream: &Server) -> tokio::
         .unwrap()
 }
 
-async fn run_case(pool: PgPool, fault: Option<(Boundary, Loss)>) {
-    let size = if fault.is_some() { 1 } else { 32 };
+async fn normal_upload(client: &reqwest::Client, base: &str, auth: &str) -> reqwest::StatusCode {
+    let mut form = b"--race\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\nuser_data\r\n--race\r\nContent-Disposition: form-data; name=\"file\"; filename=\"ordinary.txt\"\r\n\r\n".to_vec();
+    form.resize(form.len() + 64 * 1024, b'x');
+    form.extend_from_slice(b"\r\n--race--\r\n");
+    client
+        .post(format!("{base}/v1/files"))
+        .header("authorization", auth)
+        .header("content-type", "multipart/form-data; boundary=race")
+        .body(form)
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+async fn hold_segment_metadata(
+    pool: &PgPool,
+    workspace: Uuid,
+) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    sqlx::query("INSERT INTO workspace_platform_policy_overrides(workspace_id,storage_bytes) VALUES($1,1048576)")
+        .bind(workspace).execute(pool).await.unwrap();
+    sqlx::raw_sql(
+        "CREATE FUNCTION pause_segment_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN PERFORM pg_advisory_xact_lock(654715); RETURN NEW; END $$;
+    CREATE TRIGGER pause_segment_commit BEFORE UPDATE OF committed_at ON stored_files
+    FOR EACH ROW WHEN (OLD.filename LIKE 'batch_%_part_%' AND NEW.committed_at IS NOT NULL)
+    EXECUTE FUNCTION pause_segment_commit()",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let mut hold = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(654715)")
+        .execute(&mut *hold)
+        .await
+        .unwrap();
+    hold
+}
+
+async fn run_case(pool: PgPool, case: Case) {
+    let fault = match case {
+        Case::Fault(boundary, loss) => Some((boundary, loss)),
+        _ => None,
+    };
+    let size = match case {
+        Case::Fault(..) => 3,
+        Case::Group => 32,
+        Case::Quota => 1,
+        Case::Measure(size) => size,
+    };
+    let benchmark_uploads = matches!(case, Case::Measure(size) if size > 32);
+    if matches!(case, Case::Measure(_)) {
+        sqlx::raw_sql("CREATE SCHEMA bench_metrics; CREATE EXTENSION pg_stat_statements WITH SCHEMA bench_metrics")
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
     let before = matches!(fault, Some((Boundary::BeforeCommit, _)));
     let mut w = world(pool.clone(), false, false, 1).await;
+    sqlx::query("INSERT INTO deployment_batch_scheduling(deployment_id,max_concurrency,updated_by) VALUES($1,1,$2)")
+        .bind(w.f.deployment).bind(w.f.owner).execute(&pool).await.unwrap();
     sqlx::raw_sql(include_str!(
         "../../../tests/common/ensure_runtime_role.sql"
     ))
@@ -133,6 +198,18 @@ async fn run_case(pool: PgPool, fault: Option<(Boundary, Loss)>) {
     let runtime = runtime_pool((*options).clone(), options.get_database().unwrap()).await;
     let store = crate::store::Store::new(runtime);
 
+    if benchmark_uploads || matches!(case, Case::Quota) {
+        sqlx::query(
+            "UPDATE installation_settings SET file_user_files_enabled=true WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    if benchmark_uploads {
+        sqlx::query("INSERT INTO workspace_platform_policy_overrides(workspace_id,storage_bytes) VALUES($1,33554432)")
+            .bind(w.f.principal.workspace_id).execute(&pool).await.unwrap();
+    }
     let dir = tempfile::tempdir().unwrap();
     let crash = matches!(fault, Some((_, Loss::Crash)));
     let files = local_files(dir.path()).await;
@@ -175,6 +252,57 @@ async fn run_case(pool: PgPool, fault: Option<(Boundary, Loss)>) {
     } else if fault.is_some() && !crash {
         w.jobs.finalize_hold.arm();
     }
+    let quota_hold = if matches!(case, Case::Quota) {
+        Some(hold_segment_metadata(&pool, job.workspace_id).await)
+    } else {
+        None
+    };
+    let sum_calls = || {
+        sqlx::query_scalar::<_,i64>(
+        "SELECT coalesce(sum(calls),0)::bigint FROM bench_metrics.pg_stat_statements WHERE dbid=(SELECT oid FROM pg_database WHERE datname=current_database()) AND query LIKE 'SELECT coalesce(sum(CASE WHEN f.committed_at%'"
+    ).fetch_one(&pool)
+    };
+    let before_sums = if matches!(case, Case::Measure(_)) {
+        sum_calls().await.unwrap()
+    } else {
+        0
+    };
+    let uploads = benchmark_uploads.then(|| {
+        let (client, base, auth, calls) = (
+            client.clone(),
+            gateway.base.clone(),
+            auth.clone(),
+            calls.clone(),
+        );
+        tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(9), async {
+                while calls.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let mut durations = Vec::new();
+            for _ in 0..32 {
+                assert!(
+                    calls.load(Ordering::SeqCst) < size,
+                    "upload started after the last provider call"
+                );
+                let at = std::time::Instant::now();
+                assert_eq!(
+                    normal_upload(&client, &base, &auth).await,
+                    reqwest::StatusCode::OK
+                );
+                durations.push(at.elapsed());
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            durations.sort_unstable();
+            eprintln!(
+                "32 normal uploads, median {:?}, max {:?}",
+                durations[16], durations[31]
+            );
+        })
+    });
     let started = std::time::Instant::now();
     let mut process = crash.then(|| start_process(&w, dir.path(), &upstream));
     let old = (!crash).then(|| start(&w));
@@ -187,6 +315,11 @@ async fn run_case(pool: PgPool, fault: Option<(Boundary, Loss)>) {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }).await.unwrap();
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                size,
+                "the one-slot route drains before the first grouped write"
+            );
         } else if crash {
             tokio::time::timeout(Duration::from_secs(20), async {
                 while w.reload(&job).await.finalizing_at.is_none() {
@@ -200,15 +333,15 @@ async fn run_case(pool: PgPool, fault: Option<(Boundary, Loss)>) {
                 .await
                 .unwrap();
         }
-        let row:(String,Option<i32>,i32) = sqlx::query_as("SELECT l.state,l.segment,j.request_completed FROM batch_lines l JOIN async_jobs j ON j.id=l.job_id WHERE j.id=$1").bind(job.id).fetch_one(&w.f.store.pool).await.unwrap();
+        let rows: Vec<(String, Option<i32>, i32)> = sqlx::query_as("SELECT l.state,l.segment,j.request_completed FROM batch_lines l JOIN async_jobs j ON j.id=l.job_id WHERE j.id=$1").bind(job.id).fetch_all(&w.f.store.pool).await.unwrap();
         let cost = crate::governance::batch::batch_cost(&w.f.store, job.id)
             .await
             .unwrap();
-        assert_eq!((cost.0, cost.1), (15, 0));
+        assert_eq!((cost.0, cost.1), (15 * size as i64, 0));
         if before {
-            assert_eq!(row, ("running".into(), None, 0));
+            assert_eq!(rows, vec![("running".into(), None, 0); size]);
         } else {
-            assert_eq!(row, ("succeeded".into(), Some(0), 1));
+            assert_eq!(rows, vec![("succeeded".into(), Some(0), size as i32); size]);
             let segment: Uuid = sqlx::query_scalar(
                 "SELECT f.id FROM stored_files f JOIN batch_segments s ON s.file_id=f.id
                  WHERE s.job_id=$1 AND s.seq=0 AND f.committed_at IS NOT NULL
@@ -258,8 +391,59 @@ async fn run_case(pool: PgPool, fault: Option<(Boundary, Loss)>) {
         assert!(owner.await.unwrap().unwrap());
     } else {
         lock.rollback().await.unwrap();
-        assert!(old.unwrap().await.unwrap().unwrap());
-        eprintln!("32 serial lines took {:?}", started.elapsed());
+        if let Some(hold) = quota_hold {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !sqlx::query_scalar::<_,bool>(
+                    "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND objid=654715 AND NOT granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database()))"
+                ).fetch_one(&pool).await.unwrap() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.unwrap();
+            assert_eq!(w.reload(&job).await.request_completed, Some(0));
+            assert_eq!(
+                normal_upload(&client, &gateway.base, &auth).await,
+                reqwest::StatusCode::OK,
+                "a normal 64 KiB upload fits while the exact-sized internal write is pending"
+            );
+            hold.rollback().await.unwrap();
+        }
+        let limit = if matches!(case, Case::Measure(_)) {
+            300
+        } else {
+            9
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_secs(limit), old.unwrap())
+                .await
+                .expect("one-slot dispatch should drain")
+                .unwrap()
+                .unwrap()
+        );
+        let elapsed = started.elapsed();
+        if let Some(uploads) = uploads {
+            uploads.await.unwrap();
+        }
+        let seen_sums = if matches!(case, Case::Measure(_)) {
+            sum_calls().await.unwrap() - before_sums
+        } else {
+            0
+        };
+        let (segments, lines, exact, deleted): (i64, i64, bool, bool) = sqlx::query_as(
+            "SELECT count(*), coalesce(sum(s.lines),0), bool_and(f.reserved_bytes=f.size_bytes), bool_and(f.deleted_at IS NOT NULL)
+             FROM batch_segments s JOIN stored_files f ON f.id=s.file_id WHERE s.job_id=$1"
+        ).bind(job.id).fetch_one(&pool).await.unwrap();
+        assert_eq!(lines, size as i64);
+        assert!(deleted, "finalization removes the segment objects");
+        if matches!(case, Case::Group | Case::Quota) {
+            assert_eq!(segments, 1, "one bounded object for the settled responses");
+            assert!(
+                exact,
+                "the pending byte reservation matches the encoded length"
+            );
+        }
+        eprintln!(
+            "{size} serial lines took {elapsed:?}; {segments} segment objects; {seen_sums} quota sums during run"
+        );
     }
     assert_eq!(calls.load(Ordering::SeqCst), size);
     let done = w.reload(&job).await;
@@ -267,7 +451,7 @@ async fn run_case(pool: PgPool, fault: Option<(Boundary, Loss)>) {
         .await
         .unwrap();
     assert_eq!((cost.0, cost.1), (15 * size as i64, 0));
-    let failed = i32::from(before);
+    let failed = if before { size as i32 } else { 0 };
     assert_eq!(
         (done.request_completed, done.request_failed),
         (Some(size as i32 - failed), Some(failed))
@@ -331,7 +515,11 @@ async fn run_case(pool: PgPool, fault: Option<(Boundary, Loss)>) {
         );
     }
     if before {
-        assert_eq!(records[0]["error"]["code"], "result_unavailable");
+        assert!(
+            records
+                .iter()
+                .all(|record| record["error"]["code"] == "result_unavailable")
+        );
     } else {
         for record in records {
             assert_eq!(
@@ -344,21 +532,38 @@ async fn run_case(pool: PgPool, fault: Option<(Boundary, Loss)>) {
 
 #[sqlx::test(migrations = "./enterprise_migrations")]
 async fn crash_before(pool: PgPool) {
-    run_case(pool, Some((Boundary::BeforeCommit, Loss::Crash))).await;
+    run_case(pool, Case::Fault(Boundary::BeforeCommit, Loss::Crash)).await;
 }
 #[sqlx::test(migrations = "./enterprise_migrations")]
 async fn takeover_before(pool: PgPool) {
-    run_case(pool, Some((Boundary::BeforeCommit, Loss::Takeover))).await;
+    run_case(pool, Case::Fault(Boundary::BeforeCommit, Loss::Takeover)).await;
 }
 #[sqlx::test(migrations = "./enterprise_migrations")]
 async fn crash_after(pool: PgPool) {
-    run_case(pool, Some((Boundary::AfterCommit, Loss::Crash))).await;
+    run_case(pool, Case::Fault(Boundary::AfterCommit, Loss::Crash)).await;
 }
 #[sqlx::test(migrations = "./enterprise_migrations")]
 async fn takeover_after(pool: PgPool) {
-    run_case(pool, Some((Boundary::AfterCommit, Loss::Takeover))).await;
+    run_case(pool, Case::Fault(Boundary::AfterCommit, Loss::Takeover)).await;
 }
 #[sqlx::test(migrations = "./enterprise_migrations")]
 async fn serial_results(pool: PgPool) {
-    run_case(pool, None).await;
+    run_case(pool, Case::Group).await;
+}
+
+#[sqlx::test(migrations = "./enterprise_migrations")]
+async fn pending_segment_leaves_room_for_an_ordinary_upload(pool: PgPool) {
+    run_case(pool, Case::Quota).await;
+}
+
+#[sqlx::test(migrations = "./enterprise_migrations")]
+#[ignore = "local timing fixture; PostgreSQL must preload pg_stat_statements"]
+async fn measure_small(pool: PgPool) {
+    run_case(pool, Case::Measure(32)).await;
+}
+
+#[sqlx::test(migrations = "./enterprise_migrations")]
+#[ignore = "local timing fixture; PostgreSQL must preload pg_stat_statements"]
+async fn measure_large(pool: PgPool) {
+    run_case(pool, Case::Measure(2048)).await;
 }

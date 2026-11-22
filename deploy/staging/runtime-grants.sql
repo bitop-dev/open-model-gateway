@@ -386,7 +386,7 @@ GRANT UPDATE(upstream_id,output_file_id,error_file_id,runner_id,runner_epoch,run
 -- A segment commit registers the stored file, matches the running execution,
 -- and updates the line and existing job progress columns under the claim fence.
 GRANT SELECT,INSERT ON public.batch_lines,public.batch_segments TO gateway_runtime;
-GRANT UPDATE(state,attempts,execution_id,status_code,error_code,segment,finished_at)
+GRANT UPDATE(state,attempts,execution_id,status_code,error_code,segment,finished_at,awaiting_segment)
  ON public.batch_lines TO gateway_runtime;
 -- Batch scheduling (0022). Route settings are upserted by platform writers
 -- (never deleted; the route key is fixed). The last gate evaluation of a

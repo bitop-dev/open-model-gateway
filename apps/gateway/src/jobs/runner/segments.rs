@@ -1,55 +1,153 @@
 //! Finished lines stored in encrypted result segments as they complete.
 use super::*;
+use crate::jobs::fence::SegmentLines;
+use tokio::time::Instant;
 
-/// One finished line as a JSON record, newline-terminated.
-pub(super) fn encode_record(r: &Record) -> Result<Vec<u8>, InferenceError> {
-    let mut bytes = serde_json::to_vec(&json!({"n": r.line, "e": r.error, "r": r.value}))
-        .map_err(|_| InferenceError::Storage)?;
-    bytes.push(b'\n');
-    Ok(bytes)
-}
-
-/// Writes one segment file and records it under the next segment number
-/// (taken in the database, inside the fence). A segment that is not stored or
-/// recorded leaves its lines reported unavailable; one the run is no longer
-/// allowed to record is deleted and ends the run's work.
-pub(super) async fn store_segment(
-    store: &Store,
-    files: &crate::filestore::FileStorage,
-    job: &JobRow,
-    state: &RunState,
-    part: impl std::fmt::Display,
+#[derive(Default)]
+struct Segment {
     body: Vec<u8>,
-    held: super::super::fence::SegmentLines<'_>,
-) -> FenceResult<()> {
-    let template = io::batch_file(
-        true,
-        job.workspace_id,
-        job.api_key_id,
-        job.user_id,
-        format!(
-            "batch_{}_part_{}_{part}.jsonl",
-            job.id.simple(),
-            state.fence.epoch
-        ),
-    );
-    let stream = futures_util::stream::once(async move { Ok(axum::body::Bytes::from(body)) });
-    let file = files
-        .create(template, Box::pin(stream))
-        .await
-        .map_err(|_| FenceError::Storage)?
-        .id;
-    let recorded = state
-        .fence
-        .insert_segment(store, job.workspace_id, file, held)
-        .await;
-    if matches!(recorded, Err(FenceError::Stale | FenceError::Storage)) {
-        let _ = files.delete(file, Some(job.workspace_id)).await;
-    }
-    recorded.map(|_| ())
+    succeeded: Vec<(i32, Uuid)>,
+    failed: Vec<i32>,
+    deadline: Option<Instant>,
 }
 
-/// Store finished lines in encrypted segments as they complete.
+impl Segment {
+    fn push(&mut self, record: Record, encoded: Vec<u8>) -> bool {
+        self.deadline
+            .get_or_insert_with(|| Instant::now() + SEGMENT_AGE);
+        self.body.extend(encoded);
+        if let Some(execution) = record.execution {
+            self.succeeded.push((record.line, execution));
+        } else {
+            self.failed.push(record.line);
+        }
+        self.succeeded.len() + self.failed.len() >= SEGMENT_LINES
+            || self.body.len() >= SEGMENT_BYTES
+    }
+}
+
+struct Writer {
+    store: Store,
+    files: crate::filestore::FileStorage,
+    job: JobRow,
+    state: Arc<RunState>,
+    part: u32,
+}
+
+impl Writer {
+    async fn store_segment(&mut self, body: Vec<u8>, lines: SegmentLines<'_>) -> FenceResult<()> {
+        let job = &self.job;
+        let mut template = io::batch_file(
+            true,
+            job.workspace_id,
+            job.api_key_id,
+            job.user_id,
+            format!(
+                "batch_{}_part_{}_{}.jsonl",
+                job.id.simple(),
+                self.state.fence.epoch,
+                self.part
+            ),
+        );
+        self.part += 1;
+        template.max_bytes = Some(body.len() as u64);
+        let stream = futures_util::stream::once(async move { Ok(axum::body::Bytes::from(body)) });
+        let file = self
+            .files
+            .create(template, Box::pin(stream))
+            .await
+            .map_err(|_| FenceError::Storage)?
+            .id;
+        let recorded = self
+            .state
+            .fence
+            .insert_segment(&self.store, job.workspace_id, file, lines)
+            .await;
+        if matches!(recorded, Err(FenceError::Stale | FenceError::Storage)) {
+            let _ = self.files.delete(file, Some(job.workspace_id)).await;
+        }
+        recorded.map(|_| ())
+    }
+
+    /// A stopped writer drops its receiver so no producer can block on send.
+    async fn flush(&mut self, pending: &mut Segment) -> bool {
+        if pending.body.is_empty() {
+            return true;
+        }
+        let Segment {
+            body,
+            succeeded,
+            failed,
+            ..
+        } = std::mem::take(pending);
+        let result = if self.state.fenced.load(Ordering::SeqCst) {
+            Err(FenceError::Stale)
+        } else {
+            self.store_segment(
+                body,
+                SegmentLines {
+                    succeeded: &succeeded,
+                    failed: &failed,
+                },
+            )
+            .await
+        };
+        let unknown = matches!(result, Err(FenceError::Unknown));
+        match self.state.written(result) {
+            Ok(Some(())) => {
+                crate::metrics::METRICS.observe_batch_lines(
+                    "gateway",
+                    &self.job.provider,
+                    succeeded.len() as u64,
+                    0,
+                );
+            }
+            Ok(None) => {
+                for (line, execution) in succeeded {
+                    tracing::warn!(execution_id = %execution, line, "batch line outcome not recorded: the runner no longer holds the batch");
+                }
+                return false;
+            }
+            Err(_) if unknown || !succeeded.is_empty() => {
+                self.state.lost.store(true, Ordering::SeqCst);
+                tracing::warn!(job_id = %self.job.id, "batch segment commit not confirmed");
+                return false;
+            }
+            Err(_) => {
+                tracing::warn!(job_id = %self.job.id, "batch error segment unavailable");
+            }
+        }
+        true
+    }
+}
+
+enum Incoming {
+    Record(Record),
+    Flush,
+    Closed,
+}
+
+async fn receive(
+    records: &mut mpsc::Receiver<Record>,
+    state: &RunState,
+    deadline: Option<Instant>,
+) -> Incoming {
+    let age = async {
+        match deadline {
+            Some(at) => tokio::time::sleep_until(at).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = age => Incoming::Flush,
+        _ = state.doubt.notified() => Incoming::Flush,
+        record = records.recv() => record.map_or(Incoming::Closed, Incoming::Record),
+    }
+}
+
+/// Group results up to the row, byte or oldest-record age limit. Flush a
+/// partial group when dispatch and its in-flight tasks close the channel.
 pub(super) async fn write_segments(
     store: Store,
     files: crate::filestore::FileStorage,
@@ -57,53 +155,41 @@ pub(super) async fn write_segments(
     state: Arc<RunState>,
     mut records: mpsc::Receiver<Record>,
 ) -> Result<(), InferenceError> {
-    let mut part = 0u32;
-    let mut buffer: Vec<u8> = Vec::new();
-    let mut lines: Vec<i32> = Vec::new();
-    let mut open = true;
-    while open {
-        let deadline = tokio::time::sleep(SEGMENT_AGE);
-        tokio::pin!(deadline);
-        let flush = tokio::select! {
-            record = records.recv() => match record {
-                Some(r) => {
-                    let bytes = encode_record(&r)?;
-                    buffer.extend_from_slice(&bytes);
-                    lines.push(r.line);
-                    lines.len() >= SEGMENT_LINES || buffer.len() >= SEGMENT_BYTES
+    let mut writer = Writer {
+        store,
+        files,
+        job,
+        state,
+        part: 0,
+    };
+    let mut segment = Segment::default();
+    loop {
+        match receive(&mut records, &writer.state, segment.deadline).await {
+            Incoming::Record(record) => {
+                let mut bytes = serde_json::to_vec(&json!({
+                    "n": record.line, "e": record.execution.is_none(), "r": record.value
+                }))
+                .map_err(|_| InferenceError::Storage)?;
+                bytes.push(b'\n');
+                // A single response may exceed the grouping target. Store it alone.
+                if segment.body.len() + bytes.len() > SEGMENT_BYTES
+                    && !writer.flush(&mut segment).await
+                {
+                    break;
                 }
-                None => {
-                    open = false;
-                    true
+                if segment.push(record, bytes) && !writer.flush(&mut segment).await {
+                    break;
                 }
-            },
-            _ = &mut deadline => true,
-            // The lease is in doubt: store what is held before a takeover
-            // can refuse it.
-            _ = state.doubt.notified() => true,
-        };
-        if !flush || lines.is_empty() {
-            continue;
-        }
-        let body = std::mem::take(&mut buffer);
-        let held = std::mem::take(&mut lines);
-        // A run the fence refused stores nothing more; what it holds is
-        // dropped (the owner reports those lines unavailable).
-        if !state.fenced.load(Ordering::SeqCst) {
-            let result = store_segment(
-                &store,
-                &files,
-                &job,
-                &state,
-                part,
-                body,
-                super::super::fence::SegmentLines::Failed(&held),
-            )
-            .await;
-            if state.written(result).is_err() {
-                tracing::warn!(job_id = %job.id, "batch error segment unavailable");
             }
-            part += 1;
+            Incoming::Flush => {
+                if !writer.flush(&mut segment).await {
+                    break;
+                }
+            }
+            Incoming::Closed => {
+                writer.flush(&mut segment).await;
+                break;
+            }
         }
     }
     Ok(())
@@ -138,7 +224,7 @@ impl Probe {
         self.records
             .send(Record {
                 line,
-                error: true,
+                execution: None,
                 value,
             })
             .await
@@ -154,5 +240,36 @@ impl Probe {
     pub(crate) async fn close(self) {
         drop(self.records);
         self.writer.await.unwrap().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_records_do_not_delay_the_oldest_record_flush() {
+        let state = RunState::new(BatchFence {
+            job: Uuid::nil(),
+            runner: Uuid::nil(),
+            epoch: 1,
+        });
+        let record = |line| Record {
+            line,
+            execution: None,
+            value: Value::Null,
+        };
+        let mut segment = Segment::default();
+        assert!(!segment.push(record(0), vec![b'a']));
+        let (tx, mut rx) = mpsc::channel(1);
+        tokio::time::advance(SEGMENT_AGE - Duration::from_millis(1)).await;
+        assert!(!segment.push(record(1), vec![b'b']));
+        tx.try_send(record(2)).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(matches!(
+            receive(&mut rx, &state, segment.deadline).await,
+            Incoming::Flush
+        ));
+        assert_eq!(rx.try_recv().unwrap().line, 2);
     }
 }

@@ -316,7 +316,7 @@ async fn every_claim_of_a_batch_moves_its_epoch_on(pool: PgPool) {
 
 #[dbtest::test]
 async fn a_stale_claim_writes_nothing_and_a_current_one_everything(pool: PgPool) {
-    let (w, job) = batch(pool, &[("a", "plain"), ("b", "plain")]).await;
+    let (w, job) = batch(pool, &[("a", "plain"), ("b", "plain"), ("c", "plain")]).await;
     let old = claim(&w, &job).await;
     assert!(
         old.claim_line(&w.f.store, job.workspace_id, 0, Uuid::new_v4())
@@ -341,7 +341,10 @@ async fn a_stale_claim_writes_nothing_and_a_current_one_everything(pool: PgPool)
             s,
             job.workspace_id,
             Uuid::new_v4(),
-            SegmentLines::Failed(&[0])
+            SegmentLines {
+                failed: &[0],
+                ..Default::default()
+            }
         )
         .await
     ));
@@ -387,22 +390,36 @@ async fn a_stale_claim_writes_nothing_and_a_current_one_everything(pool: PgPool)
             .unwrap()
     );
     assert!(new.retry_line(s, 1, 1, execution).await.unwrap());
-    let record = |execution| {
+    let second = Uuid::new_v4();
+    assert!(
+        new.claim_line(s, job.workspace_id, 2, second)
+            .await
+            .unwrap()
+    );
+    assert!(!new.await_segment(s, 1, first_execution).await.unwrap());
+    assert!(new.await_segment(s, 1, execution).await.unwrap());
+    assert!(new.await_segment(s, 2, second).await.unwrap());
+    let record = |execution| async move {
         new.insert_segment(
             s,
             job.workspace_id,
             file,
-            SegmentLines::Success { line: 1, execution },
+            SegmentLines {
+                succeeded: &[(1, execution), (2, second)],
+                ..Default::default()
+            },
         )
+        .await
     };
     assert!(matches!(
         record(first_execution).await,
         Err(FenceError::Storage)
     ));
     assert_eq!(w.reload(&job).await.request_completed, Some(0));
+    assert_eq!(segments(&w, &job).await, 0);
     assert_eq!(record(execution).await.unwrap(), 0);
     assert!(matches!(record(execution).await, Err(FenceError::Storage)));
-    assert_eq!(w.reload(&job).await.request_completed, Some(1));
+    assert_eq!(w.reload(&job).await.request_completed, Some(2));
     assert_eq!(segments(&w, &job).await, 1);
 }
 
@@ -447,7 +464,15 @@ async fn a_taken_segment_number_never_blocks_the_owners_later_flushes(pool: PgPo
     for n in 1..=3u8 {
         seqs.push(
             fence
-                .insert_segment(&w.f.store, ws, file(n).await, SegmentLines::Failed(&[0]))
+                .insert_segment(
+                    &w.f.store,
+                    ws,
+                    file(n).await,
+                    SegmentLines {
+                        failed: &[0],
+                        ..Default::default()
+                    },
+                )
                 .await
                 .unwrap(),
         );
@@ -677,16 +702,39 @@ async fn a_takeover_between_the_result_files_and_finishing_leaves_no_duplicate_f
 #[dbtest::test]
 async fn a_committed_result_survives_takeover_with_another_line_in_flight(pool: PgPool) {
     let (w, job) = batch(pool, &[("a", "plain"), ("b", "hold-b")]).await;
+    sqlx::query("INSERT INTO deployment_batch_scheduling(deployment_id,max_concurrency,updated_by) VALUES($1,1,$2)")
+        .bind(w.f.deployment).bind(w.f.owner).execute(&w.f.store.pool).await.unwrap();
     let held = w.openai.gate("hold-b");
     let old = start(&w);
-    held.entered.notified().await;
-    let state: (String, Option<i32>) =
-        sqlx::query_as("SELECT state,segment FROM batch_lines WHERE job_id=$1 AND line_no=0")
-            .bind(job.id)
-            .fetch_one(&w.f.store.pool)
+    tokio::time::timeout(Duration::from_secs(5), held.entered.notified())
+        .await
+        .expect("the second provider call needs no segment flush to start");
+    let line = || {
+        sqlx::query_as::<_, (String, Option<i32>, bool)>(
+            "SELECT state,segment,awaiting_segment FROM batch_lines WHERE job_id=$1 AND line_no=0",
+        )
+        .bind(job.id)
+        .fetch_one(&w.f.store.pool)
+    };
+    assert_eq!(line().await.unwrap(), ("running".into(), None, true));
+    assert_eq!(w.reload(&job).await.request_completed, Some(0));
+    assert_eq!(
+        crate::jobs::schedule::Scheduler::new(w.f.store.clone(), None)
+            .running_lines(w.f.deployment)
             .await
-            .unwrap();
-    assert_eq!(state, ("succeeded".into(), Some(0)));
+            .unwrap(),
+        1
+    );
+    tokio::time::timeout(Duration::from_secs(13), async {
+        loop {
+            if line().await.unwrap() == ("succeeded".into(), Some(0), false) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the oldest outcome must flush while another provider is blocked");
     assert_eq!(segments(&w, &job).await, 1);
     lapse(&w, &job).await;
     assert!(Runner::new(w.jobs.clone()).run_next().await.unwrap());
@@ -990,4 +1038,116 @@ async fn a_rejected_finish_is_a_certain_failure_and_a_refused_one_is_stale(pool:
         Err(FenceError::Stale)
     ));
     assert_eq!(w.reload(&job).await.state, "queued");
+}
+
+#[dbtest::test]
+async fn cancelling_flushes_queued_and_in_flight_answers_without_running_the_tail(pool: PgPool) {
+    let (w, job) = batch(pool, &[("a", "plain"), ("b", "hold-b"), ("c", "never")]).await;
+    let held = w.openai.gate("hold-b");
+    let running = start(&w);
+    tokio::time::timeout(Duration::from_secs(5), held.entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(w.reload(&job).await.request_completed, Some(0));
+    let lease = || {
+        sqlx::query_scalar::<_, gateway_datetime_compat::UtcInstant>(
+            "SELECT runner_lease_until FROM async_jobs WHERE id=$1",
+        )
+        .bind(job.id)
+        .fetch_one(&w.f.store.pool)
+    };
+    let initial = lease().await.unwrap();
+    w.jobs
+        .cancel_batch(&w.f.principal, &client_id("batch_", job.id))
+        .await
+        .unwrap();
+    // Let the active runner observe cancel before its current provider call returns.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while lease().await.unwrap() == initial {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    held.release.notify_one();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+    );
+    let done = w.reload(&job).await;
+    assert_eq!(done.state, "cancelled");
+    assert_eq!(w.openai.executed(), ["plain", "hold-b"]);
+    let ws = w.f.principal.workspace_id;
+    let output = w.read(ws, done.output_file_id).await;
+    assert_eq!(
+        output
+            .iter()
+            .map(|line| line["custom_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    let errors = w.read(ws, done.error_file_id).await;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0]["custom_id"], "c");
+    assert_eq!(errors[0]["error"]["code"], "batch_cancelled");
+    consistent(&w.f).await;
+}
+
+#[dbtest::test]
+async fn a_segment_commit_error_keeps_the_file_and_recovery_does_not_replay(pool: PgPool) {
+    let (w, job) = batch(pool, &[("a", "one"), ("b", "two")]).await;
+    let db = &w.f.store.pool;
+    sqlx::raw_sql(
+        "CREATE FUNCTION fail_segment_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'segment commit refused' USING ERRCODE='23514'; END $$;
+        CREATE CONSTRAINT TRIGGER fail_segment_commit AFTER INSERT ON batch_segments
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fail_segment_commit()",
+    )
+    .execute(db)
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(9), start(&w))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+    );
+    let waiting = w.reload(&job).await;
+    assert_eq!(waiting.state, "in_progress");
+    assert_eq!(waiting.request_completed, Some(0));
+    assert_eq!(segments(&w, &job).await, 0);
+    let retained: i64 = sqlx::query_scalar("SELECT count(*) FROM stored_files WHERE workspace_id=$1
+        AND filename LIKE 'batch_%_part_%' AND deleted_at IS NULL AND committed_at IS NOT NULL AND api_purpose IS NULL")
+        .bind(job.workspace_id).fetch_one(db).await.unwrap();
+    assert_eq!(
+        retained, 1,
+        "an unacknowledged commit leaves one private object"
+    );
+    sqlx::query("DROP TRIGGER fail_segment_commit ON batch_segments")
+        .execute(db)
+        .await
+        .unwrap();
+    assert!(start(&w).await.unwrap().unwrap());
+    let done = w.reload(&job).await;
+    assert_eq!(
+        (done.request_completed, done.request_failed),
+        (Some(0), Some(2))
+    );
+    assert_eq!(w.openai.executed(), ["one", "two"]);
+    let errors = w.read(job.workspace_id, done.error_file_id).await;
+    assert_eq!(errors.len(), 2);
+    assert!(
+        errors
+            .iter()
+            .all(|e| e["error"]["code"] == "result_unavailable")
+    );
+    let cost = crate::governance::batch::batch_cost(&w.f.store, job.id)
+        .await
+        .unwrap();
+    assert_eq!((cost.0, cost.1), (30, 0));
+    consistent(&w.f).await;
 }

@@ -289,8 +289,8 @@ impl Runner {
             tracing::warn!(job_id = %job.id, "batch budget hold unavailable; remaining lines will not run");
             state.hold_unavailable.store(true, Ordering::SeqCst);
         }
-        let line = self.line_run(job, files, engine, endpoint, &state);
-        let (records, receiver) = mpsc::channel::<Record>(64);
+        let line = self.line_run(job, engine, endpoint, &state);
+        let (records, receiver) = mpsc::channel::<Record>(8);
         let writer = tokio::spawn(write_segments(
             store.clone(),
             files.clone(),
@@ -366,7 +366,6 @@ impl Runner {
     fn line_run(
         &self,
         job: &JobRow,
-        files: &crate::filestore::FileStorage,
         engine: Engine,
         endpoint: BatchEndpoint,
         state: &Arc<RunState>,
@@ -382,7 +381,6 @@ impl Runner {
             claimed: Mutex::default(),
         });
         Arc::new(LineRun {
-            files: files.clone(),
             store: store.clone(),
             engine: engine.with_repository(repository.clone(), self.jobs.limits.batch_concurrency),
             repository,
