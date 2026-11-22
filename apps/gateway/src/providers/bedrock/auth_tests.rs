@@ -289,10 +289,10 @@ async fn assumed_role_uses_server_identity_external_id_and_signs_bedrock_with_ro
         "server-identity",
     ));
     // Production builds the same STS configuration; only the test points it at loopback.
-    let sts = auth::sts_config("us-east-1", server_identity)
-        .into_builder()
-        .endpoint_url(&sts_base)
-        .build();
+    let sts = auth::sts_config_for_tests("us-east-1", server_identity);
+    assert!(sts.http_client().is_none());
+    assert!(sts.endpoint_url().is_none());
+    let sts = sts.into_builder().endpoint_url(&sts_base).build();
     let role = auth::assume_role_provider(ROLE, Some("tenant-ext-42"), None, &sts).await;
     let mock = Mock::serve(complete(false), Vec::new(), 200).await;
     let mut adapter = BedrockAdapter::new().unwrap();
@@ -335,7 +335,7 @@ async fn assumed_role_uses_server_identity_external_id_and_signs_bedrock_with_ro
 #[tokio::test]
 async fn assumed_role_session_name_is_configurable() {
     let (sts_base, sts_requests, sts_task) = sts_mock().await;
-    let sts = auth::sts_config(
+    let sts = auth::sts_config_for_tests(
         "eu-central-1",
         SharedCredentialsProvider::new(Credentials::new("AKIDSERVER", "s", None, None, "t")),
     )
@@ -392,7 +392,7 @@ async fn an_sts_response_date_never_moves_the_signing_time() {
         None,
         "server-identity",
     ));
-    let sts = auth::sts_config("us-east-1", server_identity)
+    let sts = auth::sts_config_for_tests("us-east-1", server_identity)
         .into_builder()
         .endpoint_url(&base)
         .build();

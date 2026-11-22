@@ -73,6 +73,16 @@ impl S3Auth {
     }
 }
 
+/// Operator-configured trust material, held privately by `S3Settings`.
+pub(crate) struct S3CaBundle(Vec<u8>);
+
+impl S3CaBundle {
+    pub(crate) fn certificates(&self) -> anyhow::Result<Vec<reqwest::Certificate>> {
+        reqwest::Certificate::from_pem_bundle(&self.0)
+            .map_err(|_| anyhow::anyhow!("{CA_FILE_ENV} is not a PEM certificate bundle"))
+    }
+}
+
 /// Validated S3 configuration. No Debug.
 pub struct S3Settings {
     pub(crate) bucket: String,
@@ -81,7 +91,7 @@ pub struct S3Settings {
     pub(crate) endpoint: Option<String>,
     pub(crate) path_style: bool,
     pub(crate) auth: S3Auth,
-    pub(crate) ca_pem: Option<Vec<u8>>,
+    ca_bundle: Option<S3CaBundle>,
 }
 
 fn charset(value: &str, extra: &[u8]) -> bool {
@@ -254,12 +264,13 @@ impl S3Settings {
             );
             S3Auth::Aws(auth)
         };
-        let ca_pem = match get(CA_FILE_ENV) {
+        let ca_bundle = match get(CA_FILE_ENV) {
             None => None,
-            Some(path) => Some(
-                std::fs::read(&path)
-                    .map_err(|_| anyhow::anyhow!("{CA_FILE_ENV} could not be read"))?,
-            ),
+            Some(path) => {
+                let pem = std::fs::read(path)
+                    .map_err(|_| anyhow::anyhow!("{CA_FILE_ENV} could not be read"))?;
+                Some(S3CaBundle(pem))
+            }
         };
         Ok(Self {
             bucket,
@@ -268,7 +279,7 @@ impl S3Settings {
             endpoint,
             path_style,
             auth,
-            ca_pem,
+            ca_bundle,
         })
     }
 
@@ -368,14 +379,16 @@ impl S3Backend {
                 aws_auth::credentials(auth, region).await
             }
         };
-        let http = transport::client(settings.ca_pem.as_deref())?;
         let mut builder = aws_sdk_s3::Config::builder();
         builder.set_endpoint_url(settings.endpoint.clone());
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "S3 installs the gateway transport"
+        )]
         let config = builder
             .behavior_version(aws_auth::sdk_behavior_version())
             .region(Region::new(settings.region.clone()))
             .credentials_provider(credentials)
-            .http_client(http)
             .retry_config(RetryConfig::standard().with_max_attempts(1))
             // Sign with this host's clock only: a response's Date header must
             // not move the signing time (the SDK's skew correction is on by
@@ -405,6 +418,7 @@ impl S3Backend {
             .disable_s3_express_session_auth(true)
             .disable_multi_region_access_points(true)
             .use_arn_region(false)
+            .http_client(transport::client(settings.ca_bundle.as_ref())?)
             .build();
         Ok(Self {
             client: Client::from_conf(config),
