@@ -43,8 +43,10 @@
 //! This syntax check follows expression tails (including if/match arms and
 //! closure bodies), call arguments, method receivers, unwrap_or arguments,
 //! casts, `?` and `.await`. It checks free static/const initializers, plain
-//! local assignments, and let patterns (including let-else and if-let) for
-//! identifiers and matching tuple/array literals. Other patterns (such as
+//! local assignments, and identifier bindings in let, let-else and if-let.
+//! Tuple and slice patterns are checked position by position when the
+//! initializer is a tuple or array literal. Destructuring a tuple or array
+//! returned by an `if` or `match` requires review. Other patterns (such as
 //! `Some(token)` or the captured rest slice itself), associated constants,
 //! earlier bindings, early returns and other method arguments require review.
 //! The check does not expand Rust macros
