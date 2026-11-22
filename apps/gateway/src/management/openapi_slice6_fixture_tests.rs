@@ -1964,15 +1964,33 @@ async fn slice6_fixtures(pool: PgPool, shard: usize) -> (PositiveFixtures, Vec<S
     w.status(&member, "GET", &batchpath, None, StatusCode::NOT_FOUND)
         .await;
     fresh_waits(&pool).await;
-    w.json(&owner, "GET", &format!("{ws}/batches"), None).await;
-    for j in [j0, j1, j2, j3, j4, j5] {
-        w.json(
-            &owner,
-            "GET",
-            &format!("{ws}/batches/batch_{}", j.simple()),
-            None,
-        )
-        .await;
+    let batches = w.json(&owner, "GET", &format!("{ws}/batches"), None).await;
+    let active_id = format!("batch_{}", j2.simple());
+    let active = batches["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == active_id)
+        .unwrap();
+    assert_eq!(active["running_lines"], 2);
+
+    // Both provider calls have finished, but their result segment is still pending.
+    sqlx::query("UPDATE batch_lines SET execution_id=gen_random_uuid(),awaiting_segment=true WHERE job_id=$1")
+        .bind(j2).execute(&pool).await.unwrap();
+    fresh_waits(&pool).await;
+    for j in [j2, j0, j1, j3, j4, j5] {
+        let detail = w
+            .json(
+                &owner,
+                "GET",
+                &format!("{ws}/batches/batch_{}", j.simple()),
+                None,
+            )
+            .await;
+        if j == j2 {
+            assert_eq!(detail["batch"]["running_lines"], 0);
+            assert_eq!(detail["batch"]["waiting_reason"], "workers");
+        }
     }
     w.json(&auditor, "GET", "/api/v1/platform/batches", None)
         .await;
