@@ -45,6 +45,13 @@ for (const [name, args] of Object.entries(profiles)) {
   });
 }
 
+test("the CNPG cluster renders a digest-pinned upstream image", () => {
+  for (const profile of ["cnpg", "loadtest"]) {
+    const [cluster] = docsOfKind(helmTemplate(profiles[profile]), "Cluster");
+    assert.match(cluster, /^  imageName: ghcr\.io\/cloudnative-pg\/postgresql:17\.6@sha256:[a-f0-9]{64}$/m);
+  }
+});
+
 test("inference base URL is optional, display-only configuration", () => {
   const args = ["-f", join(chart, "ci/external-db-values.yaml")];
   const [unset] = docsOfKind(helmTemplate(args), "ConfigMap");
@@ -64,6 +71,9 @@ test("loadgen Job passes the arguments `loadgen run` accepts", () => {
     "--set", "loadtest.loadgen.rate=750", "--set", "loadtest.loadgen.duration=120", "--set", "loadtest.loadgen.extraArgs={--readers,4}"]);
   const [job] = docsOfKind(rendered, "Job").filter((doc) => /name: omg-test-[\w-]*loadgen/.test(doc));
   assert.ok(job, "no loadgen Job rendered");
+  assert.match(job, /^\s+image: "omg-loadtest:local"$/m);
+  const [mock] = docsOfKind(rendered, "Deployment").filter((doc) => /component: loadtest-mock-upstream/.test(doc));
+  assert.match(mock, /^\s+image: "omg-loadtest:local"$/m);
   const args = [...job.matchAll(/^\s+- "?([^"\n]*)"?$/gm)].map((m) => m[1]);
   const at = (flag) => args[args.indexOf(flag) + 1];
   assert.equal(args[args.indexOf("run")], "run");

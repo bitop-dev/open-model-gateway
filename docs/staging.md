@@ -14,7 +14,7 @@ This is a **single-host staging baseline, not approval for public production lau
 
 Tag the gateway image with the Git commit and promote the tested digest. For rollback, use the previously tested digest. The Dockerfile pins the Node, Rust and runtime base images by digest. Staging Compose also pins its default PostgreSQL and Caddy images to reviewed digests at `mirror.gcr.io`. To replace either default, set `STAGING_POSTGRES_IMAGE` or `STAGING_CADDY_IMAGE` to the reviewed image and digest in `staging.env` or the environment.
 
-The gateway, migration and grant services use the gateway image already in the local image store. Build the staging gateway first, or pull the selected release digest before setting `GATEWAY_IMAGE` to that reference. The release rehearsal follows this pull-by-digest path. [Image verification](verification.md#no-docker-hub-pulls-in-ci)
+The gateway, migration and grant services use the gateway image already in the local image store. Use `scripts/staging.py build` to build the local tag, or pull the selected release digest before setting `GATEWAY_IMAGE` to that reference. A missing gateway image makes Compose fail with `No such image`. The release rehearsal follows the pull-by-digest path. [Image verification](verification.md#no-docker-hub-pulls-in-ci)
 
 ## Image CI and registry publication
 
