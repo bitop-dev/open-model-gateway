@@ -172,3 +172,204 @@ async fn failed_tool_result_batch_sends_explicit_bedrock_status(pool: PgPool) {
         json!({"toolUseId":"call","status":"error","content":[{"text":"failed"}]})
     );
 }
+
+#[dbtest::test]
+async fn priority_batch_prices_and_dispatches_adaptive_thinking_on_anthropic(pool: PgPool) {
+    adaptive_thinking_batch(pool, "priority").await;
+}
+
+#[dbtest::test]
+async fn weighted_batch_prices_and_dispatches_adaptive_thinking_on_anthropic(pool: PgPool) {
+    adaptive_thinking_batch(pool, "weighted").await;
+}
+
+async fn adaptive_thinking_batch(pool: PgPool, strategy: &str) {
+    use crate::providers::{
+        anthropic::AnthropicAdapter,
+        secrets::{Secret, SecretResolver},
+    };
+
+    struct Resolver;
+    impl SecretResolver for Resolver {
+        fn resolve(&self, _: &str) -> Result<Secret, InferenceError> {
+            Secret::new("loopback-only".into())
+        }
+    }
+
+    let (mut w, bedrock_calls, _bedrock) = bedrock_world(pool.clone()).await;
+    sqlx::query("INSERT INTO routing_policies(model_id,strategy) VALUES($1,$2)")
+        .bind(w.claude)
+        .bind(strategy)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (connection, anthropic, price) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO provider_connections(id,name,provider,credential_ref,enabled)
+         VALUES($1,'Batch Anthropic','anthropic','env:LOOPBACK_ONLY',true)",
+    )
+    .bind(connection)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO deployments(id,model_id,provider_connection_id,upstream_model,enabled)
+         VALUES($1,$2,$3,'claude-loopback',false)",
+    )
+    .bind(anthropic)
+    .bind(w.claude)
+    .bind(connection)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO deployment_prices(
+            id,deployment_id,input_microusd_per_million,output_microusd_per_million,
+            input_token_limit,output_token_limit,pricing_version
+         ) VALUES($1,$2,3000000,4000000,100,100,1)",
+    )
+    .bind(price)
+    .bind(anthropic)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO deployment_routing(deployment_id,priority) VALUES($1,0),($2,10)")
+        .bind(w.claude_deployment)
+        .bind(anthropic)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let anthropic_calls = Arc::new(Mutex::new(Vec::new()));
+    let capture = anthropic_calls.clone();
+    let (upstream, _anthropic) = serve(axum::Router::new().fallback(
+        move |uri: axum::http::Uri, axum::Json(body): axum::Json<Value>| async move {
+            capture.lock().unwrap().push((uri.path().to_owned(), body));
+            axum::Json(json!({
+                "id":"msg_loopback","type":"message","role":"assistant","model":"claude-loopback",
+                "content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn",
+                "usage":{"input_tokens":4,"output_tokens":1,
+                         "cache_read_input_tokens":0,"cache_creation_input_tokens":0}
+            }))
+        },
+    ))
+    .await;
+    let mut registry = ProviderRegistry::default();
+    registry
+        .register(w.jobs.registry.get("bedrock").unwrap())
+        .unwrap();
+    registry
+        .register(Arc::new(AnthropicAdapter::for_test(
+            Arc::new(Resolver),
+            format!("{upstream}/v1"),
+        )))
+        .unwrap();
+    let engine = Engine::new(
+        Arc::new(w.f.store.clone()),
+        registry,
+        EngineLimits::default(),
+    )
+    .unwrap();
+    let runtime = FileStoreRuntime::memory();
+    w.files = crate::filestore::FileStorage::new(w.f.store.clone(), runtime.clone());
+    w.jobs = Jobs::new(w.f.store.clone(), &engine).with_files(Some(runtime.clone()));
+    let (gateway, _gateway) = serve(
+        crate::http::router_with_engine(w.f.store.clone(), None, engine)
+            .layer(axum::Extension(runtime)),
+    )
+    .await;
+    let auth = crate::jobs::db_tests::bearer(&w.f, w.f.principal.workspace_id).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let create = |file: String| {
+        client
+            .post(format!("{gateway}/v1/batches"))
+            .header("authorization", &auth)
+            .json(
+                &json!({"input_file_id":file,"endpoint":"/v1/messages","completion_window":"24h"}),
+            )
+            .send()
+    };
+    let line = |max| {
+        json!({
+            "custom_id":"thinking","method":"POST","url":"/v1/messages",
+            "body":{"model":"company/claude","max_tokens":max,"thinking":{"type":"adaptive"},
+                    "messages":[{"role":"user","content":"ping"}]}
+        })
+    };
+    let runner = Runner::new(w.jobs.clone());
+
+    // At the Bedrock ceiling, the only refusal is the unsupported thinking option.
+    let file = w.upload(&w.f.principal, &[line(50)]).await;
+    let before = admission_rowcounts(&w.f).await;
+    let response = create(file).await.unwrap();
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "invalid_batch_input");
+    assert_eq!(body["errors"]["data"][0]["line"], 1);
+    assert_eq!(body["errors"]["data"][0]["code"], "invalid_body");
+    assert_eq!(admission_rowcounts(&w.f).await, before);
+    assert!(!runner.run_next().await.unwrap());
+    assert!(bedrock_calls.lock().unwrap().is_empty());
+    assert!(anthropic_calls.lock().unwrap().is_empty());
+
+    // Bedrock has higher priority and a ceiling of 50. The compatible route
+    // accepts 51, so its ceiling and price must govern admission and dispatch.
+    sqlx::query("UPDATE deployments SET enabled=true WHERE id=$1")
+        .bind(anthropic)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let file = w.upload(&w.f.principal, &[line(51)]).await;
+    let response = create(file).await.unwrap();
+    let status = response.status();
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    let job = store::reload(
+        &w.f.store,
+        sqlx::query_scalar("SELECT id FROM async_jobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(job.mode(), Some(BatchMode::Gateway));
+    assert_eq!(job.deployment_id, anthropic);
+    assert_eq!(reservation(&w.f, job.execution_id).await.1, Some(504));
+    assert!(bedrock_calls.lock().unwrap().is_empty());
+    assert!(anthropic_calls.lock().unwrap().is_empty());
+
+    assert!(runner.run_next().await.unwrap());
+    let job = w.reload(&job).await;
+    assert_eq!(
+        (job.request_completed, job.request_failed),
+        (Some(1), Some(0))
+    );
+    let output = w.read(w.f.principal.workspace_id, job.output_file_id).await;
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0]["response"]["status_code"], 200);
+    let child: (Uuid, Uuid, Option<i64>) = sqlx::query_as(
+        "SELECT e.deployment_id, r.price_id, r.actual_microusd
+         FROM inference_executions e JOIN governance_reservations r ON r.execution_id=e.id
+         WHERE e.batch_job_id=$1",
+    )
+    .bind(job.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(child, (anthropic, price, Some(16)));
+    assert!(bedrock_calls.lock().unwrap().is_empty());
+    {
+        let calls = anthropic_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "/v1/messages");
+        assert_eq!(calls[0].1["model"], "claude-loopback");
+        assert_eq!(calls[0].1["max_tokens"], 51);
+        assert_eq!(calls[0].1["thinking"], json!({"type":"adaptive"}));
+    }
+    consistent(&w.f).await;
+}
