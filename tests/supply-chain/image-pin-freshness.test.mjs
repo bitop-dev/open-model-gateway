@@ -92,14 +92,20 @@ console.log(JSON.stringify({digest: current, manifests}));
   assert.deepEqual(lookups.sort(), [...expected].sort());
 
   const failed = run(true);
-  for (const job of ["gateway-tests", "gateway-special", "browser"]) {
-    const [service, config] = Object.entries(loadWorkflow("ci").jobs[job].services)
-      .find(([, entry]) => (entry.image ?? entry).startsWith(postgres + "@"));
-    const pinned = config.image ?? config;
-    const where = `.github/workflows/ci.yml job '${job}' services.${service}`;
-    assert.ok(result.stderr.split("\n").includes(`${where}: ${postgres} moved from ${pinned.split("@")[1]} to sha256:${"e".repeat(64)}`), where);
-    assert.ok(failed.stderr.split("\n").includes(`${where}: lookup exited 1 for ${pinned}`), where);
+  const driftLines = result.stderr.split("\n");
+  const failureLines = failed.stderr.split("\n");
+  const postgresJobs = new Set();
+  for (const [job, config] of Object.entries(loadWorkflow("ci").jobs)) {
+    for (const [service, entry] of Object.entries(config.services ?? {})) {
+      const pinned = typeof entry === "string" ? entry : entry?.image;
+      if (!pinned?.startsWith(postgres + "@")) continue;
+      postgresJobs.add(job);
+      const where = imagePinLocation(`.github/workflows/ci.yml job '${job}' services.${service}`);
+      assert.ok(driftLines.includes(`${where}: ${postgres} moved from ${pinned.split("@")[1]} to sha256:${"e".repeat(64)}`), where);
+      assert.ok(failureLines.includes(`${where}: lookup exited 1 for ${pinned}`), where);
+    }
   }
+  for (const job of ["gateway-tests", "gateway-special", "browser"]) assert.ok(postgresJobs.has(job), job);
 });
 
 test("scheduled and manual image freshness uses read-only permissions without persisted credentials", () => {
