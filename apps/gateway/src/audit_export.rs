@@ -1711,8 +1711,8 @@ mod tests {
             "development loopback"
         );
 
-        // #106 review: the signing secret's variable can't be on an allowlist
-        // a Platform Admin can point somewhere, nor a reserved name.
+        // Reject a signing-secret variable that is reserved or available to a
+        // Platform Admin through the provider secret allowlist.
         let base = |name: &'static str, extra: Vec<(&'static str, String)>| {
             let mut pairs = vec![
                 (URL_ENV, "https://siem.example.org".to_owned()),
@@ -2177,20 +2177,12 @@ mod tests {
         }
     }
 
-    /// #321 round 2 (LOW finding 2, adversarial review): the OTLP audit
-    /// exporter's collector is a distinct `Purpose::AuditOtlp` (not the
-    /// webhook/syslog `Purpose::Audit`) built through `https_client`, with
-    /// the same real DNS, real `reqwest::Client` path telemetry export
-    /// uses: `localhost`, refused by a strict (production-like, non-dev)
-    /// policy. Repeated refused attempts through one OTLP exporter's own
-    /// (reused) client must log the refusal only once, host-free; an
-    /// identical webhook exporter must keep naming the host on every
-    /// attempt (unaffected).
+    /// The OTLP audit collector uses the strict HTTPS client with
+    /// `Purpose::AuditOtlp`. Real resolution of localhost exercises DNS refusal:
+    /// the reused client logs it once without the host. Webhook refusal logs
+    /// name the host on each attempt.
     ///
-    /// #352: captured via `crate::log_capture_test::Capture`, not a
-    /// per-test thread-local subscriber - see that module's doc comment
-    /// for why (this test's DNS resolution runs on a Tokio blocking-pool
-    /// thread, which a thread-local capture would never see).
+    /// Capture includes events from the DNS resolver's blocking thread.
     #[tokio::test]
     async fn otlp_audit_refusals_are_transition_only_and_host_free_but_webhook_refusals_still_name_the_host()
      {
@@ -2255,14 +2247,9 @@ mod tests {
         }
     }
 
-    /// #321 round 2 (LOW finding 2): `log_delivery_outcome`, the `start`
-    /// loop's own per-delivery log, in isolation. An OTLP destination logs
-    /// one host-free warning on the transition into failure and one on the
-    /// transition back (never on `Idle`, which just means still backing
-    /// off, not a successful attempt); a webhook destination keeps naming
-    /// the host on every failure.
-    /// #352: captured via `crate::log_capture_test::Capture`, see its doc
-    /// comment.
+    /// The per-delivery logger emits host-free OTLP warnings on transitions
+    /// into and out of failure. Idle leaves the failure state unchanged.
+    /// Webhook warnings name the host on every failure.
     #[test]
     fn otlp_delivery_log_is_transition_only_and_host_free_but_webhook_delivery_log_still_names_the_host()
      {
@@ -2522,17 +2509,9 @@ mod database {
         id
     }
 
-    /// #37 PR2 item 1: the exported `EVENT` projection carries
-    /// `admin_token_id` (additive, nullable; `omg.audit.v1` stays additive
-    /// per docs/operations.md). A real admin token (migration 0051: owner
-    /// must be a currently effective Platform Admin, created under the
-    /// owner's own exclusive user-scope lock, exactly as PR2's
-    /// `admin_tokens.rs` handler does), one event attributed to it, one
-    /// plain browser-session event (`admin_token_id` stays NULL, as
-    /// before), and one event on a personal workspace attributed to the
-    /// same token (still excluded: token attribution never widens what is
-    /// exported). Delivered to a loopback HTTP receiver, not just read
-    /// back from the database.
+    /// The loopback receiver gets the token ID for token-attributed events
+    /// and a null ID for browser sessions. Personal-workspace events stay
+    /// excluded even when attributed to a token.
     #[dbtest::test]
     async fn delivered_events_carry_admin_token_attribution_and_personal_events_stay_excluded(
         pool: sqlx::PgPool,
@@ -2754,11 +2733,9 @@ mod database {
         assert_eq!(signature, sign(SECRET, t, &body));
     }
 
-    /// #174 review: switching export off directly in the database (what a
-    /// stolen runtime credential could do) is itself exported and stops the
-    /// heartbeat; a number planted on a queued row becomes a gap, not a
-    /// collision that stalls export; a backlog over one numbering batch is
-    /// numbered in order across runs.
+    /// A direct database update disabling export is itself exported and stops
+    /// heartbeats. A preassigned sequence on a queued row leaves a gap without
+    /// stalling delivery, and a backlog is numbered in order across batches.
     #[dbtest::test]
     async fn tampering_with_the_export_state_shows_up_at_the_receiver(pool: sqlx::PgPool) {
         let store = Store::new(pool.clone());
