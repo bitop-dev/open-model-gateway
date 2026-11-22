@@ -202,7 +202,7 @@ Assumptions of the model (some are also properties of the code):
 8. **Admission inserts the execution and reservation together** (section 1). The foreign key requires every
    reservation to reference its execution. The [`PRIMARY KEY(execution_id,admitted_at)`](../../apps/gateway/enterprise_migrations/0030_partition_history.sql#L538)
    allows at most one reservation for that pair. `ExecConsistent` assumes every writer moves both together.
-9. **Deadlock retry** ([`macro_rules! retry_deadlocks`](../../apps/gateway/src/governance/locks.rs#L284)) **is safe** under the guards: a retried transaction re-reads
+9. **Deadlock retry** ([`macro_rules! retry_deadlocks`](../../apps/gateway/src/governance/locks.rs#L283)) **is safe** under the guards: a retried transaction re-reads
    the row state, so a lost deadlock race behaves like a late arrival. Not modelled.
 10. **Replicas only contribute `up`.** `SKIP LOCKED` claims and the lock order are database
     semantics, not checked; the model has one reconciler step that any alive replica may take.
