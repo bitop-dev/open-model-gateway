@@ -51,7 +51,7 @@ class OciStageTests(unittest.TestCase):
                         ACTIONS_ID_TOKEN_REQUEST_TOKEN="oidc-secret", PATH="/ambient/helpers",
                         HOME=str(self.base / "ambient-home"), TMPDIR=str(self.base / "ambient-tmp"))
 
-    def install_tool(self, fail="", sleep=""):
+    def install_tool(self, fail="", sleep="", diagnostic=None):
         self.tool.write_text(f'''#!{sys.executable}
 import hashlib, json, os, pathlib, stat, sys, time
 args = sys.argv[1:]
@@ -67,7 +67,10 @@ with open({str(self.log)!r}, 'a') as log:
 if kind == {sleep!r}:
     time.sleep(30)
 print('untrusted-output fixture-private-token')
-print('credentialed-error fixture-private-token', file=sys.stderr)
+if kind == 'cp' and {diagnostic is not None!r}:
+    sys.stderr.buffer.write({diagnostic!r})
+else:
+    print('credentialed-error fixture-private-token', file=sys.stderr)
 if kind == {fail!r}:
     sys.exit(9)
 if kind == 'login':
@@ -113,14 +116,16 @@ if kind == 'login':
             for path in (record["auth"], record["env"]["HOME"], record["cwd"]):
                 self.assertFalse(Path(path).exists(), path)
 
-    def refused(self, args=None, calls=0):
+    def refused(self, args=None, calls=0, diagnostic=None):
         boundary = mock.patch.object(self.api.subprocess, "run", side_effect=AssertionError("preflight executed a process")) if not calls else contextlib.nullcontext()
         with boundary:
             code, out, err = self.invoke(args)
         self.assertNotEqual(code, 0)
         self.assertEqual(out, "")
-        self.assertIn(err, {"oci-stage: validation failed\n", "oci-stage: authentication unavailable\n",
-                            "oci-stage: login failed\n", "oci-stage: copy failed\n"})
+        if diagnostic is None:
+            self.assertIn(err, {"oci-stage: validation failed\n", "oci-stage: authentication unavailable\n"})
+        else:
+            self.assertEqual(err, f"oci-stage: {diagnostic}\n")
         self.assertEqual(len(self.records()), calls)
         self.assert_cleanup()
 
@@ -155,10 +160,19 @@ if kind == 'login':
                 self.assert_cleanup()
 
     def test_cli_success_is_only_the_root_digest(self):
+        self.install_tool(diagnostic=b"Error response from registry: denied: fixture-private-token\n")
         result = subprocess.run([sys.executable, str(self.script), *self.args()], env=self.env, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, (self.graph["root"]["digest"] + "\n").encode())
         self.assertEqual(result.stderr, b"")
+        self.assert_cleanup()
+
+    def test_cli_copy_failure_has_no_digest_or_transport_text(self):
+        self.install_tool(fail="cp", diagnostic=b"Error response from registry: denied: fixture-private-token\n")
+        result = subprocess.run([sys.executable, str(self.script), *self.args()], env=self.env, capture_output=True, timeout=10)
+        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                         (1, b"", b"oci-stage: copy failed (registry-access)\n"))
+        self.assertEqual(len(self.records()), 2)
         self.assert_cleanup()
 
     def test_missing_production_pin_is_fail_closed(self):
@@ -247,15 +261,44 @@ if kind == 'login':
                 self.refused()
 
     def test_login_and_copy_failures_are_redacted_and_cleaned(self):
-        for kind, count in (("login", 1), ("cp", 2)):
+        for kind, count, diagnostic in (("login", 1, "login failed"), ("cp", 2, "copy failed (unknown)")):
             with self.subTest(kind=kind):
                 self.log.unlink(missing_ok=True)
                 self.install_tool(fail=kind)
-                self.refused(calls=count)
+                self.refused(calls=count, diagnostic=diagnostic)
+
+    def test_copy_failure_categories_are_bounded_and_contain_no_transport_text(self):
+        registry = b"Error response from registry: "
+        destination = f'Error from destination registry for "{IMAGE}": '.encode()
+        url = b'"https://ghcr.io/v2/bitop-dev/open-model-gateway/blobs/uploads/?fixture-secret=query"'
+        fixtures = (
+            (registry + b"denied: fixture-private-token", "registry-access"),
+            (destination + b"unauthorized", "registry-access"),
+            (destination + b"POST " + url + b": response status code 403: fixture-private-token", "registry-access"),
+            (registry + b"toomanyrequests: slow down", "registry-rate-limit"),
+            (destination + b"POST " + url + b": response status code 429: Too Many Requests", "registry-rate-limit"),
+            (registry + b"manifest blob unknown: fixture-private-token", "registry-content"),
+            (destination + b"PUT " + url + b": response status code 503: Service Unavailable", "registry-server"),
+            (destination + b"Head " + url + b": dial tcp: lookup ghcr.io: no such host", "transport"),
+            (destination + b"Head " + url + b": net/http: TLS handshake timeout", "transport"),
+            (registry + b"unknown: response status code 403: fixture-private-token", "unknown"),
+            (registry + b"unauthorized-ish: fixture-private-token", "unknown"),
+            (destination + b'POST "https://ghcr.io.example/v2/": response status code 429: fake', "unknown"),
+            (f'Error from destination registry for "{IMAGE}-loadtest": denied'.encode(), "unknown"),
+            (b"Error from source oci-layout: " + registry + b"denied: fixture-private-token", "unknown"),
+            (b"unrelated error\n" + registry + b"denied: fixture-private-token", "unknown"),
+            (registry + b"denied: " + b"x" * 65536, "unknown"),
+            (b"\xff\x00::error::fixture-private-token", "unknown"),
+        )
+        for index, (stderr, category) in enumerate(fixtures):
+            with self.subTest(index=index, category=category):
+                self.log.unlink(missing_ok=True)
+                self.install_tool(fail="cp", diagnostic=stderr + b"\n")
+                self.refused(calls=2, diagnostic=f"copy failed ({category})")
 
     def test_login_and_copy_timeouts_are_bounded_redacted_and_cleaned(self):
         run = subprocess.run
-        for kind, count in (("login", 1), ("cp", 2)):
+        for kind, count, diagnostic in (("login", 1, "login failed"), ("cp", 2, "copy failed (deadline)")):
             self.log.unlink(missing_ok=True)
             self.install_tool(sleep=kind)
             def bounded(*args, **kwargs):
@@ -264,7 +307,7 @@ if kind == 'login':
                 self.assertLessEqual(kwargs["timeout"], 600)
                 return run(*args, **dict(kwargs, timeout=1))
             with mock.patch.object(self.api.subprocess, "run", side_effect=bounded):
-                self.refused(calls=count)
+                self.refused(calls=count, diagnostic=diagnostic)
 
 
 if __name__ == "__main__":
