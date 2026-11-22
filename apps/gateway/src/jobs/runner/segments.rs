@@ -3,23 +3,104 @@ use super::*;
 use crate::jobs::fence::SegmentLines;
 use tokio::time::Instant;
 
+/// A complete JSONL record, including its newline, bounded by the reader limit.
+pub(super) struct Record {
+    pub(super) line: i32,
+    pub(super) execution: Uuid,
+    error: bool,
+    encoded: Vec<u8>,
+}
+
+impl Record {
+    pub(super) fn encode(
+        line: i32,
+        execution: Uuid,
+        error: bool,
+        value: &Value,
+    ) -> Result<Self, serde_json::Error> {
+        let encoded = encode_line(line, error, value, RESULT_LINE_BYTES)?;
+        Ok(Self {
+            line,
+            execution,
+            error,
+            encoded,
+        })
+    }
+}
+
+fn encode_line(
+    line: i32,
+    error: bool,
+    value: &Value,
+    limit: usize,
+) -> Result<Vec<u8>, serde_json::Error> {
+    #[derive(serde::Serialize)]
+    struct Envelope<'a> {
+        n: i32,
+        e: bool,
+        r: &'a Value,
+    }
+    struct Bounded {
+        bytes: Vec<u8>,
+        limit: usize,
+    }
+    impl std::io::Write for Bounded {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let needed = self.bytes.len().saturating_add(bytes.len());
+            if needed > self.limit {
+                return Err(std::io::Error::other("result line exceeds limit"));
+            }
+            if needed > self.bytes.capacity() {
+                let capacity = needed
+                    .max(self.bytes.capacity().saturating_mul(2))
+                    .min(self.limit);
+                self.bytes.reserve_exact(capacity - self.bytes.len());
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut out = Bounded {
+        bytes: Vec::new(),
+        limit: limit.saturating_sub(1),
+    };
+    serde_json::to_writer(
+        &mut out,
+        &Envelope {
+            n: line,
+            e: error,
+            r: value,
+        },
+    )?;
+    out.bytes.reserve_exact(1);
+    out.bytes.push(b'\n');
+    Ok(out.bytes)
+}
+
 #[derive(Default)]
 struct Segment {
     body: Vec<u8>,
     succeeded: Vec<(i32, Uuid)>,
-    failed: Vec<i32>,
+    failed: Vec<(i32, Uuid)>,
     deadline: Option<Instant>,
 }
 
 impl Segment {
-    fn push(&mut self, record: Record, encoded: Vec<u8>) -> bool {
+    fn push(&mut self, record: Record) -> bool {
         self.deadline
             .get_or_insert_with(|| Instant::now() + SEGMENT_AGE);
-        self.body.extend(encoded);
-        if let Some(execution) = record.execution {
-            self.succeeded.push((record.line, execution));
+        if self.body.is_empty() {
+            self.body = record.encoded;
         } else {
-            self.failed.push(record.line);
+            self.body.extend(record.encoded);
+        }
+        if record.error {
+            self.failed.push((record.line, record.execution));
+        } else {
+            self.succeeded.push((record.line, record.execution));
         }
         self.succeeded.len() + self.failed.len() >= SEGMENT_LINES
             || self.body.len() >= SEGMENT_BYTES
@@ -170,18 +251,13 @@ pub(super) async fn write_segments(
     loop {
         match receive(&mut records, &writer.state, segment.deadline).await {
             Incoming::Record(record) => {
-                let mut bytes = serde_json::to_vec(&json!({
-                    "n": record.line, "e": record.execution.is_none(), "r": record.value
-                }))
-                .map_err(|_| InferenceError::Storage)?;
-                bytes.push(b'\n');
                 // A single response may exceed the grouping target. Store it alone.
-                if segment.body.len() + bytes.len() > SEGMENT_BYTES
+                if segment.body.len() + record.encoded.len() > SEGMENT_BYTES
                     && !writer.flush(&mut segment).await
                 {
                     break;
                 }
-                if segment.push(record, bytes) && !writer.flush(&mut segment).await {
+                if segment.push(record) && !writer.flush(&mut segment).await {
                     break;
                 }
             }
@@ -223,14 +299,10 @@ impl Probe {
             writer,
         }
     }
-    pub(crate) async fn finished(&self, line: i32) {
+    pub(crate) async fn finished(&self, line: i32, execution: Uuid) {
         let value = json!({"custom_id": line.to_string()});
         self.records
-            .send(Record {
-                line,
-                execution: None,
-                value,
-            })
+            .send(Record::encode(line, execution, true, &value).unwrap())
             .await
             .unwrap();
     }
@@ -251,6 +323,33 @@ impl Probe {
 mod tests {
     use super::*;
 
+    #[test]
+    fn encoding_caps_escaped_json_and_the_newline() {
+        let value = json!("\n\n\t");
+        let bytes = encode_line(0, false, &value, 128).unwrap();
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        assert_eq!(encode_line(0, false, &value, bytes.len()).unwrap(), bytes);
+        assert!(encode_line(0, false, &value, bytes.len() - 1).is_err());
+    }
+
+    #[test]
+    fn oversized_response_is_refused_before_it_reaches_the_writer() {
+        let value = json!("\0".repeat(RESULT_LINE_BYTES / 6));
+        assert!(Record::encode(0, Uuid::nil(), false, &value).is_err());
+    }
+
+    #[test]
+    fn a_readable_record_over_the_group_target_flushes_by_itself() {
+        let value = json!("x".repeat(SEGMENT_BYTES));
+        let record = Record::encode(0, Uuid::nil(), false, &value).unwrap();
+        assert!(record.encoded.len() > SEGMENT_BYTES);
+        assert!(record.encoded.len() <= RESULT_LINE_BYTES);
+        let mut segment = Segment::default();
+        assert!(segment.push(record));
+        assert_eq!(segment.succeeded.len(), 1);
+        assert_eq!(segment.body.iter().filter(|&&b| b == b'\n').count(), 1);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn ready_records_do_not_delay_the_oldest_record_flush() {
         let state = RunState::new(BatchFence {
@@ -258,16 +357,12 @@ mod tests {
             runner: Uuid::nil(),
             epoch: 1,
         });
-        let record = |line| Record {
-            line,
-            execution: None,
-            value: Value::Null,
-        };
+        let record = |line| Record::encode(line, Uuid::nil(), true, &Value::Null).unwrap();
         let mut segment = Segment::default();
-        assert!(!segment.push(record(0), vec![b'a']));
+        assert!(!segment.push(record(0)));
         let (tx, mut rx) = mpsc::channel(1);
         tokio::time::advance(SEGMENT_AGE - Duration::from_millis(1)).await;
-        assert!(!segment.push(record(1), vec![b'b']));
+        assert!(!segment.push(record(1)));
         tx.try_send(record(2)).unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(matches!(

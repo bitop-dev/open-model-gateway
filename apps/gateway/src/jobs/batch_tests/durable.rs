@@ -22,6 +22,8 @@ enum Case {
     Fault(Boundary, Loss),
     Group,
     Quota,
+    FailedCommit { retryable: bool },
+    Pressure,
     Measure(usize),
 }
 
@@ -54,12 +56,17 @@ fn loopback_engine(store: &crate::store::Store, base: &str) -> Engine {
     Engine::new(Arc::new(store.clone()), registry, EngineLimits::default()).unwrap()
 }
 
-fn loopback_jobs(store: crate::store::Store, engine: Engine, files: FileStoreRuntime) -> Jobs {
+fn loopback_jobs(
+    store: crate::store::Store,
+    engine: Engine,
+    files: FileStoreRuntime,
+    concurrency: usize,
+) -> Jobs {
     Jobs::with(
         store,
         engine.registry().clone(),
         JobLimits {
-            batch_concurrency: 1,
+            batch_concurrency: concurrency,
             ..JobLimits::default()
         },
     )
@@ -81,7 +88,7 @@ async fn crash_worker() {
     let dir = std::env::var("BATCH_TEST_DIR").unwrap();
     let store = crate::store::Store::new(pool);
     let engine = loopback_engine(&store, &std::env::var("BATCH_TEST_UPSTREAM").unwrap());
-    let jobs = loopback_jobs(store, engine, local_files(dir.as_ref()).await);
+    let jobs = loopback_jobs(store, engine, local_files(dir.as_ref()).await, 1);
     jobs.finalize_hold.arm();
     assert!(Runner::new(jobs).run_next().await.unwrap());
 }
@@ -171,8 +178,9 @@ async fn run_case(pool: PgPool, case: Case) {
         _ => None,
     };
     let size = match case {
-        Case::Fault(..) => 3,
+        Case::Fault(..) | Case::FailedCommit { .. } => 3,
         Case::Group => 32,
+        Case::Pressure => 24,
         Case::Quota => 1,
         Case::Measure(size) => size,
     };
@@ -183,10 +191,12 @@ async fn run_case(pool: PgPool, case: Case) {
             .await
             .unwrap();
     }
+    let pressure = matches!(case, Case::Pressure);
+    let concurrency = if pressure { 4 } else { 1 };
     let before = matches!(fault, Some((Boundary::BeforeCommit, _)));
     let mut w = world(pool.clone(), false, false, 1).await;
-    sqlx::query("INSERT INTO deployment_batch_scheduling(deployment_id,max_concurrency,updated_by) VALUES($1,1,$2)")
-        .bind(w.f.deployment).bind(w.f.owner).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO deployment_batch_scheduling(deployment_id,max_concurrency,updated_by) VALUES($1,$2,$3)")
+        .bind(w.f.deployment).bind(concurrency as i16).bind(w.f.owner).execute(&pool).await.unwrap();
     sqlx::raw_sql(include_str!(
         "../../../tests/common/ensure_runtime_role.sql"
     ))
@@ -220,9 +230,24 @@ async fn run_case(pool: PgPool, case: Case) {
     let file = w.upload(&w.f.principal, &input).await;
     let calls = Arc::new(AtomicUsize::default());
     let seen = calls.clone();
+    let fail_commit = matches!(case, Case::FailedCommit { .. });
+    let retryable = matches!(case, Case::FailedCommit { retryable: true });
+    let release_provider = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = release_provider.clone();
     let upstream = Server::start(axum::Router::new().fallback(move || {
-        seen.fetch_add(1, Ordering::SeqCst);
-        async { axum::Json(json!({"id":"chatcmpl-test","model":"smart","choices":[{"index":0,"message":{"role":"assistant","content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}})) }
+        use axum::response::IntoResponse;
+        let call = seen.fetch_add(1, Ordering::SeqCst);
+        let release = release.clone();
+        async move {
+            if pressure && call > 0 {
+                release.acquire().await.unwrap().forget();
+            }
+            if fail_commit && call != 1 {
+                let status = if retryable && call == 2 { axum::http::StatusCode::SERVICE_UNAVAILABLE } else { axum::http::StatusCode::BAD_REQUEST };
+                return (status, axum::Json(json!({"error":{"message":"fixture rejected","type":"invalid_request_error"}}))).into_response();
+            }
+            axum::Json(json!({"id":"chatcmpl-test","model":"smart","choices":[{"index":0,"message":{"role":"assistant","content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}})).into_response()
+        }
     })).await;
     let engine = loopback_engine(&store, &upstream.base);
     let gateway = Server::start(
@@ -233,7 +258,7 @@ async fn run_case(pool: PgPool, case: Case) {
     let auth = crate::jobs::db_tests::bearer(&w.f, w.f.principal.workspace_id).await;
     let client = client();
     let created = client.post(format!("{}/v1/batches", gateway.base)).header("authorization", &auth)
-        .json(&json!({"input_file_id":file,"endpoint":"/v1/chat/completions","completion_window":"24h","metadata":{"omg_mode":"gateway"}}))
+        .json(&json!({"input_file_id":file,"endpoint":"/v1/chat/completions","completion_window":"24h","metadata":{"omg_mode":"gateway","omg_retries": if retryable { "1" } else { "0" }}}))
         .send().await.unwrap().error_for_status().unwrap().json::<Value>().await.unwrap();
     let id = created["id"].as_str().unwrap();
     let job = crate::jobs::store::reload(
@@ -242,7 +267,11 @@ async fn run_case(pool: PgPool, case: Case) {
     )
     .await
     .unwrap();
-    w.jobs = loopback_jobs(store, engine, files);
+    w.jobs = loopback_jobs(store, engine, files, concurrency);
+    if fail_commit {
+        check_failed_commit(&w, &job, &client, &gateway.base, &auth, &calls).await;
+        return;
+    }
     let mut lock = w.f.store.pool.begin().await.unwrap();
     if before {
         sqlx::query("LOCK TABLE stored_files IN SHARE MODE")
@@ -252,7 +281,7 @@ async fn run_case(pool: PgPool, case: Case) {
     } else if fault.is_some() && !crash {
         w.jobs.finalize_hold.arm();
     }
-    let quota_hold = if matches!(case, Case::Quota) {
+    let quota_hold = if matches!(case, Case::Quota | Case::Pressure) {
         Some(hold_segment_metadata(&pool, job.workspace_id).await)
     } else {
         None
@@ -392,19 +421,18 @@ async fn run_case(pool: PgPool, case: Case) {
     } else {
         lock.rollback().await.unwrap();
         if let Some(hold) = quota_hold {
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while !sqlx::query_scalar::<_,bool>(
-                    "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND objid=654715 AND NOT granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database()))"
-                ).fetch_one(&pool).await.unwrap() {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            }).await.unwrap();
+            wait_for_metadata_commit(&pool, if pressure { 15 } else { 5 }).await;
             assert_eq!(w.reload(&job).await.request_completed, Some(0));
-            assert_eq!(
-                normal_upload(&client, &gateway.base, &auth).await,
-                reqwest::StatusCode::OK,
-                "a normal 64 KiB upload fits while the exact-sized internal write is pending"
-            );
+            if pressure {
+                release_provider.add_permits(size);
+                check_writer_backpressure(&pool, job.id, &calls).await;
+            } else {
+                assert_eq!(
+                    normal_upload(&client, &gateway.base, &auth).await,
+                    reqwest::StatusCode::OK,
+                    "a normal 64 KiB upload fits while the exact-sized internal write is pending"
+                );
+            }
             hold.rollback().await.unwrap();
         }
         let limit = if matches!(case, Case::Measure(_)) {
@@ -566,4 +594,152 @@ async fn measure_small(pool: PgPool) {
 #[ignore = "local timing fixture; PostgreSQL must preload pg_stat_statements"]
 async fn measure_large(pool: PgPool) {
     run_case(pool, Case::Measure(2048)).await;
+}
+
+#[sqlx::test(migrations = "./enterprise_migrations")]
+async fn rolled_back_provider_failure_is_unavailable_after_takeover(pool: PgPool) {
+    run_case(pool, Case::FailedCommit { retryable: false }).await;
+}
+
+#[sqlx::test(migrations = "./enterprise_migrations")]
+async fn rolled_back_retryable_failure_is_unavailable_without_retry(pool: PgPool) {
+    run_case(pool, Case::FailedCommit { retryable: true }).await;
+}
+
+async fn check_failed_commit(
+    w: &World,
+    job: &JobRow,
+    client: &reqwest::Client,
+    base: &str,
+    auth: &str,
+    calls: &AtomicUsize,
+) {
+    let db = &w.f.store.pool;
+    sqlx::raw_sql(
+        "CREATE FUNCTION refuse_failed_line() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'failed line commit refused' USING ERRCODE='23514'; END $$;
+        CREATE CONSTRAINT TRIGGER refuse_failed_line AFTER UPDATE ON batch_lines
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+        WHEN (NEW.line_no=2 AND NEW.state='failed') EXECUTE FUNCTION refuse_failed_line()",
+    )
+    .execute(db)
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), start(w))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+    );
+    let attempts = || {
+        sqlx::query_as::<_,(Uuid,String,Option<i64>)>(
+        "SELECT e.id,r.state,r.actual_microusd FROM inference_executions e JOIN governance_reservations r ON r.execution_id=e.id WHERE e.batch_job_id=$1 ORDER BY e.id"
+    ).bind(job.id).fetch_all(db)
+    };
+    let charged = attempts().await.unwrap();
+    assert_eq!(charged.len(), 3);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(w.reload(job).await.request_failed, Some(1));
+    let lease: Option<gateway_datetime_compat::UtcInstant> =
+        sqlx::query_scalar("SELECT runner_lease_until FROM async_jobs WHERE id=$1")
+            .bind(job.id)
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert!(lease.is_none());
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), start(w))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+    );
+    let final_job = w.reload(job).await;
+    let file = public_id(final_job.error_file_id.unwrap());
+    let content = client
+        .get(format!("{base}/v1/files/{file}/content"))
+        .header("authorization", auth)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let errors: Vec<Value> = content
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let error =
+        |id: &str| errors.iter().find(|r| r["custom_id"] == id).unwrap()["error"]["code"].clone();
+    assert_eq!(errors.len(), 2);
+    assert_eq!(error("2"), "result_unavailable");
+    assert_ne!(error("0"), "result_unavailable");
+    assert_eq!(
+        (final_job.request_completed, final_job.request_failed),
+        (Some(1), Some(2))
+    );
+    let states: Vec<(String, Option<i32>)> =
+        sqlx::query_as("SELECT state,segment FROM batch_lines WHERE job_id=$1 ORDER BY line_no")
+            .bind(job.id)
+            .fetch_all(db)
+            .await
+            .unwrap();
+    assert_eq!(
+        states,
+        [
+            ("failed".into(), Some(0)),
+            ("succeeded".into(), Some(0)),
+            ("interrupted".into(), None)
+        ]
+    );
+    let segment_sizes: Vec<i32> =
+        sqlx::query_scalar("SELECT lines FROM batch_segments WHERE job_id=$1 ORDER BY seq")
+            .bind(job.id)
+            .fetch_all(db)
+            .await
+            .unwrap();
+    assert_eq!(segment_sizes, [2]);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(attempts().await.unwrap(), charged);
+    consistent(&w.f).await;
+}
+
+#[sqlx::test(migrations = "./enterprise_migrations")]
+async fn stalled_writer_drains_a_full_channel_with_multiple_producers(pool: PgPool) {
+    run_case(pool, Case::Pressure).await;
+}
+
+async fn wait_for_metadata_commit(pool: &PgPool, seconds: u64) {
+    tokio::time::timeout(Duration::from_secs(seconds), async {
+        while !sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND objid=654715 AND NOT granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database()))"
+        ).fetch_one(pool).await.unwrap() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+}
+
+async fn check_writer_backpressure(pool: &PgPool, job: Uuid, calls: &AtomicUsize) {
+    let awaiting = || {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM batch_lines WHERE job_id=$1 AND awaiting_segment",
+        )
+        .bind(job)
+        .fetch_one(pool)
+    };
+    // One record in the stalled write, eight in the channel, and four
+    // independent producers waiting for channel space.
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while awaiting().await.unwrap() < 13 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(awaiting().await.unwrap(), 13);
+    assert_eq!(calls.load(Ordering::SeqCst), 13);
 }

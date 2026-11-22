@@ -1006,6 +1006,8 @@ BEGIN
   INSERT INTO governance_reservations(execution_id,workspace_id,api_key_id,deployment_id,price_id,admitted_at,minute_start,month_start,lease_expires_at,state,reserved_tokens,held_microusd) VALUES(line,ws,k,d,bp,now(),date_trunc('minute',now()),date_trunc('month',now()),now()+interval '2 minutes','pending',110,5);
   UPDATE governance_reservations SET held_microusd=held_microusd-5 WHERE execution_id=env AND state='pending' AND held_microusd>=5;
   UPDATE batch_lines SET state='failed',status_code=429,error_code='rate_limit_error',finished_at=clock_timestamp() WHERE job_id=bj AND line_no=0 AND state='running';
+  PERFORM b.line_no FROM batch_lines b WHERE b.job_id=bj AND b.line_no=0 AND b.execution_id=line AND b.state='failed' AND b.segment IS NULL FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'failed execution could not be locked for retry fallback'; END IF;
   UPDATE batch_lines SET state='running',attempts=attempts+1,execution_id=gen_random_uuid(),status_code=NULL,error_code=NULL,finished_at=NULL WHERE job_id=bj AND line_no=0 AND state='failed' AND attempts=1 AND segment IS NULL;
   UPDATE batch_lines SET awaiting_segment=true WHERE job_id=bj AND line_no=0 AND state='running';
   IF EXISTS (SELECT FROM batch_lines WHERE job_id=bj AND state='succeeded') THEN RAISE EXCEPTION 'staging reported a success'; END IF;

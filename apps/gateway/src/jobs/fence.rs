@@ -85,7 +85,7 @@ pub(crate) enum Hold {
 #[derive(Default)]
 pub(crate) struct SegmentLines<'a> {
     pub(crate) succeeded: &'a [(i32, Uuid)],
-    pub(crate) failed: &'a [i32],
+    pub(crate) failed: &'a [(i32, Uuid)],
 }
 
 impl BatchFence {
@@ -209,6 +209,7 @@ impl BatchFence {
     }
 
     /// Lines finished since the last call.
+    #[cfg(test)]
     pub(crate) async fn progress(
         &self,
         store: &Store,
@@ -293,6 +294,7 @@ impl BatchFence {
         &self,
         store: &Store,
         line_no: i32,
+        execution: Uuid,
         status_code: Option<u16>,
         error_code: Option<&str>,
         count: bool,
@@ -300,8 +302,8 @@ impl BatchFence {
         let mut tx = self
             .begin(store, if count { Hold::Update } else { Hold::Rows })
             .await?;
-        let changed = sqlx::query("UPDATE batch_lines SET state='failed',status_code=$3,error_code=$4,finished_at=clock_timestamp() WHERE job_id=$1 AND line_no=$2 AND state='running'")
-            .bind(self.job).bind(line_no)
+        let changed = sqlx::query("UPDATE batch_lines SET state='failed',status_code=$4,error_code=$5,finished_at=clock_timestamp() WHERE job_id=$1 AND line_no=$2 AND execution_id=$3 AND state='running' AND NOT awaiting_segment")
+            .bind(self.job).bind(line_no).bind(execution)
             .bind(status_code.map(|s| s as i16)).bind(error_code)
             .execute(&mut *tx).await.map_err(job_storage)?.rows_affected() == 1;
         if count && changed {
@@ -309,6 +311,25 @@ impl BatchFence {
         }
         tx.commit().await.map_err(job_storage)?;
         Ok(changed)
+    }
+
+    /// Count a provisional retry failure only while that execution still owns
+    /// the failed row. An unconfirmed retry claim cannot publish its old error.
+    pub(crate) async fn count_retry_failure(
+        &self,
+        store: &Store,
+        line: i32,
+        execution: Uuid,
+    ) -> FenceResult<bool> {
+        let mut tx = self.begin(store, Hold::Update).await?;
+        let failed: Option<i32> = sqlx::query_scalar("SELECT line_no FROM batch_lines WHERE job_id=$1 AND line_no=$2 AND execution_id=$3 AND state='failed' AND segment IS NULL FOR UPDATE")
+            .bind(self.job).bind(line).bind(execution)
+            .fetch_optional(&mut *tx).await.map_err(job_storage)?;
+        if failed.is_some() {
+            count_lines(&mut tx, self.job, 0, 1).await?;
+        }
+        tx.commit().await.map_err(job_storage)?;
+        Ok(failed.is_some())
     }
 
     /// Release the route once the provider attempt has settled. Recovery
@@ -356,6 +377,8 @@ impl BatchFence {
         // take ours between the read and the insert: take the next one.
         let length = (lines.succeeded.len() + lines.failed.len()) as i32;
         let (line_numbers, executions): (Vec<_>, Vec<_>) = lines.succeeded.iter().copied().unzip();
+        let (failed_lines, failed_executions): (Vec<_>, Vec<_>) =
+            lines.failed.iter().copied().unzip();
         let mut collisions = 0;
         loop {
             // Serialize registrations with other progress updates.
@@ -381,9 +404,13 @@ impl BatchFence {
                 }
                 count_lines(&mut tx, self.job, changed as i32, 0).await?;
             }
-            if !lines.failed.is_empty() {
-                sqlx::query("UPDATE batch_lines SET segment=$2 WHERE job_id=$1 AND line_no=ANY($3) AND segment IS NULL AND state='failed'")
-                    .bind(self.job).bind(seq).bind(lines.failed).execute(&mut *tx).await.map_err(job_storage)?;
+            if !failed_lines.is_empty() {
+                let changed = sqlx::query("UPDATE batch_lines l SET segment=$2 FROM unnest($3::integer[],$4::uuid[]) AS ready(line_no,execution_id) WHERE l.job_id=$1 AND l.line_no=ready.line_no AND l.execution_id=ready.execution_id AND l.state='failed' AND l.segment IS NULL")
+                    .bind(self.job).bind(seq).bind(&failed_lines).bind(&failed_executions)
+                    .execute(&mut *tx).await.map_err(job_storage)?.rows_affected();
+                if changed != failed_lines.len() as u64 {
+                    return Err(FenceError::Storage);
+                }
             }
             // Once COMMIT is sent, keep the file on any missing acknowledgement.
             // Retention can reclaim an orphan; a committed segment still needs its file.

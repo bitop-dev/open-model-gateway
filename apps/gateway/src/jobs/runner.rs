@@ -69,11 +69,11 @@ mod repository;
 mod segments;
 use dispatch::Dispatch;
 use lanes::{Head, Lane, Pin, Planned, note, permits, spawn_line, wait_reason_without_permits};
-use line::{LineRun, Record, RunState, Stop};
+use line::{LineRun, RunState, Stop};
 use repository::LineRepository;
 #[cfg(test)]
 pub(crate) use segments::Probe as SegmentProbe;
-use segments::write_segments;
+use segments::{Record, write_segments};
 
 /// Runner lease of a claimed batch, renewed every [`RENEW`].
 const LEASE_SECONDS: f64 = 60.0;

@@ -344,7 +344,8 @@ async fn a_stale_claim_writes_nothing_and_a_current_one_everything(pool: PgPool)
     ));
     assert!(stale(old.retry_line(s, 0, 1, Uuid::new_v4()).await));
     assert!(stale(
-        old.fail_line(s, 0, Some(500), Some("failed"), true).await
+        old.fail_line(s, 0, Uuid::nil(), Some(500), Some("failed"), true)
+            .await
     ));
     assert!(stale(old.progress(s, 1, 0).await));
     assert!(stale(old.interrupt_running(s).await));
@@ -354,7 +355,7 @@ async fn a_stale_claim_writes_nothing_and_a_current_one_everything(pool: PgPool)
             job.workspace_id,
             Uuid::new_v4(),
             SegmentLines {
-                failed: &[0],
+                failed: &[(0, Uuid::nil())],
                 ..Default::default()
             }
         )
@@ -397,7 +398,7 @@ async fn a_stale_claim_writes_nothing_and_a_current_one_everything(pool: PgPool)
             .unwrap()
     );
     assert!(
-        new.fail_line(s, 1, Some(503), Some("unavailable"), false)
+        new.fail_line(s, 1, first_execution, Some(503), Some("unavailable"), false)
             .await
             .unwrap()
     );
@@ -439,7 +440,7 @@ async fn a_stale_claim_writes_nothing_and_a_current_one_everything(pool: PgPool)
 /// segment number: the owner takes the one after it and keeps flushing.
 #[dbtest::test]
 async fn a_taken_segment_number_never_blocks_the_owners_later_flushes(pool: PgPool) {
-    let (w, job) = batch(pool, &[("a", "plain")]).await;
+    let (w, job) = batch(pool, &[("a", "plain"), ("b", "plain"), ("c", "plain")]).await;
     let fence = claim(&w, &job).await;
     let file = |n: u8| {
         let w = &w;
@@ -474,14 +475,39 @@ async fn a_taken_segment_number_never_blocks_the_owners_later_flushes(pool: PgPo
     .unwrap();
     let mut seqs = vec![];
     for n in 1..=3u8 {
+        let line = i32::from(n) - 1;
+        let execution = Uuid::new_v4();
+        let store = &w.f.store;
+        assert!(fence.claim_line(store, ws, line, execution).await.unwrap());
+        assert!(
+            fence
+                .fail_line(store, line, execution, Some(500), Some("failed"), true)
+                .await
+                .unwrap()
+        );
+        let file_id = file(n).await;
+        assert!(matches!(
+            fence
+                .insert_segment(
+                    store,
+                    ws,
+                    file_id,
+                    SegmentLines {
+                        failed: &[(line, Uuid::nil())],
+                        ..Default::default()
+                    }
+                )
+                .await,
+            Err(FenceError::Storage)
+        ));
         seqs.push(
             fence
                 .insert_segment(
                     &w.f.store,
                     ws,
-                    file(n).await,
+                    file_id,
                     SegmentLines {
-                        failed: &[0],
+                        failed: &[(line, execution)],
                         ..Default::default()
                     },
                 )
@@ -1259,20 +1285,21 @@ async fn a_failed_renewal_stores_the_buffered_results_at_once(pool: PgPool) {
     use crate::jobs::runner::SegmentProbe;
     let (w, job) = batch(pool, &[("a", "plain"), ("b", "plain")]).await;
     let old = claim(&w, &job).await;
-    for line in 0..2 {
+    let executions = [Uuid::new_v4(), Uuid::new_v4()];
+    for (line, execution) in (0..2).zip(executions) {
         assert!(
-            old.claim_line(&w.f.store, job.workspace_id, line, Uuid::new_v4())
+            old.claim_line(&w.f.store, job.workspace_id, line, execution)
                 .await
                 .unwrap()
         );
         assert!(
-            old.fail_line(&w.f.store, line, Some(500), Some("failed"), true)
+            old.fail_line(&w.f.store, line, execution, Some(500), Some("failed"), true)
                 .await
                 .unwrap()
         );
     }
     let probe = SegmentProbe::start(w.f.store.clone(), w.files.clone(), job.clone(), old);
-    probe.finished(0).await;
+    probe.finished(0, executions[0]).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         segments(&w, &job).await,
@@ -1296,7 +1323,7 @@ async fn a_failed_renewal_stores_the_buffered_results_at_once(pool: PgPool) {
     assert_eq!(stored, Some(0));
     // The batch is taken over: the next flush is refused and stores nothing.
     let _new = claim(&w, &job).await;
-    probe.finished(1).await;
+    probe.finished(1, executions[1]).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     probe.doubt();
     for _ in 0..50 {
