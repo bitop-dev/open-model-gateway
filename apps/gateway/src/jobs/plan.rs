@@ -192,10 +192,10 @@ impl Jobs {
         })
     }
 
-    /// Estimate the scheduler's first weighted route for an unpinned line,
-    /// and classify a deterministic refusal when every capable route rejects
-    /// the body. Candidate filtering happens before the weighted draw, as
-    /// it does at dispatch. Neither operation admits a line.
+    /// Estimate the scheduler's first compatible route for an unpinned line
+    /// or classify a deterministic refusal when every capable route rejects
+    /// the body. Candidate filtering precedes route selection here and at
+    /// dispatch. This preview does not admit a line.
     async fn line_routing(
         &self,
         scope: ScanScope<'_>,
@@ -233,7 +233,7 @@ impl Jobs {
         }
         let routes = &memo.routes[model];
         if !candidates.is_empty() {
-            let id = match routes.first_weighted(
+            let id = match routes.first_route(
                 scope.principal,
                 model,
                 lines::routing_seed(scope.request_id, line_index),
@@ -242,11 +242,10 @@ impl Jobs {
                 Ok(id) => id,
                 // Keep the model-level estimate if the body-specific routes
                 // are cooling or unavailable. Dispatch can replan later.
-                Err(InferenceError::RouteCoolingDown(_) | InferenceError::ModelUnavailable) => None,
+                Err(InferenceError::RouteCoolingDown(_) | InferenceError::ModelUnavailable) => {
+                    return Ok(LineRouting::default());
+                }
                 Err(e) => return Err(e.into()),
-            };
-            let Some(id) = id else {
-                return Ok(LineRouting::default());
             };
             let deployment = deployments
                 .iter()

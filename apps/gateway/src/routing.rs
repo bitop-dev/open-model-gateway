@@ -166,23 +166,23 @@ impl RouteInputs {
         )
     }
 
-    /// The scheduler only uses the first draw. Skip ordering the remaining
-    /// routes when estimating an unpinned weighted line.
-    pub(crate) fn first_weighted(
+    /// Estimate the scheduler's first eligible route for an unpinned line.
+    /// Weighted routing only needs the first draw.
+    pub(crate) fn first_route(
         &self,
         principal: &Principal,
         model: &str,
         request_id: Uuid,
         ids: &HashSet<Uuid>,
-    ) -> Result<Option<Uuid>, InferenceError> {
-        if self.policy.strategy != "weighted" {
-            return Ok(None);
-        }
+    ) -> Result<Uuid, InferenceError> {
         let candidates = eligible_candidates(&self.policy, self.subset(ids))?;
-        let mut rng = StdRng::from_seed(weighted_order_seed(principal, model, request_id));
-        Ok(Some(
-            candidates[weighted_index(&candidates, &mut rng)?].deployment_id,
-        ))
+        let index = if self.policy.strategy == "weighted" {
+            let mut rng = StdRng::from_seed(weighted_order_seed(principal, model, request_id));
+            weighted_index(&candidates, &mut rng)?
+        } else {
+            0
+        };
+        Ok(candidates[index].deployment_id)
     }
 }
 
