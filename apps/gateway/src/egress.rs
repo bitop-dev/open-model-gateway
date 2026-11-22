@@ -1326,15 +1326,9 @@ mod tests {
         }
     }
 
-    /// #321 round 2 (LOW finding 1, adversarial review): a mixed
-    /// allowed/refused DNS answer logs its dropped addresses at DEBUG even
-    /// when the overall answer succeeds. Before this fix that DEBUG line
-    /// named the telemetry/audit-OTLP collector host and the refused
-    /// address on every attempt, bypassing the destination-free policy
-    /// `denied` already applies to a full refusal. A provider-purpose
-    /// client's identical partial drop is unaffected.
-    /// #352: captured via `crate::log_capture_test::Capture`, see its doc
-    /// comment.
+    /// A mixed DNS answer still emits a partial-refusal DEBUG log. The
+    /// telemetry log omits the collector host and refused address.
+    /// The provider log retains both fields.
     #[test]
     fn telemetry_partial_drop_is_destination_free_but_provider_partial_drop_still_names_it() {
         let capture = crate::log_capture_test::Capture::start();

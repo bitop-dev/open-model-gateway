@@ -2,7 +2,7 @@
 # detectors: the Rust one (source_rules/review_history.rs, apps/gateway/src)
 # and the TypeScript one (apps/web/src/lib/review-history.test.ts, apps/web/src).
 # Each reads this file, runs its own tokeniser over every comment of the
-# production sources, and runs every `refuse` and `allow` line below as a
+# source tree, including tests, and runs every `refuse` and `allow` line below as a
 # planted comment before it trusts itself on the tree.
 #
 # A comment (adjacent own-line `//` comments are one comment) is lowercased and

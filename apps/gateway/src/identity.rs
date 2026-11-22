@@ -197,16 +197,9 @@ impl IdentityState {
         self
     }
 
-    /// Replace the per-token and replica admin-token limiters with tiny,
-    /// test-chosen rates (#37 PR2 finding 3): deterministic small-limit
-    /// tests exhaust a limiter of 1-2 requests a minute within a handful of
-    /// in-process requests, with no real-minute wait and no injected clock
-    /// (the limiters still read the wall clock, but a burst this small is
-    /// exhausted well inside one test's execution). Independent `Arc`s, so
-    /// a clone of this state still shares its own limiters correctly
-    /// (`management::authz_admin_token_tests` clones `IdentityState`
-    /// freely); this only ever replaces the limiter this value points at
-    /// before any clone is made, never a production default.
+    /// Set low per-token and per-replica rates so in-process tests can
+    /// exhaust either limit with a few requests on the wall clock. Clones
+    /// of this test state share the replacement limiters.
     #[cfg(test)]
     pub(crate) fn with_admin_token_limits(
         mut self,
