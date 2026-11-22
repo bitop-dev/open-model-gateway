@@ -380,16 +380,10 @@ mod tests {
             .is_err()
         );
     }
-    /// The approval check as it was before #196 and #203, frozen here as a
-    /// self-contained independent oracle (#203 review finding): this used
-    /// to call *production* `allowed` for the translated-IPv4 case, so it
-    /// could not catch a drift between the two. Copied from `git show
-    /// a99bb00:apps/gateway/src/providers/local/endpoints.rs` (the only
-    /// difference from the pre-#196 function proper is that the recursive
-    /// calls below go to `before` itself, exactly as the original function
-    /// recursed on itself before it was renamed): its own independent
-    /// 6to4/Teredo/NAT64 decoding (`oracle_translated_v4`), never a call
-    /// into `egress.rs` or into this file's current `allowed`/`category_of`.
+    /// Independent approval oracle based on the implementation at a99bb00.
+    /// It decodes embedded IPv4 addresses with `oracle_translated_v4` and
+    /// recurses into itself, keeping the expected decisions independent of the
+    /// current classifier.
     fn before(ip: IpAddr, development: bool, http: bool) -> bool {
         match ip {
             IpAddr::V4(ip) => {
@@ -739,18 +733,10 @@ mod tests {
 
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(8192))]
-        /// #203 review finding, updated for release N+1: `allowed` decides
-        /// *exactly* as the frozen, self-contained a99bb00 oracle (`before`)
-        /// for every encoding and setting, except that an address in one of
-        /// the special-use ranges #203 refuses (decided by the independent
-        /// `oracle_refused_range`, after decoding any embedded IPv4 address)
-        /// is now refused too. Everything else keeps its exact decision:
-        /// public and RFC 1918 approvals, loopback in development, NAT64
-        /// refused, 6to4/Teredo judged by their embedded address (#196).
-        /// Covers both schemes (`http`), both `development` settings, every
-        /// encoding form (plain v4, mapped, compatible, 6to4, Teredo, NAT64,
-        /// random v6), and biased sampling at the first/last address of every
-        /// range in `special_use.rs`'s table.
+        /// Approval agrees with the frozen oracle except for the special-use
+        /// ranges checked independently by `oracle_refused_range`. The generated
+        /// cases exercise both development settings, every listed address encoding,
+        /// and the boundaries of the special-use ranges.
         #[test]
         fn allowed_matches_the_frozen_a99bb00_oracle_exactly(
             random_bits in proptest::prelude::any::<u32>(),

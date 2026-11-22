@@ -44,7 +44,7 @@ function Harness({ request }: { request: ReviewRequest }) {
       >
         Open review
       </Button>
-      {/* onStale (#89 review item 6): a 412 reopens a fresh review on the same origin, remounting (not just re-rendering) so it refetches. */}
+      {/* A 412 remounts the dialog for the same trigger so the preview is fetched again. */}
       {origin && <MappingReviewDialog request={{ ...request, returnFocus: origin, onStale: () => setOrigin(originRef.current) }} onClose={() => setOrigin(null)} />}
     </>
   );
