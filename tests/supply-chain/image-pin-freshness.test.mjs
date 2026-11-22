@@ -4,10 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { spawnSync } from "../process.mjs";
-import { loadWorkflow, root } from "./lib.mjs";
-import { postgresServiceImages } from "./policy.mjs";
+import { loadWorkflow, parseStrict, readLocalFromRepo, repoFiles, root, toData } from "./lib.mjs";
+import { checkedComposeFiles, imagePinLocation, postgresServiceImages, upstreamComposeImages } from "./policy.mjs";
 
 test("CI PostgreSQL service discovery follows the image repository", () => {
+  assert.equal(imagePinLocation("services.first\r\nsecond\u2028third"), "services.first\\u{d}\\u{a}second\\u{2028}third");
+  assert.deepEqual(postgresServiceImages(null), []);
   const postgres = "mirror.example:5000/library/postgres:17@sha256:" + "a".repeat(64);
   assert.deepEqual(postgresServiceImages({ db: { image: postgres }, history: postgres, cache: { image: "postgres:5000/redis:7" } }),
     [["db", postgres], ["history", postgres]]);
@@ -59,23 +61,28 @@ console.log(JSON.stringify({digest: current, manifests}));
   }
   const postgres = "mirror.gcr.io/library/postgres:17-alpine";
   const lookups = readFileSync(calls, "utf8").trim().split("\n");
-  const workflowFiles = ["branch-images", "image", "loadtest-image", "ci"].map(name =>
-    readFileSync(join(root, ".github/workflows", name + ".yml"), "utf8"));
+  const workflowFiles = repoFiles().filter(({ file }) => file.startsWith(".github/workflows/"));
+  const composePins = [...checkedComposeFiles()].flatMap(file =>
+    upstreamComposeImages(file, toData(parseStrict(readLocalFromRepo(file), file))).map(({ image }) => image));
   for (const tag of [
     "mirror.gcr.io/moby/buildkit:buildx-stable-1",
     "mirror.gcr.io/docker/buildkit-syft-scanner:stable-1",
     postgres,
   ]) {
     const declared = new Set();
-    for (const workflow of workflowFiles) {
-      for (const suffix of workflow.split(tag + "@").slice(1)) {
+    for (const { text } of workflowFiles) {
+      for (const suffix of text.split(tag + "@").slice(1)) {
         const digest = /^sha256:[a-f0-9]{64}/.exec(suffix);
         assert.ok(digest, tag);
         declared.add(tag + "@" + digest[0]);
       }
     }
     assert.ok(declared.size > 0, tag);
-    for (const ref of [tag, ...declared]) assert.equal(lookups.filter(value => value === ref).length, 1, ref);
+    for (const ref of composePins) {
+      if (ref.startsWith(tag + "@")) declared.add(ref);
+    }
+    const observed = lookups.filter(ref => ref === tag || ref.startsWith(tag + "@"));
+    assert.deepEqual(observed.sort(), [tag, ...declared].sort());
   }
 
   const failed = run(true);

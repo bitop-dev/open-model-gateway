@@ -44,9 +44,15 @@ export function isPinnedImage(image) {
   return normalizedPath.length <= 255;
 }
 
-export function postgresServiceImages(services = {}) {
+export function imagePinLocation(source) {
+  // Workflow identifiers and paths occupy one printable location in the Actions log.
+  return source.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}:]/gu,
+    character => "\\u{" + character.codePointAt(0).toString(16) + "}");
+}
+
+export function postgresServiceImages(services) {
   const images = [];
-  for (const [name, service] of Object.entries(services)) {
+  for (const [name, service] of Object.entries(services ?? {})) {
     const image = typeof service === "string" ? service : service?.image;
     const isPostgres = typeof image === "string" && /(?:^|\/)postgres(?:[:@][^/]*)?$/.test(image);
     if (name === "postgres" || isPostgres) images.push([name, image]);

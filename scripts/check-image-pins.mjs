@@ -1,7 +1,7 @@
 // Report registry tag drift for upstream Compose, chart and workflow image pins.
 import { spawnSync } from "node:child_process";
 import { actionName, jobsOf, parseStrict, readLocalFromRepo, repoFiles, root, stepsOf, toData } from "../tests/supply-chain/lib.mjs";
-import { checkedComposeFiles, imageTrackingReference, isPinnedImage, postgresServiceImages, upstreamComposeImages } from "../tests/supply-chain/policy.mjs";
+import { checkedComposeFiles, imagePinLocation, imageTrackingReference, isPinnedImage, postgresServiceImages, upstreamComposeImages } from "../tests/supply-chain/policy.mjs";
 
 const yaml = file => toData(parseStrict(readLocalFromRepo(file), file));
 const chart = "deploy/helm/open-model-gateway/values.yaml";
@@ -74,7 +74,8 @@ function indexDigest(reference) {
   return lookups.get(reference);
 }
 
-for (const [location, pinned, trackingTag] of pins) {
+for (const [source, pinned, trackingTag] of pins) {
+  const location = imagePinLocation(source);
   try {
     if (typeof pinned !== "string" || !isPinnedImage(pinned)) throw new Error("expected a digest-pinned image");
     const [, digest] = pinned.split("@");
