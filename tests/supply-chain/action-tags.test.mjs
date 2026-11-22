@@ -47,3 +47,31 @@ test("refuses a pin to the annotated tag object itself", async () => {
     : { sha: pin, object: { type: "commit", sha: other } };
   await assert.rejects(verifyActionTags(files, get), /mismatch/);
 });
+
+test("peels up to four annotated tags and refuses a fifth before fetching it", async () => {
+  for (const depth of [4, 5]) {
+    const tags = Array.from({ length: depth }, (_, index) => (index + 3).toString().repeat(40));
+    const calls = [];
+    const get = async path => {
+      calls.push(path);
+      if (path === refPath) return { ref: "refs/tags/v4.0.0", object: { type: "tag", sha: tags[0] } };
+      const index = tags.findIndex(sha => path === `/repos/github/codeql-action/git/tags/${sha}`);
+      assert.ok(index >= 0);
+      const next = tags[index + 1];
+      return { sha: tags[index], object: next ? { type: "tag", sha: next } : { type: "commit", sha: pin } };
+    };
+    if (depth === 4) assert.equal(await verifyActionTags(files, get), 1);
+    else await assert.rejects(verifyActionTags(files, get), /too many annotated tags/);
+    assert.deepEqual(calls, [refPath, ...tags.slice(0, 4).map(sha => `/repos/github/codeql-action/git/tags/${sha}`)]);
+  }
+});
+
+test("a non-string tag SHA is refused before requesting an annotated object", async () => {
+  const calls = [];
+  const get = async path => {
+    calls.push(path);
+    return { ref: "refs/tags/v4.0.0", object: { type: "tag", sha: [other] } };
+  };
+  await assert.rejects(verifyActionTags(files, get), /tag did not resolve to a commit/);
+  assert.deepEqual(calls, [refPath]);
+});

@@ -12,15 +12,19 @@ async function github(path) {
   return response.json();
 }
 
+// Each ref costs one ref lookup and at most four annotated-object lookups.
+const MAX_ANNOTATED_TAGS = 4;
+
 async function resolveTag(repo, tag, get) {
   const base = `/repos/${repo}/git`;
   const ref = await get(`${base}/ref/tags/${tag}`);
   if (ref.ref !== `refs/tags/${tag}`) throw new Error("unexpected tag reference");
   let object = ref.object;
   const seen = new Set();
-  while (object && /^[0-9a-f]{40}$/.test(object.sha)) {
+  while (typeof object?.sha === "string" && /^[0-9a-f]{40}$/.test(object.sha)) {
     if (object.type === "commit") return object.sha;
     if (object.type !== "tag" || seen.has(object.sha)) break;
+    if (seen.size >= MAX_ANNOTATED_TAGS) throw new Error("too many annotated tags");
     seen.add(object.sha);
     const annotated = await get(`${base}/tags/${object.sha}`);
     if (annotated.sha !== object.sha) throw new Error("unexpected annotated tag object");
