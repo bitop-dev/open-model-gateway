@@ -35,7 +35,7 @@ fn digest(token: &str) -> [u8; 32] {
 }
 
 /// The key cache index of a presented token (its SHA-256; tests).
-#[cfg(test)]
+#[cfg(all(test, feature = "integration-tests"))]
 pub(crate) fn token_digest(token: &str) -> [u8; 32] {
     digest(token)
 }
@@ -163,7 +163,7 @@ pub(crate) async fn revalidate(
 /// lock: the same live rules and the same `FOR SHARE` row locks (each locking
 /// CTE is fully read through `count(*)`, so every matching row is locked as
 /// the multi-statement form does). Equality with [`revalidate`] is tested.
-#[cfg(test)]
+#[cfg(all(test, feature = "integration-tests"))]
 pub(crate) async fn revalidate_admission(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     principal: &Principal,

@@ -71,7 +71,7 @@ use dispatch::Dispatch;
 use lanes::{Head, Lane, Pin, Planned, note, permits, spawn_line, wait_reason_without_permits};
 use line::{LineRun, RunState, Stop};
 use repository::LineRepository;
-#[cfg(test)]
+#[cfg(all(test, feature = "integration-tests"))]
 pub(crate) use segments::Probe as SegmentProbe;
 use segments::{Record, write_segments};
 

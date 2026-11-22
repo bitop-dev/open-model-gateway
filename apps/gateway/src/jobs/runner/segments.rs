@@ -352,13 +352,13 @@ pub(super) async fn write_segments(
 }
 
 /// The segment writer of one run, driven by tests.
-#[cfg(test)]
+#[cfg(all(test, feature = "integration-tests"))]
 pub(crate) struct Probe {
     state: Arc<RunState>,
     records: mpsc::Sender<Record>,
     writer: tokio::task::JoinHandle<Result<(), InferenceError>>,
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "integration-tests"))]
 impl Probe {
     pub(crate) fn start(
         store: Store,

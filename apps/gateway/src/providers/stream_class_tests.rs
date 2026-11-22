@@ -30,6 +30,7 @@ use axum::{
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
+#[cfg(feature = "integration-tests")]
 use tokio::sync::Notify;
 
 pub(crate) struct Resolver;
@@ -65,10 +66,13 @@ pub(crate) enum Step {
     /// The body stalls for good (until the client goes away).
     Hang,
     /// Send the bytes and leave the body open until the peer closes it.
+    #[cfg(feature = "integration-tests")]
     BytesThenHang(Vec<u8>, Arc<Notify>),
 }
 
+#[cfg(feature = "integration-tests")]
 struct NotifyOnDrop(Arc<Notify>);
+#[cfg(feature = "integration-tests")]
 impl Drop for NotifyOnDrop {
     fn drop(&mut self) {
         self.0.notify_one();
@@ -91,6 +95,7 @@ pub(crate) fn response(
                     yield Err(std::io::Error::other("reset"));
                 }
                 Step::Hang => std::future::pending::<()>().await,
+                #[cfg(feature = "integration-tests")]
                 Step::BytesThenHang(bytes, dropped) => {
                     let _guard = NotifyOnDrop(dropped);
                     yield Ok(Bytes::from(bytes));
