@@ -17,7 +17,7 @@ test("every Compose build section builds a known Dockerfile from the checkout", 
   for (const expected of ["compose.yaml", "deploy/demo/compose.yaml", "deploy/loadtest/compose.yaml", "deploy/staging/compose.yaml", "deploy/staging/compose.openai.yaml"]) assert.ok(files.includes(expected), expected);
   const builds = [];
   assert.deepEqual(files.flatMap(file => composeBuildViolations(file, toData(parseStrict(readLocalFromRepo(file), file)), builds)), []);
-  assert.deepEqual(builds.filter(build => build.file === COMPOSE_FILE), [], "staging runs a prepared image");
+  assert.deepEqual(builds, [], "Compose services use prepared images");
 });
 
 test("no tracked .env sits beside a checked Compose file", () => {
