@@ -1,7 +1,7 @@
 // Report registry tag drift for upstream Compose, chart and workflow image pins.
 import { spawnSync } from "node:child_process";
 import { actionName, jobsOf, parseStrict, readLocalFromRepo, repoFiles, root, stepsOf, toData } from "../tests/supply-chain/lib.mjs";
-import { checkedComposeFiles, imageTrackingReference, isPinnedImage, upstreamComposeImages } from "../tests/supply-chain/policy.mjs";
+import { checkedComposeFiles, imageTrackingReference, isPinnedImage, postgresServiceImages, upstreamComposeImages } from "../tests/supply-chain/policy.mjs";
 
 const yaml = file => toData(parseStrict(readLocalFromRepo(file), file));
 const chart = "deploy/helm/open-model-gateway/values.yaml";
@@ -20,9 +20,10 @@ for (const { file, text } of repoFiles()) {
   if (!file.startsWith(".github/workflows/")) continue;
   for (const [name, job] of jobsOf(toData(parseStrict(text, file)))) {
     const location = `${file} job '${name}'`;
-    if (file === ".github/workflows/ci.yml" && Object.hasOwn(job.services ?? {}, "postgres")) {
-      const service = job.services.postgres;
-      pins.push([`${location} services.postgres`, typeof service === "string" ? service : service?.image]);
+    if (file === ".github/workflows/ci.yml") {
+      for (const [service, image] of postgresServiceImages(job.services)) {
+        pins.push([`${location} services.${service}`, image]);
+      }
     }
     for (const step of stepsOf(job)) {
       const action = actionName(step.uses);

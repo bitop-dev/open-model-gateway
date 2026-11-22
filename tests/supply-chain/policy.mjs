@@ -44,6 +44,16 @@ export function isPinnedImage(image) {
   return normalizedPath.length <= 255;
 }
 
+export function postgresServiceImages(services = {}) {
+  const images = [];
+  for (const [name, service] of Object.entries(services)) {
+    const image = typeof service === "string" ? service : service?.image;
+    const isPostgres = typeof image === "string" && /(?:^|\/)postgres(?:[:@][^/]*)?$/.test(image);
+    if (name === "postgres" || isPostgres) images.push([name, image]);
+  }
+  return images;
+}
+
 export function imageTrackingReference(pinned, fallbackTag) {
   const [reference] = pinned.split("@");
   if (reference.lastIndexOf(":") > reference.lastIndexOf("/")) return reference;
