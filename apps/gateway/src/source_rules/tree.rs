@@ -403,54 +403,6 @@ fn prune(items: &mut Vec<Item>) {
     }
 }
 
-/// A source range: `((start line, start column), (end line, end column))`.
-pub(super) type SpanRange = ((usize, usize), (usize, usize));
-
-/// Where `file` (parsed from the unpruned text) holds items [`prune`] drops
-/// (lines from 1, columns from 0, in characters), attributes and doc comments
-/// included. For scans that read the text itself, such as comments, which
-/// `syn` does not keep.
-pub(super) fn dropped_spans(file: &syn::File) -> Vec<SpanRange> {
-    fn span(tokens: &impl syn::spanned::Spanned) -> SpanRange {
-        let s = tokens.span();
-        let (a, b) = (s.start(), s.end());
-        ((a.line, a.column), (b.line, b.column))
-    }
-    fn collect(list: &[Item], out: &mut Vec<SpanRange>) {
-        for item in list {
-            if !kept(item_attrs(item)) {
-                out.push(span(item));
-                continue;
-            }
-            match item {
-                Item::Mod(module) => {
-                    if let Some((_, inner)) = &module.content {
-                        collect(inner, out);
-                    }
-                }
-                Item::Impl(imp) => {
-                    for i in &imp.items {
-                        if !kept(impl_item_attrs(i)) {
-                            out.push(span(i));
-                        }
-                    }
-                }
-                Item::Trait(tr) => {
-                    for i in &tr.items {
-                        if !kept(trait_item_attrs(i)) {
-                            out.push(span(i));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    let mut out = Vec::new();
-    collect(&file.items, &mut out);
-    out
-}
-
 /// Match both interpretations of capital runs: APIkey contains "apikey",
 /// while clientAPIKey contains the adjacent words "api" and "key".
 pub(super) fn word_forms(ident: &str) -> impl Iterator<Item = Vec<String>> {

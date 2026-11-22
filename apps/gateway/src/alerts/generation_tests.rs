@@ -404,9 +404,9 @@ async fn alert_generation_clock_boundary_forgery_and_isolation(pool: PgPool) {
     }
 }
 
-/// A REPEATABLE READ snapshot taken before another transaction commits 50
-/// recipients would count a stale 0 and admit a 51st; the guard therefore
-/// refuses elevated isolation outright (review finding on #277).
+/// The recipient-cap guard refuses REPEATABLE READ. A snapshot taken before
+/// another transaction adds recipients could undercount the recipients already
+/// committed and admit a 51st.
 #[dbtest::test]
 async fn alert_generation_recipient_guard_refuses_stale_snapshots(pool: PgPool) {
     let s = seed(pool).await;
