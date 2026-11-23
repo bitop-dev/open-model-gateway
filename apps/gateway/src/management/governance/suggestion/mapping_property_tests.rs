@@ -1242,6 +1242,35 @@ proptest! {
 
 // ---- endpoint selection ------------------------------------------------------
 
+#[test]
+fn extreme_negative_cost_does_not_match_an_endpoint() {
+    let pricing = json!({"prompt":"0.000001","completion":"0.000001"});
+    let model = json!({"pricing":pricing,"context_length":4096});
+    let endpoints = json!({"endpoints":[
+        {"provider_name":"Endpoint","pricing":pricing},
+        {"provider_name":"Maximum fee","pricing":{
+            "prompt":"0","completion":"0","request":"9223372036854.775807",
+        }},
+    ]});
+    // The second endpoint costs i64::MAX micro-USD. Wrapping its difference
+    // from i64::MIN would put it within the two-micro-USD match tolerance.
+    let evidence = [Evidence {
+        input: 1,
+        output: 0,
+        cost: i64::MIN,
+    }];
+    let mapped = map_with_endpoints(
+        &model,
+        WorkloadKind::Generation,
+        None,
+        Some(&endpoints),
+        &evidence,
+    );
+    assert_eq!(mapped["endpoint"]["provider"], "Endpoint");
+    assert_eq!(mapped["endpoint"]["selection"], "cheapest");
+    assert_eq!(mapped["endpoint"]["matched_attempts"], 0);
+}
+
 /// Endpoint prices: mostly small per-token decimals (so evidence can match
 /// them), sometimes a random pricing object, a non-object or a hostile value.
 fn endpoint_pricing() -> impl Strategy<Value = Value> {

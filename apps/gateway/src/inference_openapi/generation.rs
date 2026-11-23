@@ -1,5 +1,7 @@
 //! Generation contract evidence registry (#82). These are executable tests,
 //! never a claim that cancellation is observable in the SSE bytes.
+use crate::management::openapi::responses::validate_request_value;
+
 pub(super) const CANCELLATION_TESTS: &[(&str, &str)] = &[
     (
         "/v1/chat/completions",
@@ -25,7 +27,7 @@ pub(super) fn validate_request(
         "generation JSON body cap"
     );
     let schema = &document["paths"][path]["post"]["x-omg-request-schema"];
-    super::responses::validate_value(document, schema, body)?;
+    validate_request_value(document, schema, body)?;
     anyhow::ensure!(
         document["components"]["schemas"]
             [schema["$ref"].as_str().unwrap().rsplit('/').next().unwrap()]["x-omg-request-constraints"]
@@ -129,11 +131,7 @@ pub(super) fn validate_request_headers(
             let value = value
                 .to_str()
                 .map_err(|_| anyhow::anyhow!("protocol header is not visible ASCII"))?;
-            super::responses::validate_value(
-                document,
-                &parameter["schema"],
-                &serde_json::json!(value),
-            )?;
+            validate_request_value(document, &parameter["schema"], &serde_json::json!(value))?;
         }
     }
     let betas = headers

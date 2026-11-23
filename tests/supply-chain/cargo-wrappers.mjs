@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { posix } from "node:path";
 import ts from "typescript";
-import { shellCommands } from "./policy.mjs";
+import { shellCommandReadings, shellCommands } from "./policy.mjs";
 
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z_0-9]*=/;
 
@@ -147,17 +147,18 @@ export function cargoScanner(read, shellSources) {
     seen.add(invocation);
     runningScripts.add(name.text);
     let cargo = false;
+    const separator = args.findIndex(word => !word.variable && word.text === "--");
+    const forwarded = args.filter((arg, i) => (separator >= 0 && i > separator)
+      || (i !== separator && !arg.text.startsWith("-"))).map(arg => ({ ...arg, forwarded: true }));
     for (const event of [`pre${name.text}`, name.text, `post${name.text}`]) {
       if (typeof scripts[event] !== "string") continue;
       shellSources.set(`npm:${event}`, scripts[event]);
-      const commands = shellCommands(scripts[event]);
-      if (event === name.text && commands.length) {
-        const separator = args.findIndex(word => !word.variable && word.text === "--");
-        const forwarded = args.filter((arg, i) => (separator >= 0 && i > separator)
-          || (i !== separator && !arg.text.startsWith("-")));
-        commands.at(-1).push(...forwarded.map(arg => ({ ...arg, forwarded: true })));
+      for (const commands of shellCommandReadings(scripts[event])) {
+        if (event === name.text && commands.length && forwarded.length) {
+          commands[commands.length - 1] = commands.at(-1).concat(forwarded);
+        }
+        if (scanCommands(commands, ".", false)) cargo = true;
       }
-      if (scanCommands(commands, ".", false)) cargo = true;
     }
     runningScripts.delete(name.text);
     return cargo;

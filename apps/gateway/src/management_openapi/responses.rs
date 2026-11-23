@@ -1,6 +1,7 @@
 //! Raw-wire contract checks. Never infer an empty body from a failed JSON decode.
 use std::collections::BTreeSet;
 
+use super::validation::{SchemaMode, ValidatorCache};
 use anyhow::{Context, Result, ensure};
 use axum::http::{HeaderMap, StatusCode};
 use serde_json::{Value, json};
@@ -157,11 +158,6 @@ fn artifact_nodes() -> &'static std::collections::HashSet<usize> {
         nodes
     })
 }
-/// Is `value` a node of the committed artifact (not a copy of one)?
-pub(super) fn is_artifact_node(value: &Value) -> bool {
-    artifact_nodes().contains(&(std::ptr::from_ref(value) as usize))
-}
-
 /// A text that is equal for two JSON values exactly when the values are equal:
 /// every encoding is self-delimiting (a string carries its byte length instead
 /// of escapes, a number its `Display` text up to `;`), so concatenations decode
@@ -249,7 +245,7 @@ pub(crate) fn key_serializations() -> usize {
 struct Scope {
     document: usize,
     registry: jsonschema::Registry<'static>,
-    validators: std::collections::HashMap<String, std::sync::Arc<jsonschema::Validator>>,
+    validators: ValidatorCache<String>,
     checked: BTreeSet<String>,
 }
 thread_local! {
@@ -291,6 +287,7 @@ pub(crate) fn with_document_cache<R>(document: &Value, f: impl FnOnce() -> R) ->
 fn scoped_validator(
     document: &Value,
     schema: &Value,
+    mode: SchemaMode,
 ) -> Result<Option<std::sync::Arc<jsonschema::Validator>>> {
     SCOPE.with(|scope| {
         let mut scope = scope.borrow_mut();
@@ -300,13 +297,14 @@ fn scoped_validator(
         else {
             return Ok(None);
         };
-        let key = serde_json::to_string(schema)?;
+        let key = (mode, serde_json::to_string(schema)?);
         if let Some(found) = scope.validators.get(&key) {
             return Ok(Some(found.clone()));
         }
         let compiled = std::sync::Arc::new(super::validation::compile_in_document(
             &scope.registry,
             schema,
+            mode,
         )?);
         scope.validators.insert(key, compiled.clone());
         Ok(Some(compiled))
@@ -317,30 +315,42 @@ pub(crate) fn validator(
     document: &Value,
     schema: &Value,
 ) -> Result<std::sync::Arc<jsonschema::Validator>> {
+    validator_with_mode(document, schema, SchemaMode::Standard)
+}
+
+pub(crate) fn request_validator(
+    document: &Value,
+    schema: &Value,
+) -> Result<std::sync::Arc<jsonschema::Validator>> {
+    validator_with_mode(document, schema, SchemaMode::HttpRequest)
+}
+
+fn validator_with_mode(
+    document: &Value,
+    schema: &Value,
+    mode: SchemaMode,
+) -> Result<std::sync::Arc<jsonschema::Validator>> {
     // Additive #82 routing: inference owns its own bounded cache. Never mix
     // identically spelled refs from the two contracts in management's cache.
     if std::ptr::eq(document, crate::inference_openapi::committed_artifact()) {
-        return crate::inference_openapi::cached_validator(document, schema);
+        return crate::inference_openapi::cached_validator(document, schema, mode);
     }
     // Pointer identity, not value equality: mutated-document controls must
     // always compile their own document and can never reuse a trusted result.
     if !std::ptr::eq(document, artifact()) {
-        if let Some(scoped) = scoped_validator(document, schema)? {
+        if let Some(scoped) = scoped_validator(document, schema, mode)? {
             return Ok(scoped);
         }
         let registry = super::validation::document_registry(document)?;
         return Ok(std::sync::Arc::new(super::validation::compile_in_document(
-            &registry, schema,
+            &registry, schema, mode,
         )?));
     }
     static REGISTRY: std::sync::OnceLock<jsonschema::Registry<'static>> =
         std::sync::OnceLock::new();
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<
-            std::collections::BTreeMap<std::sync::Arc<str>, std::sync::Arc<jsonschema::Validator>>,
-        >,
-    > = std::sync::OnceLock::new();
-    let key = cache_key(schema)?;
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<ValidatorCache<std::sync::Arc<str>>>> =
+        std::sync::OnceLock::new();
+    let key = (mode, cache_key(schema)?);
     let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
     if let Some(validator) = cache.get(&key) {
         return Ok(validator.clone());
@@ -361,7 +371,9 @@ pub(crate) fn validator(
             REGISTRY.get_or_init(|| built)
         }
     };
-    let validator = std::sync::Arc::new(super::validation::compile_in_document(registry, schema)?);
+    let validator = std::sync::Arc::new(super::validation::compile_in_document(
+        registry, schema, mode,
+    )?);
     cache.insert(key, validator.clone());
     Ok(validator)
 }
@@ -434,6 +446,12 @@ pub(crate) fn describe(error: &jsonschema::ValidationError<'_>) -> String {
         pointer(error.instance_path().to_string()),
         pointer(error.schema_path().to_string())
     )
+}
+
+pub(crate) fn validate_request_value(document: &Value, schema: &Value, body: &Value) -> Result<()> {
+    request_validator(document, schema)?
+        .validate(body)
+        .map_err(|e| anyhow::anyhow!(describe(&e)))
 }
 
 pub(crate) fn validate_value(document: &Value, schema: &Value, body: &Value) -> Result<()> {
@@ -757,6 +775,7 @@ pub(crate) struct Captured {
 }
 
 /// Names (not values) of the query parameters in a request target.
+#[cfg(feature = "integration-tests")]
 fn query_names(path: &str) -> Vec<String> {
     path.split_once('?')
         .map(|(_, query)| {
@@ -966,6 +985,7 @@ impl PositiveFixtures {
     /// `finish` judges the complete group; a coverage item that only one planned
     /// vector provides fails the gate of the shards that do not send it.
     #[track_caller]
+    #[cfg(feature = "integration-tests")]
     pub(crate) fn sharded(index: usize, count: usize) -> Self {
         Self {
             _shard: Some(super::http_vectors::divide(index, count)),

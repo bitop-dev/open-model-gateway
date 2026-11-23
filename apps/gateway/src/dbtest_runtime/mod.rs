@@ -33,13 +33,12 @@
 //!   name printed. Records older than a day whose database nobody is using are
 //!   dropped during template setup.
 
-use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::str::FromStr;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-use futures::FutureExt;
+use futures::{FutureExt, future::LocalBoxFuture};
 use sha2::{Digest, Sha256};
 use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -75,16 +74,13 @@ const OBJECT_IN_USE: &str = "55006";
 /// serialize the same DDL.
 const SQLX_BOOKKEEPING_LOCK: i64 = 8_318_549_251_334_697_844;
 
+type TestFn<T> = fn(PgPool) -> LocalBoxFuture<'static, T>;
+
 /// Run one database test: a database cloned from the process's template, a
 /// pool on it, the body, then the database dropped when the body succeeded.
-/// The same single-threaded runtime `#[sqlx::test]` used drives it. Futures are
-/// boxed so a large test future lives on the heap, not on the test thread's
-/// small stack.
-pub(crate) fn run<Fut>(test_path: &'static str, test_fn: fn(PgPool) -> Fut) -> Fut::Output
-where
-    Fut: Future,
-    Fut::Output: TestTermination,
-{
+/// Boxing the body at the call site lets tests with the same result type
+/// share setup and cleanup. The same single-threaded runtime drives both.
+pub(crate) fn run<T: TestTermination>(test_path: &'static str, test_fn: TestFn<T>) -> T {
     sqlx::test_block_on(Box::pin(async move {
         let process = process_template();
         process
@@ -409,16 +405,12 @@ impl Templates {
         Ok(())
     }
 
-    async fn run_test<Fut>(
+    async fn run_test<T: TestTermination>(
         &self,
         template: &str,
         test_path: &'static str,
-        test_fn: fn(PgPool) -> Fut,
-    ) -> Fut::Output
-    where
-        Fut: Future,
-        Fut::Output: TestTermination,
-    {
+        test_fn: TestFn<T>,
+    ) -> T {
         let (db_name, created) = self
             .create_owned(template, test_path)
             .await
@@ -432,9 +424,7 @@ impl Templates {
             .connect_with(self.options().database(&db_name).options([("jit", "off")]))
             .await
             .expect("failed to connect the test pool");
-        let outcome = AssertUnwindSafe(Box::pin(test_fn(pool.clone())))
-            .catch_unwind()
-            .await;
+        let outcome = AssertUnwindSafe(test_fn(pool.clone())).catch_unwind().await;
         if tokio::time::timeout(Duration::from_secs(10), pool.close())
             .await
             .is_err()

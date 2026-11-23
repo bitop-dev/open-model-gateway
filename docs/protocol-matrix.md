@@ -100,15 +100,15 @@ Deliveries 1–2 validate the field grammar into `ChatRequest.messages_options`;
 | `anthropic-version` | Validated exact supported version (`2023-06-01` or `2026-10-21`); sent upstream as `2023-06-01` | Accepted, not forwarded | Accepted, not forwarded | Accepted, not forwarded |
 | `anthropic-beta` (including repeated values) | Forward original values verbatim except denied prefixes below; never add betas | Same denylist/bounds; not forwarded | Same denylist/bounds; not forwarded | Same denylist/bounds; not forwarded |
 | String/block `system`, text blocks | Preserve system form, block order and content | Keep text | Keep text | Keep text |
-| `cache_control` on system/message/tool/result blocks and tools; `ttl:5m/1h` | Preserve exactly; pinned v2/v3 price must explicitly price cache reads and every requested write TTL | Validate then drop hints | Validate then drop hints | Validate then drop hints |
-| `thinking` (`adaptive`, `enabled` with budget, `disabled`; optional `display`) | Forward | Validate then drop: no Messages reasoning control exposed yet | Validate then drop: no reasoning control exposed | Validate then drop: no reasoning control exposed |
+| `cache_control` on system/message/tool/result blocks and tools; `ttl:5m/1h` | Preserve exactly; pinned v2/v3 price must explicitly price cache reads and every requested write TTL | Validate then drop hints | **400 `cache_control`** | Validate then drop hints |
+| `thinking` (`adaptive`, `enabled` with budget, `disabled`; optional `display`) | Forward | Validate then drop: no Messages reasoning control exposed yet | **400 `thinking`** | Validate then drop: no reasoning control exposed |
 | `output_config.effort` (`low/medium/high/xhigh/max`) | Forward | Validate then drop until reasoning mapping in delivery 3 | Validate then drop | Validate then drop |
-| Assistant `thinking`/`redacted_thinking` history with signatures/data | Preserve order, signatures and data exactly | Remove foreign thinking history | Remove foreign thinking history | Remove foreign thinking history |
+| Assistant `thinking`/`redacted_thinking` history with signatures/data | Preserve order, signatures and data exactly | Remove foreign thinking history | **400 `thinking`** | Remove foreign thinking history |
 | Images in messages or `tool_result` (bounded base64 source only; URL sources refused) | Forward validated image blocks | **400 `image`**, adapter declares no image input | **400 `image`**, adapter declares no image input | **400 `image`**, adapter declares no image input |
 | `output_config.format` JSON schema | **400 `output_config.format`**, pending fidelity | **400 `output_config.format`**, mapping follows in delivery 3 | **400 `output_config.format`** | **400 `output_config.format`** |
 | Tool `strict` (true or false) | **400 `strict`**, pending fidelity | **400 `strict`**, mapping follows in delivery 3 | **400 `strict`** | **400 `strict`** |
-| `context_management.edits` | Forward | Validate then drop | Validate then drop | Validate then drop |
-| Tool `defer_loading` | Forward, including explicit false | Validate then drop | Validate then drop | Validate then drop |
+| `context_management.edits` | Forward | Validate then drop | **400 `context_management`** | Validate then drop |
+| Tool `defer_loading` | Forward, including explicit false | Validate then drop | **400 `defer_loading`** | Validate then drop |
 | `output_config.task_budget` (`type:tokens`, `total`, optional `remaining`) | Forward | Validate then drop | Validate then drop | Validate then drop |
 | Server tools (web search/code execution), server-tool history/results | **400 `tools.type`**, extra charges unpriced | **400 `tools.type`** | **400 `tools.type`** | **400 `tools.type`** |
 | `temperature` (0–1; `2023-06-01` only, **400** under `2026-10-21`) | Forward | Map | Map | Map |
@@ -116,10 +116,12 @@ Deliveries 1–2 validate the field grammar into `ChatRequest.messages_options`;
 | `top_k` (positive integer; `2023-06-01` only, **400** under `2026-10-21`) | Forward | **400 `top_k`** | **400 `top_k`**, no universal Converse mapping | **400 `top_k`**, not in the pinned compatible dialect |
 | `stop_sequences` | Forward | Map `stop` | Map `stopSequences` | Map `stop` |
 | `metadata.user_id` (up to 256 characters) | Gateway client label only; not forwarded | Map to gateway client label only | Map to gateway client label only | Map to gateway client label only |
-| Ordinary function tools, `tool_choice:auto/none/any/tool` | Existing mapping | Existing mapping | Existing constraints | Existing profile constraints |
+| Ordinary function tools, `tool_choice:auto/none/any/tool` | Existing mapping | Existing mapping | Map custom tool definitions to Converse `toolSpec`; existing choice constraints | Existing profile constraints |
 | `tool_result.is_error` | Preserve explicit true/false; omission remains absent | True: prefix tool content with `[tool_error]\n`; false/absent unchanged | True: `toolResult.status:"error"`; false/absent omit status | Same marker as OpenAI; false/absent unchanged |
 | `tool_choice.disable_parallel_tool_use` | **400**, no faithful shared representation yet | **400** | **400** | **400** |
 | Unknown fields, including nested fields and unknown fields set to null | **400**, naming the field | **400**, naming the field | **400**, naming the field | **400**, naming the field |
+
+On a Bedrock-only Messages route, unsupported thinking, caching, context management and deferred tool loading return HTTP 400 before any reservation or provider call, including when `stream:true`. The Messages frontend also refuses hosted tool types and server-tool history before routing. Ordinary custom tool definitions, calls and correlated results are translated to Converse.
 
 **Beta headers are an open list**, following Anthropic's [gateway protocol](https://code.claude.com/docs/en/llm-gateway-protocol) and [beta-header grammar](https://platform.claude.com/docs/en/api/beta-headers). New Claude Code beta versions must not break simply because the gateway has not seen their names. `claude-code-20250219`, `extended-cache-ttl-2025-04-11`, tool-search, effort, OAuth and structured-output betas pass through unchanged. Accepting a beta does not enable unsupported body fields or server tools; those remain independently validated. Cache TTLs still require the priced categories below, including when paired with extended-cache-ttl.
 

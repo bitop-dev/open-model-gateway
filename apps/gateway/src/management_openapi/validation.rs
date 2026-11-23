@@ -166,19 +166,49 @@ fn rebased(schema: &Value) -> Value {
     }
 }
 
+/// Only HTTP request contracts interpret the reviewed UTF-8 byte limit.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum SchemaMode {
+    Standard,
+    HttpRequest,
+}
+
+pub(crate) type ValidatorCache<K> = BTreeMap<(SchemaMode, K), std::sync::Arc<Validator>>;
+
+struct MaxBytes(u64);
+
+impl<'i> jsonschema::Keyword<'i> for MaxBytes {
+    fn is_valid(&self, instance: &'i Value) -> bool {
+        instance
+            .as_str()
+            .is_none_or(|text| text.len() as u64 <= self.0)
+    }
+
+    fn validate(&self, instance: &'i Value) -> Result<(), jsonschema::ValidationError<'i>> {
+        if self.is_valid(instance) {
+            Ok(())
+        } else {
+            Err(jsonschema::ValidationError::custom(
+                "string exceeds the UTF-8 byte limit",
+            ))
+        }
+    }
+}
+
 /// Compile `schema` as a fragment of the document held by `registry`: its local
 /// references resolve into that document, exactly as when the schema is placed
 /// under `$defs` of a copy of the document.
 pub(crate) fn compile_in_document(
     registry: &jsonschema::Registry<'_>,
     schema: &Value,
+    mode: SchemaMode,
 ) -> Result<Validator> {
     let root = json!({"$defs":{"observed":rebased(schema)},"$ref":"#/$defs/observed"});
-    build(&root, Some(registry))
+    build(&root, Some(registry), mode)
 }
 
 pub(crate) fn compile_schema(schema: &Value) -> Result<Validator> {
-    build(schema, None)
+    build(schema, None, SchemaMode::Standard)
 }
 /// The validator of `{"type":"string","pattern":<pattern>}`, compiled once per
 /// distinct pattern for the process (a compilation is a pure function of the
@@ -200,7 +230,11 @@ pub(crate) fn pattern_validator(pattern: &str) -> Result<std::sync::Arc<Validato
     built.map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-fn build(schema: &Value, registry: Option<&jsonschema::Registry<'_>>) -> Result<Validator> {
+fn build(
+    schema: &Value,
+    registry: Option<&jsonschema::Registry<'_>>,
+    mode: SchemaMode,
+) -> Result<Validator> {
     // No runtime backtracking: look-around/backreferences, malformed patterns and
     // compilation exhaustion fail at construction. The RED tests cover both regex
     // keywords, including underneath `not` (where treating errors as false is unsafe).
@@ -219,6 +253,17 @@ fn build(schema: &Value, registry: Option<&jsonschema::Registry<'_>>) -> Result<
         })
         .with_retriever(local_schemas()?)
         .with_pattern_options(PatternOptions::regex().size_limit(1 << 20));
+    let options = match mode {
+        SchemaMode::Standard => options,
+        SchemaMode::HttpRequest => {
+            options.with_keyword(super::http_vectors::MAX_BYTES, |_, limit, _| {
+                let limit = limit.as_u64().ok_or_else(|| {
+                    jsonschema::ValidationError::schema("expected an unsigned UTF-8 byte limit")
+                })?;
+                Ok(Box::new(MaxBytes(limit)))
+            })
+        }
+    };
     let options = match registry {
         Some(registry) => options.with_registry(registry),
         None => options,
@@ -368,6 +413,7 @@ pub(crate) fn validate_document_with(
         compile_in_document(
             &registry,
             &json!({"$ref":format!("#{}", fragment(&pointer))}),
+            SchemaMode::Standard,
         )
         .with_context(|| format!("compile contract schema at {pointer}"))?;
     }

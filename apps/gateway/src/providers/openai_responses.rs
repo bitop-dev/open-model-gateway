@@ -506,13 +506,15 @@ impl State {
     }
     fn terminal(&mut self, kind: &str, value: &Value, frame: &[u8]) -> Result<Vec<ChatEvent>> {
         let snapshot = &value["response"];
+        let reject_snapshot = || {
+            crate::inference::evidence::preserve(Err(InferenceError::InvalidUpstream), || {
+                Some(evidence::rejected_terminal_usage(frame))
+            })
+        };
         if (kind == "response.completed" && snapshot["status"] != "completed")
             || (kind == "response.incomplete" && snapshot["status"] != "incomplete")
         {
-            return crate::inference::evidence::preserve(
-                Err(InferenceError::InvalidUpstream),
-                || Some(evidence::mismatch_usage(frame)),
-            );
+            return reject_snapshot();
         }
         let response = decode(snapshot)?;
         if self.stopped.len() != self.items.len()
@@ -525,11 +527,7 @@ impl State {
                 .zip(self.calls.values())
                 .any(|(a, b)| a.id != b.id || a.name != b.name || a.arguments != b.arguments)
         {
-            // The terminal snapshot's validated usage is still evidence.
-            return crate::inference::evidence::preserve(
-                Err(InferenceError::InvalidUpstream),
-                || Some(Ok(response.usage)),
-            );
+            return reject_snapshot();
         }
         Ok(vec![
             ChatEvent::Finish(response.finish_reason),

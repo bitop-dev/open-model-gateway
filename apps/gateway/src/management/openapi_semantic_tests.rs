@@ -30,6 +30,7 @@ impl<'de, T: Deserialize<'de> + Semantic> Deserialize<'de> for Checked<T> {
 
 /// The documented JSON request schema of the operation `method` routes `path`
 /// to, resolved like an executed request (the most specific static template).
+#[cfg(feature = "integration-tests")]
 fn request_schema(method: &str, path: &str) -> &'static serde_json::Value {
     let document = crate::management::openapi::responses::artifact();
     let path = path.split('?').next().unwrap();
@@ -61,6 +62,7 @@ fn request_schema(method: &str, path: &str) -> &'static serde_json::Value {
 
 /// Validate an executed request body against its exact routed operation,
 /// including manually decoded JSON bodies that have no derived struct DTO.
+#[cfg(feature = "integration-tests")]
 pub(crate) fn check_request(
     method: &str,
     path: &str,

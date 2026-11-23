@@ -620,8 +620,8 @@ impl State {
         fields(&value["delta"], &["stop_reason", "stop_sequence"])?;
         self.usage = super::metering::merge(self.usage, usage(&value["usage"])?)?;
         if !value["delta"]["stop_reason"].is_null() {
-            self.finished = true;
             events.push(ChatEvent::Finish(finish(&value["delta"]["stop_reason"])?));
+            self.finished = true;
         }
         Ok(())
     }

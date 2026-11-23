@@ -24,6 +24,7 @@ import { runInNewContext } from "node:vm";
 import { isMap, isScalar, parseDocument, visit } from "yaml";
 import { bashPath, runBash } from "./bash-preflight.mjs";
 import { APPROVED_RUNTIME, OTHER_BASE, hasWrite, jobCanWrite, jobPermissions, APPROVED_RUST, KNOWN_DOCKERFILES, RUNTIME_DOCKERFILES, SHA, actionName, containerImagesIn, findDockerfiles, jobsOf, parseStrict, readLocalFromRepo, repoFiles, root, stepsOf, toData, unknownDockerfileViolations, walk, wf, workflowsDir } from "./supply-chain/lib.mjs";
+import { pinViolations } from "./supply-chain/action-pins.mjs";
 import { git } from "./supply-chain/secret-scan-lib.mjs";
 
 // An unsupported shell fails this file here, before any test or fixture runs (#380).
@@ -62,31 +63,6 @@ const UNVERIFIED_INSTALLERS = new Map([
 ]);
 
 // ---- pinning ----
-
-// Every `uses:` anywhere in the file, read from the syntax tree so comments and
-// flow-style or aliased values are seen as they are.
-export function pinViolations(text, file) {
-  const doc = parseStrict(text, file);
-  const out = [];
-  visit(doc, {
-    Pair(_, pair) {
-      if (!isScalar(pair.key) || pair.key.value !== "uses") return;
-      const v = pair.value;
-      if (!isScalar(v) || typeof v.value !== "string") {
-        out.push(`${file}: a 'uses' value is not a plain string (aliases and expressions cannot be checked)`);
-        return;
-      }
-      const ref = v.value;
-      if (ref.startsWith("./")) return; // local actions and reusable workflows
-      if (ref.startsWith("docker://")) {
-        if (!/@sha256:[0-9a-f]{64}$/.test(ref)) out.push(`${file}: ${ref} is not pinned by digest`);
-        return;
-      }
-      if (!/@[0-9a-f]{40}$/.test(ref) || !(v.comment ?? "").trim()) out.push(`${file}: ${ref} needs a full commit SHA and a version comment`);
-    },
-  });
-  return out;
-}
 
 // ---- permissions ----
 
@@ -471,10 +447,22 @@ test("the Docker PostgreSQL fixture uses exactly one approved digest-pinned imag
   ], "expected exactly one PostgreSQL fixture reference, using the approved PostgreSQL 17 digest (not a mutable tag)");
 });
 
+test("Compose uses the approved PostgreSQL 17 Alpine index (#771)", () => {
+  const digest = "sha256:f9cf3e1f0066f0eb0c48707d864f0ac5941e9ff454a072077d97a4d278d07d73";
+  for (const [file, image] of [
+    ["compose.yaml", "postgres"],
+    ["deploy/demo/compose.yaml", "postgres"],
+    ["deploy/loadtest/compose.yaml", "mirror.gcr.io/library/postgres"],
+  ]) {
+    const compose = toData(parseStrict(readLocalFromRepo(file), file));
+    assert.equal(compose.services.postgres.image, `${image}:17-alpine@${digest}`, file);
+  }
+});
+
 test("staging verifier images use the approved literal digest pins in both workflows, Compose defaults and examples (#373)", () => {
   const pins = [
-    ["STAGING_POSTGRES_IMAGE", "postgres", "mirror.gcr.io/library/postgres@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27"],
-    ["STAGING_CADDY_IMAGE", "ingress", "mirror.gcr.io/library/caddy@sha256:d8542f48d34a9cf4e4c11a478865229840e87e4c96ea3f439101f31a5d35f75f"],
+    ["STAGING_POSTGRES_IMAGE", "postgres", "mirror.gcr.io/library/postgres@sha256:837bed18782820fe967067cb5328b02b0d9992c1be9a37ee0c9c492cfc03af3b"],
+    ["STAGING_CADDY_IMAGE", "ingress", "mirror.gcr.io/library/caddy@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0"],
   ];
   const actual = [];
   const expected = [];
@@ -1640,13 +1628,15 @@ function probeFixture() {
     GITHUB_REPOSITORY: "bitop-dev/open-model-gateway", IMAGE: "ghcr.io/bitop-dev/open-model-gateway", GITHUB_ACTOR: "probe-fixture",
     DIGEST: `sha256:${"b".repeat(64)}`, CHILD: `sha256:${"c".repeat(64)}`,
     FIXTURE_DIR: dir,
+    FIXTURE_PRIMARY_BUNDLE: JSON.stringify(probeBundle()) + "\n",
+    FIXTURE_SECONDARY_BUNDLE: JSON.stringify(probeBundle("fixture-second")) + "\n",
     REPORTED_VERSION: `open-model-gateway ${readFileSync(join(root, "apps/gateway/Cargo.toml"), "utf8").match(/^version = "([^"]+)"$/m)[1]}`,
   };
   const mock = `#!${process.execPath}
 const fs = require('node:fs');
 const path = require('node:path');
 const e = process.env, a = process.argv.slice(2), command = path.basename(process.argv[1]);
-fs.appendFileSync(path.join(e.FIXTURE_DIR, 'calls'), JSON.stringify([command, ...a]) + '\\n');
+fs.appendFileSync(path.join(e.FIXTURE_DIR, 'calls'), [a.length + 1, command, ...a, ''].join('\\0'));
 const fail = (message, code = 1) => { console.error(message); process.exit(code); };
 if (command === 'docker') {
   if (a[0] === 'login') {
@@ -1673,18 +1663,8 @@ if (command === 'docker') {
     process.stdout.write(fs.readFileSync(path.join(e.FIXTURE_DIR, 'download.jsonl')), () => process.exit(0));
     return;
   }
-  if (!['verify', 'verify-blob'].includes(a[0])) fail('local signing is forbidden');
+  if (a[0] !== 'verify') fail('local signing is forbidden');
   const artifact = a.at(-1), identity = a[a.indexOf('--certificate-identity') + 1], issuer = a[a.indexOf('--certificate-oidc-issuer') + 1];
-  const local = a[0] === 'verify-blob';
-  if (local) {
-    const cwd = process.cwd(), bundlePath = a[a.indexOf('--bundle') + 1];
-    if (bundlePath !== './bundle.json' || fs.readdirSync(cwd).join() !== 'bundle.json') fail('bundle verification needs a fresh isolated directory');
-    if ((fs.statSync(cwd).mode & 0o777) !== 0o700 || (fs.statSync(bundlePath).mode & 0o777) !== 0o600) fail('bundle data is not private');
-    if (!/^sha256:[0-9a-f]{64}$/.test(artifact) || fs.existsSync(artifact)) fail('expected a digest, not a file');
-    const bundle = fs.readFileSync(bundlePath, 'utf8');
-    fs.appendFileSync(path.join(e.FIXTURE_DIR, 'blob-calls'), JSON.stringify({ cwd, bundle, artifact, identity, issuer }) + '\\n');
-    if (!['fixture-payload', 'fixture-second'].includes(JSON.parse(bundle).dsseEnvelope.payload)) fail('fixture tampered payload or bad digest');
-  }
   const negative = artifact.endsWith(e.CHILD) || identity.includes('wrong-workflow') || issuer.includes('wrong-issuer');
   if (negative && e.NEGATIVE_MODE === 'success') { console.log('[]'); process.exit(0); }
   if (negative && e.NEGATIVE_MODE === 'network') fail('Get https://ghcr.io/v2/: connection reset');
@@ -1692,14 +1672,13 @@ if (command === 'docker') {
   if (negative) {
     const actualIdentity = 'https://github.com/' + e.GITHUB_REPOSITORY + '/.github/workflows/image.yml@' + e.GITHUB_REF;
     let message;
-    if (artifact.endsWith(e.CHILD)) message = e.CHILD_ERROR || (local
-      ? 'failed to verify signature: provided artifact digest does not match any digest in statement' : 'no signatures found');
+    if (artifact.endsWith(e.CHILD)) message = e.CHILD_ERROR || 'no signatures found';
     else {
       const detail = identity.includes('wrong-workflow')
         ? 'expected SAN value "' + identity + '", got "' + actualIdentity + '"'
         : 'expected issuer value "' + issuer + '", got "https://token.actions.githubusercontent.com"';
       const supplied = identity.includes('wrong-workflow') ? e.IDENTITY_ERROR : e.ISSUER_ERROR;
-      message = supplied || (local ? '' : 'no matching attestations: ') + 'failed to verify certificate identity: no matching CertificateIdentity found, last error: ' + detail;
+      message = supplied || 'no matching attestations: failed to verify certificate identity: no matching CertificateIdentity found, last error: ' + detail;
     }
     if (e.NEGATIVE_MODE === 'policy-mixed') message += '\\nGet https://ghcr.io/v2/: connection reset';
     // Observed pinned Cosign stderr has a bare main.go logger; retain dated compatibility.
@@ -1707,35 +1686,149 @@ if (command === 'docker') {
     const logger = (e.DATED ? '2026/10/26 12:00:00 ' : '') + 'error during command execution: ';
     fail((e.ERROR_PREFIX ?? 'Error: ') + message + (e.ERROR_SUFFIX || '') + '\\n' + (e.LOGGER_PREFIX ?? logger) + message);
   }
-  if (local) {
-    if (e.LOCAL_POSITIVE_ERROR) fail(e.LOCAL_POSITIVE_ERROR);
-    console.error('Verified OK');
-  } else {
-    if (e.ONLINE_ERROR) fail(e.ONLINE_ERROR);
-    console.log(e.PAYLOAD_JSON || JSON.stringify([{ critical: { image: { 'docker-manifest-digest': e.DIGEST } } }]));
-  }
+  if (e.ONLINE_ERROR) fail(e.ONLINE_ERROR);
+  console.log(e.PAYLOAD_JSON || JSON.stringify([{ critical: { image: { 'docker-manifest-digest': e.DIGEST } } }]));
 } else fail('unexpected executable');
 `;
-  for (const name of ["docker", "cosign"]) { writeFileSync(join(bin, name), mock); chmodSync(join(bin, name), 0o755); }
+  const online = join(dir, "online");
+  mkdirSync(online);
+  writeFileSync(join(bin, "docker"), mock, { mode: 0o755 });
+  writeFileSync(join(online, "cosign"), mock, { mode: 0o755 });
+  // Run each local check as a separate command without starting Node 64 times
+  // in the max-bundle case.
+  const local = `#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ \${1:-} != verify-blob ]]; then
+  exec "\${FIXTURE_DIR}/online/cosign" "$@"
+fi
+
+fail() {
+  printf '%s\\n' "$1" >&2
+  exit 1
+}
+
+# Record the invocation before any local refusal so a premature call is observable.
+printf '%s\\0' "$(($# + 1))" cosign "$@" >>"$FIXTURE_DIR/calls"
+
+artifact=\${!#}
+bundle_path=
+identity=
+issuer=
+while (($# > 1)); do
+  case "$1" in
+    --bundle) bundle_path=$2; shift ;;
+    --certificate-identity) identity=$2; shift ;;
+    --certificate-oidc-issuer) issuer=$2; shift ;;
+  esac
+  shift
+done
+
+shopt -s nullglob dotglob
+files=(*)
+if [[ $bundle_path != ./bundle.json || \${#files[@]} != 1 || \${files[0]} != bundle.json ]]; then
+  fail 'bundle verification needs a fresh isolated directory'
+fi
+# Replace the command-substitution shell with stat. GNU and BSD use different flags.
+if ! modes=$(exec stat -c '%a' . "$bundle_path" 2>/dev/null); then
+  modes=$(exec stat -f '%Lp' . "$bundle_path")
+fi
+[[ $modes == $'700\\n600' ]] || fail 'bundle data is not private'
+if [[ ! $artifact =~ ^sha256:[0-9a-f]{64}$ || -e $artifact ]]; then
+  fail 'expected a digest, not a file'
+fi
+
+# Read the exact bytes, including the final newline. A NUL is invalid JSON.
+if IFS= read -r -d '' bundle < "$bundle_path"; then
+  fail 'fixture tampered payload or bad digest'
+fi
+# Both canonical fixture bundles have accepted payloads. Parse any other
+# bundle so the fixture still checks the payload in noncanonical JSON.
+valid=true
+if [[ $bundle != "$FIXTURE_PRIMARY_BUNDLE" && $bundle != "$FIXTURE_SECONDARY_BUNDLE" ]]; then
+  valid=$(jq -Rs '
+    fromjson | .dsseEnvelope.payload | . == "fixture-payload" or . == "fixture-second"
+  ' <<<"$bundle")
+fi
+cd -P .
+printf '%s\\0' 5 "$PWD" "$bundle" "$artifact" "$identity" "$issuer" >>"$FIXTURE_DIR/blob-calls"
+[[ $valid == true ]] || fail 'fixture tampered payload or bad digest'
+
+if [[ $artifact != *"$CHILD" && $identity != *wrong-workflow* && $issuer != *wrong-issuer* ]]; then
+  [[ -z \${LOCAL_POSITIVE_ERROR:-} ]] || fail "$LOCAL_POSITIVE_ERROR"
+  printf '%s\\n' 'Verified OK' >&2
+  exit 0
+fi
+
+network_error='Get https://ghcr.io/v2/: connection reset'
+case "\${NEGATIVE_MODE:-}" in
+  success) printf '%s\\n' '[]'; exit 0 ;;
+  network) fail "$network_error" ;;
+  mixed) fail "no signatures found"$'\\n'"$network_error" ;;
+esac
+
+policy='failed to verify certificate identity: no matching CertificateIdentity found, last error:'
+if [[ $artifact == *"$CHILD" ]]; then
+  message=\${CHILD_ERROR:-failed to verify signature: provided artifact digest does not match any digest in statement}
+elif [[ $identity == *wrong-workflow* ]]; then
+  expected_identity="https://github.com/\${GITHUB_REPOSITORY}/.github/workflows/image.yml@\${GITHUB_REF}"
+  message=\${IDENTITY_ERROR:-"\${policy} expected SAN value \\"\${identity}\\", got \\"\${expected_identity}\\""}
+else
+  message=\${ISSUER_ERROR:-"\${policy} expected issuer value \\"\${issuer}\\", got \\"https://token.actions.githubusercontent.com\\""}
+fi
+if [[ \${NEGATIVE_MODE:-} == policy-mixed ]]; then
+  message+=$'\\n'"$network_error"
+fi
+logger='error during command execution: '
+if [[ -n \${DATED:-} ]]; then
+  logger="2026/10/26 12:00:00 \${logger}"
+fi
+fail "\${ERROR_PREFIX-Error: }\${message}\${ERROR_SUFFIX:-}"$'\\n'"\${LOGGER_PREFIX-\${logger}}\${message}"
+`;
+  writeFileSync(join(bin, "cosign"), local, { mode: 0o755 });
   const child = { mediaType: "application/vnd.oci.image.manifest.v1+json", digest: env.CHILD, size: 100, platform: { os: "linux", architecture: "amd64" } };
   const index = { schemaVersion: 2, mediaType: "application/vnd.oci.image.index.v1+json", manifests: [child, {
     ...child, digest: `sha256:${"d".repeat(64)}`, platform: { os: "unknown", architecture: "unknown" },
     annotations: { "vnd.docker.reference.type": "attestation-manifest", "vnd.docker.reference.digest": env.CHILD },
   }] };
   writeFileSync(join(dir, "index.json"), JSON.stringify(index));
-  writeFileSync(join(dir, "download.jsonl"), JSON.stringify(probeBundle()) + "\n");
+  writeFileSync(join(dir, "download.jsonl"), env.FIXTURE_PRIMARY_BUNDLE);
   writeFileSync(env.GITHUB_ENV, ""); writeFileSync(env.GITHUB_OUTPUT, "");
-  const run = (script, overrides = {}, cwd = root) => runBash(["--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script], {
-    cwd, env: { ...env, ...overrides }, encoding: "utf8", timeout: 10_000,
-  });
-  const calls = () => existsSync(join(dir, "calls")) ? readFileSync(join(dir, "calls"), "utf8").trim().split("\n").filter(Boolean).map(JSON.parse) : [];
+  const run = (script, overrides = {}, cwd = root) => {
+    const result = runBash(["--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script], {
+      cwd, env: { ...env, ...overrides }, encoding: "utf8", timeout: 10_000,
+    });
+    assert.ifError(result.error);
+    assert.equal(result.signal, null, result.stderr);
+    return result;
+  };
+  // A field count and NUL separators preserve empty fields and newlines
+  // without asking every offline invocation to start a JSON encoder.
+  const readRecords = file => {
+    const path = join(dir, file);
+    if (!existsSync(path)) return [];
+    const fields = readFileSync(path, "utf8").split("\0");
+    assert.equal(fields.pop(), "", "unterminated fixture log record");
+    const records = [];
+    for (let offset = 0; offset < fields.length;) {
+      const count = Number(fields[offset++]);
+      assert.ok(Number.isSafeInteger(count) && count > 0 && offset + count <= fields.length, "invalid fixture log field count");
+      records.push(fields.slice(offset, offset + count));
+      offset += count;
+    }
+    return records;
+  };
+  const calls = () => readRecords("calls");
+  const blobCalls = () => readRecords("blob-calls").map(([cwd, bundle, artifact, identity, issuer]) => ({
+    cwd, bundle, artifact, identity, issuer,
+  }));
   const authenticate = script => {
     const result = run(script, { GITHUB_TOKEN: "fixture-read-token" });
     const match = [...readFileSync(env.GITHUB_ENV, "utf8").matchAll(/^DOCKER_CONFIG=(.+)$/gm)].at(-1);
     if (match) env.DOCKER_CONFIG = match[1];
     return result;
   };
-  return { dir, env, run, calls, authenticate, index, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  return { dir, env, run, calls, blobCalls, authenticate, index, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
 test("actual probe branch/digest guards refuse main, tags, invalid SHAs and reusable activation before credentials (#375)", () => {
@@ -1882,6 +1975,20 @@ test("collapsed child discovery 'no signatures found' is never artifact-binding 
   } finally { f.cleanup(); }
 });
 
+test("the offline verifier records attempts even when its inputs are refused", () => {
+  const f = probeFixture();
+  try {
+    const identity = 'quoted "subject"\nwith a backslash \\';
+    const result = f.run('cosign verify-blob --bundle ./bundle.json --certificate-identity "$IDENTITY" --certificate-oidc-issuer "" "$DIGEST"',
+      { IDENTITY: identity }, f.dir);
+    assert.equal(result.status, 1);
+    assert.equal(result.stderr, "bundle verification needs a fresh isolated directory\n");
+    assert.deepEqual(f.calls(), [
+      ["cosign", "verify-blob", "--bundle", "./bundle.json", "--certificate-identity", identity, "--certificate-oidc-issuer", "", f.env.DIGEST],
+    ]);
+  } finally { f.cleanup(); }
+});
+
 test("download gate refuses empty, legacy, malformed, wrong-media, oversized and excess root bundles (#375)", () => {
   const script = probeStep(publicationData().image, "probe-verify", "Verify exact root and expected refusals").run;
   const invalid = [
@@ -1908,7 +2015,9 @@ test("download gate refuses empty, legacy, malformed, wrong-media, oversized and
 
 test("root bundle download accepts exactly one MiB but rejects even one extra byte (#375)", () => {
   const script = probeStep(publicationData().image, "probe-verify", "Verify exact root and expected refusals").run;
-  const bundle = JSON.stringify(probeBundle());
+  const { verificationMaterial, ...rest } = probeBundle();
+  // Exercise the payload parser with a different field order.
+  const bundle = JSON.stringify({ verificationMaterial, ...rest });
   for (const extra of ["", " ", "\0"]) {
     const f = probeFixture();
     try {
@@ -1938,8 +2047,9 @@ test("all four local checks reuse each validated root bundle in a fresh private 
       const calls = f.calls().filter(c => c[0] === "cosign");
       assert.equal(calls.filter(c => c[1] === "download").length, 1);
       assert.equal(calls.filter(c => c[1] === "verify").length, 1);
+      assert.equal(calls.filter(c => c[1] === "verify-blob").length, 4 * count);
       assert.ok(calls.filter(c => c[1] !== "verify-blob").every(c => c.at(-1) === f.env.IMAGE + "@" + f.env.DIGEST));
-      const local = readFileSync(join(f.dir, "blob-calls"), "utf8").trim().split("\n").map(JSON.parse);
+      const local = f.blobCalls();
       assert.equal(local.length, 4 * count);
       assert.equal(new Set(local.map(c => c.cwd)).size, count);
       const identity = `https://github.com/${f.env.GITHUB_REPOSITORY}/.github/workflows/image.yml@${f.env.GITHUB_REF}`;

@@ -35,9 +35,31 @@
 //! claim fencing tokens compared in SQL, multipart boundaries and event ids.
 //! A value that must be unguessable to protect anything (a credential, a
 //! token that authorizes on its own, a key or a nonce) is drawn here, never
-//! from a UUID. The source gate checks direct secret-named bindings; indirect flows require review
-//! (a UUID reaching the name through another binding, a `static`, a branch, closure,
-//! macro body or `format!`, and SQL through an implicit alias, a CTE or a function).
+//! from a UUID. The UUID binding check reads gateway production Rust modules and
+//! literal SQL there, plus SQL files under gateway src, migrations,
+//! enterprise_migrations and deploy/staging. tools/loadgen, crates/* and
+//! apps/gateway/tests are outside its inventory.
+//!
+//! This syntax check follows expression tails (including if/match arms and
+//! closure bodies), call arguments, method receivers, unwrap_or arguments,
+//! casts, `?` and `.await`. It checks free static/const initializers, plain
+//! local assignments, and identifier bindings in let, let-else and if-let.
+//! Tuple and slice patterns are checked position by position when the
+//! initializer is a tuple or array literal. Destructuring a tuple or array
+//! returned by an `if` or `match` requires review. Other patterns (such as
+//! `Some(token)` or the captured rest slice itself), associated constants,
+//! earlier bindings, early returns and other method arguments require review.
+//! The check does not expand Rust macros
+//! (including tokio::select! and format!). Review formatted credentials for
+//! a separately generated secret alongside any public UUID, as in auth.rs
+//! and admin_tokens.rs.
+//!
+//! SQL checks recognize gen_random_uuid() with explicit target columns or
+//! AS aliases. Implicit SELECT aliases, tuple SET, uuid_generate_v4(),
+//! uuidv7(), and data flow through a CTE or function require review.
+//! Names match by substring with an exact key_id exemption and scoped fence
+//! exceptions. UUID identifiers named api_key_id, token_id or idempotency_key
+//! can therefore be reported even when public.
 //!
 //! The scan reads source text. A path assembled at run time is not seen:
 //! `Path::join`, `format!`, slices joined with `join("/")`, text read with
@@ -706,12 +728,16 @@ mod tests {
 
     /// What Clippy cannot name (a field, a type used through `Default`, a
     /// device path) is named here instead (#511).
-    /// The crates whose paths `clippy.toml` names (#509, #511), at the
+    /// The crates whose paths `clippy.toml` names, at the
     /// versions the paths were written and probed for. Clippy reports a
     /// path it cannot resolve only as a warning, and not at all under
     /// `allow-invalid`, so a version change must bring the entries up for
     /// review: update the paths, re-run a planted probe, then this table.
-    const REVIEWED_CRATES: [(&str, &[&str]); 8] = [
+    const REVIEWED_CRATES: [(&str, &[&str]); 12] = [
+        ("aws-config", &["1"]),
+        ("aws-sdk-bedrockruntime", &["1"]),
+        ("aws-sdk-s3", &["1"]),
+        ("aws-types", &["1"]),
         ("crypto-common", &["0.1", "0.2"]),
         ("oauth2", &["5"]),
         ("openidconnect", &["4"]),

@@ -199,7 +199,7 @@ async fn body_outcome(
     label: &str,
     body: Value,
 ) -> (bool, bool) {
-    let schema_accepts = openapi::responses::validate_value(
+    let schema_accepts = openapi::responses::validate_request_value(
         openapi::responses::artifact(),
         request_schema(method, template),
         &body,
@@ -219,7 +219,7 @@ async fn query_outcome(
     label: &str,
     value: &str,
 ) -> (bool, bool) {
-    let schema_accepts = openapi::responses::validate_value(
+    let schema_accepts = openapi::responses::validate_request_value(
         openapi::responses::artifact(),
         query_schema(template, name),
         &json!(value),
@@ -386,7 +386,25 @@ fn query_candidates(template: &str, base: &[(&str, &str)]) -> Vec<(String, Strin
         cut.next();
         match *name {
             // The valid value, and the same with its first character cut off.
-            "status" | "finish_reason" | "cursor" => {
+            "cursor" => {
+                let mut longest = format!("1000000000000000000_{}", Uuid::nil());
+                if template.ends_with("/sessions") {
+                    longest.push('_');
+                    longest.push_str(&"f09f9880".repeat(128));
+                    out.extend(
+                        super::session_cursor_width_candidates(longest)
+                            .into_iter()
+                            .map(|(name, value)| (name.to_owned(), value)),
+                    );
+                } else {
+                    out.push(("cursor".into(), format!("9{longest}")));
+                    out.push(("cursor".into(), format!("{longest}0")));
+                    out.push(("cursor".into(), longest));
+                }
+                out.push(("cursor".into(), (*value).to_owned()));
+                out.push(("cursor".into(), cut.as_str().to_owned()));
+            }
+            "status" | "finish_reason" => {
                 out.push(((*name).to_owned(), (*value).to_owned()));
                 out.push(((*name).to_owned(), cut.as_str().to_owned()));
             }
@@ -402,6 +420,9 @@ fn query_candidates(template: &str, base: &[(&str, &str)]) -> Vec<(String, Strin
             }
             // Twenty actions of up to 64 characters.
             "exclude_actions" => {
+                let longest = vec!["a".repeat(64); 20].join(",");
+                out.push(("exclude_actions".into(), format!("{longest}a")));
+                out.push(("exclude_actions".into(), longest));
                 out.push(("exclude_actions".into(), vec!["a"; 20].join(",")));
                 out.push(("exclude_actions".into(), vec!["a"; 21].join(",")));
                 out.push(("exclude_actions".into(), "a".repeat(64)));
@@ -1964,15 +1985,33 @@ async fn slice6_fixtures(pool: PgPool, shard: usize) -> (PositiveFixtures, Vec<S
     w.status(&member, "GET", &batchpath, None, StatusCode::NOT_FOUND)
         .await;
     fresh_waits(&pool).await;
-    w.json(&owner, "GET", &format!("{ws}/batches"), None).await;
-    for j in [j0, j1, j2, j3, j4, j5] {
-        w.json(
-            &owner,
-            "GET",
-            &format!("{ws}/batches/batch_{}", j.simple()),
-            None,
-        )
-        .await;
+    let batches = w.json(&owner, "GET", &format!("{ws}/batches"), None).await;
+    let active_id = format!("batch_{}", j2.simple());
+    let active = batches["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == active_id)
+        .unwrap();
+    assert_eq!(active["running_lines"], 2);
+
+    // Both provider calls have finished, but their result segment is still pending.
+    sqlx::query("UPDATE batch_lines SET execution_id=gen_random_uuid(),awaiting_segment=true WHERE job_id=$1")
+        .bind(j2).execute(&pool).await.unwrap();
+    fresh_waits(&pool).await;
+    for j in [j2, j0, j1, j3, j4, j5] {
+        let detail = w
+            .json(
+                &owner,
+                "GET",
+                &format!("{ws}/batches/batch_{}", j.simple()),
+                None,
+            )
+            .await;
+        if j == j2 {
+            assert_eq!(detail["batch"]["running_lines"], 0);
+            assert_eq!(detail["batch"]["waiting_reason"], "workers");
+        }
     }
     w.json(&auditor, "GET", "/api/v1/platform/batches", None)
         .await;
@@ -2841,7 +2880,7 @@ async fn slice6_fixtures(pool: PgPool, shard: usize) -> (PositiveFixtures, Vec<S
             if let Some(file) = file {
                 parts.insert("file".into(), json!(if file.is_empty() { "" } else { "x" }));
             }
-            let schema_accepts = openapi::responses::validate_value(
+            let schema_accepts = openapi::responses::validate_request_value(
                 openapi::responses::artifact(),
                 &upload_schema,
                 &Value::Object(parts),
@@ -2867,7 +2906,7 @@ async fn slice6_fixtures(pool: PgPool, shard: usize) -> (PositiveFixtures, Vec<S
             if handled { ok } else { bad },
             "upload case {label}"
         );
-        let schema_accepts = openapi::responses::validate_value(
+        let schema_accepts = openapi::responses::validate_request_value(
             openapi::responses::artifact(),
             &upload_schema,
             &json!({"purpose":"user_data","expires_after[anchor]":"created_at","expires_after[seconds]":seconds,"file":"x"}),
@@ -2892,7 +2931,7 @@ async fn slice6_fixtures(pool: PgPool, shard: usize) -> (PositiveFixtures, Vec<S
         )
         .await;
         assert_eq!(r.status, bad, "upload case {label}");
-        let schema_accepts = openapi::responses::validate_value(
+        let schema_accepts = openapi::responses::validate_request_value(
             openapi::responses::artifact(),
             &upload_schema,
             &json!({"purpose":purpose,"file":"x"}),

@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 MIGRATIONS = Path(__file__).resolve().parents[1] / "apps/gateway/enterprise_migrations"
-SENSITIVE = re.compile("secret|token|password|credential", re.I)
+SENSITIVE = re.compile("secret|token|password|credential|passwd|pwd|api_key|private_key|bearer|jwt|passphrase", re.I)
 
 
 # Match quoted tokens before punctuation so embedded commas and keywords stay opaque.
@@ -38,18 +38,32 @@ def sql_tokens(sql):
             end = sql.index(word, pos)
             yield sql[match.start():end + len(word)]
             pos = end + len(word)
-        elif word.startswith('"'):
+        elif word.startswith(('"', "'")) or word[:2].lower() == "e'":
             yield word
         else:
             yield word.translate(lower_ascii)
 
 
 def supported_language(token):
-    if token.startswith("e'"):
+    if token.startswith("$") and len(token) > 1:
+        end = token.index("$", 1) + 1
+        return token[end:-end] in ("plpgsql", "sql")
+    if token[:2].lower() == "e'":
         token = token[1:]
     if len(token) >= 2 and token[0] == token[-1] and token[0] in ("'", '"'):
         token = token[1:-1]
     return token in ("plpgsql", "sql")
+
+
+def standalone_body(statement, index):
+    if index >= len(statement):
+        return False
+    word = statement[index]
+    if word.startswith("'") and index + 1 < len(statement) and statement[index + 1].startswith("'"):
+        # Newline-separated string fragments form one PostgreSQL literal.
+        # A fragment on its own need not contain complete SQL.
+        return False
+    return word.startswith(("$", "'"))
 
 
 def routine_bodies(statement):
@@ -62,7 +76,7 @@ def routine_bodies(statement):
                 if j + 1 >= len(statement) or not supported_language(statement[j + 1]):
                     continue
                 j += 2
-            if j < len(statement) and statement[j].startswith("$"):
+            if standalone_body(statement, j):
                 if statement[j + 1:j + 2] == ["language"] and not (
                     j + 2 < len(statement) and supported_language(statement[j + 2])
                 ):
@@ -87,7 +101,7 @@ def routine_bodies(statement):
                     # consume the name as data and cannot reset that choice.
                     if option == "language" and supported_language(value):
                         supported = True
-                    elif option == "as" and value.startswith("$"):
+                    elif option == "as" and standalone_body(statement, k + 1):
                         body = value
             if supported and body:
                 yield body
@@ -102,8 +116,12 @@ def ddl_tokens(sql):
         yield from statement
         yield ";"
         for quoted in routine_bodies(statement):
-            end = quoted.index("$", 1) + 1
-            yield from ddl_tokens(quoted[end:-end])
+            if quoted.startswith("'"):
+                body = quoted[1:-1].replace("''", "'")
+            else:
+                end = quoted.index("$", 1) + 1
+                body = quoted[end:-end]
+            yield from ddl_tokens(body)
             yield ";"
         statement.clear()
 
@@ -134,6 +152,8 @@ def columns(sql):
             continue
         i = start + 1
         while words[i] in ("global", "local", "temporary", "temp", "unlogged"):
+            i += 1
+        if words[i] == "foreign":
             i += 1
         if words[i] != "table":
             continue
@@ -172,6 +192,16 @@ def columns(sql):
 
 # Each exception identifies a declaration and its first type token, or a rename.
 REVIEWED = (
+    # Inference key UUIDs for ownership, attribution and accounting.
+    ("0001_enterprise.sql", "governance_reservations", "api_key_id", "uuid"),
+    ("0001_enterprise.sql", "inference_executions", "api_key_id", "uuid"),
+    ("0016_async_jobs.sql", "async_job_files", "api_key_id", "uuid"),
+    ("0016_async_jobs.sql", "async_jobs", "api_key_id", "uuid"),
+    ("0019_file_store.sql", "stored_files", "created_by_api_key_id", "uuid"),
+    ("0032_usage_rollups.sql", "usage_rollups_hourly", "api_key_id", "uuid"),
+    ("0033_partition_archive.sql", "archived_budget_contributions", "api_key_id", "uuid"),
+    ("0049_key_expiry_reminders.sql", "alert_events", "api_key_id", "uuid"),
+    ("0080_access_review_keys.sql", "access_review_items", "api_key_id", "uuid"),
     # Lookup digests for inference keys, browser sessions, invitations and admin tokens.
     ("0001_enterprise.sql", "api_keys", "secret_hash", "bytea"),
     ("0001_enterprise.sql", "browser_sessions", "token_hash", "bytea"),
@@ -275,6 +305,65 @@ class MigrationColumns(unittest.TestCase):
                 "stale: 9000_fixture.sql public.fixture example_token_ref text",
             ])
 
+
+    def fixture_findings(self, sql):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "9000_fixture.sql").write_text(sql, encoding="utf-8")
+            return problems(root, ())
+
+    def test_sensitive_name_vocabulary(self):
+        for name in ("passwd", "pwd", "api_key", "private_key", "bearer", "jwt", "passphrase"):
+            with self.subTest(name=name):
+                sql = f"CREATE TABLE sample (id int, demo_{name} text)"
+                self.assertEqual(self.fixture_findings(sql), [
+                    f"unreviewed: 9000_fixture.sql sample demo_{name} text",
+                ])
+
+    def test_foreign_table_columns(self):
+        sql = """
+            CREATE FOREIGN TABLE sample (id int, sample_password text) SERVER fixture;
+            ALTER FOREIGN TABLE sample ADD sample_token text;
+        """
+        self.assertEqual(self.fixture_findings(sql), [
+            "unreviewed: 9000_fixture.sql sample sample_password text",
+            "unreviewed: 9000_fixture.sql sample sample_token text",
+        ])
+
+    def test_single_quoted_body(self):
+        sql = """
+            DO 'BEGIN ALTER TABLE sample ADD "DemoSecret" text; END';
+            CREATE FUNCTION f() RETURNS void LANGUAGE sql AS
+                'SELECT ''ALTER TABLE sample ADD bogus_secret text''; ALTER TABLE sample ADD demo_token text;';
+        """
+        self.assertEqual(self.fixture_findings(sql), [
+            'unreviewed: 9000_fixture.sql sample "DemoSecret" text',
+            "unreviewed: 9000_fixture.sql sample demo_token text",
+        ])
+
+    def test_quoted_language_names_preserve_case(self):
+        for language, expected in (
+            ("$lang$plpgsql$lang$", [("x", "api_secret", "text")]),
+            ("'SQL'", []),
+            ("E'SQL'", []),
+        ):
+            with self.subTest(language=language):
+                sql = f"DO LANGUAGE {language} 'BEGIN ALTER TABLE x ADD api_secret text; END';"
+                self.assertEqual(list(columns(sql)), expected)
+
+    def test_concatenated_body_is_left_to_review(self):
+        for routine in (
+            "DO LANGUAGE plpgsql",
+            "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS",
+            "CREATE PROCEDURE p() LANGUAGE plpgsql AS",
+        ):
+            with self.subTest(routine=routine):
+                sql = f"""{routine} 'BEGIN /* part one'
+                    'part two */ NULL; END';
+                    ALTER TABLE sample ADD demo_secret text;"""
+                self.assertEqual(self.fixture_findings(sql), [
+                    "unreviewed: 9000_fixture.sql sample demo_secret text",
+                ])
 
     def test_explicit_clauses_preserve_names_and_body_language(self):
         sql = """

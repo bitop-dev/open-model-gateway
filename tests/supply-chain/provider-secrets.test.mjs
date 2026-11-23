@@ -130,12 +130,18 @@ function checkInputs(data, file, docs = documents, read = repoScript) {
 }
 
 function checkAssignments(script, path) {
-  for (const { text, variable } of shellCommands(script).flat()) {
+  function check(text, variable) {
     const eq = text.indexOf("=");
     if (eq >= 0 && liveNames.has(text.slice(0, eq))) {
       assert.ok(!variable && fixtureValues.has(text.slice(eq + 1)), `${path}: live credential assignment`);
     }
   }
+  // A heredoc can supply environment-file records even when its recipient
+  // treats the contents as data. Inspect the records without shell decoding.
+  function checkEnvRecords(body) {
+    for (const line of body.split("\n")) check(line, false);
+  }
+  for (const { text, variable } of shellCommands(script, "sh", checkEnvRecords).flat()) check(text, variable);
 }
 
 function inspect(parent, path, conditions, runs) {
@@ -160,6 +166,15 @@ function inspect(parent, path, conditions, runs) {
 
 test("Cargo jobs and their local calls cannot import provider secrets", () => {
   for (const [file, data] of documents) if (data.jobs) checkInputs(data, file);
+});
+
+test("Cargo jobs validate physical credential records written to GITHUB_ENV", () => {
+  const check = value => checkInputs({ jobs: { tests: { steps: [
+    { run: `cat <<-'END' >> "$GITHUB_ENV"\n\tOPENAI_KEY=${value}\n\tEND` },
+    { run: "cargo test" },
+  ] } } }, "fixture.yml");
+  check("fixture");
+  assert.throws(() => check("sentinel"), /live credential assignment/);
 });
 
 test("provider secret references and inheritance are refused regardless of the credential alias", () => {
@@ -296,6 +311,16 @@ for (const hook of ["preverify", "postverify"]) {
   });
 }
 
+test("wrapper inventory follows commands across redirects and literal heredoc data", () => {
+  const workflow = { jobs: { job: credentialJob("bash check.sh") } };
+  const data = "cat <<-'END'\n\tcargo test\n\t'unclosed text\n\tEND\n";
+  const files = new Map([["check.sh", data + "true"], ["inner.sh", "cargo test"]]);
+  const check = () => checkInputs(workflow, "fixture.yml", new Map(), path => files.get(path));
+  check();
+  files.set("check.sh", data + "bash &>>log inner.sh");
+  assert.throws(check, /env.TOKEN/);
+});
+
 test("shell wrappers use the effective run directory at each step", () => {
   const job = credentialJob("bash check.sh");
   const workflow = { jobs: { job } };
@@ -407,6 +432,18 @@ test("npm forwards literal script operands to the main lifecycle event", () => {
   assert.throws(() => check("npm run script -- check.sh"), /env.TOKEN/);
   files.set("runner.js", 'spawn("npm", ["run", "script", "--", "check.sh"])');
   assert.throws(() => check("node runner.js"), /env.TOKEN/);
+});
+
+test("npm forwards arguments to the last command in each shell reading", () => {
+  const files = new Map([["check.sh", "cargo test"]]);
+  const check = script => {
+    files.set("package.json", JSON.stringify({ scripts: { check: script } }));
+    checkInputs({ jobs: { job: credentialJob("npm run check -- check.sh") } },
+      "fixture.yml", new Map(), path => files.get(path));
+  };
+  assert.throws(() => check("true &>log printf fixture; bash"), /env.TOKEN/);
+  assert.throws(() => check("true &>log bash"), /env.TOKEN/);
+  check("true &>log printf fixture; cat");
 });
 
 test("a shell environment prefix preserves the npm script's Cargo classification", () => {

@@ -9,7 +9,7 @@
 //! rewrites the function.
 
 use proc_macro::TokenStream;
-use proc_macro2::TokenStream as TokenStream2;
+use proc_macro2::{Ident, Span, TokenStream as TokenStream2};
 use quote::quote;
 use syn::{Error, ItemFn};
 
@@ -49,6 +49,8 @@ fn expand(args: TokenStream2, function: ItemFn) -> syn::Result<TokenStream2> {
             "`#[dbtest::test]` functions cannot be generic",
         ));
     }
+    // Keep the generated closure binding separate from the caller's test name.
+    let pool = Ident::new("pool", Span::mixed_site());
     let attrs = &function.attrs;
     let name = &function.sig.ident;
     let inputs = &function.sig.inputs;
@@ -60,8 +62,9 @@ fn expand(args: TokenStream2, function: ItemFn) -> syn::Result<TokenStream2> {
         fn #name() #ret {
             async fn #name(#inputs) #ret #body
 
-            let f: fn(_) -> _ = #name;
-            crate::dbtest_runtime::run(concat!(module_path!(), "::", stringify!(#name)), f)
+            crate::dbtest_runtime::run(concat!(module_path!(), "::", stringify!(#name)), |#pool| {
+                ::std::boxed::Box::pin(#name(#pool))
+            })
         }
     })
 }

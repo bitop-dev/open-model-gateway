@@ -161,6 +161,7 @@ pub(super) async fn run(
             (offset, json!("00")),
             (offset, json!("-1")),
             (offset, json!("9223372036854765807")),
+            (offset, json!("92233720368547658070")),
             (offset, json!("9223372036854765808")),
             (offset, json!("9223372036854775807")),
             (offset, json!("10000000000000000000")),

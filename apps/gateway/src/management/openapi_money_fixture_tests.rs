@@ -1,5 +1,6 @@
 //! Slice 4: executed, populated, raw-wire money contracts over a running gateway.
 use super::*;
+use gateway_datetime_compat::{SignedDuration, UtcInstant};
 use openapi::responses::{Captured, PositiveFixtures, capture_http};
 use sha2::{Digest, Sha256};
 
@@ -371,19 +372,43 @@ fn window_mapping(
          "evidence_reference":"finance:attestation-d","model_mappings":[]},
     ]})
 }
-async fn generate_run(f: &Fixture, schedule: Uuid) -> Uuid {
+async fn generate_run(
+    f: &Fixture,
+    schedule: Uuid,
+    monday: UtcInstant,
+    delivery_minute: i64,
+) -> Uuid {
     use crate::leases::{Lease, Leases};
     sqlx::query("UPDATE report_schedules SET state='active' WHERE id=$1")
         .bind(schedule)
         .execute(&f.s.pool)
         .await
         .unwrap();
-    sqlx::query("UPDATE report_schedules SET next_period_end=date_trunc('week',clock_timestamp(),'UTC')-interval '7 days',next_run_at=clock_timestamp()-interval '1 day' WHERE id=$1")
-        .bind(schedule).execute(&f.s.pool).await.unwrap();
+    sqlx::query("UPDATE report_schedules SET next_period_end=$2::timestamptz-interval '7 days',next_run_at=$2::timestamptz-interval '1 day' WHERE id=$1")
+        .bind(schedule).bind(monday).execute(&f.s.pool).await.unwrap();
     let leases = Leases::new();
     leases.renew_once(&f.s.pool).await;
     let fence = leases.held(Lease::ReportScheduler).unwrap();
-    let claim = crate::scheduled_reports::claim(&f.s, &fence, schedule)
+    // At 00:01:23 even the backdated cursor must wait for the patched preference.
+    let before = monday + SignedDuration::seconds(83);
+    assert!(
+        crate::scheduled_reports::claim_at(&f.s, &fence, schedule, before)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    if delivery_minute == 3 {
+        let earlier_delivery = monday + SignedDuration::seconds(121);
+        assert!(
+            crate::scheduled_reports::claim_at(&f.s, &fence, schedule, earlier_delivery)
+                .await
+                .unwrap()
+                .is_none(),
+            "the 00:03 schedule must still defer at 00:02:01"
+        );
+    }
+    let after = monday + SignedDuration::minutes(delivery_minute) + SignedDuration::seconds(1);
+    let claim = crate::scheduled_reports::claim_at(&f.s, &fence, schedule, after)
         .await
         .unwrap()
         .unwrap();
@@ -544,6 +569,11 @@ async fn slice4_money_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
     let now = gateway_datetime_compat::UtcInstant::now().date_naive();
     let start = (now - gateway_datetime_compat::SignedDuration::days(7)).to_string();
     let end = (now + gateway_datetime_compat::SignedDuration::days(1)).to_string();
+    let monday = (now - SignedDuration::days(i64::from(now.weekday().number_days_from_monday())))
+        .midnight()
+        .unwrap();
+    // Noon seven calendar days before the fixture date is inside the week ending on monday.
+    let report_attempt_at = format!("timestamptz '{start}T12:00:00Z'");
     let range = format!("start_date={start}&end_date={end}");
     let wsbase = format!("/api/v1/workspaces/{}", f.team);
     let projbase = format!("/api/v1/workspaces/{}", f.project);
@@ -580,7 +610,7 @@ async fn slice4_money_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
     let unallocated_week = seed(
         &pool,
         &Seed {
-            at: ago(7),
+            at: report_attempt_at.clone(),
             ..Seed::new(f.team, id(&team_key), deployment, price)
         },
     )
@@ -668,19 +698,16 @@ async fn slice4_money_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
     )
     .await;
     let own = seed_attempt(&pool, f.team, id(&member_key), deployment, price, true, 2).await;
-    // Always populate the latest completed weekly period, irrespective of
-    // which weekday this test runs on. Settled rows do not grow the hold queue.
-    seed_attempt(&pool, f.team, id(&team_key), deployment, price, true, 7).await;
-    seed_attempt(
-        &pool,
-        f.personal,
-        id(&private_key),
-        deployment,
-        price,
-        true,
-        7,
-    )
-    .await;
+    for (ws, key) in [(f.team, &team_key), (f.personal, &private_key)] {
+        seed(
+            &pool,
+            &Seed {
+                at: report_attempt_at.clone(),
+                ..Seed::new(ws, id(key), deployment, price)
+            },
+        )
+        .await;
+    }
     // v3 meter settlement: every optional billing/meter field known or unknown.
     let (v3, v3_total) = components([2, 0, 0, 0, 0, 1], Some([3, 1, 0, 0, 0, 1]), None);
     seed(
@@ -801,7 +828,7 @@ async fn slice4_money_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
         seed(
             &pool,
             &Seed {
-                at: ago(7),
+                at: report_attempt_at.clone(),
                 provider: format!("bulk-{n:03}"),
                 ..Seed::new(f.team, id(&team_key), deployment, price)
             },
@@ -1593,9 +1620,9 @@ async fn slice4_money_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
             )
             .await;
         }
-        let run = generate_run(&f, schedule).await;
+        let run = generate_run(&f, schedule, monday, 2).await;
         if let Some(s2) = second {
-            let run2 = generate_run(&f, s2).await;
+            let run2 = generate_run(&f, s2, monday, 3).await;
             let v = observe(
                 &mut seen,
                 &client,

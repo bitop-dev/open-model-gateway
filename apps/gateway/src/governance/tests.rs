@@ -1,5 +1,4 @@
 use super::*;
-use crate::inference::error::LimitScope;
 #[test]
 fn integer_cost_rounding_overflow_and_generic_validation() {
     assert_eq!(cost(1, 1, 1, 1), Ok(2));
@@ -263,7 +262,7 @@ pub(crate) mod db {
     use super::*;
     use crate::{
         auth::{NewApiKey, Principal},
-        inference::repository::InferenceRepository,
+        inference::{error::LimitScope, repository::InferenceRepository},
     };
     use sqlx::PgPool;
     pub(crate) struct Fixture {

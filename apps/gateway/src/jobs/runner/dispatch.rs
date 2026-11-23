@@ -156,6 +156,8 @@ impl Runner {
     /// Plan the head line's route again when it was never planned or its
     /// plan is older than [`REPLAN`].
     async fn plan_head(&self, run: &Dispatch<'_>, head: &mut Head) {
+        // The seed matches admission's estimate. The eligible routes still
+        // come from the scheduler's live checks on every replan.
         if head.planned.is_none_or(|t| t.elapsed() >= REPLAN) {
             (head.route, head.cooling) = match &head.request {
                 Some(request) => {
@@ -164,7 +166,7 @@ impl Runner {
                             run.principal,
                             run.endpoint,
                             request,
-                            head.execution,
+                            lines::routing_seed(run.job.execution_id, head.n as u32),
                             head.plan.map(|p| p.deployment),
                         )
                         .await

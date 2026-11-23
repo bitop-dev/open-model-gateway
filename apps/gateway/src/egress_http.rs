@@ -162,21 +162,18 @@ pub(crate) fn pinned_client_builder(
     )
 }
 
-/// Adds operator-configured trust anchors (`GATEWAY_S3_CA_FILE`) to a builder
-/// from [`client_builder`]. The caller chooses the certificates; keeping the
-/// call here means a new trust-anchor site has to use this named helper, not
-/// `add_root_certificate` directly (#509).
+/// Adds the trust anchors carried by S3's operator configuration.
 #[expect(
     clippy::disallowed_methods,
     reason = "the egress-guarded constructor (#509)"
 )]
 pub(crate) fn add_root_certificates(
     builder: HttpClientBuilder,
-    certificates: impl IntoIterator<Item = reqwest::Certificate>,
-) -> HttpClientBuilder {
+    bundle: &crate::filestore::s3::S3CaBundle,
+) -> anyhow::Result<HttpClientBuilder> {
     let mut builder = builder.0;
-    for certificate in certificates {
+    for certificate in bundle.certificates()? {
         builder = builder.add_root_certificate(certificate);
     }
-    HttpClientBuilder(builder)
+    Ok(HttpClientBuilder(builder))
 }
