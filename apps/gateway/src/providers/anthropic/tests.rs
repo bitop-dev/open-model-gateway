@@ -511,6 +511,27 @@ async fn rejects_custom_endpoint_before_network() {
 }
 
 #[test]
+fn invalid_stop_reason_cannot_emit_usage_or_done() {
+    let mut frames = stream();
+    let stop = frames.pop().unwrap();
+    let mut delta = frames.pop().unwrap();
+    delta["delta"]["stop_reason"] = json!("unknown_reason");
+    let mut state = State::default();
+    for frame in frames {
+        state.push(frame).unwrap();
+    }
+    assert_eq!(
+        state.push(delta).err(),
+        Some(InferenceError::InvalidUpstream)
+    );
+    assert_eq!(
+        state.push(stop).err(),
+        Some(InferenceError::InvalidUpstream),
+        "message_stop after a rejected stop reason must fail"
+    );
+}
+
+#[test]
 fn cumulative_cache_usage_has_one_finish_and_one_final_usage() {
     let mut state = State::default();
     state.push(json!({"type":"message_start","message":{"type":"message","role":"assistant","content":[],"stop_reason":null,"usage":{"input_tokens":4,"output_tokens":0,"cache_read_input_tokens":10,"cache_creation_input_tokens":20,"cache_creation":{"ephemeral_5m_input_tokens":8,"ephemeral_1h_input_tokens":12}}}})).unwrap();
@@ -518,7 +539,7 @@ fn cumulative_cache_usage_has_one_finish_and_one_final_usage() {
     assert!(state.push(json!({"type":"message_delta","delta":{"stop_reason":null},"usage":{"output_tokens":5,"input_tokens":6}})).unwrap().is_empty());
     let finished=state.push(json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}})).unwrap();
     assert_eq!(finished.len(), 1);
-    assert!(matches!(finished[0], ChatEvent::Finish(_)));
+    assert!(matches!(finished[0], ChatEvent::Finish(FinishReason::Stop)));
     assert!(
         state
             .push(json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}))
