@@ -184,6 +184,8 @@ fn management_openapi_wiring_declared_request_locations_must_be_walked() {
         "/oneOf/0/properties/b",
         "/oneOf/1",
         "/oneOf/1/prefixItems/0",
+        "/oneOf/1/minItems",
+        "/oneOf/1/maxItems",
         "x-omg-unprobed-location",
     ] {
         assert!(gap.contains(expected), "{expected}: {gap}");
@@ -197,7 +199,15 @@ fn management_openapi_wiring_declared_request_locations_must_be_walked() {
         gap.contains("/oneOf/1") && !gap.contains("/properties/b"),
         "{gap}"
     );
-    reach(&mut fixtures, &["/oneOf/1", "/oneOf/1/prefixItems/0"]);
+    reach(
+        &mut fixtures,
+        &[
+            "/oneOf/1",
+            "/oneOf/1/minItems",
+            "/oneOf/1/maxItems",
+            "/oneOf/1/prefixItems/0",
+        ],
+    );
     gaps(&fixtures, &document).unwrap();
     // A reviewed exemption on the location excuses it instead.
     let mut exempt = document.clone();

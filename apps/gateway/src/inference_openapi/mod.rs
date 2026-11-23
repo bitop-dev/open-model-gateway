@@ -265,6 +265,7 @@ pub(crate) fn committed_artifact() -> &'static serde_json::Value {
 pub(crate) fn cached_validator(
     document: &serde_json::Value,
     schema: &serde_json::Value,
+    mode: crate::management::openapi::validation::SchemaMode,
 ) -> anyhow::Result<std::sync::Arc<jsonschema::Validator>> {
-    responses::validator(document, schema)
+    responses::validator(document, schema, mode)
 }

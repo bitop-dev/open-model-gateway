@@ -38,6 +38,9 @@ fn email_candidates() -> Vec<(&'static str, Value)> {
     let mut all = vec![
         ("/host", json!("127.0.0.1")),
         ("/host", json!("127.0.0.1/")),
+        // Both parse as IP addresses. Only the first permits plaintext SMTP.
+        ("/host", json!("::1")),
+        ("/host", json!("::")),
         ("/tls", json!("none")),
         ("/tls", json!("nonee")),
         ("/username", json!("u".repeat(256))),
@@ -101,13 +104,14 @@ async fn extended(
         .into_iter()
         .map(|(pointer, value)| (pointer.to_owned(), value))
         .collect();
-    walked(observed, method, template, valid, owned, send).await;
+    walked(observed, method, template, valid, &[], owned, send).await;
 }
 async fn walked(
     observed: &mut PositiveFixtures,
     method: &str,
     template: &str,
     valid: Value,
+    seeds: &[(&str, Value)],
     candidates: Vec<(String, Value)>,
     send: impl AsyncFn(Value) -> Probe,
 ) {
@@ -116,7 +120,7 @@ async fn walked(
         .iter()
         .map(|(pointer, value)| (pointer.as_str(), value.clone()))
         .collect();
-    body_vectors_extended(observed, method, template, valid, &[], &borrowed, send).await;
+    body_vectors_extended(observed, method, template, valid, seeds, &borrowed, send).await;
 }
 /// The same candidates addressed in serde's positional form: `/field/rest` becomes
 /// `/<index of field>/rest`.
@@ -142,15 +146,35 @@ async fn both(
     observed: &mut PositiveFixtures,
     method: &str,
     template: &str,
-    valid: Value,
+    bases: &[Value],
     fields: &[&str],
     candidates: Vec<(&'static str, Value)>,
     send: impl AsyncFn(Value) -> Probe,
 ) {
-    let array = json!(fields.iter().map(|f| valid[*f].clone()).collect::<Vec<_>>());
-    let positional = indexed(fields, &candidates);
-    extended(observed, method, template, valid, candidates, &send).await;
-    walked(observed, method, template, array, positional, &send).await;
+    let (valid, alternatives) = bases.split_first().expect("a valid request body");
+    let positional = |body: &Value| json!(fields.iter().map(|f| &body[*f]).collect::<Vec<_>>());
+    let array_candidates = indexed(fields, &candidates);
+    let object_candidates = candidates
+        .into_iter()
+        .map(|(at, v)| (at.to_owned(), v))
+        .collect();
+    for (base, seeds, candidates) in [
+        (
+            valid.clone(),
+            alternatives
+                .iter()
+                .map(|v| ("", v.clone()))
+                .collect::<Vec<_>>(),
+            object_candidates,
+        ),
+        (
+            positional(valid),
+            alternatives.iter().map(|v| ("", positional(v))).collect(),
+            array_candidates,
+        ),
+    ] {
+        walked(observed, method, template, base, &seeds, candidates, &send).await;
+    }
 }
 
 async fn fresh_admin(pool: &PgPool, name: &str) -> Browser {
@@ -207,7 +231,7 @@ pub(super) async fn settings(
         observed,
         "PUT",
         &general,
-        json!({"display_name":"Contract Gateway","support_url":"https://support.example.test/","logo_url":"https://cdn.example.test/logo.png","human_key_max_lifetime_days":30}),
+        &[json!({"display_name":"Contract Gateway","support_url":"https://support.example.test/","logo_url":"https://cdn.example.test/logo.png","human_key_max_lifetime_days":30})],
         &["display_name","support_url","logo_url","human_key_max_lifetime_days"],
         names("/display_name"),
         async |body| json(g, &admin, "PUT", &general, body).await,
@@ -218,7 +242,7 @@ pub(super) async fn settings(
         observed,
         "PUT",
         &privacy,
-        json!({"openrouter_data_collection":"deny","request_log_retention_days":90}),
+        &[json!({"openrouter_data_collection":"deny","request_log_retention_days":90})],
         &["openrouter_data_collection", "request_log_retention_days"],
         Vec::new(),
         async |body| json(g, &admin, "PUT", &privacy, body).await,
@@ -229,7 +253,7 @@ pub(super) async fn settings(
         observed,
         "PUT",
         &privacy,
-        json!({"openrouter_data_collection":"allow","request_log_retention_days":null}),
+        &[json!({"openrouter_data_collection":"allow","request_log_retention_days":null})],
         &["openrouter_data_collection", "request_log_retention_days"],
         Vec::new(),
         async |body| json(g, &admin, "PUT", &privacy, body).await,
@@ -240,7 +264,7 @@ pub(super) async fn settings(
         observed,
         "PUT",
         &storage,
-        json!({"batch":{"enabled":true,"retention_days":30},"video":{"enabled":false,"retention_days":30},"user_files":{"enabled":false,"retention_days":30},"export":{"retention_days":7}}),
+        &[json!({"batch":{"enabled":true,"retention_days":30},"video":{"enabled":false,"retention_days":30},"user_files":{"enabled":false,"retention_days":30},"export":{"retention_days":7}})],
         &["batch", "video", "user_files", "export"],
         Vec::new(),
         async |body| json(g, &admin, "PUT", &storage, body).await,
@@ -252,6 +276,7 @@ pub(super) async fn settings(
         "PUT",
         &storage,
         json!({"batch":[true, 30],"video":[false, 30],"user_files":[false, 30],"export":[7]}),
+        &[],
         Vec::new(),
         async |body| json(g, &admin, "PUT", &storage, body).await,
     )
@@ -261,6 +286,7 @@ pub(super) async fn settings(
         "PUT",
         &storage,
         json!([[true, 30], [false, 30], [false, 30], [7]]),
+        &[],
         Vec::new(),
         async |body| json(g, &admin, "PUT", &storage, body).await,
     )
@@ -274,11 +300,19 @@ pub(super) async fn settings(
         json!({"host":"127.0.0.1","port":mail_port,"tls":"none","username":null,"password_ref":null,"from_address":"gateway@example.test","from_name":"Contract Gateway"}),
         json!({"host":"127.0.0.1","port":mail_port,"tls":"none","username":"smtp-user","password_ref":"env:CONTRACT_SMTP_PASSWORD","from_address":"gateway@example.test","from_name":null}),
     ] {
+        let mut bases = vec![valid];
+        if bases[0]["tls"] == "none" {
+            // Plaintext restricts the host to loopback. With STARTTLS the general
+            // host syntax can independently refuse its malformed neighbor.
+            let mut encrypted = bases[0].clone();
+            encrypted["tls"] = json!("starttls");
+            bases.push(encrypted);
+        }
         both(
             observed,
             "PUT",
             &email,
-            valid,
+            &bases,
             &[
                 "host",
                 "port",
@@ -406,7 +440,7 @@ pub(super) async fn webhooks(g: &Gateway, pool: &PgPool, observed: &mut Positive
             observed,
             "PATCH",
             "/api/v1/platform/alerts/webhooks/{id}",
-            valid,
+            &[valid],
             &[
                 "label",
                 "enabled",
@@ -508,7 +542,7 @@ pub(super) async fn rules(
                 observed,
                 "POST",
                 post,
-                valid.clone(),
+                std::slice::from_ref(&valid),
                 &RULE_FIELDS,
                 rule_candidates(),
                 async |request| json(g, actor, "POST", prefix, request).await,
@@ -522,7 +556,7 @@ pub(super) async fn rules(
                 observed,
                 "PUT",
                 put,
-                valid,
+                &[valid],
                 &RULE_FIELDS,
                 rule_candidates(),
                 async |request| json(g, actor, "PUT", &path, request).await,

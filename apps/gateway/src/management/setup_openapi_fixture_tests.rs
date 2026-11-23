@@ -8,6 +8,7 @@ struct Journey<'a> {
     base: String,
     actor: &'a Browser,
     observed: PositiveFixtures,
+    probe_failures: std::cell::RefCell<Vec<String>>,
 }
 impl Journey<'_> {
     async fn request(&mut self, method: &str, path: &str, input: Option<Value>) -> Value {
@@ -418,7 +419,7 @@ fn param_accepts(template: &str, name: &str, raw: &str) -> bool {
         .as_array()
         .and_then(|all| all.iter().find(|p| p["name"] == name))
         .expect("documented query parameter");
-    openapi::responses::validate_value(document, &parameter["schema"], &json!(raw)).is_ok()
+    openapi::responses::validate_request_value(document, &parameter["schema"], &json!(raw)).is_ok()
 }
 /// The handler's verdict on an exchange, as `Probe` derives it: 400/422 refuse,
 /// 2xx/3xx/404/409 accept; a 400 whose machine reason is in `domain` is a domain
@@ -456,6 +457,63 @@ fn judged_when(
         Probe::decided(captured, true)
     } else {
         judged(captured, rules.1)
+    }
+}
+fn positional_provider_probe(captured: openapi::responses::Captured, body: &Value) -> Probe {
+    if schema_accepts("POST", "/api/v1/platform/providers", body)
+        && positional_provider_refusal(body)
+    {
+        assert_eq!(
+            captured.status,
+            StatusCode::BAD_REQUEST,
+            "expected positional provider refusal"
+        );
+        assert!(
+            serde_json::from_slice::<Value>(&captured.bytes)
+                .is_ok_and(|error| error["error"]["message"] == "Invalid request"),
+            "unexpected positional provider refusal explanation"
+        );
+        Probe::decided(captured, true)
+    } else {
+        captured.into()
+    }
+}
+fn positional_provider_refusal(body: &Value) -> bool {
+    let Some(items) = body.as_array() else {
+        return false;
+    };
+    let names = [
+        "name",
+        "provider",
+        "credential_ref",
+        "endpoint",
+        "region",
+        "enabled",
+        "aws_external_id",
+        "aws_session_name",
+    ];
+    let object = Value::Object(
+        names
+            .into_iter()
+            .zip(items)
+            .map(|(name, v)| (name.to_owned(), v.clone()))
+            .collect(),
+    );
+    if !schema_accepts("POST", "/api/v1/platform/providers", &object) {
+        return true;
+    }
+    match object["provider"].as_str() {
+        Some("bedrock") => {
+            object["endpoint"].is_string()
+                || object["credential_ref"]
+                    .as_str()
+                    .is_some_and(|r| r.starts_with("aws:profile:"))
+        }
+        Some("openai" | "anthropic" | "openrouter") => {
+            object["credential_ref"] != "env:CONTRACT_REFERENCE"
+        }
+        Some("ollama" | "sglang" | "vllm" | "openai_compatible") => true, // No approved local endpoint.
+        _ => false,
     }
 }
 /// Whether the REAL price-line rules (`billing::v3::PriceLines`, which validates in
@@ -630,16 +688,10 @@ async fn extra_body(
     // Collected, not asserted one by one: a run reports every pinned verdict that
     // moved (labels and verdicts only, never a value), checked at the end.
     if (schema, handler) != expected {
-        PROBE_FAILURES.with(|failures| {
-            failures.borrow_mut().push(format!(
+        j.probe_failures.borrow_mut().push(format!(
                 "{method} {template}: {label}: schema accepts {schema}, handler accepts {handler}; pinned {expected:?}"
             ));
-        });
     }
-}
-thread_local! {
-    /// Pinned-probe mismatches of the running fixture (one test thread).
-    static PROBE_FAILURES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 fn enc(raw: &str) -> String {
     raw.bytes()
@@ -1076,6 +1128,7 @@ async fn slice3_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
         axum::serve(listener, app).await.unwrap()
     }));
     let mut j = Journey {
+        probe_failures: Default::default(),
         client: reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -3160,7 +3213,7 @@ async fn slice3_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
     // An IANA zone must be known to the server: another length-valid name is a domain refusal.
     // The HH:MM window times have no derivable length bounds: candidates one edit
     // apart (a valid time, the same time missing its last digit).
-    body_set_when_candidates(&mut j, a, "PUT", "/api/v1/platform/deployments/{deployment}/batch-scheduling", &format!("/api/v1/platform/deployments/{vdep}/batch-scheduling"), json!({"max_concurrency":3,"yield_live_threshold":5,"window":{"timezone":"UTC","days":["mon","fri"],"start":"23:00","end":"06:00"}}), (&|b| unknown_zone(b), &[]), &[("/window/start", json!("23:00")), ("/window/start", json!("23:0")), ("/window/end", json!("06:00")), ("/window/end", json!("06:0"))]).await;
+    body_set_when_candidates(&mut j, a, "PUT", "/api/v1/platform/deployments/{deployment}/batch-scheduling", &format!("/api/v1/platform/deployments/{vdep}/batch-scheduling"), json!({"max_concurrency":3,"yield_live_threshold":5,"window":{"timezone":"UTC","days":["mon","fri"],"start":"23:00","end":"06:00"}}), (&|b| unknown_zone(b), &[]), &[("/window/start", json!("23:00")), ("/window/start", json!("23:0")), ("/window/start", json!("23:000")), ("/window/end", json!("06:00")), ("/window/end", json!("06:0")), ("/window/end", json!("06:000"))]).await;
     body_set(
         &mut j,
         a,
@@ -3199,6 +3252,7 @@ async fn slice3_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
             &[
                 (pointer, json!("9223372036854775807")),
                 (pointer, json!("9223372036854775808")),
+                (pointer, json!("92233720368547758070")),
             ],
         )
         .await;
@@ -3251,6 +3305,7 @@ async fn slice3_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
             &[
                 (pointer, json!("9223372036854775807")),
                 (pointer, json!("9223372036854775808")),
+                (pointer, json!("92233720368547758070")),
             ],
         )
         .await;
@@ -3359,12 +3414,9 @@ async fn slice3_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
         )
         .await;
     }
-    // Provider create, positional: the form documents that it carries none of the
-    // object form's per-kind cross-field rules (every per-field bound is still in
-    // its item), so a 400 for a schema-valid positional body is that documented
-    // divergence.
-    // Also every optional slot null (OpenRouter), and an endpoint string (a local
-    // connection, which the test process never approves either).
+    // Positional input omits the object form's provider-specific constraints.
+    // Only their documented divergences and this fixture's allowlists can
+    // explain the handler's domain refusal after successful extraction.
     for body in [
         json!([
             "Vector Bedrock positional",
@@ -3397,15 +3449,19 @@ async fn slice3_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
             null
         ]),
     ] {
-        body_set_when(
-            &mut j,
-            a,
-            "POST",
-            "/api/v1/platform/providers",
-            "/api/v1/platform/providers",
-            body,
-            (&|b| b.is_array(), &[]),
-        )
+        let (client, root) = (j.client.clone(), j.base.clone());
+        http_vectors::body_vectors_http(&mut j.observed, "POST", providers, body, async |body| {
+            let captured = send(
+                &client,
+                &root,
+                Some(a),
+                "POST",
+                providers,
+                Some(body.clone()),
+            )
+            .await;
+            positional_provider_probe(captured, &body)
+        })
         .await;
     }
     // Batch scheduling: a metrics gate in both forms, a priority, the null arms and
@@ -3423,8 +3479,10 @@ async fn slice3_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
             vec![
                 (format!("{at}/start"), json!("23:00")),
                 (format!("{at}/start"), json!("23:0")),
+                (format!("{at}/start"), json!("23:000")),
                 (format!("{at}/end"), json!("06:00")),
                 (format!("{at}/end"), json!("06:0")),
+                (format!("{at}/end"), json!("06:000")),
             ]
         };
         // Rule order (RouteSettings::validate): thresholds, metrics URL, priority
@@ -3451,8 +3509,10 @@ async fn slice3_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
                 vec![
                     ("/window/2".to_owned(), json!("23:00")),
                     ("/window/2".to_owned(), json!("23:0")),
+                    ("/window/2".to_owned(), json!("23:000")),
                     ("/window/3".to_owned(), json!("06:00")),
                     ("/window/3".to_owned(), json!("06:0")),
+                    ("/window/3".to_owned(), json!("06:000")),
                 ],
             ),
             (
@@ -3466,8 +3526,10 @@ async fn slice3_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
                 vec![
                     ("/4/2".to_owned(), json!("23:00")),
                     ("/4/2".to_owned(), json!("23:0")),
+                    ("/4/2".to_owned(), json!("23:000")),
                     ("/4/3".to_owned(), json!("06:00")),
                     ("/4/3".to_owned(), json!("06:0")),
+                    ("/4/3".to_owned(), json!("06:000")),
                 ],
             ),
             (
@@ -4544,7 +4606,7 @@ async fn slice3_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
         .await;
     // Moved pinned verdicts join the vector failures and coverage gaps in the one
     // report `finish` prints.
-    for moved in PROBE_FAILURES.with(|failures| failures.take()) {
+    for moved in j.probe_failures.take() {
         j.observed
             .record_failure(&anyhow::anyhow!("pinned probe verdict moved: {moved}"));
     }
@@ -4584,6 +4646,42 @@ fn management_openapi_price_integer_encoding_is_not_a_domain_refusal() {
         assert!(
             price_refused(&duplicate),
             "duplicate-line domain refusal lost"
+        );
+    }
+}
+
+#[test]
+fn boundary_review_predicted_provider_refusal_requires_the_status_and_explanation() {
+    let body = json!([
+        "Local",
+        "ollama",
+        "none",
+        "http://127.0.0.1:11434/v1",
+        null,
+        false,
+        null,
+        null
+    ]);
+    assert!(
+        schema_accepts("POST", "/api/v1/platform/providers", &body)
+            && positional_provider_refusal(&body)
+    );
+    for (status, message, expected) in [
+        (StatusCode::BAD_REQUEST, "Invalid request", true),
+        (StatusCode::OK, "Invalid request", false),
+        (StatusCode::BAD_REQUEST, "unrelated refusal", false),
+    ] {
+        let captured = openapi::responses::Captured {
+            status,
+            headers: Default::default(),
+            bytes: json!({"error":{"message":message}}).to_string().into(),
+            method: "POST".into(),
+            template: Some("/api/v1/platform/providers".into()),
+            query: vec![],
+        };
+        assert_eq!(
+            std::panic::catch_unwind(|| positional_provider_probe(captured, &body)).is_ok(),
+            expected
         );
     }
 }
