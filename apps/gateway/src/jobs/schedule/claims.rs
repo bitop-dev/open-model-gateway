@@ -9,6 +9,15 @@ use crate::jobs::{
     store::job_storage,
 };
 
+/// Result of trying to start a previously failed batch line again.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RetryClaim {
+    Started,
+    Cancelled,
+    Full,
+    LineChanged,
+}
+
 impl Scheduler {
     /// Claim line `line` of the fenced batch on `deployment` when the route has room and
     /// it is this batch's turn. Serialized per route by a transaction lock;
@@ -26,15 +35,7 @@ impl Scheduler {
             .await
             .map_err(job_storage)?;
         fence.hold_counted(&mut tx, Hold::Rows).await?;
-        lock_route(&mut tx, deployment).await?;
-        let running: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM batch_lines WHERE deployment_id=$1 AND state='running' AND NOT awaiting_segment",
-        )
-        .bind(deployment)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(job_storage)?;
-        if running >= i64::from(max_concurrency) {
+        if route_full(&mut tx, deployment, max_concurrency).await? {
             tx.commit().await.map_err(job_storage)?;
             return Ok(Claim::Full);
         }
@@ -75,37 +76,46 @@ impl Scheduler {
         Ok(Claim::Claimed)
     }
 
-    /// An explicit retry of a failed line on its route (a new attempt),
-    /// within the route's concurrency. `None`: the route is full.
+    /// An explicit retry of a failed line within the pinned route's concurrency, if routed.
     pub(crate) async fn claim_retry(
         &self,
         fence: &BatchFence,
         line: i32,
         attempts: i16,
         execution: Uuid,
-        deployment: Uuid,
-        max_concurrency: i32,
-    ) -> FenceResult<Option<bool>> {
+        route: Option<(Uuid, i32)>,
+    ) -> FenceResult<RetryClaim> {
         let mut tx = crate::db::begin(&self.store.pool)
             .await
             .map_err(job_storage)?;
-        fence.hold_counted(&mut tx, Hold::Rows).await?;
-        lock_route(&mut tx, deployment).await?;
-        let running: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM batch_lines WHERE deployment_id=$1 AND state='running' AND NOT awaiting_segment",
+        // Cancellation updates this same row. Hold its write lock from the
+        // persisted decision through commit, including for an unrouted retry.
+        fence.hold_counted(&mut tx, Hold::Update).await?;
+        let cancelled: bool = sqlx::query_scalar(
+            "SELECT cancel_requested_at IS NOT NULL FROM async_jobs WHERE id=$1",
         )
-        .bind(deployment)
+        .bind(fence.job)
         .fetch_one(&mut *tx)
         .await
         .map_err(job_storage)?;
-        if running >= i64::from(max_concurrency) {
+        if cancelled {
             tx.commit().await.map_err(job_storage)?;
-            return Ok(None);
+            return Ok(RetryClaim::Cancelled);
+        }
+        if let Some((deployment, max_concurrency)) = route
+            && route_full(&mut tx, deployment, max_concurrency).await?
+        {
+            tx.commit().await.map_err(job_storage)?;
+            return Ok(RetryClaim::Full);
         }
         let claimed = sqlx::query("UPDATE batch_lines SET state='running',attempts=attempts+1,execution_id=$4,status_code=NULL,error_code=NULL,finished_at=NULL WHERE job_id=$1 AND line_no=$2 AND state='failed' AND attempts=$3 AND segment IS NULL")
             .bind(fence.job).bind(line).bind(attempts).bind(execution).execute(&mut *tx).await.map_err(job_storage)?.rows_affected() == 1;
         tx.commit().await.map_err(job_storage)?;
-        Ok(Some(claimed))
+        Ok(if claimed {
+            RetryClaim::Started
+        } else {
+            RetryClaim::LineChanged
+        })
     }
 
     /// Replace this batch's demand rows (heartbeat). `legit` records that
@@ -170,14 +180,22 @@ impl Scheduler {
     }
 }
 
-async fn lock_route(
+async fn route_full(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     deployment: Uuid,
-) -> Result<(), sqlx::Error> {
+    max_concurrency: i32,
+) -> Result<bool, sqlx::Error> {
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('omg_batch_route:'||$1::text,0))")
         .bind(deployment)
         .execute(&mut **tx)
         .await
         .map_err(job_storage)?;
-    Ok(())
+    let running: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM batch_lines WHERE deployment_id=$1 AND state='running' AND NOT awaiting_segment",
+    )
+    .bind(deployment)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(job_storage)?;
+    Ok(running >= i64::from(max_concurrency))
 }

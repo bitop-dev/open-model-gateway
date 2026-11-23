@@ -54,7 +54,11 @@ pub(super) fn load_tree(
         .with_extension("")
         .to_string_lossy()
         .replace('/', "::");
-    load(read, entry, module, bin, &mut out);
+    let crate_root = matches!(
+        entry.file_name().and_then(|n| n.to_str()),
+        Some("lib.rs" | "main.rs")
+    );
+    load(read, entry, module, bin, crate_root, &mut out);
     out
 }
 
@@ -63,22 +67,16 @@ fn load(
     rel: &Path,
     module: String,
     bin: bool,
+    children_beside_file: bool,
     out: &mut Vec<Source>,
 ) {
     let text = read(rel).unwrap_or_else(|| panic!("{}: cannot read", rel.display()));
-    let mut file = syn::parse_file(&text).unwrap_or_else(|e| panic!("{}: {e}", rel.display()));
-    if cfg_excludes(&file.attrs) {
+    let Some(file) = production_items(rel, &text, |_| true) else {
         return;
-    }
-    prune(&mut file.items);
-    Unreadable {
-        from: rel,
-        in_block: false,
-    }
-    .visit_file(&file);
+    };
     let name = rel.file_name().and_then(|n| n.to_str()).unwrap_or_default();
     let parent = rel.parent().unwrap_or(Path::new(""));
-    let children = if matches!(name, "lib.rs" | "main.rs" | "mod.rs") {
+    let children = if children_beside_file || name == "mod.rs" {
         parent.to_path_buf()
     } else {
         parent.join(rel.file_stem().unwrap_or_default())
@@ -99,9 +97,29 @@ fn load(
         file,
         bin,
     });
-    for (child, module) in files {
-        load(read, &child, module, bin, out);
+    for (child, module, explicit) in files {
+        load(read, &child, module, bin, explicit, out);
     }
+}
+
+/// Parse a production file and apply the reader's checks to the selected top-level items.
+pub(super) fn production_items(
+    rel: &Path,
+    text: &str,
+    keep: impl FnMut(&Item) -> bool,
+) -> Option<syn::File> {
+    let mut file = syn::parse_file(text).unwrap_or_else(|e| panic!("{}: {e}", rel.display()));
+    if cfg_excludes(&file.attrs) {
+        return None;
+    }
+    file.items.retain(keep);
+    prune(&mut file.items);
+    Unreadable {
+        from: rel,
+        in_block: false,
+    }
+    .visit_file(&file);
+    Some(file)
 }
 
 /// Constructs that add code the scan would not read.
@@ -160,7 +178,7 @@ impl<'ast> Visit<'ast> for Unreadable<'_> {
             .path
             .segments
             .last()
-            .is_some_and(|s| s.ident == "include")
+            .is_some_and(|s| s.ident.unraw() == "include")
         {
             panic!(
                 "{}: include! adds code the source rules cannot read",
@@ -196,11 +214,14 @@ impl<'ast> Visit<'ast> for Unreadable<'_> {
             );
         }
         for attr in &module.attrs {
-            if attr.path().is_ident("cfg_attr")
+            if attr
+                .path()
+                .get_ident()
+                .is_some_and(|id| id.unraw() == "cfg_attr")
                 && let Meta::List(list) = &attr.meta
                 && flat(list.tokens.clone())
                     .iter()
-                    .any(|t| matches!(t, TokenTree::Ident(i) if i == "path"))
+                    .any(|t| matches!(t, TokenTree::Ident(i) if i.unraw() == "path"))
             {
                 panic!(
                     "{}: cfg_attr(.., path = ..) on a module chooses a file the source rules cannot predict",
@@ -221,35 +242,33 @@ fn declared(
     parent_module: &str,
     read: &dyn Fn(&Path) -> Option<String>,
     from: &Path,
-    out: &mut Vec<(PathBuf, String)>,
+    out: &mut Vec<(PathBuf, String, bool)>,
 ) {
     for item in items {
         let Item::Mod(module) = item else { continue };
         let ident = module.ident.unraw().to_string();
         let module_path = format!("{parent_module}::{ident}");
-        if let Some((_, inner)) = &module.content {
-            declared(
-                inner,
-                &base.join(&ident),
-                &dir.join(&ident),
-                &module_path,
-                read,
-                from,
-                out,
-            );
-            continue;
-        }
         let explicit = module.attrs.iter().find_map(|a| match &a.meta {
-            Meta::NameValue(v) if v.path.is_ident("path") => match &v.value {
-                syn::Expr::Lit(syn::ExprLit {
-                    lit: syn::Lit::Str(s),
-                    ..
-                }) => Some(s.value()),
-                _ => None,
-            },
+            Meta::NameValue(v) if v.path.get_ident().is_some_and(|i| i.unraw() == "path") => {
+                match &v.value {
+                    syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(s),
+                        ..
+                    }) => Some(s.value()),
+                    _ => None,
+                }
+            }
             _ => None,
         });
-        let found = if let Some(path) = explicit {
+        if let Some((_, inner)) = &module.content {
+            let child_dir = match explicit {
+                Some(path) => base.join(path),
+                None => dir.join(&ident),
+            };
+            declared(inner, &child_dir, &child_dir, &module_path, read, from, out);
+            continue;
+        }
+        let found = if let Some(path) = &explicit {
             Some(base.join(path))
         } else {
             [
@@ -260,7 +279,9 @@ fn declared(
             .find(|candidate| read(candidate).is_some())
         };
         match found {
-            Some(path) if read(&path).is_some() => out.push((path, module_path)),
+            Some(path) if read(&path).is_some() => {
+                out.push((path, module_path, explicit.is_some()))
+            }
             _ => panic!(
                 "{}: cannot resolve `mod {ident};` (the source rules fail closed)",
                 from.display()
@@ -623,6 +644,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn inline_path_selects_the_directory_for_child_files() {
+        let files = [
+            ("lib.rs", "mod outer;"),
+            (
+                "outer.rs",
+                r#"#[path = "chosen"] mod inline { mod child; }"#,
+            ),
+            ("outer/inline/child.rs", ""),
+            ("chosen/child.rs", ""),
+        ];
+        assert_eq!(
+            tree(&files, "lib.rs"),
+            ["chosen/child.rs", "lib.rs", "outer.rs"]
+        );
+        assert_loader_refuses(
+            || tree(&files[..3], "lib.rs"),
+            "cannot resolve `mod child;`",
+        );
+    }
+
+    #[test]
+    fn inline_modules_in_explicit_files_start_beside_the_file() {
+        let found = tree(
+            &[
+                ("lib.rs", r#"#[r#path = "custom/outer.rs"] mod outer;"#),
+                (
+                    "custom/outer.rs",
+                    r#"mod inline { #[path = "marker.rs"] mod marker; mod child; }"#,
+                ),
+                ("custom/inline/marker.rs", ""),
+                ("custom/inline/child.rs", ""),
+            ],
+            "lib.rs",
+        );
+        assert_eq!(
+            found,
+            [
+                "custom/inline/child.rs",
+                "custom/inline/marker.rs",
+                "custom/outer.rs",
+                "lib.rs"
+            ]
+        );
+    }
+
     fn assert_loader_refuses(
         load: impl FnOnce() -> Vec<String> + std::panic::UnwindSafe,
         expected: &str,
@@ -821,6 +888,33 @@ mod tests {
             ],
             "lib.rs",
         );
+    }
+
+    #[test]
+    fn raw_include_is_rejected() {
+        assert_loader_refuses(
+            || tree(&[("lib.rs", r#"r#include!("other.rs");"#)], "lib.rs"),
+            "lib.rs: include!",
+        );
+    }
+
+    #[test]
+    fn conditional_module_paths_with_raw_identifiers_are_rejected() {
+        for attr in [
+            r#"#[cfg_attr(all(), r#path = "chosen.rs")]"#,
+            r#"#[r#cfg_attr(all(), path = "chosen.rs")]"#,
+        ] {
+            let source = format!("{attr} mod m;");
+            assert_loader_refuses(
+                || {
+                    tree(
+                        &[("lib.rs", &source), ("m.rs", ""), ("chosen.rs", "")],
+                        "lib.rs",
+                    )
+                },
+                "lib.rs: cfg_attr(.., path",
+            );
+        }
     }
 
     #[test]
