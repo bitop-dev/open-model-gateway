@@ -114,18 +114,16 @@ impl HttpConnector for Connector {
     }
 }
 
-/// `ca_pem`: optional extra trust anchor(s) for a private S3-compatible endpoint.
-pub(super) fn client(ca_pem: Option<&[u8]>) -> anyhow::Result<SharedHttpClient> {
+/// Optional extra trust anchors for a private S3-compatible endpoint.
+pub(super) fn client(ca_bundle: Option<&super::S3CaBundle>) -> anyhow::Result<SharedHttpClient> {
     // Every resolved address must pass the egress policy (#33).
     let mut builder =
         crate::egress::client_builder(crate::egress::resolver(crate::egress::Purpose::Storage))
             .connect_timeout(Duration::from_secs(10))
             .pool_idle_timeout(crate::egress::UpstreamClient::S3.pool_idle_timeout())
             .read_timeout(Duration::from_secs(60));
-    if let Some(pem) = ca_pem {
-        let certificates = reqwest::Certificate::from_pem_bundle(pem)
-            .map_err(|_| anyhow::anyhow!("GATEWAY_S3_CA_FILE is not a PEM certificate bundle"))?;
-        builder = crate::egress::add_root_certificates(builder, certificates);
+    if let Some(bundle) = ca_bundle {
+        builder = crate::egress::add_root_certificates(builder, bundle)?;
     }
     let client = builder
         .build()

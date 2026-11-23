@@ -706,12 +706,16 @@ mod tests {
 
     /// What Clippy cannot name (a field, a type used through `Default`, a
     /// device path) is named here instead (#511).
-    /// The crates whose paths `clippy.toml` names (#509, #511), at the
+    /// The crates whose paths `clippy.toml` names, at the
     /// versions the paths were written and probed for. Clippy reports a
     /// path it cannot resolve only as a warning, and not at all under
     /// `allow-invalid`, so a version change must bring the entries up for
     /// review: update the paths, re-run a planted probe, then this table.
-    const REVIEWED_CRATES: [(&str, &[&str]); 8] = [
+    const REVIEWED_CRATES: [(&str, &[&str]); 12] = [
+        ("aws-config", &["1"]),
+        ("aws-sdk-bedrockruntime", &["1"]),
+        ("aws-sdk-s3", &["1"]),
+        ("aws-types", &["1"]),
         ("crypto-common", &["0.1", "0.2"]),
         ("oauth2", &["5"]),
         ("openidconnect", &["4"]),
