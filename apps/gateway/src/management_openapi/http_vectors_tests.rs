@@ -3562,3 +3562,197 @@ fn intermediate_width_supplied_pairs_respect_reachable_alternatives() {
         }
     }
 }
+
+#[test]
+fn byte_dominance_keeps_the_character_edge_across_union_selections() {
+    let common = json!({"type":"string","maxLength":6,"x-omg-max-bytes":8});
+    let unicode = json!({"pattern":"^(a|é{2,8})$"});
+    let ascii = json!({"pattern":"^a{1,8}$"});
+    let mut scalar = common.clone();
+    scalar["anyOf"] = json!([unicode, ascii]);
+    let mut shorter = scalar.clone();
+    shorter["anyOf"][0]["pattern"] = json!("^(a|é{2,5})$");
+    for (schema, base, path) in [
+        (scalar, json!("a"), "(root)"),
+        (shorter, json!("a"), "(root)"),
+        (
+            json!({"type":"object","properties":{"n":common},"anyOf":[{"properties":{"n":unicode}},{"properties":{"n":ascii}}]}),
+            json!({"n":"a"}),
+            "/n",
+        ),
+        (
+            json!({"type":"array","items":common,"anyOf":[{"prefixItems":[unicode]},{"items":ascii}]}),
+            json!(["a"]),
+            "/0",
+        ),
+    ] {
+        let document = body_only(schema);
+        let plan = |pairs: &[(&str, &str)]| {
+            let candidates: Vec<_> = pairs
+                .iter()
+                .flat_map(|(at, over)| [*at, *over])
+                .map(|v| (path.to_owned(), json!(v)))
+                .collect();
+            super::http_vectors::body_plan(
+                &document,
+                &document["paths"][TEMPLATE]["post"],
+                &base,
+                &[],
+                &candidates,
+            )
+        };
+        assert!(
+            plan(&[("éééé", "ééééé")])
+                .err()
+                .expect("the ASCII edge remains reachable")
+                .to_string()
+                .contains("straddle"),
+            "{path}"
+        );
+        for pairs in [vec![], vec![("aaaaaa", "aaaaaaa")]] {
+            let planned = plan(&pairs).unwrap();
+            for (kind, text, accept) in [
+                ("maxLength", "aaaaaa", true),
+                ("maxLength+1", "aaaaaaa", false),
+            ] {
+                assert!(
+                    planned.cases.iter().any(|c| c.kind == kind
+                        && c.pointer == path
+                        && c.accept == accept
+                        && c.body.pointer(if path == "(root)" { "" } else { path })
+                            == Some(&json!(text))),
+                    "{path} {kind}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn byte_dominance_does_not_excuse_a_missing_generated_character_pair() {
+    let document = body_only(json!({"type":"string","maxLength":6,"x-omg-max-bytes":8,
+        "anyOf":[{"pattern":"^(a|é{2,8})$"},{"pattern":"^(a|b{1,8})$"}]}));
+    let result = super::http_vectors::body_plan(
+        &document,
+        &document["paths"][TEMPLATE]["post"],
+        &json!("a"),
+        &[],
+        &[],
+    );
+    assert!(
+        result
+            .err()
+            .expect("six b characters fit but the seed fills none")
+            .to_string()
+            .contains("maxLength@6")
+    );
+}
+
+#[test]
+fn byte_dominance_requires_the_contributing_cap_to_be_unconditional() {
+    let document = body_only(
+        json!({"type":"string","maxLength":6,"pattern":"^(a|[éê]{2,8})$",
+        "anyOf":[{"pattern":"^(a|é+)$","x-omg-max-bytes":8},{"pattern":"^(a|ê+)$"}]}),
+    );
+    let result = super::http_vectors::body_plan(
+        &document,
+        &document["paths"][TEMPLATE]["post"],
+        &json!("a"),
+        &[],
+        &[
+            ("(root)".into(), json!("éééé")),
+            ("(root)".into(), json!("ééééé")),
+        ],
+    );
+    assert!(
+        result
+            .err()
+            .expect("six uncapped ê fit")
+            .to_string()
+            .contains("straddle")
+    );
+}
+
+#[test]
+fn byte_dominance_keeps_conjunctive_ref_and_sibling_constraints() {
+    let referenced = json!({"$ref":"#/components/schemas/Chars"});
+    let cap = json!({"x-omg-max-bytes":8});
+    for (n, conjunct) in [
+        (
+            json!({"$ref":"#/components/schemas/Chars","allOf":[cap]}),
+            json!({}),
+        ),
+        (referenced, json!({"additionalProperties":cap})),
+    ] {
+        let mut document = body_only(
+            json!({"type":"object","properties":{"n":n}, "allOf":[conjunct],
+            "anyOf":[{"properties":{"n":{"minLength":1}}}, {"required":["other"]}]}),
+        );
+        document["components"]["schemas"]["Chars"] =
+            json!({"type":"string","maxLength":6,"pattern":"^(a|é{2,8})$"});
+        let plan = super::http_vectors::body_plan(
+            &document,
+            &document["paths"][TEMPLATE]["post"],
+            &json!({"n":"a"}),
+            &[],
+            &[("/n".into(), json!("éééé")), ("/n".into(), json!("ééééé"))],
+        )
+        .unwrap();
+        assert_eq!(plan.notes.dominated_patterns, 1);
+    }
+}
+
+#[test]
+fn byte_dominance_query_pairs_use_the_whole_parameter() {
+    let mut document = query_document();
+    let schema = json!({"type":"string","maxLength":6,"x-omg-max-bytes":8,
+        "anyOf":[{"pattern":"^(a|é{2,8})$"},{"pattern":"^a{1,8}$"}]});
+    document["paths"][TEMPLATE]["get"]["parameters"] =
+        json!([parameter("s", true, schema.clone())]);
+    for (keyword, at, past) in [
+        ("maxLength", "aaaaaa", "aaaaaaa"),
+        ("x-omg-max-bytes", "éééé", "ééééé"),
+    ] {
+        let mut relaxed = schema.clone();
+        relaxed.as_object_mut().unwrap().remove(keyword);
+        assert!(super::http_vectors::accepts(&document, &schema, &json!(at)).unwrap());
+        assert!(!super::http_vectors::accepts(&document, &schema, &json!(past)).unwrap());
+        assert!(super::http_vectors::accepts(&document, &relaxed, &json!(past)).unwrap());
+    }
+    let plan = |at: &str, past: &str| {
+        super::http_vectors::query_plan(
+            &document,
+            &document["paths"][TEMPLATE]["get"],
+            &[("s".into(), "a".into())],
+            &[],
+            &[("s".into(), at.into()), ("s".into(), past.into())],
+        )
+    };
+    assert!(
+        plan("éééé", "ééééé")
+            .err()
+            .expect("the byte cap leaves the ASCII character edge reachable")
+            .to_string()
+            .contains("straddle")
+    );
+    plan("aaaaaa", "aaaaaaa").unwrap();
+}
+
+#[test]
+fn byte_dominance_retains_type_disjoint_parent_wire_forms() {
+    let leaf = json!({"type":"string","maxLength":6,"x-omg-max-bytes":8,"pattern":"^(a|é{2,8})$"});
+    let document = body_only(json!({"oneOf":[
+        {"type":"object","properties":{"n":leaf}}, {"type":"array","prefixItems":[leaf]}
+    ]}));
+    for (body, path) in [(json!({"n":"a"}), "/n"), (json!(["a"]), "/0")] {
+        let plan = super::http_vectors::body_plan(
+            &document,
+            &document["paths"][TEMPLATE]["post"],
+            &body,
+            &[],
+            &[(path.into(), json!("éééé")), (path.into(), json!("ééééé"))],
+        )
+        .unwrap();
+        assert_eq!(plan.notes.dominated_patterns, 1);
+    }
+}

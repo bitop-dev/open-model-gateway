@@ -142,6 +142,123 @@ pub(super) fn relaxations(
     Ok(out)
 }
 
+/// Facts that hold for every choice at this instance path. The nodes chosen
+/// by a fixture seed are useful for generating probes, but only a conjunction
+/// can justify dropping one.
+#[derive(Default)]
+pub(super) struct ByteDominance {
+    pub(super) cap: Option<u64>,
+    pub(super) max_chars: Option<u64>,
+    patterns: std::collections::BTreeSet<String>,
+    pub(super) parent_choice: bool,
+}
+
+impl ByteDominance {
+    pub(super) fn at(
+        document: &Value,
+        root: &Value,
+        path: &[Step],
+        nodes: &[&Value],
+    ) -> Result<Self> {
+        let mut rules = Self::default();
+        if nodes
+            .iter()
+            .any(|node| node.get(super::MAX_BYTES).is_some())
+        {
+            let mut remaining = 4096;
+            rules.collect(document, root, path, &mut remaining, 0)?;
+        }
+        Ok(rules)
+    }
+
+    fn collect(
+        &mut self,
+        document: &Value,
+        schema: &Value,
+        path: &[Step],
+        remaining: &mut usize,
+        depth: usize,
+    ) -> Result<()> {
+        // Unvisited constraints cannot contribute to the proof. A projection
+        // of unknown ancestry still needs whole-body verdicts.
+        if *remaining == 0 || depth >= 48 {
+            self.parent_choice |= !path.is_empty();
+            return Ok(());
+        }
+        *remaining -= 1;
+        for node in super::chain(document, schema)? {
+            if let Some((first, tail)) = path.split_first() {
+                self.parent_choice |= node.get("if").is_some();
+                // Changing a member or element preserves its container type.
+                // The sole arm compatible with that type is a conjunction for
+                // this substitution (e.g. object versus positional wire forms).
+                let container = match first {
+                    Step::Key(_) => "object",
+                    Step::Index(_) => "array",
+                };
+                for key in ["anyOf", "oneOf"] {
+                    let Some(arms) = node[key].as_array() else {
+                        continue;
+                    };
+                    if arms.len() > *remaining {
+                        self.parent_choice = true;
+                        continue;
+                    }
+                    *remaining -= arms.len();
+                    let mut possible = arms.iter().filter(|arm| match &arm["type"] {
+                        Value::String(t) => t == container,
+                        Value::Array(types) => types.iter().any(|t| t == container),
+                        _ => arm.as_bool() != Some(false),
+                    });
+                    if let Some(only) = possible.next() {
+                        if possible.next().is_none() {
+                            self.collect(document, only, path, remaining, depth + 1)?;
+                        } else {
+                            self.parent_choice = true;
+                        }
+                    }
+                }
+                let child = match first {
+                    Step::Key(name) => super::member_schema(&[node], name)?,
+                    Step::Index(index) => super::element_schema(&[node], *index),
+                };
+                if let Some(child) = child {
+                    self.collect(document, &child, tail, remaining, depth + 1)?;
+                }
+            } else {
+                if let Some(cap) = node[super::MAX_BYTES].as_u64() {
+                    self.cap = Some(self.cap.map_or(cap, |previous| previous.min(cap)));
+                }
+                if let Some(max) = node["maxLength"].as_u64() {
+                    self.max_chars = Some(self.max_chars.map_or(max, |previous| previous.min(max)));
+                }
+                if let Some(pattern) = node["pattern"].as_str() {
+                    self.patterns.insert(pattern.to_owned());
+                }
+            }
+            for conjunct in node["allOf"].as_array().into_iter().flatten() {
+                self.collect(document, conjunct, path, remaining, depth + 1)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn excludes(&self, width: u64) -> bool {
+        let Some(cap) = self.cap else {
+            return false;
+        };
+        if cap < width {
+            return true;
+        }
+        let widths: Vec<_> = self
+            .patterns
+            .iter()
+            .filter_map(|p| pattern_width(p))
+            .collect();
+        byte_cap_prevents_width(widths.iter(), width, cap)
+    }
+}
+
 /// Maximum Unicode scalar count, and the fewest UTF-8 bytes a match of
 /// that width can occupy. A byte edge can stand in for the character edge
 /// only when the byte budget makes the latter unreachable.

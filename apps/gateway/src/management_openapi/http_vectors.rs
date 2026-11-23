@@ -236,6 +236,7 @@ fn valid(document: &Value, schema: &Value, instance: &Value) -> Result<bool> {
 
 /// The schema nodes that constrain `value`: the node itself, its `allOf` members,
 /// the `oneOf`/`anyOf` branches the value matches and the active conditional arm.
+/// This inventory describes the seed. A replacement can select other arms.
 fn applicable<'a>(
     document: &'a Value,
     node: &'a Value,
@@ -801,23 +802,52 @@ fn relaxed(
     Ok(validator)
 }
 
+/// Most generated bounds can be checked at their leaf. Below a parent
+/// choice the seed's synthetic child schema may conjoin alternative arms.
+struct BoundaryOracle<'a> {
+    schema: &'a Value,
+    body: Option<(&'a Value, &'a [Step])>,
+    rules: ByteDominance,
+}
+
+impl<'a> BoundaryOracle<'a> {
+    fn leaf(schema: &'a Value) -> Self {
+        Self {
+            schema,
+            body: None,
+            rules: ByteDominance::default(),
+        }
+    }
+
+    fn instance<'v>(&self, value: &'v Value) -> Cow<'v, Value> {
+        match self.body {
+            Some((base, path)) => Cow::Owned(set(base, path, Some(value.clone()))),
+            None => Cow::Borrowed(value),
+        }
+    }
+}
+
 /// The first candidate pair the schema accepts at the limit and refuses past
 /// it, preferring one the bound ALONE refuses (`relaxed` accepts it). `None`
 /// when no candidate satisfies the schema at the limit.
 fn find_pair(
     document: &Value,
-    schema: &Value,
+    oracle: &BoundaryOracle,
     relaxed: Option<&jsonschema::Validator>,
     candidates: impl Iterator<Item = (Value, Value)>,
 ) -> Result<Option<Pair>> {
     let mut implied = None;
     for (at, over) in candidates {
-        if !accepts(document, schema, &at)? || accepts(document, schema, &over)? {
+        let at_instance = oracle.instance(&at);
+        let over_instance = oracle.instance(&over);
+        if !accepts(document, oracle.schema, &at_instance)?
+            || accepts(document, oracle.schema, &over_instance)?
+        {
             continue;
         }
         let alone = match relaxed {
-            Some(relaxed) => relaxed.is_valid(&over),
-            None => valid(document, schema, &over)?,
+            Some(relaxed) => relaxed.is_valid(&over_instance),
+            None => valid(document, oracle.schema, &over_instance)?,
         };
         if alone {
             return Ok(Some(Pair {
@@ -926,7 +956,7 @@ fn byte_pairs<'a>(seed: &'a str, bytes: usize) -> impl Iterator<Item = (Value, V
 /// Can the schema hold a multibyte value at all (at its shortest length)?
 fn multibyte_possible(
     document: &Value,
-    schema: &Value,
+    oracle: &BoundaryOracle,
     seed: &str,
     shortest: usize,
     longest: usize,
@@ -936,7 +966,7 @@ fn multibyte_possible(
             let chars = shortest.max(head + 1);
             if chars <= longest
                 && let Some(candidate) = glyph_value(seed, head, glyph, chars)
-                && accepts(document, schema, &json!(candidate))?
+                && accepts(document, oracle.schema, &oracle.instance(&json!(candidate)))?
             {
                 return Ok(true);
             }
@@ -948,7 +978,7 @@ fn multibyte_possible(
 /// The length vectors of a string location, one pair per DISTINCT bound.
 fn string_bounds(
     document: &Value,
-    schema: &Value,
+    oracle: &BoundaryOracle,
     nodes: &[&Value],
     seed: &str,
     out: &mut Vec<(&'static str, Value)>,
@@ -963,10 +993,10 @@ fn string_bounds(
             evidence.settle(("minLength", Some("minLength-1")), min, None, dominated);
             continue;
         }
-        let validator = relaxed(document, schema, "minLength", min)?;
+        let validator = relaxed(document, oracle.schema, "minLength", min)?;
         let found = find_pair(
             document,
-            schema,
+            oracle,
             Some(&validator),
             ascii_pairs(seed, min as usize, min as usize - 1),
         )?;
@@ -977,25 +1007,19 @@ fn string_bounds(
         evidence.settle(("minLength", Some("minLength-1")), min, found, dominated);
     }
     let shortest = mins.last().copied().unwrap_or(0) as usize;
-    let byte_masks_chars = maxs
-        .first()
-        .zip(byte_limits.first())
-        .is_some_and(|(&max, &cap)| {
-            let widths: Vec<_> = strings(nodes, "pattern")
-                .into_iter()
-                .filter_map(pattern_width)
-                .collect();
-            byte_cap_prevents_width(widths.iter(), max, cap)
-        });
     for &max in &maxs {
-        let dominated = Some(&max) != maxs.first() || byte_masks_chars;
+        let dominated = if byte_limits.is_empty() {
+            Some(&max) != maxs.first()
+        } else {
+            oracle.rules.max_chars.is_some_and(|cap| cap < max) || oracle.rules.excludes(max)
+        };
         if max >= LONGEST {
             evidence.settle(("maxLength", Some("maxLength+1")), max, None, dominated);
         } else {
-            let validator = relaxed(document, schema, "maxLength", max)?;
+            let validator = relaxed(document, oracle.schema, "maxLength", max)?;
             let found = find_pair(
                 document,
-                schema,
+                oracle,
                 Some(&validator),
                 ascii_pairs(seed, max as usize, max as usize + 1),
             )?;
@@ -1011,7 +1035,7 @@ fn string_bounds(
                     let next = (max as usize / period + 1).saturating_mul(period);
                     if next > max as usize + 1 && next <= LONGEST as usize {
                         let candidate = json!(repeat_to(seed, next));
-                        if validator.is_valid(&candidate) {
+                        if validator.is_valid(&oracle.instance(&candidate)) {
                             out.push(("past maxLength", candidate));
                         }
                     }
@@ -1024,10 +1048,11 @@ fn string_bounds(
         // character, or a schema that refuses multibyte text, leaves nothing
         // to tell apart (counted, not decisive).
         let kinds = ("multibyte maxLength", Some("multibyte maxLength+1"));
-        if byte_limits
-            .iter()
-            .any(|limit| *limit < max.saturating_mul(2))
-            || !multibyte_possible(document, schema, seed, shortest, max as usize)?
+        if oracle
+            .rules
+            .cap
+            .is_some_and(|limit| limit < max.saturating_mul(2))
+            || !multibyte_possible(document, oracle, seed, shortest, max as usize)?
         {
             evidence.dropped.push("multibyte not applicable".to_owned());
             // Still sent when small enough: the handler must agree with the
@@ -1044,10 +1069,10 @@ fn string_bounds(
         } else if max > 20_000 {
             evidence.settle(kinds, max, None, dominated);
         } else {
-            let validator = relaxed(document, schema, "maxLength", max)?;
+            let validator = relaxed(document, oracle.schema, "maxLength", max)?;
             let found = find_pair(
                 document,
-                schema,
+                oracle,
                 Some(&validator),
                 glyph_pairs(seed, max as usize),
             )?;
@@ -1057,7 +1082,7 @@ fn string_bounds(
     // A reviewed byte limit (every distinct one): ASCII and multibyte values of
     // EXACTLY the limit and of one byte more.
     for &limit in &byte_limits {
-        let dominated = Some(&limit) != byte_limits.first();
+        let dominated = oracle.rules.cap.is_some_and(|cap| cap < limit);
         if limit >= LONGEST {
             evidence.settle(("maxBytes", Some("maxBytes+1")), limit, None, dominated);
             evidence.settle(
@@ -1070,16 +1095,16 @@ fn string_bounds(
         }
         let ascii = find_pair(
             document,
-            schema,
+            oracle,
             None,
             ascii_pairs(seed, limit as usize, limit as usize + 1)
                 .filter(|(at, _)| at.as_str().is_some_and(|t| t.len() == limit as usize)),
         )?;
-        let possible = multibyte_possible(document, schema, seed, shortest, usize::MAX)?;
+        let possible = multibyte_possible(document, oracle, seed, shortest, usize::MAX)?;
         // A short ASCII alternative can hide a longer multibyte match from
-        // the shortest-length probe. Exercise the byte edge that masks maxLength.
-        let wide = if possible || (ascii.is_none() && byte_masks_chars && !dominated) {
-            find_pair(document, schema, None, byte_pairs(seed, limit as usize))?
+        // the shortest-length probe. Try the byte edge when no ASCII pair fits.
+        let wide = if possible || (ascii.is_none() && !dominated) {
+            find_pair(document, oracle, None, byte_pairs(seed, limit as usize))?
         } else {
             None
         };
@@ -1103,12 +1128,13 @@ const STRADDLE: &str = "supplied candidates must straddle the boundary: include 
 #[path = "supplied_boundaries.rs"]
 mod supplied_boundaries;
 
-use supplied_boundaries::{byte_cap_prevents_width, pattern_width, wider_patterns};
+use supplied_boundaries::{ByteDominance, pattern_width, wider_patterns};
 
 /// An adjacent accepted/refused pair at the effective limit. Byte caps and
 /// JSON Schema character limits use different units for the same candidate.
 fn straddles(
     nodes: &[&Value],
+    rules: &ByteDominance,
     verdicts: &[(String, bool)],
     notes: &mut Notes,
     mut confirms: impl FnMut(&str, &Value, Option<&Value>, &str, &str) -> Result<bool>,
@@ -1130,16 +1156,13 @@ fn straddles(
         .iter()
         .filter_map(|(_, w, _)| w.as_ref().map(|w| w.chars as u64))
         .min();
-    let char_cap = distinct_u64(nodes, "maxLength").first().copied();
+    let char_caps = distinct_u64(nodes, "maxLength");
+    let char_cap = char_caps.first().copied();
     let byte_cap = distinct_u64(nodes, MAX_BYTES).first().copied();
     let edge = maximum.map(|width| char_cap.unwrap_or(width).min(width));
-    let byte_dominates = edge.zip(byte_cap).is_some_and(|(edge, cap)| {
-        byte_cap_prevents_width(
-            patterns.iter().filter_map(|(_, w, _)| w.as_ref()),
-            edge,
-            cap,
-        )
-    });
+    let byte_dominates = edge
+        .or(char_cap)
+        .is_some_and(|target| rules.excludes(target));
     // The extra repetition may contain several scalars (a hex byte, for
     // example). The rest of the string must agree before and after it.
     fn insertion(short: &str, long: &str) -> bool {
@@ -1174,7 +1197,7 @@ fn straddles(
                 if adjacent
                     && at < edge
                     && over <= edge
-                    && let Some(cap) = byte_cap
+                    && let Some(cap) = rules.cap
                     && byte_dominates
                     && accepted.len() as u64 == cap
                     && refused.len() as u64 > cap
@@ -1183,14 +1206,22 @@ fn straddles(
                     notes.dominated_patterns += 1;
                     return Ok(true);
                 }
-                if at != edge || over <= edge || !insertion(accepted, refused) {
-                    continue;
+                // An alternative matching the seed can end before the actual
+                // character cap. A whole-schema verdict change proves the
+                // supplied pair reaches an independent maxLength edge.
+                if adjacent
+                    && over == at + 1
+                    && char_caps.contains(&at)
+                    && confirms("maxLength", &json!(at), None, accepted, refused)?
+                {
+                    notes.dominated_patterns += 1;
+                    return Ok(true);
                 }
-                if maximum.is_some_and(|width| edge < width) {
-                    if adjacent && confirms("maxLength", &json!(edge), None, accepted, refused)? {
-                        notes.dominated_patterns += 1;
-                        return Ok(true);
-                    }
+                if at != edge
+                    || over <= edge
+                    || !insertion(accepted, refused)
+                    || maximum.is_some_and(|width| edge < width)
+                {
                     continue;
                 }
             }
@@ -1215,6 +1246,9 @@ fn straddles(
                     if let Some(cap) = limit
                         && at as u64 == cap
                         && over as u64 > cap
+                        && (key != MAX_BYTES
+                            || char_cap.is_none()
+                            || (byte_dominates && Some(cap) == rules.cap))
                         && confirms(key, &json!(cap), None, accepted, refused)?
                     {
                         return Ok(true);
@@ -1223,6 +1257,7 @@ fn straddles(
             }
             for (pattern, width, wider) in &patterns {
                 if maximum.is_some_and(|max| width.as_ref().is_none_or(|w| w.chars as u64 != max))
+                    || !super::validation::pattern_validator(pattern)?.is_valid(&json!(accepted))
                     || super::validation::pattern_validator(pattern)?.is_valid(&json!(refused))
                 {
                     continue;
@@ -1307,6 +1342,7 @@ fn declared_values(
 fn scalar_mutations(
     document: &Value,
     schema: &Value,
+    oracle: &BoundaryOracle,
     nodes: &[&Value],
     value: &Value,
     query: bool,
@@ -1505,7 +1541,7 @@ fn scalar_mutations(
     // String bounds are derived from the VALID value so the alphabet stays valid.
     if kinds.contains("string") {
         let seed = value.as_str().unwrap_or("a");
-        string_bounds(document, schema, nodes, seed, &mut out, &mut evidence)?;
+        string_bounds(document, oracle, nodes, seed, &mut out, &mut evidence)?;
         dropped.append(&mut evidence.dropped);
         let patterns = strings(nodes, "pattern");
         let annotated = nodes
@@ -1769,8 +1805,20 @@ pub(super) fn query_plan(
             .filter(|(n, _)| n == name)
             .map(|(_, v)| v.as_str())
             .collect();
-        let mut mutations =
-            scalar_mutations(document, schema, &nodes, &typed, true, supplied.len())?;
+        let rules = ByteDominance::at(document, schema, &[], &nodes)?;
+        let oracle = BoundaryOracle {
+            rules,
+            ..BoundaryOracle::leaf(schema)
+        };
+        let mut mutations = scalar_mutations(
+            document,
+            schema,
+            &oracle,
+            &nodes,
+            &typed,
+            true,
+            supplied.len(),
+        )?;
         if mutations.needs_candidates {
             notes.problems.push(format!(
                 "query parameter {name}: the pattern has no derivable length bounds; supply boundary candidates or annotate it with {PATTERN_BOUNDARIES}"
@@ -1793,6 +1841,7 @@ pub(super) fn query_plan(
                 .collect::<Result<Vec<_>>>()?;
             if !straddles(
                 &nodes,
+                &oracle.rules,
                 &verdicts,
                 &mut notes,
                 |key, bound, replacement, accepted, refused| {
@@ -2467,7 +2516,7 @@ impl Walk<'_> {
             let validator = relaxed(self.document, schema, key, bound)?;
             let found = find_pair(
                 self.document,
-                schema,
+                &BoundaryOracle::leaf(schema),
                 Some(&validator),
                 std::iter::once((Value::Array(at.clone()), Value::Array(over.clone()))),
             )?;
@@ -2509,8 +2558,29 @@ impl Walk<'_> {
             .insert(raw_pointer(path));
         let here = pointer(path);
         let supplied = self.candidates.get(&here).cloned().unwrap_or_default();
-        let mutations =
-            scalar_mutations(self.document, schema, &nodes, value, false, supplied.len())?;
+        let rules = ByteDominance::at(self.document, self.root_schema, path, &nodes)?;
+        let oracle = if rules.parent_choice {
+            BoundaryOracle {
+                schema: self.root_schema,
+                body: Some((&self.valid_body, path)),
+                rules,
+            }
+        } else {
+            BoundaryOracle {
+                rules,
+                ..BoundaryOracle::leaf(schema)
+            }
+        };
+        let mutations = scalar_mutations(
+            self.document,
+            schema,
+            &oracle,
+            &nodes,
+            value,
+            false,
+            supplied.len(),
+        )?;
+        let rules = oracle.rules;
         if mutations.needs_candidates {
             self.notes.problems.push(format!(
                 "{here}: the pattern has no derivable length bounds; supply boundary candidates or annotate it with {PATTERN_BOUNDARIES}"
@@ -2546,16 +2616,18 @@ impl Walk<'_> {
             let mut verdicts = Vec::new();
             let patterned = nodes.iter().any(|node| node.get("pattern").is_some());
             for candidate in &supplied {
-                let leaf = accepts(self.document, schema, candidate)?;
                 let body = set(&self.valid_body, path, Some(candidate.clone()));
+                let verdict = accepts(self.document, self.root_schema, &body)?;
                 if (!patterned || candidate.is_string())
-                    && accepts(self.document, self.root_schema, &body)? == leaf
+                    && (rules.parent_choice
+                        || accepts(self.document, schema, candidate)? == verdict)
                 {
-                    verdicts.push((render(candidate), leaf));
+                    verdicts.push((render(candidate), verdict));
                 }
             }
             if !straddles(
                 &nodes,
+                &rules,
                 &verdicts,
                 &mut self.notes,
                 |key, bound, replacement, accepted, refused| {
@@ -2676,30 +2748,23 @@ fn child_schema<'a>(nodes: &[&'a Value], name: &str) -> Option<Cow<'a, Value>> {
 /// `patternProperties` value whose pattern matches the name, or the schema-valued
 /// `additionalProperties` when neither selects it.
 fn member_schema<'a>(nodes: &[&'a Value], name: &str) -> Result<Option<Cow<'a, Value>>> {
-    let mut parts: Vec<Cow<'a, Value>> = nodes
-        .iter()
-        .filter_map(|node| node["properties"].get(name))
-        .map(Cow::Borrowed)
-        .collect();
-    let mut selected = !parts.is_empty();
+    let mut parts = Vec::new();
     for node in nodes {
+        let property = node["properties"].get(name);
+        let mut selected = property.is_some();
+        parts.extend(property.map(Cow::Borrowed));
         for (pattern, child) in node["patternProperties"].as_object().into_iter().flatten() {
-            if child.is_object()
-                && super::validation::pattern_validator(pattern)?
-                    .is_valid(&Value::String(name.to_owned()))
-            {
+            if super::validation::pattern_validator(pattern)?.is_valid(&json!(name)) {
                 selected = true;
-                parts.push(Cow::Borrowed(child));
+                if child.is_object() {
+                    parts.push(Cow::Borrowed(child));
+                }
             }
         }
-    }
-    if !selected {
-        parts.extend(
-            nodes
-                .iter()
-                .filter_map(|node| node.get("additionalProperties").filter(|v| v.is_object()))
-                .map(Cow::Borrowed),
-        );
+        if !selected && let Some(child) = node.get("additionalProperties").filter(|v| v.is_object())
+        {
+            parts.push(Cow::Borrowed(child));
+        }
     }
     Ok(combine(parts))
 }

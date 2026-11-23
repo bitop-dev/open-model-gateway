@@ -34,7 +34,16 @@ async fn management_openapi_integer_encoding_preserves_wire_spelling() {
 fn management_openapi_integer_encoding_nullable_seed() {
     let schema = json!({"type":["integer","null"],"minimum":2,"maximum":9});
     let nodes = vec![&schema];
-    let mutations = scalar_mutations(&json!({}), &schema, &nodes, &Value::Null, false, 0).unwrap();
+    let mutations = scalar_mutations(
+        &json!({}),
+        &schema,
+        &BoundaryOracle::leaf(&schema),
+        &nodes,
+        &Value::Null,
+        false,
+        0,
+    )
+    .unwrap();
     for kind in ["integer encoding fraction", "integer encoding exponent"] {
         assert!(
             mutations
@@ -397,8 +406,16 @@ fn management_openapi_integer_encoding_finite_domain_inference_is_restricted() {
         );
     }
     let schema = json!({"const":3.0});
-    let mutations =
-        scalar_mutations(&json!({}), &schema, &[&schema], &json!(3.0), false, 0).unwrap();
+    let mutations = scalar_mutations(
+        &json!({}),
+        &schema,
+        &BoundaryOracle::leaf(&schema),
+        &[&schema],
+        &json!(3.0),
+        false,
+        0,
+    )
+    .unwrap();
     assert!(
         mutations
             .vectors
