@@ -14,7 +14,10 @@ use axum::{
 use futures::StreamExt;
 
 use super::*;
-use crate::filestore::{Encrypted, FileStore, KeyRing, Purpose, PutMeta, Scope};
+use crate::filestore::{
+    Encrypted, FileStore, FileStoreConfig, FileStoreRuntime, KeyRing, Purpose, PutMeta, Scope,
+    config::BACKEND_ENV, crypto,
+};
 
 type Lookup = Box<dyn Fn(&str) -> Option<String>>;
 
@@ -282,22 +285,142 @@ async fn mock(mode: &'static str) -> (String, Arc<Mutex<Vec<Seen>>>) {
 }
 
 async fn store_for(origin: &str) -> Encrypted<S3Backend> {
-    let settings = S3Settings::from_lookup(&*lookup(&[
-        ("GATEWAY_S3_BUCKET", "files"),
-        ("GATEWAY_S3_PREFIX", "gw/test"),
-        ("GATEWAY_S3_ENDPOINT", origin),
-        ("GATEWAY_S3_ENDPOINT_ALLOWLIST", origin),
-        ("GATEWAY_S3_AUTH", "static"),
-        ("GATEWAY_S3_ACCESS_KEY_ID_ENV", "K"),
-        ("GATEWAY_S3_SECRET_ACCESS_KEY_ENV", "S"),
-        ("K", "test-access-key"),
-        ("S", "test-secret-key"),
-    ]))
-    .unwrap();
+    let settings = S3Settings::from_lookup(&*s3_lookup(origin, None)).unwrap();
     Encrypted::new(
         S3Backend::new(&settings).await.unwrap(),
         Arc::new(KeyRing::random("mock").unwrap()),
     )
+}
+
+fn s3_lookup(origin: &str, ca_file: Option<&str>) -> Lookup {
+    let mut pairs = vec![
+        (BACKEND_ENV, "s3"),
+        (crypto::KEYS_ENV, "KEYS"),
+        ("KEYS", "mock:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="),
+        (BUCKET_ENV, "files"),
+        (PREFIX_ENV, "gw/test"),
+        (ENDPOINT_ENV, origin),
+        (ENDPOINT_ALLOWLIST_ENV, origin),
+        (AUTH_ENV, "static"),
+        (ACCESS_KEY_ENV, "K"),
+        (SECRET_KEY_ENV, "S"),
+        ("K", "test-access-key"),
+        ("S", "test-secret-key"),
+    ];
+    if let Some(path) = ca_file {
+        pairs.push((CA_FILE_ENV, path));
+    }
+    lookup(&pairs)
+}
+
+#[tokio::test]
+async fn operator_ca_bundle_is_required_for_private_s3_tls() {
+    use crate::audit_export::pki::{CA, OTHER_CA, SERVER_CERT, SERVER_KEY, WRONG_NAME_CERT};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s3-ca.pem");
+    let key = ObjectKey::new(Purpose::BatchInput, Scope::Workspace(uuid::Uuid::new_v4())).unwrap();
+
+    let stored_size = crypto::stored_len(42).unwrap();
+    for (bundle, leaf, trusted) in [
+        (None, SERVER_CERT, false),
+        (Some(OTHER_CA.to_owned()), SERVER_CERT, false),
+        (Some(CA.to_owned()), WRONG_NAME_CERT, false),
+        (Some(format!("{OTHER_CA}{CA}")), SERVER_CERT, true),
+    ] {
+        if let Some(pem) = &bundle {
+            std::fs::write(&path, pem).unwrap();
+        }
+        let certificate = CertificateDer::from_pem_slice(leaf.as_bytes()).unwrap();
+        let private_key = PrivateKeyDer::from_pem_slice(SERVER_KEY.as_bytes()).unwrap();
+        let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate], private_key)
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("https://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let handshake = acceptor.accept(socket).await;
+            if !trusted {
+                assert!(
+                    handshake.is_err(),
+                    "the client must reject this certificate"
+                );
+                return;
+            }
+            let mut stream = BufReader::new(handshake.unwrap());
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            assert!(line.starts_with("HEAD /files/gw/test/"), "{line}");
+            let mut signed = false;
+            loop {
+                line.clear();
+                assert_ne!(stream.read_line(&mut line).await.unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                signed |=
+                    line.starts_with("authorization: AWS4-HMAC-SHA256 Credential=test-access-key/");
+            }
+            assert!(signed);
+            stream
+                .write_all(
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {stored_size}\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let settings = s3_lookup(&origin, bundle.as_ref().map(|_| path.to_str().unwrap()));
+        let config = FileStoreConfig::from_lookup(&*settings).unwrap();
+        let store = FileStoreRuntime::build(config)
+            .await
+            .unwrap()
+            .store()
+            .unwrap();
+        let (result, finished) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(store.head(&key), server)
+        })
+        .await
+        .expect("loopback S3 TLS fixture finished");
+        finished.unwrap();
+        if trusted {
+            assert_eq!(result.unwrap().unwrap().size, 42);
+        } else {
+            assert!(matches!(result, Err(FileStoreError::Unavailable)));
+        }
+    }
+}
+
+#[tokio::test]
+async fn invalid_ca_file_fails_through_s3_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s3-ca.pem");
+    let path = path.to_str().unwrap();
+    assert_eq!(
+        error(&[(BUCKET_ENV, "files"), (CA_FILE_ENV, path)]),
+        "GATEWAY_S3_CA_FILE could not be read"
+    );
+    std::fs::write(
+        path,
+        "-----BEGIN CERTIFICATE-----\n!invalid-base64!\n-----END CERTIFICATE-----\n",
+    )
+    .unwrap();
+    let settings = s3_lookup("https://127.0.0.1:1", Some(path));
+    let config = FileStoreConfig::from_lookup(&*settings).unwrap();
+    let error = FileStoreRuntime::build(config).await.err().unwrap();
+    assert_eq!(
+        error.to_string(),
+        "GATEWAY_S3_CA_FILE is not a PEM certificate bundle"
+    );
 }
 
 fn checksum_headers(seen: &Seen) -> Vec<&(String, String)> {

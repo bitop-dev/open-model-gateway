@@ -102,6 +102,7 @@ impl BedrockAdapter {
             return client.clone();
         }
         let credentials = auth::credentials(&plan.auth, &plan.region).await;
+        #[expect(clippy::disallowed_methods, reason = "Bedrock uses its service config")]
         let client = Client::from_conf(self.service_config(plan, credentials));
         // Bound cache cardinality even if catalog configuration changes repeatedly. Evicting
         // keeps a reused client (and its credential cache) for the current configuration.
@@ -122,11 +123,14 @@ impl BedrockAdapter {
     ) -> aws_sdk_bedrockruntime::Config {
         let mut builder = aws_sdk_bedrockruntime::Config::builder();
         builder.set_endpoint_url(plan.endpoint.clone());
-        builder
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "Bedrock installs the gateway transport"
+        )]
+        let config = builder
             .behavior_version(auth::sdk_behavior_version())
             .region(Region::new(plan.region.clone()))
             .credentials_provider(credentials)
-            .http_client(self.http.clone())
             .retry_config(RetryConfig::standard().with_max_attempts(1))
             // Sign with this host's clock only: a response's Date header must
             // not move the signing time (the SDK's skew correction is on by
@@ -141,7 +145,9 @@ impl BedrockAdapter {
                     .build(),
             )
             .timeout_config(self.operation_timeouts())
-            .build()
+            .http_client(self.http.clone())
+            .build();
+        config
     }
     fn operation_timeouts(&self) -> TimeoutConfig {
         TimeoutConfig::builder()
@@ -182,7 +188,11 @@ impl ProviderAdapter for BedrockAdapter {
         let input = encode(&request)?; // Validate before any credential discovery/network work.
         let client = self.client(&plan).await;
         if request.stream {
-            let output = client
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "Bedrock streaming installs the gateway transport"
+            )]
+            let operation = client
                 .converse_stream()
                 .model_id(&target.upstream_model)
                 .set_messages(Some(input.messages))
@@ -195,7 +205,8 @@ impl ProviderAdapter for BedrockAdapter {
                 .config_override(
                     aws_sdk_bedrockruntime::Config::builder()
                         .http_client(self.streaming_http.clone()),
-                )
+                );
+            let output = operation
                 .send()
                 .await
                 .map_err(|e| sdk_messages_error(e, request.messages_options.is_some()))?;
