@@ -153,6 +153,31 @@ async fn a_runner_that_lost_the_batch_cannot_change_a_batch_the_new_owner_finish
     consistent(&w.f).await;
 }
 
+async fn overlapping_runners(
+    w: &World,
+    job: &JobRow,
+) -> (
+    tokio::task::JoinHandle<JobResult<bool>>,
+    tokio::task::JoinHandle<JobResult<bool>>,
+    Arc<Gate>,
+    Arc<Gate>,
+) {
+    // Each runner executes one line. Both calls must overlap on this route.
+    sqlx::query("INSERT INTO deployment_batch_scheduling(deployment_id,max_concurrency,updated_by) VALUES($1,2,$2)")
+        .bind(w.f.deployment).bind(w.f.owner).execute(&w.f.store.pool).await.unwrap();
+    let (held_a, held_b) = (w.openai.gate("hold-a"), w.openai.gate("hold-b"));
+    let old = start(w);
+    tokio::time::timeout(Duration::from_secs(10), held_a.entered.notified())
+        .await
+        .expect("old runner reached the provider");
+    lapse(w, job).await;
+    let owner = start(w);
+    tokio::time::timeout(Duration::from_secs(10), held_b.entered.notified())
+        .await
+        .expect("replacement runner used the second route slot");
+    (old, owner, held_a, held_b)
+}
+
 /// The old runner returns while the new owner still runs: it must not finish
 /// or settle the batch, and the owner's own results must all be recorded.
 #[dbtest::test]
@@ -160,12 +185,7 @@ async fn a_runner_that_lost_the_batch_neither_finalizes_it_nor_costs_the_owner_a
     pool: PgPool,
 ) {
     let (w, job) = batch(pool, &[("a", "hold-a"), ("b", "hold-b")]).await;
-    let (held_a, held_b) = (w.openai.gate("hold-a"), w.openai.gate("hold-b"));
-    let old = start(&w);
-    held_a.entered.notified().await;
-    lapse(&w, &job).await;
-    let owner = start(&w);
-    held_b.entered.notified().await;
+    let (old, owner, held_a, held_b) = overlapping_runners(&w, &job).await;
     assert_eq!(w.reload(&job).await.request_failed, Some(1));
 
     held_a.release.notify_one();
@@ -214,12 +234,7 @@ async fn a_runner_that_lost_the_batch_neither_finalizes_it_nor_costs_the_owner_a
 #[dbtest::test]
 async fn a_runner_that_lost_the_batch_claims_and_runs_no_further_line(pool: PgPool) {
     let (w, job) = batch(pool, &[("a", "hold-a"), ("b", "hold-b"), ("c", "plain-c")]).await;
-    let (held_a, held_b) = (w.openai.gate("hold-a"), w.openai.gate("hold-b"));
-    let old = start(&w);
-    held_a.entered.notified().await;
-    lapse(&w, &job).await;
-    let owner = start(&w);
-    held_b.entered.notified().await;
+    let (old, owner, held_a, held_b) = overlapping_runners(&w, &job).await;
 
     held_a.release.notify_one();
     let old = old.await.unwrap();

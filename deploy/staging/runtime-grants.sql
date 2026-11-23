@@ -395,6 +395,8 @@ GRANT UPDATE(upstream_id,output_file_id,error_file_id,runner_id,runner_epoch,run
 -- A segment commit registers the stored file, matches the running execution,
 -- and updates the line and existing job progress columns under the claim fence.
 GRANT SELECT,INSERT ON public.batch_lines,public.batch_segments TO gateway_runtime;
+-- Route admission reads line claims and pending batch execution reservations
+-- under the route advisory lock using the existing SELECT grants on all three tables.
 -- A cancelled, undispatched retry restores the prior failed execution and its status under the runner fence.
 GRANT UPDATE(state,attempts,execution_id,status_code,error_code,segment,finished_at,awaiting_segment)
  ON public.batch_lines TO gateway_runtime;

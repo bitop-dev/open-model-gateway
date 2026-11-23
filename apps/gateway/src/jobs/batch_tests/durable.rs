@@ -33,6 +33,7 @@ enum Case {
     CancelUnavailable,
     Group,
     NestedTakeover,
+    CapacityTakeover(Loss),
     Quota,
     FailedCommit { retryable: bool },
     Retry(RetryCase),
@@ -206,7 +207,10 @@ async fn run_case(pool: PgPool, case: Case) {
     let size = match case {
         Case::Fault(..) | Case::FailedCommit { .. } => 3,
         Case::Group => 32,
-        Case::NestedTakeover | Case::FinalizeCancel { .. } | Case::CancelUnavailable => 2,
+        Case::CapacityTakeover(_)
+        | Case::NestedTakeover
+        | Case::FinalizeCancel { .. }
+        | Case::CancelUnavailable => 2,
         Case::Pressure => 24,
         Case::Quota | Case::Retry(_) => 1,
         Case::Measure(size) => size,
@@ -269,7 +273,7 @@ async fn run_case(pool: PgPool, case: Case) {
         let call = seen.fetch_add(1, Ordering::SeqCst);
         let release = release.clone();
         async move {
-            if pressure && call > 0 {
+            if (pressure && call > 0) || (matches!(case, Case::CapacityTakeover(_)) && call == 0) {
                 release.acquire().await.unwrap().forget();
             }
             if matches!(case, Case::Retry(_)) && call == 0 {
@@ -301,6 +305,11 @@ async fn run_case(pool: PgPool, case: Case) {
     .await
     .unwrap();
     w.jobs = loopback_jobs(store, engine, files, concurrency);
+    if let Case::CapacityTakeover(loss) = case {
+        let process = matches!(loss, Loss::Crash).then(|| start_process(&w, dir.path(), &upstream));
+        check_takeover_capacity(&w, &job, &calls, &release_provider, process).await;
+        return;
+    }
     if matches!(case, Case::CancelUnavailable) {
         check_cancel_unavailable(&w, &job, &client, &gateway.base, &auth, &calls).await;
         return;
@@ -1273,4 +1282,96 @@ async fn check_backoff_retry(
             "answer"
         );
     }
+}
+
+#[dbtest::test]
+async fn a_takeover_keeps_the_pending_provider_call_in_route_capacity(pool: PgPool) {
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        run_case(pool, Case::CapacityTakeover(Loss::Takeover)),
+    )
+    .await
+    .expect("both runners must finish");
+}
+
+#[dbtest::test]
+async fn lease_recovery_releases_a_crashed_runners_route_slot(pool: PgPool) {
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        run_case(pool, Case::CapacityTakeover(Loss::Crash)),
+    )
+    .await
+    .expect("the replacement runner must finish after lease recovery");
+}
+
+async fn check_takeover_capacity(
+    w: &World,
+    job: &JobRow,
+    calls: &AtomicUsize,
+    release: &tokio::sync::Semaphore,
+    mut process: Option<tokio::process::Child>,
+) {
+    let old = process.is_none().then(|| start(w));
+    while calls.load(Ordering::SeqCst) == 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    lapse(w, job).await;
+    let owner = start(w);
+    loop {
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "takeover exceeded route capacity"
+        );
+        // Only a demand heartbeat after interruption shows that the new
+        // owner has tried to dispatch the remaining line.
+        let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT FROM batch_lines l JOIN batch_route_waits w USING(job_id,deployment_id) WHERE l.job_id=$1 AND l.state='interrupted' AND w.reason='concurrency' AND w.updated_at>l.finished_at)")
+            .bind(job.id).fetch_one(&w.f.store.pool).await.unwrap();
+        if waiting {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let scheduler = crate::jobs::schedule::Scheduler::new(w.jobs.store.clone(), None);
+    assert_eq!(
+        scheduler.running_lines(w.claude_deployment).await.unwrap(),
+        0
+    );
+    assert_eq!(scheduler.running_lines(w.f.deployment).await.unwrap(), 1);
+    if let Some(child) = process.as_mut() {
+        child.kill().await.unwrap();
+        assert_eq!(sqlx::query("UPDATE governance_reservations SET lease_expires_at=clock_timestamp() WHERE state='pending' AND execution_id=(SELECT execution_id FROM batch_lines WHERE job_id=$1 AND line_no=0)")
+            .bind(job.id).execute(&w.f.store.pool).await.unwrap().rows_affected(), 1);
+        assert_eq!(
+            crate::governance::reconcile_expired(&w.jobs.store, 1)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+    release.add_permits(1);
+    if let Some(old) = old {
+        assert!(old.await.unwrap().unwrap());
+    }
+    assert!(owner.await.unwrap().unwrap());
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let done = w.reload(job).await;
+    assert_eq!(
+        (
+            done.state.as_str(),
+            done.request_completed,
+            done.request_failed
+        ),
+        ("completed", Some(1), Some(1))
+    );
+    let cost = crate::governance::batch::batch_cost(&w.f.store, job.id)
+        .await
+        .unwrap();
+    if process.is_some() {
+        assert_eq!((cost.0, cost.2), (15, true));
+        assert!(cost.1 > 0, "lease recovery retains the unknown cost hold");
+    } else {
+        assert_eq!(cost, (30, 0, false));
+    }
+    consistent(&w.f).await;
 }

@@ -188,7 +188,7 @@ With `--scheduling-policy priority`, vLLM handles requests with a lower `priorit
 
 When several batches wait for one route, the next slot goes to the workspace with the fewest batch lines running on it, then the least recently served workspace, then (within a workspace) the batch with the fewest lines running, least recently served. One huge batch therefore cannot starve the others. A batch whose lines target several routes progresses on each independently.
 
-Claims are durable and safe across processes: a line is claimed by inserting its row under a per-route transaction lock that checks the route's capacity and the fair-share order. A line still runs at most once. A runner that stops leaves its running lines `interrupted` (never re-run), and they count toward the route's capacity until the batch resumes elsewhere.
+Claims are durable and safe across processes: a line is claimed by inserting its row under a per-route transaction lock that checks the route's capacity and the fair-share order. A line still runs at most once. When another runner takes over, it marks the previous runner’s unfinished lines `interrupted`. Each admitted attempt with a pending reservation continues to occupy its route slot until settlement or expired-lease reconciliation. Reconciliation retains the hold for unknown cost.
 
 ### Example: Gemma on vLLM
 

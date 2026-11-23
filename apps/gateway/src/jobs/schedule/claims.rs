@@ -253,6 +253,20 @@ impl Scheduler {
     }
 }
 
+// A claim holds a slot before provider admission. Once admitted, its pending
+// reservation keeps the slot across a takeover until settlement or lease
+// recovery. Count the overlap once, in the same database snapshot.
+pub(super) const ROUTE_OCCUPANCY: &str = "
+    WITH running AS (
+        SELECT execution_id FROM batch_lines
+        WHERE deployment_id=$1 AND state='running' AND NOT awaiting_segment
+    )
+    SELECT (SELECT count(*) FROM running) + count(*)
+    FROM governance_reservations r
+    JOIN inference_executions e ON e.id=r.execution_id AND e.started_at=r.admitted_at
+    WHERE r.deployment_id=$1 AND r.state='pending' AND e.batch_job_id IS NOT NULL
+      AND NOT EXISTS (SELECT FROM running WHERE execution_id=r.execution_id)";
+
 async fn route_full(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     deployment: Uuid,
@@ -263,12 +277,10 @@ async fn route_full(
         .execute(&mut **tx)
         .await
         .map_err(job_storage)?;
-    let running: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM batch_lines WHERE deployment_id=$1 AND state='running' AND NOT awaiting_segment",
-    )
-    .bind(deployment)
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(job_storage)?;
+    let running: i64 = sqlx::query_scalar(ROUTE_OCCUPANCY)
+        .bind(deployment)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(job_storage)?;
     Ok(running >= i64::from(max_concurrency))
 }
