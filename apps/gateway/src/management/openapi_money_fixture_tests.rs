@@ -397,6 +397,16 @@ async fn generate_run(
             .unwrap()
             .is_none()
     );
+    if delivery_minute == 3 {
+        let earlier_delivery = monday + SignedDuration::seconds(121);
+        assert!(
+            crate::scheduled_reports::claim_at(&f.s, &fence, schedule, earlier_delivery)
+                .await
+                .unwrap()
+                .is_none(),
+            "the 00:03 schedule must still defer at 00:02:01"
+        );
+    }
     let after = monday + SignedDuration::minutes(delivery_minute) + SignedDuration::seconds(1);
     let claim = crate::scheduled_reports::claim_at(&f.s, &fence, schedule, after)
         .await
