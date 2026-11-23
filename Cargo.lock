@@ -2574,6 +2574,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-bedrockruntime",
  "aws-sdk-s3",
+ "aws-sdk-sts",
  "aws-smithy-async",
  "aws-smithy-eventstream",
  "aws-smithy-runtime-api",

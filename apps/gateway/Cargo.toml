@@ -88,6 +88,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 
 [dev-dependencies]
+# Inspect the raw HTTP response retained in AssumeRole credential errors.
+aws-sdk-sts = { version = "1", default-features = false }
 # Tokenize literal SQL for the UUID binding policy.
 regex = "1"
 regex-syntax = "0.8"
