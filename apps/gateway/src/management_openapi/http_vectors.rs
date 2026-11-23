@@ -1883,12 +1883,14 @@ pub(super) fn query_plan(
                 });
             }
         }
-        // Only cases admitted by the encoded request-size check can prove an edge.
+        // A schema boundary needs sendable cases where the HTTP runner expects
+        // the handler to agree with the schema.
         let verdicts: Vec<_> = out[first_case..]
             .iter()
             .filter_map(|case| {
                 if let Edit::Set(raw) = &case.edit
                     && supplied_values.contains(raw.as_str())
+                    && !pins_integer_refusal(document, case.kind)
                 {
                     Some((raw.clone(), case.accept))
                 } else {
@@ -1997,6 +1999,11 @@ fn mismatch(
     )
 }
 
+fn pins_integer_refusal(document: &Value, kind: &str) -> bool {
+    document["x-omg-integer-encoding"] == "json-integer-literal"
+        && kind.starts_with("integer encoding ")
+}
+
 // JSON Schema cannot express this lexical constraint. A declared document
 // pins the divergence rather than pretending these values are schema-invalid.
 fn integer_refusal(
@@ -2005,9 +2012,7 @@ fn integer_refusal(
     schema_accepts: bool,
     probe: &Probe,
 ) -> Result<bool> {
-    if document["x-omg-integer-encoding"] != "json-integer-literal"
-        || !kind.starts_with("integer encoding ")
-    {
+    if !pins_integer_refusal(document, kind) {
         return Ok(false);
     }
     ensure!(
