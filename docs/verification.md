@@ -72,7 +72,13 @@ still happen at the usual entry points. Database and SDK prerequisites for
 the tests you run are listed above.
 
 Preparation moves compilation ahead of assignment and costs one build per
-new empty target. For consecutive issues on a single worker, the same path
+new empty target. On a four-core Celeron N5105 with a warm registry, one
+empty-target preparation took 8m56s and used 3.5 GiB of disk. With the same
+main commit, fetching, branching and checking the build took 1.58s at issue
+entry. A one-line edit to gateway timeout parsing then rebuilt in 44s.
+Larger edits and toolchain or dependency changes can cost more.
+
+For consecutive issues on a single worker, the same path
 and target can serve again after the previous branch has landed and the
 worktree is clean. Switch to the freshly fetched main commit in detached
 mode and repeat preparation. Keep each active worker's checkout private.
