@@ -1,5 +1,4 @@
-//! Admin API tokens (#37 PR1: storage and lifecycle only). Request
-//! authentication, management routes and the UI are PR2 and PR3.
+//! Admin API token storage, credential lookup and lifecycle.
 //!
 //! Format `omg_admin_<32-hex uuid>.<64-hex secret>`, 256 secret bits from
 //! the same fallible OS CSPRNG inference keys use (`entropy.rs`); strictly
@@ -24,7 +23,7 @@ use uuid::Uuid;
 
 use crate::store::Store;
 
-/// Every admin-token scope (route assignments are PR2's `route_policy.rs`).
+/// Every admin-token scope. Route assignments are in `route_policy.rs`.
 /// Write scopes do not imply read scope; there is no wildcard.
 pub const SCOPES: [&str; 5] = [
     "platform:read",
@@ -39,8 +38,7 @@ pub const SCOPES: [&str; 5] = [
 pub const MIN_EXPIRES_IN_DAYS: i32 = 1;
 pub const MAX_EXPIRES_IN_DAYS: i32 = 90;
 
-/// Admin tokens never cache a positive authorization; successful use is
-/// recorded at most this often (migration 0051: `last_used_at`/`last_used_address`).
+/// The interval between recorded authorized admin-token attempts (migration 0051: `last_used_at`/`last_used_address`).
 const LAST_USE_EVERY_SECONDS: i64 = 5 * 60;
 
 const PREFIX: &str = "omg_admin_";
@@ -264,15 +262,12 @@ fn canonical_allowlist(list: &[String]) -> Option<Vec<String>> {
     Some(canonical)
 }
 
-/// A lookup-for-authorization hit: live, unrevoked, unexpired, owner active
-/// and currently effective role exactly `admin` (checked by the query
-/// itself, not cached). Route-scope enforcement is PR2's job.
+/// A live token lookup checks expiry, revocation and the active owner's
+/// effective Platform Admin role in the primary database.
 ///
-/// `ip_allowlist` is the token's canonical `addr/len` allowlist entries
-/// (empty/`None` means unrestricted), exactly as stored: **PR2 must check
-/// the request's resolved client address against it before dispatching any
-/// request authenticated by this principal.** This PR only stores and
-/// returns it; nothing here enforces it yet.
+/// Management authorization checks the route scope and the resolved client
+/// IP before dispatch. The canonical CIDR allowlist comes from storage as-is.
+/// An absent or empty list is unrestricted.
 pub struct AdminTokenPrincipal {
     pub token_id: Uuid,
     pub owner_user_id: Uuid,
@@ -289,30 +284,15 @@ struct TokenRecord {
     ip_allowlist: Option<Vec<String>>,
 }
 
-/// Create a token owned by `owner_user_id` (the caller, a currently
-/// effective Platform Admin; enforcing that this is the *creating* user is
-/// PR2's handler-level job — this is the storage primitive). Returns the
-/// plaintext once.
+/// Stores a token and returns its plaintext once. The management handler
+/// supplies the creating Platform Admin's own user id.
 ///
-/// Runs on the caller's own `tx`, never a separate pool connection.
-/// Migration 0051's `BEFORE INSERT` trigger takes the
-/// owner's `governance::locks` user-scope authority lock
-/// (`Scope::User(owner_user_id)`) before checking that the owner is
-/// currently an effective Admin; that lock is transaction-scoped
-/// (`pg_advisory_xact_lock`), so a caller that already holds it in its own
-/// transaction — as PR2's handler is documented to, before calling this —
-/// and then ran this `INSERT` on a *different* connection would hang: the
-/// `INSERT`'s own re-entrant acquisition attempt blocks until the caller's
-/// transaction ends, which it cannot do until this call returns. **The
-/// caller must still take that same lock exclusive up front in `tx`**,
-/// like every other management change of that scope (AGENTS.md's
-/// canonical lock order), before calling this: the trigger's own
-/// re-entrant acquisition inside the single `INSERT` statement is a
-/// correctness backstop (and, now that both run on the same connection,
-/// free to ask for again), not a substitute for the caller holding the
-/// lock across its own multi-statement transaction (e.g. an earlier read
-/// of the caller's own role, or audit insertion, that must not race a
-/// concurrent demotion either).
+/// The caller must acquire the owner's exclusive user-scope authority lock
+/// up front in the same transaction. It protects live role validation,
+/// insertion and audit from concurrent demotion. Migration 0051's insert
+/// trigger re-acquires the lock in that transaction and verifies that the
+/// owner is still an effective Admin. A separate connection would wait for
+/// the caller's lock while the caller waits for the insert.
 pub async fn create_admin_token(
     tx: &mut Transaction<'_, Postgres>,
     owner_user_id: Uuid,
@@ -385,14 +365,8 @@ pub async fn create_admin_token(
 /// already). Revocation is final (migration 0051's trigger): nothing
 /// ever un-revokes a token, including regaining the Admin role.
 ///
-/// Runs on the caller's own `tx`, like [`create_admin_token`]: revocation
-/// must be atomic with whatever else that transaction does (PR2's audit
-/// insertion, in particular), and roll back with it rather than
-/// committing early on a separate connection the instant this is called.
-/// Revoking a token does not itself need the owner's scope lock (no
-/// trigger on `admin_api_tokens` takes one), but running on the caller's
-/// transaction keeps this symmetric with `create_admin_token` and correct
-/// for PR2's atomicity requirement regardless.
+/// Revocation and its audit event commit or roll back in the caller's
+/// transaction. Revocation itself requires no owner-scope lock.
 pub async fn revoke_admin_token(
     tx: &mut Transaction<'_, Postgres>,
     id: Uuid,
@@ -508,18 +482,10 @@ impl Store {
         }))
     }
 
-    /// Record successful use, throttled to once per 5 minutes across
-    /// replicas via one conditional `UPDATE` (no read-then-write race): a
-    /// second call inside the window changes nothing. `address` is the
-    /// resolved client address (PR2's job to resolve it); absent here, it
-    /// is stored as `NULL`.
-    ///
-    /// Takes a parsed [`std::net::IpAddr`], not a string: the caller has
-    /// necessarily already resolved and validated an address object (the
-    /// job of identity/session.rs and identity/throttle.rs, per this
-    /// module's own doc comment) by the time it gets here, so this
-    /// signature cannot accept an arbitrary unparsed string and defer
-    /// that validation to PostgreSQL's `inet` cast.
+    /// Records an authorized attempt before dispatch, at most once per five minutes across replicas.
+    /// A single conditional update enforces the interval atomically.
+    /// Identity middleware supplies the parsed client address. An absent
+    /// address is stored as NULL.
     pub async fn touch_admin_token_use(
         &self,
         id: Uuid,

@@ -1,11 +1,10 @@
 //! Preflight for the declared access level, before extraction. Handlers retain
 //! object checks and live authority rechecks under their own transaction locks.
 //!
-//! #37 PR2 adds the admin-token half: scope and IP-allowlist enforcement, and
-//! a per-attempt audit record (start before dispatch, completion before
-//! returning) for every admitted token attempt -- including a denial, which
-//! is still an admitted *attempt* by an authenticated token, just not one
-//! the route let through.
+//! Admin-token preflight enforces the route scope and IP allowlist.
+//! Admitted attempts get audit start and completion records, including
+//! authorization denials. Start is recorded before dispatch and completion
+//! before returning.
 use super::*;
 use crate::{
     http::RequestId,
@@ -103,14 +102,9 @@ async fn database_access(
     result
 }
 
-/// Admin tokens never reach this far for a workspace-member/key/admin/
-/// inference/SCIM route (`TokenPolicy::Denied`), so only the Scope-bearing
-/// `Access` variants above are ever evaluated for one; this set is just the
-/// routes among those whose *handler* has actually been converted to accept
-/// either principal (#37 PR2). A Scope-declared route not yet listed here
-/// answers 501 for a token instead of reaching a handler that still expects
-/// only a browser session -- an explicit, audited "not implemented yet",
-/// never a crash and never a silent bypass. Exact method + router template.
+/// Exact methods and route templates whose handlers accept admin tokens.
+/// An authorized admin-token request to an unlisted route returns an
+/// audited 501 before handler dispatch.
 pub(super) const TOKEN_READY_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/v1/platform/providers"),
     ("POST", "/api/v1/platform/providers"),

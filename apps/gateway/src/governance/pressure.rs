@@ -1,4 +1,4 @@
-//! Scope-lock ceiling visibility (migration 0036; scale follow-up to P3).
+//! Scope-lock ceiling visibility (migration 0036).
 //!
 //! Scoped admission serializes one workspace's (and one key lineage's)
 //! admissions and settlements on that scope's totals and counter rows, so a

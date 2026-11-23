@@ -54,16 +54,10 @@ use crate::{
     store::Store,
 };
 
-/// The acting identity of a management request: whose authority governs it
-/// (`user_id`), and which admin token, if any, made the call (`token_id`,
-/// for audit attribution). Implemented by both principal types so every
-/// shared preflight/transaction helper below (`resources::audit`,
-/// `catalog_tx`, `workspace_access` and friends) accepts either without the
-/// ~180 existing `Extension<BrowserPrincipal>` handlers needing to change at
-/// all (#37 PR2): `BrowserPrincipal` already implements this trait, so every
-/// call site that still passes one keeps compiling unchanged, and
-/// `route_policy::TokenPolicy::Denied`/`BrowserAdminOnly` refuse an admin
-/// token before any handler using a generic helper is ever reached by one.
+/// The acting identity of a management request. Shared preflight and
+/// transaction helpers use the user id for authority checks and the
+/// optional admin-token id for audit attribution. Route policy excludes
+/// admin tokens from browser-only handlers before extraction.
 pub(crate) trait Actor {
     fn user_id(&self) -> Uuid;
     fn token_id(&self) -> Option<Uuid> {

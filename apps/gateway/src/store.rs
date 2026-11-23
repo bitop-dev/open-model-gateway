@@ -193,9 +193,9 @@ const ENTERPRISE_RELATIONS: &[&str] = &[
     "audit_export_queue",
     // 0045 legal holds (#75)
     "legal_holds",
-    // 0051 admin API tokens, storage and lifecycle (#37 PR1)
+    // 0051 admin API tokens, storage and lifecycle
     "admin_api_tokens",
-    // 0052 admin API token authentication and audit (#37 PR2)
+    // 0052 admin API token authentication and audit
     "admin_token_attempts",
     // 0064 provider-reported cost reconciliation (#48)
     "provider_cost_imports",

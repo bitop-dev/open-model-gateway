@@ -2,8 +2,7 @@
  * Usage & costs › Explore: metric × group by × then by × top N (URL-backed) →
  * a daily chart of the top groups and a table with %-of-total bars. The CSV is
  * the current table only, behind an explicit button that states its scope.
- * The period rates (cache hit rate, cost per 1M tokens; no longer overview
- * tiles) sit above the breakdown, and a model breakdown adds each top model's
+ * The period rates (cache hit rate and cost per 1M tokens) sit above the breakdown, and a model breakdown adds each top model's
  * cost per 1M tokens.
  */
 import { wsPath, platformPath, type Workspace } from "../../lib/api";

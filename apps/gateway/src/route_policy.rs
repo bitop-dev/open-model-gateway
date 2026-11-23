@@ -21,7 +21,7 @@ pub(crate) enum Access {
     WorkspaceAdminOrReader,
     WorkspacePlatformWrite,
 }
-/// The five admin-token scopes (#37 PR2), one per [`crate::admin_tokens::SCOPES`]
+/// The five admin-token scopes, one per [`crate::admin_tokens::SCOPES`]
 /// entry. A dedicated enum (rather than reusing the scope strings directly in
 /// every route declaration) makes a typo a compile error instead of a silent
 /// mismatch, and keeps this module the single source of truth for the
@@ -203,7 +203,7 @@ pub(crate) const ROUTES: &[Route] = routes! {
     "POST"                 "/api/v1/platform/access-reviews/{id}/close" => PlatformWrite, DENIED;
     "GET"                  "/api/v1/platform/access-reviews/{id}/export" => PlatformRead, DENIED;
     "POST"                 "/api/v1/platform/access-reviews/{id}/items/{item}/reviewer" => PlatformWrite, DENIED;
-    // #90 slice 2: each reviewer's inbox and decisions (who may decide is
+    // Access reviews: each reviewer's inbox and decisions (who may decide is
     // derived live per item; anything else is 404).
     "GET"                  "/api/v1/me/access-reviews" => Browser, DENIED;
     "POST"                 "/api/v1/me/access-reviews/{item}/decision" => Browser, DENIED;
@@ -410,7 +410,7 @@ pub(crate) const ROUTES: &[Route] = routes! {
     "GET"                  "/api/v1/platform/deployments/{deployment}/routing" => PlatformRead, PLATFORM_READ;
     "PUT"                  "/api/v1/platform/deployments/{deployment}/routing" => PlatformWrite, CATALOG_WRITE;
     "GET"                  "/api/v1/platform/cost-report" => PlatformRead, PLATFORM_READ;
-    // #37 PR2: admin API token CRUD. Browser session (Platform Admin) only,
+    // Admin API token management. Browser session (Platform Admin) only,
     // never delegable to a token, regardless of any scope it holds.
     "GET POST"             "/api/v1/platform/admin-tokens" => PlatformWrite, BROWSER_ADMIN_ONLY;
     "DELETE"               "/api/v1/platform/admin-tokens/{token}" => PlatformWrite, BROWSER_ADMIN_ONLY;

@@ -3,9 +3,8 @@
  * stacked budgets (each with its reset rule) and budget meters where the
  * caller may see usage. Effective access (layers and per-model reasons) is
  * its own Settings tab, "Access" (WorkspaceAccess), not stacked under this.
- * Personal workspaces show this (their limits are set by the platform;
- * ux-api-contract §1), and so do shared-workspace members (no edit
- * affordances, P2-13). Team/Project admins get the editable tighten-only view
+ * Personal workspace owners and shared-workspace members see read-only
+ * limits. Team/Project admins get the editable tighten-only view
  * (pages/governance.tsx `Governance`).
  *
  * Per-key caps live on each key's page. Grounded reference:

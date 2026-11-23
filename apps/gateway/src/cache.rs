@@ -1,4 +1,4 @@
-//! Per-replica caches of pre-admission reads (scale plan P4, migration 0028).
+//! Per-replica caches of pre-admission reads (migration 0028).
 //!
 //! What is cached, and why it is safe:
 //!

@@ -567,7 +567,7 @@ fn parse_syslog_url(url: &str) -> anyhow::Result<(String, u16)> {
 }
 
 impl Webhook {
-    /// The same signed JSON bodies as before #107.
+    /// Sends a signed JSON body for an event batch, heartbeat or test.
     async fn send(&self, payload: &Payload) -> Result<(), &'static str> {
         let sent_at = gateway_datetime_compat::UtcInstant::now();
         let body = match payload {
@@ -931,10 +931,9 @@ async fn number_queue(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<
     Ok(())
 }
 
-// #37 PR2: additive `admin_token_id` (nullable; NULL for every browser-
-// session event, exactly as before). Only the token's own id -- never a
-// digest, plaintext or anything else from `admin_api_tokens` -- so this
-// stays schema `omg.audit.v1`, additive (docs/operations.md).
+// The additive `omg.audit.v1` field `admin_token_id` contains the token's
+// UUID for an admin-token event and null for a browser-session event.
+// Token digests and plaintext stay out of the export (docs/operations.md).
 const EVENT: &str = "jsonb_build_object('id',a.id,'occurred_at',a.created_at,'action',a.action,'resource',jsonb_build_object('type',a.resource_type,'id',a.resource_id),'actor',CASE WHEN a.actor_user_id IS NULL THEN NULL ELSE jsonb_build_object('id',a.actor_user_id,'label',(SELECT coalesce(nullif(btrim(u.display_name),''),u.email,'Retained identity') FROM users u WHERE u.id=a.actor_user_id)) END,'workspace',CASE WHEN w.id IS NULL THEN NULL ELSE jsonb_build_object('id',w.id,'name',w.name,'kind',w.kind) END,'admin_token_id',a.admin_token_id,'metadata',a.metadata)";
 
 fn backoff(attempts: i32) -> f64 {

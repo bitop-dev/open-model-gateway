@@ -9,9 +9,8 @@ pub(super) enum Stop {
     Cancelled,
     Expired,
     Budget,
-    /// The batch's envelope reservation is no longer pending (its lease ran
-    /// out before this release kept it for the life of the job): no line can
-    /// be admitted, so none is attempted.
+    /// The batch's envelope reservation is no longer pending. No line
+    /// can be admitted without a pending envelope.
     HoldUnavailable,
     /// The run lost its claim or doubts its lease. Never a reason to end the
     /// batch: the run leaves it for the claim that holds it next.

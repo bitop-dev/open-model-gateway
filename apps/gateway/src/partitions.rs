@@ -1,4 +1,4 @@
-//! Monthly history partitions (migrations 0030/0031, scale plan P6).
+//! Monthly history partitions (migrations 0030/0031).
 //!
 //! `inference_executions`, `governance_reservations`, `monetary_ledger`,
 //! `audit_events` and `storage_usage_hours` are range partitioned by UTC

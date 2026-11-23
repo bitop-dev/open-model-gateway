@@ -546,7 +546,7 @@ pub(super) async fn usage_export(
             "cost_center_id",
             "cost_center_name",
             "cost_center_code",
-            // Appended in Phase 1; earlier columns keep their positions.
+            // Append these fields to preserve the positions of existing CSV columns.
             "meter_usage",
             "output_image_variant",
             "provider_cost_microusd",

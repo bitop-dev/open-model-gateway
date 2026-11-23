@@ -136,8 +136,7 @@ impl BedrockAdapter {
             // not move the signing time (the SDK's skew correction is on by
             // default since the 1.15x generation, #456).
             .disable_clock_skew_correction(true)
-            // A stuck credential source fails the request after 5 s, as before
-            // that generation; the SDK now derives a longer wait from the
+            // Cap credential loading at 5 s independently of the SDK's
             // operation timeouts.
             .identity_cache(
                 aws_sdk_bedrockruntime::config::IdentityCache::lazy()

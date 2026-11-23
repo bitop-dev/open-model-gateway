@@ -1,4 +1,4 @@
-//! The steps of applying a published template version (#84 slice B): the
+//! The steps of applying a published template version: the
 //! body and idempotency checks, the reviewed version, and the writes that
 //! create the workspace, in the order `apply` runs them.
 use super::*;

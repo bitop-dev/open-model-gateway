@@ -721,7 +721,7 @@ impl Runner {
         // that pass. A pinned (omitted-maximum) line's candidate list is
         // already narrowed to its one route above and is left unfiltered
         // here: it stays judged on that pinned route alone, inside the
-        // engine at dispatch, exactly as before (#238).
+        // engine at dispatch.
         let candidates: Vec<Deployment> = if planned_deployment.is_none() {
             if let BatchRequest::Chat(r) = request {
                 let mut verdicts: HashMap<String, bool> = HashMap::new();

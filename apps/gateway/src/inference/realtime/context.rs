@@ -21,7 +21,7 @@
 //! when the hold is valued. Output is bounded by the response's own
 //! `max_output_tokens`, which the frontend always sets within the configured
 //! window. A response whose usage exceeds its bound is recorded as unbounded,
-//! exactly as before, so a wrong assumption is visible, not hidden.
+//! making any exceeded estimate visible to settlement.
 use serde_json::Value;
 
 use super::RealtimeUsage;

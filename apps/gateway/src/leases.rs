@@ -1,4 +1,4 @@
-//! Work leases for singleton background jobs (migration 0029, scale plan P5).
+//! Work leases for singleton background jobs (migration 0029).
 //!
 //! Every replica runs one [`Leases`] task that takes or renews each lease row
 //! every [`RENEW`] (term [`TTL`]). A job runs only on the replica whose term

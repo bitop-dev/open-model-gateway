@@ -439,11 +439,8 @@ pub(crate) fn filter(
     host: &str,
     found: Vec<SocketAddr>,
 ) -> anyhow::Result<Vec<SocketAddr>> {
-    // A fresh flag every call: `resolve`'s and `resolve_classified`'s own
-    // (non-`Resolver`) callers resolve once per connection, so they keep
-    // naming the host and address on every refusal exactly as before #321.
-    // Only `Resolver::resolve`'s persistent, per-client flag below can ever
-    // observe a transition.
+    // One-shot resolutions start with a fresh transition flag. The purpose’s
+    // logging policy determines whether a refusal includes the destination.
     filter_tracked(policy, purpose, host, found, &AtomicBool::new(false))
 }
 
@@ -542,8 +539,6 @@ pub(crate) async fn resolve_classified(
     host: &str,
     port: u16,
 ) -> Result<Vec<SocketAddr>, ResolveError> {
-    // A fresh flag every call: SMTP (this function's other caller) keeps
-    // naming the host and address on every refusal exactly as before #321.
     resolve_classified_tracked(policy, purpose, host, port, &AtomicBool::new(false)).await
 }
 

@@ -124,7 +124,7 @@ const jumpTo = (id: string) => { const el = document.getElementById(id); el?.scr
 export function ModelPage({ session, model, path, tab }: ModelPageProps) {
   const writable = session.capabilities.platform_write, ask = useAction(), policy = useServerPolicy(session);
   const set = useModelRoutes(model.id), connections = useChoices<Provider>(`${platformPath}/providers`);
-  // GET /platform/models/{id} carries created_at (wave 2); older gateways leave it unknown.
+  // GET /platform/models/{id} carries created_at when known. Older gateways omit it.
   const workload = workloadOf(model.supported_protocols);
   useResourceName(model.display_name);
   useSectionFromTab(modelSectionFor(tab));

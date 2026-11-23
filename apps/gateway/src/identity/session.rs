@@ -106,8 +106,8 @@ fn looks_like_inference_key(token: &str) -> bool {
 
 /// Whether a (possibly malformed) `omg_session` cookie is present at all,
 /// regardless of its value's validity: used only to refuse a request that
-/// also carries an `Authorization` header (#37 PR2) -- "even an invalid
-/// cookie" means this check must not itself validate the cookie's shape.
+/// also carries an `Authorization` header. Check cookie presence without
+/// validating its shape.
 /// An undecodable `Cookie` header line is treated as present (fails closed):
 /// this function only ever makes credential selection *stricter*.
 fn raw_cookie_present(headers: &HeaderMap, name: &str) -> bool {
@@ -128,7 +128,7 @@ fn raw_cookie_present(headers: &HeaderMap, name: &str) -> bool {
 /// Apply to every management route (not inference). Selects exactly one
 /// credential family -- an admin API token (`Authorization: Bearer`) or a
 /// browser session (`omg_session` cookie) -- never both, with no fallback
-/// in either direction (#37 PR2): a duplicate `Authorization` header, or any
+/// in either direction. A duplicate `Authorization` header, or any
 /// request carrying both an `Authorization` header and an `omg_session`
 /// cookie (even an invalid one), is refused before either credential is
 /// examined.
@@ -226,9 +226,8 @@ async fn authenticate_admin_token_request(
     }
     match state.store.authenticate_admin_token(token).await {
         Ok(Some(principal)) => {
-            // Per-token gate, only now that the token has successfully
-            // authenticated, and before this attempt is started (audited)
-            // or dispatched: the key here is the
+            // Apply the per-token gate after authentication, before audit
+            // or dispatch. The key is the
             // token's own id, never allocated for an arbitrary
             // unauthenticated credential pre-authentication. A rejection
             // here is counted only in the fixed, low-cardinality

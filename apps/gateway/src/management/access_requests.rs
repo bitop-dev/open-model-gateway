@@ -1,12 +1,12 @@
-//! #83: browser-only, independent approval of manual member grants (slice
-//! A) and of catalog model selections for a shared workspace (slice B).
-//! All writes use the existing management transaction and canonical locks.
+//! Browser-only requests for manual membership grants and shared-workspace
+//! catalog model selections. Each request is approved independently. Writes
+//! use the management transaction and canonical locks.
 use super::*;
 use sha2::{Digest, Sha256};
 
 type RequestResult = Result<Json<Value>, ManagementError>;
 /// Common fields for every viewer: the requester's own `member`/`admin` and the two approver
-/// queues. `workspace_name_at_request` is a frozen submitted reference (UX fix, #83): it is
+/// queues. `workspace_name_at_request` is a frozen submitted reference: it is
 /// captured once at INSERT and never updated, so it never discloses a later rename or a
 /// workspace becoming non-discoverable. It is not the live workspace name.
 const PROJECTION: &str = "jsonb_build_object('id',r.id,'requester',r.requester,'target_kind',r.target_kind,'workspace_id',r.workspace_id,'workspace_name_at_request',r.workspace_name_at_request,'model_id',r.model_id,'model_name_at_request',r.model_name_at_request,'requested_role',r.requested_role,'status',r.status,'reason',r.reason,'created_at',r.created_at,'expires_at',r.expires_at,'decided_by',r.decided_by,'decided_at',r.decided_at,'membership_grant_id',(SELECT membership_grant_id FROM access_request_applications a WHERE a.request_id=r.id))";
@@ -66,7 +66,7 @@ struct Submission {
     workspace_id: Uuid,
     reason: Option<String>,
     idempotency_key: String,
-    /// #83 slice B: request selection of this model for the workspace. Last
+    /// Request selection of this model for the workspace. Last
     /// and defaulted, so the three-element positional form still parses.
     #[serde(default)]
     model_id: Option<Uuid>,
@@ -380,7 +380,7 @@ async fn create(
 struct MineQuery {
     limit: Option<i64>,
     offset: Option<i64>,
-    /// #83 slice B: only this workspace's requests.
+    /// Lists only this workspace's requests.
     workspace_id: Option<Uuid>,
     /// Only `pending` (unexpired): a read-only snapshot that expires nothing,
     /// for the Models page's Requested state.

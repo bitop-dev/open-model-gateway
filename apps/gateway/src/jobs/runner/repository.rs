@@ -9,9 +9,8 @@ use super::*;
 /// `pins` carries each attempt's routing/pricing plan: an omitted-maximum
 /// line's creation-time plan (`lines::LinePlan`), or an explicit-maximum
 /// line's dispatch-time route, used for `candidate_deployments`/
-/// `route_plan` and (when admitted) the price, exactly as before (#215,
-/// #238) - a line that carries a plan is still judged against that one
-/// route, never every candidate.
+/// `route_plan` and, at admission, the price. A line carrying a plan is
+/// judged only against its pinned route.
 ///
 /// `claimed` is a separate, narrower fact: whether
 /// THIS attempt actually holds the scheduler's route-capacity claim

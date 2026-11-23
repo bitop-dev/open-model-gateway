@@ -1,5 +1,5 @@
 /*
- * Workspace › Logs (formerly Requests): the shared Logs page in this
+ * Workspace › Logs: the shared Logs page in this
  * workspace's scope. Tabs, filters, tiles and tables live in ./logs; this
  * module keeps the workspace entry point and the helpers other pages and
  * tests import.
