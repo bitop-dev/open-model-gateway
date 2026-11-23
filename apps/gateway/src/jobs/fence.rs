@@ -30,10 +30,15 @@
 //! same columns and the same rule (`store::claim_due`): the runner and the
 //! poller never claim the same row, because the runner takes only
 //! gateway-run batches and the poller every other job. Every poller write to
-//! a native batch goes through the fenced methods below. Video and 0016
-//! batch observations are forward-only compare-and-set writes that a client
-//! read also makes outside any claim (`get_video`), so their claim only keeps
-//! two pollers from refreshing one job at once.
+//! a native batch's row up to and including its finish goes through the
+//! fenced methods below; what follows a committed finish (the idempotent
+//! settlement, the deletion of the provider's copies) is not fenced
+//! (`jobs::native`). Video and 0016 batch observations are not fenced: only
+//! their `state` change is compare-and-set (`store::observe`), while
+//! progress, counts and display status take whatever the observation read,
+//! so a stale poller, or a client read outside any claim (`get_video`), can
+//! write older values. Their claim only keeps two pollers from refreshing one
+//! job at once.
 use sqlx::{Postgres, Transaction, postgres::PgArguments, query::Query};
 use uuid::Uuid;
 
@@ -501,7 +506,7 @@ impl BatchFence {
         if let Some(counts) = counts {
             store::observe_counts(&mut tx, self.job, counts).await?;
         }
-        store::set_status(&mut *tx, self.job, status).await?;
+        store::observe_status(&mut tx, self.job, status).await?;
         tx.commit().await.map_err(job_storage)?;
         Ok(())
     }
@@ -523,7 +528,7 @@ impl BatchFence {
         if running {
             store::mark_running(&mut tx, self.job).await?;
         }
-        store::set_status(&mut *tx, self.job, status).await?;
+        store::observe_status(&mut tx, self.job, status).await?;
         store::poll_ok(&mut tx, self.job, interval_seconds).await?;
         tx.commit().await.map_err(job_storage)?;
         Ok(())

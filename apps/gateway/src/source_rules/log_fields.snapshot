@@ -15,14 +15,13 @@ jobs/batch.rs :: impl Jobs::discard_work_file :: warn :: job_id=%job.id
 jobs/mod.rs :: impl Attempt::drop :: error :: execution_id=%record.id
 jobs/mod.rs :: impl Attempt::fail :: error :: execution_id=%self.id
 jobs/mod.rs :: impl Jobs::settle :: warn :: job_id=%job.id
-jobs/native.rs :: held :: warn :: job_id=%fence.job
 jobs/native.rs :: impl Jobs::collect_native :: warn :: job_id=%job.id
-jobs/native.rs :: impl Jobs::publish_native :: warn :: job_id=%fence.job
 jobs/native.rs :: impl Jobs::submit_native :: warn :: job_id=%job.id
+jobs/native.rs :: stopped :: warn :: job_id=%fence.job
 jobs/plan.rs :: impl Jobs::line_candidates :: warn :: error=?other ; provider=%deployment.provider
 jobs/plan.rs :: impl ScanState::report_rejects :: warn :: error=?other
 jobs/poller.rs :: impl Jobs::poll_as :: warn :: job_id=%fence.job
-jobs/poller.rs :: impl Jobs::renewing :: warn :: job_id=%fence.job
+jobs/poller.rs :: impl Jobs::renew_claim :: warn :: job_id=%fence.job
 jobs/poller.rs :: start :: debug :: jobs=n
 jobs/poller.rs :: start :: warn :: -
 jobs/runner.rs :: impl Runner::finalize :: warn :: job_id=%job.id

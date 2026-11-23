@@ -14,12 +14,23 @@
 //!    settles at its pinned price list. Then the provider's copies and the
 //!    private copy are deleted.
 //!
-//! Every step runs under the poller's claim of the batch ([`BatchFence`]),
-//! checked inside each transaction that writes the batch's row. A poller
-//! whose claim ended writes nothing more: it does not submit, record a
-//! status or finish the batch, and it deletes the result files it wrote.
-//! The upstream id of an accepted submission is the exception: it is
+//! Every write to the batch's row up to and including the finish runs under
+//! the poller's claim of the batch ([`BatchFence`]), checked inside the
+//! transaction that makes it. A poller whose claim ended before its finish
+//! committed writes nothing more to the row: it does not submit, record a
+//! status or counts, or finish the batch, and it deletes the result files it
+//! wrote. Once a lease renewal is refused, a collection also stops at its
+//! next safe point (before each result line, before the lines without a
+//! result, after the files are committed) and deletes what it wrote.
+//!
+//! Two things are not fenced. The upstream id of an accepted submission is
 //! recorded whatever the claim, because it is the evidence of acceptance.
+//! And everything after a committed finish: settlement (idempotent), the
+//! deletion of the provider's copies and of the private copy. A poller whose
+//! lease lapses between its finish and its settlement therefore still
+//! settles the batch and deletes the provider's copies, possibly while
+//! another poller collects it again; that collection finds the batch
+//! terminal, keeps the first collection's links and deletes its own files.
 use super::{
     batch::settlement,
     fence::{BatchFence, FenceError, FenceResult},
@@ -29,31 +40,58 @@ use super::{
     *,
 };
 use gateway_datetime_compat::UtcInstant;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Longer than one submission may take; afterwards an unfinished submission
 /// is treated as interrupted.
-const SUBMIT_GRACE: TimeDelta = TimeDelta::minutes(40);
+pub(crate) const SUBMIT_GRACE: TimeDelta = TimeDelta::minutes(40);
 
 /// `None` when the claim ended: another poller holds the batch.
 fn held<T>(fence: &BatchFence, written: FenceResult<T>) -> JobResult<Option<T>> {
     match written {
         Ok(value) => Ok(Some(value)),
         Err(FenceError::Stale) => {
-            tracing::warn!(job_id = %fence.job, "batch poller no longer holds its batch; it stops working on it");
+            stopped(fence);
             Ok(None)
         }
         Err(_) => Err(InferenceError::Storage.into()),
     }
 }
 
+/// The poller stops working on a batch whose claim ended.
+fn stopped(fence: &BatchFence) {
+    tracing::warn!(job_id = %fence.job, "batch poller no longer holds its batch; it stops working on it");
+}
+
+/// Whether the poller's lease renewal found the claim ended.
+fn lost_claim(lost: &AtomicBool) -> bool {
+    lost.load(Ordering::SeqCst)
+}
+
 impl Jobs {
+    #[cfg(not(test))]
+    fn submit_grace(&self) -> TimeDelta {
+        SUBMIT_GRACE
+    }
+    /// Tests may shorten the grace.
+    #[cfg(test)]
+    fn submit_grace(&self) -> TimeDelta {
+        self.submit_grace
+    }
+
     /// One poller step for a native engine batch.
-    pub(crate) async fn poll_native(&self, job: JobRow, fence: BatchFence) -> JobResult<()> {
+    /// `lost` is set once a lease renewal found the claim ended.
+    pub(crate) async fn poll_native(
+        &self,
+        job: JobRow,
+        fence: BatchFence,
+        lost: &AtomicBool,
+    ) -> JobResult<()> {
         if job.upstream_id.is_none() {
             return match job.submit_started_at {
                 None if job.cancel_requested_at.is_none() => self.submit_native(job, fence).await,
                 None => Ok(()),
-                Some(at) if UtcInstant::now() - at > SUBMIT_GRACE => {
+                Some(at) if UtcInstant::now() - at > self.submit_grace() => {
                     self.submission_lost(fence).await
                 }
                 Some(_) => Ok(()),
@@ -82,7 +120,7 @@ impl Jobs {
             held(&fence, observed)?;
             return Ok(());
         }
-        self.collect_native(job, fence, &target, adapter.as_ref(), &upstream)
+        self.collect_native(job, fence, lost, &target, adapter.as_ref(), &upstream)
             .await
     }
 
@@ -272,6 +310,7 @@ impl Jobs {
         &self,
         job: JobRow,
         fence: BatchFence,
+        lost: &AtomicBool,
         target: &Deployment,
         adapter: &dyn ProviderAdapter,
         upstream: &UpstreamBatch,
@@ -305,6 +344,7 @@ impl Jobs {
             ),
         );
         let state = upstream.status.state();
+        // `Ok(None)`: the claim was lost; the sinks are aborted below.
         let written = async {
             let results = call(adapter.native_batch_results(target, upstream)).await?;
             let mut reader = LineReader::new(Source::Upstream(results), RESULT_LINE_BYTES);
@@ -312,7 +352,11 @@ impl Jobs {
             let mut usage: Option<Usage> = None;
             let mut usage_known = true;
             let mut succeeded = 0u32;
-            while let Some(raw) = reader.next_request().await? {
+            // Safe points: before each result line and before the lines
+            // without a result.
+            while !lost_claim(lost)
+                && let Some(raw) = reader.next_request().await?
+            {
                 let Ok(result) = adapter.decode_native_result(target, endpoint, &raw) else {
                     usage_known = false;
                     continue;
@@ -364,6 +408,9 @@ impl Jobs {
                     }
                 }
             }
+            if lost_claim(lost) {
+                return Ok(None);
+            }
             let missing = match state {
                 JobState::Cancelled => NotRun::Cancelled,
                 JobState::Expired => NotRun::Expired,
@@ -375,11 +422,17 @@ impl Jobs {
                     err.line(&lines::not_run_line(custom_id, missing)).await?;
                 }
             }
-            Ok::<_, InferenceError>((usage.filter(|_| usage_known), succeeded))
+            Ok::<_, InferenceError>(Some((usage.filter(|_| usage_known), succeeded)))
         }
         .await;
         let (summed, succeeded) = match written {
-            Ok(v) => v,
+            Ok(Some(v)) if !lost_claim(lost) => v,
+            Ok(_) => {
+                out.abort().await;
+                err.abort().await;
+                stopped(&fence);
+                return Ok(());
+            }
             Err(e) => {
                 out.abort().await;
                 err.abort().await;
@@ -387,7 +440,20 @@ impl Jobs {
             }
         };
         let output_file = out.finish().await?;
-        let error_file = err.finish().await?;
+        // A committed output file that no batch will link is removed with
+        // the error file's failure, as the runner does.
+        let error_file = match err.finish().await {
+            Ok(file) => file,
+            Err(e) => {
+                super::runner::remove_files(&files, &job, [output_file, None]).await;
+                return Err(e.into());
+            }
+        };
+        if lost_claim(lost) {
+            super::runner::remove_files(&files, &job, [output_file, error_file]).await;
+            stopped(&fence);
+            return Ok(());
+        }
         let total = ids.len() as u32;
         let counts = RequestCounts {
             total,
@@ -396,12 +462,6 @@ impl Jobs {
                 .counts
                 .map_or(total - succeeded.min(total), |c| c.failed),
         };
-        crate::metrics::METRICS.observe_batch_lines(
-            "native",
-            &job.provider,
-            u64::from(succeeded),
-            u64::from(counts.failed),
-        );
         let finished = Finished {
             state,
             error_code: (state == JobState::Failed).then_some("batch_failed"),
@@ -412,6 +472,16 @@ impl Jobs {
         let Some(job) = self.publish_native(&files, job, fence, &finished).await? else {
             return Ok(());
         };
+        // Counted once the claim recorded the lines (a lost claim records
+        // nothing and counts nothing).
+        crate::metrics::METRICS.observe_batch_lines(
+            "native",
+            &job.provider,
+            u64::from(succeeded),
+            u64::from(counts.failed),
+        );
+        #[cfg(test)]
+        self.settle_hold.pause().await;
         // The provider's aggregate when it reports one, else the per-line sum
         // when every succeeded line reported usage; otherwise unknown.
         let usage = upstream.usage.or(summed);
@@ -449,7 +519,7 @@ impl Jobs {
                 Ok(Some(row))
             }
             Err(FenceError::Stale) => {
-                tracing::warn!(job_id = %fence.job, "batch poller no longer holds its batch; it stops working on it");
+                stopped(&fence);
                 super::runner::remove_files(files, &job, created).await;
                 Ok(None)
             }

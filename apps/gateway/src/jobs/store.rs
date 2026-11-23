@@ -401,12 +401,24 @@ pub(crate) async fn cancel_unsubmitted(store: &Store, id: Uuid) -> Result<bool> 
 }
 /// Display status (`validating`, `in_progress`, `finalizing`, `cancelling`)
 /// of an unfinished batch.
-pub(crate) async fn set_status<'e>(
-    conn: impl sqlx::PgExecutor<'e>,
+pub(crate) async fn set_status(store: &Store, id: Uuid, status: &str) -> Result<()> {
+    sqlx::query("UPDATE async_jobs SET upstream_status=$2,finalizing_at=CASE WHEN $2='finalizing' THEN coalesce(finalizing_at,clock_timestamp()) ELSE finalizing_at END WHERE id=$1 AND state IN('queued','in_progress')")
+        .bind(id)
+        .bind(status)
+        .execute(&store.pool)
+        .await.map_err(job_storage)?;
+    Ok(())
+}
+/// Display status the poller observed for an unfinished native batch. Once
+/// a client asked to cancel it and it shows `cancelling`, it keeps showing
+/// `cancelling` until it ends, whatever the provider reported before the
+/// cancellation reached it.
+pub(crate) async fn observe_status(
+    conn: &mut sqlx::PgConnection,
     id: Uuid,
     status: &str,
 ) -> Result<()> {
-    sqlx::query("UPDATE async_jobs SET upstream_status=$2,finalizing_at=CASE WHEN $2='finalizing' THEN coalesce(finalizing_at,clock_timestamp()) ELSE finalizing_at END WHERE id=$1 AND state IN('queued','in_progress')")
+    sqlx::query("UPDATE async_jobs SET upstream_status=CASE WHEN cancel_requested_at IS NOT NULL AND upstream_status='cancelling' THEN upstream_status ELSE $2 END,finalizing_at=CASE WHEN $2='finalizing' THEN coalesce(finalizing_at,clock_timestamp()) ELSE finalizing_at END WHERE id=$1 AND state IN('queued','in_progress')")
         .bind(id)
         .bind(status)
         .execute(conn)

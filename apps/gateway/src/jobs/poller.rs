@@ -9,9 +9,15 @@
 //! bumped epoch (`store::claim_due`, [`super::fence`]): another poller skips
 //! the job while the lease runs, and once it takes the job over, every write
 //! the earlier claim still makes to a native batch is refused. The lease is
-//! renewed while the job is refreshed, so a refresh can run for its whole
-//! deadline, and a crashed poller's jobs are taken again after [`LEASE_SECONDS`].
-use std::time::Duration;
+//! renewed while the job is refreshed, concurrently with the refresh, so a
+//! refresh can run for its whole deadline, and a crashed poller's jobs are
+//! taken again after [`LEASE_SECONDS`]. A refused renewal marks the claim
+//! lost: a native collection then stops at its next safe point and removes
+//! the result files it created.
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 use super::{
     fence::{BatchFence, Renewed},
@@ -25,8 +31,24 @@ const REFRESH_TIMEOUT: Duration = Duration::from_secs(30 * 60 + 60);
 /// Poller lease of a claimed job, renewed every [`RENEW`] while it is refreshed.
 const LEASE_SECONDS: f64 = 60.0;
 const RENEW: Duration = Duration::from_secs(15);
-/// One renewal gets this long: a hung connection counts as a failed renewal.
-const RENEW_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Lease term and renewal period of a poller claim.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PollLease {
+    pub(crate) seconds: f64,
+    pub(crate) renew: Duration,
+}
+impl PollLease {
+    pub(crate) const DEFAULT: Self = Self {
+        seconds: LEASE_SECONDS,
+        renew: RENEW,
+    };
+    /// One renewal gets two thirds of the period (10 s of 15 s): a hung
+    /// connection counts as a failed renewal before the next one is due.
+    fn renew_timeout(self) -> Duration {
+        self.renew * 2 / 3
+    }
+}
 
 /// Start the poller when an interval is configured.
 pub fn start(jobs: Jobs) -> Option<tokio::task::JoinHandle<()>> {
@@ -47,6 +69,17 @@ pub fn start(jobs: Jobs) -> Option<tokio::task::JoinHandle<()>> {
 }
 
 impl Jobs {
+    /// The lease of a poller claim.
+    #[cfg(not(test))]
+    fn poll_lease(&self) -> PollLease {
+        PollLease::DEFAULT
+    }
+    /// The lease of a poller claim: tests may shorten it.
+    #[cfg(test)]
+    fn poll_lease(&self) -> PollLease {
+        self.poll_lease
+    }
+
     /// One poll pass as an owner of its own; returns how many jobs were
     /// refreshed successfully.
     pub async fn poll_once(&self) -> Result<usize, InferenceError> {
@@ -56,16 +89,18 @@ impl Jobs {
     /// One poll pass as `owner`.
     pub(crate) async fn poll_as(&self, owner: Uuid) -> Result<usize, InferenceError> {
         let interval = self.poll_seconds();
+        let lease = self.poll_lease();
         let mut done = 0;
         for _ in 0..BATCH {
-            let Some((job, fence)) = store::claim_due(&self.store, owner, interval, LEASE_SECONDS)
+            let Some((job, fence)) = store::claim_due(&self.store, owner, interval, lease.seconds)
                 .await
                 .map_err(|_| InferenceError::Storage)?
             else {
                 break;
             };
-            let refreshed = tokio::time::timeout(REFRESH_TIMEOUT, self.poll_job(job, fence));
-            let refreshed = self.renewing(fence, refreshed).await;
+            let lost = AtomicBool::new(false);
+            let refreshed = tokio::time::timeout(REFRESH_TIMEOUT, self.poll_job(job, fence, &lost));
+            let refreshed = self.renewing(fence, lease, &lost, refreshed).await;
             let failed = match refreshed {
                 Ok(Ok(())) => {
                     done += 1;
@@ -82,36 +117,53 @@ impl Jobs {
         Ok(done)
     }
 
-    /// Run `work` while renewing the claim's lease every [`RENEW`]. A
-    /// renewal never stops the work: once the claim ended its next fenced
-    /// write is refused, and the work then removes what it created.
-    async fn renewing<T>(&self, fence: BatchFence, work: impl Future<Output = T>) -> T {
+    /// Run `work` while renewing the claim's lease every `lease.renew`. The
+    /// renewal runs beside the work in the same task, so a renewal waiting on
+    /// the job row behind one of the work's fenced transactions never keeps
+    /// that transaction from finishing. A refused renewal sets `lost` and the
+    /// work stops at its next safe point; a renewal of a settled batch ends
+    /// the renewals; the work always runs to its end.
+    async fn renewing<T>(
+        &self,
+        fence: BatchFence,
+        lease: PollLease,
+        lost: &AtomicBool,
+        work: impl Future<Output = T>,
+    ) -> T {
         let mut work = std::pin::pin!(work);
-        let mut renew = tokio::time::interval_at(tokio::time::Instant::now() + RENEW, RENEW);
-        let mut held = true;
+        let renewal = std::pin::pin!(self.renew_claim(fence, lease, lost));
+        tokio::select! {
+            done = &mut work => done,
+            () = renewal => work.await,
+        }
+    }
+
+    /// Renew the lease until the claim ended (`lost`) or the batch settled.
+    async fn renew_claim(&self, fence: BatchFence, lease: PollLease, lost: &AtomicBool) {
+        let mut renew =
+            tokio::time::interval_at(tokio::time::Instant::now() + lease.renew, lease.renew);
         loop {
-            tokio::select! {
-                done = &mut work => return done,
-                _ = renew.tick(), if held => {
-                    match tokio::time::timeout(RENEW_TIMEOUT, fence.renew(&self.store, LEASE_SECONDS)).await {
-                        Ok(Ok(Renewed::Held { .. })) => {}
-                        // Settled: only cleanup is left. Fenced: another
-                        // poller holds the job.
-                        Ok(Ok(Renewed::Settled | Renewed::Fenced)) => held = false,
-                        _ => tracing::warn!(job_id = %fence.job, "async job lease renewal failed"),
-                    }
+            renew.tick().await;
+            let renewed = fence.renew(&self.store, lease.seconds);
+            match tokio::time::timeout(lease.renew_timeout(), renewed).await {
+                Ok(Ok(Renewed::Held { .. })) => {}
+                Ok(Ok(Renewed::Settled)) => return,
+                Ok(Ok(Renewed::Fenced)) => {
+                    lost.store(true, Ordering::SeqCst);
+                    return;
                 }
+                _ => tracing::warn!(job_id = %fence.job, "async job lease renewal failed"),
             }
         }
     }
 
-    async fn poll_job(&self, job: JobRow, fence: BatchFence) -> JobResult<()> {
+    async fn poll_job(&self, job: JobRow, fence: BatchFence, lost: &AtomicBool) -> JobResult<()> {
         match job.job_kind() {
             Some(JobKind::Video) => {
                 self.refresh_video(job).await?;
             }
             Some(JobKind::Batch) => match job.mode() {
-                Some(BatchMode::Native) => self.poll_native(job, fence).await?,
+                Some(BatchMode::Native) => self.poll_native(job, fence, lost).await?,
                 // Gateway-run batches belong to the batch runner.
                 Some(BatchMode::Gateway) => {}
                 None => {

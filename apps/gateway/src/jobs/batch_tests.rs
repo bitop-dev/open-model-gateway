@@ -69,6 +69,8 @@ struct Script {
     retrieve_gate: Option<Arc<Gate>>,
     /// The next `native_batch_results` waits here before it returns.
     results_gate: Option<Arc<Gate>>,
+    /// The next `submit_native_batch` waits here before it reads the records.
+    submit_gate: Option<Arc<Gate>>,
 }
 /// A provider call held open by a test: `entered` is signalled when the call
 /// starts and the call returns once `release` is signalled.
@@ -351,8 +353,16 @@ impl ProviderAdapter for Fake {
         _: BatchEndpoint,
         mut records: ByteStream,
     ) -> Result<UpstreamBatch, InferenceError> {
-        if self.script.lock().unwrap().early_accept {
-            return Ok(upstream(BatchStatus::Validating));
+        let gate = {
+            let mut s = self.script.lock().unwrap();
+            if s.early_accept {
+                return Ok(upstream(BatchStatus::Validating));
+            }
+            s.submit_gate.take()
+        };
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
         }
         let mut seen = Vec::new();
         while let Some(r) = records.next().await {
