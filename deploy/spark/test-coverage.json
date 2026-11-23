@@ -23,6 +23,7 @@
     {"ci": "npm run test:sdk-bases", "why": "another npm script of CI's web job", "suites": ["web", "all"]},
     {"ci": "npm run test:demo", "why": "another npm script of CI's web job", "suites": ["web", "all"]},
     {"ci": "npm run test:supply-chain", "why": "another npm script of CI's web job", "suites": ["web", "all"]},
+    {"ci": "node scripts/check-action-tags.mjs", "why": "live GitHub tag resolution in the read-only CI job", "suites": ["web", "all"]},
     {"ci": "node --test tests/oci-tool.test.mjs", "why": "another test of CI's web job", "suites": ["web", "all"]},
     {"ci": "python3 -B -m unittest discover -s tests -p 'oci_*test.py' -v", "why": "another test of CI's web job", "suites": ["web", "all"]},
     {"ci": "npm run test:ci", "why": "another npm script of CI's web job", "suites": ["web", "all"]},
