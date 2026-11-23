@@ -643,22 +643,12 @@ fn check_output(
         if l["not_applicable"] == true || !l["microusd_per_batch"].is_null() {
             continue;
         }
-        let same = |p: &&Value| {
-            p["meter"] == l["meter"]
-                && p["variant"] == l["variant"]
-                && p["min_prompt_tokens"] == l["min_prompt_tokens"]
-        };
-        prop_assert!(
-            !draft
-                .iter()
-                .filter(same)
-                .any(|p| p["microusd_per_batch"].is_string()),
-            "an unpriced line was priced in the draft: {l}"
-        );
-        prop_assert!(
-            draft.iter().any(|p| p["meter"] == l["meter"]
-                && (!l["min_prompt_tokens"].is_null() || p["unknown"] == true)),
-            "an unpriced meter with no draft line: {l}"
+        let meter_lines: Vec<_> = draft.iter().filter(|p| p["meter"] == l["meter"]).collect();
+        prop_assert_eq!(
+            meter_lines,
+            [&json!({"meter": l["meter"], "unknown": true})],
+            "an unpriced line must make the whole meter unknown: {}",
+            l
         );
     }
     // The draft is valid, or says it is not.
@@ -861,24 +851,23 @@ fn check_line_amounts(out: &Value, model: &Value) -> Result<(), TestCaseError> {
         .iter()
         .filter(|l| l["microusd_per_batch"].is_string())
     {
-        let unknown_base = lines(out).iter().any(|base| {
-            base["meter"] == l["meter"]
-                && base["min_prompt_tokens"].is_null()
-                && base["microusd_per_batch"].is_null()
-                && base["not_applicable"] != true
-        });
+        // The draft has already been checked for a sole unknown line on
+        // every incomplete meter. Fully priced meters keep every rate.
+        if lines(out).iter().any(|rate| {
+            rate["meter"] == l["meter"]
+                && rate["microusd_per_batch"].is_null()
+                && rate["not_applicable"] != true
+        }) {
+            continue;
+        }
         prop_assert!(
-            (unknown_base
-                && draft
-                    .iter()
-                    .any(|p| p["meter"] == l["meter"] && p["unknown"] == true))
-                || draft.iter().any(|p| {
-                    p["meter"] == l["meter"]
-                        && p["variant"] == l["variant"]
-                        && p["min_prompt_tokens"] == l["min_prompt_tokens"]
-                        && p["microusd_per_batch"] == l["microusd_per_batch"]
-                        && p["batch"] == l["batch"]
-                }),
+            draft.iter().any(|p| {
+                p["meter"] == l["meter"]
+                    && p["variant"] == l["variant"]
+                    && p["min_prompt_tokens"] == l["min_prompt_tokens"]
+                    && p["microusd_per_batch"] == l["microusd_per_batch"]
+                    && p["batch"] == l["batch"]
+            }),
             "priced line {} is missing from the draft",
             l
         );
