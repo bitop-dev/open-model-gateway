@@ -53,6 +53,20 @@ test("the shell reader splits commands and removes quotes", () => {
   assert.deepEqual(words("a \\\n  b"), ["a b"]);
 });
 
+test("shell continuations depend on quoting and comment boundaries", () => {
+  const words = script => shellCommands(script).map(command => command.map(word => word.text));
+  const continued = "\\" + "\n";
+  assert.deepEqual(words("echo first # note " + continued + "echo second"),
+    [["echo", "first"], ["echo", "second"]]);
+  assert.deepEqual(words("echo 'a" + continued + "b'"),
+    [["echo", "a" + continued + "b"]]);
+  assert.deepEqual(words('echo "a' + continued + 'b"'), [["echo", "ab"]]);
+  assert.deepEqual(words("echo a" + continued + "b"), [["echo", "ab"]]);
+  assert.deepEqual(words("echo $" + continued + "(echo value)"), [["echo", "value"], ["echo", ""]]);
+  assert.deepEqual(words("echo ok 2" + continued + ">" + continued + "> log"), [["echo", "ok"]]);
+  assert.deepEqual(words("echo '2'> log"), [["echo", "2"]]);
+});
+
 // ---- the run-command parser (#488) ----
 
 const CHECKED = new Set(["compose.yaml", "deploy/staging/compose.yaml", "deploy/staging/compose.openai.yaml"]);
@@ -141,6 +155,7 @@ test("the run-command parser refuses builds, builder and endpoint switches and u
 });
 
 const ESCAPED_ENV = [
+  String.raw`printf "DOCKER_""\x48OST=x"`,
   "printf 'DOCKER_\\x48OST=tcp://evil:2375\\n' >> \"$GITHUB_ENV\"",
   "echo -e 'DOCKER_\\x48OST=tcp://evil:2375' >> \"$GITHUB_ENV\"",
   "printf 'DOCKER_\\110OST=tcp://evil:2375\\n' >> \"$GITHUB_ENV\"",
