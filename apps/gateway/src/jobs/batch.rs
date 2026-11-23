@@ -385,7 +385,7 @@ impl Jobs {
                 } else {
                     // The submission is in flight: the poller cancels after it.
                     store::mark_cancel_requested(&self.store, job.id).await?;
-                    store::set_status(&self.store, job.id, "cancelling").await?;
+                    store::set_status(&self.store.pool, job.id, "cancelling").await?;
                 }
             }
             Some(BatchMode::Gateway) => {
@@ -399,7 +399,7 @@ impl Jobs {
                 let upstream = call(adapter.cancel_batch(&target, &upstream_id)).await?;
                 store::mark_cancel_requested(&self.store, job.id).await?;
                 if !upstream.status.state().is_terminal() {
-                    store::set_status(&self.store, job.id, upstream.status.as_str()).await?;
+                    store::set_status(&self.store.pool, job.id, upstream.status.as_str()).await?;
                 }
             }
         }

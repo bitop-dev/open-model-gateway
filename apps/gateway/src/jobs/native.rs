@@ -13,8 +13,16 @@
 //!    (the provider's aggregate when it reports one) and the reservation
 //!    settles at its pinned price list. Then the provider's copies and the
 //!    private copy are deleted.
+//!
+//! Every step runs under the poller's claim of the batch ([`BatchFence`]),
+//! checked inside each transaction that writes the batch's row. A poller
+//! whose claim ended writes nothing more: it does not submit, record a
+//! status or finish the batch, and it deletes the result files it wrote.
+//! The upstream id of an accepted submission is the exception: it is
+//! recorded whatever the claim, because it is the evidence of acceptance.
 use super::{
     batch::settlement,
+    fence::{BatchFence, FenceError, FenceResult},
     io::{LazySink, LineReader, RESULT_LINE_BYTES, Source},
     lines::{self, NotRun},
     store::Finished,
@@ -26,15 +34,27 @@ use gateway_datetime_compat::UtcInstant;
 /// is treated as interrupted.
 const SUBMIT_GRACE: TimeDelta = TimeDelta::minutes(40);
 
+/// `None` when the claim ended: another poller holds the batch.
+fn held<T>(fence: &BatchFence, written: FenceResult<T>) -> JobResult<Option<T>> {
+    match written {
+        Ok(value) => Ok(Some(value)),
+        Err(FenceError::Stale) => {
+            tracing::warn!(job_id = %fence.job, "batch poller no longer holds its batch; it stops working on it");
+            Ok(None)
+        }
+        Err(_) => Err(InferenceError::Storage.into()),
+    }
+}
+
 impl Jobs {
     /// One poller step for a native engine batch.
-    pub(crate) async fn poll_native(&self, job: JobRow) -> JobResult<()> {
+    pub(crate) async fn poll_native(&self, job: JobRow, fence: BatchFence) -> JobResult<()> {
         if job.upstream_id.is_none() {
             return match job.submit_started_at {
-                None if job.cancel_requested_at.is_none() => self.submit_native(job).await,
+                None if job.cancel_requested_at.is_none() => self.submit_native(job, fence).await,
                 None => Ok(()),
                 Some(at) if UtcInstant::now() - at > SUBMIT_GRACE => {
-                    self.submission_lost(job).await
+                    self.submission_lost(fence).await
                 }
                 Some(_) => Ok(()),
             };
@@ -48,25 +68,27 @@ impl Jobs {
         {
             upstream = call(adapter.cancel_batch(&target, &upstream_id)).await?;
         }
-        if let Some(counts) = upstream.counts {
-            store::observe_counts(&self.store, job.id, counts).await?;
-        }
         let state = upstream.status.state();
         if !state.is_terminal() {
-            if state == JobState::InProgress {
-                store::mark_running(&self.store, job.id).await?;
-            }
-            store::set_status(&self.store, job.id, upstream.status.as_str()).await?;
-            store::poll_ok(&self.store, job.id, self.poll_seconds()).await?;
+            let observed = fence
+                .observe_native(
+                    &self.store,
+                    upstream.counts,
+                    state == JobState::InProgress,
+                    upstream.status.as_str(),
+                    self.poll_seconds(),
+                )
+                .await;
+            held(&fence, observed)?;
             return Ok(());
         }
-        self.collect_native(job, &target, adapter.as_ref(), &upstream)
+        self.collect_native(job, fence, &target, adapter.as_ref(), &upstream)
             .await
     }
 
     #[cfg_attr(not(test), expect(clippy::too_many_lines, reason = "#499"))]
-    async fn submit_native(&self, job: JobRow) -> JobResult<()> {
-        if !store::claim_submit(&self.store, job.id).await? {
+    async fn submit_native(&self, job: JobRow, fence: BatchFence) -> JobResult<()> {
+        if held(&fence, fence.claim_submit(&self.store).await)? != Some(true) {
             return Ok(());
         }
         let files = self.files()?.clone();
@@ -155,26 +177,33 @@ impl Jobs {
         };
         match outcome {
             Ok(upstream) => {
-                if !upstream.status.state().is_terminal() {
-                    store::set_status(&self.store, job.id, upstream.status.as_str()).await?;
-                }
                 crate::metrics::METRICS.observe_batch_submitted(&job.provider);
+                if !upstream.status.state().is_terminal() {
+                    let status = fence.native_status(&self.store, None, upstream.status.as_str());
+                    held(&fence, status.await)?;
+                }
                 Ok(())
             }
             Err(e) => {
                 tracing::warn!(job_id = %job.id, "native batch submission failed");
-                let job = store::finish_batch(
-                    &self.store,
-                    job.id,
-                    &Finished {
-                        state: JobState::Failed,
-                        error_code: Some("submission_failed"),
-                        output_file: None,
-                        error_file: None,
-                        counts: None,
-                    },
-                )
-                .await?;
+                // A claim that ended leaves the started submission to the
+                // claim that holds the batch: it ends interrupted after the
+                // grace, with its hold retained.
+                let finished = fence
+                    .finish_native(
+                        &self.store,
+                        &Finished {
+                            state: JobState::Failed,
+                            error_code: Some("submission_failed"),
+                            output_file: None,
+                            error_file: None,
+                            counts: None,
+                        },
+                    )
+                    .await;
+                let Some(job) = held(&fence, finished)? else {
+                    return Ok(());
+                };
                 // Partial submission may have reached the provider. Only an explicit
                 // pre-processing rejection can qualify for free-zero settlement.
                 self.settle(
@@ -195,19 +224,22 @@ impl Jobs {
 
     /// A submission that never recorded its upstream id (crash): never
     /// retried; the batch fails and its hold is retained as unknown.
-    async fn submission_lost(&self, job: JobRow) -> JobResult<()> {
-        let job = store::finish_batch(
-            &self.store,
-            job.id,
-            &Finished {
-                state: JobState::Failed,
-                error_code: Some("submission_interrupted"),
-                output_file: None,
-                error_file: None,
-                counts: None,
-            },
-        )
-        .await?;
+    async fn submission_lost(&self, fence: BatchFence) -> JobResult<()> {
+        let finished = fence
+            .finish_native(
+                &self.store,
+                &Finished {
+                    state: JobState::Failed,
+                    error_code: Some("submission_interrupted"),
+                    output_file: None,
+                    error_file: None,
+                    counts: None,
+                },
+            )
+            .await;
+        let Some(job) = held(&fence, finished)? else {
+            return Ok(());
+        };
         self.settle(
             &job,
             Settlement {
@@ -239,13 +271,17 @@ impl Jobs {
     async fn collect_native(
         &self,
         job: JobRow,
+        fence: BatchFence,
         target: &Deployment,
         adapter: &dyn ProviderAdapter,
         upstream: &UpstreamBatch,
     ) -> JobResult<()> {
         let files = self.files()?.clone();
         let endpoint = job.endpoint().ok_or(InferenceError::Storage)?;
-        store::set_status(&self.store, job.id, "finalizing").await?;
+        let finalizing = fence.native_status(&self.store, upstream.counts, "finalizing");
+        if held(&fence, finalizing.await)?.is_none() {
+            return Ok(());
+        }
         let ids = self.custom_ids(&job).await?;
         let hex = job.id.simple();
         let mut out = LazySink::new(
@@ -366,18 +402,16 @@ impl Jobs {
             u64::from(succeeded),
             u64::from(counts.failed),
         );
-        let job = store::finish_batch(
-            &self.store,
-            job.id,
-            &Finished {
-                state,
-                error_code: (state == JobState::Failed).then_some("batch_failed"),
-                output_file,
-                error_file,
-                counts: Some(counts),
-            },
-        )
-        .await?;
+        let finished = Finished {
+            state,
+            error_code: (state == JobState::Failed).then_some("batch_failed"),
+            output_file,
+            error_file,
+            counts: Some(counts),
+        };
+        let Some(job) = self.publish_native(&files, job, fence, &finished).await? else {
+            return Ok(());
+        };
         // The provider's aggregate when it reports one, else the per-line sum
         // when every succeeded line reported usage; otherwise unknown.
         let usage = upstream.usage.or(summed);
@@ -393,5 +427,39 @@ impl Jobs {
         self.discard_work_file(&job).await;
         crate::metrics::METRICS.observe_batch_finished("native", state.as_str());
         Ok(())
+    }
+
+    /// Record the collected results under the claim. `None` when the claim
+    /// ended: nothing was recorded and the result files are deleted. Files a
+    /// batch that finished earlier does not link are deleted too.
+    async fn publish_native(
+        &self,
+        files: &FileStorage,
+        job: JobRow,
+        fence: BatchFence,
+        f: &Finished<'_>,
+    ) -> JobResult<Option<JobRow>> {
+        let created = [f.output_file, f.error_file];
+        match fence.finish_native(&self.store, f).await {
+            Ok(row) => {
+                let unused = created.map(|f| {
+                    f.filter(|f| row.output_file_id != Some(*f) && row.error_file_id != Some(*f))
+                });
+                super::runner::remove_files(files, &row, unused).await;
+                Ok(Some(row))
+            }
+            Err(FenceError::Stale) => {
+                tracing::warn!(job_id = %fence.job, "batch poller no longer holds its batch; it stops working on it");
+                super::runner::remove_files(files, &job, created).await;
+                Ok(None)
+            }
+            Err(FenceError::Storage) => {
+                super::runner::remove_files(files, &job, created).await;
+                Err(InferenceError::Storage.into())
+            }
+            // The links may have committed, or a file is locked by another
+            // operation: the sweeper reclaims what no batch links.
+            Err(FenceError::Unknown | FenceError::FileBusy) => Err(InferenceError::Storage.into()),
+        }
     }
 }

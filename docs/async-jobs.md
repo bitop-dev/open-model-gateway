@@ -97,9 +97,11 @@ Batch inputs are gateway files ([Files API](files-api.md)). `POST /v1/batches` s
 
 `serve` starts a background poller on the runtime database role. Every interval it:
 
-1. Claims at most 32 due, unsettled provider jobs (videos and native batches; gateway-run batches belong to the [batch runner](batches.md#execution-of-gateway-run-batches)) that are still within their poll deadline (`FOR UPDATE SKIP LOCKED`, so multiple gateway processes never poll the same job at once).
-2. Refreshes each job from its provider with a bounded deadline. A native batch is first submitted (once); when it ends, its results are collected into gateway files.
+1. Claims, one at a time and at most 32 per interval, the due, unsettled provider jobs (videos, native batches and 0016 batches; gateway-run batches belong to the [batch runner](batches.md#execution-of-gateway-run-batches)) that are still within their poll deadline and that no poller holds.
+2. Refreshes each job from its provider with a bounded deadline (31 minutes). A native batch is first submitted (once); when it ends, its results are collected into gateway files.
 3. Applies the state machine and settles terminal jobs.
+
+**Claims (#651).** Each gateway process polls as one owner. A claim writes the owner, a 60 s lease and a bumped **claim epoch** to the job row (`async_jobs.runner_id`, `runner_lease_until`, `runner_epoch`: the columns the batch runner uses for gateway-run batches, which the poller never claims). The poller renews the lease every 15 s while it refreshes the job and gives it up when the refresh ends, so another process never polls a job one holds, and a crashed process's jobs are polled again about a minute later. A poller that stalls past its lease can lose the job to another; every write it then makes to a native batch is refused, because each one checks the owner and epoch inside its own transaction while it holds the job row: it does not submit the batch, record a status, counts or the next poll, finish the batch, settle it or delete the provider's copies, and it deletes the result files it wrote. Such a poller logs `batch poller no longer holds its batch; it stops working on it`; a failed renewal logs `async job lease renewal failed`. Video and 0016 batch writes stay forward-only compare-and-set writes and are not fenced: a video read refreshes the job outside any claim too, so the claim only keeps two pollers from reading the same job from the provider at once. Settlement is idempotent whoever reaches it.
 
 Failures back off per job, up to 32 × the interval. With the poller disabled, video reads still refresh and settle jobs, but native batches are not processed.
 
