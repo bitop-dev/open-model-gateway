@@ -33,6 +33,10 @@ struct Counters<'a> {
     total_tokens: Option<u64>,
     #[serde(borrow)]
     input_tokens_details: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct OutputDetails<'a> {
     #[serde(borrow)]
     output_tokens_details: Option<&'a RawValue>,
     #[serde(borrow)]
@@ -59,7 +63,7 @@ fn object<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T> {
     serde_json::from_slice(bytes).map_err(|_| InferenceError::InvalidUpstream)
 }
 
-fn reasoning(details: Option<&RawValue>, output: Option<u64>) -> Result<Option<u64>> {
+fn reasoning(details: Option<&RawValue>, output_bound: Option<u64>) -> Result<Option<u64>> {
     let Some(raw) = details.filter(|raw| raw.get().starts_with('{')) else {
         return Ok(None);
     };
@@ -67,10 +71,18 @@ fn reasoning(details: Option<&RawValue>, output: Option<u64>) -> Result<Option<u
     Ok(details
         .reasoning_tokens
         .and_then(|raw| serde_json::from_str::<u64>(raw.get()).ok())
-        .filter(|&n| metering::plausible_reasoning(n, output)))
+        .filter(|&n| metering::plausible_reasoning(n, output_bound)))
 }
 
-pub(super) fn mismatch_usage(bytes: &[u8]) -> Result<Usage> {
+// Keep ambiguity in optional reasoning metadata local to that observation.
+fn reported_reasoning(usage: &RawValue, output_bound: Option<u64>) -> Result<Option<u64>> {
+    let fields: OutputDetails<'_> = object(usage.get().as_bytes())?;
+    let native = reasoning(fields.output_tokens_details, output_bound)?;
+    let compatible = reasoning(fields.completion_tokens_details, output_bound)?;
+    Ok(native.or(compatible))
+}
+
+pub(super) fn rejected_terminal_usage(bytes: &[u8]) -> Result<Usage> {
     let frame: Frame<'_> = object(bytes)?;
     let response: Snapshot<'_> = object(frame.response.get().as_bytes())?;
     let counts: Counters<'_> = object(response.usage.get().as_bytes())?;
@@ -85,28 +97,30 @@ pub(super) fn mismatch_usage(bytes: &[u8]) -> Result<Usage> {
         cache.cached_tokens,
         cache.cache_write_tokens,
     )?;
+    let mut output_bound = counts.output_tokens;
     if let Some(total) = counts.total_tokens {
-        // The supplied total can disqualify counts, but cannot supply missing evidence.
-        let contradictory = match (observed.input_tokens, observed.output_tokens) {
-            (Some(input), Some(output)) => input.checked_add(output) != Some(total),
-            (_, output) => {
-                let input_floor = observed
-                    .billing
-                    .ok_or(InferenceError::InvalidUpstream)?
-                    .input_lower_bound()
-                    .map_err(|_| InferenceError::InvalidUpstream)?;
-                input_floor
-                    .checked_add(output.unwrap_or(0))
-                    .is_none_or(|floor| floor > total)
-            }
-        };
-        if total > i64::MAX as u64 || contradictory {
+        let input_floor = observed
+            .billing
+            .ok_or(InferenceError::InvalidUpstream)?
+            .input_lower_bound()
+            .map_err(|_| InferenceError::InvalidUpstream)?;
+        let remaining = total
+            .checked_sub(input_floor)
+            .ok_or(InferenceError::InvalidUpstream)?;
+        if total > i64::MAX as u64
+            || counts.output_tokens.is_some_and(|output| {
+                output > remaining || (counts.input_tokens.is_some() && output != remaining)
+            })
+        {
             return Err(InferenceError::InvalidUpstream);
         }
+        // The remainder bounds reasoning telemetry when the output count is absent.
+        // Billing keeps the original observation.
+        output_bound = Some(counts.output_tokens.unwrap_or(remaining));
     }
-    let native = reasoning(counts.output_tokens_details, counts.output_tokens)?;
-    let compatible = reasoning(counts.completion_tokens_details, counts.output_tokens)?;
-    observed.reasoning_tokens = native.or(compatible);
+    observed.reasoning_tokens = reported_reasoning(response.usage, output_bound)
+        .ok()
+        .flatten();
     observed.reported_model = response
         .model
         .and_then(|raw| serde_json::from_str::<String>(raw.get()).ok())
