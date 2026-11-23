@@ -2,8 +2,7 @@
 //! `oneshot`, synthetic schemas, no database. A handler that is looser or
 //! stricter than its schema must FAIL, and the failure names no sent value.
 use super::http_vectors::{
-    Edit, Probe, binary_cases, body_cases, query_cases, reaches_byte_limits, run_binary, run_body,
-    run_query,
+    Edit, Probe, binary_cases, body_cases, query_cases, run_binary, run_body, run_query,
 };
 use super::responses::Captured;
 use axum::{
@@ -471,9 +470,6 @@ async fn management_openapi_http_vectors_shards_divide_the_planned_vectors() {
     assert_eq!(sent_bodies(&app, &document).await, whole);
 }
 
-/// A body is judged against reviewed byte limits only where one can apply: the
-/// search follows every reference (cycles included) and never answers "none"
-/// when a reference cannot be followed.
 #[test]
 fn management_openapi_http_vectors_byte_limits_are_found_through_references() {
     let document = json!({"components":{"schemas":{
@@ -481,19 +477,26 @@ fn management_openapi_http_vectors_byte_limits_are_found_through_references() {
         "Limited":{"type":"string","x-omg-max-bytes":10},
         "Plain":{"type":"object","properties":{"again":{"$ref":"#/components/schemas/Plain"}}},
         "Listing":{"type":"array","items":{"oneOf":[{"$ref":"#/components/schemas/Plain"},{"$ref":"#/components/schemas/Holder"}]}}}}});
-    let reaches = |name: &str| {
-        reaches_byte_limits(
+    let allows = |name: &str, value: Value| {
+        super::http_vectors::accepts(
             &document,
-            &json!({"$ref": format!("#/components/schemas/{name}")}),
+            &json!({"$ref":format!("#/components/schemas/{name}")}),
+            &value,
         )
     };
-    assert!(reaches("Holder") && reaches("Limited") && reaches("Listing"));
-    assert!(!reaches("Plain"));
-    assert!(reaches("Missing"));
-    assert!(reaches_byte_limits(
-        &document,
-        &json!({"$ref":"https://elsewhere.invalid/x"})
-    ));
+    assert!(!allows("Holder", json!({"url":"é".repeat(6)})).unwrap());
+    assert!(allows("Limited", json!("é".repeat(5))).unwrap());
+    assert!(allows("Plain", json!({"again":{}})).unwrap());
+    assert!(allows("Listing", json!([{"url":"é".repeat(6)}])).unwrap());
+    assert!(allows("Missing", Value::Null).is_err());
+    assert!(
+        super::http_vectors::accepts(
+            &document,
+            &json!({"$ref":"https://elsewhere.invalid/x"}),
+            &Value::Null
+        )
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -700,8 +703,8 @@ fn management_openapi_http_vectors_seeds_add_declared_absent_optionals() {
     assert!(has(&cases, "/all", "optional added", false, |b| {
         b["all"] == json!(true) && b["ids"] == json!(["abcd"])
     }));
-    // The seeded value is walked too: its own flip is a vector.
-    assert!(has(&cases, "/all", "boolean flip", true, |b| b["all"]
+    // A cross-field-invalid addition is sent but cannot establish reach.
+    assert!(!has(&cases, "/all", "boolean flip", true, |b| b["all"]
         == json!(false)));
     // A seed for an undeclared or already present location is a harness error
     // that names the pointer.
@@ -720,7 +723,7 @@ fn management_openapi_http_vectors_seeds_add_declared_absent_optionals() {
     assert!(
         cases
             .iter()
-            .any(|c| c.accept && c.body == json!(["abcd", true]))
+            .any(|c| c.kind == "maxItems" && c.accept && c.body == json!(["abcd", true]))
     );
 }
 
@@ -1414,6 +1417,8 @@ fn management_openapi_http_vectors_report_union_arms_the_valid_body_did_not_matc
         unreached_in(&both, &object),
         vec![
             ("/oneOf/1".to_owned(), "union arm"),
+            ("/oneOf/1/maxItems".to_owned(), "array bound"),
+            ("/oneOf/1/minItems".to_owned(), "array bound"),
             ("/oneOf/1/prefixItems/0".to_owned(), "array element")
         ]
     );
@@ -2221,10 +2226,18 @@ fn at_most_9_bytes(b: &Code) -> bool {
     bytes_within(9, b)
 }
 fn under_9_bytes(b: &Code) -> bool {
-    bytes_within(8, b)
+    if b.code.is_ascii() {
+        bytes_within(9, b)
+    } else {
+        bytes_within(8, b)
+    }
 }
 fn at_most_10_bytes(b: &Code) -> bool {
-    bytes_within(10, b)
+    if b.code.is_ascii() {
+        bytes_within(9, b)
+    } else {
+        bytes_within(10, b)
+    }
 }
 
 #[tokio::test]
@@ -2266,12 +2279,12 @@ async fn management_openapi_http_vectors_byte_limits_are_probed_at_the_exact_byt
     for (check, kind, side) in [
         (
             under_9_bytes as fn(&Code) -> bool,
-            "maxLength",
+            "multibyte maxBytes",
             "schema accepts but handler refuses",
         ),
         (
             at_most_10_bytes,
-            "maxLength+1",
+            "multibyte maxBytes+1",
             "schema refuses but handler accepts",
         ),
     ] {
@@ -2376,8 +2389,8 @@ fn management_openapi_http_vectors_candidates_must_straddle_the_boundary() {
     assert!(text.contains("straddle") && text.contains("/n"), "{text}");
     // GREEN: fifteen and sixteen digits differ by one character.
     plan(&[("/n", json!("1".repeat(15))), ("/n", json!("1".repeat(16)))]).unwrap();
-    // A changed character straddles too: "0" accepted, "00" refused (one added).
-    plan(&[("/n", json!("0")), ("/n", json!("00"))]).unwrap();
+    // A leading-zero refusal does not exercise the fifteen-digit limit.
+    plan(&[("/n", json!("0")), ("/n", json!("00"))]).unwrap_err();
 }
 
 #[test]
@@ -2898,4 +2911,1410 @@ async fn management_openapi_integer_encoding_wire_spellings() {
     run_judged(&app, &document, json!({"n":2}), &[])
         .await
         .unwrap();
+}
+
+#[test]
+fn composed_patterns_and_formats_generate_each_boundary() {
+    let document = body_only(
+        json!({"type":"string","allOf":[{"pattern":"^[a-z]{1,8}$"},{"pattern":"^[a-z]{2,6}$"}]}),
+    );
+    let cases = cases_of(&document, &json!("abc"), &[]).unwrap();
+    assert!(cases.iter().any(|c| c.body == json!("abcabc") && c.accept));
+    let document = body_only(json!({"type":"string","format":"uri","allOf":[{"format":"uuid"}]}));
+    let cases = cases_of(
+        &document,
+        &json!("urn:uuid:123e4567-e89b-12d3-a456-426614174000"),
+        &[],
+    )
+    .unwrap();
+    for violation in ["not a uri", "not-a-uuid"] {
+        assert!(
+            cases.iter().any(|case| case.kind == "format violation"
+                && case.body == violation
+                && !case.accept)
+        );
+    }
+}
+
+#[test]
+fn repeated_seed_probes_past_an_implied_immediate_neighbour() {
+    let document = body_only(json!({"type":"string","pattern":"^(ab)+$","maxLength":64}));
+    let cases = cases_of(&document, &json!("ab"), &[]).unwrap();
+    assert!(
+        cases
+            .iter()
+            .any(|c| c.kind == "past maxLength" && c.body == json!("ab".repeat(33)) && !c.accept)
+    );
+}
+
+#[test]
+fn a_root_constraint_cannot_supply_a_vacuous_leaf_witness() {
+    let document = body_only(
+        json!({"type":"object","properties":{"v":{"type":"string","maxLength":4}},
+        "if":{"properties":{"v":{"const":"aaaa"}}},"then":false}),
+    );
+    let error = cases_of(&document, &json!({"v":"a"}), &[]).err().unwrap();
+    assert!(format!("{error:#}").contains("whole-request"));
+}
+
+#[test]
+fn null_values_do_not_cover_array_bounds_and_keyword_only_arms_are_walked() {
+    let document =
+        property_document(json!({"type":["null","array"],"maxItems":2,"items":{"type":"string"}}));
+    assert!(
+        unreached_in(&document, &reach_of(&document, &json!({"big":null}), &[]))
+            .iter()
+            .any(|(key, kind)| key == "/properties/big/maxItems" && *kind == "array bound")
+    );
+    let document = body_only(
+        json!({"type":"array","items":{"type":"integer","if":{"maximum":0},"then":{"minimum":-3},"else":{"maximum":8}}}),
+    );
+    let cases = cases_of(&document, &json!([-1, 1]), &[]).unwrap();
+    assert!(has(&cases, "/1", "maximum+1", false, |b| b[1] == 9));
+}
+
+#[test]
+fn dependent_property_coverage_needs_a_base_containing_both_names() {
+    let document = body_only(
+        json!({"type":"object","properties":{"period":{"type":"string"},"budget":{"type":"string"}},
+        "dependentRequired":{"period":["budget"]}}),
+    );
+    let only_budget = reach_of(&document, &json!({"budget":"50"}), &[]);
+    assert!(
+        unreached_in(&document, &only_budget)
+            .iter()
+            .any(|(_, kind)| *kind == "dependent property")
+    );
+    let both = json!({"period":"month","budget":"50"});
+    assert!(unreached_in(&document, &reach_of(&document, &both, &[])).is_empty());
+    assert!(has(
+        &cases_of(&document, &both, &[]).unwrap(),
+        "/budget",
+        "omitted",
+        false,
+        |b| b == &json!({"period":"month"})
+    ));
+}
+
+#[test]
+fn boundary_review_supplied_pairs_require_whole_request_witnesses() {
+    let schema = json!({"type":"object","properties":{"n":{"type":"string","pattern":"^(0|[1-9][0-9]{0,14})$"}},
+        "not":{"properties":{"n":{"const":"1".repeat(15)}}}});
+    let document = body_only(schema);
+    let plan = |digit: &str| {
+        super::http_vectors::body_plan(
+            &document,
+            &document["paths"][TEMPLATE]["post"],
+            &json!({"n":"1"}),
+            &[],
+            &[
+                ("/n".into(), json!(digit.repeat(15))),
+                ("/n".into(), json!(digit.repeat(16))),
+            ],
+        )
+    };
+    assert!(
+        format!("{:#}", plan("1").err().expect("both bodies are invalid")).contains("straddle")
+    );
+    let cases = plan("2").unwrap().cases;
+    for (length, accepted) in [(15, true), (16, false)] {
+        assert!(has(
+            &cases,
+            "/n",
+            "supplied candidate",
+            accepted,
+            |b| b["n"] == "2".repeat(length)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn boundary_review_formats_each_disagree_with_a_single_format_handler() {
+    let document = body_only(json!({"type":"string","format":"uri","allOf":[{"format":"uuid"}]}));
+    let base = json!("urn:uuid:123e4567-e89b-12d3-a456-426614174000");
+    let uri = |v: &String| reqwest::Url::parse(v).is_ok();
+    let uuid = |v: &String| uuid::Uuid::parse_str(v).is_ok();
+    let cases = cases_of(&document, &base, &[]).unwrap();
+    for (single, other) in [
+        (uri as fn(&String) -> bool, uuid as fn(&String) -> bool),
+        (uuid, uri),
+    ] {
+        let error = message(run_judged(&judge(single), &document, base.clone(), &[]).await);
+        assert!(
+            error.contains("format violation")
+                && error.contains("schema refuses but handler accepts"),
+            "{error}"
+        );
+        assert!(cases.iter().any(|case| {
+            !case.accept
+                && case.kind == "format violation"
+                && case
+                    .body
+                    .as_str()
+                    .is_some_and(|v| single(&v.to_string()) && !other(&v.to_string()))
+        }));
+    }
+    run_judged(
+        &judge::<String>(|v| reqwest::Url::parse(v).is_ok() && uuid::Uuid::parse_str(v).is_ok()),
+        &document,
+        base,
+        &[],
+    )
+    .await
+    .unwrap();
+}
+
+#[test]
+fn boundary_review_array_bounds_are_specific_to_each_conditional_arm() {
+    let document = body_only(
+        json!({"type":"object","properties":{"flag":{"type":"boolean"},"xs":{"type":["null","array"],"items":{"type":"string"}}},
+        "if":{"properties":{"flag":{"const":true}}},"then":{"properties":{"xs":{"maxItems":2}}},"else":{"properties":{"xs":{"maxItems":5}}}}),
+    );
+    let mut reached = reach_of(&document, &json!({"flag":true,"xs":["a"]}), &[]);
+    reached.extend(reach_of(&document, &json!({"flag":false,"xs":null}), &[]));
+    assert!(
+        unreached_paths(&document, &reached).contains(&"/else/properties/xs/maxItems".to_owned())
+    );
+    reached.extend(reach_of(&document, &json!({"flag":false,"xs":["b"]}), &[]));
+    assert!(unreached_paths(&document, &reached).is_empty());
+
+    let common = json!({"$ref":"#/components/schemas/Shared"});
+    let mut document = body_only(json!({
+        "type":"object","properties":{"flag":{"type":"boolean"},"xs":common},
+        "if":{"properties":{"flag":{"const":true}}},"then":{"properties":{"xs":common}}
+    }));
+    document["components"]["schemas"]["Shared"] = json!({
+        "type":"array","maxItems":2,"items":{"type":"string"}
+    });
+    let reached = reach_of(&document, &json!({"flag":false,"xs":["a"]}), &[]);
+    assert!(unreached_paths(&document, &reached).is_empty());
+}
+
+#[test]
+fn boundary_review_scalar_conditional_coverage_requires_both_arms() {
+    let document = body_only(
+        json!({"type":"array","items":{"type":"integer","if":{"maximum":0},"then":{"minimum":-3},"else":{"maximum":8}}}),
+    );
+    let negative = reach_of(&document, &json!([-1]), &[]);
+    assert!(unreached_paths(&document, &negative).contains(&"/items/else".to_owned()));
+    let positive = reach_of(&document, &json!([1]), &[]);
+    assert!(unreached_paths(&document, &positive).contains(&"/items/then".to_owned()));
+    assert!(unreached_paths(&document, &reach_of(&document, &json!([-1, 1]), &[])).is_empty());
+}
+
+#[test]
+fn boundary_review_finite_pattern_can_be_dominated_by_length() {
+    for (cap, edge) in [(Some(4), 4), (None, 8)] {
+        let mut schema = json!({"type":"string","pattern":"^(a|a{2,8})$"});
+        if let Some(cap) = cap {
+            schema["maxLength"] = json!(cap);
+        }
+        let document = body_only(schema);
+        let plan = super::http_vectors::body_plan(
+            &document,
+            &document["paths"][TEMPLATE]["post"],
+            &json!("a"),
+            &[],
+            &[
+                ("(root)".into(), json!("a".repeat(edge))),
+                ("(root)".into(), json!("a".repeat(edge + 1))),
+            ],
+        )
+        .unwrap();
+        assert_eq!(plan.notes.dominated_patterns, usize::from(cap.is_some()));
+    }
+}
+
+#[tokio::test]
+async fn boundary_review_query_uses_typed_value_to_select_the_integer_arm() {
+    let mut document = query_document();
+    document["paths"][TEMPLATE]["get"]["parameters"][0]["schema"] =
+        json!({"type":"string","anyOf":[{"type":"integer"},{"type":"string","maxLength":4}]});
+    let cases = query_cases(&document, &document["paths"][TEMPLATE]["get"], &base(), &[]).unwrap();
+    assert!(
+        cases
+            .iter()
+            .any(|c| c.param == "limit" && c.kind == "maxLength+1" && !c.accept)
+    );
+    document["paths"][TEMPLATE]["get"]["parameters"][0]["schema"] =
+        json!({"oneOf":[{"type":"integer","minimum":1,"maximum":4242},{"type":"boolean"}]});
+    let cases = query_cases(&document, &document["paths"][TEMPLATE]["get"], &base(), &[]).unwrap();
+    assert!(
+        cases
+            .iter()
+            .any(|c| c.param == "limit" && c.edit == Edit::Set("true".into()) && c.accept)
+    );
+    assert!(
+        cases
+            .iter()
+            .any(|c| c.param == "limit" && c.kind == "maximum+1" && !c.accept)
+    );
+    document["paths"][TEMPLATE]["get"]["parameters"][0]["schema"] =
+        json!({"type":"integer","minimum":1,"anyOf":[{"type":"integer","maximum":4242}]});
+    run(&query_app(EXACT), &document).await.unwrap();
+    let text = message(run(&query_app(Handler { max: 4243, ..EXACT }), &document).await);
+    assert!(
+        text.contains("maximum+1") && text.contains("schema refuses but handler accepts"),
+        "{text}"
+    );
+}
+
+#[test]
+fn supplied_counterfactual_preserves_whole_request_refusals() {
+    let digits = json!({"type":"string","pattern":"^(0|[1-9][0-9]{0,14})$"});
+    let mut document = body_only(json!({
+        "$ref":"#/components/schemas/Object",
+        "allOf":[{"$ref":"#/components/schemas/Guard"}]
+    }));
+    document["components"]["schemas"] = json!({
+        "Object":{"type":"object","properties":{"n":{"$ref":"#/components/schemas/Digits"}}},
+        "Digits":digits,
+        "Guard":{"not":{"properties":{"n":{"const":"1".repeat(16)}}}}
+    });
+    let plan = |doc: &Value, digit: &str| {
+        super::http_vectors::body_plan(
+            doc,
+            &doc["paths"][TEMPLATE]["post"],
+            &json!({"n":"1"}),
+            &[],
+            &[
+                ("/n".into(), json!(digit.repeat(15))),
+                ("/n".into(), json!(digit.repeat(16))),
+            ],
+        )
+    };
+    let original = &document["paths"][TEMPLATE]["post"]["requestBody"]["content"]["application/json"]
+        ["schema"];
+    let mut wider = document.clone();
+    wider["components"]["schemas"]["Digits"]["pattern"] = json!("^(0|[1-9][0-9]{0,15})$");
+    for digit in ["1", "2"] {
+        for (n, before, after) in [(15, true, true), (16, false, digit == "2")] {
+            let body = json!({"n":digit.repeat(n)});
+            assert_eq!(
+                super::http_vectors::accepts(&document, original, &body).unwrap(),
+                before
+            );
+            assert_eq!(
+                super::http_vectors::accepts(&wider, original, &body).unwrap(),
+                after
+            );
+        }
+    }
+    assert!(
+        plan(&document, "1")
+            .err()
+            .expect("the root guard still refuses sixteen ones")
+            .to_string()
+            .contains("straddle")
+    );
+    plan(&document, "2").unwrap();
+    document["components"]["schemas"]["Guard"] = json!({"not":{"properties":{"n":{
+        "const":"1".repeat(16),"not":{"$ref":"#/components/schemas/Digits"}
+    }}}});
+    assert!(plan(&document, "1").is_err());
+    plan(&document, "2").unwrap();
+    // An independent conjunct references the very same component.
+    document["components"]["schemas"]["Guard"] =
+        json!({"properties":{"n":{"$ref":"#/components/schemas/Digits"}}});
+    assert!(plan(&document, "2").is_err());
+}
+
+#[test]
+fn supplied_counterfactual_measures_byte_edges_in_bytes() {
+    let schema = json!({"type":"string","pattern":"^(é|é{2,8})$","x-omg-max-bytes":4});
+    let document = body_only(schema);
+    let plan = |left, right| {
+        super::http_vectors::body_plan(
+            &document,
+            &document["paths"][TEMPLATE]["post"],
+            &json!("é"),
+            &[],
+            &[
+                ("(root)".into(), json!(left)),
+                ("(root)".into(), json!(right)),
+            ],
+        )
+    };
+    assert!(plan("é", "éx").is_err());
+    assert_eq!(plan("éé", "ééé").unwrap().notes.dominated_patterns, 1);
+    let mixed = body_only(json!({"type":"string","pattern":"^[aé]{1,8}$","x-omg-max-bytes":10}));
+    let check = |left: &str, right: &str| {
+        super::http_vectors::body_plan(
+            &mixed,
+            &mixed["paths"][TEMPLATE]["post"],
+            &json!("a"),
+            &[],
+            &[
+                ("(root)".into(), json!(left)),
+                ("(root)".into(), json!(right)),
+            ],
+        )
+    };
+    // The byte cap can be crossed early, but eight ASCII characters still fit.
+    assert!(check("ééééé", "éééééé").is_err());
+    assert_eq!(
+        check("aaaaaaaa", "aaaaaaaaa")
+            .unwrap()
+            .notes
+            .dominated_patterns,
+        0
+    );
+}
+
+#[tokio::test]
+async fn supplied_counterfactual_query_coercion_uses_byte_aware_verdicts() {
+    let mut document = query_document();
+    let op = &mut document["paths"][TEMPLATE]["get"];
+    op["parameters"] = json!([parameter(
+        "limit",
+        false,
+        json!({"oneOf":[
+            {"type":"integer","minimum":1,"maximum":4242},{"type":"string","x-omg-max-bytes":1}
+        ]})
+    )]);
+    let plan = |base: &str| {
+        query_cases(
+            &document,
+            &document["paths"][TEMPLATE]["get"],
+            &[("limit".into(), base.into())],
+            &[],
+        )
+    };
+    assert!(plan("4243").is_err());
+    assert!(plan("ab").is_err());
+    // The exact one-byte spelling is the base request and is deduplicated.
+    let string_cases = plan("1").unwrap();
+    assert!(string_cases.iter().any(|c| c.kind == "maxBytes+1"));
+    assert!(string_cases.iter().all(|c| c.kind != "maximum+1"));
+    let app = Router::new().route(
+        TEMPLATE,
+        get(
+            |Query(q): Query<std::collections::HashMap<String, String>>| async move {
+                if q.get("limit").is_none_or(|s| {
+                    s.len() <= 1
+                        || s.parse::<i64>()
+                            .is_ok_and(|n| n.to_string() == *s && (1..=4242).contains(&n))
+                }) {
+                    StatusCode::OK
+                } else {
+                    StatusCode::BAD_REQUEST
+                }
+            },
+        ),
+    );
+    let seen = std::sync::Mutex::new(Vec::new());
+    run_query(
+        &document,
+        "GET",
+        TEMPLATE,
+        &[],
+        &async || ((), vec![("limit".into(), "10".into())]),
+        &async |_: &(), query: String| {
+            let request = Request::builder()
+                .uri(format!("{TEMPLATE}?{query}"))
+                .body(Body::empty())
+                .unwrap();
+            let captured = exchange(&app, "GET", request).await;
+            seen.lock().unwrap().push((query, captured.status));
+            Probe::from(captured)
+        },
+    )
+    .await
+    .unwrap();
+    let seen = seen.into_inner().unwrap();
+    assert!(seen.contains(&("limit=4242".into(), StatusCode::OK)));
+    assert!(seen.contains(&("limit=4243".into(), StatusCode::BAD_REQUEST)));
+}
+
+#[test]
+fn supplied_counterfactual_follows_array_and_map_use_sites() {
+    let digits = json!({"type":"string","pattern":"^[1-9]{1,15}$"});
+    for map in [
+        json!({"type":"object","patternProperties":{"^n":digits}}),
+        json!({"type":"object","additionalProperties":digits}),
+    ] {
+        let document =
+            body_only(json!({"type":"array","prefixItems":[{"type":"integer"}],"items":map}));
+        let plan = super::http_vectors::body_plan(
+            &document,
+            &document["paths"][TEMPLATE]["post"],
+            &json!([1,{"n":"2","next":"3"}]),
+            &[],
+            &[
+                ("/1/n".into(), json!("2".repeat(15))),
+                ("/1/n".into(), json!("2".repeat(16))),
+            ],
+        )
+        .unwrap();
+        assert!(plan.cases.iter().any(|case| !case.accept && case.body == json!([1,{"n":"2".repeat(16),"next":"3"}])));
+    }
+}
+
+#[test]
+fn supplied_width_edge_keeps_the_repeated_digit_class_and_prefix() {
+    let document = unbounded_pattern(json!({}));
+    let at = "2".repeat(15);
+    let plan = |over: String| {
+        super::http_vectors::body_plan(
+            &document,
+            &document["paths"][TEMPLATE]["post"],
+            &json!({"n":"2"}),
+            &[],
+            &[("/n".into(), json!(at)), ("/n".into(), json!(over))],
+        )
+    };
+    for malformed in [format!("{at}x"), format!("0{at}")] {
+        assert!(
+            plan(malformed).is_err(),
+            "widening the digit run still refuses this shape"
+        );
+    }
+    plan("2".repeat(16)).unwrap();
+}
+
+#[test]
+fn supplied_width_edge_accounts_for_bytes_beneath_a_character_cap() {
+    for (chars, bytes) in [(6, 8), (4, 4)] {
+        let schema = json!({"type":"string","pattern":"^(é|é{2,8})$","maxLength":chars,"x-omg-max-bytes":bytes});
+        let document = body_only(schema);
+        let at = "é".repeat(bytes / 2);
+        let plan = super::http_vectors::body_plan(
+            &document,
+            &document["paths"][TEMPLATE]["post"],
+            &json!("é"),
+            &[],
+            &[
+                ("(root)".into(), json!(at)),
+                ("(root)".into(), json!(format!("{at}é"))),
+            ],
+        )
+        .unwrap();
+        assert_eq!(plan.notes.dominated_patterns, 1);
+    }
+}
+
+#[test]
+fn supplied_width_edge_query_counterfactual_keeps_the_pattern() {
+    let mut document = query_document();
+    document["paths"][TEMPLATE]["get"]["parameters"] = json!([parameter(
+        "s",
+        true,
+        json!({"type":"string","pattern":"^(é|é{2,8})$","x-omg-max-bytes":4})
+    )]);
+    let plan = |over: &str| {
+        super::http_vectors::query_plan(
+            &document,
+            &document["paths"][TEMPLATE]["get"],
+            &[("s".into(), "é".into())],
+            &[],
+            &[("s".into(), "éé".into()), ("s".into(), over.into())],
+        )
+    };
+    assert!(
+        plan("ééx").is_err(),
+        "the same spelling still fails after relaxing the byte limit"
+    );
+    assert_eq!(plan("ééé").unwrap().notes.dominated_patterns, 1);
+}
+
+#[test]
+fn supplied_width_edge_reports_fixed_grammar_as_shape_only() {
+    let document = body_only(json!({"type":"string","pattern":"^(on|off)$"}));
+    let plan = super::http_vectors::body_plan(
+        &document,
+        &document["paths"][TEMPLATE]["post"],
+        &json!("on"),
+        &[],
+        &[
+            ("(root)".into(), json!("off")),
+            ("(root)".into(), json!("offx")),
+        ],
+    )
+    .unwrap();
+    assert_eq!(plan.notes.shape_only_patterns, 1);
+}
+
+#[test]
+fn supplied_width_edge_keeps_a_reachable_character_cap() {
+    let document = body_only(
+        json!({"type":"string","pattern":"^([aé]|[aé]{2,8})$","maxLength":6,"x-omg-max-bytes":8}),
+    );
+    let plan = |at: &str, over: &str| {
+        super::http_vectors::body_plan(
+            &document,
+            &document["paths"][TEMPLATE]["post"],
+            &json!("a"),
+            &[],
+            &[("(root)".into(), json!(at)), ("(root)".into(), json!(over))],
+        )
+    };
+    assert!(plan("éééé", "ééééé").is_err());
+    assert_eq!(
+        plan("aaaaaa", "aaaaaaa").unwrap().notes.dominated_patterns,
+        1
+    );
+}
+
+#[test]
+fn supplied_boundary_requires_an_accepted_string_for_a_query_pattern() {
+    let mut document = query_document();
+    document["paths"][TEMPLATE]["get"]["parameters"] = json!([parameter(
+        "s",
+        true,
+        json!({"type":["integer","string"],"pattern":"^a[0-9]{0,1}$"})
+    )]);
+    let plan = |at: &str| {
+        super::http_vectors::query_plan(
+            &document,
+            &document["paths"][TEMPLATE]["get"],
+            &[("s".into(), "a".into())],
+            &[],
+            &[("s".into(), at.into()), ("s".into(), "a12".into())],
+        )
+    };
+    assert!(
+        plan("12")
+            .err()
+            .expect("integer cannot witness a string edge")
+            .to_string()
+            .contains("straddle")
+    );
+    plan("a1").unwrap();
+}
+
+#[test]
+fn supplied_boundary_limits_total_regex_derivation_work() {
+    let count = 120;
+    let pattern = format!("^{}$", "a{0,1}".repeat(count));
+    let document = body_only(json!({"type":"string","pattern":pattern}));
+    let result = super::http_vectors::body_plan(
+        &document,
+        &document["paths"][TEMPLATE]["post"],
+        &json!("a"),
+        &[],
+        &[
+            ("(root)".into(), json!("a".repeat(count))),
+            ("(root)".into(), json!("a".repeat(count + 1))),
+        ],
+    );
+    assert!(
+        result
+            .err()
+            .expect("the cumulative variant size exceeds the budget")
+            .to_string()
+            .contains("regex derivation budget")
+    );
+}
+
+#[test]
+fn supplied_patterns_share_the_variant_budget_at_one_location() {
+    let count = 80;
+    let first = format!("^{}$", "a{0,1}".repeat(count));
+    let second = format!("^{}$", "[a]{0,1}".repeat(count));
+    // Each pattern fits separately. Widening all ranges in both exceeds 64 KiB.
+    assert!(count * first.len() < 65536 && count * second.len() < 65536);
+    let doc = body_only(json!({"type":"string","allOf":[{"pattern":first},{"pattern":second}]}));
+    let result = super::http_vectors::body_plan(
+        &doc,
+        &doc["paths"][TEMPLATE]["post"],
+        &json!("a"),
+        &[],
+        &[
+            ("(root)".into(), json!("a".repeat(count))),
+            ("(root)".into(), json!("a".repeat(count + 1))),
+        ],
+    );
+    let error = result
+        .err()
+        .expect("the attempted variants share one byte budget");
+    assert!(
+        error.to_string().contains("regex derivation budget"),
+        "{error}"
+    );
+}
+
+#[test]
+fn intermediate_width_generated_bounds_ignore_too_short_ascii_alternatives() {
+    let document = body_only(
+        json!({"type":"string","pattern":"^(a|é{2,8})$","maxLength":6,"x-omg-max-bytes":8}),
+    );
+    let plan = super::http_vectors::body_plan(
+        &document,
+        &document["paths"][TEMPLATE]["post"],
+        &json!("éé"),
+        &[],
+        &[],
+    )
+    .unwrap();
+    assert!(
+        plan.cases
+            .iter()
+            .any(|case| case.body == json!("éééé") && case.accept)
+    );
+}
+
+#[test]
+fn intermediate_width_supplied_pairs_respect_reachable_alternatives() {
+    for (pattern, ascii_at_six) in [("^(a|é{2,8})$", false), ("^([aé]|[aé]{2,8})$", true)] {
+        let document =
+            body_only(json!({"type":"string","pattern":pattern,"maxLength":6,"x-omg-max-bytes":8}));
+        let plan = |at: &str, past: &str| {
+            super::http_vectors::body_plan(
+                &document,
+                &document["paths"][TEMPLATE]["post"],
+                &json!("a"),
+                &[],
+                &[("(root)".into(), json!(at)), ("(root)".into(), json!(past))],
+            )
+        };
+        let bytes = plan("éééé", "ééééé");
+        if ascii_at_six {
+            assert!(
+                bytes
+                    .err()
+                    .expect("six ASCII characters fit")
+                    .to_string()
+                    .contains("straddle")
+            );
+            assert_eq!(
+                plan("aaaaaa", "aaaaaaa").unwrap().notes.dominated_patterns,
+                1
+            );
+        } else {
+            let bytes = bytes.unwrap();
+            assert_eq!(bytes.notes.dominated_patterns, 1);
+            assert!(
+                bytes
+                    .cases
+                    .iter()
+                    .any(|c| c.body == json!("ééééé") && !c.accept)
+            );
+        }
+    }
+}
+
+#[test]
+fn byte_dominance_keeps_the_character_edge_across_union_selections() {
+    let common = json!({"type":"string","maxLength":6,"x-omg-max-bytes":8});
+    let unicode = json!({"pattern":"^(a|é{2,8})$"});
+    let ascii = json!({"pattern":"^a{1,8}$"});
+    let mut scalar = common.clone();
+    scalar["anyOf"] = json!([unicode, ascii]);
+    let mut shorter = scalar.clone();
+    shorter["anyOf"][0]["pattern"] = json!("^(a|é{2,5})$");
+    for (schema, base, path) in [
+        (scalar, json!("a"), "(root)"),
+        (shorter, json!("a"), "(root)"),
+        (
+            json!({"type":"object","properties":{"n":common},"anyOf":[{"properties":{"n":unicode}},{"properties":{"n":ascii}}]}),
+            json!({"n":"a"}),
+            "/n",
+        ),
+        (
+            json!({"type":"array","items":common,"anyOf":[{"prefixItems":[unicode]},{"items":ascii}]}),
+            json!(["a"]),
+            "/0",
+        ),
+    ] {
+        let document = body_only(schema);
+        let plan = |pairs: &[(&str, &str)]| {
+            let candidates: Vec<_> = pairs
+                .iter()
+                .flat_map(|(at, over)| [*at, *over])
+                .map(|v| (path.to_owned(), json!(v)))
+                .collect();
+            super::http_vectors::body_plan(
+                &document,
+                &document["paths"][TEMPLATE]["post"],
+                &base,
+                &[],
+                &candidates,
+            )
+        };
+        assert!(
+            plan(&[("éééé", "ééééé")])
+                .err()
+                .expect("the ASCII edge remains reachable")
+                .to_string()
+                .contains("straddle"),
+            "{path}"
+        );
+        for pairs in [vec![], vec![("aaaaaa", "aaaaaaa")]] {
+            let planned = plan(&pairs).unwrap();
+            for (kind, text, accept) in [
+                ("maxLength", "aaaaaa", true),
+                ("maxLength+1", "aaaaaaa", false),
+            ] {
+                assert!(
+                    planned.cases.iter().any(|c| c.kind == kind
+                        && c.pointer == path
+                        && c.accept == accept
+                        && c.body.pointer(if path == "(root)" { "" } else { path })
+                            == Some(&json!(text))),
+                    "{path} {kind}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn byte_dominance_does_not_excuse_a_missing_generated_character_pair() {
+    let document = body_only(json!({"type":"string","maxLength":6,"x-omg-max-bytes":8,
+        "anyOf":[{"pattern":"^(a|é{2,8})$"},{"pattern":"^(a|b{1,8})$"}]}));
+    let result = super::http_vectors::body_plan(
+        &document,
+        &document["paths"][TEMPLATE]["post"],
+        &json!("a"),
+        &[],
+        &[],
+    );
+    assert!(
+        result
+            .err()
+            .expect("six b characters fit but the seed fills none")
+            .to_string()
+            .contains("maxLength@6")
+    );
+}
+
+#[test]
+fn byte_dominance_requires_the_contributing_cap_to_be_unconditional() {
+    let document = body_only(
+        json!({"type":"string","maxLength":6,"pattern":"^(a|[éê]{2,8})$",
+        "anyOf":[{"pattern":"^(a|é+)$","x-omg-max-bytes":8},{"pattern":"^(a|ê+)$"}]}),
+    );
+    let result = super::http_vectors::body_plan(
+        &document,
+        &document["paths"][TEMPLATE]["post"],
+        &json!("a"),
+        &[],
+        &[
+            ("(root)".into(), json!("éééé")),
+            ("(root)".into(), json!("ééééé")),
+        ],
+    );
+    assert!(
+        result
+            .err()
+            .expect("six uncapped ê fit")
+            .to_string()
+            .contains("straddle")
+    );
+}
+
+#[test]
+fn byte_dominance_keeps_conjunctive_ref_and_sibling_constraints() {
+    let referenced = json!({"$ref":"#/components/schemas/Chars"});
+    let cap = json!({"x-omg-max-bytes":8});
+    for (n, conjunct) in [
+        (
+            json!({"$ref":"#/components/schemas/Chars","allOf":[cap]}),
+            json!({}),
+        ),
+        (referenced, json!({"additionalProperties":cap})),
+    ] {
+        let mut document = body_only(
+            json!({"type":"object","properties":{"n":n}, "allOf":[conjunct],
+            "anyOf":[{"properties":{"n":{"minLength":1}}}, {"required":["other"]}]}),
+        );
+        document["components"]["schemas"]["Chars"] =
+            json!({"type":"string","maxLength":6,"pattern":"^(a|é{2,8})$"});
+        let plan = super::http_vectors::body_plan(
+            &document,
+            &document["paths"][TEMPLATE]["post"],
+            &json!({"n":"a"}),
+            &[],
+            &[("/n".into(), json!("éééé")), ("/n".into(), json!("ééééé"))],
+        )
+        .unwrap();
+        assert_eq!(plan.notes.dominated_patterns, 1);
+    }
+}
+
+#[test]
+fn byte_dominance_query_pairs_use_the_whole_parameter() {
+    let mut document = query_document();
+    let schema = json!({"type":"string","maxLength":6,"x-omg-max-bytes":8,
+        "anyOf":[{"pattern":"^(a|é{2,8})$"},{"pattern":"^a{1,8}$"}]});
+    document["paths"][TEMPLATE]["get"]["parameters"] =
+        json!([parameter("s", true, schema.clone())]);
+    for (keyword, at, past) in [
+        ("maxLength", "aaaaaa", "aaaaaaa"),
+        ("x-omg-max-bytes", "éééé", "ééééé"),
+    ] {
+        let mut relaxed = schema.clone();
+        relaxed.as_object_mut().unwrap().remove(keyword);
+        assert!(super::http_vectors::accepts(&document, &schema, &json!(at)).unwrap());
+        assert!(!super::http_vectors::accepts(&document, &schema, &json!(past)).unwrap());
+        assert!(super::http_vectors::accepts(&document, &relaxed, &json!(past)).unwrap());
+    }
+    let plan = |at: &str, past: &str| {
+        super::http_vectors::query_plan(
+            &document,
+            &document["paths"][TEMPLATE]["get"],
+            &[("s".into(), "a".into())],
+            &[],
+            &[("s".into(), at.into()), ("s".into(), past.into())],
+        )
+    };
+    assert!(
+        plan("éééé", "ééééé")
+            .err()
+            .expect("the byte cap leaves the ASCII character edge reachable")
+            .to_string()
+            .contains("straddle")
+    );
+    plan("aaaaaa", "aaaaaaa").unwrap();
+}
+
+#[test]
+fn byte_dominance_retains_type_disjoint_parent_wire_forms() {
+    let leaf = json!({"type":"string","maxLength":6,"x-omg-max-bytes":8,"pattern":"^(a|é{2,8})$"});
+    let document = body_only(json!({"oneOf":[
+        {"type":"object","properties":{"n":leaf}}, {"type":"array","prefixItems":[leaf]}
+    ]}));
+    for (body, path) in [(json!({"n":"a"}), "/n"), (json!(["a"]), "/0")] {
+        let plan = super::http_vectors::body_plan(
+            &document,
+            &document["paths"][TEMPLATE]["post"],
+            &body,
+            &[],
+            &[(path.into(), json!("éééé")), (path.into(), json!("ééééé"))],
+        )
+        .unwrap();
+        assert_eq!(plan.notes.dominated_patterns, 1);
+    }
+}
+
+fn overlapping_byte_arms(keyword: &str) -> Value {
+    json!({"type":"string","maxLength":6,keyword:[
+        {"pattern":"^(a|é+)$","x-omg-max-bytes":8},{"pattern":"^(a|[éê]+)$"}
+    ]})
+}
+
+#[test]
+fn keyword_scope_evaluates_the_complete_applicator() {
+    let limited = json!({"x-omg-max-bytes":8});
+    for (schema, expected) in [
+        (overlapping_byte_arms("anyOf"), [true, true, false]),
+        (overlapping_byte_arms("allOf"), [true, false, false]),
+        (overlapping_byte_arms("oneOf"), [false, true, false]),
+        (json!({"not":limited}), [false, true, true]),
+        (
+            json!({"if":limited,"then":false,"else":{"maxLength":6}}),
+            [false, true, false],
+        ),
+    ] {
+        let mut document = body_only(json!({}));
+        document["components"]["schemas"]["Text"] = schema.clone();
+        let nested = json!({"type":"object","properties":{"entries":{"type":"array","items":{"$ref":"#/components/schemas/Text"}}}});
+        for (length, accept) in [4, 6, 7].into_iter().zip(expected) {
+            let text = "é".repeat(length);
+            assert_eq!(
+                super::http_vectors::accepts(&document, &nested, &json!({"entries":[text]}))
+                    .unwrap(),
+                accept,
+                "{schema} at {length}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn keyword_scope_query_checks_overlapping_arms_over_loopback() {
+    let mut document = query_document();
+    document["paths"][TEMPLATE]["get"]["parameters"] =
+        json!([parameter("s", true, overlapping_byte_arms("anyOf"))]);
+    for global_cap in [false, true] {
+        let app = Router::new().route(
+            TEMPLATE,
+            get(
+                move |Query(q): Query<std::collections::HashMap<String, String>>| async move {
+                    if q.get("s").is_some_and(|s| {
+                        (s == "a" || (!s.is_empty() && s.chars().all(|c| matches!(c, 'é' | 'ê'))))
+                            && s.chars().count() <= 6
+                            && (!global_cap || s.len() <= 8)
+                    }) {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}{TEMPLATE}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let result = run_query(
+            &document,
+            "GET",
+            TEMPLATE,
+            &[],
+            &async || ((), vec![("s".into(), "é".into())]),
+            &async |_: &(), query: String| {
+                let reply = client.get(format!("{url}?{query}")).send().await.unwrap();
+                let status = reply.status();
+                seen.lock().unwrap().push((query, status));
+                Probe::from(Captured {
+                    status,
+                    headers: reply.headers().clone(),
+                    bytes: reply.bytes().await.unwrap(),
+                    method: "GET".into(),
+                    template: Some(TEMPLATE.into()),
+                    query: vec![],
+                })
+            },
+        )
+        .await;
+        server.abort();
+        let seen = seen.into_inner().unwrap();
+        let at = format!("s={}", "%C3%A9".repeat(6));
+        if global_cap {
+            assert!(message(result).contains("schema accepts but handler refuses"));
+            assert!(seen.contains(&(at, StatusCode::BAD_REQUEST)));
+        } else {
+            result.unwrap();
+            assert!(seen.contains(&(at, StatusCode::OK)));
+            assert!(seen.contains(&(format!("s={}", "%C3%A9".repeat(7)), StatusCode::BAD_REQUEST)));
+        }
+    }
+}
+
+fn sibling_cap_schema(cap: &str) -> Value {
+    json!({"type":"string","anyOf":[{"pattern":"^(a|b{1,4})$"},{"pattern":"^a+$",cap:4}]})
+}
+
+fn check_empty_pattern_candidates(plan: impl Fn(Value) -> anyhow::Result<()>) {
+    let mut missing = Vec::new();
+    for cap in ["maxLength", "x-omg-max-bytes"] {
+        let mut schema = sibling_cap_schema(cap);
+        match plan(schema.clone()) {
+            Ok(()) => missing.push(cap),
+            Err(error) => assert!(
+                error.to_string().contains("supply boundary candidates"),
+                "{cap}: {error}"
+            ),
+        }
+        let reason = json!("The handler fixture checks this pattern's length boundary.");
+        let mut annotated = schema.clone();
+        annotated["anyOf"][1]["x-omg-pattern-boundaries"] = reason.clone();
+        let error =
+            plan(annotated).expect_err("a sibling annotation cannot excuse the finite pattern");
+        assert!(
+            error.to_string().contains("supply boundary candidates"),
+            "{error}"
+        );
+
+        assert!(error.to_string().contains("is stale"), "{error}");
+
+        let mut annotated_owner = schema.clone();
+        annotated_owner["anyOf"][0]["x-omg-pattern-boundaries"] = reason;
+        plan(annotated_owner).expect("the exemption belongs to the finite pattern");
+        let mut shared = schema.clone();
+        shared["anyOf"][0][cap] = json!(4);
+        plan(shared.clone()).expect("every string arm has the same cap");
+        shared["anyOf"][0][cap] = json!(5);
+        let error = plan(shared).expect_err("different caps cannot establish one common boundary");
+        assert!(
+            error.to_string().contains("supply boundary candidates"),
+            "{cap}: {error}"
+        );
+        schema["anyOf"][1].as_object_mut().unwrap().remove(cap);
+        schema[cap] = json!(4);
+        plan(schema).unwrap();
+    }
+    assert!(
+        missing.is_empty(),
+        "sibling caps waived the pattern evidence: {missing:?}"
+    );
+}
+
+#[test]
+fn empty_pattern_candidates_require_owned_bounds_for_body() {
+    check_empty_pattern_candidates(|schema| {
+        let doc = body_only(schema);
+        super::http_vectors::body_plan(&doc, &doc["paths"][TEMPLATE]["post"], &json!("a"), &[], &[])
+            .map(|_| ())
+    });
+}
+
+#[test]
+fn empty_pattern_candidates_require_owned_bounds_for_query() {
+    check_empty_pattern_candidates(|schema| {
+        let mut doc = query_document();
+        doc["paths"][TEMPLATE]["get"]["parameters"] = json!([parameter("s", true, schema)]);
+        super::http_vectors::query_plan(
+            &doc,
+            &doc["paths"][TEMPLATE]["get"],
+            &[("s".into(), "a".into())],
+            &[],
+            &[],
+        )
+        .map(|_| ())
+    });
+}
+
+fn check_supplied_pattern_ownership(plan: impl Fn(Value, &[&str]) -> anyhow::Result<()>) {
+    let a = "^(a+|b+)$";
+    let b = "^(a|[ab]{1,4})$";
+    let schema = json!({"type":"string","allOf":[{"pattern":a},{"pattern":b}]});
+    let b_pair = ["bbbb", "bbbbb"];
+    let a_pair = ["aaa", "aba"];
+    let document = body_only(schema.clone());
+    let accepts = |rule: &Value, text: &str| {
+        super::http_vectors::accepts(&document, rule, &json!(text)).unwrap()
+    };
+    for text in b_pair {
+        assert!(accepts(&schema["allOf"][0], text));
+    }
+    assert!(accepts(&schema, b_pair[0]));
+    assert!(!accepts(&schema, b_pair[1]));
+    let mut widened = schema.clone();
+    widened["allOf"][1]["pattern"] = json!("^(a|[ab]{1,5})$");
+    assert!(accepts(&widened, b_pair[1]));
+    for text in a_pair {
+        assert!(accepts(&schema["allOf"][1], text));
+    }
+
+    let mut exempt_a = schema.clone();
+    exempt_a["allOf"][0]["x-omg-pattern-boundaries"] =
+        json!("Separate shape coverage for uniform runs.");
+    let missing = plan(exempt_a.clone(), &[]).unwrap_err().to_string();
+    assert!(
+        missing.contains("supply boundary candidates") && !missing.contains("is stale"),
+        "{missing}"
+    );
+    plan(exempt_a.clone(), &b_pair).expect("B's width witness leaves A's exemption necessary");
+    let wrong = plan(exempt_a.clone(), &a_pair).unwrap_err().to_string();
+    assert!(
+        wrong.contains("supply boundary candidates") && wrong.contains("is stale"),
+        "{wrong}"
+    );
+    exempt_a["allOf"][1]["x-omg-pattern-boundaries"] = json!("Separate length coverage.");
+    let stale = plan(exempt_a, &b_pair).unwrap_err().to_string();
+    assert!(
+        stale.contains("is stale") && !stale.contains("supply boundary candidates"),
+        "{stale}"
+    );
+    plan(schema, &[a_pair[0], a_pair[1], b_pair[0], b_pair[1]])
+        .expect("both independent witnesses cover both patterns");
+}
+
+// One reference independently refuses five b's. Widening the other reference's
+// pattern can admit that value, even though both resolve to the same component.
+fn check_referenced_pattern_ownership(plan: impl Fn(Value, &[&str]) -> anyhow::Result<()>) {
+    let usage = json!({"$ref":"#/components/schemas/Width"});
+    let mut schema = json!({"type":"string","anyOf":[usage,usage]});
+    schema["anyOf"][1]["not"] = json!({"const":"bbbbb"});
+    let missing = plan(schema.clone(), &["bbbb", "bbbbb"])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        missing.contains("supply boundary candidates") && !missing.contains("is stale"),
+        "{missing}"
+    );
+    let reason = json!("The guarded use has separate fixture coverage.");
+    schema["anyOf"][1]["x-omg-pattern-boundaries"] = reason.clone();
+    plan(schema.clone(), &["bbbb", "bbbbb"])
+        .expect("the reference without the guard owns the supplied witness");
+    schema["anyOf"][1]
+        .as_object_mut()
+        .unwrap()
+        .remove("x-omg-pattern-boundaries");
+    schema["anyOf"][0]["x-omg-pattern-boundaries"] = reason;
+    let error = plan(schema, &["bbbb", "bbbbb"]).unwrap_err().to_string();
+    assert!(
+        error.contains("is stale") && error.contains("supply boundary candidates"),
+        "{error}"
+    );
+}
+
+#[test]
+fn supplied_pattern_ownership_for_body() {
+    let plan = |schema, values: &[&str]| {
+        let mut document = body_only(schema);
+        document["components"]["schemas"]["Width"] = json!({"pattern":"^(a|b{1,4})$"});
+        let candidates = values
+            .iter()
+            .map(|s| ("(root)".into(), json!(s)))
+            .collect::<Vec<_>>();
+        super::http_vectors::body_plan(
+            &document,
+            &document["paths"][TEMPLATE]["post"],
+            &json!("a"),
+            &[],
+            &candidates,
+        )
+        .map(|_| ())
+    };
+    check_supplied_pattern_ownership(plan);
+    check_referenced_pattern_ownership(plan);
+}
+
+#[test]
+fn supplied_pattern_ownership_across_valid_body_contexts() {
+    let document = body_only(json!({"type":"object","required":["mode","s"],
+        "properties":{"mode":{"enum":["limited","free"]},"s":{"type":"string","pattern":"^(a+|b+)$"}},
+        "if":{"properties":{"mode":{"const":"limited"}}},
+        "then":{"properties":{"s":{"pattern":"^(a{1,4}|b{1,4})$"}}}
+    }));
+    let plan = |seeds: &[(String, Value)]| {
+        super::http_vectors::body_plan(
+            &document,
+            &document["paths"][TEMPLATE]["post"],
+            &json!({"mode":"limited","s":"a"}),
+            seeds,
+            &["aaaa", "aaaaa", "aaa", "aba"].map(|s| ("/s".into(), json!(s))),
+        )
+    };
+    assert!(
+        plan(&[])
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("supply boundary candidates")
+    );
+    let free = json!({"mode":"free","s":"a"});
+    let cases = plan(&[("".into(), free.clone())]).unwrap().cases;
+    assert!(cases.iter().any(|case| case.body == free && case.accept));
+    for (mode, value, accept) in [
+        ("limited", "aaaa", true),
+        ("limited", "aaaaa", false),
+        ("free", "aaa", true),
+        ("free", "aba", false),
+    ] {
+        assert!(
+            cases
+                .iter()
+                .any(|case| case.body == json!({"mode":mode,"s":value}) && case.accept == accept)
+        );
+    }
+    let error = plan(&[("".into(), json!({"mode":"free","s":"aba"}))])
+        .err()
+        .unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("alternate request body must satisfy its schema")
+    );
+}
+
+#[test]
+fn supplied_pattern_ownership_for_query() {
+    let plan = |schema, values: &[&str]| {
+        let mut document = query_document();
+        document["components"]["schemas"]["Width"] = json!({"pattern":"^(a|b{1,4})$"});
+        document["paths"][TEMPLATE]["get"]["parameters"] = json!([parameter("s", true, schema)]);
+        let candidates = values
+            .iter()
+            .map(|s| ("s".into(), (*s).into()))
+            .collect::<Vec<_>>();
+        super::http_vectors::query_plan(
+            &document,
+            &document["paths"][TEMPLATE]["get"],
+            &[("s".into(), "a".into())],
+            &[],
+            &candidates,
+        )
+        .map(|_| ())
+    };
+    check_supplied_pattern_ownership(plan);
+    check_referenced_pattern_ownership(plan);
+}
+
+#[test]
+fn empty_pattern_candidates_preserve_only_fixed_conditional_caps() {
+    for (guard, expected) in [("kind", true), ("s", false)] {
+        let doc = body_only(json!({
+            "type":"object", "required":["s","kind"],
+            "properties":{"s":sibling_cap_schema("maxLength"),"kind":{"type":"string"}},
+            "if":{"properties":{guard:{"const":"a"}},"required":[guard]},
+            "then":{"properties":{"s":{"maxLength":4}}}
+        }));
+        let plan = super::http_vectors::body_plan(
+            &doc,
+            &doc["paths"][TEMPLATE]["post"],
+            &json!({"kind":"a","s":"a"}),
+            &[],
+            &[],
+        );
+        if expected {
+            plan.unwrap();
+        } else {
+            let error = plan
+                .err()
+                .expect("the substituted string can change its own guard");
+            assert!(
+                error.to_string().contains("supply boundary candidates"),
+                "{error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn keyword_scope_sibling_cap_cannot_witness_the_finite_pattern() {
+    let schema = sibling_cap_schema("maxLength");
+    let body = body_only(schema.clone());
+    let mut query = query_document();
+    query["paths"][TEMPLATE]["get"]["parameters"] = json!([parameter("s", true, schema.clone())]);
+    let mut uncapped = schema.clone();
+    uncapped["anyOf"][1]
+        .as_object_mut()
+        .unwrap()
+        .remove("maxLength");
+    let mut wider = schema.clone();
+    wider["anyOf"][0]["pattern"] = json!("^(a|b{1,5})$");
+    for (text, uncapped_ok, wider_ok) in [("aaaaa", true, false), ("bbbbb", false, true)] {
+        for (variant, ok) in [
+            (&schema, false),
+            (&uncapped, uncapped_ok),
+            (&wider, wider_ok),
+        ] {
+            assert_eq!(
+                super::http_vectors::accepts(&body, variant, &json!(text)).unwrap(),
+                ok
+            );
+        }
+    }
+    for (ch, credit) in [("a", false), ("b", true)] {
+        let at = ch.repeat(4);
+        let over = ch.repeat(5);
+        let body_plan = super::http_vectors::body_plan(
+            &body,
+            &body["paths"][TEMPLATE]["post"],
+            &json!("a"),
+            &[],
+            &[("(root)".into(), json!(at)), ("(root)".into(), json!(over))],
+        );
+        let query_plan = super::http_vectors::query_plan(
+            &query,
+            &query["paths"][TEMPLATE]["get"],
+            &[("s".into(), "a".into())],
+            &[],
+            &[("s".into(), at), ("s".into(), over)],
+        );
+        for result in [body_plan.map(|p| p.notes), query_plan.map(|p| p.notes)] {
+            if credit {
+                assert_eq!(result.unwrap().dominated_patterns, 0);
+            } else {
+                assert!(
+                    result
+                        .err()
+                        .expect("only the sibling cap was tested")
+                        .to_string()
+                        .contains("straddle")
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn supplied_query_witness_must_be_accepted_on_the_wire() {
+    let schema = json!({"type":["string","integer"],"pattern":"^(-0+|a+)$"});
+    let mut document = query_document();
+    document["paths"][TEMPLATE]["get"]["parameters"] = json!([parameter("s", false, schema)]);
+    let plan = |doc: &Value, pair: [&str; 2]| {
+        super::http_vectors::query_plan(
+            doc,
+            &doc["paths"][TEMPLATE]["get"],
+            &[],
+            &[("s".into(), "a".into())],
+            &pair.map(|s| ("s".into(), s.into())),
+        )
+    };
+    let error = plan(&document, ["-0", "-0x"])
+        .err()
+        .expect("the HTTP runner requires a refusal for bare negative zero");
+    assert!(error.to_string().contains("straddle"), "{error}");
+    let cases = plan(&document, ["a", "ax"]).unwrap().cases;
+    assert!(cases.iter().any(|case| case.edit == Edit::Set("-0".into())
+        && case.kind == "integer encoding bare negative zero"
+        && case.accept));
+    document["x-omg-integer-encoding-query-exceptions"] = json!({"s":["-0"]});
+    let cases = plan(&document, ["-0", "-0x"]).unwrap().cases;
+    assert!(cases.iter().any(|case| case.edit == Edit::Set("-0".into())
+        && case.kind == "query negative zero literal"
+        && case.accept));
+}
+
+#[test]
+fn supplied_query_witness_must_fit_the_encoded_request() {
+    let schema = json!({"type":"string","allOf":[
+        {"pattern":"^(é+|é+b)$"},{"pattern":"^(é+|é+c)$"}
+    ]});
+    let mut document = query_document();
+    document["paths"][TEMPLATE]["get"]["parameters"] = json!([parameter("s", false, schema)]);
+    let plan = |values: &[&str]| {
+        let candidates = values
+            .iter()
+            .map(|s| ("s".into(), (*s).into()))
+            .collect::<Vec<_>>();
+        super::http_vectors::query_plan(
+            &document,
+            &document["paths"][TEMPLATE]["get"],
+            &[],
+            &[("s".into(), "é".into())],
+            &candidates,
+        )
+    };
+    let long = "é".repeat(10_000);
+    let over = format!("{long}c");
+    let error = plan(&["é", "éb", &long, &over])
+        .err()
+        .expect("the encoded A witness exceeds the query budget");
+    assert!(
+        error.to_string().contains("supply boundary candidates"),
+        "{error}"
+    );
+    let cases = plan(&["é", "éb", "éc", &long, &over]).unwrap().cases;
+    for (value, accept) in [("é", true), ("éb", false), ("éc", false)] {
+        assert!(
+            cases
+                .iter()
+                .any(|case| case.edit == Edit::Set(value.into()) && case.accept == accept)
+        );
+    }
+    assert!(
+        !cases
+            .iter()
+            .any(|case| matches!(&case.edit, Edit::Set(s) if s == &long || s == &over))
+    );
+}
+
+#[test]
+fn supplied_body_witness_can_be_masked_in_one_valid_base() {
+    let doc = body_only(json!({"type":"object","required":["mode","s"],
+        "properties":{"mode":{"enum":["fixed","free"]},"s":{"type":"string","pattern":"^(a+|b+)$"}},
+        "if":{"properties":{"mode":{"const":"fixed"}}},"then":{"properties":{"s":{"const":"aaa"}}}
+    }));
+    let base = |mode: &str| json!({"mode":mode,"s":"aaa"});
+    let plan = |mode: &str, seeds: &[(String, Value)]| {
+        super::http_vectors::body_plan(
+            &doc,
+            &doc["paths"][TEMPLATE]["post"],
+            &base(mode),
+            seeds,
+            &["aaa", "aba"].map(|v| ("/s".into(), json!(v))),
+        )
+    };
+    assert!(
+        plan("fixed", &[])
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("straddle")
+    );
+    for (first, other) in [("fixed", "free"), ("free", "fixed")] {
+        let cases = plan(first, &[("".into(), base(other))]).unwrap().cases;
+        assert!(
+            cases
+                .iter()
+                .any(|c| c.body == json!({"mode":"free","s":"aba"}) && !c.accept)
+        );
+    }
 }

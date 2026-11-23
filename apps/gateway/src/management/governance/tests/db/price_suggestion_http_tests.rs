@@ -18,14 +18,14 @@ impl Drop for Server {
     }
 }
 
-async fn session(pool: &PgPool, id: Uuid, email: &str) -> String {
+async fn session(pool: &PgPool, id: Uuid, email: &str) -> (String, String) {
     let cookie = crate::entropy::hex_token().unwrap();
     let csrf = crate::entropy::hex_token().unwrap();
     sqlx::query("INSERT INTO browser_sessions(token_hash,user_id,csrf_hash,expires_at,verified_email,last_seen_at) VALUES($1,$2,$3,now()+interval '1 hour',$4,now())")
         .bind(Sha256::digest(cookie.as_bytes()).as_slice()).bind(id)
         .bind(Sha256::digest(csrf.as_bytes()).as_slice()).bind(email)
         .execute(pool).await.unwrap();
-    format!("omg_session={cookie}")
+    (format!("omg_session={cookie}"), csrf)
 }
 
 #[dbtest::test]
@@ -52,6 +52,8 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
                     {"id":"v/m","context_length":4096,"top_provider":{"max_completion_tokens":100},"pricing":{"prompt":"3","completion":"3","input_cache_write":"1e400","overrides":[{"min_prompt_tokens":1,"input_cache_write":"0"}]}},
                     {"id":"v/large","context_length":4096,"top_provider":{"max_completion_tokens":100},"pricing":{"prompt":"1","overrides":tiers}},
                     {"id":"v/cold","pricing":{"prompt":"1"}},
+                    tiered_model("v/incomplete-free", "0"),
+                    tiered_model("v/incomplete-paid", "0.000001"),
                     {"id":"v/image"},
                     {"id":"v/endpoint-large","context_length":4096,"top_provider":{"max_completion_tokens":100},"pricing":{"prompt":"1","completion":"2"}},
                     {"id":"v/endpoint-deep","context_length":4096,"top_provider":{"max_completion_tokens":100},"pricing":{"prompt":"1","completion":"2"}},
@@ -122,6 +124,14 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
     sqlx::query("INSERT INTO provider_connections(id,name,provider,credential_ref,endpoint,enabled) VALUES($1,'Preview','openrouter','env:NOT_USED','https://openrouter.ai/api/v1',false)").bind(connection).execute(&f.store.pool).await.unwrap();
     sqlx::query("INSERT INTO models(id,public_name,supported_protocols) VALUES($1,'preview',ARRAY['chat_completions'])").bind(model).execute(&f.store.pool).await.unwrap();
     sqlx::query("INSERT INTO deployments(id,model_id,provider_connection_id,upstream_model) VALUES($1,$3,$4,'v/m'),($2,$3,$4,'v/large'),($5,$3,$4,'v/tiers'),($6,$3,$4,'v/cold')").bind(deployment).bind(large).bind(model).bind(connection).bind(tiered).bind(cold).execute(&f.store.pool).await.unwrap();
+    let incomplete_tiers = [
+        (Uuid::new_v4(), "v/incomplete-free", "0"),
+        (Uuid::new_v4(), "v/incomplete-paid", "1000000"),
+    ];
+    for (id, upstream, _) in incomplete_tiers {
+        sqlx::query("INSERT INTO deployments(id,model_id,provider_connection_id,upstream_model) VALUES($1,$2,$3,$4)")
+            .bind(id).bind(model).bind(connection).bind(upstream).execute(&f.store.pool).await.unwrap();
+    }
     let endpoint_large = Uuid::new_v4();
     sqlx::query("INSERT INTO deployments(id,model_id,provider_connection_id,upstream_model) VALUES($1,$2,$3,'v/endpoint-large')")
         .bind(endpoint_large).bind(model).bind(connection).execute(&f.store.pool).await.unwrap();
@@ -158,8 +168,8 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
             .await
             .unwrap();
     assert_eq!(before.len(), 1);
-    let admin_cookie = session(&f.store.pool, f.owner, "owner@test.invalid").await;
-    let member_cookie = session(&f.store.pool, f.other, "member@test.invalid").await;
+    let (admin_cookie, csrf) = session(&f.store.pool, f.owner, "owner@test.invalid").await;
+    let (member_cookie, _) = session(&f.store.pool, f.other, "member@test.invalid").await;
     // The allowlist and SET ROLE match the runtime HTTP acceptance fixtures.
     sqlx::raw_sql(include_str!(
         "../../../../../tests/common/ensure_runtime_role.sql"
@@ -391,6 +401,98 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    let mut published = Vec::new();
+    let mut imported_input = Vec::new();
+    for (id, _, base_amount) in incomplete_tiers {
+        let deployment_url = format!("{gateway_url}/api/v1/platform/deployments/{id}");
+        let preview = client
+            .get(format!("{deployment_url}/price-suggestion"))
+            .header("cookie", &admin_cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(preview.status(), StatusCode::OK);
+        let preview: Value = preview.json().await.unwrap();
+        let publish = |body: Value| {
+            client
+                .post(format!("{deployment_url}/prices"))
+                .header("cookie", &admin_cookie)
+                .header("origin", "http://127.0.0.1:3000")
+                .header("x-csrf-token", &csrf)
+                .json(&body)
+                .send()
+        };
+        let draft = &preview["draft"];
+        let mut omitted = draft.clone();
+        omitted["price_lines"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|line| line["meter"] != "input_tokens");
+        let refusal = publish(omitted).await.unwrap();
+        assert_eq!(refusal.status(), StatusCode::BAD_REQUEST);
+        let error = refusal.json::<Value>().await.unwrap();
+        assert_eq!(error["error"]["reason"], "price_meters_incomplete");
+        assert_eq!(error["error"]["missing_meters"], json!(["input_tokens"]));
+
+        // Direct clients can submit the draft as-is. The unknown meter must
+        // be stored without any rate, so larger prompts cannot use the base.
+        let response = publish(draft.clone()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let price_id: Uuid =
+            serde_json::from_value(response.json::<Value>().await.unwrap()["id"].clone()).unwrap();
+        published.push(price_id);
+
+        assert_eq!(preview["needs_review"], true);
+        let annotated = preview["lines"].as_array().unwrap();
+        for (threshold, amount) in [
+            (Value::Null, json!(base_amount)),
+            (json!(200), Value::Null),
+            (json!(300), json!("2000000")),
+        ] {
+            assert!(
+                annotated.iter().any(|line| line["meter"] == "input_tokens"
+                    && line["min_prompt_tokens"] == threshold
+                    && line["microusd_per_batch"] == amount),
+                "{preview}"
+            );
+        }
+        let draft_input: Vec<_> = draft["price_lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|line| line["meter"] == "input_tokens")
+            .cloned()
+            .collect();
+        let stored: Vec<Value> =
+            sqlx::query_scalar("SELECT price_lines FROM deployment_prices WHERE deployment_id=$1")
+                .bind(id)
+                .fetch_all(&f.store.pool)
+                .await
+                .unwrap();
+        assert_eq!(stored.len(), 1);
+        let stored_lines = stored[0].as_array().unwrap();
+        let stored_input: Vec<_> = stored_lines
+            .iter()
+            .filter(|line| line["meter"] == "input_tokens")
+            .cloned()
+            .collect();
+        imported_input.push((base_amount, draft_input, stored_input));
+        assert!(
+            stored_lines
+                .iter()
+                .any(|line| line["meter"] == "output_tokens"
+                    && line["min_prompt_tokens"] == 200
+                    && line["microusd_per_batch"] == "3000000")
+        );
+    }
+    let unknown_input = vec![json!({"meter":"input_tokens","unknown":true})];
+    assert_eq!(
+        imported_input,
+        [
+            ("0", unknown_input.clone(), vec![]),
+            ("1000000", unknown_input, vec![]),
+        ]
+    );
     let uncached_url = format!("{gateway_url}/api/v1/platform/deployments/{cold}/price-suggestion");
     let before_denials = all_requests.load(Ordering::SeqCst);
     // A stale browser session cannot retain admin authority after revocation.
@@ -429,11 +531,29 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
     assert_eq!(r.status(), StatusCode::FORBIDDEN);
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(all_requests.load(Ordering::SeqCst), before_denials);
-    let after: Vec<Value> =
-        sqlx::query_scalar("SELECT to_jsonb(p) FROM deployment_prices p ORDER BY id")
-            .fetch_all(&f.store.pool)
-            .await
-            .unwrap();
+    let after: Vec<Value> = sqlx::query_scalar(
+        "SELECT to_jsonb(p) FROM deployment_prices p WHERE NOT (id=ANY($1)) ORDER BY id",
+    )
+    .bind(&published)
+    .fetch_all(&f.store.pool)
+    .await
+    .unwrap();
     assert_eq!(after, before);
     runtime.close().await;
+}
+
+fn tiered_model(id: &str, prompt: &str) -> Value {
+    json!({
+        "id": id,
+        "context_length": 4096,
+        "top_provider": {"max_completion_tokens": 100},
+        "pricing": {
+            "prompt": prompt,
+            "completion": "0.000001",
+            "overrides": [
+                {"min_prompt_tokens": 200, "prompt": "1e400", "completion": "0.000003"},
+                {"min_prompt_tokens": 300, "prompt": "0.000002"}
+            ]
+        }
+    })
 }

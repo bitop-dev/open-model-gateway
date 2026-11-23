@@ -303,8 +303,13 @@ fn request_schemas(document: &Value) -> (BTreeSet<String>, BTreeSet<String>) {
 fn in_request_schema(document: &Value, location: &str) -> bool {
     location.starts_with("/operation/requestBody")
         || location.starts_with("/components/requestBodies/")
-        || component_of(location)
-            .is_some_and(|component| request_schemas(document).1.contains(&component))
+        || location.starts_with("/components/schemas/")
+            && request_schemas(document).1.iter().any(|target| {
+                location == target
+                    || location
+                        .strip_prefix(target)
+                        .is_some_and(|tail| tail.starts_with('/'))
+            })
 }
 
 /// Is `location` a property (or positional item) declared DIRECTLY on a request
@@ -528,6 +533,7 @@ fn schema(
     document: &Value,
     node: &Value,
     location: &str,
+    query: bool,
     inherited: &Facts,
     seen: &mut BTreeSet<String>,
 ) -> Result<()> {
@@ -667,7 +673,7 @@ fn schema(
             super::http_vectors::MAX_BYTES
         );
     }
-    unprobed_request_keywords(document, node, location)?;
+    unprobed_request_keywords(document, node, location, query)?;
     // Reviewed arbitrary JSON still declares its JSON type (e.g. "object").
     if arbitrary(location, node) {
         ensure!(
@@ -732,7 +738,7 @@ fn schema(
     if node.get("$ref").is_some() {
         let (target, pointer) = reference(document, node)?;
         if seen.insert(pointer.clone()) {
-            schema(document, target, &pointer, &Facts::default(), seen)?;
+            schema(document, target, &pointer, query, &Facts::default(), seen)?;
         }
     }
     for keyword in ["allOf", "anyOf", "oneOf", "prefixItems"] {
@@ -748,6 +754,7 @@ fn schema(
                 document,
                 child,
                 &format!("{location}/{keyword}/{i}"),
+                query,
                 &context,
                 seen,
             )?;
@@ -758,6 +765,7 @@ fn schema(
             document,
             child,
             &format!("{location}/properties/{}", segment(name)),
+            query,
             effective.properties.get(name).unwrap_or(&Facts::default()),
             seen,
         )?;
@@ -767,6 +775,7 @@ fn schema(
             document,
             child,
             &format!("{location}/patternProperties/{}", segment(pattern)),
+            query,
             &Facts::default(),
             seen,
         )?;
@@ -785,6 +794,7 @@ fn schema(
                 document,
                 child,
                 &format!("{location}/{keyword}"),
+                query,
                 &Facts::default(),
                 seen,
             )?;
@@ -796,6 +806,7 @@ fn schema(
                 document,
                 child,
                 &format!("{location}/{keyword}"),
+                query,
                 &effective,
                 seen,
             )?;
@@ -812,6 +823,9 @@ const UNPROBED_REQUEST_KEYWORDS: &[&str] = &[
     "maxProperties",
     "multipleOf",
     "propertyNames",
+    "dependentSchemas",
+    "unevaluatedProperties",
+    "unevaluatedItems",
     "contains",
     "minContains",
     "maxContains",
@@ -822,11 +836,35 @@ const UNPROBED_REQUEST_KEYWORDS: &[&str] = &[
 /// are `bound` and `bound` +/- 1 as i64).
 const NUMERIC_BOUNDS: &[&str] = &["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"];
 
-fn unprobed_request_keywords(document: &Value, node: &Value, location: &str) -> Result<()> {
+fn unprobed_request_keywords(
+    document: &Value,
+    node: &Value,
+    location: &str,
+    query: bool,
+) -> Result<()> {
+    let unsupported_dependency = node.get("dependentRequired").is_some()
+        && (query
+            || super::request_reach::dependencies(node).any(|(trigger, name)| {
+                trigger == name
+                    || node["properties"].get(trigger).is_none()
+                    || node["properties"].get(name).is_none()
+            }));
     let keyword = UNPROBED_REQUEST_KEYWORDS
         .iter()
         .find(|keyword| node.get(**keyword).is_some())
         .copied()
+        .or(unsupported_dependency.then_some("dependentRequired"))
+        .or_else(|| {
+            ["minLength", "maxLength", "minItems", "maxItems"]
+                .into_iter()
+                .find(|key| node.get(key).is_some_and(|v| v.as_u64().is_none()))
+        })
+        .or_else(|| {
+            node["format"]
+                .as_str()
+                .filter(|f| super::http_vectors::format_violations(f).is_none())
+                .map(|_| "format")
+        })
         .or_else(|| {
             NUMERIC_BOUNDS
                 .iter()
@@ -844,7 +882,7 @@ fn unprobed_request_keywords(document: &Value, node: &Value, location: &str) -> 
                 .copied()
         });
     if let Some(keyword) = keyword
-        && in_request_schema(document, location)
+        && (query || in_request_schema(document, location))
     {
         let why = if NUMERIC_BOUNDS.contains(&keyword) {
             "a request bound must be an integer within i64"
@@ -856,12 +894,9 @@ fn unprobed_request_keywords(document: &Value, node: &Value, location: &str) -> 
     Ok(())
 }
 
-/// `x-omg-max-bytes` is read from every APPLICABLE node of a value, so it must
-/// state a limit that always applies: it is refused on a oneOf/anyOf branch (the
-/// limit would hold only when that branch matches, and a sibling branch could
-/// state another) and anywhere under `if`/`then`/`else`/`not` (conditional or
-/// inverted). Properties, items and map values INSIDE a branch are separate
-/// instances and may carry their own.
+/// Published schemas declare unconditional byte limits for a given instance.
+/// Properties, items and map values inside a branch are separate instances and
+/// may carry their own limits.
 fn bytes_placement(
     document: &Value,
     node: &Value,
@@ -1037,6 +1072,7 @@ pub(crate) fn completed_with(document: &Value, is_completed: &dyn Fn(&str) -> bo
                 document,
                 node,
                 &format!("/components/schemas/{}", segment(name)),
+                false,
                 &Facts::default(),
                 &mut BTreeSet::new(),
             )?;
@@ -1085,7 +1121,7 @@ fn operation_at(document: &Value, operation: &Value, location: &str) -> Result<(
             let (target, pointer) = reference(document, node)?;
             if pointer.starts_with("/components/schemas/") {
                 if seen.insert(pointer.clone()) {
-                    schema(document, target, &pointer, &Facts::default(), seen)?;
+                    schema(document, target, &pointer, false, &Facts::default(), seen)?;
                 }
             } else if seen.insert(pointer.clone()) {
                 discover(document, target, &pointer, seen)?;
@@ -1126,7 +1162,16 @@ fn operation_at(document: &Value, operation: &Value, location: &str) -> Result<(
                 for (key, child) in map {
                     let pointer = format!("{location}/{}", segment(key));
                     if key == "schema" {
-                        schema(document, child, &pointer, &Facts::default(), seen)?;
+                        let query = node["in"] == "query";
+                        let mut query_refs = BTreeSet::new();
+                        schema(
+                            document,
+                            child,
+                            &pointer,
+                            query,
+                            &Facts::default(),
+                            if query { &mut query_refs } else { seen },
+                        )?;
                     } else {
                         discover(document, child, &pointer, seen)?;
                     }

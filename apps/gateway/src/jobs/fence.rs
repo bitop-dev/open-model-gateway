@@ -270,22 +270,6 @@ impl BatchFence {
         Ok(inserted)
     }
 
-    /// Claim an explicit retry (a new attempt with its own execution).
-    pub(crate) async fn retry_line(
-        &self,
-        store: &Store,
-        line_no: i32,
-        attempts: i16,
-        execution: Uuid,
-    ) -> FenceResult<bool> {
-        let mut tx = self.begin(store, Hold::Rows).await?;
-        let claimed = sqlx::query("UPDATE batch_lines SET state='running',attempts=attempts+1,execution_id=$4,status_code=NULL,error_code=NULL,finished_at=NULL WHERE job_id=$1 AND line_no=$2 AND state='failed' AND attempts=$3 AND segment IS NULL")
-            .bind(self.job).bind(line_no).bind(attempts).bind(execution)
-            .execute(&mut *tx).await.map_err(job_storage)?.rows_affected() == 1;
-        tx.commit().await.map_err(job_storage)?;
-        Ok(claimed)
-    }
-
     /// Record a failed attempt. With `count` the batch's counters move in the
     /// same transaction, and only when this call is what moved the line out of
     /// `running` (a line already interrupted or finished is not counted

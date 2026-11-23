@@ -1216,6 +1216,9 @@ fn response_doc(schema: Value) -> Value {
 #[test]
 fn management_openapi_coverage_request_schemas_refuse_keywords_the_vectors_cannot_probe() {
     for keyword in [
+        ("dependentRequired", json!({"a":["b"]})),
+        ("unevaluatedProperties", json!(false)),
+        ("unevaluatedItems", json!(false)),
         ("minProperties", json!(1)),
         ("maxProperties", json!(3)),
         ("multipleOf", json!(5)),
@@ -1335,4 +1338,82 @@ fn management_openapi_coverage_exemptions_on_shared_parameter_and_reusable_compo
     );
     assert!(text.contains("shared component"), "{text}");
     quality::completed(&document(&["/api/v1/unfinished-a"])).unwrap();
+}
+
+#[test]
+fn query_constraints_follow_schema_refs_and_request_subpointers_are_scoped() {
+    for constraint in [
+        json!({"type":"integer","multipleOf":2}),
+        json!({"type":"integer","minimum":1.5}),
+        json!({"type":"string","maxLength":5.0}),
+        json!({"type":"string","format":"unprobed-format"}),
+    ] {
+        let parameter =
+            json!({"in":"query","name":"v","schema":{"$ref":"#/components/schemas/Value"}});
+        let document = doc(
+            op(json!({"type":"string"}), json!([parameter])),
+            json!({"Value":constraint}),
+        );
+        assert!(quality::operation(&document, &document["paths"]["/api/v1/x"]["get"]).is_err());
+    }
+    let mut document = request_doc(closed(json!({
+        "p":{"type":"integer","multipleOf":5}, "prefix":{"type":"integer"}
+    })));
+    let schema = &mut document["paths"]["/api/v1/x"]["post"]["requestBody"]["content"]["application/json"]
+        ["schema"];
+    schema["$ref"] = json!("#/components/schemas/Body/properties/prefix");
+    quality::completed(&document).unwrap();
+    document["paths"]["/api/v1/x"]["post"]["requestBody"]["content"]["application/json"]["schema"]
+        ["$ref"] = json!("#/components/schemas/Body/properties/p");
+    assert!(message(quality::completed(&document)).contains("multipleOf"));
+}
+
+#[test]
+fn response_tail_coverage_respects_positional_capacity() {
+    let mut response = json!({"type":"array","maxItems":1,"prefixItems":[{"type":"integer"}],
+        "items":{"type":"array","items":{"type":"string"}}});
+    run(
+        &doc(op(response.clone(), json!([])), json!({})),
+        &[json!([1])],
+        &[],
+    )
+    .unwrap();
+    response["maxItems"] = json!(2);
+    assert!(run(&doc(op(response, json!([])), json!({})), &[json!([1])], &[]).is_err());
+}
+
+#[test]
+fn boundary_review_unconditional_caps_bound_tails_across_composition() {
+    let tuple = json!({"type":"array","prefixItems":[{"type":"integer"}],"items":{"type":"array","items":{"type":"integer"}}});
+    for cap in [1, 2] {
+        let schemas = json!({"Tuple":tuple,"Cap":{"maxItems":cap}});
+        for response in [
+            json!({"allOf":[{"$ref":"#/components/schemas/Tuple"},{"$ref":"#/components/schemas/Cap"}]}),
+            json!({"$ref":"#/components/schemas/Tuple","allOf":[{"maxItems":cap}]}),
+        ] {
+            let document = doc(op(response, json!([])), schemas.clone());
+            assert_eq!(run(&document, &[json!([1])], &[]).is_ok(), cap == 1);
+            if cap == 2 {
+                run(&document, &[json!([1, [2]])], &[]).unwrap();
+            }
+        }
+    }
+    let mut response = tuple;
+    response["if"] = json!({"maxItems":1});
+    response["then"] = json!({"maxItems":1});
+    let document = doc(op(response, json!([])), json!({}));
+    assert!(run(&document, &[json!([1])], &[]).is_err());
+    run(&document, &[json!([1, [2]])], &[]).unwrap();
+}
+
+#[test]
+fn boundary_review_unconditional_caps_bound_prefix_positions() {
+    for cap in [1, 2] {
+        let response = json!({"type":"array","prefixItems":[{"type":"integer"},{"type":"array","items":{"type":"integer"}}],"allOf":[{"maxItems":cap}]});
+        let document = doc(op(response, json!([])), json!({}));
+        assert_eq!(run(&document, &[json!([1])], &[]).is_ok(), cap == 1);
+        if cap == 2 {
+            run(&document, &[json!([1, [2]])], &[]).unwrap();
+        }
+    }
 }

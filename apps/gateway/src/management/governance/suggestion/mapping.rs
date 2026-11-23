@@ -60,7 +60,7 @@ pub(crate) fn map(model: &Value, workload: WorkloadKind, mut images: Option<&[u8
                 .iter()
                 .any(|p| p["meter"] == l["meter"] && p["unknown"] == true)
     }) {
-        d.warnings.push("Prompt-size tiers were left out of the draft where the base rate is unknown; enter a base rate before applying those tiers.".into());
+        d.warnings.push("Prompt-size tiers were left out of the draft where a base or tier rate is unknown. Enter the missing rates before applying those tiers.".into());
     }
     let parsed = serde_json::from_value::<PriceLines>(json!(price_lines)).ok();
     if parsed.is_none() {
@@ -304,9 +304,9 @@ fn request_line(d: &mut Draft, pricing: &Value) {
 }
 /// The draft's price lines.
 fn draft_price_lines(d: &Draft) -> Vec<Value> {
-    // Draft: fully priced and not-applicable lines without review
-    // annotations, plus an explicit `unknown` line for each meter whose price
-    // the catalog does not give (publication requires every meter stated).
+    // V3 cannot mix unknown and priced lines for a meter. A missing tier
+    // would extend a lower rate through its threshold, so keep all rates for
+    // that meter in the annotated preview and state it as unknown in the draft.
     let mut price_lines: Vec<Value> = d
         .lines
         .iter()
@@ -325,7 +325,6 @@ fn draft_price_lines(d: &Draft) -> Vec<Value> {
         let meter = &line["meter"];
         if line["microusd_per_batch"].is_null()
             && line["not_applicable"] != true
-            && line["min_prompt_tokens"].is_null()
             && line["variant"].is_null()
         {
             price_lines.retain(|l| &l["meter"] != meter);
