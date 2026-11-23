@@ -5,6 +5,22 @@ use super::*;
 const KEY_SHARE: &str = " FOR SHARE OF k,w";
 const SHARE: &str = " FOR SHARE";
 
+pub(super) fn source(text: &str) -> Source {
+    let path = "auth.rs";
+    let file = tree::production_items(std::path::Path::new(path), text, |item| match item {
+        syn::Item::Const(item) => item.ident.unraw() == "ADMISSION_SQL",
+        syn::Item::Fn(item) => item.sig.ident.unraw() == "revalidate_admission_with",
+        _ => false,
+    })
+    .expect("auth.rs must be present in production");
+    Source {
+        path: path.into(),
+        module: "auth".into(),
+        file,
+        bin: false,
+    }
+}
+
 pub(super) fn scan(scan: &mut Scan<'_>, file: &syn::File) {
     let mut constants = 0;
     let mut functions = 0;

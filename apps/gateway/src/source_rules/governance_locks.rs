@@ -545,11 +545,8 @@ fn violations(source: &Source) -> Vec<String> {
 #[test]
 fn production_governance_lock_sql() {
     let mut files = tree::production("governance.rs");
-    files.extend(
-        tree::production("auth.rs")
-            .into_iter()
-            .filter(|source| source.path == "auth.rs"),
-    );
+    let auth = std::fs::read_to_string(tree::src_dir().join("auth.rs")).expect("read auth.rs");
+    files.push(auth_query::source(&auth));
     for required in [
         "auth.rs",
         "governance/admission.rs",

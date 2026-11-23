@@ -45,15 +45,36 @@ fn job_installation_and_catalog_exceptions_are_consumed_together() {
     }
 }
 
-#[test]
-fn scoped_authority_query_and_mode_selection_are_checked() {
-    let source = r#"const ADMISSION_SQL: &str = "SELECT 1 FOR SHARE OF k,w";
+const AUTHORITY: &str = r#"const ADMISSION_SQL: &str = "SELECT 1 FOR SHARE OF k,w";
     fn revalidate_admission_with() {
         static UNLOCKED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
             ADMISSION_SQL.replace(" FOR SHARE OF k,w", "").replace(" FOR SHARE", "")
         });
         sqlx::query_as(if lock { ADMISSION_SQL } else { UNLOCKED.as_str() });
     }"#;
+
+#[test]
+fn authority_reader_limits_strict_checks_to_inventoried_items() {
+    for unrelated in [
+        "mod unrelated;",
+        r#"fn unrelated() { include!("generated.rs"); }"#,
+        "fn unrelated() { mod local; }",
+    ] {
+        let text = format!("{AUTHORITY} {unrelated}");
+        assert!(violations(&auth_query::source(&text)).is_empty());
+    }
+}
+
+#[test]
+#[should_panic(expected = "include!")]
+fn authority_reader_rejects_unreadable_revalidation_code() {
+    let text = AUTHORITY.replace("sqlx::query_as", r#"include!("extra.rs"); sqlx::query_as"#);
+    auth_query::source(&text);
+}
+
+#[test]
+fn scoped_authority_query_and_mode_selection_are_checked() {
+    let source = AUTHORITY;
     assert!(violations(&parse_fixture("auth.rs", source)).is_empty());
     for changed in [
         source.replace("SELECT 1 FOR SHARE", "SELECT 1 FOR UPDATE"),
