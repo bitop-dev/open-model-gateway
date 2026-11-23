@@ -245,8 +245,12 @@ impl Client {
             .unwrap();
         let schema = query.iter().all(|(name, value)| {
             let parameter = parameters.iter().find(|p| p["name"] == *name).unwrap();
-            openapi::responses::validate_value(document, &parameter["schema"], &json!(value))
-                .is_ok()
+            openapi::responses::validate_request_value(
+                document,
+                &parameter["schema"],
+                &json!(value),
+            )
+            .is_ok()
         });
         let query: Vec<(String, String)> = query
             .iter()

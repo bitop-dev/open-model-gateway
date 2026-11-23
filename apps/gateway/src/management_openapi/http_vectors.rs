@@ -253,13 +253,13 @@ fn applicable<'a>(
         }
         for keyword in ["oneOf", "anyOf"] {
             for branch in node[keyword].as_array().into_iter().flatten() {
-                if valid(document, branch, value)? {
+                if accepts(document, branch, value)? {
                     applicable(document, branch, value, out, depth + 1)?;
                 }
             }
         }
         if let Some(condition) = node.get("if") {
-            let keyword = if valid(document, condition, value)? {
+            let keyword = if accepts(document, condition, value)? {
                 "then"
             } else {
                 "else"
@@ -467,108 +467,10 @@ impl Notes {
 /// schema that claims characters for a byte limit) cannot silently pass.
 pub(super) const MAX_BYTES: &str = "x-omg-max-bytes";
 
-/// A reviewed byte limit that applies to `instance`, or one of its nested values?
-fn bytes_ok(document: &Value, schema: &Value, instance: &Value, depth: usize) -> Result<bool> {
-    ensure!(depth < 16, "schema nesting too deep");
-    let mut nodes = Vec::new();
-    applicable(document, schema, instance, &mut nodes, 0)?;
-    match instance {
-        Value::String(text) => {
-            let over = nodes
-                .iter()
-                .filter_map(|node| node.get(MAX_BYTES).and_then(Value::as_u64))
-                .any(|limit| text.len() as u64 > limit);
-            Ok(!over)
-        }
-        Value::Object(map) => {
-            for (name, child) in map {
-                // Properties AND typed map values (`patternProperties` /
-                // `additionalProperties`) carry byte limits too.
-                if let Some(child_schema) = member_schema(&nodes, name)?
-                    && !bytes_ok(document, &child_schema, child, depth + 1)?
-                {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        }
-        Value::Array(items) => {
-            for (i, child) in items.iter().enumerate() {
-                // EVERY element: a positional schema, else the homogeneous `items`.
-                if let Some(item_schema) = element_schema(&nodes, i)
-                    && !bytes_ok(document, &item_schema, child, depth + 1)?
-                {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        }
-        _ => Ok(true),
-    }
-}
-
-/// Can any reviewed byte limit apply to an instance of `schema`? `false` only
-/// when no [`MAX_BYTES`] key exists anywhere in `schema` or in the schemas it
-/// references, so [`bytes_ok`] has nothing to judge. Every key and array item is
-/// followed, applicator or not, and an unresolved reference counts as a limit:
-/// the answer errs toward running the full check.
-pub(super) fn reaches_byte_limits(document: &Value, schema: &Value) -> bool {
-    fn walk(document: &Value, node: &Value, seen: &mut BTreeSet<String>) -> bool {
-        match node {
-            Value::Object(map) => {
-                if map.contains_key(MAX_BYTES) {
-                    return true;
-                }
-                if let Some(reference) = map.get("$ref") {
-                    let target = reference
-                        .as_str()
-                        .and_then(|r| r.strip_prefix('#'))
-                        .and_then(|pointer| document.pointer(pointer));
-                    match target {
-                        None => return true,
-                        Some(target) => {
-                            let first =
-                                seen.insert(reference.as_str().unwrap_or_default().to_owned());
-                            if first && walk(document, target, seen) {
-                                return true;
-                            }
-                        }
-                    }
-                }
-                map.values().any(|child| walk(document, child, seen))
-            }
-            Value::Array(items) => items.iter().any(|child| walk(document, child, seen)),
-            _ => false,
-        }
-    }
-    walk(document, schema, &mut BTreeSet::new())
-}
-
-/// [`reaches_byte_limits`], remembered for the nodes of the committed artifact
-/// (immutable, so an address names one schema for good); any other schema is
-/// searched on every call.
-fn byte_limits_apply(document: &Value, schema: &Value) -> bool {
-    static REMEMBERED: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<usize, bool>>,
-    > = std::sync::OnceLock::new();
-    if !std::ptr::eq(document, responses::artifact()) || !responses::is_artifact_node(schema) {
-        return reaches_byte_limits(document, schema);
-    }
-    let address = std::ptr::from_ref(schema) as usize;
-    let remembered = REMEMBERED.get_or_init(Default::default);
-    if let Some(found) = remembered.lock().unwrap().get(&address) {
-        return *found;
-    }
-    let found = reaches_byte_limits(document, schema);
-    remembered.lock().unwrap().insert(address, found);
-    found
-}
-
-/// The schema's verdict: JSON Schema validity plus the reviewed byte limits
-/// (judged only where one can apply).
+/// The keyword participates in the same Draft 2020-12 evaluation as the rest
+/// of the request schema, including branch selection and negation.
 pub(crate) fn accepts(document: &Value, schema: &Value, instance: &Value) -> Result<bool> {
-    Ok(valid(document, schema, instance)?
-        && (!byte_limits_apply(document, schema) || bytes_ok(document, schema, instance, 0)?))
+    Ok(responses::request_validator(document, schema)?.is_valid(instance))
 }
 
 /// `(min, max)` repetitions of a SIMPLE anchored pattern: one character class,
@@ -771,7 +673,7 @@ fn relaxed(
         let mut schema = schema.clone();
         strip(&mut schema, key, &bound);
         // A fresh document is never the artifact: this compiles without caching.
-        responses::validator(&document, &schema)
+        responses::request_validator(&document, &schema)
     };
     // Only the immutable committed artifact is cached (by value of the request).
     let inference = std::ptr::eq(document, crate::inference_openapi::committed_artifact());
@@ -847,6 +749,7 @@ fn find_pair(
         }
         let alone = match relaxed {
             Some(relaxed) => relaxed.is_valid(&over_instance),
+            // With no relaxed standard keyword this is the byte-only control.
             None => valid(document, oracle.schema, &over_instance)?,
         };
         if alone {
@@ -1156,10 +1059,9 @@ fn straddles(
         .iter()
         .filter_map(|(_, w, _)| w.as_ref().map(|w| w.chars as u64))
         .min();
-    let char_caps = distinct_u64(nodes, "maxLength");
-    let char_cap = char_caps.first().copied();
+    let char_cap = distinct_u64(nodes, "maxLength").first().copied();
     let byte_cap = distinct_u64(nodes, MAX_BYTES).first().copied();
-    let edge = maximum.map(|width| char_cap.unwrap_or(width).min(width));
+    let edge = maximum.map(|width| rules.max_chars.unwrap_or(width).min(width));
     let byte_dominates = edge
         .or(char_cap)
         .is_some_and(|target| rules.excludes(target));
@@ -1211,7 +1113,7 @@ fn straddles(
                 // supplied pair reaches an independent maxLength edge.
                 if adjacent
                     && over == at + 1
-                    && char_caps.contains(&at)
+                    && rules.max_chars == Some(at)
                     && confirms("maxLength", &json!(at), None, accepted, refused)?
                 {
                     notes.dominated_patterns += 1;
@@ -1805,7 +1707,7 @@ pub(super) fn query_plan(
             .filter(|(n, _)| n == name)
             .map(|(_, v)| v.as_str())
             .collect();
-        let rules = ByteDominance::at(document, schema, &[], &nodes)?;
+        let rules = ByteDominance::at(document, schema, &[], &nodes, !supplied.is_empty())?;
         let oracle = BoundaryOracle {
             rules,
             ..BoundaryOracle::leaf(schema)
@@ -2558,7 +2460,13 @@ impl Walk<'_> {
             .insert(raw_pointer(path));
         let here = pointer(path);
         let supplied = self.candidates.get(&here).cloned().unwrap_or_default();
-        let rules = ByteDominance::at(self.document, self.root_schema, path, &nodes)?;
+        let rules = ByteDominance::at(
+            self.document,
+            self.root_schema,
+            path,
+            &nodes,
+            !supplied.is_empty(),
+        )?;
         let oracle = if rules.parent_choice {
             BoundaryOracle {
                 schema: self.root_schema,
@@ -2833,7 +2741,7 @@ fn distinct_variants(
             Value::Null => Vec::new(),
         }
     }
-    let validator = responses::validator(document, schema)?;
+    let validator = responses::request_validator(document, schema)?;
     let mut seen: BTreeSet<String> = taken
         .iter()
         .chain([template])

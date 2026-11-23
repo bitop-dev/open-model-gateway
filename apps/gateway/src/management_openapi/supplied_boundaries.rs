@@ -1,7 +1,7 @@
 //! Whole-request counterfactuals for a supplied string boundary. Each variant
 //! relaxes one keyword at one use site. The original document still resolves
 //! every other reference, including a second reference to the same component.
-use super::{Step, coverage, valid};
+use super::{Step, accepts, coverage};
 use anyhow::{Result, ensure};
 use regex_syntax::hir::{Hir, HirKind};
 use serde_json::{Value, json};
@@ -50,7 +50,7 @@ pub(super) fn relaxations(
     }
     for key in ["allOf", "oneOf", "anyOf"] {
         for (i, branch) in node[key].as_array().into_iter().flatten().enumerate() {
-            if key == "allOf" || valid(document, branch, instance)? {
+            if key == "allOf" || accepts(document, branch, instance)? {
                 for variant in descend(branch, instance, path)? {
                     let mut local = node.clone();
                     local[key][i] = variant;
@@ -60,7 +60,7 @@ pub(super) fn relaxations(
         }
     }
     if let Some(condition) = node.get("if") {
-        let arm = if valid(document, condition, instance)? {
+        let arm = if accepts(document, condition, instance)? {
             "then"
         } else {
             "else"
@@ -159,12 +159,12 @@ impl ByteDominance {
         root: &Value,
         path: &[Step],
         nodes: &[&Value],
+        supplied: bool,
     ) -> Result<Self> {
         let mut rules = Self::default();
-        if nodes
-            .iter()
-            .any(|node| node.get(super::MAX_BYTES).is_some())
-        {
+        if nodes.iter().any(|node| {
+            node.get(super::MAX_BYTES).is_some() || (supplied && node.get("maxLength").is_some())
+        }) {
             let mut remaining = 4096;
             rules.collect(document, root, path, &mut remaining, 0)?;
         }

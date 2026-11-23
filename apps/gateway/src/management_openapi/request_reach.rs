@@ -416,7 +416,7 @@ fn reach(
         }
     }
     let matches = |schema: &Value| -> Result<bool> {
-        Ok(super::responses::validator(document, schema)?.is_valid(instance))
+        super::http_vectors::accepts(document, schema, instance)
     };
     for keyword in ["oneOf", "anyOf"] {
         for (i, arm) in node[keyword].as_array().into_iter().flatten().enumerate() {

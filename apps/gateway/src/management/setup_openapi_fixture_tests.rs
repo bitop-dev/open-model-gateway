@@ -419,7 +419,7 @@ fn param_accepts(template: &str, name: &str, raw: &str) -> bool {
         .as_array()
         .and_then(|all| all.iter().find(|p| p["name"] == name))
         .expect("documented query parameter");
-    openapi::responses::validate_value(document, &parameter["schema"], &json!(raw)).is_ok()
+    openapi::responses::validate_request_value(document, &parameter["schema"], &json!(raw)).is_ok()
 }
 /// The handler's verdict on an exchange, as `Probe` derives it: 400/422 refuse,
 /// 2xx/3xx/404/409 accept; a 400 whose machine reason is in `domain` is a domain

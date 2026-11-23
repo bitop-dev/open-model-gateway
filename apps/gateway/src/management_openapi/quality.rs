@@ -894,12 +894,9 @@ fn unprobed_request_keywords(
     Ok(())
 }
 
-/// `x-omg-max-bytes` is read from every APPLICABLE node of a value, so it must
-/// state a limit that always applies: it is refused on a oneOf/anyOf branch (the
-/// limit would hold only when that branch matches, and a sibling branch could
-/// state another) and anywhere under `if`/`then`/`else`/`not` (conditional or
-/// inverted). Properties, items and map values INSIDE a branch are separate
-/// instances and may carry their own.
+/// Published schemas declare unconditional byte limits for a given instance.
+/// Properties, items and map values inside a branch are separate instances and
+/// may carry their own limits.
 fn bytes_placement(
     document: &Value,
     node: &Value,

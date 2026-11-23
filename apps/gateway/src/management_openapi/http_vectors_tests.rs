@@ -2,8 +2,7 @@
 //! `oneshot`, synthetic schemas, no database. A handler that is looser or
 //! stricter than its schema must FAIL, and the failure names no sent value.
 use super::http_vectors::{
-    Edit, Probe, binary_cases, body_cases, query_cases, reaches_byte_limits, run_binary, run_body,
-    run_query,
+    Edit, Probe, binary_cases, body_cases, query_cases, run_binary, run_body, run_query,
 };
 use super::responses::Captured;
 use axum::{
@@ -471,9 +470,6 @@ async fn management_openapi_http_vectors_shards_divide_the_planned_vectors() {
     assert_eq!(sent_bodies(&app, &document).await, whole);
 }
 
-/// A body is judged against reviewed byte limits only where one can apply: the
-/// search follows every reference (cycles included) and never answers "none"
-/// when a reference cannot be followed.
 #[test]
 fn management_openapi_http_vectors_byte_limits_are_found_through_references() {
     let document = json!({"components":{"schemas":{
@@ -481,19 +477,26 @@ fn management_openapi_http_vectors_byte_limits_are_found_through_references() {
         "Limited":{"type":"string","x-omg-max-bytes":10},
         "Plain":{"type":"object","properties":{"again":{"$ref":"#/components/schemas/Plain"}}},
         "Listing":{"type":"array","items":{"oneOf":[{"$ref":"#/components/schemas/Plain"},{"$ref":"#/components/schemas/Holder"}]}}}}});
-    let reaches = |name: &str| {
-        reaches_byte_limits(
+    let allows = |name: &str, value: Value| {
+        super::http_vectors::accepts(
             &document,
-            &json!({"$ref": format!("#/components/schemas/{name}")}),
+            &json!({"$ref":format!("#/components/schemas/{name}")}),
+            &value,
         )
     };
-    assert!(reaches("Holder") && reaches("Limited") && reaches("Listing"));
-    assert!(!reaches("Plain"));
-    assert!(reaches("Missing"));
-    assert!(reaches_byte_limits(
-        &document,
-        &json!({"$ref":"https://elsewhere.invalid/x"})
-    ));
+    assert!(!allows("Holder", json!({"url":"é".repeat(6)})).unwrap());
+    assert!(allows("Limited", json!("é".repeat(5))).unwrap());
+    assert!(allows("Plain", json!({"again":{}})).unwrap());
+    assert!(allows("Listing", json!([{"url":"é".repeat(6)}])).unwrap());
+    assert!(allows("Missing", Value::Null).is_err());
+    assert!(
+        super::http_vectors::accepts(
+            &document,
+            &json!({"$ref":"https://elsewhere.invalid/x"}),
+            &Value::Null
+        )
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -3754,5 +3757,159 @@ fn byte_dominance_retains_type_disjoint_parent_wire_forms() {
         )
         .unwrap();
         assert_eq!(plan.notes.dominated_patterns, 1);
+    }
+}
+
+fn overlapping_byte_arms(keyword: &str) -> Value {
+    json!({"type":"string","maxLength":6,keyword:[
+        {"pattern":"^(a|é+)$","x-omg-max-bytes":8},{"pattern":"^(a|[éê]+)$"}
+    ]})
+}
+
+#[test]
+fn keyword_scope_evaluates_the_complete_applicator() {
+    let limited = json!({"x-omg-max-bytes":8});
+    for (schema, expected) in [
+        (overlapping_byte_arms("anyOf"), [true, true, false]),
+        (overlapping_byte_arms("allOf"), [true, false, false]),
+        (overlapping_byte_arms("oneOf"), [false, true, false]),
+        (json!({"not":limited}), [false, true, true]),
+        (
+            json!({"if":limited,"then":false,"else":{"maxLength":6}}),
+            [false, true, false],
+        ),
+    ] {
+        let mut document = body_only(json!({}));
+        document["components"]["schemas"]["Text"] = schema.clone();
+        let nested = json!({"type":"object","properties":{"entries":{"type":"array","items":{"$ref":"#/components/schemas/Text"}}}});
+        for (length, accept) in [4, 6, 7].into_iter().zip(expected) {
+            let text = "é".repeat(length);
+            assert_eq!(
+                super::http_vectors::accepts(&document, &nested, &json!({"entries":[text]}))
+                    .unwrap(),
+                accept,
+                "{schema} at {length}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn keyword_scope_query_checks_overlapping_arms_over_loopback() {
+    let mut document = query_document();
+    document["paths"][TEMPLATE]["get"]["parameters"] =
+        json!([parameter("s", true, overlapping_byte_arms("anyOf"))]);
+    for global_cap in [false, true] {
+        let app = Router::new().route(
+            TEMPLATE,
+            get(
+                move |Query(q): Query<std::collections::HashMap<String, String>>| async move {
+                    if q.get("s").is_some_and(|s| {
+                        (s == "a" || (!s.is_empty() && s.chars().all(|c| matches!(c, 'é' | 'ê'))))
+                            && s.chars().count() <= 6
+                            && (!global_cap || s.len() <= 8)
+                    }) {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}{TEMPLATE}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let result = run_query(
+            &document,
+            "GET",
+            TEMPLATE,
+            &[],
+            &async || ((), vec![("s".into(), "é".into())]),
+            &async |_: &(), query: String| {
+                let reply = client.get(format!("{url}?{query}")).send().await.unwrap();
+                let status = reply.status();
+                seen.lock().unwrap().push((query, status));
+                Probe::from(Captured {
+                    status,
+                    headers: reply.headers().clone(),
+                    bytes: reply.bytes().await.unwrap(),
+                    method: "GET".into(),
+                    template: Some(TEMPLATE.into()),
+                    query: vec![],
+                })
+            },
+        )
+        .await;
+        server.abort();
+        let seen = seen.into_inner().unwrap();
+        let at = format!("s={}", "%C3%A9".repeat(6));
+        if global_cap {
+            assert!(message(result).contains("schema accepts but handler refuses"));
+            assert!(seen.contains(&(at, StatusCode::BAD_REQUEST)));
+        } else {
+            result.unwrap();
+            assert!(seen.contains(&(at, StatusCode::OK)));
+            assert!(seen.contains(&(format!("s={}", "%C3%A9".repeat(7)), StatusCode::BAD_REQUEST)));
+        }
+    }
+}
+
+#[test]
+fn keyword_scope_sibling_cap_cannot_witness_the_finite_pattern() {
+    let schema = json!({"type":"string","anyOf":[{"pattern":"^(a|b{1,4})$"},{"pattern":"^a+$","maxLength":4}]});
+    let body = body_only(schema.clone());
+    let mut query = query_document();
+    query["paths"][TEMPLATE]["get"]["parameters"] = json!([parameter("s", true, schema.clone())]);
+    let mut uncapped = schema.clone();
+    uncapped["anyOf"][1]
+        .as_object_mut()
+        .unwrap()
+        .remove("maxLength");
+    let mut wider = schema.clone();
+    wider["anyOf"][0]["pattern"] = json!("^(a|b{1,5})$");
+    for (text, uncapped_ok, wider_ok) in [("aaaaa", true, false), ("bbbbb", false, true)] {
+        for (variant, ok) in [
+            (&schema, false),
+            (&uncapped, uncapped_ok),
+            (&wider, wider_ok),
+        ] {
+            assert_eq!(
+                super::http_vectors::accepts(&body, variant, &json!(text)).unwrap(),
+                ok
+            );
+        }
+    }
+    for (ch, credit) in [("a", false), ("b", true)] {
+        let at = ch.repeat(4);
+        let over = ch.repeat(5);
+        let body_plan = super::http_vectors::body_plan(
+            &body,
+            &body["paths"][TEMPLATE]["post"],
+            &json!("a"),
+            &[],
+            &[("(root)".into(), json!(at)), ("(root)".into(), json!(over))],
+        );
+        let query_plan = super::http_vectors::query_plan(
+            &query,
+            &query["paths"][TEMPLATE]["get"],
+            &[("s".into(), "a".into())],
+            &[],
+            &[("s".into(), at), ("s".into(), over)],
+        );
+        for result in [body_plan.map(|p| p.notes), query_plan.map(|p| p.notes)] {
+            if credit {
+                assert_eq!(result.unwrap().dominated_patterns, 0);
+            } else {
+                assert!(
+                    result
+                        .err()
+                        .expect("only the sibling cap was tested")
+                        .to_string()
+                        .contains("straddle")
+                );
+            }
+        }
     }
 }

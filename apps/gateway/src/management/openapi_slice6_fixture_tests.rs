@@ -199,7 +199,7 @@ async fn body_outcome(
     label: &str,
     body: Value,
 ) -> (bool, bool) {
-    let schema_accepts = openapi::responses::validate_value(
+    let schema_accepts = openapi::responses::validate_request_value(
         openapi::responses::artifact(),
         request_schema(method, template),
         &body,
@@ -219,7 +219,7 @@ async fn query_outcome(
     label: &str,
     value: &str,
 ) -> (bool, bool) {
-    let schema_accepts = openapi::responses::validate_value(
+    let schema_accepts = openapi::responses::validate_request_value(
         openapi::responses::artifact(),
         query_schema(template, name),
         &json!(value),
@@ -2880,7 +2880,7 @@ async fn slice6_fixtures(pool: PgPool, shard: usize) -> (PositiveFixtures, Vec<S
             if let Some(file) = file {
                 parts.insert("file".into(), json!(if file.is_empty() { "" } else { "x" }));
             }
-            let schema_accepts = openapi::responses::validate_value(
+            let schema_accepts = openapi::responses::validate_request_value(
                 openapi::responses::artifact(),
                 &upload_schema,
                 &Value::Object(parts),
@@ -2906,7 +2906,7 @@ async fn slice6_fixtures(pool: PgPool, shard: usize) -> (PositiveFixtures, Vec<S
             if handled { ok } else { bad },
             "upload case {label}"
         );
-        let schema_accepts = openapi::responses::validate_value(
+        let schema_accepts = openapi::responses::validate_request_value(
             openapi::responses::artifact(),
             &upload_schema,
             &json!({"purpose":"user_data","expires_after[anchor]":"created_at","expires_after[seconds]":seconds,"file":"x"}),
@@ -2931,7 +2931,7 @@ async fn slice6_fixtures(pool: PgPool, shard: usize) -> (PositiveFixtures, Vec<S
         )
         .await;
         assert_eq!(r.status, bad, "upload case {label}");
-        let schema_accepts = openapi::responses::validate_value(
+        let schema_accepts = openapi::responses::validate_request_value(
             openapi::responses::artifact(),
             &upload_schema,
             &json!({"purpose":purpose,"file":"x"}),
