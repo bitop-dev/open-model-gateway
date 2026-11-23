@@ -4,6 +4,7 @@ use super::{
     fence::{lapse, start},
     http_support::{Resolver, Server, client},
 };
+use crate::jobs::schedule::claims::RetryCommitFault;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Clone, Copy)]
@@ -18,6 +19,13 @@ enum Boundary {
 }
 
 #[derive(Clone, Copy)]
+enum RetryCase {
+    Cancel,
+    Normal,
+    CommitFault(RetryCommitFault),
+}
+
+#[derive(Clone, Copy)]
 enum Case {
     Fault(Boundary, Loss),
     FinalizeCancel { cancel_first: bool },
@@ -26,7 +34,7 @@ enum Case {
     NestedTakeover,
     Quota,
     FailedCommit { retryable: bool },
-    Retry { cancel: bool },
+    Retry(RetryCase),
     Pressure,
     Measure(usize),
 }
@@ -199,7 +207,7 @@ async fn run_case(pool: PgPool, case: Case) {
         Case::Group => 32,
         Case::NestedTakeover | Case::FinalizeCancel { .. } | Case::CancelUnavailable => 2,
         Case::Pressure => 24,
-        Case::Quota | Case::Retry { .. } => 1,
+        Case::Quota | Case::Retry(_) => 1,
         Case::Measure(size) => size,
     };
     let benchmark_uploads = matches!(case, Case::Measure(size) if size > 32);
@@ -251,7 +259,7 @@ async fn run_case(pool: PgPool, case: Case) {
     let fail_commit = matches!(case, Case::FailedCommit { .. });
     let retryable = matches!(
         case,
-        Case::FailedCommit { retryable: true } | Case::Retry { .. }
+        Case::FailedCommit { retryable: true } | Case::Retry(_)
     );
     let release_provider = Arc::new(tokio::sync::Semaphore::new(0));
     let release = release_provider.clone();
@@ -263,7 +271,7 @@ async fn run_case(pool: PgPool, case: Case) {
             if pressure && call > 0 {
                 release.acquire().await.unwrap().forget();
             }
-            if matches!(case, Case::Retry { .. }) && call == 0 {
+            if matches!(case, Case::Retry(_)) && call == 0 {
                 return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
             if fail_commit && call != 1 {
@@ -296,8 +304,8 @@ async fn run_case(pool: PgPool, case: Case) {
         check_cancel_unavailable(&w, &job, &client, &gateway.base, &auth, &calls).await;
         return;
     }
-    if let Case::Retry { cancel } = case {
-        check_backoff_retry(&w, &job, &client, &gateway.base, &auth, &calls, cancel).await;
+    if let Case::Retry(retry) = case {
+        check_backoff_retry(&w, &job, &client, &gateway.base, &auth, &calls, retry).await;
         return;
     }
     if fail_commit {
@@ -1066,12 +1074,30 @@ async fn oversized_result_is_downloadable_as_a_public_error(pool: PgPool) {
 
 #[dbtest::test]
 async fn backoff_retry_cancelled(pool: PgPool) {
-    run_case(pool, Case::Retry { cancel: true }).await;
+    run_case(pool, Case::Retry(RetryCase::Cancel)).await;
 }
 
 #[dbtest::test]
 async fn backoff_retry_uncancelled(pool: PgPool) {
-    run_case(pool, Case::Retry { cancel: false }).await;
+    run_case(pool, Case::Retry(RetryCase::Normal)).await;
+}
+
+#[dbtest::test]
+async fn retry_claim_commit_lost_ack(pool: PgPool) {
+    run_case(
+        pool,
+        Case::Retry(RetryCase::CommitFault(RetryCommitFault::LostAck)),
+    )
+    .await;
+}
+
+#[dbtest::test]
+async fn retry_claim_commit_rollback(pool: PgPool) {
+    run_case(
+        pool,
+        Case::Retry(RetryCase::CommitFault(RetryCommitFault::Rollback)),
+    )
+    .await;
 }
 
 async fn check_backoff_retry(
@@ -1081,10 +1107,17 @@ async fn check_backoff_retry(
     base: &str,
     auth: &str,
     calls: &AtomicUsize,
-    cancel: bool,
+    retry: RetryCase,
 ) {
     let pool = &w.f.store.pool;
-    let runner = start(w);
+    let cancel = matches!(retry, RetryCase::Cancel);
+    let failed = cancel || matches!(retry, RetryCase::CommitFault(RetryCommitFault::Rollback));
+    w.jobs.finalize_hold.arm();
+    let runner = Runner::new(w.jobs.clone());
+    if let RetryCase::CommitFault(fault) = retry {
+        *runner.scheduler.retry_commit_fault.lock().unwrap() = Some(fault);
+    }
+    let runner = tokio::spawn(async move { runner.run_next().await });
     let first: Uuid = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if let Some(execution) = sqlx::query_scalar("SELECT execution_id FROM batch_lines WHERE job_id=$1 AND attempts=1 AND state='failed' AND deployment_id IS NOT NULL")
@@ -1113,6 +1146,13 @@ async fn check_backoff_retry(
             .error_for_status()
             .unwrap();
     }
+    tokio::time::timeout(Duration::from_secs(20), w.jobs.finalize_hold.reached())
+        .await
+        .expect("batch reached finalization");
+    let progress = w.reload(job).await;
+    w.jobs.finalize_hold.release();
+    assert_eq!(progress.request_completed, Some(i32::from(!failed)));
+    assert_eq!(progress.request_failed, Some(i32::from(failed)));
     assert!(
         tokio::time::timeout(Duration::from_secs(20), runner)
             .await
@@ -1120,30 +1160,31 @@ async fn check_backoff_retry(
             .unwrap()
             .unwrap()
     );
-    let attempts = if cancel { 1 } else { 2 };
+    let attempts = if failed { 1 } else { 2 };
     assert_eq!(calls.load(Ordering::SeqCst), attempts);
     let reservations: Vec<Uuid> = sqlx::query_scalar("SELECT r.execution_id FROM governance_reservations r JOIN inference_executions e ON r.execution_id=e.id WHERE e.batch_job_id=$1 ORDER BY e.id")
         .bind(job.id).fetch_all(pool).await.unwrap();
     assert_eq!(reservations.len(), attempts);
     assert_eq!(reservations[0], first);
-    let (execution, count): (Uuid, i16) =
-        sqlx::query_as("SELECT execution_id,attempts FROM batch_lines WHERE job_id=$1")
+    let (execution, count, state): (Uuid, i16, String) =
+        sqlx::query_as("SELECT execution_id,attempts,state FROM batch_lines WHERE job_id=$1")
             .bind(job.id)
             .fetch_one(pool)
             .await
             .unwrap();
+    assert_eq!(state, if failed { "failed" } else { "succeeded" });
     assert_eq!(count as usize, attempts);
     assert_eq!(reservations.last(), Some(&execution));
     let done = w.reload(job).await;
     assert_eq!(done.request_total, Some(1));
-    assert_eq!(done.request_completed, Some(i32::from(!cancel)));
-    assert_eq!(done.request_failed, Some(i32::from(cancel)));
+    assert_eq!(done.request_completed, Some(i32::from(!failed)));
+    assert_eq!(done.request_failed, Some(i32::from(failed)));
     assert_eq!(done.state, if cancel { "cancelled" } else { "completed" });
     let cost = crate::governance::batch::batch_cost(&w.f.store, job.id)
         .await
         .unwrap();
-    assert_eq!(cost.0, if cancel { 0 } else { 15 });
-    let (file, other) = if cancel {
+    assert_eq!(cost.0, if failed { 0 } else { 15 });
+    let (file, other) = if failed {
         (done.error_file_id, done.output_file_id)
     } else {
         (done.output_file_id, done.error_file_id)
@@ -1169,7 +1210,7 @@ async fn check_backoff_retry(
     let response = &records[0]["response"];
     assert_eq!(records[0]["custom_id"], "0");
     assert_eq!(response["request_id"], execution.to_string());
-    if cancel {
+    if failed {
         assert_eq!(ledger_count().await.unwrap(), first_entries);
         assert_eq!(response["body"]["error"]["code"], "upstream_unavailable");
     } else {

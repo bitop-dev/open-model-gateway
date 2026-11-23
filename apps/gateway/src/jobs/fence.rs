@@ -136,7 +136,7 @@ impl BatchFence {
         }
     }
 
-    async fn begin(
+    pub(super) async fn begin(
         &self,
         store: &Store,
         hold: Hold,

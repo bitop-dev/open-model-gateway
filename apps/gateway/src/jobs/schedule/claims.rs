@@ -3,11 +3,23 @@
 //! demand heartbeat. Each is a fenced write ([`crate::jobs::fence`]).
 use uuid::Uuid;
 
-use super::{Claim, Pause, Scheduler, WaitRow, order_sql};
+use super::{Pause, Scheduler, WaitRow, order_sql};
 use crate::jobs::{
     fence::{BatchFence, FenceResult, Hold},
     store::job_storage,
 };
+
+/// Outcome of a claim attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Claim {
+    Claimed,
+    /// The line was already claimed (never run it again).
+    Taken,
+    /// The route runs its maximum.
+    Full,
+    /// Another batch's turn.
+    Wait,
+}
 
 /// Result of trying to start a previously failed batch line again.
 #[derive(Debug, PartialEq, Eq)]
@@ -16,6 +28,13 @@ pub(crate) enum RetryClaim {
     Cancelled,
     Full,
     LineChanged,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum RetryCommitFault {
+    Rollback,
+    LostAck,
 }
 
 impl Scheduler {
@@ -85,12 +104,9 @@ impl Scheduler {
         execution: Uuid,
         route: Option<(Uuid, i32)>,
     ) -> FenceResult<RetryClaim> {
-        let mut tx = crate::db::begin(&self.store.pool)
-            .await
-            .map_err(job_storage)?;
         // Cancellation updates this same row. Hold its write lock from the
         // persisted decision through commit, including for an unrouted retry.
-        fence.hold_counted(&mut tx, Hold::Update).await?;
+        let mut tx = fence.begin(&self.store, Hold::Update).await?;
         let cancelled: bool = sqlx::query_scalar(
             "SELECT cancel_requested_at IS NOT NULL FROM async_jobs WHERE id=$1",
         )
@@ -110,12 +126,64 @@ impl Scheduler {
         }
         let claimed = sqlx::query("UPDATE batch_lines SET state='running',attempts=attempts+1,execution_id=$4,status_code=NULL,error_code=NULL,finished_at=NULL WHERE job_id=$1 AND line_no=$2 AND state='failed' AND attempts=$3 AND segment IS NULL")
             .bind(fence.job).bind(line).bind(attempts).bind(execution).execute(&mut *tx).await.map_err(job_storage)?.rows_affected() == 1;
+        if !claimed {
+            tx.commit().await.map_err(job_storage)?;
+            return Ok(RetryClaim::LineChanged);
+        }
+        match self.commit_retry(tx).await.map_err(job_storage) {
+            Ok(()) => Ok(RetryClaim::Started),
+            Err(_) => self.recover_retry(fence, line, attempts, execution).await,
+        }
+    }
+
+    /// The provider has not been called for this execution yet. Taking the
+    /// same job lock waits out the original transaction and verifies the
+    /// runner epoch. A committed retry already occupies its route slot.
+    async fn recover_retry(
+        &self,
+        fence: &BatchFence,
+        line: i32,
+        attempts: i16,
+        execution: Uuid,
+    ) -> FenceResult<RetryClaim> {
+        let mut tx = fence.begin(&self.store, Hold::Update).await?;
+        let cancelled: Option<bool> = sqlx::query_scalar(
+            "SELECT j.cancel_requested_at IS NOT NULL FROM batch_lines l
+             JOIN async_jobs j ON j.id=l.job_id
+             WHERE l.job_id=$1 AND l.line_no=$2 AND l.execution_id=$3 AND l.attempts=$4
+               AND l.state='running' AND l.segment IS NULL AND NOT l.awaiting_segment",
+        )
+        .bind(fence.job)
+        .bind(line)
+        .bind(execution)
+        .bind(attempts + 1)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(job_storage)?;
         tx.commit().await.map_err(job_storage)?;
-        Ok(if claimed {
-            RetryClaim::Started
-        } else {
-            RetryClaim::LineChanged
+        Ok(match cancelled {
+            Some(false) => RetryClaim::Started,
+            Some(true) => RetryClaim::Cancelled,
+            None => RetryClaim::LineChanged,
         })
+    }
+
+    async fn commit_retry(
+        &self,
+        tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> Result<(), sqlx::Error> {
+        #[cfg(test)]
+        {
+            let fault = self.retry_commit_fault.lock().unwrap().take();
+            if let Some(fault) = fault {
+                match fault {
+                    RetryCommitFault::Rollback => tx.rollback().await?,
+                    RetryCommitFault::LostAck => tx.commit().await?,
+                }
+                return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset).into());
+            }
+        }
+        tx.commit().await
     }
 
     /// Replace this batch's demand rows (heartbeat). `legit` records that
