@@ -1,4 +1,4 @@
-//! Canonical lock order of scoped admission (scale plan P3, migration 0027).
+//! Canonical lock order of scoped admission (migration 0027).
 //!
 //! Every transaction that admits, settles or changes something admission
 //! depends on acquires a subset of these locks, always in this order, which
@@ -21,8 +21,8 @@
 //! Database triggers (0027) also take the exclusive authority lock on every
 //! row change admission depends on, so no code path can forget it; the
 //! gateway takes the same locks up front so they are never acquired out of
-//! order. `GATEWAY_ADMISSION_MODE=global` restores the former protocol (the
-//! installation row lock in admission and settlement) for one release.
+//! order. In `GATEWAY_ADMISSION_MODE=global`, admission and settlement
+//! take the installation row lock.
 use std::cell::Cell;
 
 use gateway_datetime_compat::UtcInstant;
@@ -38,8 +38,7 @@ pub enum AdmissionMode {
     /// Scoped authority locks and totals/counter row locks (default).
     #[default]
     Scoped,
-    /// The former protocol: admission and settlement serialize on the
-    /// installation row (operational rollback for one release).
+    /// Admission and settlement serialize on the installation row.
     Global,
 }
 impl AdmissionMode {

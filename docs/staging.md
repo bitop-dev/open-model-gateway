@@ -105,6 +105,8 @@ Run `grants apply` as the database and schema/object owner (`gateway_migrator` i
 
 `migrate` runs the migration job **and then reapplies grants**, both with the migrator secret. Never deploy new application code without its matching migration and grant policy. All replicas must use the matching schema version; rolling old/new mixed-schema replicas is not promised by the readiness contract.
 
+**PostgreSQL 17.11 to 17.12 on an existing staging volume.** When Compose recreates the database container with the new Bookworm image, PostgreSQL 17.12 can use the existing 17.x data directory. Before upgrading, review the upstream changelog entries that mention `REINDEX`. After upgrading, rebuild any indexes that match the affected cases. Pre-upgrade native incremental backups may be corrupt and are unreliable for recovery. If you use them, take a new full backup on 17.12 and base subsequent incremental backups on it. The staging restore rehearsal checks a logical `pg_dump` backup. [PostgreSQL 17.12 migration notes](https://www.postgresql.org/docs/release/17.12/#RELEASE-17-12-MIGRATION)
+
 Upgrade procedure:
 
 1. Record current image digest and configuration; build/test the new image without real secrets in its build context.

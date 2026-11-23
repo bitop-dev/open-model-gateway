@@ -1,4 +1,4 @@
-//! Browser Admin-only API for admin API tokens (#37 PR2). Declared
+//! Browser Admin-only API for admin API tokens. Declared
 //! `TokenPolicy::BrowserAdminOnly` in `route_policy.rs`: never reachable by
 //! a token itself, regardless of any scope it holds. GET/POST
 //! `/api/v1/platform/admin-tokens`, DELETE `/api/v1/platform/admin-tokens/{token}`.

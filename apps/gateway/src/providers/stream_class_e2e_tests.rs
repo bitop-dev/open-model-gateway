@@ -164,7 +164,8 @@ fn client_request(base: &str, client: Client) -> reqwest::RequestBuilder {
         Client::Chat => http
             .post(format!("{base}/v1/chat/completions"))
             .json(&json!({
-                "model":"company/smart","stream":true,"messages":[{"role":"user","content":"hi"}]
+                "model":"company/smart","stream":true,"stream_options":{"include_usage":true},
+                "messages":[{"role":"user","content":"hi"}]
             })),
         Client::Messages => http
             .post(format!("{base}/v1/messages"))
@@ -380,6 +381,118 @@ async fn check(
     }
 }
 
+#[dbtest::test]
+async fn anthropic_stop_reason_controls_stream_success_and_settlement(pool: PgPool) {
+    let kind = Kind::Anthropic;
+    let w = world(pool, kind, false).await;
+    let (content, _, stop) = kind.valid();
+    let wire = |reason| {
+        let delta = sse(&[
+            json!({"type":"content_block_stop","index":0}),
+            json!({
+                "type":"message_delta",
+                "delta":{"stop_reason":reason,"stop_sequence":null},
+                "usage":{"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}
+            }),
+        ]);
+        [content.as_slice(), &delta, &stop].concat()
+    };
+    let events = |body: &str| -> Vec<Value> {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim)
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect()
+    };
+    let invalid = wire("unknown_reason");
+    let valid = wire("end_turn");
+
+    for client in clients(kind) {
+        let reply = w.ask(client, vec![Step::Bytes(invalid.clone())]).await;
+        let mut problems = Vec::new();
+        check(
+            &w,
+            client,
+            &reply,
+            InferenceError::InvalidUpstream,
+            None,
+            "invalid Anthropic stop reason",
+            &mut problems,
+        )
+        .await;
+        assert!(problems.is_empty(), "{client:?}: {problems:#?}");
+        assert!(reply.body.contains("Hello"), "{client:?}");
+        let refused = events(&reply.body);
+        assert_eq!(
+            refused.iter().filter(|e| e.get("error").is_some()).count(),
+            1
+        );
+        assert!(refused.iter().all(|e| {
+            e["usage"].is_null()
+                && e["choices"][0]["finish_reason"].is_null()
+                && e["delta"]["stop_reason"].is_null()
+        }));
+        let (held, admitted): (i64, i64) = sqlx::query_as(
+            "SELECT r.held_microusd,h.amount_microusd FROM inference_executions e
+             JOIN governance_reservations r ON r.execution_id=e.id AND r.admitted_at=e.started_at
+             JOIN monetary_ledger h ON h.execution_id=e.id AND h.admitted_at=e.started_at AND h.kind='hold'
+             WHERE e.root_request_id=$1",
+        )
+        .bind(reply.id)
+        .fetch_one(&w.f.store.pool)
+        .await
+        .unwrap();
+        assert!(admitted > 0);
+        assert_eq!(held, admitted, "{client:?}");
+
+        let reply = w.ask(client, vec![Step::Bytes(valid.clone())]).await;
+        assert_eq!(reply.status, 200, "{client:?}");
+        let terminal = if client == Client::Messages {
+            "event: message_stop"
+        } else {
+            "data: [DONE]"
+        };
+        assert_eq!(
+            reply.body.lines().filter(|line| *line == terminal).count(),
+            1
+        );
+        let (before_terminal, _) = reply.body.split_once(terminal).unwrap();
+        let accepted = events(before_terminal);
+        if client == Client::Messages {
+            let finish = accepted
+                .iter()
+                .find(|e| e["delta"]["stop_reason"] == "end_turn")
+                .unwrap();
+            assert_eq!(finish["usage"]["input_tokens"], 4);
+            assert_eq!(finish["usage"]["output_tokens"], 2);
+        } else {
+            assert!(
+                accepted
+                    .iter()
+                    .any(|e| e["choices"][0]["finish_reason"] == "stop")
+            );
+            let usage = accepted.iter().find(|e| e["usage"].is_object()).unwrap();
+            assert_eq!(usage["usage"]["prompt_tokens"], 4);
+            assert_eq!(usage["usage"]["completion_tokens"], 2);
+        }
+        assert_eq!(
+            recorded(&w.f.store.pool, w.deployment, reply.id).await,
+            Recorded {
+                state: "succeeded".into(),
+                error_code: None,
+                input: Some(4),
+                output: Some(2),
+                reservation: "settled".into(),
+                actual: Some(6),
+                ledger: vec!["hold".into(), "settlement".into()],
+                health_failures: 0,
+            },
+            "{client:?}"
+        );
+    }
+}
+
 /// Every in-stream error name, each client protocol, before and after
 /// content: the 200 ends in the class the same error has as an HTTP response,
 /// and nothing about settlement changes.
@@ -541,6 +654,15 @@ async fn terminal_order(pool: PgPool, kind: Kind, client: Client, input: i64) {
 
 #[dbtest::test]
 async fn responses_terminal_status_mismatch_preserves_valid_usage(pool: PgPool) {
+    responses_rejected_terminal_evidence(pool, false).await;
+}
+
+#[dbtest::test]
+async fn responses_terminal_content_mismatch_preserves_valid_usage(pool: PgPool) {
+    responses_rejected_terminal_evidence(pool, true).await;
+}
+
+async fn responses_rejected_terminal_evidence(pool: PgPool, matching_status: bool) {
     let kind = Kind::Responses;
     let w = world(pool, kind, false).await;
     let (content, rest, late_completion) = kind.valid();
@@ -548,12 +670,20 @@ async fn responses_terminal_status_mismatch_preserves_valid_usage(pool: PgPool) 
     let snapshot = responses_complete();
     let class = InferenceError::InvalidUpstream;
     let mut problems = Vec::new();
-    for (event, status) in [
-        ("response.incomplete", "completed"),
-        ("response.completed", "incomplete"),
+    for (event, terminal_status, other_status) in [
+        ("response.incomplete", "incomplete", "completed"),
+        ("response.completed", "completed", "incomplete"),
     ] {
         let mut snapshot = snapshot.clone();
+        let status = if matching_status {
+            terminal_status
+        } else {
+            other_status
+        };
         snapshot["status"] = json!(status);
+        if matching_status {
+            snapshot["output"][0]["content"][0]["text"] = json!("Different final text");
+        }
         if status == "incomplete" {
             snapshot["incomplete_details"] = json!({"reason":"max_output_tokens"});
         }
@@ -648,6 +778,41 @@ async fn responses_terminal_status_mismatch_preserves_valid_usage(pool: PgPool) 
                 5,
             ),
             (
+                "reasoning exceeds total less input",
+                r#","usage":{"input_tokens":3,"total_tokens":5,"output_tokens_details":{"reasoning_tokens":3}}"#,
+                Some(3),
+                None,
+                3,
+            ),
+            (
+                "reasoning exceeds total less cache floor",
+                r#","usage":{"input_tokens_details":{"cached_tokens":3,"cache_write_tokens":1},"total_tokens":5,"completion_tokens_details":{"reasoning_tokens":2}}"#,
+                None,
+                None,
+                4,
+            ),
+            (
+                "reasoning fits total less cache floor",
+                r#","usage":{"input_tokens_details":{"cached_tokens":3,"cache_write_tokens":1},"total_tokens":5,"output_tokens_details":{"reasoning_tokens":1}}"#,
+                None,
+                None,
+                4,
+            ),
+            (
+                "duplicate reasoning count",
+                r#","usage":{"input_tokens":5000,"output_tokens":2,"total_tokens":5002,"output_tokens_details":{"reasoning_tokens":1,"reasoning_tokens":2}}"#,
+                Some(5000),
+                Some(2),
+                5002,
+            ),
+            (
+                "duplicate compatibility details",
+                r#","usage":{"input_tokens":5000,"output_tokens":2,"total_tokens":5002,"completion_tokens_details":null,"completion_tokens_details":{"reasoning_tokens":1}}"#,
+                Some(5000),
+                Some(2),
+                5002,
+            ),
+            (
                 "duplicate count",
                 r#","usage":{"input_tokens":null,"input_\u0074okens":5000,"output_tokens":2,"total_tokens":5002}"#,
                 None,
@@ -685,6 +850,21 @@ async fn responses_terminal_status_mismatch_preserves_valid_usage(pool: PgPool) 
             assert_eq!(reply.status, 200, "{at}");
             assert_eq!(last_event(&reply.body)["type"], "error", "{at}");
             assert_eq!(told(Client::Responses, &reply.body), class.code(), "{at}");
+            assert_eq!(
+                reply
+                    .body
+                    .lines()
+                    .filter(|line| *line == "event: error")
+                    .count(),
+                1,
+                "{at}"
+            );
+            assert!(
+                reply.body.contains("Hello"),
+                "{at}: a delta must reach the client"
+            );
+            assert!(!reply.body.contains("Different final text"), "{at}");
+
             for event in ["response.completed", "response.incomplete", "[DONE]"] {
                 assert!(!reply.body.contains(event), "{at}: unexpected {event}");
             }
@@ -718,7 +898,17 @@ async fn responses_terminal_status_mismatch_preserves_valid_usage(pool: PgPool) 
             .fetch_one(&w.f.store.pool)
             .await
             .unwrap();
-            if label == "conflicting reasoning fields" {
+            let expected_reasoning = match label {
+                "conflicting reasoning fields" | "reasoning fits total less cache floor" => {
+                    Some(Some(1))
+                }
+                "reasoning exceeds total less input"
+                | "reasoning exceeds total less cache floor"
+                | "duplicate reasoning count"
+                | "duplicate compatibility details" => Some(None),
+                _ => None,
+            };
+            if let Some(expected_reasoning) = expected_reasoning {
                 let telemetry: (Option<i64>, Option<String>) = sqlx::query_as(
                     "SELECT reasoning_tokens,reported_upstream_model FROM inference_executions WHERE root_request_id=$1",
                 )
@@ -726,7 +916,10 @@ async fn responses_terminal_status_mismatch_preserves_valid_usage(pool: PgPool) 
                 .fetch_one(&w.f.store.pool)
                 .await
                 .unwrap();
-                assert_eq!(telemetry, (Some(1), Some("served".into())), "{at}");
+                let want = (expected_reasoning, Some("served".into()));
+                if telemetry != want {
+                    problems.push(format!("{at}: telemetry {telemetry:?}, want {want:?}"));
+                }
             }
             assert!(admitted > 0, "{at}: the fixture must reserve money");
             let got = (

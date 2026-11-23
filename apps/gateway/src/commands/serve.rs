@@ -203,7 +203,7 @@ async fn prepare(store: Store) -> Result<Prepared> {
     })
 }
 
-/// Background work leases (P5): singleton jobs run on one replica. Takes
+/// Background work leases: singleton jobs run on one replica. Takes
 /// them once, then renews them in the returned task. Infallible: every step
 /// after this one runs inside [`start`], whose failure releases them.
 async fn take_leases(
@@ -307,7 +307,7 @@ async fn listen(
     tokio::net::TcpListener,
     Option<JoinHandle<()>>,
 )> {
-    // Per-replica caches (P4): version polling plus LISTEN.
+    // Per-replica caches: version polling plus LISTEN.
     let notifications = config
         .config_cache
         .then(|| config.connect_listener())

@@ -7,8 +7,8 @@
 //!   Deactivation (`active:false` or DELETE) suspends the user: sessions and the user's
 //!   personal/issued keys are revoked. Reactivation never restores revoked keys.
 //! - A pushed Group becomes "SCIM-managed": its membership feeds the configured issuer's
-//!   group mappings with group provenance (manual grants are never touched), and sign-in
-//!   no longer takes that group's membership from the token.
+//!   group mappings with group provenance (manual grants are never touched). Sign-in
+//!   uses the provisioned membership for that group.
 //! - Attributes outside the published schema subset are accepted but not stored.
 //! - SCIM never removes platform access from the last active Platform Admin: a write
 //!   that would leave none is rolled back whole, answered with 409, audited, and raises

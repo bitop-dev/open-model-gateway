@@ -1,4 +1,4 @@
-//! Lock-free read snapshots and the optional reporting replica (scale plan P1).
+//! Lock-free read snapshots and the optional reporting replica.
 //!
 //! Reports, usage, logs, `/me` and `/v1/models` never take the catalog
 //! advisory lock or the installation row lock. Each runs in one

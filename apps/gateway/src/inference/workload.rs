@@ -205,8 +205,7 @@ impl StreamSettlement {
     }
     /// Durably settle success; only then may the body terminate cleanly.
     pub async fn succeed(&mut self) -> Result<(), InferenceError> {
-        // Non-generation workloads are outside this PR's tracing scope
-        // (#98 PR 2 covers chat/responses/messages only): no phase buffer.
+        // Only interactive generation records admission phase spans.
         self.guard.finish(Outcome::Succeeded, None, None).await
     }
     /// Record failure and return the error the client should see.
@@ -454,8 +453,7 @@ impl Engine {
             )
             .await
             .map_err(|_| InferenceError::Timeout)??;
-            // Non-generation workloads are outside this PR's tracing scope
-            // (#98 PR 2): no correlation id to log.
+            // Non-generation workloads carry no trace correlation id.
             let mut guard = ExecutionGuard::new(
                 self.repository.clone(),
                 execution_id,

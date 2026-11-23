@@ -1,4 +1,4 @@
-//! Hourly usage rollups (migration 0032, scale plan P6).
+//! Hourly usage rollups (migration 0032).
 //!
 //! `usage_rollups_hourly` keeps exact integer sums per UTC hour and usage
 //! dimension. The leased `rollups` job ([`run_once`], every minute in

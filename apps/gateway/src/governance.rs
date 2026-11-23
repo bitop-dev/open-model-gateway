@@ -90,8 +90,8 @@ impl LockGates {
         let pool = max_connections as usize;
         let (admission, settlement) = match mode {
             locks::AdmissionMode::Global => (pool / 4, pool / 4),
-            // P3 load test: with a quarter of the pool, one replica's
-            // settlements queued in process at 1000/s (2 permits of 10).
+            // In a 1,000/s single-replica load test with a quarter of the pool,
+            // settlements queued in process (2 permits of 10).
             locks::AdmissionMode::Scoped => (pool / 2, pool * 3 / 10),
         };
         Self {
@@ -212,12 +212,12 @@ async fn catalog_lock(tx: &mut Tx<'_>) -> Result<(), InferenceError> {
         .map_err(storage)?;
     Ok(())
 }
-/// The installation row lock, taken after [`catalog_lock`]. Admission and
-/// settlement still serialize on it with authorization, membership and policy
-/// changes (management holds it too); it no longer guards any limit data:
-/// there are no installation-wide limits (0026) and admission reads only the
-/// workspace's and key lineage's own policies, budget totals and counters.
-/// Scale plan P3 replaces it in admission with scoped authority locks.
+/// The installation row lock, taken after [`catalog_lock`], serializes
+/// management changes. Global-mode admission and settlement also take
+/// this lock when serializing with authorization, membership and policy
+/// changes. Scoped admission and settlement use scoped authority locks.
+/// Admission reads limit data from the workspace and key lineage policies,
+/// budget totals and counters.
 async fn installation_lock(tx: &mut Tx<'_>) -> Result<(), InferenceError> {
     sqlx::query_scalar::<_, Uuid>("SELECT id FROM installation WHERE singleton FOR NO KEY UPDATE")
         .fetch_one(&mut **tx)

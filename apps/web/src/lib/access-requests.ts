@@ -1,6 +1,6 @@
 /*
- * Self-service access requests (#83): join a discoverable Team/Project as `member` (slice A),
- * or, as a member, ask for a catalog model to be selected for the workspace (slice B).
+ * Self-service access requests (#83): join a discoverable Team/Project as `member`,
+ * or, as a member, ask for a catalog model to be selected for the workspace.
  * Browser-only routes (docs/management-api.md#self-service-access-requests-83).
  * Reasons are bounded plain text and are always rendered as text, never HTML. Server
  * capabilities are presentation only: Rust rechecks authority, discoverability, membership
@@ -14,7 +14,7 @@ export type AccessRequestStatus = "pending" | "approved" | "denied" | "withdrawn
 export type AccessRequestTarget = { id: string; name: string; kind: Exclude<WorkspaceKind, "personal"> };
 /**
  * `requester`/`workspace_id`/`decided_by` stay opaque IDs; the server never adds newly disclosed
- * live workspace/membership data to history (docs/management-api.md). Two UX-fix fields narrow
+ * live workspace/membership data to history (docs/management-api.md). Two fields narrow
  * that rule, by viewer:
  * - `workspace_name_at_request`: the name captured once, server-side, at submission. Present on
  *   every read (requester and approver), it is a frozen reference, never the workspace's current

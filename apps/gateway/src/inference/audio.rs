@@ -10,7 +10,7 @@
 //!   seconds plus one second of decoder/rounding slack); when the container
 //!   cannot be measured (MP4/M4A/WebM, or a malformed header) the pinned
 //!   price's `max_units` is the only bound, otherwise the meter is unbounded and
-//!   budgeted admission is refused (Phase 1 rule).
+//!   budgeted admission is refused.
 //! - **Speech** meters `input_characters` exactly, counted by the gateway as
 //!   Unicode scalar values (`char`s) of `input` before admission. Output audio
 //!   duration is unknown (never reported), so prices must mark

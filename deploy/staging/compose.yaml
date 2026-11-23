@@ -17,7 +17,7 @@ x-gateway: &gateway
 # STAGING_POSTGRES_IMAGE / STAGING_CADDY_IMAGE allow digest-pinned overrides.
 services:
   postgres:
-    image: ${STAGING_POSTGRES_IMAGE:-mirror.gcr.io/library/postgres@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27}
+    image: ${STAGING_POSTGRES_IMAGE:-mirror.gcr.io/library/postgres@sha256:837bed18782820fe967067cb5328b02b0d9992c1be9a37ee0c9c492cfc03af3b}
     restart: unless-stopped
     environment:
       POSTGRES_USER: gateway_bootstrap
@@ -96,7 +96,7 @@ services:
     logging: *logging
 
   ingress:
-    image: ${STAGING_CADDY_IMAGE:-mirror.gcr.io/library/caddy@sha256:d8542f48d34a9cf4e4c11a478865229840e87e4c96ea3f439101f31a5d35f75f}
+    image: ${STAGING_CADDY_IMAGE:-mirror.gcr.io/library/caddy@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0}
     restart: unless-stopped
     read_only: true
     tmpfs: ['/tmp:rw,noexec,nosuid,size=16m']

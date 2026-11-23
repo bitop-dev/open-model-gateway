@@ -1,4 +1,4 @@
-//! Configuration change notifications (migration 0028, scale plan P4).
+//! Configuration change notifications (migration 0028).
 //!
 //! Configuration writes bump a per-domain version in `config_versions` and
 //! `NOTIFY omg_config, '<topic>:<version>'` at commit. Each replica learns the

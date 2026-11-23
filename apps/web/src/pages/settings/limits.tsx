@@ -1,7 +1,6 @@
 /*
- * Admin › Settings › Defaults & limits (formerly Admin › Limits; /admin/limits
- * redirects here): Grounded/ResourcePage pill tabs, one scope per tab (URL
- * `?tab=personal|team|project`): the live Personal/Team/Project type
+ * Admin › Settings › Defaults & limits (/admin/limits redirects here).
+ * Grounded/ResourcePage pill tabs use `?tab=personal|team|project` for the live type
  * defaults. There are no installation-wide limits (removed in migration 0026;
  * an old `?tab=installation` link opens the first tab). Each tab shows that scope's limits
  * table (components/scope-limits.tsx): three rate rows and stacked budgets

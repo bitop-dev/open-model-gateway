@@ -1,11 +1,10 @@
-//! History parent consistency (migration 0034, scale decision gate D3).
+//! History parent consistency (migration 0034).
 //!
-//! Executions and reservations no longer carry foreign keys to their hot
-//! parents (workspaces, keys, deployments, price versions, cost centers,
-//! batch jobs): those keys locked the parent rows `FOR KEY SHARE` on every
-//! insert and created MultiXacts under concurrency. Instead the parents can
-//! never be deleted or re-keyed (triggers), and a `BEFORE INSERT` trigger on
-//! each history table checks its scoped references with plain reads.
+//! Triggers protect hot parent rows (workspaces, keys, deployments, price
+//! versions, cost centers and batch jobs) from deletion or re-keying.
+//! A `BEFORE INSERT` trigger on each history table checks its scoped
+//! references with plain reads. This avoids parent-row `FOR KEY SHARE`
+//! locks and MultiXacts on concurrent execution and reservation inserts.
 //!
 //! [`verify`] re-checks the same relations over stored history: every
 //! execution's key belongs to its workspace, its deployment, cost center and

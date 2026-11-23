@@ -564,12 +564,13 @@ async fn inference_openapi_completed_area_fixtures(pool: PgPool) {
             .await;
     }
 
-    // images: `size` has no derivable bounds, so the fixture supplies the
-    // straddling candidates (16384 per side is the last accepted value).
+    // Probe both numeric limits and the longest spelling: each side can have
+    // five digits, and 16384 is the largest accepted dimension.
     serve(&pool, "images").await;
     let straddle = |at: &'static str| {
         [
             (at, json!("16384x16384")),
+            (at, json!("163840x16384")),
             (at, json!("16385x16384")),
             (at, json!("1x1")),
             (at, json!("0x1")),

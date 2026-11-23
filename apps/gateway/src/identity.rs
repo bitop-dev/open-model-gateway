@@ -83,10 +83,8 @@ pub struct IdentityState {
     scim: Option<Arc<ScimRuntime>>,
     /// Lifetime and idle timeout of new sessions and of recorded activity.
     policy: SessionPolicy,
-    /// #37 PR2: admin-token request handling (IP allowlist resolution) is
-    /// independent of whether OIDC sign-in is configured at all, so this is
-    /// read directly from `GATEWAY_TRUSTED_PROXIES` rather than through
-    /// `IdentityConfig` (which only exists when OIDC is configured).
+    /// Read `GATEWAY_TRUSTED_PROXIES` independently of OIDC configuration
+    /// so admin-token requests can resolve the client address without OIDC.
     trusted_proxies: throttle::TrustedProxies,
     /// Bounded per-replica rate limiting of admin-token authentication
     /// attempts (malformed credentials, unknown/expired/revoked tokens):
@@ -420,7 +418,7 @@ pub struct BrowserPrincipal {
     pub platform_auditor: bool,
 }
 
-/// A live admin-token request context (#37 PR2): everything
+/// The live admin-token request context includes everything
 /// `authenticate_admin_token` returned, plus the request's resolved client
 /// address (identical resolution as [`throttle::client_ip`]), needed to
 /// enforce the token's optional IP allowlist and to record last use.
@@ -433,12 +431,9 @@ pub struct AdminTokenContext {
     pub client_address: Option<IpAddr>,
 }
 
-/// Exactly one credential family authenticated a management request (#37
-/// PR2): a browser session, or an admin API token. Never both -- selection
-/// happens once, in [`authenticate_management`], before extraction, and a
-/// `BrowserPrincipal` is never manufactured for a token (a token's
-/// authority is its own: an owner id, scopes and an optional allowlist, not
-/// a verified email or session claim).
+/// [`authenticate_management`] selects one credential family before
+/// extraction. An admin token has its own principal with an owner id,
+/// scopes and optional allowlist. It carries no browser-session claims.
 #[derive(Clone)]
 pub enum ManagementPrincipal {
     Browser(BrowserPrincipal),

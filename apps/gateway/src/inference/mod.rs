@@ -306,7 +306,7 @@ fn valid_token_usage(usage: Usage) -> bool {
 /// as a `settlement` span, via [`begin_phase_group`]/[`end_phase_group`])
 /// and records its `upstream.attempt` span, regardless of whether the
 /// settlement write itself succeeded. Returns settlement's own result
-/// unchanged, so callers keep deciding failover/return exactly as before.
+/// unchanged so the caller can decide whether to fail over or return.
 #[allow(clippy::too_many_arguments)]
 async fn settle_attempt(
     telemetry: &mut RequestTelemetry,

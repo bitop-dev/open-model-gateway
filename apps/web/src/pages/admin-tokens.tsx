@@ -1,7 +1,7 @@
 /*
- * Admin › Settings › Admin API tokens (#37 PR3). Long-lived
- * management credentials a Platform Admin can use from scripts and automation: five explicit
- * write-does-not-imply-read scopes plus platform:read, an optional CIDR allowlist, and a 1–90
+ * Admin › Settings › Admin API tokens. Long-lived
+ * management credentials a Platform Admin can use from scripts and automation: four write scopes and
+ * a separate platform:read scope, an optional CIDR allowlist, and a 1–90
  * day expiry (default 30; no renewal). They can never call inference or issue inference keys.
  * Token CRUD is browser-session-only; the backend denies these routes to admin tokens
  * themselves. A caller creates only for themself; any Admin may revoke any token, idempotently.

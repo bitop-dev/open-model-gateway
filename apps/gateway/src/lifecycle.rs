@@ -68,14 +68,11 @@ pub(crate) async fn cleanup_user(
     .bind(user)
     .execute(&mut **tx)
     .await?;
-    // Admin API tokens (#37 PR1): the owner-invalidation trigger already
-    // revoked every token this user owns the instant `platform_role_grants`
-    // below loses their last `admin` row (or, independently, the moment
-    // `users.cleaned_at` below is set). The address is kept until then (it
-    // helps investigate misuse of a high-risk credential), but a cleaned-up
-    // account is gone for good, so scrub it here like the rest of this
-    // function's address/identity copies (docs/identity.md's retention
-    // note next to the sessions statement).
+    // The owner-invalidation triggers revoke admin tokens when the user
+    // loses their effective Admin role or their account is cleaned.
+    // Keep last-used addresses for misuse investigations until account
+    // cleanup, which scrubs them alongside other address and identity
+    // data (docs/identity.md).
     sqlx::query("UPDATE admin_api_tokens SET last_used_address=NULL WHERE owner_user_id=$1")
         .bind(user)
         .execute(&mut **tx)
@@ -116,8 +113,7 @@ pub async fn cleanup_inactive_accounts(store: &Store) -> Result<u64, sqlx::Error
 
 /// [`cleanup_inactive_accounts`] as the `lifecycle` lease holder: the
 /// transaction is fenced to the term, and a lock-free check first skips the
-/// catalog/installation locks entirely when nothing is due (the common case;
-/// before P5 every replica took the installation row every minute).
+/// catalog/installation locks entirely when nothing is due.
 pub async fn cleanup_inactive_accounts_fenced(
     store: &Store,
     fence: Option<&crate::leases::Fence>,
@@ -187,7 +183,7 @@ pub async fn expire_access_requests_fenced(
     let expired: Vec<(Uuid,Uuid,String)>=sqlx::query_as("UPDATE access_requests SET status='expired',decided_by=NULL WHERE id IN (SELECT id FROM access_requests WHERE status='pending' AND expires_at<=clock_timestamp() ORDER BY expires_at,id LIMIT 100 FOR UPDATE SKIP LOCKED) AND status='pending' RETURNING id,workspace_id,target_kind")
         .fetch_all(&mut *tx).await?;
     for (id, ws, kind) in &expired {
-        // The request's own kind (#83 slice B): a membership or model request.
+        // The request's kind: membership or model selection.
         sqlx::query("INSERT INTO audit_events(id,workspace_id,action,resource_type,resource_id,metadata) VALUES($1,$2,'access_request.expired','access_request',$3,jsonb_build_object('kind',$4::text,'outcome','expired'))")
             .bind(Uuid::now_v7()).bind(ws).bind(id).bind(kind).execute(&mut *tx).await?;
     }

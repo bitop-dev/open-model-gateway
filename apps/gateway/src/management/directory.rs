@@ -197,7 +197,7 @@ struct DirectoryQuery {
 // Display-only shared-workspace metadata: member_count counts users holding at
 // least one non-revoked grant (the rows of the members endpoint, suspended users
 // included); cost_center resolves the current allocation pointer by name.
-// `discoverable` (#83 slice A) names the write-only PUT's current state; callers are
+// `discoverable` names the write-only PUT's current state; callers are
 // always filtered to kind IN ('team','project'), so it's never read for personal workspaces.
 const SHARED_WORKSPACE_JSON: &str = "jsonb_build_object('id',w.id,'name',w.name,'kind',w.kind,'cost_center_id',w.cost_center_id,'cost_center',CASE WHEN c.id IS NULL THEN NULL ELSE jsonb_build_object('id',c.id,'name',c.name,'code',c.code) END,'member_count',(SELECT count(DISTINCT g.user_id) FROM workspace_membership_grants g WHERE g.workspace_id=w.id AND g.revoked_at IS NULL),'disabled_at',w.disabled_at,'discoverable',w.discoverable,'created_at',w.created_at) FROM workspaces w LEFT JOIN cost_centers c ON c.id=w.cost_center_id";
 async fn workspaces(
@@ -529,7 +529,7 @@ async fn platform_user(
         .ok_or_else(missing)?;
     // A count only: an admin never sees another person's devices.
     data["active_sessions"] = json!(super::sessions::live_count(&mut tx, id).await?);
-    // On the user since #80: deleting ended sessions doesn't change it.
+    // Stored on the user, so deleting ended sessions leaves it intact.
     // Active legal holds (#75): a count; the holds page has the details.
     data["legal_holds"] = json!(super::legal_holds::active_for_user(&mut tx, id).await?);
     data["first_sign_in_at"] = sqlx::query_scalar::<_, Option<Value>>(
@@ -856,8 +856,8 @@ pub(super) async fn revoke_role_locked(
     role: &str,
     only: Option<Uuid>,
 ) -> Result<(), ApiError> {
-    // The grants this revokes (without `only`: as before, every manual and
-    // bootstrap grant of the role, so group grants are the ones retained).
+    // Without `only`, revoke every manual and bootstrap grant of the role.
+    // Group grants are retained.
     const REVOKED: &str = "user_id=$1 AND role=$2 AND source IN ('manual','bootstrap') AND revoked_at IS NULL AND ($3::uuid IS NULL OR id=$3)";
     if role == "admin" {
         let retained:bool=sqlx::query_scalar(&format!("SELECT EXISTS(SELECT 1 FROM platform_role_grants WHERE user_id=$1 AND role='admin' AND revoked_at IS NULL AND NOT ({REVOKED}))")).bind(id).bind(role).bind(only).fetch_one(&mut **tx).await?;

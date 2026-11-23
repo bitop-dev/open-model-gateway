@@ -215,12 +215,8 @@ pub(crate) fn classify_v6(ip: Ipv6Addr) -> Category {
     if s[0] == 0x2001 && s[1] == 0xdb8 {
         return Category::Documentation;
     }
-    // 3fff::/20, IETF-reserved, grouped with documentation. #244 fix: this
-    // used to use the wider `(s[0] & 0xfff0) == 0x3ff0` mask, i.e.
-    // 3ff0::/12, which incorrectly classified all of 3ff0::/12 as
-    // documentation (every address whose first hextet is 0x3ff0..=0x3fff).
-    // `s[0]` supplies 16 of the 20 prefix bits; the remaining 4 are the top
-    // nibble of `s[1]`, so both must match.
+    // The documentation prefix 3fff::/20 requires all 16 bits of `s[0]`
+    // and the high four bits of `s[1]` to match.
     if s[0] == 0x3fff && (s[1] & 0xf000) == 0 {
         return Category::Documentation;
     }

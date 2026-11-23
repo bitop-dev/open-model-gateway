@@ -1,7 +1,7 @@
 /*
- * Self-service access requests (#83): join a discoverable Team/Project as `member` (slice A),
- * or ask for a catalog model for a workspace you belong to (slice B; asked from the
- * workspace's Models page). Three surfaces, all browser-session-only (docs/management-api.md):
+ * Self-service access requests (#83): join a discoverable Team/Project as `member`,
+ * or ask for a catalog model from the Models page of a workspace you belong to.
+ * Three surfaces, all browser-session-only (docs/management-api.md):
  *   - Workspace portal "Request access" (discover + submit) and "My requests" (status, withdraw).
  *   - Workspace Settings › Access requests: the owner/admin approval queue for that workspace.
  *   - Admin › Access requests: the platform queue/history (Platform Admin approves; Auditor reads).

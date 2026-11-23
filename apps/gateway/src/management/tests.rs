@@ -600,3 +600,57 @@ async fn sanitized_audit_failure_rolls_back_resource_creation(pool: PgPool) {
 
 #[path = "settings/url_length_tests.rs"]
 mod settings_url_length_tests;
+
+#[cfg(feature = "integration-tests")]
+fn session_cursor_width_candidates(longest: String) -> Vec<(&'static str, String)> {
+    vec![
+        ("cursor", format!("{longest}0")),
+        ("cursor", format!("{longest}00")),
+        ("cursor", longest),
+    ]
+}
+
+#[cfg(feature = "integration-tests")]
+#[test]
+fn boundary_review_even_cursor_overflow_distinguishes_a_widened_byte_pair_cap() {
+    let document = openapi::responses::artifact();
+    for (path, sign) in [
+        ("/api/v1/platform/logs/sessions", ""),
+        ("/api/v1/workspaces/{ws}/sessions", "-"),
+    ] {
+        let schema = &document["paths"][path]["get"]["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "cursor")
+            .unwrap()["schema"];
+        let longest = format!(
+            "{sign}0000000000000000001_{}_{}",
+            uuid::Uuid::nil(),
+            "f09f9880".repeat(128)
+        );
+        let candidates = session_cursor_width_candidates(longest.clone());
+        let mut widened = schema.clone();
+        widened["pattern"] = serde_json::json!(
+            schema["pattern"]
+                .as_str()
+                .unwrap()
+                .replace("{1,512}", "{1,513}")
+        );
+        for (suffix, original, mutant) in
+            [("", true, true), ("0", false, false), ("00", false, true)]
+        {
+            let value = format!("{longest}{suffix}");
+            assert!(candidates.iter().any(|(_, c)| c == &value));
+            let value = serde_json::json!(value);
+            assert_eq!(
+                openapi::http_vectors::accepts(document, schema, &value).unwrap(),
+                original
+            );
+            assert_eq!(
+                openapi::http_vectors::accepts(document, &widened, &value).unwrap(),
+                mutant
+            );
+        }
+    }
+}

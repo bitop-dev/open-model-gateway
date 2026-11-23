@@ -53,8 +53,8 @@ pub(crate) fn public_origin() -> Option<String> {
     .filter(|s| s.len() <= 512)
 }
 /// Browser deep link, following locations.ts's /workspaces/{ws} and /admin
-/// scope conventions. Slice D renders this route and loads the separately
-/// authorized JSON occurrence endpoint; link possession grants no authority.
+/// scope conventions. The browser loads the separately authorized JSON
+/// occurrence endpoint. Link possession grants no authority.
 pub(crate) fn report_path(workspace: Option<Uuid>, schedule: Uuid, run: Uuid) -> String {
     let scope = workspace.map_or_else(|| "admin".to_owned(), |ws| format!("workspaces/{ws}"));
     format!("/{scope}/report-schedules/{schedule}/runs/{run}")

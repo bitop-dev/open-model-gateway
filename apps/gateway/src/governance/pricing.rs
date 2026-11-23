@@ -24,7 +24,7 @@ static PRICES: std::sync::LazyLock<
     crate::cache::ImmutableCache<(Uuid, Uuid), std::sync::Arc<Price>>,
 > = std::sync::LazyLock::new(|| crate::cache::ImmutableCache::new("prices", 20_000));
 /// The immutable price version `id` of `deployment` (cached; a missing row is
-/// a storage error, as before).
+/// a storage error).
 pub(super) async fn price_version(
     tx: &mut Tx<'_>,
     id: Uuid,
