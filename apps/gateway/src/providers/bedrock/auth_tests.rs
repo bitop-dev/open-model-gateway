@@ -415,7 +415,7 @@ async fn an_sts_response_date_never_moves_the_signing_time() {
     }
 }
 
-use auth::attempt_fixture::{Failure, Fixture, attempt_cases};
+use auth::attempt_fixture::{Failure, Fixture, ResponseStatus, attempt_cases};
 
 fn fixture_identity() -> SharedCredentialsProvider {
     SharedCredentialsProvider::new(Credentials::new(
@@ -440,12 +440,23 @@ async fn bedrock_attempt(failure: Failure, stream: bool) {
         auth: AwsAuth::Default,
         endpoint: Some(fixture.endpoint.clone()),
     };
+    let status = ResponseStatus::default();
     adapter.test_client = Some(Client::from_conf(
-        adapter.service_config(&plan, fixture_identity()),
+        adapter
+            .service_config(&plan, fixture_identity())
+            .to_builder()
+            .interceptor(status.clone())
+            .build(),
     ));
     let mut input = request();
     input.stream = stream;
-    assert!(adapter.execute(&target(), input).await.is_err());
+    assert!(
+        failure
+            .check_header_deadline(adapter.execute(&target(), input))
+            .await
+            .is_err()
+    );
+    assert_eq!(status.observed(), failure.expected_status());
     fixture.assert_one(failure);
 }
 
@@ -473,6 +484,18 @@ async fn sts_attempt(failure: Failure, short_attempt: bool) {
     }
     let provider = auth::assume_role_provider(ROLE, None, None, &builder.build()).await;
     let error = anyhow::Error::new(provider.provide_credentials().await.unwrap_err());
+    type AssumeRoleError =
+        aws_sdk_sts::error::SdkError<aws_sdk_sts::operation::assume_role::AssumeRoleError>;
+    let sdk_error = error
+        .chain()
+        .find_map(|source| source.downcast_ref::<AssumeRoleError>())
+        .expect("AssumeRole SDK error");
+    assert_eq!(
+        sdk_error
+            .raw_response()
+            .map(|response| response.status().as_u16()),
+        failure.expected_status()
+    );
     if matches!(failure, Failure::Timeout(_)) {
         // Smithy exposes the two timeout kinds through their error sources.
         let kind = if short_attempt {
