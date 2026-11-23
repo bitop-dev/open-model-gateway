@@ -4214,6 +4214,35 @@ fn keyword_scope_sibling_cap_cannot_witness_the_finite_pattern() {
 }
 
 #[test]
+fn supplied_query_witness_must_be_accepted_on_the_wire() {
+    let schema = json!({"type":["string","integer"],"pattern":"^(-0+|a+)$"});
+    let mut document = query_document();
+    document["paths"][TEMPLATE]["get"]["parameters"] = json!([parameter("s", false, schema)]);
+    let plan = |doc: &Value, pair: [&str; 2]| {
+        super::http_vectors::query_plan(
+            doc,
+            &doc["paths"][TEMPLATE]["get"],
+            &[],
+            &[("s".into(), "a".into())],
+            &pair.map(|s| ("s".into(), s.into())),
+        )
+    };
+    let error = plan(&document, ["-0", "-0x"])
+        .err()
+        .expect("the HTTP runner requires a refusal for bare negative zero");
+    assert!(error.to_string().contains("straddle"), "{error}");
+    let cases = plan(&document, ["a", "ax"]).unwrap().cases;
+    assert!(cases.iter().any(|case| case.edit == Edit::Set("-0".into())
+        && case.kind == "integer encoding bare negative zero"
+        && case.accept));
+    document["x-omg-integer-encoding-query-exceptions"] = json!({"s":["-0"]});
+    let cases = plan(&document, ["-0", "-0x"]).unwrap().cases;
+    assert!(cases.iter().any(|case| case.edit == Edit::Set("-0".into())
+        && case.kind == "query negative zero literal"
+        && case.accept));
+}
+
+#[test]
 fn supplied_query_witness_must_fit_the_encoded_request() {
     let schema = json!({"type":"string","allOf":[
         {"pattern":"^(é+|é+b)$"},{"pattern":"^(é+|é+c)$"}
