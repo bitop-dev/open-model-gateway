@@ -16,15 +16,30 @@ fn sensitive(name: &str) -> bool {
             .any(|part| lower.contains(part))
 }
 
+fn block_value(block: &syn::Block) -> bool {
+    matches!(block.stmts.last(), Some(syn::Stmt::Expr(tail, None)) if uuid_value(tail))
+}
+
 fn uuid_value(expr: &Expr) -> bool {
     match expr {
-        Expr::MethodCall(e) => uuid_value(&e.receiver),
+        Expr::MethodCall(e) => {
+            uuid_value(&e.receiver) || (e.method == "unwrap_or" && e.args.iter().any(uuid_value))
+        }
+        Expr::Try(e) => uuid_value(&e.expr),
+        Expr::Await(e) => uuid_value(&e.base),
+        Expr::Cast(e) => uuid_value(&e.expr),
+        Expr::Closure(e) => uuid_value(&e.body),
+        Expr::Match(e) => e.arms.iter().any(|arm| uuid_value(&arm.body)),
+        Expr::If(e) => {
+            block_value(&e.then_branch)
+                || e.else_branch
+                    .as_ref()
+                    .is_some_and(|(_, expr)| uuid_value(expr))
+        }
         Expr::Paren(e) => uuid_value(&e.expr),
         Expr::Reference(e) => uuid_value(&e.expr),
         Expr::Unary(e) if matches!(e.op, syn::UnOp::Deref(_)) => uuid_value(&e.expr),
-        Expr::Block(e) => {
-            matches!(e.block.stmts.last(), Some(syn::Stmt::Expr(tail, None)) if uuid_value(tail))
-        }
+        Expr::Block(e) => block_value(&e.block),
         Expr::Call(e) => {
             let constructor = matches!(&*e.func, Expr::Path(p) if {
                 let mut path = p.path.segments.iter().rev();
@@ -74,23 +89,36 @@ impl Bindings<'_> {
             (Pat::Ident(p), _) => self.binding(&p.ident, expr, true),
             (Pat::Type(p), _) => self.pattern(&p.pat, expr),
             (Pat::Tuple(p), Expr::Tuple(values)) => {
-                // A rest pattern absorbs any number of tuple elements. Its two
-                // sides align independently with the start and end of the value.
-                let mut patterns = p.elems.iter();
-                let mut elements = values.elems.iter();
-                while let Some(pattern) = patterns.next() {
-                    if matches!(pattern, Pat::Rest(_)) {
-                        for (pattern, value) in patterns.rev().zip(elements.rev()) {
-                            self.pattern(pattern, value);
-                        }
-                        break;
-                    }
-                    if let Some(value) = elements.next() {
-                        self.pattern(pattern, value);
-                    }
-                }
+                self.sequence(p.elems.iter(), values.elems.iter())
+            }
+            (Pat::Slice(p), Expr::Array(values)) => {
+                self.sequence(p.elems.iter(), values.elems.iter())
             }
             _ => {}
+        }
+    }
+
+    fn sequence<'a>(
+        &mut self,
+        mut patterns: impl DoubleEndedIterator<Item = &'a Pat>,
+        mut elements: impl DoubleEndedIterator<Item = &'a Expr>,
+    ) {
+        // A rest pattern absorbs any number of elements. Its two
+        // sides align independently with the start and end of the value.
+        while let Some(pattern) = patterns.next() {
+            let inner = match pattern {
+                Pat::Ident(p) => p.subpat.as_ref().map_or(pattern, |(_, sub)| sub.as_ref()),
+                other => other,
+            };
+            if matches!(inner, Pat::Rest(_)) {
+                for (pattern, value) in patterns.rev().zip(elements.rev()) {
+                    self.pattern(pattern, value);
+                }
+                break;
+            }
+            if let Some(value) = elements.next() {
+                self.pattern(pattern, value);
+            }
         }
     }
 
@@ -118,6 +146,18 @@ impl<'ast> Visit<'ast> for Bindings<'_> {
         visit::visit_item_fn(self, f);
         self.function = prev;
     }
+    fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
+        self.binding(&item.ident, &item.expr, false);
+        visit::visit_item_static(self, item);
+    }
+    fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
+        self.binding(&item.ident, &item.expr, false);
+        visit::visit_item_const(self, item);
+    }
+    fn visit_expr_let(&mut self, e: &'ast syn::ExprLet) {
+        self.pattern(&e.pat, &e.expr);
+        visit::visit_expr_let(self, e);
+    }
     fn visit_local(&mut self, local: &'ast syn::Local) {
         if let Some(init) = &local.init {
             self.pattern(&local.pat, &init.expr);
@@ -133,6 +173,11 @@ impl<'ast> Visit<'ast> for Bindings<'_> {
     fn visit_expr_assign(&mut self, a: &'ast syn::ExprAssign) {
         if let Expr::Field(f) = &*a.left
             && let Member::Named(id) = &f.member
+        {
+            self.binding(id, &a.right, false);
+        }
+        if let Expr::Path(p) = &*a.left
+            && let Some(id) = p.path.get_ident()
         {
             self.binding(id, &a.right, false);
         }
@@ -373,4 +418,45 @@ fn rest_patterns_align_suffix_values_from_the_end() {
         rust("fixture.rs", &ast),
         ["fixture.rs:1: UUID bound to nonce"]
     );
+}
+
+#[test]
+fn indirect_uuid_bindings_are_reported() {
+    let fixtures = [
+        "static SESSION_NONCE: LazyLock<Uuid> = LazyLock::new(|| Uuid::new_v4());",
+        "const SESSION_TOKEN: fn() -> Uuid = || Uuid::new_v4();",
+        "fn f() { let salt; salt = Uuid::now_v7(); }",
+        "fn f() { let token = if ready { existing } else { Uuid::now_v7() }; }",
+        "fn f() { let token = match kind { A => Uuid::new_v4(), _ => existing }; }",
+        "fn f() { let nonce = Ok(Uuid::new_v4())?; }",
+        "async fn f() { let nonce = ready(Uuid::new_v4()).await; }",
+        "fn f() { let salt = Uuid::new_v4().as_u128() as u64; }",
+        "fn f() { let token = supplied.unwrap_or(Uuid::new_v4()); }",
+        "fn f() { if let [token] = [Uuid::new_v4()] {} }",
+        "fn f() { let [middle @ .., nonce] = [id, other, Uuid::now_v7()]; }",
+        "fn f() { let [.., token] = [id, Uuid::new_v4()] else { return }; }",
+    ];
+    let missed: Vec<_> = fixtures
+        .into_iter()
+        .filter(|source| rust("fixture.rs", &syn::parse_file(source).unwrap()).len() != 1)
+        .collect();
+    assert!(
+        missed.is_empty(),
+        "expected one finding for each fixture: {missed:#?}"
+    );
+}
+
+#[test]
+fn unrelated_uuids_do_not_supply_secret_values() {
+    let source = r#"
+        fn f() {
+            let nonce = if active(Uuid::new_v4()) { first } else { second };
+            let salt = match Uuid::now_v7() { _ => existing };
+            let [key_id, .., verifier] = [Uuid::new_v4(), spare, existing];
+            let id = Uuid::new_v4();
+            let secret = entropy::bytes::<32>()?;
+            let token = format!("omg_{}.{}", id.simple(), hex::encode(secret));
+        }
+    "#;
+    assert!(rust("fixture.rs", &syn::parse_file(source).unwrap()).is_empty());
 }
