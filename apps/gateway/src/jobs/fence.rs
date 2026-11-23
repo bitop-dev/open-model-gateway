@@ -19,8 +19,8 @@
 //! reservation and totals rows (docs/governance.md). Transactions that change
 //! the job row take it `FOR NO KEY UPDATE` at the start, so no transaction
 //! upgrades a lock it already holds; `KEY SHARE` and `NO KEY UPDATE` do not
-//! conflict, so admissions, segment writes and counter updates of one run do
-//! not queue behind each other on it.
+//! conflict, so admission can proceed while a segment or progress update holds
+//! the job row. Segment registrations serialize their sequence allocation.
 //!
 //! A frozen runner inside a fenced transaction would hold the row against
 //! every claim: each fenced transaction therefore ends the session after
@@ -28,7 +28,7 @@
 use sqlx::{Postgres, Transaction, postgres::PgArguments, query::Query};
 use uuid::Uuid;
 
-use super::store::{Finished, JobRow, finish_batch_sql, job_storage};
+use super::store::{Finished, JobRow, finish_batch_tx, job_storage};
 use crate::store::Store;
 
 /// What a runner holds for one claim of a batch.
@@ -44,11 +44,11 @@ pub(crate) struct BatchFence {
 pub(crate) enum FenceError {
     /// The claim ended: the batch belongs to another claim now.
     Stale,
-    /// A statement failed and was not applied (counted where it ran): the
-    /// server answered with an error, or the statement never reached it.
+    /// A write failed and was not applied. Counted where it ran.
     Storage,
-    /// The connection failed with the statement possibly sent: the server may
-    /// still commit it. Counted where it ran.
+    /// Result file locked by a concurrent operation. The batch can retry.
+    FileBusy,
+    /// COMMIT did not return a successful acknowledgement. Counted where it ran.
     Unknown,
 }
 impl From<sqlx::Error> for FenceError {
@@ -79,6 +79,13 @@ pub(crate) enum Hold {
     Rows,
     /// Also changes the job row.
     Update,
+}
+
+/// Lines represented by one encrypted output file.
+#[derive(Default)]
+pub(crate) struct SegmentLines<'a> {
+    pub(crate) succeeded: &'a [(i32, Uuid)],
+    pub(crate) failed: &'a [(i32, Uuid)],
 }
 
 impl BatchFence {
@@ -133,17 +140,6 @@ impl BatchFence {
         Ok(tx)
     }
 
-    /// Whether the claim is still current (a read; it fences nothing).
-    pub(crate) async fn current(&self, store: &Store) -> Result<bool, sqlx::Error> {
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM async_jobs WHERE id=$1 AND runner_id=$2 AND runner_epoch=$3)")
-            .bind(self.job)
-            .bind(self.runner)
-            .bind(self.epoch)
-            .fetch_one(&store.pool)
-            .await
-            .map_err(job_storage)
-    }
-
     /// A statement whose first three parameters are the fence's.
     fn query<'q>(&self, sql: &'q str) -> Query<'q, Postgres, PgArguments> {
         sqlx::query(sql)
@@ -176,7 +172,7 @@ impl BatchFence {
         store: &Store,
         lease_seconds: f64,
     ) -> Result<Renewed, sqlx::Error> {
-        let row: Option<(bool, bool)> = sqlx::query_as("UPDATE async_jobs SET runner_lease_until=clock_timestamp()+make_interval(secs=>$4) WHERE id=$1 AND runner_id=$2 AND runner_epoch=$3 RETURNING cancel_requested_at IS NOT NULL,settled_at IS NOT NULL")
+        let row: Option<(bool, bool)> = sqlx::query_as("UPDATE async_jobs SET runner_lease_until=clock_timestamp()+make_interval(secs=>$4) WHERE id=$1 AND runner_id=$2 AND runner_epoch=$3 AND runner_lease_until IS NOT NULL RETURNING cancel_requested_at IS NOT NULL,settled_at IS NOT NULL")
             .bind(self.job).bind(self.runner).bind(self.epoch).bind(lease_seconds)
             .fetch_optional(&store.pool).await.map_err(job_storage)?;
         Ok(match row {
@@ -213,6 +209,7 @@ impl BatchFence {
     }
 
     /// Lines finished since the last call.
+    #[cfg(all(test, feature = "integration-tests"))]
     pub(crate) async fn progress(
         &self,
         store: &Store,
@@ -230,34 +227,22 @@ impl BatchFence {
         store: &Store,
         f: &Finished<'_>,
     ) -> FenceResult<JobRow> {
-        let row: Option<JobRow> = sqlx::query_as(&finish_batch_sql(true))
-            .bind(self.job)
-            .bind(self.runner)
-            .bind(self.epoch)
-            .bind(f.state.as_str())
-            .bind(f.error_code)
-            .bind(f.output_file)
-            .bind(f.error_file)
-            .bind(f.counts.map(|c| c.total as i32))
-            .bind(f.counts.map(|c| c.completed as i32))
-            .bind(f.counts.map(|c| c.failed as i32))
-            .fetch_optional(&store.pool)
+        let mut tx = self.begin(store, Hold::Update).await?;
+        let row = finish_batch_tx(&mut tx, self.job, f)
             .await
-            .map_err(|e| {
-                let unknown = outcome_unknown(&e);
-                job_storage(e);
-                if unknown {
-                    FenceError::Unknown
-                } else {
-                    FenceError::Storage
+            .map_err(|error| match &error {
+                sqlx::Error::Database(e) if e.code().as_deref() == Some("55P03") => {
+                    FenceError::FileBusy
                 }
+                _ => FenceError::Storage,
             })?;
-        match row {
-            Some(row) => Ok(row),
-            // Already finished by this claim, or the claim ended.
-            None if self.current(store).await? => Ok(super::store::reload(store, self.job).await?),
-            None => Err(FenceError::Stale),
-        }
+        // An error at COMMIT cannot authorize cleanup. The sweeper can
+        // check whether the job links actually committed.
+        tx.commit().await.map_err(|e| {
+            job_storage(e);
+            FenceError::Unknown
+        })?;
+        Ok(row)
     }
 
     pub(crate) async fn mark_settled(&self, store: &Store) -> FenceResult<()> {
@@ -301,15 +286,15 @@ impl BatchFence {
         Ok(claimed)
     }
 
-    /// Record a line's outcome. With `count` the batch's counters move in the
+    /// Record a failed attempt. With `count` the batch's counters move in the
     /// same transaction, and only when this call is what moved the line out of
     /// `running` (a line already interrupted or finished is not counted
     /// twice). Returns whether the line changed.
-    pub(crate) async fn finish_line(
+    pub(crate) async fn fail_line(
         &self,
         store: &Store,
         line_no: i32,
-        succeeded: bool,
+        execution: Uuid,
         status_code: Option<u16>,
         error_code: Option<&str>,
         count: bool,
@@ -317,16 +302,50 @@ impl BatchFence {
         let mut tx = self
             .begin(store, if count { Hold::Update } else { Hold::Rows })
             .await?;
-        let changed = sqlx::query("UPDATE batch_lines SET state=$3,status_code=$4,error_code=$5,finished_at=clock_timestamp() WHERE job_id=$1 AND line_no=$2 AND state='running'")
-            .bind(self.job).bind(line_no).bind(if succeeded { "succeeded" } else { "failed" })
+        let changed = sqlx::query("UPDATE batch_lines SET state='failed',status_code=$4,error_code=$5,finished_at=clock_timestamp() WHERE job_id=$1 AND line_no=$2 AND execution_id=$3 AND state='running' AND NOT awaiting_segment")
+            .bind(self.job).bind(line_no).bind(execution)
             .bind(status_code.map(|s| s as i16)).bind(error_code)
             .execute(&mut *tx).await.map_err(job_storage)?.rows_affected() == 1;
         if count && changed {
-            let (c, f) = if succeeded { (1, 0) } else { (0, 1) };
-            count_lines(&mut tx, self.job, c, f).await?;
+            count_lines(&mut tx, self.job, 0, 1).await?;
         }
         tx.commit().await.map_err(job_storage)?;
         Ok(changed)
+    }
+
+    /// Count a provisional retry failure only while that execution still owns
+    /// the failed row. An unconfirmed retry claim cannot publish its old error.
+    pub(crate) async fn count_retry_failure(
+        &self,
+        store: &Store,
+        line: i32,
+        execution: Uuid,
+    ) -> FenceResult<bool> {
+        let mut tx = self.begin(store, Hold::Update).await?;
+        let failed: Option<i32> = sqlx::query_scalar("SELECT line_no FROM batch_lines WHERE job_id=$1 AND line_no=$2 AND execution_id=$3 AND state='failed' AND segment IS NULL FOR UPDATE")
+            .bind(self.job).bind(line).bind(execution)
+            .fetch_optional(&mut *tx).await.map_err(job_storage)?;
+        if failed.is_some() {
+            count_lines(&mut tx, self.job, 0, 1).await?;
+        }
+        tx.commit().await.map_err(job_storage)?;
+        Ok(failed.is_some())
+    }
+
+    /// Release the route once the provider attempt has settled. Recovery
+    /// still treats the line as running until its result segment commits.
+    pub(crate) async fn await_segment(
+        &self,
+        store: &Store,
+        line: i32,
+        execution: Uuid,
+    ) -> FenceResult<bool> {
+        let mut tx = self.begin(store, Hold::Rows).await?;
+        let changed = sqlx::query("UPDATE batch_lines SET awaiting_segment=true WHERE job_id=$1 AND line_no=$2 AND execution_id=$3 AND state='running' AND NOT awaiting_segment")
+            .bind(self.job).bind(line).bind(execution)
+            .execute(&mut *tx).await.map_err(job_storage)?.rows_affected();
+        tx.commit().await.map_err(job_storage)?;
+        Ok(changed == 1)
     }
 
     /// A line a crashed or lost runner left `running` is `interrupted`: never
@@ -334,7 +353,7 @@ impl BatchFence {
     /// many.
     pub(crate) async fn interrupt_running(&self, store: &Store) -> FenceResult<i32> {
         let mut tx = self.begin(store, Hold::Update).await?;
-        let n = sqlx::query("UPDATE batch_lines SET state='interrupted',error_code='interrupted',finished_at=clock_timestamp() WHERE job_id=$1 AND state='running'")
+        let n = sqlx::query("UPDATE batch_lines SET state='interrupted',awaiting_segment=false,error_code='interrupted',finished_at=clock_timestamp() WHERE job_id=$1 AND state='running'")
             .bind(self.job).execute(&mut *tx).await.map_err(job_storage)?.rows_affected();
         let n = i32::try_from(n).unwrap_or(i32::MAX);
         if n > 0 {
@@ -352,15 +371,20 @@ impl BatchFence {
         store: &Store,
         workspace: Uuid,
         file: Uuid,
-        lines: &[i32],
+        lines: SegmentLines<'_>,
     ) -> FenceResult<i32> {
         // A process that predates the epoch allocates its own numbers and can
         // take ours between the read and the insert: take the next one.
+        let length = (lines.succeeded.len() + lines.failed.len()) as i32;
+        let (line_numbers, executions): (Vec<_>, Vec<_>) = lines.succeeded.iter().copied().unzip();
+        let (failed_lines, failed_executions): (Vec<_>, Vec<_>) =
+            lines.failed.iter().copied().unzip();
         let mut collisions = 0;
         loop {
-            let mut tx = self.begin(store, Hold::Rows).await?;
+            // Serialize registrations with other progress updates.
+            let mut tx = self.begin(store, Hold::Update).await?;
             let seq: Result<i32, sqlx::Error> = sqlx::query_scalar("INSERT INTO batch_segments(job_id,workspace_id,seq,file_id,lines) SELECT $1,$2,coalesce(max(seq)+1,0),$3,$4 FROM batch_segments WHERE job_id=$1 RETURNING seq")
-                .bind(self.job).bind(workspace).bind(file).bind(lines.len() as i32)
+                .bind(self.job).bind(workspace).bind(file).bind(length)
                 .fetch_one(&mut *tx).await;
             let seq = match seq {
                 Ok(seq) => seq,
@@ -370,9 +394,30 @@ impl BatchFence {
                 }
                 Err(e) => return Err(job_storage(e).into()),
             };
-            sqlx::query("UPDATE batch_lines SET segment=$2 WHERE job_id=$1 AND line_no=ANY($3) AND segment IS NULL AND state<>'running'")
-                .bind(self.job).bind(seq).bind(lines).execute(&mut *tx).await.map_err(job_storage)?;
-            tx.commit().await.map_err(job_storage)?;
+            if !line_numbers.is_empty() {
+                let changed = sqlx::query("UPDATE batch_lines l SET segment=$2,state='succeeded',awaiting_segment=false,finished_at=clock_timestamp(),status_code=200 FROM unnest($3::integer[],$4::uuid[]) AS ready(line_no,execution_id) WHERE l.job_id=$1 AND l.line_no=ready.line_no AND l.execution_id=ready.execution_id AND l.state='running' AND l.awaiting_segment AND l.segment IS NULL")
+                    .bind(self.job).bind(seq).bind(&line_numbers).bind(&executions)
+                    .execute(&mut *tx).await.map_err(job_storage)?.rows_affected();
+                if changed != line_numbers.len() as u64 {
+                    // No part of a segment can publish if an attempt is no longer current.
+                    return Err(FenceError::Storage);
+                }
+                count_lines(&mut tx, self.job, changed as i32, 0).await?;
+            }
+            if !failed_lines.is_empty() {
+                let changed = sqlx::query("UPDATE batch_lines l SET segment=$2 FROM unnest($3::integer[],$4::uuid[]) AS ready(line_no,execution_id) WHERE l.job_id=$1 AND l.line_no=ready.line_no AND l.execution_id=ready.execution_id AND l.state='failed' AND l.segment IS NULL")
+                    .bind(self.job).bind(seq).bind(&failed_lines).bind(&failed_executions)
+                    .execute(&mut *tx).await.map_err(job_storage)?.rows_affected();
+                if changed != failed_lines.len() as u64 {
+                    return Err(FenceError::Storage);
+                }
+            }
+            // Once COMMIT is sent, keep the file on any missing acknowledgement.
+            // Retention can reclaim an orphan; a committed segment still needs its file.
+            tx.commit().await.map_err(|e| {
+                job_storage(e);
+                FenceError::Unknown
+            })?;
             return Ok(seq);
         }
     }
@@ -389,16 +434,6 @@ async fn count_lines(
         .bind(job).bind(completed).bind(failed)
         .execute(&mut **tx).await.map_err(job_storage)?;
     Ok(())
-}
-
-/// Whether a failed statement may still have been applied: the connection
-/// broke with the statement possibly sent. A server error (the statement was
-/// rolled back) and a statement that never left the pool are certain.
-pub(crate) fn outcome_unknown(error: &sqlx::Error) -> bool {
-    !matches!(
-        error,
-        sqlx::Error::Database(_) | sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed
-    )
 }
 
 fn is_unique_violation(error: &sqlx::Error) -> bool {

@@ -342,8 +342,15 @@ GRANT EXECUTE ON FUNCTION public.valid_model_protocols_base(text[]),
 -- Rows are inserted once and never deleted: removal sets deleted_at and clears the
 -- filename/content type. Identity, ownership, purpose and backend are fixed (the
 -- key id changes only through `files rekey`); size/sha256/committed_at are written once and deleted rows are final (trigger).
+-- Batch finalization locks result rows against deletion claims. The sweeper
+-- checks indexed output/error references using the existing SELECT on async_jobs.
+-- The batch result marker is written only by the job trigger (0085).
 -- Settings: per-group toggles, retention and the last storage health check.
-GRANT SELECT,INSERT ON public.stored_files TO gateway_runtime;
+GRANT SELECT ON public.stored_files TO gateway_runtime;
+GRANT INSERT(id,object_key,purpose,workspace_id,created_by_user_id,created_by_api_key_id,
+ filename,content_type,size_bytes,sha256,backend,encryption_key_id,created_at,committed_at,
+ expires_at,deleted_at,delete_attempts,last_delete_attempt_at,last_delete_error,api_purpose,
+ reserved_bytes) ON public.stored_files TO gateway_runtime;
 GRANT UPDATE(size_bytes,sha256,committed_at,expires_at,deleted_at,filename,content_type,
  delete_attempts,last_delete_attempt_at,last_delete_error) ON public.stored_files TO gateway_runtime;
 -- `files rekey` (#35) records the master key an object was re-wrapped under.
@@ -383,8 +390,11 @@ GRANT SELECT,UPDATE(recorded_through) ON public.storage_usage_progress TO gatewa
 -- the UPDATE grants below allow.
 GRANT UPDATE(upstream_id,output_file_id,error_file_id,runner_id,runner_epoch,runner_lease_until,
  submit_started_at,in_progress_at,finalizing_at,last_progress_at) ON public.async_jobs TO gateway_runtime;
+-- A segment commit registers the stored file, matches the running execution,
+-- and updates the line and existing job progress columns under the claim fence.
 GRANT SELECT,INSERT ON public.batch_lines,public.batch_segments TO gateway_runtime;
-GRANT UPDATE(state,attempts,execution_id,status_code,error_code,segment,finished_at)
+-- Retry fallback locks the failed execution using the existing SELECT and UPDATE grants.
+GRANT UPDATE(state,attempts,execution_id,status_code,error_code,segment,finished_at,awaiting_segment)
  ON public.batch_lines TO gateway_runtime;
 -- Batch scheduling (0022). Route settings are upserted by platform writers
 -- (never deleted; the route key is fixed). The last gate evaluation of a

@@ -55,6 +55,7 @@ function validateGraph(data) {
   assert.deepEqual(runs(data.jobs["gateway-lint"]), [
     "cargo fmt --all -- --check", "cargo clippy --workspace --all-targets --all-features -- -D warnings",
     "cargo clippy -p open-model-gateway --bins --lib --locked -- -D warnings",
+    "cargo clippy -p open-model-gateway --all-targets --locked -- -D warnings",
   ]);
 }
 
@@ -74,6 +75,16 @@ test("a required job step cannot keep its command and not run it (#502)", () => 
     assert.throws(() => validateGraph(data), assert.AssertionError, what);
   }
   validateGraph(loadWorkflow());
+});
+
+test("the required read-only web job checks upstream action tags", () => {
+  const data = loadWorkflow();
+  const web = data.jobs.web;
+  required(web);
+  assert.deepEqual(web.permissions ?? data.permissions, { contents: "read" });
+  assert.deepEqual(web.steps.filter(step => step.run === "node scripts/check-action-tags.mjs"), [{
+    run: "node scripts/check-action-tags.mjs", env: { GH_TOKEN: "${{ github.token }}" },
+  }]);
 });
 
 const ociPolicyCommands = [

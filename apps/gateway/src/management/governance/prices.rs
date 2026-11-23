@@ -133,7 +133,7 @@ pub(crate) fn add_display(row: &mut Value) {
 /// Test oracle: whether the REAL same-meters rule refuses a batch list beside its
 /// standard list. Both must parse as `PriceLines` (a list that does not parse is
 /// refused by its own rules, decided elsewhere).
-#[cfg(test)]
+#[cfg(all(test, feature = "integration-tests"))]
 pub(crate) fn batch_meters_refused(
     standard: &serde_json::Value,
     batch: &serde_json::Value,

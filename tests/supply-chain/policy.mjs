@@ -44,6 +44,28 @@ export function isPinnedImage(image) {
   return normalizedPath.length <= 255;
 }
 
+export function imagePinLocation(source) {
+  // Workflow identifiers and paths occupy one printable location in the Actions log.
+  return source.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}:]/gu,
+    character => "\\u{" + character.codePointAt(0).toString(16) + "}");
+}
+
+export function postgresServiceImages(services) {
+  const images = [];
+  for (const [name, service] of Object.entries(services ?? {})) {
+    const image = typeof service === "string" ? service : service?.image;
+    const isPostgres = typeof image === "string" && /(?:^|\/)postgres(?:[:@][^/]*)?$/.test(image);
+    if (name === "postgres" || isPostgres) images.push([name, image]);
+  }
+  return images;
+}
+
+export function imageTrackingReference(pinned, fallbackTag) {
+  const [reference] = pinned.split("@");
+  if (reference.lastIndexOf(":") > reference.lastIndexOf("/")) return reference;
+  if (fallbackTag) return `${reference}:${fallbackTag}`;
+}
+
 // Container `options:` that reach the host or replace what the image runs, refused unless
 // listed here as `<file>: <where>: <option>` with the reason. None is listed: today's options
 // are the PostgreSQL services' --health-* settings.
@@ -416,6 +438,35 @@ export function invisibleCharacterViolations(texts = Object.fromEntries(stagingT
 
 export const STAGING_CANDIDATE_SERVICES = new Set(["gateway", "migrate", "grant-runtime"]);
 
+const staging = "deploy/staging/compose.yaml";
+const loadtest = "deploy/loadtest/compose.yaml";
+const candidate = "${GATEWAY_IMAGE:-open-model-gateway:staging}";
+const loadImage = "${OMG_LOADTEST_IMAGE:-omg-loadtest:local}";
+
+// staging.py builds gateway once for the gateway and its two ops commands.
+// loadtest.py builds one tag before Compose starts the replicas and tools.
+const loadConsumers = new Set(["gateway-1", "gateway-2", "gateway-3", "gateway-cli", "mock-upstream", "loadgen"]);
+const stagingOverrides = new Map([["postgres", "STAGING_POSTGRES_IMAGE"], ["ingress", "STAGING_CADDY_IMAGE"]]);
+
+export function upstreamComposeImages(file, data) {
+  const found = [];
+  for (const [name, service] of Object.entries(data.services ?? {})) {
+    if (!service || !Object.hasOwn(service, "image")) continue;
+    let image = service.image;
+    if (service.pull_policy === "never") {
+      if (file === staging && STAGING_CANDIDATE_SERVICES.has(name) && image === candidate && !Object.hasOwn(service, "build")) continue;
+      if (file === loadtest && loadConsumers.has(name) && image === loadImage) continue;
+    }
+    // Only the two staging verifier slots support overriding a pinned default.
+    if (file === staging && stagingOverrides.has(name) && typeof image === "string") {
+      const prefix = "${" + stagingOverrides.get(name) + ":-";
+      if (image.startsWith(prefix) && image.endsWith("}")) image = image.slice(prefix.length, -1);
+    }
+    found.push({ name, image });
+  }
+  return found;
+}
+
 export function stagingCandidateViolations(compose, envExample, ci, overlays = readOverlays()) {
   const out = [];
   const candidate = stepOf(ci?.jobs?.["staging-image"], "docker/build-push-action")?.with?.tags;
@@ -437,7 +488,7 @@ export function stagingCandidateViolations(compose, envExample, ci, overlays = r
       if (candidates.has(name) && isMapping(service) && "pull_policy" in service && service.pull_policy !== "never") {
         out.push(`${file}: service '${name}' must retain pull_policy: never for the local candidate`);
       }
-      if (isMapping(service) && "build" in service) out.push(`${file}: service '${name}' may not set build; only deploy/staging/compose.yaml builds the candidate`);
+      if (isMapping(service) && "build" in service) out.push(`${file}: service '${name}' may not set build; staging runs a prepared candidate`);
     }
   }
   const example = "deploy/staging/staging.env.example";
