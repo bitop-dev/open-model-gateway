@@ -647,6 +647,26 @@ export function unpinnedImageJobViolations(file, data, pinned = pinnedJobKeys())
 export const DOCKER_ENV = /^(BUILDX_\w*|BUILDKIT_\w*|DOCKER_HOST|DOCKER_CONTEXT|DOCKER_CONFIG|DOCKER_BUILDKIT|DOCKER_TLS_VERIFY|DOCKER_CERT_PATH|COMPOSE_FILE|COMPOSE_PATH_SEPARATOR|COMPOSE_PROJECT_DIRECTORY|COMPOSE_ENV_FILES)$/;
 export const STEP_SHELLS = new Set(["bash", "sh"]);
 
+// Only a single identifier delimiter on a simple command is supported. Read
+// physical lines so quotes, comments and continuations in data cannot consume
+// the command following the closing delimiter.
+function heredocBody(source, start, { delimiter, stripTabs, literal }) {
+  let offset = start;
+  while (offset < source.length) {
+    const newline = source.indexOf("\n", offset);
+    const end = newline === -1 ? source.length : newline;
+    const line = source.slice(offset, end);
+    if ((stripTabs ? line.replace(/^\t+/, "") : line) === delimiter) {
+      let body = source.slice(start, offset);
+      if (stripTabs) body = body.replace(/^\t+/gm, "");
+      if (!literal && /[$`\\]/.test(body)) throw new Error("unsupported expansion or escape in unquoted heredoc");
+      return { body, end };
+    }
+    offset = end + 1;
+  }
+  throw new Error("missing heredoc delimiter");
+}
+
 // Simple commands of a script: continuations joined, split at newlines, ; & | && || ( ) $( and
 // backticks, comments dropped, words shell-split (quotes removed; `DOCKER_""HOST` is one word).
 // Each word records whether it holds a `$` expansion.
@@ -658,6 +678,7 @@ export function shellCommands(s) {
     return offset;
   };
   const commands = [], stack = [];
+  let heredoc;
   let words = [], word = null, quoted = false, ioNumber = false;
   const add = (text, variable = false, digit = false) => {
     ioNumber = digit && (!word || ioNumber);
@@ -689,31 +710,59 @@ export function shellCommands(s) {
     if (c === "\\" && i + 1 < s.length) { add(s[++i]); continue; }
     if (c === "#" && word === null) { const j = s.indexOf("\n", i); i = j === -1 ? s.length : j - 1; continue; }
     if (c === ")" && stack.at(-1)?.close === ")") { close(); continue; }
-    if ("\n;&|()".includes(c)) { endCommand(); continue; }
+    const next = skipContinuations(i + 1);
+    const combined = c === "&" && s[next] === ">";
+    if (!combined && "\n;&|()".includes(c)) {
+      if (heredoc) {
+        if (c !== "\n" || stack.length) throw new Error("unsupported compound heredoc command");
+        endWord();
+        const [program] = commandWords(words);
+        const { body, end } = heredocBody(s, i + 1, heredoc);
+        endCommand();
+        // Other recipients may interpret their input. Keep that text in the
+        // command inventory, isolated from the shell after the delimiter.
+        if (program?.text !== "cat" || program.variable) {
+          for (const command of shellCommands(body)) commands.push(command);
+        }
+        heredoc = undefined;
+        i = end;
+      } else endCommand();
+      continue;
+    }
     if (c === " " || c === "\t") { endWord(); continue; }
-    if (c === ">" || c === "<") {
-      if (ioNumber) word = null;
+    if (combined || c === ">" || c === "<") {
+      if (!combined && ioNumber) word = null;
       endWord();
       let operator = c;
-      const next = skipContinuations(i + 1);
-      if (["<<", "<>", "<&", ">>", ">|", ">&"].includes(c + s[next])) {
+      if (combined || ["<<", "<>", "<&", ">>", ">|", ">&"].includes(c + s[next])) {
         operator += s[next];
         i = next;
         const last = skipContinuations(i + 1);
-        if (operator === "<<" && (s[last] === "<" || s[last] === "-")) {
+        if ((operator === "<<" && (s[last] === "<" || s[last] === "-")) || (operator === "&>" && s[last] === ">")) {
           operator += s[last];
           i = last;
         }
+      }
+      if (operator === "<<" || operator === "<<-") {
+        const match = /^[ \t]*(?:(["'])(\w+)\1|\\(\w+)|(\w+))(?=$|[ \t\n<>;&|])/.exec(s.slice(i + 1));
+        if (!match || heredoc || stack.length) throw new Error("unsupported heredoc delimiter or nesting");
+        heredoc = { delimiter: match[2] ?? match[3] ?? match[4], literal: !match[4], stripTabs: operator === "<<-" };
       }
       words.push({ text: operator, redirection: true });
       continue;
     }
     add(c, c === "$", c >= "0" && c <= "9");
+    if ("*?{}[".includes(c)) word.pattern = true;
   }
+  if (heredoc) throw new Error("missing heredoc body");
   while (stack.length) close();
   endCommand();
   // Redirections and their targets are not words of the command.
-  return commands.map(ws => ws.filter((w, i) => !w.redirection && !ws[i - 1]?.redirection)).filter(ws => ws.length);
+  return commands.map(commandWords).filter(ws => ws.length);
+}
+
+function commandWords(words) {
+  return words.filter((word, i) => !word.redirection && !words[i - 1]?.redirection);
 }
 
 const PREFIX_COMMANDS = new Set(["sudo", "env", "exec", "command", "time", "nohup", "xargs", "nice"]);
@@ -761,20 +810,37 @@ function options(args, table, command) {
   return { files, rest: args.slice(i) };
 }
 
-function composeCommand(args, composeFiles) {
-  const read = options(args, COMPOSE_GLOBALS, "compose");
+// Keep shell metadata on operands after consuming the CLI's global options.
+function commandAfterOptions(words, table, command) {
+  // Command substitution leaves an unknown value even if its literal prefix is empty.
+  const args = words.map(w => w.variable && !w.text.includes("$") ? "$computed" : w.text);
+  const parsed = options(args, table, command);
+  if (parsed.refused) return parsed;
+  const [sub] = parsed.rest;
+  return { sub, files: parsed.files, args: words.slice(words.length - parsed.rest.length + 1) };
+}
+
+function composeCommand(words, composeFiles, runOnly = false) {
+  const read = commandAfterOptions(words, COMPOSE_GLOBALS, "compose");
   if (read.refused) return read.refused;
+  const { sub, args } = read;
+  if (runOnly && sub !== "run") return null;
   for (const file of read.files) if (file.includes("$") || !composeFiles.has(posix.normalize(file))) return `Compose file '${file}' is not one of the checked Compose files (repoComposeFiles)`;
-  const [sub, ...rest] = read.rest;
+  if (sub === "run") {
+    const { builds, operand } = runOperand(args, "compose");
+    if (builds) return "compose run --build builds an image";
+    return operand && !operand.variable && /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(operand.text) ? null : "docker compose run needs a literal service name";
+  }
   if (sub === "build") return "compose build builds an image";
-  if (["up", "run", "create"].includes(sub) && rest.includes("--build")) return `compose ${sub} --build builds an image`;
+  if (["up", "create"].includes(sub) && args.some(w => w.text === "--build")) return `compose ${sub} --build builds an image`;
   return null;
 }
 
-function dockerCommand(args, composeFiles) {
-  const read = options(args, DOCKER_GLOBALS, "docker");
+function dockerCommand(words, composeFiles) {
+  const read = commandAfterOptions(words, DOCKER_GLOBALS, "docker");
   if (read.refused) return read.refused;
-  const [sub, ...rest] = read.rest;
+  const { sub, args } = read;
+  const rest = args.map(w => w.text);
   if (sub === "build") return "docker build builds an image";
   if ((sub === "image" || sub === "builder") && rest[0] === "build") return `docker ${sub} build builds an image`;
   if (sub === "buildx") {
@@ -784,7 +850,7 @@ function dockerCommand(args, composeFiles) {
     if (["create", "use"].includes(bx.rest[0])) return `buildx ${bx.rest[0]} selects another builder`;
   }
   if (sub === "context" && ["create", "use", "update", "import"].includes(rest[0])) return `docker context ${rest[0]} selects another Docker endpoint`;
-  if (sub === "compose") return composeCommand(rest, composeFiles);
+  if (sub === "compose") return composeCommand(args, composeFiles);
   const positional = rest.filter(a => !a.startsWith("-"));
   if (sub === "login" || sub === "push" || (sub === "image" && positional[0] === "push")) return PUBLISHES;
   if (sub === "tag" && isRegistryRef(positional[1])) return PUBLISHES;
@@ -823,8 +889,8 @@ function commandViolation(words, composeFiles) {
   const args = words.slice(i + 1).map(w => w.text);
   if (/^python3?$/.test(name) && args[0]?.endsWith("staging.py")) return args.find((a, k) => k > 0 && !a.startsWith("-")) === "build" ? "staging.py build builds an image" : null;
   if (name === "staging.py") return args.find(a => !a.startsWith("-")) === "build" ? "staging.py build builds an image" : null;
-  if (name === "docker") return dockerCommand(args, composeFiles);
-  if (name === "docker-compose") return composeCommand(args, composeFiles);
+  if (name === "docker") return dockerCommand(words.slice(i + 1), composeFiles);
+  if (name === "docker-compose") return composeCommand(words.slice(i + 1), composeFiles);
   if (["podman", "nerdctl"].includes(name)) {
     const words2 = args.filter(a => !a.startsWith("-"));
     if (words2[0] === "build" || (["image", "builder", "buildx"].includes(words2[0]) && ["build", "b", "bake"].includes(words2[1]))) return `${name} builds an image`;
@@ -890,30 +956,33 @@ const OPERAND_FLAGS = {
   compose: ["--rm", "--no-deps", "--service-ports", "--use-aliases", "-T", "--no-TTY", "-d", "--detach", "-i", "--interactive"],
 };
 const CONTAINER_VALUES = ["--name", "--entrypoint", "-e", "--env", "--env-file", "-v", "--volume", "-p", "--publish", "-u", "--user", "-w", "--workdir", "--pull"];
-function runOperand(args, kind) {
+function runOperand(words, kind) {
   const values = kind === "pull" ? ["--platform"] : [...CONTAINER_VALUES];
   if (kind === "create" || kind === "run") values.push("--platform", "--network", "--cap-drop", "--security-opt", "-h", "--hostname");
   let i = 0;
-  for (; i < args.length; i++) {
-    const arg = args[i];
-    if (arg === "--") return args[i + 1];
+  for (; i < words.length; i++) {
+    const arg = words[i].text;
+    if (arg.startsWith("-") && words[i].variable) return {};
+    if (kind === "compose" && (arg === "--build" || arg === "--build=true")) return { builds: true };
+    if (arg === "--") return { operand: words[i + 1] };
     if (!arg.startsWith("-") || arg === "-") break;
     const long = arg.startsWith("--");
     const name = long ? arg.split("=")[0] : arg.slice(0, 2);
     if (values.includes(name)) {
       const inline = long ? arg.includes("=") : arg.length > 2;
-      const value = inline ? arg.slice(long ? name.length + 1 : 2) : args[++i];
-      if (kind === "compose" && name === "--pull" && value !== "never") return undefined;
-      if (value === undefined || /[$*?{}\[`]/.test(value)) return undefined;
+      const valueWord = inline ? words[i] : words[++i];
+      if (!valueWord || valueWord.variable || valueWord.pattern || valueWord.text.includes("${{")) return {};
+      const value = inline ? arg.slice(long ? name.length + 1 : 2) : valueWord.text;
+      if (kind === "compose" && name === "--pull" && value !== "never") return {};
     } else {
       // An unknown option could consume the apparent operand.
       const flags = OPERAND_FLAGS[kind];
       if (long) {
-        if (!flags.includes(name) || (arg !== name && arg !== name + "=true" && arg !== name + "=false")) return undefined;
-      } else if (![...arg.slice(1)].every(c => flags.includes("-" + c))) return undefined;
+        if (!flags.includes(name) || (arg !== name && arg !== name + "=true" && arg !== name + "=false")) return {};
+      } else if (![...arg.slice(1)].every(c => flags.includes("-" + c))) return {};
     }
   }
-  return args[i];
+  return { operand: words[i] };
 }
 
 function runImageViolation(words, releaseStep, composeFiles) {
@@ -923,25 +992,20 @@ function runImageViolation(words, releaseStep, composeFiles) {
   const index = start + commandIndex(words.slice(start));
   const name = posix.basename(words[index]?.text ?? "");
   if (name !== "docker" && name !== "docker-compose") return null;
-  const args = words.slice(index + 1).map(w => w.variable && !w.text.includes("$") ? "$computed" : w.text);
-  const globals = name === "docker-compose" ? { rest: ["compose", ...args] } : options(args, DOCKER_GLOBALS, "docker");
+  const args = words.slice(index + 1);
+  if (name === "docker-compose") return composeCommand(args, composeFiles, true);
+  const globals = commandAfterOptions(args, DOCKER_GLOBALS, "docker");
   if (globals.refused) return globals.refused;
-  let [sub, ...rest] = globals.rest;
-  if ((sub === "image" && rest[0] === "pull") || (sub === "container" && ["run", "create"].includes(rest[0]))) {
-    [sub, ...rest] = rest;
-  }
-  if (sub === "compose") {
-    const compose = options(rest, COMPOSE_GLOBALS, "compose");
-    if (compose.refused) return compose.refused;
-    if (compose.rest[0] !== "run") return null;
-    const unchecked = compose.files.find(file => !composeFiles.has(posix.normalize(file)));
-    if (unchecked !== undefined) return "docker compose run needs a checked Compose file";
-    const service = runOperand(compose.rest.slice(1), "compose");
-    return service && /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(service) ? null : "docker compose run needs a literal service name";
+  let { sub, args: rest } = globals;
+  if (sub === "compose") return composeCommand(rest, composeFiles, true);
+  const alias = rest[0]?.text;
+  if ((sub === "image" && alias === "pull") || (sub === "container" && ["run", "create"].includes(alias))) {
+    sub = alias;
+    rest = rest.slice(1);
   }
   if (!["run", "pull", "create"].includes(sub)) return null;
-  const operand = runOperand(rest, sub);
-  if (operand && (isPinnedImage(operand) || RELEASE_OPERANDS.get(releaseStep + ":" + sub) === operand)) return null;
+  const { operand } = runOperand(rest, sub);
+  if (operand && ((!operand.variable && isPinnedImage(operand.text)) || RELEASE_OPERANDS.get(releaseStep + ":" + sub) === operand.text)) return null;
   return `docker ${sub} needs an identifiable image pinned by digest`;
 }
 

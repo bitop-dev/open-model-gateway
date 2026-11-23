@@ -9,6 +9,34 @@ const documents = {
 };
 for (const [kind, document] of Object.entries(documents)) {
   const check = run => imageBuildViolations(kind, document(run), { pinned: new Set(), composeFiles: new Set(["compose.yaml"]) });
+  for (const redirect of ["&>", "&>>"]) {
+    test(`${kind} inventories Docker operands across ${redirect}`, () => {
+      assert.deepEqual(check(`docker pull ${redirect}log ${pinned}`), []);
+      assert.match(check(`docker ${redirect}log pull alpine`).join(), /digest/);
+      assert.deepEqual(check(`docker run --name 2${redirect}log ${pinned}`), []);
+    });
+  }
+  test(`${kind} ends Compose option parsing at the service`, () => {
+    assert.deepEqual(check("docker compose run --rm -- gateway tool --build"), []);
+    assert.deepEqual(check("docker compose run -e --build gateway"), []);
+    assert.match(check("docker compose run --rm --build gateway").join(), /builds an image/);
+  });
+  test(`${kind} preserves literal option values and refuses uncertain boundaries`, () => {
+    assert.deepEqual(check(`docker run --env 'PRICE=$PRICE' ${pinned}`), []);
+    assert.match(check(`docker run --env PRICE=$PRICE ${pinned}`).join(), /digest/);
+  });
+  test(`${kind} inventories commands after a quoted cat heredoc`, () => {
+    const data = "cat <<-'END' >out\n\t'unclosed literal\n\tdocker pull floating\n\t END\n\tEND\n";
+    assert.deepEqual(check(data + `docker pull ${pinned}`), []);
+    assert.match(check(data + "docker create floating").join(), /digest/);
+    assert.deepEqual(check('cat <<"END"\ndocker pull floating\nEND\ntrue'), []);
+  });
+  test(`${kind} checks heredocs that can execute commands`, () => {
+    assert.match(check("bash <<'END'\ndocker create floating\nEND").join(), /digest/);
+    assert.throws(() => check("cat <<END\n'$(docker pull floating)'\nEND"), /heredoc/);
+    assert.throws(() => check("cat <<'END' | sh\ndocker pull floating\nEND"), /heredoc/);
+    assert.throws(() => check("cat <<-'END'\n END"), /heredoc/);
+  });
   test(`${kind} refuses unpinned Docker operands`, () => {
     for (const run of [
       'docker run --rm alpine:latest true',

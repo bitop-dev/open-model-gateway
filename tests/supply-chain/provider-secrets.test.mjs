@@ -296,6 +296,16 @@ for (const hook of ["preverify", "postverify"]) {
   });
 }
 
+test("wrapper inventory follows commands across redirects and literal heredoc data", () => {
+  const workflow = { jobs: { job: credentialJob("bash check.sh") } };
+  const data = "cat <<-'END'\n\tcargo test\n\t'unclosed text\n\tEND\n";
+  const files = new Map([["check.sh", data + "true"], ["inner.sh", "cargo test"]]);
+  const check = () => checkInputs(workflow, "fixture.yml", new Map(), path => files.get(path));
+  check();
+  files.set("check.sh", data + "bash &>>log inner.sh");
+  assert.throws(check, /env.TOKEN/);
+});
+
 test("shell wrappers use the effective run directory at each step", () => {
   const job = credentialJob("bash check.sh");
   const workflow = { jobs: { job } };
