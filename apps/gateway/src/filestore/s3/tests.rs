@@ -563,3 +563,20 @@ async fn failed_multipart_uploads_are_aborted() {
     assert_eq!(last.method, "DELETE", "{seen:#?}");
     assert!(last.uri.contains("uploadId=up-1"));
 }
+
+#[tokio::test]
+async fn aws_attempt_matrix_s3() {
+    use aws_auth::attempt_fixture::{Failure, Fixture};
+    let key = ObjectKey::new(Purpose::Export, Scope::Installation).unwrap();
+    for failure in Failure::ALL {
+        let fixture = Fixture::new(failure, "HEAD /files/gw/test/").await;
+        let store = store_for(&fixture.endpoint).await;
+        let expected = if matches!(failure, Failure::Timeout) {
+            FileStoreError::Timeout
+        } else {
+            FileStoreError::Unavailable
+        };
+        assert_eq!(store.head(&key).await.unwrap_err(), expected);
+        fixture.assert_one(failure);
+    }
+}

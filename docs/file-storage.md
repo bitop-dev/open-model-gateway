@@ -195,7 +195,7 @@ Tests:
 - **Real stores:** `apps/gateway/tests/filestore_s3.rs` starts **MinIO** (`mirror.gcr.io/pgsty/minio:RELEASE.2026-08-04T00-00-00Z`, pinned by digest) and **RustFS** (`ghcr.io/rustfs/rustfs:1.0.1`, pinned by digest) on random loopback ports and checks round trips at every chunk and part boundary, multipart uploads, that only ciphertext is stored under the prefix, tamper detection, idempotent deletes, multipart abort on failure and size limit, denial on wrong credentials, and health-probe cleanup. Upstream MinIO stopped publishing community images in October 2025, so the MinIO image is the pgsty community build of the upstream source. Neither is pulled from Docker Hub: RustFS comes from its own registry, and pgsty (Docker Hub only) through Google's Docker Hub mirror with the same digest. The mirror serves only images it has cached, so the test pulls with up to four attempts and backoff and, if the image is gone, names the override. Override the images with `FILESTORE_MINIO_IMAGE` and `FILESTORE_RUSTFS_IMAGE` (for example `pgsty/minio@sha256:…` from Docker Hub).
 - **Docker:** the tests skip with a message when Docker is unavailable. CI sets `FILESTORE_REQUIRE_DOCKER=1`, so a missing Docker fails the run.
 - **Real AWS:** an opt-in test runs only with `FILESTORE_AWS_TEST_BUCKET` set (optionally `FILESTORE_AWS_TEST_REGION` and `FILESTORE_AWS_TEST_AUTH`). It never runs in CI.
-- **Wire behavior:** a loopback mock (`filestore/s3/tests.rs`) asserts the wire behavior: path-style URLs, SigV4, no checksum headers, one attempt on 503, no redirect following, and abort on a failed multipart upload.
+- **Wire behavior:** a loopback mock (`filestore/s3/tests.rs`) asserts the wire behavior: path-style URLs, SigV4, no checksum headers, one attempt on a bare 429, 503, read timeout or dropped connection, no redirect following, and abort on a failed multipart upload.
 
 ### Crate choice
 
@@ -207,7 +207,7 @@ The backend uses **`aws-sdk-s3` (pinned `=1.156.0`)**, not `object_store`:
 
 The S3 and Bedrock crates are bumped together, as one SDK generation (#456 moved both from 1.122/1.124 to 1.156/1.152). Three SDK defaults are set explicitly on the S3 and Bedrock clients (and the first two on the gateway's own STS client for `aws:role:`), so a later bump cannot change them silently. Clients that `aws-config` builds internally for a profile's own role chain keep the SDK defaults:
 
-- **Behaviour version** is pinned (`v2026_01_12`), not `latest()`.
+- **Behaviour version** is pinned to `v2026_11_10` (Retry Behavior 2.1).
 - **Clock-skew correction is off.** The SDK otherwise takes the difference between a response's `Date` header and its own clock and signs later requests that far off. Requests are signed with the host's clock only; keep it synchronised.
 - **Credential loading waits 5 seconds at most** (including an AssumeRole call), not a time derived from the operation timeouts.
 

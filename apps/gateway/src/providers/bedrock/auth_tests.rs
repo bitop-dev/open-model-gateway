@@ -414,3 +414,63 @@ async fn an_sts_response_date_never_moves_the_signing_time() {
         );
     }
 }
+
+fn fixture_identity() -> SharedCredentialsProvider {
+    SharedCredentialsProvider::new(Credentials::new(
+        "AKIDLOCALTEST",
+        "loopback",
+        None,
+        None,
+        "fixture",
+    ))
+}
+
+async fn bedrock_attempts(stream: bool) {
+    use auth::attempt_fixture::{Failure, Fixture};
+    let prefix = if stream {
+        "POST /model/test-model/converse-stream "
+    } else {
+        "POST /model/test-model/converse "
+    };
+    for failure in Failure::ALL {
+        let fixture = Fixture::new(failure, prefix).await;
+        let mut adapter = BedrockAdapter::new().unwrap();
+        let plan = Plan {
+            region: "us-east-1".into(),
+            auth: AwsAuth::Default,
+            endpoint: Some(fixture.endpoint.clone()),
+        };
+        adapter.test_client = Some(Client::from_conf(
+            adapter.service_config(&plan, fixture_identity()),
+        ));
+        let mut input = request();
+        input.stream = stream;
+        assert!(adapter.execute(&target(), input).await.is_err());
+        fixture.assert_one(failure);
+    }
+}
+
+#[tokio::test]
+async fn aws_attempt_matrix_converse() {
+    bedrock_attempts(false).await;
+}
+
+#[tokio::test]
+async fn aws_attempt_matrix_converse_stream() {
+    bedrock_attempts(true).await;
+}
+
+#[tokio::test]
+async fn aws_attempt_matrix_sts() {
+    use auth::attempt_fixture::{Failure, Fixture};
+    for failure in Failure::ALL {
+        let fixture = Fixture::new(failure, "POST / ").await;
+        let config = auth::sts_config_for_tests("us-east-1", fixture_identity())
+            .into_builder()
+            .endpoint_url(&fixture.endpoint)
+            .build();
+        let provider = auth::assume_role_provider(ROLE, None, None, &config).await;
+        assert!(provider.provide_credentials().await.is_err());
+        fixture.assert_one(failure);
+    }
+}
