@@ -24,6 +24,7 @@ import { runInNewContext } from "node:vm";
 import { isMap, isScalar, parseDocument, visit } from "yaml";
 import { bashPath, runBash } from "./bash-preflight.mjs";
 import { APPROVED_RUNTIME, OTHER_BASE, hasWrite, jobCanWrite, jobPermissions, APPROVED_RUST, KNOWN_DOCKERFILES, RUNTIME_DOCKERFILES, SHA, actionName, containerImagesIn, findDockerfiles, jobsOf, parseStrict, readLocalFromRepo, repoFiles, root, stepsOf, toData, unknownDockerfileViolations, walk, wf, workflowsDir } from "./supply-chain/lib.mjs";
+import { pinViolations } from "./supply-chain/action-pins.mjs";
 import { git } from "./supply-chain/secret-scan-lib.mjs";
 
 // An unsupported shell fails this file here, before any test or fixture runs (#380).
@@ -62,31 +63,6 @@ const UNVERIFIED_INSTALLERS = new Map([
 ]);
 
 // ---- pinning ----
-
-// Every `uses:` anywhere in the file, read from the syntax tree so comments and
-// flow-style or aliased values are seen as they are.
-export function pinViolations(text, file) {
-  const doc = parseStrict(text, file);
-  const out = [];
-  visit(doc, {
-    Pair(_, pair) {
-      if (!isScalar(pair.key) || pair.key.value !== "uses") return;
-      const v = pair.value;
-      if (!isScalar(v) || typeof v.value !== "string") {
-        out.push(`${file}: a 'uses' value is not a plain string (aliases and expressions cannot be checked)`);
-        return;
-      }
-      const ref = v.value;
-      if (ref.startsWith("./")) return; // local actions and reusable workflows
-      if (ref.startsWith("docker://")) {
-        if (!/@sha256:[0-9a-f]{64}$/.test(ref)) out.push(`${file}: ${ref} is not pinned by digest`);
-        return;
-      }
-      if (!/@[0-9a-f]{40}$/.test(ref) || !(v.comment ?? "").trim()) out.push(`${file}: ${ref} needs a full commit SHA and a version comment`);
-    },
-  });
-  return out;
-}
 
 // ---- permissions ----
 
