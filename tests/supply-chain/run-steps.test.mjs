@@ -63,7 +63,8 @@ test("shell continuations depend on quoting and comment boundaries", () => {
   assert.deepEqual(words('echo "a' + continued + 'b"'), [["echo", "ab"]]);
   assert.deepEqual(words("echo a" + continued + "b"), [["echo", "ab"]]);
   assert.deepEqual(words("echo $" + continued + "(echo value)"), [["echo", "value"], ["echo", ""]]);
-  assert.deepEqual(words("echo ok >" + continued + "> log"), [["echo", "ok"]]);
+  assert.deepEqual(words("echo ok 2" + continued + ">" + continued + "> log"), [["echo", "ok"]]);
+  assert.deepEqual(words("echo '2'> log"), [["echo", "2"]]);
 });
 
 // ---- the run-command parser (#488) ----

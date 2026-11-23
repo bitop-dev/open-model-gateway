@@ -650,11 +650,21 @@ export const STEP_SHELLS = new Set(["bash", "sh"]);
 // Simple commands of a script: continuations joined, split at newlines, ; & | && || ( ) $( and
 // backticks, comments dropped, words shell-split (quotes removed; `DOCKER_""HOST` is one word).
 // Each word records whether it holds a `$` expansion.
-export function shellCommands(script) {
-  const s = script.replace(/\\\n/g, "");
+export function shellCommands(s) {
+  // Comments and single quotes consume physical lines. Outside them, an
+  // unescaped backslash-newline can join parts of a word or shell operator.
+  const skipContinuations = offset => {
+    while (s.startsWith("\\\n", offset)) offset += 2;
+    return offset;
+  };
   const commands = [], stack = [];
-  let words = [], word = null, quoted = false;
-  const add = (text, variable = false) => { word ??= { text: "", variable: false }; word.text += text; word.variable ||= variable; };
+  let words = [], word = null, quoted = false, ioNumber = false;
+  const add = (text, variable = false, digit = false) => {
+    ioNumber = digit && (!word || ioNumber);
+    word ??= { text: "", variable: false };
+    word.text += text;
+    word.variable ||= variable;
+  };
   const endWord = () => { if (word !== null) words.push(word); word = null; };
   const endCommand = () => { endWord(); if (words.length) commands.push(words); words = []; };
   // A command substitution is read as commands of its own; its value is a variable word.
@@ -663,7 +673,11 @@ export function shellCommands(script) {
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
     if (c === "`") { if (stack.at(-1)?.close === "`") close(); else open("`"); continue; }
-    if (s.startsWith("$(", i)) { open(")"); i++; continue; }
+    if (c === "\\" && s[i + 1] === "\n") { i++; continue; }
+    if (c === "$") {
+      const next = skipContinuations(i + 1);
+      if (s[next] === "(") { open(")"); i = next; continue; }
+    }
     if (quoted) {
       if (c === '"') quoted = false;
       else if (c === "\\" && i + 1 < s.length) add(s[++i]);
@@ -678,14 +692,23 @@ export function shellCommands(script) {
     if ("\n;&|()".includes(c)) { endCommand(); continue; }
     if (c === " " || c === "\t") { endWord(); continue; }
     if (c === ">" || c === "<") {
-      if (word && /^\d+$/.test(word.text) && s.slice(i - word.text.length, i) === word.text) word = null;
+      if (ioNumber) word = null;
       endWord();
-      const operator = /^(?:<<<|<<-|<<|<>|<&|>>|>\||>&|[<>])/.exec(s.slice(i))[0];
+      let operator = c;
+      const next = skipContinuations(i + 1);
+      if (["<<", "<>", "<&", ">>", ">|", ">&"].includes(c + s[next])) {
+        operator += s[next];
+        i = next;
+        const last = skipContinuations(i + 1);
+        if (operator === "<<" && (s[last] === "<" || s[last] === "-")) {
+          operator += s[last];
+          i = last;
+        }
+      }
       words.push({ text: operator, redirection: true });
-      i += operator.length - 1;
       continue;
     }
-    add(c, c === "$");
+    add(c, c === "$", c >= "0" && c <= "9");
   }
   while (stack.length) close();
   endCommand();
