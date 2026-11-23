@@ -470,7 +470,8 @@ test("migration Job applies runtime grants with the gateway image itself, from n
   const images = [...job.matchAll(/^\s+image: (.+)$/gm)].map((m) => m[1]);
   assert.ok(images.length >= 2, "migrate and grants steps");
   assert.equal(new Set(images).size, 1, `one image for every step, got ${images.join(", ")}`);
-  assert.match(images[0], /ghcr\.io\/ncecere\/open-model-gateway/);
+  const version = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version;
+  assert.equal(images[0], `ghcr.io/bitop-dev/open-model-gateway:v${version}`);
   assert.match(job, /args: \["grants", "apply"\]/);
   assert.doesNotMatch(job, /psql|configMap/);
   assert.equal(docsOf(rendered).filter((d) => /runtime-grants/.test(d) && /^kind: ConfigMap$/m.test(d)).length, 0);
