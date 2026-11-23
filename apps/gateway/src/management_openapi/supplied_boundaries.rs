@@ -142,11 +142,126 @@ pub(super) fn relaxations(
     Ok(out)
 }
 
+fn permits_type(node: &Value, kind: &str) -> bool {
+    match &node["type"] {
+        Value::String(t) => t == kind,
+        Value::Array(types) => types.iter().any(|t| t == kind),
+        _ => node.as_bool() != Some(false),
+    }
+}
+
+/// Does every way to accept a string at this path impose this exact cap?
+/// A conjunction needs one such constraint. A union needs one in every arm that
+/// can accept the replacement. Unknown shapes and exhausted work require evidence.
+fn bounded_string_path(
+    document: &Value,
+    schema: &Value,
+    instance: &Value,
+    path: &[Step],
+    cap: (&str, u64),
+    remaining: &mut usize,
+    depth: usize,
+) -> Result<bool> {
+    if *remaining == 0 || depth >= 48 {
+        return Ok(false);
+    }
+    *remaining -= 1;
+    let kind = match path.first() {
+        Some(Step::Key(_)) => "object",
+        Some(Step::Index(_)) => "array",
+        None => "string",
+    };
+    for node in super::chain(document, schema)? {
+        if !permits_type(node, kind) {
+            return Ok(true);
+        }
+        if let Some((step, tail)) = path.split_first() {
+            let (child, value) = match step {
+                Step::Key(name) => {
+                    let child = super::member_schema(&[node], name)?;
+                    if child.is_none()
+                        && node.get("patternProperties").is_none()
+                        && node["additionalProperties"] == false
+                    {
+                        return Ok(true);
+                    }
+                    (child, &instance[name])
+                }
+                Step::Index(i) => {
+                    if node["maxItems"].as_u64().is_some_and(|n| *i as u64 >= n) {
+                        return Ok(true);
+                    }
+                    let child = node["prefixItems"].get(i).or_else(|| node.get("items"));
+                    (child.map(std::borrow::Cow::Borrowed), &instance[i])
+                }
+            };
+            if let Some(child) = child
+                && bounded_string_path(document, &child, value, tail, cap, remaining, depth + 1)?
+            {
+                return Ok(true);
+            }
+        } else if node[cap.0].as_u64() == Some(cap.1) {
+            return Ok(true);
+        }
+        let per_node = *remaining;
+        let mut bounded =
+            |s: &Value| bounded_string_path(document, s, instance, path, cap, remaining, depth + 1);
+        for arm in node["allOf"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(per_node)
+        {
+            if bounded(arm)? {
+                return Ok(true);
+            }
+        }
+        for key in ["anyOf", "oneOf"] {
+            if let Some(arms) = node[key].as_array()
+                && arms.len() <= per_node
+            {
+                let mut all = true;
+                for arm in arms {
+                    if !bounded(arm)? {
+                        all = false;
+                        break;
+                    }
+                }
+                if all {
+                    return Ok(true);
+                }
+            }
+        }
+        // Changing one existing member preserves required keys and every sibling.
+        if let Some(Step::Key(name)) = path.first()
+            && let Some(condition) = node.get("if")
+            && let Some(fields) = condition.as_object()
+            && fields
+                .keys()
+                .all(|k| matches!(k.as_str(), "properties" | "required"))
+            && condition["properties"].get(name).is_none()
+        {
+            let arm = if accepts(document, condition, instance)? {
+                "then"
+            } else {
+                "else"
+            };
+            if let Some(s) = node.get(arm)
+                && bounded(s)?
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Facts that hold for every choice at this instance path. The nodes chosen
 /// by a fixture seed are useful for generating probes, but only a conjunction
 /// can justify dropping one.
 #[derive(Default)]
 pub(super) struct ByteDominance {
+    pub(super) needs_pattern_witness: bool,
     pub(super) cap: Option<u64>,
     pub(super) max_chars: Option<u64>,
     patterns: std::collections::BTreeSet<String>,
@@ -157,6 +272,7 @@ impl ByteDominance {
     pub(super) fn at(
         document: &Value,
         root: &Value,
+        instance: &Value,
         path: &[Step],
         nodes: &[&Value],
         supplied: bool,
@@ -167,6 +283,33 @@ impl ByteDominance {
         }) {
             let mut remaining = 4096;
             rules.collect(document, root, path, &mut remaining, 0)?;
+        }
+        if !supplied
+            && rules.cap.is_none()
+            && rules.max_chars.is_none()
+            && nodes
+                .iter()
+                .filter_map(|node| node["pattern"].as_str())
+                .any(|p| super::simple_bounds(p).is_none())
+        {
+            rules.needs_pattern_witness = true;
+            let mut remaining = 4096;
+            for key in ["maxLength", super::MAX_BYTES] {
+                for limit in super::distinct_u64(nodes, key) {
+                    if bounded_string_path(
+                        document,
+                        root,
+                        instance,
+                        path,
+                        (key, limit),
+                        &mut remaining,
+                        0,
+                    )? {
+                        rules.needs_pattern_witness = false;
+                        return Ok(rules);
+                    }
+                }
+            }
         }
         Ok(rules)
     }
@@ -205,11 +348,7 @@ impl ByteDominance {
                         continue;
                     }
                     *remaining -= arms.len();
-                    let mut possible = arms.iter().filter(|arm| match &arm["type"] {
-                        Value::String(t) => t == container,
-                        Value::Array(types) => types.iter().any(|t| t == container),
-                        _ => arm.as_bool() != Some(false),
-                    });
+                    let mut possible = arms.iter().filter(|arm| permits_type(arm, container));
                     if let Some(only) = possible.next() {
                         if possible.next().is_none() {
                             self.collect(document, only, path, remaining, depth + 1)?;

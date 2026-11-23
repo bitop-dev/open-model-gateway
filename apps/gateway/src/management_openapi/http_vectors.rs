@@ -1248,7 +1248,6 @@ fn scalar_mutations(
     nodes: &[&Value],
     value: &Value,
     query: bool,
-    candidates: usize,
 ) -> Result<Mutations> {
     let mut out: Vec<(&'static str, Value)> = Vec::new();
     let mut evidence = Evidence::default();
@@ -1449,14 +1448,9 @@ fn scalar_mutations(
         let annotated = nodes
             .iter()
             .any(|node| node.get(PATTERN_BOUNDARIES).is_some());
-        let needs_witness = patterns
-            .iter()
-            .any(|pattern| simple_bounds(pattern).is_none())
-            && distinct_u64(nodes, "maxLength").is_empty()
-            && !nodes.iter().any(|node| node.get(MAX_BYTES).is_some())
-            && candidates == 0;
-        needs_candidates = needs_witness && !annotated;
-        stale_pattern_boundaries = annotated && !patterns.is_empty() && !needs_witness;
+        needs_candidates = oracle.rules.needs_pattern_witness && !annotated;
+        stale_pattern_boundaries =
+            annotated && !patterns.is_empty() && !oracle.rules.needs_pattern_witness;
         for pattern in patterns {
             let (shapes, lengths) = pattern_candidates(pattern, seed, &mut dropped);
             for (length, candidate) in lengths {
@@ -1707,20 +1701,12 @@ pub(super) fn query_plan(
             .filter(|(n, _)| n == name)
             .map(|(_, v)| v.as_str())
             .collect();
-        let rules = ByteDominance::at(document, schema, &[], &nodes, !supplied.is_empty())?;
+        let rules = ByteDominance::at(document, schema, &typed, &[], &nodes, !supplied.is_empty())?;
         let oracle = BoundaryOracle {
             rules,
             ..BoundaryOracle::leaf(schema)
         };
-        let mut mutations = scalar_mutations(
-            document,
-            schema,
-            &oracle,
-            &nodes,
-            &typed,
-            true,
-            supplied.len(),
-        )?;
+        let mut mutations = scalar_mutations(document, schema, &oracle, &nodes, &typed, true)?;
         if mutations.needs_candidates {
             notes.problems.push(format!(
                 "query parameter {name}: the pattern has no derivable length bounds; supply boundary candidates or annotate it with {PATTERN_BOUNDARIES}"
@@ -2463,6 +2449,7 @@ impl Walk<'_> {
         let rules = ByteDominance::at(
             self.document,
             self.root_schema,
+            &self.valid_body,
             path,
             &nodes,
             !supplied.is_empty(),
@@ -2479,15 +2466,7 @@ impl Walk<'_> {
                 ..BoundaryOracle::leaf(schema)
             }
         };
-        let mutations = scalar_mutations(
-            self.document,
-            schema,
-            &oracle,
-            &nodes,
-            value,
-            false,
-            supplied.len(),
-        )?;
+        let mutations = scalar_mutations(self.document, schema, &oracle, &nodes, value, false)?;
         let rules = oracle.rules;
         if mutations.needs_candidates {
             self.notes.problems.push(format!(

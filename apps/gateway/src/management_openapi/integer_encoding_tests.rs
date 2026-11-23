@@ -41,7 +41,6 @@ fn management_openapi_integer_encoding_nullable_seed() {
         &nodes,
         &Value::Null,
         false,
-        0,
     )
     .unwrap();
     for kind in ["integer encoding fraction", "integer encoding exponent"] {
@@ -413,7 +412,6 @@ fn management_openapi_integer_encoding_finite_domain_inference_is_restricted() {
         &[&schema],
         &json!(3.0),
         false,
-        0,
     )
     .unwrap();
     assert!(

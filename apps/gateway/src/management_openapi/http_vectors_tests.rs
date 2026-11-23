@@ -3856,9 +3856,98 @@ async fn keyword_scope_query_checks_overlapping_arms_over_loopback() {
     }
 }
 
+fn sibling_cap_schema(cap: &str) -> Value {
+    json!({"type":"string","anyOf":[{"pattern":"^(a|b{1,4})$"},{"pattern":"^a+$",cap:4}]})
+}
+
+fn check_empty_pattern_candidates(plan: impl Fn(Value) -> anyhow::Result<()>) {
+    let mut missing = Vec::new();
+    for cap in ["maxLength", "x-omg-max-bytes"] {
+        let mut schema = sibling_cap_schema(cap);
+        match plan(schema.clone()) {
+            Ok(()) => missing.push(cap),
+            Err(error) => assert!(
+                error.to_string().contains("supply boundary candidates"),
+                "{cap}: {error}"
+            ),
+        }
+        let mut shared = schema.clone();
+        shared["anyOf"][0][cap] = json!(4);
+        plan(shared.clone()).expect("every string arm has the same cap");
+        shared["anyOf"][0][cap] = json!(5);
+        let error = plan(shared).expect_err("different caps cannot establish one common boundary");
+        assert!(
+            error.to_string().contains("supply boundary candidates"),
+            "{cap}: {error}"
+        );
+        schema["anyOf"][1].as_object_mut().unwrap().remove(cap);
+        schema[cap] = json!(4);
+        plan(schema).unwrap();
+    }
+    assert!(
+        missing.is_empty(),
+        "sibling caps waived the pattern evidence: {missing:?}"
+    );
+}
+
+#[test]
+fn empty_pattern_candidates_require_owned_bounds_for_body() {
+    check_empty_pattern_candidates(|schema| {
+        let doc = body_only(schema);
+        super::http_vectors::body_plan(&doc, &doc["paths"][TEMPLATE]["post"], &json!("a"), &[], &[])
+            .map(|_| ())
+    });
+}
+
+#[test]
+fn empty_pattern_candidates_require_owned_bounds_for_query() {
+    check_empty_pattern_candidates(|schema| {
+        let mut doc = query_document();
+        doc["paths"][TEMPLATE]["get"]["parameters"] = json!([parameter("s", true, schema)]);
+        super::http_vectors::query_plan(
+            &doc,
+            &doc["paths"][TEMPLATE]["get"],
+            &[("s".into(), "a".into())],
+            &[],
+            &[],
+        )
+        .map(|_| ())
+    });
+}
+
+#[test]
+fn empty_pattern_candidates_preserve_only_fixed_conditional_caps() {
+    for (guard, expected) in [("kind", true), ("s", false)] {
+        let doc = body_only(json!({
+            "type":"object", "required":["s","kind"],
+            "properties":{"s":sibling_cap_schema("maxLength"),"kind":{"type":"string"}},
+            "if":{"properties":{guard:{"const":"a"}},"required":[guard]},
+            "then":{"properties":{"s":{"maxLength":4}}}
+        }));
+        let plan = super::http_vectors::body_plan(
+            &doc,
+            &doc["paths"][TEMPLATE]["post"],
+            &json!({"kind":"a","s":"a"}),
+            &[],
+            &[],
+        );
+        if expected {
+            plan.unwrap();
+        } else {
+            let error = plan
+                .err()
+                .expect("the substituted string can change its own guard");
+            assert!(
+                error.to_string().contains("supply boundary candidates"),
+                "{error}"
+            );
+        }
+    }
+}
+
 #[test]
 fn keyword_scope_sibling_cap_cannot_witness_the_finite_pattern() {
-    let schema = json!({"type":"string","anyOf":[{"pattern":"^(a|b{1,4})$"},{"pattern":"^a+$","maxLength":4}]});
+    let schema = sibling_cap_schema("maxLength");
     let body = body_only(schema.clone());
     let mut query = query_document();
     query["paths"][TEMPLATE]["get"]["parameters"] = json!([parameter("s", true, schema.clone())]);
