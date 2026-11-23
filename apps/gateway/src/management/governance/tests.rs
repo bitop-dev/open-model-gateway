@@ -1,5 +1,4 @@
 use super::*;
-use gateway_datetime_compat::UtcInstant;
 #[test]
 fn strict_exact_money_and_required_nullable_fields() {
     for s in ["", "-1", "+1", "1.0", "1e6", "9223372036854775808"] {
@@ -59,6 +58,7 @@ mod db {
         http::{Request, header},
     };
 
+    use gateway_datetime_compat::UtcInstant;
     use sqlx::PgPool;
     use tower::ServiceExt;
     fn user(id: Uuid, admin: bool) -> BrowserPrincipal {

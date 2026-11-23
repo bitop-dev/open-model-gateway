@@ -757,6 +757,7 @@ pub(crate) struct Captured {
 }
 
 /// Names (not values) of the query parameters in a request target.
+#[cfg(feature = "integration-tests")]
 fn query_names(path: &str) -> Vec<String> {
     path.split_once('?')
         .map(|(_, query)| {
@@ -966,6 +967,7 @@ impl PositiveFixtures {
     /// `finish` judges the complete group; a coverage item that only one planned
     /// vector provides fails the gate of the shards that do not send it.
     #[track_caller]
+    #[cfg(feature = "integration-tests")]
     pub(crate) fn sharded(index: usize, count: usize) -> Self {
         Self {
             _shard: Some(super::http_vectors::divide(index, count)),

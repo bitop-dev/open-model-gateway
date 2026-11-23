@@ -311,7 +311,7 @@ enum Workspaces {
 /// hour's rollup only when it matches raw history in this snapshot).
 pub(crate) const SPIKE: &str = "SELECT coalesce(sum(known_cost_microusd) FILTER(WHERE w='current' AND accounting_state='settled'),0)::text,coalesce(sum(known_cost_microusd) FILTER(WHERE w='baseline' AND accounting_state='settled'),0)::text,coalesce(sum(attempts) FILTER(WHERE w='current' AND accounting_state='unknown'),0)::bigint FROM (SELECT 'baseline' w,u.* FROM omg_usage_rows($1,$2) u UNION ALL SELECT 'current',u.* FROM omg_usage_rows($2,$3) u) x WHERE ($4::uuid IS NULL OR workspace_id=$4)";
 /// The former raw-history spike query (parity oracle for [`SPIKE`]).
-#[cfg(test)]
+#[cfg(all(test, feature = "integration-tests"))]
 pub(crate) const SPIKE_RAW: &str = "SELECT coalesce(sum(actual_microusd) FILTER(WHERE admitted_at>=$2 AND state='settled'),0)::text,coalesce(sum(actual_microusd) FILTER(WHERE admitted_at<$2 AND state='settled'),0)::text,count(*) FILTER(WHERE admitted_at>=$2 AND state='unknown') FROM governance_reservations WHERE admitted_at>=$1 AND admitted_at<$3 AND ($4::uuid IS NULL OR workspace_id=$4)";
 
 /// What one evaluation did. `None` from [`evaluate_once`] means another replica

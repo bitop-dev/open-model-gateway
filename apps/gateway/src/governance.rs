@@ -504,7 +504,7 @@ mod audio_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod generation_defaults_tests;
 /// Test helper: replace one scope's whole budget set with `amount` for `period` (or none).
-#[cfg(test)]
+#[cfg(all(test, feature = "integration-tests"))]
 pub(crate) async fn set_test_budget(
     pool: &sqlx::PgPool,
     layer: &str,

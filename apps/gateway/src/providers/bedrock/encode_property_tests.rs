@@ -887,7 +887,7 @@ fn edit_request(r: &mut ChatRequest, e: &Edit) {
         }
         Edit::Temperature(t) => r.temperature = *t,
         Edit::MaxTokens(m) => r.max_output_tokens = *m,
-        Edit::Extras => add_extras(r),
+        Edit::Extras => add_non_converse_fields(r),
         _ => {}
     }
 }
@@ -948,24 +948,15 @@ proptest! {
     }
 }
 
-/// Messages options the Bedrock mapping does not carry (see #637): thinking,
-/// cache control, context management, a task budget, native tools and
-/// messages, a system value, deferred loading, history thinking, an output
-/// config without a format, and a valid beta header. None of them is a refused
-/// option (`validate` refuses `image`, `strict`, `top_k`, an output format,
-/// and bad or denied beta headers).
-fn add_extras(r: &mut ChatRequest) {
+/// Converse uses the normalized messages, system text and custom tools.
+fn add_non_converse_fields(r: &mut ChatRequest) {
     let o = options(r);
-    o.thinking = Some(json!({"type": "enabled", "budget_tokens": 1024}));
-    o.cache_controls = vec![json!({"type": "ephemeral"})];
-    o.context_management = Some(json!({"edits": []}));
-    o.task_budget = Some(json!({"total": 1000}));
     o.native_tools = vec![json!({"type": "custom", "name": "t"})];
     o.native_messages = vec![json!({"role": "user", "content": "x"})];
     o.system = Some(json!("system"));
-    o.defer_loading = vec![json!({"name": "t"})];
-    o.history_thinking = vec![json!({"type": "thinking", "thinking": "h", "signature": "s"})];
-    o.output_config = Some(json!({"effort": "high"}));
+    o.output_config =
+        Some(json!({"effort": "high", "task_budget": {"type": "tokens", "total": 1000}}));
+    o.task_budget = Some(o.output_config.as_ref().unwrap()["task_budget"].clone());
     o.beta_headers = vec!["prompt-caching-2024-07-31".into()];
 }
 
@@ -1034,17 +1025,16 @@ proptest! {
 proptest! {
     #![proptest_config(config(1500))]
 
-    /// Messages options the mapping does not carry change nothing: the encoded
-    /// input of a request with them equals the one without (#637 tracks
-    /// whether they should be refused instead).
+    /// Native envelopes, beta headers, effort and task budget leave the
+    /// normalized Converse input intact.
     #[test]
-    fn messages_options_the_mapping_omits_change_nothing(spec in spec()) {
+    fn non_converse_fields_leave_canonical_input_intact(spec in spec()) {
         let plain = build(&spec);
         let mut with = plain.clone();
-        add_extras(&mut with);
+        add_non_converse_fields(&mut with);
         let (a, b) = (encode(&plain), encode(&with));
         prop_assert!(a.is_ok());
-        prop_assert!(same(&a, &b), "the omitted options changed the encoded input");
+        prop_assert!(same(&a, &b), "non-Converse fields changed the encoded input");
         check_carried(&with, &b.unwrap())?;
     }
 
@@ -1094,22 +1084,18 @@ fn one_message_may_carry_exactly_max_tools_calls() {
     }
 }
 
-/// `validate` keeps one earlier refusal for translated providers: history
-/// thinking with no text and no tool calls anywhere is `InvalidRequest`. Such a
-/// request is refused for its empty message too, so the class is the same
-/// either way; with a message that has text it is accepted and the history is
-/// omitted.
 #[test]
-fn history_thinking_alone_is_not_a_conversation() {
-    let hist = json!({"type": "thinking", "thinking": "h", "signature": "s"});
-    let mut r = build(&spec_min());
-    r.messages = vec![msg(Role::User, None)];
-    options(&mut r).history_thinking = vec![hist.clone()];
-    assert_eq!(encode(&r).err(), Some(InferenceError::InvalidRequest));
-    let mut r = build(&spec_min());
-    options(&mut r).history_thinking = vec![hist];
-    let input = encode(&r).expect("history thinking beside real text is omitted, not refused");
-    check_carried(&r, &input).unwrap();
+fn thinking_history_is_refused_with_or_without_text() {
+    let mut request = build(&spec_min());
+    options(&mut request).history_thinking =
+        vec![json!({"type": "thinking", "thinking": "h", "signature": "s"})];
+    for messages in [request.messages.clone(), vec![msg(Role::User, None)]] {
+        request.messages = messages;
+        assert_eq!(
+            encode(&request).err(),
+            Some(InferenceError::InvalidField("thinking")),
+        );
+    }
 }
 
 /// The documented limits refuse rather than truncate: exactly `MAX_TOOLS`

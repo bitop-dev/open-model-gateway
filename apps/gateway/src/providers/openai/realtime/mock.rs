@@ -44,8 +44,10 @@ pub(crate) enum Reply {
     /// `response.done` without a usage object.
     NoUsage,
     /// `response.created` and a delta, then nothing.
+    #[cfg(feature = "integration-tests")]
     Hang,
     /// An `error` event for the request's event id (no response).
+    #[cfg(feature = "integration-tests")]
     Reject,
 }
 pub(crate) fn usage(
@@ -119,6 +121,7 @@ impl Shared {
             })
             .collect()
     }
+    #[cfg(feature = "integration-tests")]
     pub fn received_of(&self, kind: &str) -> Vec<Value> {
         self.received
             .lock()
@@ -237,7 +240,9 @@ async fn serve(tcp: tokio::net::TcpStream, state: Arc<Shared>) {
                 match reply {
                     Reply::Done(u) => out.extend([created, delta, json!({"type":"rate_limits.updated","event_id":"event_r","rate_limits":[{"name":"tokens","limit":1000000,"remaining":999,"reset_seconds":1}]}), done(Some(u))]),
                     Reply::NoUsage => out.extend([created, done(None)]),
+                    #[cfg(feature = "integration-tests")]
                     Reply::Hang => out.extend([created, delta]),
+                    #[cfg(feature = "integration-tests")]
                     Reply::Reject => out.push(json!({"type":"error","event_id":"event_x","error":{"type":"invalid_request_error","code":"conversation_already_has_active_response","message":"private","event_id":event["event_id"]}})),
                 }
             }
