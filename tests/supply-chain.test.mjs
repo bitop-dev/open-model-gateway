@@ -447,10 +447,22 @@ test("the Docker PostgreSQL fixture uses exactly one approved digest-pinned imag
   ], "expected exactly one PostgreSQL fixture reference, using the approved PostgreSQL 17 digest (not a mutable tag)");
 });
 
+test("Compose uses the approved PostgreSQL 17 Alpine index (#771)", () => {
+  const digest = "sha256:f9cf3e1f0066f0eb0c48707d864f0ac5941e9ff454a072077d97a4d278d07d73";
+  for (const [file, image] of [
+    ["compose.yaml", "postgres"],
+    ["deploy/demo/compose.yaml", "postgres"],
+    ["deploy/loadtest/compose.yaml", "mirror.gcr.io/library/postgres"],
+  ]) {
+    const compose = toData(parseStrict(readLocalFromRepo(file), file));
+    assert.equal(compose.services.postgres.image, `${image}:17-alpine@${digest}`, file);
+  }
+});
+
 test("staging verifier images use the approved literal digest pins in both workflows, Compose defaults and examples (#373)", () => {
   const pins = [
-    ["STAGING_POSTGRES_IMAGE", "postgres", "mirror.gcr.io/library/postgres@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27"],
-    ["STAGING_CADDY_IMAGE", "ingress", "mirror.gcr.io/library/caddy@sha256:d8542f48d34a9cf4e4c11a478865229840e87e4c96ea3f439101f31a5d35f75f"],
+    ["STAGING_POSTGRES_IMAGE", "postgres", "mirror.gcr.io/library/postgres@sha256:837bed18782820fe967067cb5328b02b0d9992c1be9a37ee0c9c492cfc03af3b"],
+    ["STAGING_CADDY_IMAGE", "ingress", "mirror.gcr.io/library/caddy@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0"],
   ];
   const actual = [];
   const expected = [];

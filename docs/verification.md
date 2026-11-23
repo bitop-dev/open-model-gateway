@@ -501,7 +501,7 @@ GitHub's shared runners hit Docker Hub's anonymous pull limit, and a Docker Hub 
 | `Dockerfile` build stages (`node`, `rust`) | `mirror.gcr.io/library/...`, Google's Docker Hub mirror (the same image digests). No `# syntax=` line: BuildKit's built-in Dockerfile frontend. The runtime base was already `gcr.io/distroless`. |
 | PostgreSQL service containers (`gateway-tests`, `gateway-special`, `browser` jobs) | `mirror.gcr.io/library/postgres:17-alpine@sha256:…`, the tag's multi-architecture index, pinned by digest (#493) |
 | `test:container`'s database | `mirror.gcr.io/library/postgres@sha256:…` (a PostgreSQL 17 index, pinned by digest in #369) |
-| Staging rehearsal PostgreSQL and Caddy | `STAGING_POSTGRES_IMAGE` / `STAGING_CADDY_IMAGE` set to `mirror.gcr.io/library/postgres:17-bookworm` and `mirror.gcr.io/library/caddy:2-alpine` by `ci.yml` and `image.yml`. `deploy/staging/compose.yaml` still defaults to Docker Hub for operators. |
+| Staging rehearsal PostgreSQL and Caddy | `ci.yml` and `image.yml` explicitly set `STAGING_POSTGRES_IMAGE` and `STAGING_CADDY_IMAGE` to approved Bookworm and Alpine image digests in `mirror.gcr.io`. Local staging uses the same digest pins by default in `deploy/staging/compose.yaml`. |
 | BuildKit (`docker/setup-buildx-action`) | `driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1@sha256:…` |
 | SBOM generator | `attests: type=sbom,generator=mirror.gcr.io/docker/buildkit-syft-scanner:stable-1@sha256:…` (replaces `sbom: true`) |
 | MinIO / RustFS file-store tests | `mirror.gcr.io/pgsty/minio@sha256:…` (pgsty publishes only to Docker Hub; the pull is retried with backoff) and `ghcr.io/rustfs/rustfs@sha256:…` (RustFS's own registry). Same digests as on Docker Hub. |
