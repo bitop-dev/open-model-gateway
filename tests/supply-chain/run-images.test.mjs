@@ -34,6 +34,18 @@ END
     assert.deepEqual(check(data + "true"), []);
     assert.match(check(data + "docker pull floating").join(), /digest/);
   });
+  test(`${kind} checks the command after an attached global option`, () => {
+    const prefix = 'docker --log-level="$(printf warn)"';
+    assert.match(check(prefix + " build .").join(), /builds an image|computed.*option/);
+    assert.match(check(prefix + " pull floating").join(), /digest|computed.*option/);
+  });
+  test(`${kind} refuses a grouped heredoc header`, () => {
+    assert.throws(() => check("(cat <<'END'\nprintf fixture\nEND\n) | sh"), /heredoc/);
+  });
+  test(`${kind} handles arithmetic shifts and checks the next command`, () => {
+    assert.deepEqual(check("limit=$((1 << 4))"), []);
+    assert.match(check("limit=$((1 << 4))\ndocker pull floating").join(), /digest/);
+  });
   test(`${kind} ends Compose option parsing at the service`, () => {
     assert.deepEqual(check("docker compose run --rm -- gateway tool --build"), []);
     assert.deepEqual(check("docker compose run -e --build gateway"), []);

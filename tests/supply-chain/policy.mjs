@@ -670,29 +670,29 @@ function heredocBody(source, start, { delimiter, stripTabs, literal }) {
 // Simple commands of a script: continuations joined, split at newlines, ; & | && || ( ) $( and
 // backticks, comments dropped, words shell-split (quotes removed; `DOCKER_""HOST` is one word).
 // Each word records whether it holds a `$` expansion.
-export function shellCommands(s, shell = "sh") {
-  const [bash, posix] = shellCommandReadings(s, shell);
+export function shellCommands(s, shell = "sh", onHeredoc) {
+  const [bash, posix] = shellCommandReadings(s, shell, onHeredoc);
   if (!posix) return bash;
   const seen = new Set(bash.map(words => JSON.stringify(words)));
   return bash.concat(posix.filter(words => !seen.has(JSON.stringify(words))));
 }
 
 // Order-sensitive consumers need the final command in each interpretation.
-export function shellCommandReadings(s, shell = "sh") {
+export function shellCommandReadings(s, shell = "sh", onHeredoc) {
   // The same heredoc can occur in both readings of its header. Parse its
   // body once per recipient shell, including when shell inputs are nested.
   const bodies = new Map();
   const readBody = (body, interpreter) => {
     const key = interpreter + "\n" + body;
-    if (!bodies.has(key)) bodies.set(key, shellCommands(body, interpreter));
+    if (!bodies.has(key)) bodies.set(key, shellCommands(body, interpreter, onHeredoc));
     return bodies.get(key);
   };
-  const bash = tokenizeCommands(s, true, readBody);
+  const bash = tokenizeCommands(s, true, readBody, onHeredoc);
   if (shell === "bash" || !bash.sawCombinedRedirect) return [bash.commands];
-  return [bash.commands, tokenizeCommands(s, false, readBody).commands];
+  return [bash.commands, tokenizeCommands(s, false, readBody, onHeredoc).commands];
 }
 
-function tokenizeCommands(s, combinedRedirects, readBody) {
+function tokenizeCommands(s, combinedRedirects, readBody, onHeredoc) {
   let sawCombinedRedirect = false;
   // Comments and single quotes consume physical lines. Outside them, an
   // unescaped backslash-newline can join parts of a word or shell operator.
@@ -701,7 +701,7 @@ function tokenizeCommands(s, combinedRedirects, readBody) {
     return offset;
   };
   const commands = [], stack = [];
-  let heredoc;
+  let heredoc, groupDepth = 0;
   let words = [], word = null, quoted = false, ioNumber = false;
   const add = (text, variable = false, digit = false) => {
     ioNumber = digit && (!word || ioNumber);
@@ -712,15 +712,18 @@ function tokenizeCommands(s, combinedRedirects, readBody) {
   const endWord = () => { if (word !== null) words.push(word); word = null; };
   const endCommand = () => { endWord(); if (words.length) commands.push(words); words = []; };
   // A command substitution is read as commands of its own; its value is a variable word.
-  const open = close => { stack.push({ words, word, quoted, close }); words = []; word = null; quoted = false; };
-  const close = () => { endCommand(); ({ words, word, quoted } = stack.pop()); add("", true); };
+  const open = (close, arithmetic = false) => {
+    stack.push({ words, word, quoted, groupDepth, close, arithmetic });
+    words = []; word = null; quoted = false; groupDepth = 0;
+  };
+  const close = () => { endCommand(); ({ words, word, quoted, groupDepth } = stack.pop()); add("", true); };
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
     if (c === "`") { if (stack.at(-1)?.close === "`") close(); else open("`"); continue; }
     if (c === "\\" && s[i + 1] === "\n") { i++; continue; }
     if (c === "$") {
       const next = skipContinuations(i + 1);
-      if (s[next] === "(") { open(")"); i = next; continue; }
+      if (s[next] === "(") { open(")", s[skipContinuations(next + 1)] === "("); i = next; continue; }
     }
     if (quoted) {
       if (c === '"') quoted = false;
@@ -732,16 +735,19 @@ function tokenizeCommands(s, combinedRedirects, readBody) {
     if (c === "'") { const j = s.indexOf("'", i + 1); add(s.slice(i + 1, j === -1 ? s.length : j)); i = j === -1 ? s.length : j; continue; }
     if (c === "\\" && i + 1 < s.length) { add(s[++i]); continue; }
     if (c === "#" && word === null) { const j = s.indexOf("\n", i); i = j === -1 ? s.length : j - 1; continue; }
-    if (c === ")" && stack.at(-1)?.close === ")") { close(); continue; }
+    if (c === ")" && groupDepth === 0 && stack.at(-1)?.close === ")") { close(); continue; }
     const next = skipContinuations(i + 1);
     const combined = combinedRedirects && c === "&" && s[next] === ">";
     sawCombinedRedirect ||= combined;
     if (!combined && "\n;&|()".includes(c)) {
+      if (c === "(") groupDepth++;
+      if (c === ")" && groupDepth) groupDepth--;
       if (heredoc) {
         if (c !== "\n" || stack.length) throw new Error("unsupported compound heredoc command");
         endWord();
         const [program] = commandWords(words);
         const { body, end } = heredocBody(s, i + 1, heredoc);
+        onHeredoc?.(body);
         endCommand();
         // Other recipients may interpret their input. Keep that text in the
         // command inventory, isolated from the shell after the delimiter.
@@ -755,6 +761,8 @@ function tokenizeCommands(s, combinedRedirects, readBody) {
       continue;
     }
     if (c === " " || c === "\t") { endWord(); continue; }
+    // Redirection characters in an arithmetic expansion are comparisons or shifts.
+    if ((c === "<" || c === ">") && stack.at(-1)?.arithmetic) { add(c); continue; }
     if (combined || c === ">" || c === "<") {
       if (!combined && ioNumber) word = null;
       endWord();
@@ -770,7 +778,7 @@ function tokenizeCommands(s, combinedRedirects, readBody) {
       }
       if (operator === "<<" || operator === "<<-") {
         const match = /^[ \t]*(?:(["'])(\w+)\1|\\(\w+)|(\w+))(?=$|[ \t\n<>;&|])/.exec(s.slice(i + 1));
-        if (!match || heredoc || stack.length) throw new Error("unsupported heredoc delimiter or nesting");
+        if (!match || heredoc || stack.length || groupDepth) throw new Error("unsupported heredoc delimiter or nesting");
         heredoc = { delimiter: match[2] ?? match[3] ?? match[4], literal: !match[4], stripTabs: operator === "<<-" };
       }
       words.push({ text: operator, redirection: true });
@@ -841,8 +849,9 @@ function commandAfterOptions(words, table, command) {
   const args = words.map(w => w.variable && !w.text.includes("$") ? "$computed" : w.text);
   const parsed = options(args, table, command);
   if (parsed.refused) return parsed;
-  const [sub] = parsed.rest;
-  return { sub, files: parsed.files, args: words.slice(words.length - parsed.rest.length + 1) };
+  const index = words.length - parsed.rest.length;
+  if (words[index]?.variable) return { refused: `computed ${command} subcommand or global option cannot be checked` };
+  return { sub: parsed.rest[0], files: parsed.files, args: words.slice(index + 1) };
 }
 
 function composeCommand(words, composeFiles, runOnly = false) {

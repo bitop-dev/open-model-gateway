@@ -130,12 +130,18 @@ function checkInputs(data, file, docs = documents, read = repoScript) {
 }
 
 function checkAssignments(script, path) {
-  for (const { text, variable } of shellCommands(script).flat()) {
+  function check(text, variable) {
     const eq = text.indexOf("=");
     if (eq >= 0 && liveNames.has(text.slice(0, eq))) {
       assert.ok(!variable && fixtureValues.has(text.slice(eq + 1)), `${path}: live credential assignment`);
     }
   }
+  // A heredoc can supply environment-file records even when its recipient
+  // treats the contents as data. Inspect the records without shell decoding.
+  function checkEnvRecords(body) {
+    for (const line of body.split("\n")) check(line, false);
+  }
+  for (const { text, variable } of shellCommands(script, "sh", checkEnvRecords).flat()) check(text, variable);
 }
 
 function inspect(parent, path, conditions, runs) {
@@ -160,6 +166,15 @@ function inspect(parent, path, conditions, runs) {
 
 test("Cargo jobs and their local calls cannot import provider secrets", () => {
   for (const [file, data] of documents) if (data.jobs) checkInputs(data, file);
+});
+
+test("Cargo jobs validate physical credential records written to GITHUB_ENV", () => {
+  const check = value => checkInputs({ jobs: { tests: { steps: [
+    { run: `cat <<-'END' >> "$GITHUB_ENV"\n\tOPENAI_KEY=${value}\n\tEND` },
+    { run: "cargo test" },
+  ] } } }, "fixture.yml");
+  check("fixture");
+  assert.throws(() => check("sentinel"), /live credential assignment/);
 });
 
 test("provider secret references and inheritance are refused regardless of the credential alias", () => {
