@@ -77,6 +77,16 @@ test("a required job step cannot keep its command and not run it (#502)", () => 
   validateGraph(loadWorkflow());
 });
 
+test("the required read-only web job checks upstream action tags", () => {
+  const data = loadWorkflow();
+  const web = data.jobs.web;
+  required(web);
+  assert.deepEqual(web.permissions ?? data.permissions, { contents: "read" });
+  assert.deepEqual(web.steps.filter(step => step.run === "node scripts/check-action-tags.mjs"), [{
+    run: "node scripts/check-action-tags.mjs", env: { GH_TOKEN: "${{ github.token }}" },
+  }]);
+});
+
 const ociPolicyCommands = [
   "node --test tests/oci-tool.test.mjs",
   "python3 -B -m unittest discover -s tests -p 'oci_*test.py' -v",
