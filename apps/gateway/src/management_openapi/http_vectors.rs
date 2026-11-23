@@ -234,6 +234,14 @@ fn valid(document: &Value, schema: &Value, instance: &Value) -> Result<bool> {
     Ok(responses::validator(document, schema)?.is_valid(instance))
 }
 
+#[derive(Default)]
+struct ApplicableSchemas<'a> {
+    nodes: Vec<&'a Value>,
+    unannotated_complex_pattern: bool,
+    annotated_complex_pattern: bool,
+    annotated_simple_pattern: bool,
+}
+
 /// The schema nodes that constrain `value`: the node itself, its `allOf` members,
 /// the `oneOf`/`anyOf` branches the value matches and the active conditional arm.
 /// This inventory describes the seed. A replacement can select other arms.
@@ -241,13 +249,26 @@ fn applicable<'a>(
     document: &'a Value,
     node: &'a Value,
     value: &Value,
-    out: &mut Vec<&'a Value>,
+    out: &mut ApplicableSchemas<'a>,
     depth: usize,
 ) -> Result<()> {
     ensure!(depth < 16, "schema nesting too deep");
     // Every link of a `$ref` chain contributes its own keywords, siblings included.
+    // A reason beside a reference belongs to its referenced pattern. Each
+    // applicator arm starts a separate chain, even when arms share a target.
+    let mut annotated = false;
     for node in chain(document, node)? {
-        out.push(node);
+        out.nodes.push(node);
+        annotated |= node.get(PATTERN_BOUNDARIES).is_some();
+        if let Some(pattern) = node["pattern"].as_str() {
+            if simple_bounds(pattern).is_none() {
+                out.unannotated_complex_pattern |= !annotated;
+                out.annotated_complex_pattern |= annotated;
+            } else {
+                out.annotated_simple_pattern |= annotated;
+            }
+            annotated = false;
+        }
         for branch in node["allOf"].as_array().into_iter().flatten() {
             applicable(document, branch, value, out, depth + 1)?;
         }
@@ -1245,10 +1266,11 @@ fn scalar_mutations(
     document: &Value,
     schema: &Value,
     oracle: &BoundaryOracle,
-    nodes: &[&Value],
+    schemas: &ApplicableSchemas<'_>,
     value: &Value,
     query: bool,
 ) -> Result<Mutations> {
+    let nodes = schemas.nodes.as_slice();
     let mut out: Vec<(&'static str, Value)> = Vec::new();
     let mut evidence = Evidence::default();
     let mut dropped: Vec<String> = Vec::new();
@@ -1445,12 +1467,10 @@ fn scalar_mutations(
         string_bounds(document, oracle, nodes, seed, &mut out, &mut evidence)?;
         dropped.append(&mut evidence.dropped);
         let patterns = strings(nodes, "pattern");
-        let annotated = nodes
-            .iter()
-            .any(|node| node.get(PATTERN_BOUNDARIES).is_some());
-        needs_candidates = oracle.rules.needs_pattern_witness && !annotated;
-        stale_pattern_boundaries =
-            annotated && !patterns.is_empty() && !oracle.rules.needs_pattern_witness;
+        needs_candidates =
+            oracle.rules.needs_pattern_witness && schemas.unannotated_complex_pattern;
+        stale_pattern_boundaries = schemas.annotated_simple_pattern
+            || (schemas.annotated_complex_pattern && !oracle.rules.needs_pattern_witness);
         for pattern in patterns {
             let (shapes, lengths) = pattern_candidates(pattern, seed, &mut dropped);
             for (length, candidate) in lengths {
@@ -1666,9 +1686,9 @@ pub(super) fn query_plan(
             .find(|(n, _)| n == name)
             .map(|(_, v)| v.as_str())
             .context("every documented query parameter needs a valid base or seed value")?;
-        let mut nodes = Vec::new();
-        query_type_nodes(document, schema, &mut nodes, 0)?;
-        let kinds = types(&nodes);
+        let mut type_nodes = Vec::new();
+        query_type_nodes(document, schema, &mut type_nodes, 0)?;
+        let kinds = types(&type_nodes);
         let wire_value = |schema: &Value, raw: &str| -> Result<Value> {
             let typed = coerce(&kinds, raw);
             // A numeric-looking value may already satisfy a string arm.
@@ -1681,8 +1701,9 @@ pub(super) fn query_plan(
             Ok(typed)
         };
         let typed = wire_value(schema, raw)?;
-        nodes.clear();
-        applicable(document, schema, &typed, &mut nodes, 0)?;
+        let mut schemas = ApplicableSchemas::default();
+        applicable(document, schema, &typed, &mut schemas, 0)?;
+        let nodes = schemas.nodes.as_slice();
         ensure!(
             accepts(document, schema, &typed)?,
             "the valid base value of a query parameter must satisfy its schema"
@@ -1701,12 +1722,12 @@ pub(super) fn query_plan(
             .filter(|(n, _)| n == name)
             .map(|(_, v)| v.as_str())
             .collect();
-        let rules = ByteDominance::at(document, schema, &typed, &[], &nodes, !supplied.is_empty())?;
+        let rules = ByteDominance::at(document, schema, &typed, &[], nodes, !supplied.is_empty())?;
         let oracle = BoundaryOracle {
             rules,
             ..BoundaryOracle::leaf(schema)
         };
-        let mut mutations = scalar_mutations(document, schema, &oracle, &nodes, &typed, true)?;
+        let mut mutations = scalar_mutations(document, schema, &oracle, &schemas, &typed, true)?;
         if mutations.needs_candidates {
             notes.problems.push(format!(
                 "query parameter {name}: the pattern has no derivable length bounds; supply boundary candidates or annotate it with {PATTERN_BOUNDARIES}"
@@ -1728,7 +1749,7 @@ pub(super) fn query_plan(
                 })
                 .collect::<Result<Vec<_>>>()?;
             if !straddles(
-                &nodes,
+                nodes,
                 &oracle.rules,
                 &verdicts,
                 &mut notes,
@@ -2437,8 +2458,9 @@ impl Walk<'_> {
     }
     fn walk(&mut self, schema: &Value, value: &Value, path: &mut Vec<Step>) -> Result<()> {
         ensure!(path.len() < 12, "request body nesting too deep");
-        let mut nodes = Vec::new();
-        applicable(self.document, schema, value, &mut nodes, 0)?;
+        let mut schemas = ApplicableSchemas::default();
+        applicable(self.document, schema, value, &mut schemas, 0)?;
+        let nodes = schemas.nodes.as_slice();
         self.walked
             .entry(self.valid_key.clone())
             .or_insert_with(|| (self.valid_body.clone(), BTreeSet::new()))
@@ -2451,7 +2473,7 @@ impl Walk<'_> {
             self.root_schema,
             &self.valid_body,
             path,
-            &nodes,
+            nodes,
             !supplied.is_empty(),
         )?;
         let oracle = if rules.parent_choice {
@@ -2466,7 +2488,7 @@ impl Walk<'_> {
                 ..BoundaryOracle::leaf(schema)
             }
         };
-        let mutations = scalar_mutations(self.document, schema, &oracle, &nodes, value, false)?;
+        let mutations = scalar_mutations(self.document, schema, &oracle, &schemas, value, false)?;
         let rules = oracle.rules;
         if mutations.needs_candidates {
             self.notes.problems.push(format!(
@@ -2486,7 +2508,7 @@ impl Walk<'_> {
             .chain(mutations.labelled.iter().map(|(label, ..)| label.as_str()))
             .collect();
         let exempt = nodes.iter().any(|node| node.get(UNSENDABLE).is_some());
-        let bounded = decisively_bounded(&nodes);
+        let bounded = decisively_bounded(nodes);
         if exempt && bounded {
             self.exempt_used.entry(here.clone()).or_insert(false);
         }
@@ -2513,7 +2535,7 @@ impl Walk<'_> {
                 }
             }
             if !straddles(
-                &nodes,
+                nodes,
                 &rules,
                 &verdicts,
                 &mut self.notes,
@@ -2552,7 +2574,7 @@ impl Walk<'_> {
                 for (name, child) in map {
                     // Only schema-declared names (properties and typed map
                     // values) are walked (and reported).
-                    if let Some(child_schema) = member_schema(&nodes, name)? {
+                    if let Some(child_schema) = member_schema(nodes, name)? {
                         path.push(Step::Key(name.clone()));
                         self.walk(&child_schema, child, path)?;
                         path.pop();
@@ -2567,7 +2589,7 @@ impl Walk<'_> {
                     .filter(|name| !map.contains_key(*name))
                     .collect();
                 for name in absent {
-                    if child_schema(&nodes, name).is_some() {
+                    if child_schema(nodes, name).is_some() {
                         path.push(Step::Key(name.clone()));
                         self.seeded(path)?;
                         path.pop();
@@ -2575,7 +2597,7 @@ impl Walk<'_> {
                 }
             }
             Value::Array(items) => {
-                self.array_bounds(schema, &nodes, items, path)?;
+                self.array_bounds(schema, nodes, items, path)?;
                 self.push(path, "empty array", Some(json!([])))?;
                 // Every positional index, and one element of each distinct
                 // signature (the union arms and conditional branches it matches)
@@ -2583,10 +2605,10 @@ impl Walk<'_> {
                 // another arm is a different location and must be mutated too.
                 let mut signatures = BTreeSet::new();
                 for (i, item) in items.iter().enumerate() {
-                    let Some(item_schema) = element_schema(&nodes, i) else {
+                    let Some(item_schema) = element_schema(nodes, i) else {
                         continue;
                     };
-                    if !positional(&nodes, i) {
+                    if !positional(nodes, i) {
                         let signature = request_reach::reached(self.document, &item_schema, item)?;
                         if !signatures.insert(signature) {
                             continue;
@@ -2597,7 +2619,7 @@ impl Walk<'_> {
                     path.pop();
                 }
                 // The next positional item, when the caller seeded it.
-                if positional(&nodes, items.len()) {
+                if positional(nodes, items.len()) {
                     path.push(Step::Index(items.len()));
                     self.seeded(path)?;
                     path.pop();
