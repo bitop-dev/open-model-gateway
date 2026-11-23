@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run the tests that a change touches (the fast tier).
 
+    python3 -I scripts/test-fast.py --prepare        # prebuild the gateway lib tests in this worktree
     python3 -I scripts/test-fast.py                  # tests for files changed since origin/main
     python3 -I scripts/test-fast.py --base v0.18.0   # another base
     python3 -I scripts/test-fast.py --all            # every gateway lib test except the contract fixtures
@@ -242,6 +243,7 @@ def run(command):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--prepare", action="store_true", help="only compile the locked all-feature gateway lib tests")
     parser.add_argument("--base", default="origin/main", help="compare against this ref (default origin/main)")
     parser.add_argument("--all", action="store_true", help="every gateway lib test except the contract fixtures")
     parser.add_argument("--contract", action="store_true", help="include the OpenAPI contract fixtures")
@@ -249,6 +251,11 @@ def main(argv=None):
     parser.add_argument("--jobs", type=int, default=0, help="cargo build jobs (default: cargo's)")
     parser.add_argument("--test-threads", type=int, default=0, help="libtest threads (default: libtest's)")
     args = parser.parse_args(argv)
+
+    if args.prepare:
+        if args.all or args.contract or args.plan or args.test_threads or args.base != "origin/main":
+            parser.error("--prepare accepts only --jobs")
+        return run(cargo_test(args.jobs, ["--locked", "--lib", "--no-run"]))
 
     changed = changed_files(args.base)
     touches_rust = args.all or any(

@@ -4,6 +4,7 @@ import importlib.util
 import os
 import pathlib
 import unittest
+from unittest.mock import patch
 
 for _name in [name for name in os.environ if name.startswith("GIT_")]:
     del os.environ[_name]
@@ -34,6 +35,17 @@ TESTS = BIG + [
 
 def select(paths, **kwargs):
     return fast.select(paths, TESTS, **kwargs)
+
+
+class Preparation(unittest.TestCase):
+    def test_prepare_builds_the_normal_lib_and_propagates_failure(self):
+        with patch.object(fast, "changed_files", side_effect=AssertionError("unexpected diff")), \
+             patch.object(fast, "run", return_value=17) as run:
+            self.assertEqual(fast.main(["--prepare", "--jobs", "4"]), 17)
+        run.assert_called_once_with([
+            "cargo", "test", "-p", "open-model-gateway", "--all-features", "-j", "4",
+            "--locked", "--lib", "--no-run",
+        ])
 
 
 class Selection(unittest.TestCase):

@@ -31,6 +31,54 @@ Run from the repository root. None of them make paid provider calls or touch the
 
 CI (`.github/workflows/ci.yml`) runs all of these; the `browser` job uses a PostgreSQL service container, and `test:container` runs in the `staging-image` job (and on each pushed digest in `image.yml`). The binary's startup secret handling and `healthcheck` are also covered by `cargo test` (`apps/gateway/src/startup.rs`, `apps/gateway/src/healthcheck.rs`, `apps/gateway/tests/startup.rs`).
 
+### Prepare the next issue worktree
+
+When the worker is idle, build the all-feature gateway library tests in the
+directory where the next issue will be developed. Pick a new path on local
+writable disk with room for a private incremental Cargo target. In this example
+the next checkout is a sibling of the current one.
+
+```sh
+git fetch origin main &&
+git worktree add --detach ../omg-next origin/main &&
+cd ../omg-next
+```
+
+Run these settings in the prepared checkout for both preparation and development
+(including any new shell). They match the measured four-core profile.
+
+```sh
+export CARGO_TARGET_DIR="$PWD/target"
+export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=1
+python3 -I scripts/test-fast.py --prepare --jobs 4
+```
+
+Wait for preparation to finish. At issue assignment, open **that same directory**
+and create the issue branch from the latest main. Substitute the issue branch
+name below. A worker that already has a dedicated issue checkout can run the
+preparation step there directly.
+
+```sh
+git fetch origin main &&
+git switch --no-track -c issue-123 origin/main &&
+python3 -I scripts/test-fast.py --prepare --jobs 4
+```
+
+The second Cargo invocation validates freshness after the switch. If main
+advanced, Cargo rebuilds affected inputs. Make the issue edit here and run
+`python3 -I scripts/test-fast.py` as usual. Preparation compiles the full
+library test executable, including ignored tests. Test selection and execution
+still happen at the usual entry points. Database and SDK prerequisites for
+the tests you run are listed above.
+
+Preparation moves compilation ahead of assignment and costs one build per
+new empty target. For consecutive issues on a single worker, the same path
+and target can serve again after the previous branch has landed and the
+worktree is clean. Switch to the freshly fetched main commit in detached
+mode and repeat preparation. Keep each active worker's checkout private.
+To retire a checkout, clean its build outputs with `cargo clean` there and
+use ordinary `git worktree remove` from the parent checkout.
+
 ### Database tests
 
 A database test is `#[dbtest::test] async fn name(pool: PgPool)` (`crates/dbtest`, a dev-dependency proc macro; the runtime is `apps/gateway/src/dbtest_runtime`, test builds only). It replaces `#[sqlx::test(migrations = "./enterprise_migrations")]`: same test name and module path, same per-test database (named by sqlx's rule from the test path and recorded in `_sqlx_test.databases`), same single-threaded runtime, same `DATABASE_URL`. Only the way the schema gets there differs: the database is `CREATE DATABASE ... TEMPLATE` of a database the real migrator (`sqlx::migrate!("./enterprise_migrations")`) built once, about 60 ms instead of an empty database plus every migration (about 1.8 s). `#[sqlx::test(migrations = false)]`, the plain `#[sqlx::test]` and the legacy `./migrations` test stay on sqlx: they need an empty database or another schema, and the integration targets under `apps/gateway/tests` are separate crates that cannot reach the test-only runtime.
