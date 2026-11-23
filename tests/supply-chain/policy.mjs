@@ -651,7 +651,7 @@ export const STEP_SHELLS = new Set(["bash", "sh"]);
 // backticks, comments dropped, words shell-split (quotes removed; `DOCKER_""HOST` is one word).
 // Each word records whether it holds a `$` expansion.
 export function shellCommands(script) {
-  const s = script.replace(/\\\n/g, " ");
+  const s = script.replace(/\\\n/g, "");
   const commands = [], stack = [];
   let words = [], word = null, quoted = false;
   const add = (text, variable = false) => { word ??= { text: "", variable: false }; word.text += text; word.variable ||= variable; };
@@ -677,13 +677,20 @@ export function shellCommands(script) {
     if (c === ")" && stack.at(-1)?.close === ")") { close(); continue; }
     if ("\n;&|()".includes(c)) { endCommand(); continue; }
     if (c === " " || c === "\t") { endWord(); continue; }
-    if (c === ">" || c === "<") { endWord(); add(c); endWord(); continue; }
+    if (c === ">" || c === "<") {
+      if (word && /^\d+$/.test(word.text) && s.slice(i - word.text.length, i) === word.text) word = null;
+      endWord();
+      const operator = /^(?:<<<|<<-|<<|<>|<&|>>|>\||>&|[<>])/.exec(s.slice(i))[0];
+      words.push({ text: operator, redirection: true });
+      i += operator.length - 1;
+      continue;
+    }
     add(c, c === "$");
   }
   while (stack.length) close();
   endCommand();
   // Redirections and their targets are not words of the command.
-  return commands.map(ws => ws.filter((w, i) => !/^[<>]$/.test(w.text) && !(i > 0 && /^[<>]$/.test(ws[i - 1].text)))).filter(ws => ws.length);
+  return commands.map(ws => ws.filter((w, i) => !w.redirection && !ws[i - 1]?.redirection)).filter(ws => ws.length);
 }
 
 const PREFIX_COMMANDS = new Set(["sudo", "env", "exec", "command", "time", "nohup", "xargs", "nice"]);
@@ -773,14 +780,19 @@ const PUBLISHING_TOOLS = {
   crane: ["push", "copy", "cp", "tag", "append", "mutate"],
 };
 
-// The reason one simple command is refused, or null.
-function commandViolation(words, composeFiles) {
+function commandIndex(words) {
   let i = 0;
   for (;;) {
     while (i < words.length && ASSIGNMENT.test(words[i].text)) i++;
     if (i < words.length && PREFIX_COMMANDS.has(words[i].text)) { i++; while (i < words.length && words[i].text.startsWith("-")) i++; continue; }
     break;
   }
+  return i;
+}
+
+// The reason one simple command is refused, or null.
+function commandViolation(words, composeFiles) {
+  const i = commandIndex(words);
   if (i >= words.length) return null;
   const word = words[i];
   if (word.variable && !/^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?(\/[A-Za-z0-9._-]+)+$/.test(word.text)) return `the command word '${word.text}' is taken from a variable, which cannot be checked`;
@@ -839,6 +851,77 @@ export function buildStepsOf(file, data) {
   return steps;
 }
 
+// These four release steps pull or run an output digest validated by the pinned
+// image workflow. The whole-job pins also cover the validation and env bindings.
+const RELEASE_OPERANDS = new Map([
+  ["probe-prepare:Resolve and pull the existing dev index (no retry or rebuild):pull", '${IMAGE}@${child}'],
+  ["probe-prepare:Check exact revision, native platform and Cargo version without credentials:run", '${IMAGE}@${CHILD}'],
+  ["verify:Pull the pushed digest:pull", '${IMAGE}@${DIGEST}'],
+  ["verify:Check the built version:run", '${IMAGE}@${DIGEST}'],
+]);
+
+const OPERAND_FLAGS = {
+  pull: ["-q", "--quiet"],
+  run: ["--rm", "--read-only", "--privileged", "--init", "-d", "--detach", "-i", "--interactive", "-t", "--tty"],
+  create: ["--rm", "--read-only", "--privileged", "--init", "-i", "--interactive", "-t", "--tty"],
+  compose: ["--rm", "--no-deps", "--service-ports", "--use-aliases", "-T", "--no-TTY", "-d", "--detach", "-i", "--interactive"],
+};
+const CONTAINER_VALUES = ["--name", "--entrypoint", "-e", "--env", "--env-file", "-v", "--volume", "-p", "--publish", "-u", "--user", "-w", "--workdir", "--pull"];
+function runOperand(args, kind) {
+  const values = kind === "pull" ? ["--platform"] : [...CONTAINER_VALUES];
+  if (kind === "create" || kind === "run") values.push("--platform", "--network", "--cap-drop", "--security-opt", "-h", "--hostname");
+  let i = 0;
+  for (; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "--") return args[i + 1];
+    if (!arg.startsWith("-") || arg === "-") break;
+    const long = arg.startsWith("--");
+    const name = long ? arg.split("=")[0] : arg.slice(0, 2);
+    if (values.includes(name)) {
+      const inline = long ? arg.includes("=") : arg.length > 2;
+      const value = inline ? arg.slice(long ? name.length + 1 : 2) : args[++i];
+      if (kind === "compose" && name === "--pull" && value !== "never") return undefined;
+      if (value === undefined || /[$*?{}\[`]/.test(value)) return undefined;
+    } else {
+      // An unknown option could consume the apparent operand.
+      const flags = OPERAND_FLAGS[kind];
+      if (long) {
+        if (!flags.includes(name) || (arg !== name && arg !== name + "=true" && arg !== name + "=false")) return undefined;
+      } else if (![...arg.slice(1)].every(c => flags.includes("-" + c))) return undefined;
+    }
+  }
+  return args[i];
+}
+
+function runImageViolation(words, releaseStep, composeFiles) {
+  // Shell keywords can precede a simple command on the same line.
+  let start = 0;
+  while (["if", "then", "elif", "else", "while", "until", "do", "!", "{"].includes(words[start]?.text)) start++;
+  const index = start + commandIndex(words.slice(start));
+  const name = posix.basename(words[index]?.text ?? "");
+  if (name !== "docker" && name !== "docker-compose") return null;
+  const args = words.slice(index + 1).map(w => w.variable && !w.text.includes("$") ? "$computed" : w.text);
+  const globals = name === "docker-compose" ? { rest: ["compose", ...args] } : options(args, DOCKER_GLOBALS, "docker");
+  if (globals.refused) return globals.refused;
+  let [sub, ...rest] = globals.rest;
+  if ((sub === "image" && rest[0] === "pull") || (sub === "container" && ["run", "create"].includes(rest[0]))) {
+    [sub, ...rest] = rest;
+  }
+  if (sub === "compose") {
+    const compose = options(rest, COMPOSE_GLOBALS, "compose");
+    if (compose.refused) return compose.refused;
+    if (compose.rest[0] !== "run") return null;
+    const unchecked = compose.files.find(file => !composeFiles.has(posix.normalize(file)));
+    if (unchecked !== undefined) return "docker compose run needs a checked Compose file";
+    const service = runOperand(compose.rest.slice(1), "compose");
+    return service && /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(service) ? null : "docker compose run needs a literal service name";
+  }
+  if (!["run", "pull", "create"].includes(sub)) return null;
+  const operand = runOperand(rest, sub);
+  if (operand && (isPinnedImage(operand) || RELEASE_OPERANDS.get(releaseStep + ":" + sub) === operand)) return null;
+  return `docker ${sub} needs an identifiable image pinned by digest`;
+}
+
 // Every step of every workflow and local action: the build-step and Buildx rules everywhere;
 // for jobs that are not pinned, also the run-step, env and shell checks.
 export function imageBuildViolations(file, data, { composeFiles = checkedComposeFiles(), pinned = pinnedJobKeys() } = {}) {
@@ -850,6 +933,14 @@ export function imageBuildViolations(file, data, { composeFiles = checkedCompose
   for (const [where, step, job] of buildStepsOf(file, data)) {
     const isPinned = pinned.has(where);
     out.push(...envMappingViolations(where, step.env));
+    if (typeof step.run === "string") {
+      const releaseJob = /^\.github\/workflows\/image\.yml: job '(probe-prepare|verify)'$/.exec(where);
+      const releaseStep = releaseJob && isPinned ? releaseJob[1] + ":" + step.name : null;
+      for (const words of shellCommands(step.run)) {
+        const reason = runImageViolation(words, releaseStep, composeFiles);
+        if (reason) out.push(`${where}: ${reason}`);
+      }
+    }
     if (!isPinned) {
       out.push(...shellViolation(where, step.shell));
       if (typeof step.run === "string") out.push(...runBuildViolations(where, step.run, composeFiles), ...dockerEnvViolations(where, step.run));
