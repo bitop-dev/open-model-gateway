@@ -918,6 +918,12 @@ async fn check_backoff_retry(
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }).await.expect("first routed attempt has failed and released capacity");
+    let ledger_count = || {
+        sqlx::query_scalar::<_,i64>("SELECT count(*) FROM monetary_ledger l JOIN inference_executions e ON e.id=l.execution_id WHERE e.batch_job_id=$1")
+        .bind(job.id).fetch_one(pool)
+    };
+    let first_entries = ledger_count().await.unwrap();
+    assert!(first_entries > 0);
     if cancel {
         client
             .post(format!(
@@ -967,12 +973,28 @@ async fn check_backoff_retry(
         (done.output_file_id, done.error_file_id)
     };
     assert!(other.is_none());
-    let records = w.read(job.workspace_id, file).await;
+    let file = public_id(file.unwrap());
+    let content = client
+        .get(format!("{base}/v1/files/{file}/content"))
+        .header("authorization", auth)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let records: Vec<Value> = content
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
     assert_eq!(records.len(), 1);
     let response = &records[0]["response"];
     assert_eq!(records[0]["custom_id"], "0");
     assert_eq!(response["request_id"], execution.to_string());
     if cancel {
+        assert_eq!(ledger_count().await.unwrap(), first_entries);
         assert_eq!(response["body"]["error"]["code"], "upstream_unavailable");
     } else {
         assert_eq!(

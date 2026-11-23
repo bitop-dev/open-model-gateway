@@ -386,38 +386,29 @@ impl LineRun {
     /// Claim an explicit retry: on its route, within the route's concurrency
     /// (waiting for room; a stop leaves the failure standing).
     async fn claim_retry(&self, n: i32, attempts: i16, execution: Uuid, pin: Option<Pin>) -> bool {
-        let Some(pin) = pin else {
-            let claimed = self
-                .state
-                .fence
-                .retry_line(&self.store, n, attempts, execution)
-                .await;
-            return matches!(self.state.written(claimed), Ok(Some(true)));
-        };
-        loop {
+        use crate::jobs::schedule::claims::RetryClaim;
+
+        let route = pin.map(|pin| (pin.deployment, pin.max_concurrency));
+        while !self.state.should_stop(&self.job) {
             match self
                 .scheduler
-                .claim_retry(
-                    &self.state.fence,
-                    n,
-                    attempts,
-                    execution,
-                    pin.deployment,
-                    pin.max_concurrency,
-                )
+                .claim_retry(&self.state.fence, n, attempts, execution, route)
                 .await
             {
-                Ok(Some(claimed)) => return claimed,
-                Ok(None) if !self.state.should_stop(&self.job) => {
-                    tokio::time::sleep(POLL).await;
+                Ok(RetryClaim::Started) => return true,
+                Ok(RetryClaim::Full) => tokio::time::sleep(POLL).await,
+                Ok(RetryClaim::Cancelled) => {
+                    self.state.cancel.store(true, Ordering::SeqCst);
+                    return false;
                 }
                 Err(FenceError::Stale) => {
                     self.state.lose();
                     return false;
                 }
-                _ => return false,
+                Ok(RetryClaim::LineChanged) | Err(_) => return false,
             }
         }
+        false
     }
 
     /// Execute one attempt pinned to its route, with the route's priority

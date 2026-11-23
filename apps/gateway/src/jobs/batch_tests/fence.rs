@@ -2,6 +2,7 @@
 //! batch over, the runner that lost it writes nothing more to it.
 use super::*;
 use crate::jobs::fence::{FenceError, Renewed, SegmentLines};
+use crate::jobs::schedule::{Scheduler, claims::RetryClaim};
 
 /// `world` with one batch of `lines` (chat completions, one line each).
 async fn batch(pool: PgPool, lines: &[(&str, &str)]) -> (World, JobRow) {
@@ -342,7 +343,11 @@ async fn a_stale_claim_writes_nothing_and_a_current_one_everything(pool: PgPool)
     assert!(stale(
         old.claim_line(s, job.workspace_id, 1, Uuid::new_v4()).await
     ));
-    assert!(stale(old.retry_line(s, 0, 1, Uuid::new_v4()).await));
+    assert!(stale(
+        Scheduler::new(s.clone(), None)
+            .claim_retry(&old, 0, 1, Uuid::new_v4(), None)
+            .await
+    ));
     assert!(stale(
         old.fail_line(s, 0, Uuid::nil(), Some(500), Some("failed"), true)
             .await
@@ -402,7 +407,13 @@ async fn a_stale_claim_writes_nothing_and_a_current_one_everything(pool: PgPool)
             .await
             .unwrap()
     );
-    assert!(new.retry_line(s, 1, 1, execution).await.unwrap());
+    assert_eq!(
+        Scheduler::new(s.clone(), None)
+            .claim_retry(&new, 1, 1, execution, None)
+            .await
+            .unwrap(),
+        RetryClaim::Started
+    );
     let second = Uuid::new_v4();
     assert!(
         new.claim_line(s, job.workspace_id, 2, second)
@@ -1175,7 +1186,7 @@ async fn scheduler_and_job_row_writes_follow_the_claim(pool: PgPool) {
     ));
     assert!(stale(
         scheduler
-            .claim_retry(&old, 0, 1, Uuid::new_v4(), route, 2)
+            .claim_retry(&old, 0, 1, Uuid::new_v4(), Some((route, 2)))
             .await
     ));
     assert!(stale(
@@ -1225,10 +1236,10 @@ async fn scheduler_and_job_row_writes_follow_the_claim(pool: PgPool) {
     );
     assert_eq!(
         scheduler
-            .claim_retry(&new, 0, 1, Uuid::new_v4(), route, 2)
+            .claim_retry(&new, 0, 1, Uuid::new_v4(), Some((route, 2)))
             .await
             .unwrap(),
-        Some(false),
+        RetryClaim::LineChanged,
         "a running line is not a failed one: nothing to retry"
     );
     new.mark_running(s).await.unwrap();
@@ -1613,5 +1624,11 @@ async fn backoff_retry_legacy_refuses_persisted_cancel(pool: PgPool) {
     crate::jobs::store::mark_cancel_requested(store, job.id)
         .await
         .unwrap();
-    assert!(!fence.retry_line(store, 0, 1, Uuid::new_v4()).await.unwrap());
+    assert_eq!(
+        Scheduler::new(store.clone(), None)
+            .claim_retry(&fence, 0, 1, Uuid::new_v4(), None)
+            .await
+            .unwrap(),
+        RetryClaim::Cancelled
+    );
 }
