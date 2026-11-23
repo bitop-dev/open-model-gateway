@@ -414,3 +414,108 @@ async fn an_sts_response_date_never_moves_the_signing_time() {
         );
     }
 }
+
+use auth::attempt_fixture::{Failure, Fixture, ResponseStatus, attempt_cases};
+
+fn fixture_identity() -> SharedCredentialsProvider {
+    SharedCredentialsProvider::new(Credentials::new(
+        "AKIDLOCALTEST",
+        "loopback",
+        None,
+        None,
+        "fixture",
+    ))
+}
+
+async fn bedrock_attempt(failure: Failure, stream: bool) {
+    let prefix = if stream {
+        "POST /model/test-model/converse-stream "
+    } else {
+        "POST /model/test-model/converse "
+    };
+    let fixture = Fixture::new(failure, prefix).await;
+    let mut adapter = BedrockAdapter::new().unwrap();
+    let plan = Plan {
+        region: "us-east-1".into(),
+        auth: AwsAuth::Default,
+        endpoint: Some(fixture.endpoint.clone()),
+    };
+    let status = ResponseStatus::default();
+    adapter.test_client = Some(Client::from_conf(
+        adapter
+            .service_config(&plan, fixture_identity())
+            .to_builder()
+            .interceptor(status.clone())
+            .build(),
+    ));
+    let mut input = request();
+    input.stream = stream;
+    assert!(
+        failure
+            .check_header_deadline(adapter.execute(&target(), input))
+            .await
+            .is_err()
+    );
+    assert_eq!(status.observed(), failure.expected_status());
+    fixture.assert_one(failure);
+}
+
+attempt_cases!(aws_attempt_matrix_converse, bedrock_attempt, 61, false);
+attempt_cases!(
+    aws_attempt_matrix_converse_stream,
+    bedrock_attempt,
+    61,
+    true
+);
+
+async fn sts_attempt(failure: Failure, short_attempt: bool) {
+    let fixture = Fixture::new(failure, "POST / ").await;
+    let config = auth::sts_config_for_tests("us-east-1", fixture_identity());
+    let mut builder = config.to_builder().endpoint_url(&fixture.endpoint);
+    if short_attempt {
+        // Allow an attempt to expire while the production 30 s operation budget is still open.
+        let timeouts = config
+            .timeout_config()
+            .unwrap()
+            .to_builder()
+            .operation_attempt_timeout(Duration::from_secs(1))
+            .build();
+        builder = builder.timeout_config(timeouts);
+    }
+    let provider = auth::assume_role_provider(ROLE, None, None, &builder.build()).await;
+    let error = anyhow::Error::new(provider.provide_credentials().await.unwrap_err());
+    type AssumeRoleError =
+        aws_sdk_sts::error::SdkError<aws_sdk_sts::operation::assume_role::AssumeRoleError>;
+    let sdk_error = error
+        .chain()
+        .find_map(|source| source.downcast_ref::<AssumeRoleError>())
+        .expect("AssumeRole SDK error");
+    assert_eq!(
+        sdk_error
+            .raw_response()
+            .map(|response| response.status().as_u16()),
+        failure.expected_status()
+    );
+    if matches!(failure, Failure::Timeout(_)) {
+        // Smithy exposes the two timeout kinds through their error sources.
+        let kind = if short_attempt {
+            "operation attempt timeout"
+        } else {
+            "operation timeout"
+        };
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().starts_with(kind)),
+            "expected {kind}"
+        );
+    }
+    fixture.assert_one(failure);
+}
+
+attempt_cases!(aws_attempt_matrix_sts, sts_attempt, 31, false);
+
+#[tokio::test]
+async fn aws_attempt_matrix_sts_short_attempt_deadline_control() {
+    sts_attempt(Failure::Timeout(Duration::from_secs(2)), true).await;
+}
