@@ -53,6 +53,19 @@ test("the shell reader splits commands and removes quotes", () => {
   assert.deepEqual(words("a \\\n  b"), ["a b"]);
 });
 
+test("shell continuations depend on quoting and comment boundaries", () => {
+  const words = script => shellCommands(script).map(command => command.map(word => word.text));
+  const continued = "\\" + "\n";
+  assert.deepEqual(words("echo first # note " + continued + "echo second"),
+    [["echo", "first"], ["echo", "second"]]);
+  assert.deepEqual(words("echo 'a" + continued + "b'"),
+    [["echo", "a" + continued + "b"]]);
+  assert.deepEqual(words('echo "a' + continued + 'b"'), [["echo", "ab"]]);
+  assert.deepEqual(words("echo a" + continued + "b"), [["echo", "ab"]]);
+  assert.deepEqual(words("echo $" + continued + "(echo value)"), [["echo", "value"], ["echo", ""]]);
+  assert.deepEqual(words("echo ok >" + continued + "> log"), [["echo", "ok"]]);
+});
+
 // ---- the run-command parser (#488) ----
 
 const CHECKED = new Set(["compose.yaml", "deploy/staging/compose.yaml", "deploy/staging/compose.openai.yaml"]);
