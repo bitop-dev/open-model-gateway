@@ -3507,6 +3507,33 @@ fn supplied_boundary_limits_total_regex_derivation_work() {
 }
 
 #[test]
+fn supplied_patterns_share_the_variant_budget_at_one_location() {
+    let count = 80;
+    let first = format!("^{}$", "a{0,1}".repeat(count));
+    let second = format!("^{}$", "[a]{0,1}".repeat(count));
+    // Each pattern fits separately. Widening all ranges in both exceeds 64 KiB.
+    assert!(count * first.len() < 65536 && count * second.len() < 65536);
+    let doc = body_only(json!({"type":"string","allOf":[{"pattern":first},{"pattern":second}]}));
+    let result = super::http_vectors::body_plan(
+        &doc,
+        &doc["paths"][TEMPLATE]["post"],
+        &json!("a"),
+        &[],
+        &[
+            ("(root)".into(), json!("a".repeat(count))),
+            ("(root)".into(), json!("a".repeat(count + 1))),
+        ],
+    );
+    let error = result
+        .err()
+        .expect("the attempted variants share one byte budget");
+    assert!(
+        error.to_string().contains("regex derivation budget"),
+        "{error}"
+    );
+}
+
+#[test]
 fn intermediate_width_generated_bounds_ignore_too_short_ascii_alternatives() {
     let document = body_only(
         json!({"type":"string","pattern":"^(a|é{2,8})$","maxLength":6,"x-omg-max-bytes":8}),
@@ -3881,6 +3908,8 @@ fn check_empty_pattern_candidates(plan: impl Fn(Value) -> anyhow::Result<()>) {
             "{error}"
         );
 
+        assert!(error.to_string().contains("is stale"), "{error}");
+
         let mut annotated_owner = schema.clone();
         annotated_owner["anyOf"][0]["x-omg-pattern-boundaries"] = reason;
         plan(annotated_owner).expect("the exemption belongs to the finite pattern");
@@ -3926,6 +3955,174 @@ fn empty_pattern_candidates_require_owned_bounds_for_query() {
         )
         .map(|_| ())
     });
+}
+
+fn check_supplied_pattern_ownership(plan: impl Fn(Value, &[&str]) -> anyhow::Result<()>) {
+    let a = "^(a+|b+)$";
+    let b = "^(a|[ab]{1,4})$";
+    let schema = json!({"type":"string","allOf":[{"pattern":a},{"pattern":b}]});
+    let b_pair = ["bbbb", "bbbbb"];
+    let a_pair = ["aaa", "aba"];
+    let document = body_only(schema.clone());
+    let accepts = |rule: &Value, text: &str| {
+        super::http_vectors::accepts(&document, rule, &json!(text)).unwrap()
+    };
+    for text in b_pair {
+        assert!(accepts(&schema["allOf"][0], text));
+    }
+    assert!(accepts(&schema, b_pair[0]));
+    assert!(!accepts(&schema, b_pair[1]));
+    let mut widened = schema.clone();
+    widened["allOf"][1]["pattern"] = json!("^(a|[ab]{1,5})$");
+    assert!(accepts(&widened, b_pair[1]));
+    for text in a_pair {
+        assert!(accepts(&schema["allOf"][1], text));
+    }
+
+    let mut exempt_a = schema.clone();
+    exempt_a["allOf"][0]["x-omg-pattern-boundaries"] =
+        json!("Separate shape coverage for uniform runs.");
+    let missing = plan(exempt_a.clone(), &[]).unwrap_err().to_string();
+    assert!(
+        missing.contains("supply boundary candidates") && !missing.contains("is stale"),
+        "{missing}"
+    );
+    plan(exempt_a.clone(), &b_pair).expect("B's width witness leaves A's exemption necessary");
+    let wrong = plan(exempt_a.clone(), &a_pair).unwrap_err().to_string();
+    assert!(
+        wrong.contains("supply boundary candidates") && wrong.contains("is stale"),
+        "{wrong}"
+    );
+    exempt_a["allOf"][1]["x-omg-pattern-boundaries"] = json!("Separate length coverage.");
+    let stale = plan(exempt_a, &b_pair).unwrap_err().to_string();
+    assert!(
+        stale.contains("is stale") && !stale.contains("supply boundary candidates"),
+        "{stale}"
+    );
+    plan(schema, &[a_pair[0], a_pair[1], b_pair[0], b_pair[1]])
+        .expect("both independent witnesses cover both patterns");
+}
+
+// One reference independently refuses five b's. Widening the other reference's
+// pattern can admit that value, even though both resolve to the same component.
+fn check_referenced_pattern_ownership(plan: impl Fn(Value, &[&str]) -> anyhow::Result<()>) {
+    let usage = json!({"$ref":"#/components/schemas/Width"});
+    let mut schema = json!({"type":"string","anyOf":[usage,usage]});
+    schema["anyOf"][1]["not"] = json!({"const":"bbbbb"});
+    let missing = plan(schema.clone(), &["bbbb", "bbbbb"])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        missing.contains("supply boundary candidates") && !missing.contains("is stale"),
+        "{missing}"
+    );
+    let reason = json!("The guarded use has separate fixture coverage.");
+    schema["anyOf"][1]["x-omg-pattern-boundaries"] = reason.clone();
+    plan(schema.clone(), &["bbbb", "bbbbb"])
+        .expect("the reference without the guard owns the supplied witness");
+    schema["anyOf"][1]
+        .as_object_mut()
+        .unwrap()
+        .remove("x-omg-pattern-boundaries");
+    schema["anyOf"][0]["x-omg-pattern-boundaries"] = reason;
+    let error = plan(schema, &["bbbb", "bbbbb"]).unwrap_err().to_string();
+    assert!(
+        error.contains("is stale") && error.contains("supply boundary candidates"),
+        "{error}"
+    );
+}
+
+#[test]
+fn supplied_pattern_ownership_for_body() {
+    let plan = |schema, values: &[&str]| {
+        let mut document = body_only(schema);
+        document["components"]["schemas"]["Width"] = json!({"pattern":"^(a|b{1,4})$"});
+        let candidates = values
+            .iter()
+            .map(|s| ("(root)".into(), json!(s)))
+            .collect::<Vec<_>>();
+        super::http_vectors::body_plan(
+            &document,
+            &document["paths"][TEMPLATE]["post"],
+            &json!("a"),
+            &[],
+            &candidates,
+        )
+        .map(|_| ())
+    };
+    check_supplied_pattern_ownership(plan);
+    check_referenced_pattern_ownership(plan);
+}
+
+#[test]
+fn supplied_pattern_ownership_across_valid_body_contexts() {
+    let document = body_only(json!({"type":"object","required":["mode","s"],
+        "properties":{"mode":{"enum":["limited","free"]},"s":{"type":"string","pattern":"^(a+|b+)$"}},
+        "if":{"properties":{"mode":{"const":"limited"}}},
+        "then":{"properties":{"s":{"pattern":"^(a{1,4}|b{1,4})$"}}}
+    }));
+    let plan = |seeds: &[(String, Value)]| {
+        super::http_vectors::body_plan(
+            &document,
+            &document["paths"][TEMPLATE]["post"],
+            &json!({"mode":"limited","s":"a"}),
+            seeds,
+            &["aaaa", "aaaaa", "aaa", "aba"].map(|s| ("/s".into(), json!(s))),
+        )
+    };
+    assert!(
+        plan(&[])
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("supply boundary candidates")
+    );
+    let free = json!({"mode":"free","s":"a"});
+    let cases = plan(&[("".into(), free.clone())]).unwrap().cases;
+    assert!(cases.iter().any(|case| case.body == free && case.accept));
+    for (mode, value, accept) in [
+        ("limited", "aaaa", true),
+        ("limited", "aaaaa", false),
+        ("free", "aaa", true),
+        ("free", "aba", false),
+    ] {
+        assert!(
+            cases
+                .iter()
+                .any(|case| case.body == json!({"mode":mode,"s":value}) && case.accept == accept)
+        );
+    }
+    let error = plan(&[("".into(), json!({"mode":"free","s":"aba"}))])
+        .err()
+        .unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("alternate request body must satisfy its schema")
+    );
+}
+
+#[test]
+fn supplied_pattern_ownership_for_query() {
+    let plan = |schema, values: &[&str]| {
+        let mut document = query_document();
+        document["components"]["schemas"]["Width"] = json!({"pattern":"^(a|b{1,4})$"});
+        document["paths"][TEMPLATE]["get"]["parameters"] = json!([parameter("s", true, schema)]);
+        let candidates = values
+            .iter()
+            .map(|s| ("s".into(), (*s).into()))
+            .collect::<Vec<_>>();
+        super::http_vectors::query_plan(
+            &document,
+            &document["paths"][TEMPLATE]["get"],
+            &[("s".into(), "a".into())],
+            &[],
+            &candidates,
+        )
+        .map(|_| ())
+    };
+    check_supplied_pattern_ownership(plan);
+    check_referenced_pattern_ownership(plan);
 }
 
 #[test]

@@ -415,6 +415,8 @@ pub(super) struct Notes {
     /// Locations whose vectors cannot be trusted (unbounded patterns without
     /// candidates, one-sided candidates).
     pub(super) problems: Vec<String>,
+    /// Supplied evidence across valid bases of this plan, by instance and declaring use.
+    pattern_witnesses: std::collections::BTreeMap<(String, Vec<SchemaStep>), bool>,
 }
 impl Notes {
     /// `dropped` candidates of one location; `sent` are the ones that WERE sent.
@@ -440,7 +442,16 @@ impl Notes {
         }
     }
     pub(super) fn check(&self) -> Result<()> {
-        ensure!(self.problems.is_empty(), "{}", self.problems.join("; "));
+        let mut problems = self.problems.clone();
+        let missing: BTreeSet<_> = self
+            .pattern_witnesses
+            .iter()
+            .filter_map(|((location, _), covered)| (!covered).then_some(location))
+            .collect();
+        for location in missing {
+            problems.push(format!("{location}: {MISSING_PATTERN}; {STRADDLE}"));
+        }
+        ensure!(problems.is_empty(), "{}", problems.join("; "));
         ensure!(
             self.unsent.is_empty(),
             "decisive boundary vectors could not be sent ({}): annotate the query parameter or direct body property with {UNSENDABLE} and a reviewed reason, or tighten the bound",
@@ -1047,39 +1058,131 @@ fn string_bounds(
     Ok(())
 }
 
+const MISSING_PATTERN: &str = "the pattern has no derivable length bounds; supply boundary candidates or annotate it with x-omg-pattern-boundaries";
 const STRADDLE: &str = "supplied candidates must straddle the boundary: include a value the schema accepts and one it refuses that differs from it by one edit at the applicable edge (one character or one whole repeated unit)";
 
 #[path = "supplied_boundaries.rs"]
 mod supplied_boundaries;
 
-use supplied_boundaries::{ByteDominance, pattern_width, wider_patterns};
+use supplied_boundaries::{
+    ByteDominance, Edge, PatternSource, SchemaStep, pattern_width, wider_patterns,
+};
+
+struct PatternBoundary<'a> {
+    expression: &'a str,
+    maximum: Option<u64>,
+    wider: Vec<(String, usize)>,
+}
+
+/// Derive each expression once. All owners at this location share the work limit.
+fn pattern_boundaries<'a>(
+    expressions: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<PatternBoundary<'a>>> {
+    let mut remaining = 64 * 1024;
+    expressions
+        .into_iter()
+        .map(|expression| {
+            let width = pattern_width(expression);
+            let wider = match &width {
+                Some(w) => wider_patterns(expression, w.chars, &mut remaining)?,
+                None => Vec::new(),
+            };
+            Ok(PatternBoundary {
+                expression,
+                maximum: width.map(|w| w.chars as u64),
+                wider,
+            })
+        })
+        .collect()
+}
+
+/// A supplied pair settles only the pattern whose one-keyword relaxation
+/// admits the refused request. Bounds that already cover the whole location
+/// retain their ordinary shared boundary check.
+fn settle_patterns(
+    source: &PatternSource,
+    schemas: &ApplicableSchemas,
+    rules: &ByteDominance,
+    location: &str,
+    verdicts: Option<&[(String, bool)]>,
+    notes: &mut Notes,
+    mut confirms: impl FnMut(Edge<'_>, &str, &str) -> Result<bool>,
+) -> Result<()> {
+    let is_string = types(&schemas.nodes).contains("string");
+    let needs_witness = is_string && rules.needs_pattern_witness;
+    let mut stale = is_string
+        && (schemas.annotated_simple_pattern
+            || (schemas.annotated_complex_pattern && !needs_witness));
+    let mut witnessed = false;
+    if let Some(verdicts) = verdicts {
+        let mut check =
+            |patterns: &[PatternBoundary], site: Option<&[SchemaStep]>, notes: &mut Notes| {
+                straddles(
+                    &schemas.nodes,
+                    patterns,
+                    rules,
+                    verdicts,
+                    notes,
+                    |keyword, bound, replacement, accepted, refused| {
+                        confirms(
+                            Edge {
+                                keyword,
+                                bound,
+                                replacement,
+                                site,
+                            },
+                            accepted,
+                            refused,
+                        )
+                    },
+                )
+            };
+        if needs_witness {
+            let uses = source.uses()?;
+            for boundary in pattern_boundaries(uses.keys().copied())? {
+                let complex = simple_bounds(boundary.expression).is_none();
+                for owner in &uses[boundary.expression] {
+                    let covered = check(std::slice::from_ref(&boundary), Some(&owner.site), notes)?;
+                    witnessed |= covered;
+                    if complex && !owner.annotated {
+                        *notes
+                            .pattern_witnesses
+                            .entry((location.to_owned(), owner.site.clone()))
+                            .or_default() |= covered;
+                    }
+                    stale |= owner.annotated && covered;
+                }
+            }
+        } else {
+            let boundaries = pattern_boundaries(strings(&schemas.nodes, "pattern"))?;
+            witnessed = check(&boundaries, None, notes)?;
+        }
+    }
+    if verdicts.is_none() && needs_witness && schemas.unannotated_complex_pattern {
+        notes
+            .problems
+            .push(format!("{location}: {MISSING_PATTERN}"));
+    }
+    if stale {
+        notes.problems.push(format!("{location}: {PATTERN_BOUNDARIES} is stale: the pattern, a length cap or its supplied candidates already cover its boundaries; delete it"));
+    }
+    if verdicts.is_some() && !witnessed {
+        notes.problems.push(format!("{location}: {STRADDLE}"));
+    }
+    Ok(())
+}
 
 /// An adjacent accepted/refused pair at the effective limit. Byte caps and
 /// JSON Schema character limits use different units for the same candidate.
 fn straddles(
     nodes: &[&Value],
+    patterns: &[PatternBoundary],
     rules: &ByteDominance,
     verdicts: &[(String, bool)],
     notes: &mut Notes,
     mut confirms: impl FnMut(&str, &Value, Option<&Value>, &str, &str) -> Result<bool>,
 ) -> Result<bool> {
-    let mut remaining_variant_bytes = 64 * 1024;
-    let patterns: Vec<_> = strings(nodes, "pattern")
-        .into_iter()
-        .map(|p| {
-            let width = pattern_width(p);
-            let wider = width
-                .as_ref()
-                .map(|w| wider_patterns(p, w.chars, &mut remaining_variant_bytes))
-                .transpose()?
-                .unwrap_or_default();
-            Ok((p, width, wider))
-        })
-        .collect::<Result<_>>()?;
-    let maximum = patterns
-        .iter()
-        .filter_map(|(_, w, _)| w.as_ref().map(|w| w.chars as u64))
-        .min();
+    let maximum = patterns.iter().filter_map(|p| p.maximum).min();
     let char_cap = distinct_u64(nodes, "maxLength").first().copied();
     let byte_cap = distinct_u64(nodes, MAX_BYTES).first().copied();
     let edge = maximum.map(|width| rules.max_chars.unwrap_or(width).min(width));
@@ -1156,7 +1259,7 @@ fn straddles(
             }
             // A supplied value can also witness an explicit cap beside an
             // unbounded pattern (for example a printable name with maxLength).
-            if maximum.is_none() {
+            if maximum.is_none() && !rules.needs_pattern_witness {
                 for (key, limit, at, over) in [
                     (
                         "maxLength",
@@ -1178,8 +1281,10 @@ fn straddles(
                     }
                 }
             }
-            for (pattern, width, wider) in &patterns {
-                if maximum.is_some_and(|max| width.as_ref().is_none_or(|w| w.chars as u64 != max))
+            for boundary in patterns {
+                let pattern = boundary.expression;
+                let wider = &boundary.wider;
+                if maximum.is_some() && boundary.maximum != maximum
                     || !super::validation::pattern_validator(pattern)?.is_valid(&json!(accepted))
                     || super::validation::pattern_validator(pattern)?.is_valid(&json!(refused))
                 {
@@ -1187,7 +1292,7 @@ fn straddles(
                 }
                 if wider.is_empty() {
                     if adjacent && confirms("pattern", &json!(pattern), None, accepted, refused)? {
-                        notes.shape_only_patterns += usize::from(width.is_some());
+                        notes.shape_only_patterns += usize::from(boundary.maximum.is_some());
                         return Ok(true);
                     }
                 } else {
@@ -1222,11 +1327,6 @@ struct Mutations {
     labelled: Vec<(String, &'static str, Value)>,
     /// Labels (or kinds) the harness could not send or build meaningfully.
     dropped: Vec<String>,
-    /// The location has a pattern with no derivable length bounds, no reviewed
-    /// [`PATTERN_BOUNDARIES`] and no supplied candidates.
-    needs_candidates: bool,
-    /// [`PATTERN_BOUNDARIES`] is present but nothing needs it any more.
-    stale_pattern_boundaries: bool,
 }
 
 /// Every `const` value and `enum` member a schema declares, including those of
@@ -1274,8 +1374,6 @@ fn scalar_mutations(
     let mut out: Vec<(&'static str, Value)> = Vec::new();
     let mut evidence = Evidence::default();
     let mut dropped: Vec<String> = Vec::new();
-    let mut needs_candidates = false;
-    let mut stale_pattern_boundaries = false;
     let kinds = types(nodes);
     if !query {
         for wrong in [
@@ -1467,10 +1565,6 @@ fn scalar_mutations(
         string_bounds(document, oracle, nodes, seed, &mut out, &mut evidence)?;
         dropped.append(&mut evidence.dropped);
         let patterns = strings(nodes, "pattern");
-        needs_candidates =
-            oracle.rules.needs_pattern_witness && schemas.unannotated_complex_pattern;
-        stale_pattern_boundaries = schemas.annotated_simple_pattern
-            || (schemas.annotated_complex_pattern && !oracle.rules.needs_pattern_witness);
         for pattern in patterns {
             let (shapes, lengths) = pattern_candidates(pattern, seed, &mut dropped);
             for (length, candidate) in lengths {
@@ -1522,8 +1616,6 @@ fn scalar_mutations(
         vectors: out,
         labelled: evidence.labelled,
         dropped,
-        needs_candidates,
-        stale_pattern_boundaries,
     })
 }
 
@@ -1728,64 +1820,49 @@ pub(super) fn query_plan(
             ..BoundaryOracle::leaf(schema)
         };
         let mut mutations = scalar_mutations(document, schema, &oracle, &schemas, &typed, true)?;
-        if mutations.needs_candidates {
-            notes.problems.push(format!(
-                "query parameter {name}: the pattern has no derivable length bounds; supply boundary candidates or annotate it with {PATTERN_BOUNDARIES}"
-            ));
-        }
-        if mutations.stale_pattern_boundaries {
-            notes.problems.push(format!(
-                "query parameter {name}: {PATTERN_BOUNDARIES} is stale: the pattern, a maxLength or the supplied candidates already cover its boundaries; delete it"
-            ));
-        }
-        if !supplied.is_empty() {
-            let verdicts = supplied
-                .iter()
-                .map(|v| {
-                    Ok((
-                        v.to_string(),
-                        accepts(document, schema, &wire_value(schema, v)?)?,
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            if !straddles(
-                nodes,
-                &oracle.rules,
-                &verdicts,
-                &mut notes,
-                |key, bound, replacement, accepted, refused| {
-                    let accepted = wire_value(schema, accepted)?;
-                    if !accepted.is_string() {
-                        return Ok(false);
+        let verdicts = supplied
+            .iter()
+            .map(|v| {
+                Ok((
+                    v.to_string(),
+                    accepts(document, schema, &wire_value(schema, v)?)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let source = PatternSource {
+            document,
+            schema,
+            seed: &typed,
+            path: &[],
+        };
+        settle_patterns(
+            &source,
+            &schemas,
+            &oracle.rules,
+            &format!("query parameter {name}"),
+            (!supplied.is_empty()).then_some(verdicts.as_slice()),
+            &mut notes,
+            |edge, accepted, refused| {
+                let accepted = wire_value(schema, accepted)?;
+                if !accepted.is_string() {
+                    return Ok(false);
+                }
+                if let ("pattern", Some(pattern)) = (edge.keyword, edge.bound.as_str())
+                    && !super::validation::pattern_validator(pattern)?.is_valid(&accepted)
+                {
+                    return Ok(false);
+                }
+                for variant in source.relaxations(&accepted, edge)? {
+                    if accepts(document, &variant, &wire_value(&variant, refused)?)? {
+                        return Ok(true);
                     }
-                    if let ("pattern", Some(pattern)) = (key, bound.as_str())
-                        && !super::validation::pattern_validator(pattern)?.is_valid(&accepted)
-                    {
-                        return Ok(false);
-                    }
-                    for variant in supplied_boundaries::relaxations(
-                        document,
-                        schema,
-                        &accepted,
-                        &[],
-                        (key, bound, replacement),
-                        0,
-                    )? {
-                        if accepts(document, &variant, &wire_value(&variant, refused)?)? {
-                            return Ok(true);
-                        }
-                    }
-                    Ok(false)
-                },
-            )? {
-                notes
-                    .problems
-                    .push(format!("query parameter {name}: {STRADDLE}"));
-            }
-            mutations
-                .vectors
-                .extend(supplied.iter().map(|v| ("supplied candidate", json!(v))));
-        }
+                }
+                Ok(false)
+            },
+        )?;
+        mutations
+            .vectors
+            .extend(supplied.iter().map(|v| ("supplied candidate", json!(v))));
         notes.implied += mutations.implied;
         let mut dropped = mutations.dropped;
         let mut sent: Vec<String> = Vec::new();
@@ -2266,7 +2343,10 @@ impl Walk<'_> {
         };
         self.used.insert(at);
         self.push(path, "optional added", Some(seed.clone()))?;
-        let base = set(&self.valid_body, path, Some(seed));
+        self.walk_base(set(&self.valid_body, path, Some(seed)))
+    }
+
+    fn walk_base(&mut self, base: Value) -> Result<()> {
         let key = serde_json::to_string(&base)?;
         if self.bases.insert(key.clone()) && accepts(self.document, self.root_schema, &base)? {
             let saved = std::mem::replace(&mut self.valid_body, base.clone());
@@ -2490,16 +2570,6 @@ impl Walk<'_> {
         };
         let mutations = scalar_mutations(self.document, schema, &oracle, &schemas, value, false)?;
         let rules = oracle.rules;
-        if mutations.needs_candidates {
-            self.notes.problems.push(format!(
-                "{here}: the pattern has no derivable length bounds; supply boundary candidates or annotate it with {PATTERN_BOUNDARIES}"
-            ));
-        }
-        if mutations.stale_pattern_boundaries {
-            self.notes.problems.push(format!(
-                "{here}: {PATTERN_BOUNDARIES} is stale: the pattern, a maxLength or the supplied candidates already cover its boundaries; delete it"
-            ));
-        }
         self.notes.implied += mutations.implied;
         let sent: Vec<&str> = mutations
             .vectors
@@ -2522,46 +2592,44 @@ impl Walk<'_> {
         }
         if !supplied.is_empty() {
             self.candidates_used.insert(here.clone());
-            let mut verdicts = Vec::new();
-            let patterned = nodes.iter().any(|node| node.get("pattern").is_some());
-            for candidate in &supplied {
-                let body = set(&self.valid_body, path, Some(candidate.clone()));
-                let verdict = accepts(self.document, self.root_schema, &body)?;
-                if (!patterned || candidate.is_string())
-                    && (rules.parent_choice
-                        || accepts(self.document, schema, candidate)? == verdict)
-                {
-                    verdicts.push((render(candidate), verdict));
-                }
+        }
+        let mut verdicts = Vec::new();
+        let patterned = nodes.iter().any(|node| node.get("pattern").is_some());
+        for candidate in &supplied {
+            let body = set(&self.valid_body, path, Some(candidate.clone()));
+            let verdict = accepts(self.document, self.root_schema, &body)?;
+            if (!patterned || candidate.is_string())
+                && (rules.parent_choice || accepts(self.document, schema, candidate)? == verdict)
+            {
+                verdicts.push((render(candidate), verdict));
             }
-            if !straddles(
-                nodes,
-                &rules,
-                &verdicts,
-                &mut self.notes,
-                |key, bound, replacement, accepted, refused| {
-                    let accepted = set(&self.valid_body, path, Some(json!(accepted)));
-                    let body = set(&self.valid_body, path, Some(json!(refused)));
-                    for schema in supplied_boundaries::relaxations(
-                        self.document,
-                        self.root_schema,
-                        &accepted,
-                        path,
-                        (key, bound, replacement),
-                        0,
-                    )? {
-                        if accepts(self.document, &schema, &body)? {
-                            return Ok(true);
-                        }
+        }
+        let source = PatternSource {
+            document: self.document,
+            schema: self.root_schema,
+            seed: &self.valid_body,
+            path,
+        };
+        settle_patterns(
+            &source,
+            &schemas,
+            &rules,
+            &here,
+            (!supplied.is_empty()).then_some(verdicts.as_slice()),
+            &mut self.notes,
+            |edge, accepted, refused| {
+                let accepted = set(&self.valid_body, path, Some(json!(accepted)));
+                let body = set(&self.valid_body, path, Some(json!(refused)));
+                for schema in source.relaxations(&accepted, edge)? {
+                    if accepts(self.document, &schema, &body)? {
+                        return Ok(true);
                     }
-                    Ok(false)
-                },
-            )? {
-                self.notes.problems.push(format!("{here}: {STRADDLE}"));
-            }
-            for candidate in supplied {
-                self.push(path, "supplied candidate", Some(candidate))?;
-            }
+                }
+                Ok(false)
+            },
+        )?;
+        for candidate in supplied {
+            self.push(path, "supplied candidate", Some(candidate))?;
         }
         if !path.is_empty() {
             self.push(path, "omitted", None)?;
@@ -2883,9 +2951,17 @@ pub(super) fn body_plan(
         walked: std::collections::BTreeMap::new(),
     };
     walk.walk(schema, valid_body, &mut Vec::new())?;
+    for (_, base) in seeds.iter().filter(|(at, _)| at.is_empty()) {
+        ensure!(
+            accepts(document, schema, base)?,
+            "alternate request body must satisfy its schema"
+        );
+        walk.push(&[], "alternate valid body", Some(base.clone()))?;
+        walk.walk_base(base.clone())?;
+    }
     for (at, _) in seeds {
         ensure!(
-            walk.used.contains(at),
+            at.is_empty() || walk.used.contains(at),
             "seed at {at} names no declared optional location that the valid body omits"
         );
     }
@@ -3150,7 +3226,8 @@ pub(crate) async fn body_vectors_http(
 /// value)` for declared optional properties (or the next positional item) that
 /// `valid` omits. Each seed is sent ADDED to `valid` (so `{"ids":[x]}` plus
 /// `/all: true` reaches the handler) and a schema-valid result is walked from its root.
-/// A seed that names nothing the body omits fails the run.
+/// The empty pointer supplies another complete valid base. Nonempty pointers
+/// must name an omitted location on at least one walked base.
 pub(crate) async fn body_vectors_seeded(
     fixtures: &mut PositiveFixtures,
     method: &str,

@@ -17,31 +17,108 @@ fn conjunct(node: &mut Value, schema: Value) {
         .push(schema);
 }
 
-pub(super) fn relaxations(
-    document: &Value,
-    node: &Value,
-    instance: &Value,
-    path: &[Step],
-    edge: (&str, &Value, Option<&Value>),
-    depth: usize,
-) -> Result<Vec<Value>> {
-    ensure!(depth < 48, "supplied boundary schema nesting too deep");
-    let mut out = Vec::new();
-    let (keyword, bound, replacement) = edge;
-    if path.is_empty() && node.get(keyword) == Some(bound) {
-        let mut relaxed = node.clone();
-        if let Some(value) = replacement {
-            relaxed[keyword] = value.clone();
-        } else {
-            relaxed.as_object_mut().unwrap().remove(keyword);
-        }
-        out.push(relaxed);
+// The instance path is fixed during a check. Schema keywords and their child
+// indices identify its use sites even when two arms reference the same pattern.
+pub(super) type SchemaStep = (&'static str, usize);
+
+pub(super) struct Edge<'a> {
+    pub(super) keyword: &'a str,
+    pub(super) bound: &'a Value,
+    pub(super) replacement: Option<&'a Value>,
+    pub(super) site: Option<&'a [SchemaStep]>,
+}
+
+pub(super) struct PatternUse {
+    pub(super) annotated: bool,
+    pub(super) site: Vec<SchemaStep>,
+}
+
+pub(super) struct PatternSource<'a> {
+    pub(super) document: &'a Value,
+    pub(super) schema: &'a Value,
+    pub(super) seed: &'a Value,
+    pub(super) path: &'a [Step],
+}
+
+impl<'a> PatternSource<'a> {
+    pub(super) fn uses(&self) -> Result<BTreeMap<&'a str, Vec<PatternUse>>> {
+        let mut uses = BTreeMap::new();
+        transform(
+            self.document,
+            self.schema,
+            self.seed,
+            self.path,
+            &mut Vec::new(),
+            false,
+            &mut |node, annotated, site| {
+                if let Some(pattern) = node["pattern"].as_str() {
+                    uses.entry(pattern)
+                        .or_insert_with(Vec::new)
+                        .push(PatternUse {
+                            annotated,
+                            site: site.to_vec(),
+                        });
+                }
+                None
+            },
+        )?;
+        Ok(uses)
     }
 
-    let descend =
-        |child, value, tail: &[Step]| relaxations(document, child, value, tail, edge, depth + 1);
+    pub(super) fn relaxations(&self, instance: &Value, edge: Edge<'_>) -> Result<Vec<Value>> {
+        transform(
+            self.document,
+            self.schema,
+            instance,
+            self.path,
+            &mut Vec::new(),
+            false,
+            &mut |node, _, site| {
+                if node.get(edge.keyword) != Some(edge.bound)
+                    || edge.site.is_some_and(|owner| owner != site)
+                {
+                    return None;
+                }
+                let mut relaxed = node.clone();
+                if let Some(value) = edge.replacement {
+                    relaxed[edge.keyword] = value.clone();
+                } else {
+                    relaxed.as_object_mut().unwrap().remove(edge.keyword);
+                }
+                Some(relaxed)
+            },
+        )
+    }
+}
+
+/// Visit the active use sites at the requested instance path. Rebuild a
+/// whole-schema counterfactual only for a use the visitor changes.
+fn transform<'a>(
+    document: &'a Value,
+    node: &'a Value,
+    instance: &Value,
+    path: &[Step],
+    site: &mut Vec<SchemaStep>,
+    inherited_annotation: bool,
+    visit: &mut impl FnMut(&'a Value, bool, &[SchemaStep]) -> Option<Value>,
+) -> Result<Vec<Value>> {
+    ensure!(site.len() < 48, "supplied boundary schema nesting too deep");
+    let mut out = Vec::new();
+    let annotated = inherited_annotation || node.get(super::PATTERN_BOUNDARIES).is_some();
+    if path.is_empty()
+        && let Some(relaxed) = visit(node, annotated, site)
+    {
+        out.push(relaxed);
+    }
+    let mut descend = |step, child: &'a Value, value: &Value, tail: &[Step], carry| {
+        site.push(step);
+        let result = transform(document, child, value, tail, site, carry, visit);
+        site.pop();
+        result
+    };
     if let Some((target, _)) = coverage::follow(document, node)? {
-        for variant in descend(target, instance, path)? {
+        let carry = annotated && node.get("pattern").is_none();
+        for variant in descend(("$ref", 0), target, instance, path, carry)? {
             let mut local = node.clone();
             local.as_object_mut().unwrap().remove("$ref");
             conjunct(&mut local, variant);
@@ -51,7 +128,7 @@ pub(super) fn relaxations(
     for key in ["allOf", "oneOf", "anyOf"] {
         for (i, branch) in node[key].as_array().into_iter().flatten().enumerate() {
             if key == "allOf" || accepts(document, branch, instance)? {
-                for variant in descend(branch, instance, path)? {
+                for variant in descend((key, i), branch, instance, path, false)? {
                     let mut local = node.clone();
                     local[key][i] = variant;
                     out.push(local);
@@ -66,7 +143,7 @@ pub(super) fn relaxations(
             "else"
         };
         if let Some(branch) = node.get(arm) {
-            for variant in descend(branch, instance, path)? {
+            for variant in descend((arm, 0), branch, instance, path, false)? {
                 let mut local = node.clone();
                 local[arm] = variant;
                 out.push(local);
@@ -81,19 +158,30 @@ pub(super) fn relaxations(
             let mut selected = false;
             if let Some(child) = node["properties"].get(name) {
                 selected = true;
-                for variant in descend(child, &instance[name], tail)? {
+                for variant in descend(("properties", 0), child, &instance[name], tail, false)? {
                     let mut local = node.clone();
                     local["properties"][name] = variant;
                     out.push(local);
                 }
             }
-            for (pattern, child) in node["patternProperties"].as_object().into_iter().flatten() {
+            for (i, (pattern, child)) in node["patternProperties"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
                 let matcher = super::super::validation::pattern_validator(pattern)?;
                 if !matcher.is_valid(&json!(name)) {
                     continue;
                 }
                 selected = true;
-                for variant in descend(child, &instance[name], tail)? {
+                for variant in descend(
+                    ("patternProperties", i),
+                    child,
+                    &instance[name],
+                    tail,
+                    false,
+                )? {
                     let mut local = node.clone();
                     // Specialize this map rule to the members of the actual
                     // request. Every other matching member keeps its own rule.
@@ -110,7 +198,13 @@ pub(super) fn relaxations(
                 }
             }
             if !selected && let Some(child) = node.get("additionalProperties") {
-                for variant in descend(child, &instance[name], tail)? {
+                for variant in descend(
+                    ("additionalProperties", 0),
+                    child,
+                    &instance[name],
+                    tail,
+                    false,
+                )? {
                     let mut local = node.clone();
                     local["properties"][name] = variant;
                     out.push(local);
@@ -121,7 +215,13 @@ pub(super) fn relaxations(
             let prefix = node["prefixItems"].as_array().map_or(0, Vec::len);
             let child = node["prefixItems"].get(index).or_else(|| node.get("items"));
             if let Some(child) = child {
-                for variant in descend(child, &instance[*index], tail)? {
+                for variant in descend(
+                    ("array element", *index),
+                    child,
+                    &instance[*index],
+                    tail,
+                    false,
+                )? {
                     let mut local = node.clone();
                     if *index >= prefix {
                         let entries = local
@@ -284,8 +384,7 @@ impl ByteDominance {
             let mut remaining = 4096;
             rules.collect(document, root, path, &mut remaining, 0)?;
         }
-        if !supplied
-            && rules.cap.is_none()
+        if rules.cap.is_none()
             && rules.max_chars.is_none()
             && nodes
                 .iter()
