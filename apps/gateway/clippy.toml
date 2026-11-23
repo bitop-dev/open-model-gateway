@@ -31,6 +31,21 @@
 # allowed: identifiers and fencing values only, never a secret
 # (docs/threat-model.md KEY-10).
 disallowed-methods = [
+  # Configs and per-operation overrides must select the gateway transport (#571).
+  { path = "aws_sdk_bedrockruntime::config::Builder::build", reason = "use the gateway SDK transport built on crate::egress::client_builder (#571)" },
+  { path = "aws_sdk_s3::config::Builder::build", reason = "use the gateway SDK transport built on crate::egress::client_builder (#571)" },
+  { path = "aws_sdk_bedrockruntime::Client::new", reason = "use the gateway SDK transport built on crate::egress::client_builder (#571)" },
+  { path = "aws_sdk_s3::Client::new", reason = "use the gateway SDK transport built on crate::egress::client_builder (#571)" },
+  { path = "aws_sdk_bedrockruntime::Client::from_conf", reason = "construct clients from the config with the gateway transport built on crate::egress::client_builder (#571)" },
+  { path = "aws_sdk_s3::Client::from_conf", reason = "construct clients from the config with the gateway transport built on crate::egress::client_builder (#571)" },
+  { path = "aws_sdk_bedrockruntime::Config::new", reason = "use the gateway SDK transport built on crate::egress::client_builder (#571)" },
+  { path = "aws_sdk_s3::Config::new", reason = "use the gateway SDK transport built on crate::egress::client_builder (#571)" },
+  { path = "aws_sdk_bedrockruntime::client::customize::CustomizableOperation::config_override", reason = "use the gateway SDK transport built on crate::egress::client_builder (#571)" },
+  { path = "aws_sdk_s3::client::customize::CustomizableOperation::config_override", reason = "use the gateway SDK transport built on crate::egress::client_builder (#571)" },
+  { path = "aws_types::sdk_config::Builder::build", reason = "use the gateway SDK transport built on crate::egress::client_builder (#571)" },
+  { path = "aws_config::ConfigLoader::load", reason = "use the gateway SDK transport built on crate::egress::client_builder (#571)" },
+  { path = "aws_config::load_defaults", reason = "use the gateway SDK transport built on crate::egress::client_builder (#571)" },
+  { path = "aws_config::load_from_env", reason = "use the gateway SDK transport built on crate::egress::client_builder (#571)" },
   { path = "sqlx::Pool::begin", reason = "use crate::db::begin (cancellation-safe)" },
   { path = "sqlx::Pool::begin_with", reason = "use crate::db::begin_with_setup (cancellation-safe)" },
   { path = "reqwest::Client::new", reason = "build HTTP clients with crate::egress::client_builder (#509)" },
