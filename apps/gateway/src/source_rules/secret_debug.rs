@@ -1,4 +1,4 @@
-//! Secret-like named fields must have no Debug surface until reviewed.
+//! Secret-like fields and tuple payloads must have no Debug surface until reviewed.
 use std::collections::{BTreeMap, BTreeSet};
 
 use quote::ToTokens;
@@ -121,6 +121,32 @@ struct Scan<'a> {
     inventory: &'a mut Inventory,
 }
 
+fn sensitive_name(ident: &Ident) -> bool {
+    tree::word_forms(&ident.unraw().to_string())
+        .flatten()
+        .any(|word| {
+            matches!(
+                word.strip_suffix('s').unwrap_or(&word),
+                "secret"
+                    | "token"
+                    | "password"
+                    | "credential"
+                    | "key"
+                    | "apikey"
+                    | "jwt"
+                    | "bearer"
+                    | "cookie"
+                    | "authorization"
+                    | "cred"
+                    | "session"
+                    | "plaintext"
+                    | "secretkey"
+                    | "authtoken"
+                    | "passphrase"
+            )
+        })
+}
+
 impl Scan<'_> {
     fn fields(
         &mut self,
@@ -130,30 +156,19 @@ impl Scan<'_> {
         fields: &Fields,
     ) {
         let owner = format!("{}::{}::{}", self.file, self.scope.path(), name.unraw());
-        for field in fields {
-            let Some(ident) = &field.ident else { continue };
-            let label = ident.unraw().to_string();
-            let sensitive = tree::word_forms(&label).flatten().any(|word| {
-                matches!(
-                    word.as_str(),
-                    "secret"
-                        | "secrets"
-                        | "token"
-                        | "tokens"
-                        | "password"
-                        | "passwords"
-                        | "credential"
-                        | "credentials"
-                        | "key"
-                        | "keys"
-                        | "apikey"
-                        | "apikeys"
-                )
-            });
-            // The startup importer stores the secret under a neutral name.
-            if !(sensitive || owner == "startup.rs::<file>::SecretImport" && label == "value")
-                || !tree::kept(&field.attrs)
-            {
+        let tuple_sensitive = matches!(fields, Fields::Unnamed(_))
+            && (sensitive_name(name) || variant.is_some_and(sensitive_name));
+        for (index, field) in fields.iter().enumerate() {
+            let (label, sensitive) = match &field.ident {
+                Some(ident) => (ident.unraw().to_string(), sensitive_name(ident)),
+                None => (index.to_string(), tuple_sensitive),
+            };
+            let known_secret = matches!(
+                (owner.as_str(), label.as_str()),
+                ("startup.rs::<file>::SecretImport", "value")
+                    | ("config.rs::<file>::Config", "database_url")
+            );
+            if !(sensitive || known_secret) || !tree::kept(&field.attrs) {
                 continue;
             }
             let variant = variant
@@ -345,5 +360,47 @@ fn grouped_imports_and_transparent_self_types_preserve_manual_review() {
             "lib.rs::<file>::impl Debug for (Local < T >) => lib.rs::<file>::Session::Open::token: T"
                 .into(),
         ])
+    );
+}
+
+#[test]
+fn tuple_payloads_database_url_and_credential_spellings_need_review() {
+    let source = tree::parse_fixture(
+        "config.rs",
+        r#"
+        #[derive(Debug)] struct Secret(String);
+        #[derive(Debug)] enum Auth { Bearer(String, u64), Public(String), NoToken }
+        #[derive(Debug)] enum Session { Open(String) }
+        #[derive(Debug)] struct Config { database_url: String }
+        #[derive(Debug)] struct Login {
+            jwt: String, bearer: String, cookie: String, authorization: String,
+            creds: String, session: String, plaintext: String, secretkey: String,
+            authtoken: String, passphrase: String, monkey: String,
+        }
+        "#,
+    );
+    let expected = [
+        "Secret::0: String",
+        "Auth::Bearer::0: String",
+        "Auth::Bearer::1: u64",
+        "Session::Open::0: String",
+        "Config::database_url: String",
+        "Login::jwt: String",
+        "Login::bearer: String",
+        "Login::cookie: String",
+        "Login::authorization: String",
+        "Login::creds: String",
+        "Login::session: String",
+        "Login::plaintext: String",
+        "Login::secretkey: String",
+        "Login::authtoken: String",
+        "Login::passphrase: String",
+    ];
+    assert_eq!(
+        surfaces(&[source]),
+        expected
+            .into_iter()
+            .map(|field| format!("config.rs::<file>::{field}"))
+            .collect()
     );
 }
