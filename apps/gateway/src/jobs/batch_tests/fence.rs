@@ -1274,7 +1274,11 @@ async fn scheduler_and_job_row_writes_follow_the_claim(pool: PgPool) {
         error_file: None,
         counts: None,
     };
-    let finished = new.finish_batch(s, &done).await.unwrap();
+    let crate::jobs::fence::Publication::Linked(finished) =
+        new.finish_batch(s, &done).await.unwrap()
+    else {
+        panic!("expected published results");
+    };
     assert_eq!(finished.state, "completed");
     old.mark_settled(s).await.unwrap();
     assert!(

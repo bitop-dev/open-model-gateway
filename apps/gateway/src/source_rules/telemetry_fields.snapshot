@@ -70,7 +70,7 @@ jobs/native.rs :: impl Jobs::collect_native :: metrics call :: crate :: metrics 
 jobs/native.rs :: impl Jobs::collect_native :: metrics call :: crate :: metrics :: METRICS . observe_batch_lines ("native" , & job . provider , u64 :: from (succeeded) , u64 :: from (counts . failed) ,)
 jobs/native.rs :: impl Jobs::submit_native :: metrics call :: crate :: metrics :: METRICS . observe_batch_finished ("native" , JobState :: Failed . as_str ())
 jobs/native.rs :: impl Jobs::submit_native :: metrics call :: crate :: metrics :: METRICS . observe_batch_submitted (& job . provider)
-jobs/runner.rs :: impl Runner::finalize :: metrics call :: crate :: metrics :: METRICS . observe_batch_finished ("gateway" , final_state . as_str ())
+jobs/runner.rs :: impl Runner::finalize :: metrics call :: crate :: metrics :: METRICS . observe_batch_finished ("gateway" , job . job_state () . as_str ())
 jobs/runner.rs :: impl Runner::new :: metrics call :: crate :: metrics :: METRICS . set_batch_workers (workers as u64 , 0)
 jobs/runner.rs :: impl Runner::observe_queue :: metrics call :: crate :: metrics :: METRICS . set_batch_queue (mode , n . max (0) as u64)
 jobs/runner.rs :: impl Runner::observe_queue :: metrics call :: crate :: metrics :: METRICS . set_batch_workers (capacity as u64 , capacity . saturating_sub (self . pool . available_permits ()) as u64 ,)

@@ -20,6 +20,8 @@ enum Boundary {
 #[derive(Clone, Copy)]
 enum Case {
     Fault(Boundary, Loss),
+    FinalizeCancel { cancel_first: bool },
+    CancelUnavailable,
     Group,
     NestedTakeover,
     Quota,
@@ -174,6 +176,18 @@ async fn hold_segment_metadata(
     hold
 }
 
+async fn blocked_writer(pool: &PgPool, holder: i32, statement: &str) -> i32 {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(pid) = sqlx::query_scalar("SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND $1=ANY(pg_blocking_pids(pid)) AND query LIKE $2")
+                .bind(holder).bind(statement).fetch_optional(pool).await.unwrap() {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("expected a blocked batch transaction")
+}
+
 async fn run_case(pool: PgPool, case: Case) {
     let fault = match case {
         Case::Fault(boundary, loss) => Some((boundary, loss)),
@@ -183,7 +197,7 @@ async fn run_case(pool: PgPool, case: Case) {
     let size = match case {
         Case::Fault(..) | Case::FailedCommit { .. } => 3,
         Case::Group => 32,
-        Case::NestedTakeover => 2,
+        Case::NestedTakeover | Case::FinalizeCancel { .. } | Case::CancelUnavailable => 2,
         Case::Pressure => 24,
         Case::Quota | Case::Retry { .. } => 1,
         Case::Measure(size) => size,
@@ -278,6 +292,10 @@ async fn run_case(pool: PgPool, case: Case) {
     .await
     .unwrap();
     w.jobs = loopback_jobs(store, engine, files, concurrency);
+    if matches!(case, Case::CancelUnavailable) {
+        check_cancel_unavailable(&w, &job, &client, &gateway.base, &auth, &calls).await;
+        return;
+    }
     if let Case::Retry { cancel } = case {
         check_backoff_retry(&w, &job, &client, &gateway.base, &auth, &calls, cancel).await;
         return;
@@ -292,7 +310,7 @@ async fn run_case(pool: PgPool, case: Case) {
             .execute(&mut *lock)
             .await
             .unwrap();
-    } else if fault.is_some() && !crash {
+    } else if (fault.is_some() && !crash) || matches!(case, Case::FinalizeCancel { .. }) {
         w.jobs.finalize_hold.arm();
     }
     let quota_hold = if matches!(case, Case::Quota | Case::Pressure) {
@@ -349,7 +367,54 @@ async fn run_case(pool: PgPool, case: Case) {
     let started = std::time::Instant::now();
     let mut process = crash.then(|| start_process(&w, dir.path(), &upstream));
     let old = (!crash).then(|| start(&w));
-    if let Some((_, loss)) = fault {
+    if let Case::FinalizeCancel { cancel_first } = case {
+        tokio::time::timeout(Duration::from_secs(20), w.jobs.finalize_hold.reached())
+            .await
+            .unwrap();
+        let cancel = client
+            .post(format!("{}/v1/batches/{id}/cancel", gateway.base))
+            .header("authorization", &auth);
+        if cancel_first {
+            let response = cancel.send().await.unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["status"],
+                "cancelling"
+            );
+            lock.rollback().await.unwrap();
+            w.jobs.finalize_hold.release();
+        } else {
+            // Stop the finalizer at its result-file lock, while it owns the job row.
+            sqlx::query("LOCK TABLE stored_files IN EXCLUSIVE MODE")
+                .execute(&mut *lock)
+                .await
+                .unwrap();
+            let holder = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *lock)
+                .await
+                .unwrap();
+            w.jobs.finalize_hold.release();
+            let runner = blocked_writer(&pool, holder, "SELECT id FROM stored_files%").await;
+            let request = tokio::spawn(cancel.send());
+            blocked_writer(&pool, runner, "UPDATE async_jobs SET cancel_requested_at%").await;
+            lock.rollback().await.unwrap();
+            let response = request.await.unwrap().unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["error"]["code"],
+                "batch_not_cancellable"
+            );
+        }
+        assert!(old.unwrap().await.unwrap().unwrap());
+        let done = w.reload(&job).await;
+        assert!(done.settled_at.is_some());
+        let (state, _, actual, _) = reservation(&w.f, job.execution_id).await;
+        assert_eq!((state.as_str(), actual), ("settled", Some(0)));
+        assert_eq!(done.request_total, Some(size as i32));
+        assert_eq!(done.cancel_requested_at.is_some(), cancel_first);
+        assert!(done.error_file_id.is_none());
+        assert!(!Runner::new(w.jobs.clone()).run_next().await.unwrap());
+    } else if let Some((_, loss)) = fault {
         if before {
             tokio::time::timeout(Duration::from_secs(20),async {
                 loop {
@@ -514,7 +579,14 @@ async fn run_case(pool: PgPool, case: Case) {
         .json::<Value>()
         .await
         .unwrap();
-    assert_eq!(status["status"], "completed");
+    assert_eq!(
+        status["status"],
+        if matches!(case, Case::FinalizeCancel { cancel_first: true }) {
+            "cancelled"
+        } else {
+            "completed"
+        }
+    );
     let file = status[if before {
         "error_file_id"
     } else {
@@ -578,6 +650,110 @@ async fn run_case(pool: PgPool, case: Case) {
             );
         }
     }
+}
+
+async fn check_cancel_unavailable(
+    w: &World,
+    job: &JobRow,
+    client: &reqwest::Client,
+    base: &str,
+    auth: &str,
+    calls: &AtomicUsize,
+) {
+    w.jobs.soft_loss.store(true, Ordering::SeqCst);
+    assert!(Runner::new(w.jobs.clone()).run_next().await.unwrap());
+    assert_eq!(w.reload(job).await.request_completed, Some(1));
+    super::envelope::make_unknown(w, job).await;
+    let held = reservation(&w.f, job.execution_id).await;
+    w.jobs.finalize_hold.arm();
+    let runner = start(w);
+    tokio::time::timeout(Duration::from_secs(20), w.jobs.finalize_hold.reached())
+        .await
+        .unwrap();
+    let stale_error: Uuid = sqlx::query_scalar(
+        "SELECT id FROM stored_files WHERE workspace_id=$1 AND filename=$2 AND deleted_at IS NULL",
+    )
+    .bind(job.workspace_id)
+    .bind(format!("batch_{}_error.jsonl", job.id.simple()))
+    .fetch_one(&w.f.store.pool)
+    .await
+    .unwrap();
+    let stale_records = w.read(job.workspace_id, Some(stale_error)).await;
+    assert_eq!(stale_records.len(), 1);
+    assert_eq!(stale_records[0]["error"]["code"], "batch_hold_unavailable");
+    let response = client
+        .post(format!(
+            "{base}/v1/batches/{}/cancel",
+            client_id("batch_", job.id)
+        ))
+        .header("authorization", auth)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["status"],
+        "cancelling"
+    );
+    w.jobs.finalize_hold.release();
+    assert!(runner.await.unwrap().unwrap());
+    let done = w.reload(job).await;
+    assert_eq!(done.state, "cancelled");
+    assert_eq!(done.error_code, None);
+    assert!(file_deleted(&w.f, Some(stale_error)).await);
+    assert_eq!(
+        (done.request_completed, done.request_failed),
+        (Some(1), Some(0))
+    );
+    assert!(done.settled_at.is_some());
+    // Each published JSONL file contains exactly one JSON record.
+    let record = |file: Option<Uuid>| async move {
+        let file = crate::filestore::files::public_id(file.unwrap());
+        client
+            .get(format!("{base}/v1/files/{file}/content"))
+            .header("authorization", auth)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()
+    };
+    let output = record(done.output_file_id).await;
+    assert_eq!(output["custom_id"], "0");
+    assert_eq!(
+        output["response"]["body"]["choices"][0]["message"]["content"],
+        "answer"
+    );
+    let error = record(done.error_file_id).await;
+    assert_eq!(error["custom_id"], "1");
+    assert_eq!(error["error"]["code"], "batch_cancelled");
+    assert_eq!(reservation(&w.f, job.execution_id).await, held);
+    assert!(!Runner::new(w.jobs.clone()).run_next().await.unwrap());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[dbtest::test]
+async fn finalization_cancel_after_hold_unavailable_files(pool: PgPool) {
+    run_case(pool, Case::CancelUnavailable).await;
+}
+
+#[dbtest::test]
+async fn finalization_cancel_first(pool: PgPool) {
+    run_case(pool, Case::FinalizeCancel { cancel_first: true }).await;
+}
+#[dbtest::test]
+async fn finalization_completion_first(pool: PgPool) {
+    run_case(
+        pool,
+        Case::FinalizeCancel {
+            cancel_first: false,
+        },
+    )
+    .await;
 }
 
 #[sqlx::test(migrations = "./enterprise_migrations")]

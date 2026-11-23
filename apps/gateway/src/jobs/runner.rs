@@ -46,7 +46,7 @@ use serde_json::Value;
 use tokio::sync::{Semaphore, mpsc};
 
 use super::{
-    fence::{BatchFence, FenceError, FenceResult},
+    fence::{BatchFence, FenceError, FenceResult, Publication},
     io::{LazySink, LineReader, RESULT_LINE_BYTES},
     lines::{self, NotRun},
     schedule::{Claim, Pause, Scheduler, WaitRow},
@@ -425,25 +425,16 @@ impl Runner {
         }
     }
 
-    #[cfg_attr(not(test), expect(clippy::too_many_lines, reason = "#499"))]
     async fn finalize(
         &self,
         job: &JobRow,
         files: &crate::filestore::FileStorage,
         work: Uuid,
-        stop: Option<Stop>,
+        mut stop: Option<Stop>,
         state: &RunState,
     ) -> JobResult<()> {
         let store = &self.jobs.store;
         let fence = &state.fence;
-        let final_state = match stop {
-            None => JobState::Completed,
-            Some(Stop::Cancelled) => JobState::Cancelled,
-            Some(Stop::Expired) => JobState::Expired,
-            Some(Stop::Budget | Stop::HoldUnavailable) => JobState::Failed,
-            // Never a terminal state: see `run_claimed`.
-            Some(Stop::Lost) => return Ok(()),
-        };
         match self.scheduler.clear_waits(fence).await {
             Ok(()) => {}
             Err(FenceError::Stale) => {
@@ -462,154 +453,78 @@ impl Runner {
         {
             return Ok(());
         }
-        let hex = job.id.simple();
-        let template = |suffix: &str| {
-            io::batch_file(
-                false,
-                job.workspace_id,
-                job.api_key_id,
-                job.user_id,
-                format!("batch_{hex}_{suffix}.jsonl"),
-            )
-        };
-        let mut out = LazySink::new(files, template("output"));
-        let mut err = LazySink::new(files, template("error"));
-        let merged = async {
-            let mut written: HashSet<i32> = HashSet::new();
-            let segments = store::segments(store, job.id)
-                .await
-                .map_err(|_| InferenceError::Storage)?;
-            for (_, file) in &segments {
-                let mut reader =
-                    LineReader::stored(files, *file, job.workspace_id, RESULT_LINE_BYTES)
-                        .await
-                        .map_err(|_| InferenceError::Storage)?;
-                while let Some(raw) = reader.next_request().await? {
-                    let (n, is_error, result) = segments::decode_record(&raw)?;
-                    if !written.insert(n) {
-                        continue;
-                    }
-                    if is_error {
-                        err.line(&result).await?;
-                    } else {
-                        out.line(&result).await?;
-                    }
-                }
-            }
-            // Lines without a stored result: never run, or results lost.
-            let states: std::collections::HashMap<i32, String> = store::line_states(store, job.id)
-                .await
-                .map_err(|_| InferenceError::Storage)?
-                .into_iter()
-                .map(|(n, s, _)| (n, s))
-                .collect();
-            let unrun = match stop {
-                Some(Stop::Cancelled) => NotRun::Cancelled,
-                Some(Stop::Expired) => NotRun::Expired,
-                Some(Stop::Budget) => NotRun::BudgetExceeded,
-                Some(Stop::HoldUnavailable) => NotRun::HoldUnavailable,
-                Some(Stop::Lost) | None => NotRun::Failed,
-            };
-            let mut reader = LineReader::stored(files, work, job.workspace_id, WORK_LINE_BYTES)
-                .await
-                .map_err(|_| InferenceError::Storage)?;
-            let mut n: i32 = -1;
-            while let Some(raw) = reader.next_request().await? {
-                n += 1;
-                if written.contains(&n) {
-                    continue;
-                }
-                let custom_id = lines::custom_id(&raw).ok_or(InferenceError::Storage)?;
-                let reason = if states.contains_key(&n) {
-                    NotRun::ResultUnavailable
-                } else {
-                    unrun
-                };
-                err.line(&lines::not_run_line(&custom_id, reason)).await?;
-            }
-            Ok::<_, InferenceError>(segments)
-        }
-        .await;
-        let segments = match merged {
-            Ok(s) => s,
-            Err(e) => {
-                out.abort().await;
-                err.abort().await;
-                return Err(e.into());
-            }
-        };
-        let output_file = out.finish().await?;
-        let error_file = match err.finish().await {
-            Ok(file) => file,
-            Err(e) => {
-                remove_files(files, job, [output_file, None]).await;
-                return Err(e.into());
-            }
-        };
-        #[cfg(test)]
-        self.jobs.finalize_hold.pause().await;
         // Older runners could commit success before storing its segment. Such
         // a line is listed in the error file and contributes to the failed count.
-        let counted = sqlx::query_as("SELECT count(*) FILTER(WHERE state='succeeded' AND segment IS NOT NULL),count(*) FILTER(WHERE state IN('failed','interrupted') OR (state='succeeded' AND segment IS NULL)) FROM batch_lines WHERE job_id=$1")
+        let (completed, failed): (i64, i64) = sqlx::query_as("SELECT count(*) FILTER(WHERE state='succeeded' AND segment IS NOT NULL),count(*) FILTER(WHERE state IN('failed','interrupted') OR (state='succeeded' AND segment IS NULL)) FROM batch_lines WHERE job_id=$1")
             .bind(job.id)
             .fetch_one(&store.pool)
             .await
-            .map_err(store::job_storage);
-        let (completed, failed): (i64, i64) = match counted {
-            Ok(counts) => counts,
-            Err(e) => {
-                remove_files(files, job, [output_file, error_file]).await;
-                return Err(e.into());
-            }
-        };
-        let finished = fence
-            .finish_batch(
-                store,
-                &Finished {
-                    state: final_state,
-                    error_code: match stop {
-                        Some(Stop::Budget) => Some("budget_exceeded"),
-                        Some(Stop::HoldUnavailable) => Some("hold_unavailable"),
-                        _ => None,
+            .map_err(store::job_storage)?;
+        let job = loop {
+            let final_state = match stop {
+                None => JobState::Completed,
+                Some(Stop::Cancelled) => JobState::Cancelled,
+                Some(Stop::Expired) => JobState::Expired,
+                Some(Stop::Budget | Stop::HoldUnavailable) => JobState::Failed,
+                // Never a terminal state: see `run_claimed`.
+                Some(Stop::Lost) => return Ok(()),
+            };
+            let [output_file, error_file] = assemble_results(store, job, files, work, stop).await?;
+            #[cfg(test)]
+            self.jobs.finalize_hold.pause().await;
+            let finished = fence
+                .finish_batch(
+                    store,
+                    &Finished {
+                        state: final_state,
+                        error_code: match stop {
+                            Some(Stop::Budget) => Some("budget_exceeded"),
+                            Some(Stop::HoldUnavailable) => Some("hold_unavailable"),
+                            _ => None,
+                        },
+                        output_file,
+                        error_file,
+                        counts: job.request_total.map(|total| RequestCounts {
+                            total: total.max(0) as u32,
+                            completed: completed.max(0) as u32,
+                            failed: failed.max(0) as u32,
+                        }),
                     },
-                    output_file,
-                    error_file,
-                    counts: job.request_total.map(|total| RequestCounts {
-                        total: total.max(0) as u32,
-                        completed: completed.max(0) as u32,
-                        failed: failed.max(0) as u32,
-                    }),
-                },
-            )
-            .await;
-        // Clean up files the batch did not link when the outcome is known.
-        // After an unacknowledged commit, the sweeper can check for links.
-        let job = match finished {
-            Ok(row) => {
-                let unused = [output_file, error_file].map(|f| {
-                    f.filter(|f| row.output_file_id != Some(*f) && row.error_file_id != Some(*f))
-                });
-                remove_files(files, job, unused).await;
-                row
-            }
-            Err(FenceError::Stale) => {
-                state.lose();
-                remove_files(files, job, [output_file, error_file]).await;
-                return Ok(());
-            }
-            Err(FenceError::Storage) => {
-                remove_files(files, job, [output_file, error_file]).await;
-                return Err(InferenceError::Storage.into());
-            }
-            // Deleting a busy result would wait for the same file lock.
-            // Release the job for retry and let the sweeper reclaim the files.
-            Err(FenceError::Unknown | FenceError::FileBusy) => {
-                return Err(InferenceError::Storage.into());
-            }
+                )
+                .await;
+            // Clean up files the batch did not link when the outcome is known.
+            // After an unacknowledged commit, the sweeper can check for links.
+            match finished {
+                Ok(Publication::RebuildCancelled) => stop = Some(Stop::Cancelled),
+                Ok(Publication::RebuildExpired) => stop = Some(Stop::Expired),
+                Ok(Publication::Linked(row)) => {
+                    let unused = [output_file, error_file].map(|f| {
+                        f.filter(|f| {
+                            row.output_file_id != Some(*f) && row.error_file_id != Some(*f)
+                        })
+                    });
+                    remove_files(files, job, unused).await;
+                    break row;
+                }
+                Err(FenceError::Stale) => {
+                    state.lose();
+                    remove_files(files, job, [output_file, error_file]).await;
+                    return Ok(());
+                }
+                Err(FenceError::Storage) => {
+                    remove_files(files, job, [output_file, error_file]).await;
+                    return Err(InferenceError::Storage.into());
+                }
+                // Deleting a busy result would wait for the same file lock.
+                // Release the job for retry and let the sweeper reclaim the files.
+                Err(FenceError::Unknown | FenceError::FileBusy) => {
+                    return Err(InferenceError::Storage.into());
+                }
+            };
+            remove_files(files, job, [output_file, error_file]).await;
         };
-        let _ = segments;
         self.settle_finished(&job, files, state).await?;
-        crate::metrics::METRICS.observe_batch_finished("gateway", final_state.as_str());
+        crate::metrics::METRICS.observe_batch_finished("gateway", job.job_state().as_str());
         Ok(())
     }
 
@@ -760,6 +675,97 @@ impl Runner {
         };
         Ok(candidates.into_iter().find(|d| d.id == *first))
     }
+}
+
+/// Merge durable segments with records for missing lines, outside the publication transaction.
+async fn assemble_results(
+    store: &crate::store::Store,
+    job: &JobRow,
+    files: &crate::filestore::FileStorage,
+    work: Uuid,
+    stop: Option<Stop>,
+) -> JobResult<[Option<Uuid>; 2]> {
+    let hex = job.id.simple();
+    let template = |suffix: &str| {
+        io::batch_file(
+            false,
+            job.workspace_id,
+            job.api_key_id,
+            job.user_id,
+            format!("batch_{hex}_{suffix}.jsonl"),
+        )
+    };
+    let mut out = LazySink::new(files, template("output"));
+    let mut err = LazySink::new(files, template("error"));
+    let merged = async {
+        let mut written: HashSet<i32> = HashSet::new();
+        let segments = store::segments(store, job.id)
+            .await
+            .map_err(|_| InferenceError::Storage)?;
+        for (_, file) in &segments {
+            let mut reader = LineReader::stored(files, *file, job.workspace_id, RESULT_LINE_BYTES)
+                .await
+                .map_err(|_| InferenceError::Storage)?;
+            while let Some(raw) = reader.next_request().await? {
+                let (n, is_error, result) = segments::decode_record(&raw)?;
+                if !written.insert(n) {
+                    continue;
+                }
+                if is_error {
+                    err.line(&result).await?;
+                } else {
+                    out.line(&result).await?;
+                }
+            }
+        }
+        // Lines without a stored result: never run, or results lost.
+        let states: std::collections::HashMap<i32, String> = store::line_states(store, job.id)
+            .await
+            .map_err(|_| InferenceError::Storage)?
+            .into_iter()
+            .map(|(n, s, _)| (n, s))
+            .collect();
+        let unrun = match stop {
+            Some(Stop::Cancelled) => NotRun::Cancelled,
+            Some(Stop::Expired) => NotRun::Expired,
+            Some(Stop::Budget) => NotRun::BudgetExceeded,
+            Some(Stop::HoldUnavailable) => NotRun::HoldUnavailable,
+            Some(Stop::Lost) | None => NotRun::Failed,
+        };
+        let mut reader = LineReader::stored(files, work, job.workspace_id, WORK_LINE_BYTES)
+            .await
+            .map_err(|_| InferenceError::Storage)?;
+        let mut n: i32 = -1;
+        while let Some(raw) = reader.next_request().await? {
+            n += 1;
+            if written.contains(&n) {
+                continue;
+            }
+            let custom_id = lines::custom_id(&raw).ok_or(InferenceError::Storage)?;
+            let reason = if states.contains_key(&n) {
+                NotRun::ResultUnavailable
+            } else {
+                unrun
+            };
+            err.line(&lines::not_run_line(&custom_id, reason)).await?;
+        }
+        Ok::<_, InferenceError>(())
+    }
+    .await;
+    if let Err(e) = merged {
+        out.abort().await;
+        err.abort().await;
+        return Err(e.into());
+    }
+    let output_file = out.finish().await?;
+    let error_file = match err.finish().await {
+        Ok(file) => file,
+        Err(e) => {
+            remove_files(files, job, [output_file, None]).await;
+            return Err(e.into());
+        }
+    };
+    Ok([output_file, error_file])
 }
 
 /// Delete result files nothing references.

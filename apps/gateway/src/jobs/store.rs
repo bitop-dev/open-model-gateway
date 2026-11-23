@@ -290,6 +290,19 @@ pub(crate) async fn mark_settled(store: &Store, id: Uuid) -> Result<()> {
         .await.map_err(job_storage)?;
     Ok(())
 }
+/// Serialize the cancellation decision with the runner's terminal write.
+pub(crate) async fn cancel_gateway_batch(store: &Store, id: Uuid) -> Result<Option<JobRow>> {
+    sqlx::query_as(&format!(
+        "UPDATE async_jobs SET cancel_requested_at=coalesce(cancel_requested_at,clock_timestamp()),
+         upstream_status='cancelling' WHERE id=$1 AND batch_mode='gateway'
+         AND state IN('queued','in_progress') RETURNING {JOB_COLUMNS}"
+    ))
+    .bind(id)
+    .fetch_optional(&store.pool)
+    .await
+    .map_err(job_storage)
+}
+
 pub(crate) async fn mark_cancel_requested(store: &Store, id: Uuid) -> Result<()> {
     sqlx::query(
         "UPDATE async_jobs SET cancel_requested_at=coalesce(cancel_requested_at,clock_timestamp()) WHERE id=$1",
@@ -413,13 +426,29 @@ pub(super) async fn finish_batch_tx(
     id: Uuid,
     f: &Finished<'_>,
 ) -> Result<JobRow> {
-    let job: JobRow = sqlx::query_as(&format!(
+    let job = lock_batch_for_finish(tx, id).await?;
+    finish_locked_batch(tx, job, f).await
+}
+
+pub(super) async fn lock_batch_for_finish(
+    tx: &mut Transaction<'_, Postgres>,
+    id: Uuid,
+) -> Result<JobRow> {
+    sqlx::query_as(&format!(
         "SELECT {JOB_COLUMNS} FROM async_jobs WHERE id=$1 FOR NO KEY UPDATE"
     ))
     .bind(id)
     .fetch_one(&mut **tx)
     .await
-    .map_err(job_storage)?;
+    .map_err(job_storage)
+}
+
+pub(super) async fn finish_locked_batch(
+    tx: &mut Transaction<'_, Postgres>,
+    job: JobRow,
+    f: &Finished<'_>,
+) -> Result<JobRow> {
+    let id = job.id;
     if !matches!(job.state.as_str(), "queued" | "in_progress") {
         return Ok(job);
     }

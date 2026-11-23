@@ -28,7 +28,7 @@
 use sqlx::{Postgres, Transaction, postgres::PgArguments, query::Query};
 use uuid::Uuid;
 
-use super::store::{Finished, JobRow, finish_batch_tx, job_storage};
+use super::store::{Finished, JobRow, finish_locked_batch, job_storage, lock_batch_for_finish};
 use crate::store::Store;
 
 /// What a runner holds for one claim of a batch.
@@ -55,6 +55,12 @@ impl From<sqlx::Error> for FenceError {
     fn from(_: sqlx::Error) -> Self {
         Self::Storage
     }
+}
+/// A rebuild leaves both candidate files unlinked.
+pub(super) enum Publication {
+    Linked(Box<JobRow>),
+    RebuildCancelled,
+    RebuildExpired,
 }
 /// What a lease renewal found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -204,7 +210,7 @@ impl BatchFence {
 
     /// Display status of an unfinished batch.
     pub(crate) async fn set_status(&self, store: &Store, status: &str) -> FenceResult<()> {
-        let query = self.query("UPDATE async_jobs SET upstream_status=$4,finalizing_at=CASE WHEN $4='finalizing' THEN coalesce(finalizing_at,clock_timestamp()) ELSE finalizing_at END WHERE id=$1 AND runner_id=$2 AND runner_epoch=$3 AND state IN('queued','in_progress')");
+        let query = self.query("UPDATE async_jobs SET upstream_status=CASE WHEN cancel_requested_at IS NULL THEN $4 ELSE upstream_status END,finalizing_at=CASE WHEN $4='finalizing' THEN coalesce(finalizing_at,clock_timestamp()) ELSE finalizing_at END WHERE id=$1 AND runner_id=$2 AND runner_epoch=$3 AND state IN('queued','in_progress')");
         self.update(store, query.bind(status)).await
     }
 
@@ -222,27 +228,52 @@ impl BatchFence {
 
     /// Record the terminal state and result files. [`FenceError::Stale`] when
     /// the claim ended: nothing was recorded.
-    pub(crate) async fn finish_batch(
+    pub(super) async fn finish_batch(
         &self,
         store: &Store,
         f: &Finished<'_>,
-    ) -> FenceResult<JobRow> {
+    ) -> FenceResult<Publication> {
         let mut tx = self.begin(store, Hold::Update).await?;
-        let row = finish_batch_tx(&mut tx, self.job, f)
-            .await
-            .map_err(|error| match &error {
-                sqlx::Error::Database(e) if e.code().as_deref() == Some("55P03") => {
-                    FenceError::FileBusy
+        let job = lock_batch_for_finish(&mut tx, self.job).await?;
+        let mut result = Finished { ..*f };
+        if !job.job_state().is_terminal() {
+            let unavailable = f.error_code == Some("hold_unavailable");
+            // Budget refusal retains its own disposition. Cancellation precedes
+            // expiry, and either takes precedence over an unavailable envelope.
+            if job.cancel_requested_at.is_some()
+                && (matches!(
+                    f.state,
+                    super::JobState::Completed | super::JobState::Expired
+                ) || unavailable)
+            {
+                if f.error_file.is_some() {
+                    return Ok(Publication::RebuildCancelled);
                 }
-                _ => FenceError::Storage,
-            })?;
+                result.state = super::JobState::Cancelled;
+                result.error_code = None;
+            } else if unavailable
+                && gateway_datetime_compat::UtcInstant::now()
+                    >= job.created_at + job.completion_window()
+            {
+                return Ok(Publication::RebuildExpired);
+            }
+        }
+        let row =
+            finish_locked_batch(&mut tx, job, &result)
+                .await
+                .map_err(|error| match &error {
+                    sqlx::Error::Database(e) if e.code().as_deref() == Some("55P03") => {
+                        FenceError::FileBusy
+                    }
+                    _ => FenceError::Storage,
+                })?;
         // An error at COMMIT cannot authorize cleanup. The sweeper can
         // check whether the job links actually committed.
         tx.commit().await.map_err(|e| {
             job_storage(e);
             FenceError::Unknown
         })?;
-        Ok(row)
+        Ok(Publication::Linked(Box::new(row)))
     }
 
     pub(crate) async fn mark_settled(&self, store: &Store) -> FenceResult<()> {
