@@ -1584,3 +1584,34 @@ async fn a_segment_commit_error_keeps_the_file_and_recovery_does_not_replay(pool
     assert_eq!((cost.0, cost.1), (30, 0));
     consistent(&w.f).await;
 }
+
+#[dbtest::test]
+async fn backoff_retry_legacy_refuses_persisted_cancel(pool: PgPool) {
+    let (w, job) = batch(pool, &[("a", "plain")]).await;
+    let fence = claim(&w, &job).await;
+    let store = &w.f.store;
+    let first = Uuid::new_v4();
+    assert!(
+        fence
+            .claim_line(store, job.workspace_id, 0, first)
+            .await
+            .unwrap()
+    );
+    assert!(
+        fence
+            .fail_line(
+                store,
+                0,
+                first,
+                Some(502),
+                Some("upstream_unavailable"),
+                false
+            )
+            .await
+            .unwrap()
+    );
+    crate::jobs::store::mark_cancel_requested(store, job.id)
+        .await
+        .unwrap();
+    assert!(!fence.retry_line(store, 0, 1, Uuid::new_v4()).await.unwrap());
+}
