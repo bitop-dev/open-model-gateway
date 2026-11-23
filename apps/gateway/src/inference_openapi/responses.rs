@@ -92,8 +92,13 @@ fn resolved<'a>(document: &'a Value, value: &'a Value) -> Result<&'a Value> {
 pub(super) fn validator(
     document: &Value,
     schema: &Value,
+    mode: validation::SchemaMode,
 ) -> Result<std::sync::Arc<jsonschema::Validator>> {
-    fn compile(document: &Value, schema: &Value) -> Result<std::sync::Arc<jsonschema::Validator>> {
+    fn compile(
+        document: &Value,
+        schema: &Value,
+        mode: validation::SchemaMode,
+    ) -> Result<std::sync::Arc<jsonschema::Validator>> {
         // The committed artifact is registered once; any other document is
         // registered for this compilation alone.
         static REGISTRY: std::sync::OnceLock<jsonschema::Registry<'static>> =
@@ -107,21 +112,20 @@ pub(super) fn validator(
                 }
             };
             return Ok(std::sync::Arc::new(validation::compile_in_document(
-                registry, schema,
+                registry, schema, mode,
             )?));
         }
         let registry = validation::document_registry(document)?;
         Ok(std::sync::Arc::new(validation::compile_in_document(
-            &registry, schema,
+            &registry, schema, mode,
         )?))
     }
     if !std::ptr::eq(document, artifact()) {
-        return compile(document, schema);
+        return compile(document, schema, mode);
     }
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::BTreeMap<String, std::sync::Arc<jsonschema::Validator>>>,
-    > = std::sync::OnceLock::new();
-    let key = serde_json::to_string(schema)?;
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<validation::ValidatorCache<String>>> =
+        std::sync::OnceLock::new();
+    let key = (mode, serde_json::to_string(schema)?);
     let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
     if let Some(validator) = cache.get(&key) {
         return Ok(validator.clone());
@@ -129,13 +133,13 @@ pub(super) fn validator(
     if cache.len() >= 128 {
         cache.clear();
     }
-    let validator = compile(document, schema)?;
+    let validator = compile(document, schema, mode)?;
     cache.insert(key, validator.clone());
     Ok(validator)
 }
 
 pub(super) fn validate_value(document: &Value, schema: &Value, body: &Value) -> Result<()> {
-    validator(document, schema)?
+    validator(document, schema, validation::SchemaMode::Standard)?
         .validate(body)
         .map_err(|e| anyhow::anyhow!(shared::describe(&e)))
 }

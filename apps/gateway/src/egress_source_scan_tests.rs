@@ -23,6 +23,7 @@
 //! same as the plain form. Attributes written inside macro bodies are parsed
 //! from the macro's tokens.
 use proc_macro2::{Delimiter, TokenStream, TokenTree};
+use quote::ToTokens;
 use std::path::{Component, Path, PathBuf};
 use syn::{Meta, Token, ext::IdentExt, punctuated::Punctuated, visit::Visit};
 
@@ -66,6 +67,7 @@ enum Finding {
     /// macro metavariable (`#[$m]`, `#[path = $p]`, `$i!`), or one in a
     /// macro body that `syn` cannot parse. The scan fails closed on these.
     Unreadable(String),
+    AwsTransport(String),
 }
 
 fn path_name(path: &syn::Path) -> String {
@@ -282,7 +284,20 @@ impl<'ast> Visit<'ast> for Scan<'_> {
 
     fn visit_local(&mut self, local: &'ast syn::Local) {
         let on = format!("let in {}", self.here());
+        let before = self.findings.len();
         self.own(&local.attrs, &on);
+        for finding in &self.findings[before..] {
+            if let Finding::Level {
+                reason: Some(reason),
+                ..
+            } = finding
+                && let Some(transport) = aws_transport(reason)
+                && !transport.matches(local)
+            {
+                self.findings.push(Finding::AwsTransport(on));
+                break;
+            }
+        }
         syn::visit::visit_local(self, local);
     }
 
@@ -373,6 +388,112 @@ fn level_of(
     }
 }
 
+const S3_TRANSPORT: &str = "S3 installs the gateway transport";
+const BEDROCK_TRANSPORT: &str = "Bedrock installs the gateway transport";
+const BEDROCK_CLIENT: &str = "Bedrock uses its service config";
+const BEDROCK_STREAM_TRANSPORT: &str = "Bedrock streaming installs the gateway transport";
+const STS_EXCEPTION: &str = "EGR-3: regional STS AssumeRole uses the SDK credential transport";
+
+enum AwsTransport {
+    GatewayTail(&'static str),
+    S3Client,
+    Exact(&'static str),
+}
+
+impl AwsTransport {
+    fn matches(&self, local: &syn::Local) -> bool {
+        let Some(init) = &local.init else {
+            return false;
+        };
+        let expression = text(init.expr.to_token_stream());
+        match self {
+            Self::GatewayTail(tail) => expression.ends_with(tail),
+            Self::Exact(expected) => expression == *expected,
+            Self::S3Client => {
+                let syn::Expr::Call(call) = init.expr.as_ref() else {
+                    return false;
+                };
+                text(call.func.to_token_stream()) == "Client : : from_conf"
+                    && call.args.len() == 1
+                    && text(call.args[0].to_token_stream())
+                        == "builder . http_client ( transport : : client ( settings . ca_bundle . as_ref ( ) ) ? ) . build ( )"
+            }
+        }
+    }
+}
+
+// Pin transport selection at the sanctioned build/override expressions. Earlier
+// builder settings can change; the final transport assignment must stay explicit.
+fn aws_transport(reason: &str) -> Option<AwsTransport> {
+    let tail = match reason {
+        S3_TRANSPORT => return Some(AwsTransport::S3Client),
+        BEDROCK_CLIENT => {
+            return Some(AwsTransport::Exact(
+                "Client : : from_conf ( self . service_config ( plan , credentials ) )",
+            ));
+        }
+        BEDROCK_TRANSPORT => " . http_client ( self . http . clone ( ) ) . build ( )",
+        BEDROCK_STREAM_TRANSPORT => {
+            " . config_override ( aws_sdk_bedrockruntime : : Config : : builder ( ) . http_client ( self . streaming_http . clone ( ) ) , )"
+        }
+        STS_EXCEPTION => return Some(AwsTransport::Exact("builder . build ( )")),
+        _ => return None,
+    };
+    Some(AwsTransport::GatewayTail(tail))
+}
+
+#[test]
+fn aws_transport_must_be_set_on_the_sanctioned_expression() {
+    let src = Path::new("/repo/apps/gateway/src");
+    let matches = |reason, initializer| {
+        let file = src.join("fixture.rs");
+        let source = format!(
+            "fn fixture() {{
+                #[expect(clippy::disallowed_methods, reason = {reason:?})]
+                let config = {initializer};
+            }}"
+        );
+        scan(src, &file, &source) == [level("expect", false, &[], Some(reason), "let in fixture")]
+    };
+    assert!(matches(
+        BEDROCK_TRANSPORT,
+        "builder.http_client(self.http.clone()).build()"
+    ));
+    for initializer in [
+        "builder.build()",
+        "builder.other(mock.http_client(self.http.clone())).build()",
+        "builder.http_client(self.streaming_http.clone()).build()",
+    ] {
+        assert!(!matches(BEDROCK_TRANSPORT, initializer), "{initializer}");
+    }
+    assert!(matches(
+        BEDROCK_STREAM_TRANSPORT,
+        "operation.config_override(aws_sdk_bedrockruntime::Config::builder().http_client(self.streaming_http.clone()),)"
+    ));
+    assert!(!matches(
+        BEDROCK_STREAM_TRANSPORT,
+        "operation.config_override(aws_sdk_bedrockruntime::Config::builder())"
+    ));
+    assert!(matches(
+        S3_TRANSPORT,
+        "Client::from_conf(builder.http_client(transport::client(settings.ca_bundle.as_ref())?).build())"
+    ));
+    assert!(!matches(S3_TRANSPORT, "Client::from_conf(builder.build())"));
+    assert!(!matches(
+        S3_TRANSPORT,
+        "Client::from_conf(std::convert::identity(builder).http_client(transport::client(settings.ca_bundle.as_ref())?).build())"
+    ));
+    for reason in [S3_TRANSPORT, BEDROCK_CLIENT] {
+        assert!(!matches(reason, "Client::from_conf(shared.into())"));
+    }
+    assert!(matches(
+        BEDROCK_CLIENT,
+        "Client::from_conf(self.service_config(plan, credentials))"
+    ));
+    assert!(matches(STS_EXCEPTION, "builder.build()"));
+    assert!(!matches(STS_EXCEPTION, "other.build()"));
+}
+
 /// The sanctioned sites of each file under `src/`; nothing for any other.
 fn sanctioned(name: &str) -> Vec<Finding> {
     let guarded = |on: &str| {
@@ -384,7 +505,23 @@ fn sanctioned(name: &str) -> Vec<Finding> {
             on,
         )
     };
+    let aws_config = |function: &str, reason: &str| {
+        level(
+            "expect",
+            false,
+            &[],
+            Some(reason),
+            &format!("let in {function}"),
+        )
+    };
     match name {
+        "filestore/s3.rs" => vec![aws_config("new", S3_TRANSPORT)],
+        "providers/bedrock.rs" => vec![
+            aws_config("client", BEDROCK_CLIENT),
+            aws_config("service_config", BEDROCK_TRANSPORT),
+            aws_config("execute", BEDROCK_STREAM_TRANSPORT),
+        ],
+        "providers/bedrock/auth.rs" => vec![aws_config("sts_config", STS_EXCEPTION)],
         // The one module that holds or builds a raw reqwest client (#569):
         // the whole file may name the types; only the three constructors
         // may call the disallowed methods.
@@ -563,6 +700,34 @@ fn clippy_disallows_every_unguarded_client_construction() {
     }
 }
 
+const AWS_CONFIG_METHODS: &[&str] = &[
+    "aws_sdk_bedrockruntime::config::Builder::build",
+    "aws_sdk_s3::config::Builder::build",
+    "aws_sdk_bedrockruntime::Client::new",
+    "aws_sdk_s3::Client::new",
+    "aws_sdk_bedrockruntime::Client::from_conf",
+    "aws_sdk_s3::Client::from_conf",
+    "aws_sdk_bedrockruntime::Config::new",
+    "aws_sdk_s3::Config::new",
+    "aws_sdk_bedrockruntime::client::customize::CustomizableOperation::config_override",
+    "aws_sdk_s3::client::customize::CustomizableOperation::config_override",
+    "aws_types::sdk_config::Builder::build",
+    "aws_config::ConfigLoader::load",
+    "aws_config::load_defaults",
+    "aws_config::load_from_env",
+];
+
+#[test]
+fn clippy_checks_aws_config_construction() {
+    let config = uncommented(include_str!("../clippy.toml"));
+    for path in AWS_CONFIG_METHODS {
+        assert!(
+            !clippy_entry(&config, path).contains("allow-invalid"),
+            "{path} must resolve"
+        );
+    }
+}
+
 /// The `Default` routes (#569): Clippy cannot name `<Client as
 /// Default>::default`, so the raw types are refused by name and the two
 /// `RequestBuilder` methods that hand out or accept a raw client are refused.
@@ -643,7 +808,7 @@ const CLIENT_MODULE: &[&str] = &[
     "HttpClientBuilder :: pub fn build ( self ) - > reqwest : : Result < HttpClient > { self . 0 . build ( ) . map ( HttpClient ) }",
     "# [ expect ( clippy : : disallowed_methods , reason = \"the egress-guarded constructor (#509)\" ) ] pub ( crate ) fn client_builder ( resolver : Arc < Resolver > ) - > HttpClientBuilder { HttpClientBuilder ( reqwest : : Client : : builder ( ) . no_proxy ( ) . dns_resolver ( resolver ) . redirect ( reqwest : : redirect : : Policy : : none ( ) ) . retry ( reqwest : : retry : : never ( ) ) , ) }",
     "# [ expect ( clippy : : disallowed_methods , reason = \"the egress-guarded constructor (#509)\" ) ] pub ( crate ) fn pinned_client_builder ( approved : & crate : : providers : : local : : endpoints : : ApprovedDestinations , ) - > HttpClientBuilder { HttpClientBuilder ( reqwest : : Client : : builder ( ) . no_proxy ( ) . redirect ( reqwest : : redirect : : Policy : : none ( ) ) . retry ( reqwest : : retry : : never ( ) ) . resolve_to_addrs ( approved . host ( ) , approved . addresses ( ) ) , ) }",
-    "# [ expect ( clippy : : disallowed_methods , reason = \"the egress-guarded constructor (#509)\" ) ] pub ( crate ) fn add_root_certificates ( builder : HttpClientBuilder , certificates : impl IntoIterator < Item = reqwest : : Certificate > , ) - > HttpClientBuilder { let mut builder = builder . 0 ; for certificate in certificates { builder = builder . add_root_certificate ( certificate ) ; } HttpClientBuilder ( builder ) }",
+    "# [ expect ( clippy : : disallowed_methods , reason = \"the egress-guarded constructor (#509)\" ) ] pub ( crate ) fn add_root_certificates ( builder : HttpClientBuilder , bundle : & crate : : filestore : : s3 : : S3CaBundle , ) - > anyhow : : Result < HttpClientBuilder > { let mut builder = builder . 0 ; for certificate in bundle . certificates ( ) ? { builder = builder . add_root_certificate ( certificate ) ; } Ok ( HttpClientBuilder ( builder ) ) }",
 ];
 
 fn client_module_source() -> String {
@@ -699,7 +864,6 @@ fn text(tokens: TokenStream) -> String {
 /// attributes, then each item; an inherent impl is its header followed by
 /// one `Type :: member` entry per member.
 fn module_entries(file: &syn::File) -> Vec<String> {
-    use quote::ToTokens;
     let mut entries: Vec<String> = file
         .attrs
         .iter()

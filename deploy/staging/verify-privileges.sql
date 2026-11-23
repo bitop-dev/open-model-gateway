@@ -76,7 +76,7 @@ DO $$ DECLARE r record; t text; BEGIN
   IF has_column_privilege('gateway_runtime','public.async_job_files',t,'UPDATE') THEN RAISE EXCEPTION 'mutable async job file: %',t; END IF;
  END LOOP;
  IF has_column_privilege('gateway_runtime','public.governance_reservations','request_count','UPDATE') OR has_column_privilege('gateway_runtime','public.governance_reservations','admitted_at','UPDATE') THEN RAISE EXCEPTION 'mutable reservation admission snapshot'; END IF;
- IF (SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'async_job%' AND tgenabled='O' AND NOT tgisinternal)<>7 THEN RAISE EXCEPTION 'async job guards missing or disabled'; END IF;
+ IF (SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'async_job%' AND tgenabled='O' AND NOT tgisinternal)<>8 THEN RAISE EXCEPTION 'async job guards missing or disabled'; END IF;
  IF has_table_privilege('gateway_runtime','public.installation_settings','INSERT,DELETE,TRUNCATE') OR has_column_privilege('gateway_runtime','public.installation_settings','singleton','UPDATE') THEN RAISE EXCEPTION 'installation settings row replaceable'; END IF;
  -- Installation logo (0023): a reviewed column set, guarded by a trigger.
  IF NOT has_column_privilege('gateway_runtime','public.installation_settings','branding_logo_file_id','UPDATE') THEN RAISE EXCEPTION 'installation logo not maintainable by runtime'; END IF;
@@ -1006,12 +1006,15 @@ BEGIN
   INSERT INTO governance_reservations(execution_id,workspace_id,api_key_id,deployment_id,price_id,admitted_at,minute_start,month_start,lease_expires_at,state,reserved_tokens,held_microusd) VALUES(line,ws,k,d,bp,now(),date_trunc('minute',now()),date_trunc('month',now()),now()+interval '2 minutes','pending',110,5);
   UPDATE governance_reservations SET held_microusd=held_microusd-5 WHERE execution_id=env AND state='pending' AND held_microusd>=5;
   UPDATE batch_lines SET state='failed',status_code=429,error_code='rate_limit_error',finished_at=clock_timestamp() WHERE job_id=bj AND line_no=0 AND state='running';
+  PERFORM b.line_no FROM batch_lines b WHERE b.job_id=bj AND b.line_no=0 AND b.execution_id=line AND b.state='failed' AND b.segment IS NULL FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'failed execution could not be locked for retry fallback'; END IF;
   UPDATE batch_lines SET state='running',attempts=attempts+1,execution_id=gen_random_uuid(),status_code=NULL,error_code=NULL,finished_at=NULL WHERE job_id=bj AND line_no=0 AND state='failed' AND attempts=1 AND segment IS NULL;
-  UPDATE batch_lines SET state='succeeded',status_code=200,finished_at=clock_timestamp() WHERE job_id=bj AND line_no=0 AND state='running';
-  UPDATE async_jobs SET request_completed=coalesce(request_completed,0)+1,request_failed=coalesce(request_failed,0)+0,last_progress_at=clock_timestamp() WHERE id=bj;
+  UPDATE batch_lines SET awaiting_segment=true WHERE job_id=bj AND line_no=0 AND state='running';
+  IF EXISTS (SELECT FROM batch_lines WHERE job_id=bj AND state='succeeded') THEN RAISE EXCEPTION 'staging reported a success'; END IF;
   INSERT INTO batch_segments(job_id,workspace_id,seq,file_id,lines) SELECT bj,ws,coalesce(max(seq)+1,0),fs,1 FROM batch_segments WHERE job_id=bj;
-  UPDATE batch_lines SET segment=0 WHERE job_id=bj AND line_no=ANY(ARRAY[0]) AND segment IS NULL AND state<>'running';
-  UPDATE batch_lines SET state='interrupted',error_code='interrupted',finished_at=clock_timestamp() WHERE job_id=bj AND state='running';
+  UPDATE batch_lines SET state='succeeded',awaiting_segment=false,segment=0,status_code=200,finished_at=clock_timestamp() WHERE job_id=bj AND line_no=0 AND state='running' AND awaiting_segment AND segment IS NULL;
+  UPDATE async_jobs SET request_completed=coalesce(request_completed,0)+1,request_failed=coalesce(request_failed,0)+0,last_progress_at=clock_timestamp() WHERE id=bj;
+  UPDATE batch_lines SET state='interrupted',awaiting_segment=false,error_code='interrupted',finished_at=clock_timestamp() WHERE job_id=bj AND state='running';
   PERFORM seq,file_id FROM batch_segments WHERE job_id=bj ORDER BY seq;
   PERFORM coalesce(sum(r.actual_microusd) FILTER(WHERE r.state='settled'),0) FROM governance_reservations r WHERE r.execution_id IN (SELECT e2.id FROM inference_executions e2 WHERE e2.batch_job_id=bj);
   BEGIN UPDATE batch_lines SET state='running' WHERE job_id=bj AND line_no=0; RAISE EXCEPTION 'finished batch line restarted'; EXCEPTION WHEN raise_exception THEN IF SQLERRM NOT LIKE 'invalid batch line transition%' THEN RAISE; END IF; END;
@@ -1020,6 +1023,12 @@ BEGIN
   BEGIN UPDATE batch_segments SET lines=2 WHERE job_id=bj; RAISE EXCEPTION 'batch segment rewrite allowed'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
   BEGIN UPDATE async_jobs SET batch_mode='native' WHERE id=bj; RAISE EXCEPTION 'batch mode rewrite allowed'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
   UPDATE async_jobs SET state='completed',upstream_status='completed',output_file_id=coalesce(output_file_id,fo),completed_at=coalesce(completed_at,clock_timestamp()),runner_lease_until=NULL WHERE id=bj AND state IN('queued','in_progress');
+  IF NOT EXISTS(SELECT FROM stored_files WHERE id=fo AND batch_result_linked) THEN RAISE EXCEPTION 'batch result link was not marked'; END IF;
+  IF has_column_privilege('public.stored_files','batch_result_linked','INSERT')
+   OR has_column_privilege('public.stored_files','batch_result_linked','UPDATE')
+   OR has_function_privilege('public.mark_batch_result_linked()','EXECUTE') THEN
+   RAISE EXCEPTION 'batch result marker writable by runtime';
+  END IF;
   BEGIN UPDATE async_jobs SET output_file_id=fin WHERE id=bj; RAISE EXCEPTION 'batch output rewrite allowed'; EXCEPTION WHEN raise_exception THEN IF SQLERRM<>'async job identity is immutable' THEN RAISE; END IF; END;
   UPDATE governance_reservations SET state='settled',actual_microusd=0,input_tokens=0,output_tokens=0 WHERE execution_id=env AND state='pending';
   UPDATE inference_executions SET state='succeeded',input_tokens=0,output_tokens=0,elapsed_ms=1,completed_at=clock_timestamp(),finish_reason='stop' WHERE id=env AND state='started' AND workload_kind='batches';

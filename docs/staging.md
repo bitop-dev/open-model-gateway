@@ -14,7 +14,7 @@ This is a **single-host staging baseline, not approval for public production lau
 
 Tag the gateway image with the Git commit and promote the tested digest. For rollback, use the previously tested digest. The Dockerfile pins the Node, Rust and runtime base images by digest. Staging Compose also pins its default PostgreSQL and Caddy images to reviewed digests at `mirror.gcr.io`. To replace either default, set `STAGING_POSTGRES_IMAGE` or `STAGING_CADDY_IMAGE` to the reviewed image and digest in `staging.env` or the environment.
 
-The gateway, migration and grant services use the gateway image already in the local image store. Build the staging gateway first, or pull the selected release digest before setting `GATEWAY_IMAGE` to that reference. The release rehearsal follows this pull-by-digest path. [Image verification](verification.md#no-docker-hub-pulls-in-ci)
+The gateway, migration and grant services use the gateway image already in the local image store. Use `scripts/staging.py build` to build the local tag, or pull the selected release digest before setting `GATEWAY_IMAGE` to that reference. A missing gateway image makes Compose fail with `No such image`. The release rehearsal follows the pull-by-digest path. [Image verification](verification.md#no-docker-hub-pulls-in-ci)
 
 ## Image CI and registry publication
 
@@ -104,6 +104,8 @@ Three distinct identities exist:
 Run `grants apply` as the database and schema/object owner (`gateway_migrator` in staging), not merely a role with table grants: it must be able to revoke database privileges as well as reapply the table/function allowlist. `grants verify` needs a connecting role allowed to `SET ROLE gateway_runtime`; it includes a rollback-only `CREATE TEMP TABLE` refusal probe. These commands never run implicitly in `serve`, and `grants apply` does not run migrations. Configure database credentials privately; never paste connection URLs or secrets into logs or issue comments.
 
 `migrate` runs the migration job **and then reapplies grants**, both with the migrator secret. Never deploy new application code without its matching migration and grant policy. All replicas must use the matching schema version; rolling old/new mixed-schema replicas is not promised by the readiness contract.
+
+**PostgreSQL 17.11 to 17.12 on an existing staging volume.** When Compose recreates the database container with the new Bookworm image, PostgreSQL 17.12 can use the existing 17.x data directory. Before upgrading, review the upstream changelog entries that mention `REINDEX`. After upgrading, rebuild any indexes that match the affected cases. Pre-upgrade native incremental backups may be corrupt and are unreliable for recovery. If you use them, take a new full backup on 17.12 and base subsequent incremental backups on it. The staging restore rehearsal checks a logical `pg_dump` backup. [PostgreSQL 17.12 migration notes](https://www.postgresql.org/docs/release/17.12/#RELEASE-17-12-MIGRATION)
 
 Upgrade procedure:
 

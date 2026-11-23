@@ -250,16 +250,16 @@ pub(super) fn profile_provider(
     builder.build()
 }
 
-/// Bedrock, STS and S3 retain their current retry and timeout defaults.
+/// The later v2026_11_17 selector introduces a default read timeout.
 #[allow(deprecated)]
 pub(crate) fn sdk_behavior_version() -> BehaviorVersion {
-    BehaviorVersion::v2026_01_12()
+    BehaviorVersion::v2026_11_10()
 }
 
 /// STS client configuration for AssumeRole: the server's identity, the connection's region
 /// and the regional STS endpoint. Built explicitly, so shared AWS configuration (including
 /// endpoint overrides) is not loaded. One attempt and bounded timeouts.
-pub(super) fn sts_config(region: &str, base: SharedCredentialsProvider) -> SdkConfig {
+fn sts_config(region: &str, base: SharedCredentialsProvider) -> SdkConfig {
     let mut builder = SdkConfig::builder()
         .behavior_version(sdk_behavior_version())
         .region(Region::new(region.to_owned()))
@@ -277,7 +277,17 @@ pub(super) fn sts_config(region: &str, base: SharedCredentialsProvider) -> SdkCo
                 .build(),
         );
     builder.set_sleep_impl(aws_smithy_async::rt::sleep::default_async_sleep());
-    builder.build()
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "EGR-3: regional STS AssumeRole uses the SDK credential transport"
+    )]
+    let config = builder.build();
+    config
+}
+
+#[cfg(test)]
+pub(super) fn sts_config_for_tests(region: &str, base: SharedCredentialsProvider) -> SdkConfig {
+    sts_config(region, base)
 }
 
 pub(super) async fn assume_role_provider(
@@ -455,3 +465,7 @@ fn valid_model_arn(arn: &str, region: &str) -> bool {
         && id.as_bytes()[0].is_ascii_alphanumeric()
         && charset(id, b"._:/-")
 }
+
+#[cfg(test)]
+#[path = "attempt_fixture_tests.rs"]
+pub(crate) mod attempt_fixture;

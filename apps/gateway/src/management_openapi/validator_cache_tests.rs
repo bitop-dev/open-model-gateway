@@ -136,3 +136,19 @@ fn value_keys_differ_exactly_when_the_values_differ() {
         }
     }
 }
+
+#[test]
+fn keyword_scope_cache_keeps_request_and_standard_verdicts_separate() {
+    let check = |document: &Value| {
+        let capped = json!({"type":"string","x-omg-max-bytes":1});
+        let text = json!("é");
+        for _ in 0..2 {
+            assert!(responses::validate_value(document, &capped, &text).is_ok());
+            assert!(responses::validate_request_value(document, &capped, &text).is_err());
+        }
+    };
+    check(artifact());
+    check(crate::inference_openapi::committed_artifact());
+    let document = json!({"components":{"schemas":{}}});
+    responses::with_document_cache(&document, || check(&document));
+}

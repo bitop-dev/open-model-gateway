@@ -85,8 +85,12 @@ fn valid_body(template: &str, body: Value) -> Value {
         ["application/json"]["schema"];
     assert!(
         !schema.is_null()
-            && openapi::responses::validate_value(openapi::responses::artifact(), schema, &body)
-                .is_ok(),
+            && openapi::responses::validate_request_value(
+                openapi::responses::artifact(),
+                schema,
+                &body
+            )
+            .is_ok(),
         "a positive request body does not satisfy its request schema ({template})"
     );
     body

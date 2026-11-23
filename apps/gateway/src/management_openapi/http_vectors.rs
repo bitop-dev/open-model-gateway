@@ -200,6 +200,19 @@ fn resolve<'a>(document: &'a Value, mut node: &'a Value) -> Result<&'a Value> {
     bail!("reference chain too deep")
 }
 
+/// Formats with a known HTTP probe strategy. Raw uploads use the binary runner.
+pub(super) fn format_violations(format: &str) -> Option<&'static [&'static str]> {
+    Some(match format {
+        "date" => &["2024-02-30", "2024-13-01", "not-a-date"],
+        "omg-chrono-date-time" | "date-time" => &["yesterday", "2024-01-01"],
+        "uuid" => &["not-a-uuid"],
+        "email" => &["not-an-email"],
+        "uri" => &["not a uri"],
+        "binary" => &[],
+        _ => return None,
+    })
+}
+
 /// Every node along a `$ref` chain, the node itself first: siblings of a `$ref`
 /// (`{"$ref": ..., "maxLength": 15}`) are keywords of the instance too, so the
 /// validator, `declare` and `reach` see them and the vectors must as well.
@@ -221,31 +234,53 @@ fn valid(document: &Value, schema: &Value, instance: &Value) -> Result<bool> {
     Ok(responses::validator(document, schema)?.is_valid(instance))
 }
 
+#[derive(Default)]
+struct ApplicableSchemas<'a> {
+    nodes: Vec<&'a Value>,
+    unannotated_complex_pattern: bool,
+    annotated_complex_pattern: bool,
+    annotated_simple_pattern: bool,
+}
+
 /// The schema nodes that constrain `value`: the node itself, its `allOf` members,
 /// the `oneOf`/`anyOf` branches the value matches and the active conditional arm.
+/// This inventory describes the seed. A replacement can select other arms.
 fn applicable<'a>(
     document: &'a Value,
     node: &'a Value,
     value: &Value,
-    out: &mut Vec<&'a Value>,
+    out: &mut ApplicableSchemas<'a>,
     depth: usize,
 ) -> Result<()> {
     ensure!(depth < 16, "schema nesting too deep");
     // Every link of a `$ref` chain contributes its own keywords, siblings included.
+    // A reason beside a reference belongs to its referenced pattern. Each
+    // applicator arm starts a separate chain, even when arms share a target.
+    let mut annotated = false;
     for node in chain(document, node)? {
-        out.push(node);
+        out.nodes.push(node);
+        annotated |= node.get(PATTERN_BOUNDARIES).is_some();
+        if let Some(pattern) = node["pattern"].as_str() {
+            if simple_bounds(pattern).is_none() {
+                out.unannotated_complex_pattern |= !annotated;
+                out.annotated_complex_pattern |= annotated;
+            } else {
+                out.annotated_simple_pattern |= annotated;
+            }
+            annotated = false;
+        }
         for branch in node["allOf"].as_array().into_iter().flatten() {
             applicable(document, branch, value, out, depth + 1)?;
         }
         for keyword in ["oneOf", "anyOf"] {
             for branch in node[keyword].as_array().into_iter().flatten() {
-                if valid(document, branch, value)? {
+                if accepts(document, branch, value)? {
                     applicable(document, branch, value, out, depth + 1)?;
                 }
             }
         }
         if let Some(condition) = node.get("if") {
-            let keyword = if valid(document, condition, value)? {
+            let keyword = if accepts(document, condition, value)? {
                 "then"
             } else {
                 "else"
@@ -258,8 +293,8 @@ fn applicable<'a>(
     Ok(())
 }
 
-fn first<'a>(nodes: &[&'a Value], key: &str) -> Option<&'a Value> {
-    nodes.iter().find_map(|node| node.get(key))
+fn strings<'a>(nodes: &[&'a Value], key: &str) -> BTreeSet<&'a str> {
+    nodes.iter().filter_map(|node| node[key].as_str()).collect()
 }
 /// EVERY distinct value of a bound across the applicable nodes (the base
 /// schema and each active `allOf`/`then`/union arm may state a different one):
@@ -374,9 +409,16 @@ pub(super) struct Notes {
     pub(super) exempt: usize,
     /// Non-decisive candidates that were not sent (counted, never silent).
     pub(super) minor: usize,
+    implied: usize,
+    pub(super) dominated_patterns: usize,
+    pub(super) shape_only_patterns: usize,
     /// Locations whose vectors cannot be trusted (unbounded patterns without
     /// candidates, one-sided candidates).
     pub(super) problems: Vec<String>,
+    /// Whether any valid base demonstrated a supplied pair at this instance.
+    supplied_pairs: std::collections::BTreeMap<String, bool>,
+    /// Supplied evidence across valid bases of this plan, by instance and declaring use.
+    pattern_witnesses: std::collections::BTreeMap<(String, Vec<SchemaStep>), bool>,
 }
 impl Notes {
     /// `dropped` candidates of one location; `sent` are the ones that WERE sent.
@@ -402,7 +444,21 @@ impl Notes {
         }
     }
     pub(super) fn check(&self) -> Result<()> {
-        ensure!(self.problems.is_empty(), "{}", self.problems.join("; "));
+        let mut problems = self.problems.clone();
+        let missing: BTreeSet<_> = self
+            .pattern_witnesses
+            .iter()
+            .filter_map(|((location, _), covered)| (!covered).then_some(location))
+            .collect();
+        for location in missing {
+            problems.push(format!("{location}: {MISSING_PATTERN}; {STRADDLE}"));
+        }
+        for (location, covered) in &self.supplied_pairs {
+            if !covered {
+                problems.push(format!("{location}: {STRADDLE}"));
+            }
+        }
+        ensure!(problems.is_empty(), "{}", problems.join("; "));
         ensure!(
             self.unsent.is_empty(),
             "decisive boundary vectors could not be sent ({}): annotate the query parameter or direct body property with {UNSENDABLE} and a reviewed reason, or tighten the bound",
@@ -416,6 +472,24 @@ impl Notes {
     }
     /// One line, counts only: never a candidate or a location's value.
     fn report(&self, method: &str, template: &str) {
+        if self.shape_only_patterns > 0 {
+            eprintln!(
+                "{method} {template}: {} finite patterns with shape evidence only (no derivable width relaxation)",
+                self.shape_only_patterns
+            );
+        }
+        if self.dominated_patterns > 0 {
+            eprintln!(
+                "{method} {template}: {} finite pattern edges implied by tighter length limits",
+                self.dominated_patterns
+            );
+        }
+        if self.implied > 0 {
+            eprintln!(
+                "{method} {template}: {} boundary pairs also refused by another constraint",
+                self.implied
+            );
+        }
         if self.minor > 0 || self.exempt > 0 {
             eprintln!(
                 "{method} {template}: {} non-decisive and {} reviewed-unsendable vector candidates were not sent",
@@ -432,108 +506,10 @@ impl Notes {
 /// schema that claims characters for a byte limit) cannot silently pass.
 pub(super) const MAX_BYTES: &str = "x-omg-max-bytes";
 
-/// A reviewed byte limit that applies to `instance`, or one of its nested values?
-fn bytes_ok(document: &Value, schema: &Value, instance: &Value, depth: usize) -> Result<bool> {
-    ensure!(depth < 16, "schema nesting too deep");
-    let mut nodes = Vec::new();
-    applicable(document, schema, instance, &mut nodes, 0)?;
-    match instance {
-        Value::String(text) => {
-            let over = nodes
-                .iter()
-                .filter_map(|node| node.get(MAX_BYTES).and_then(Value::as_u64))
-                .any(|limit| text.len() as u64 > limit);
-            Ok(!over)
-        }
-        Value::Object(map) => {
-            for (name, child) in map {
-                // Properties AND typed map values (`patternProperties` /
-                // `additionalProperties`) carry byte limits too.
-                if let Some(child_schema) = member_schema(&nodes, name)?
-                    && !bytes_ok(document, &child_schema, child, depth + 1)?
-                {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        }
-        Value::Array(items) => {
-            for (i, child) in items.iter().enumerate() {
-                // EVERY element: a positional schema, else the homogeneous `items`.
-                if let Some(item_schema) = element_schema(&nodes, i)
-                    && !bytes_ok(document, &item_schema, child, depth + 1)?
-                {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        }
-        _ => Ok(true),
-    }
-}
-
-/// Can any reviewed byte limit apply to an instance of `schema`? `false` only
-/// when no [`MAX_BYTES`] key exists anywhere in `schema` or in the schemas it
-/// references, so [`bytes_ok`] has nothing to judge. Every key and array item is
-/// followed, applicator or not, and an unresolved reference counts as a limit:
-/// the answer errs toward running the full check.
-pub(super) fn reaches_byte_limits(document: &Value, schema: &Value) -> bool {
-    fn walk(document: &Value, node: &Value, seen: &mut BTreeSet<String>) -> bool {
-        match node {
-            Value::Object(map) => {
-                if map.contains_key(MAX_BYTES) {
-                    return true;
-                }
-                if let Some(reference) = map.get("$ref") {
-                    let target = reference
-                        .as_str()
-                        .and_then(|r| r.strip_prefix('#'))
-                        .and_then(|pointer| document.pointer(pointer));
-                    match target {
-                        None => return true,
-                        Some(target) => {
-                            let first =
-                                seen.insert(reference.as_str().unwrap_or_default().to_owned());
-                            if first && walk(document, target, seen) {
-                                return true;
-                            }
-                        }
-                    }
-                }
-                map.values().any(|child| walk(document, child, seen))
-            }
-            Value::Array(items) => items.iter().any(|child| walk(document, child, seen)),
-            _ => false,
-        }
-    }
-    walk(document, schema, &mut BTreeSet::new())
-}
-
-/// [`reaches_byte_limits`], remembered for the nodes of the committed artifact
-/// (immutable, so an address names one schema for good); any other schema is
-/// searched on every call.
-fn byte_limits_apply(document: &Value, schema: &Value) -> bool {
-    static REMEMBERED: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<usize, bool>>,
-    > = std::sync::OnceLock::new();
-    if !std::ptr::eq(document, responses::artifact()) || !responses::is_artifact_node(schema) {
-        return reaches_byte_limits(document, schema);
-    }
-    let address = std::ptr::from_ref(schema) as usize;
-    let remembered = REMEMBERED.get_or_init(Default::default);
-    if let Some(found) = remembered.lock().unwrap().get(&address) {
-        return *found;
-    }
-    let found = reaches_byte_limits(document, schema);
-    remembered.lock().unwrap().insert(address, found);
-    found
-}
-
-/// The schema's verdict: JSON Schema validity plus the reviewed byte limits
-/// (judged only where one can apply).
+/// The keyword participates in the same Draft 2020-12 evaluation as the rest
+/// of the request schema, including branch selection and negation.
 pub(crate) fn accepts(document: &Value, schema: &Value, instance: &Value) -> Result<bool> {
-    Ok(valid(document, schema, instance)?
-        && (!byte_limits_apply(document, schema) || bytes_ok(document, schema, instance, 0)?))
+    Ok(responses::request_validator(document, schema)?.is_valid(instance))
 }
 
 /// `(min, max)` repetitions of a SIMPLE anchored pattern: one character class,
@@ -602,7 +578,7 @@ pub(super) fn pattern_candidates(
         "~".to_owned(),
         "\u{e9}".to_owned(),
     ];
-    for control in ['\n', '\0', '\u{7f}', '\u{85}'] {
+    for control in ['\n', '\0', '\u{7f}', '\u{85}', '\u{2028}'] {
         out.push(control.to_string());
         out.push(format!("{seed}{control}"));
         out.push(format!("{control}{seed}"));
@@ -648,6 +624,7 @@ pub(super) fn pattern_candidates(
 /// Decisive vectors of one location, by label (`kind@bound`).
 #[derive(Default)]
 struct Evidence {
+    implied: usize,
     labelled: Vec<(String, &'static str, Value)>,
     dropped: Vec<String>,
 }
@@ -655,6 +632,7 @@ struct Evidence {
 /// An at-limit vector the schema accepts and the vector just past it.
 #[derive(Clone)]
 struct Pair {
+    implied: bool,
     at: Value,
     over: Value,
 }
@@ -677,6 +655,7 @@ impl Evidence {
         let all = [Some(kinds.0), kinds.1];
         match found {
             Some(pair) => {
+                self.implied += usize::from(pair.implied);
                 self.labelled
                     .push((label(kinds.0, bound), kinds.0, pair.at));
                 if let Some(over) = kinds.1 {
@@ -733,7 +712,7 @@ fn relaxed(
         let mut schema = schema.clone();
         strip(&mut schema, key, &bound);
         // A fresh document is never the artifact: this compiles without caching.
-        responses::validator(&document, &schema)
+        responses::request_validator(&document, &schema)
     };
     // Only the immutable committed artifact is cached (by value of the request).
     let inference = std::ptr::eq(document, crate::inference_openapi::committed_artifact());
@@ -764,28 +743,66 @@ fn relaxed(
     Ok(validator)
 }
 
+/// Most generated bounds can be checked at their leaf. Below a parent
+/// choice the seed's synthetic child schema may conjoin alternative arms.
+struct BoundaryOracle<'a> {
+    schema: &'a Value,
+    body: Option<(&'a Value, &'a [Step])>,
+    rules: ByteDominance,
+}
+
+impl<'a> BoundaryOracle<'a> {
+    fn leaf(schema: &'a Value) -> Self {
+        Self {
+            schema,
+            body: None,
+            rules: ByteDominance::default(),
+        }
+    }
+
+    fn instance<'v>(&self, value: &'v Value) -> Cow<'v, Value> {
+        match self.body {
+            Some((base, path)) => Cow::Owned(set(base, path, Some(value.clone()))),
+            None => Cow::Borrowed(value),
+        }
+    }
+}
+
 /// The first candidate pair the schema accepts at the limit and refuses past
 /// it, preferring one the bound ALONE refuses (`relaxed` accepts it). `None`
 /// when no candidate satisfies the schema at the limit.
 fn find_pair(
     document: &Value,
-    schema: &Value,
+    oracle: &BoundaryOracle,
     relaxed: Option<&jsonschema::Validator>,
     candidates: impl Iterator<Item = (Value, Value)>,
 ) -> Result<Option<Pair>> {
     let mut implied = None;
     for (at, over) in candidates {
-        if !accepts(document, schema, &at)? || accepts(document, schema, &over)? {
+        let at_instance = oracle.instance(&at);
+        let over_instance = oracle.instance(&over);
+        if !accepts(document, oracle.schema, &at_instance)?
+            || accepts(document, oracle.schema, &over_instance)?
+        {
             continue;
         }
         let alone = match relaxed {
-            Some(relaxed) => relaxed.is_valid(&over),
-            None => valid(document, schema, &over)?,
+            Some(relaxed) => relaxed.is_valid(&over_instance),
+            // With no relaxed standard keyword this is the byte-only control.
+            None => valid(document, oracle.schema, &over_instance)?,
         };
         if alone {
-            return Ok(Some(Pair { at, over }));
+            return Ok(Some(Pair {
+                at,
+                over,
+                implied: false,
+            }));
         }
-        implied.get_or_insert(Pair { at, over });
+        implied.get_or_insert(Pair {
+            at,
+            over,
+            implied: true,
+        });
     }
     Ok(implied)
 }
@@ -881,7 +898,7 @@ fn byte_pairs<'a>(seed: &'a str, bytes: usize) -> impl Iterator<Item = (Value, V
 /// Can the schema hold a multibyte value at all (at its shortest length)?
 fn multibyte_possible(
     document: &Value,
-    schema: &Value,
+    oracle: &BoundaryOracle,
     seed: &str,
     shortest: usize,
     longest: usize,
@@ -891,7 +908,7 @@ fn multibyte_possible(
             let chars = shortest.max(head + 1);
             if chars <= longest
                 && let Some(candidate) = glyph_value(seed, head, glyph, chars)
-                && accepts(document, schema, &json!(candidate))?
+                && accepts(document, oracle.schema, &oracle.instance(&json!(candidate)))?
             {
                 return Ok(true);
             }
@@ -903,7 +920,7 @@ fn multibyte_possible(
 /// The length vectors of a string location, one pair per DISTINCT bound.
 fn string_bounds(
     document: &Value,
-    schema: &Value,
+    oracle: &BoundaryOracle,
     nodes: &[&Value],
     seed: &str,
     out: &mut Vec<(&'static str, Value)>,
@@ -918,10 +935,10 @@ fn string_bounds(
             evidence.settle(("minLength", Some("minLength-1")), min, None, dominated);
             continue;
         }
-        let validator = relaxed(document, schema, "minLength", min)?;
+        let validator = relaxed(document, oracle.schema, "minLength", min)?;
         let found = find_pair(
             document,
-            schema,
+            oracle,
             Some(&validator),
             ascii_pairs(seed, min as usize, min as usize - 1),
         )?;
@@ -933,20 +950,38 @@ fn string_bounds(
     }
     let shortest = mins.last().copied().unwrap_or(0) as usize;
     for &max in &maxs {
-        let dominated = Some(&max) != maxs.first();
+        let dominated = if byte_limits.is_empty() {
+            Some(&max) != maxs.first()
+        } else {
+            oracle.rules.max_chars.is_some_and(|cap| cap < max) || oracle.rules.excludes(max)
+        };
         if max >= LONGEST {
             evidence.settle(("maxLength", Some("maxLength+1")), max, None, dominated);
         } else {
-            let validator = relaxed(document, schema, "maxLength", max)?;
+            let validator = relaxed(document, oracle.schema, "maxLength", max)?;
             let found = find_pair(
                 document,
-                schema,
+                oracle,
                 Some(&validator),
                 ascii_pairs(seed, max as usize, max as usize + 1),
             )?;
             if found.is_none() {
                 out.push(("maxLength", json!(repeat_to(seed, max as usize))));
                 out.push(("maxLength+1", json!(repeat_to(seed, max as usize + 1))));
+            }
+            if found.as_ref().is_some_and(|pair| pair.implied) {
+                // A repeated unit can cross a length bound only at its next
+                // complete repetition. Keep the immediate neighbour as well.
+                let period = seed.chars().count();
+                if period > 1 {
+                    let next = (max as usize / period + 1).saturating_mul(period);
+                    if next > max as usize + 1 && next <= LONGEST as usize {
+                        let candidate = json!(repeat_to(seed, next));
+                        if validator.is_valid(&oracle.instance(&candidate)) {
+                            out.push(("past maxLength", candidate));
+                        }
+                    }
+                }
             }
             evidence.settle(("maxLength", Some("maxLength+1")), max, found, dominated);
         }
@@ -955,8 +990,11 @@ fn string_bounds(
         // character, or a schema that refuses multibyte text, leaves nothing
         // to tell apart (counted, not decisive).
         let kinds = ("multibyte maxLength", Some("multibyte maxLength+1"));
-        if byte_limits.iter().any(|limit| *limit < 2 * max)
-            || !multibyte_possible(document, schema, seed, shortest, max as usize)?
+        if oracle
+            .rules
+            .cap
+            .is_some_and(|limit| limit < max.saturating_mul(2))
+            || !multibyte_possible(document, oracle, seed, shortest, max as usize)?
         {
             evidence.dropped.push("multibyte not applicable".to_owned());
             // Still sent when small enough: the handler must agree with the
@@ -973,10 +1011,10 @@ fn string_bounds(
         } else if max > 20_000 {
             evidence.settle(kinds, max, None, dominated);
         } else {
-            let validator = relaxed(document, schema, "maxLength", max)?;
+            let validator = relaxed(document, oracle.schema, "maxLength", max)?;
             let found = find_pair(
                 document,
-                schema,
+                oracle,
                 Some(&validator),
                 glyph_pairs(seed, max as usize),
             )?;
@@ -986,7 +1024,7 @@ fn string_bounds(
     // A reviewed byte limit (every distinct one): ASCII and multibyte values of
     // EXACTLY the limit and of one byte more.
     for &limit in &byte_limits {
-        let dominated = Some(&limit) != byte_limits.first();
+        let dominated = oracle.rules.cap.is_some_and(|cap| cap < limit);
         if limit >= LONGEST {
             evidence.settle(("maxBytes", Some("maxBytes+1")), limit, None, dominated);
             evidence.settle(
@@ -999,20 +1037,23 @@ fn string_bounds(
         }
         let ascii = find_pair(
             document,
-            schema,
+            oracle,
             None,
             ascii_pairs(seed, limit as usize, limit as usize + 1)
                 .filter(|(at, _)| at.as_str().is_some_and(|t| t.len() == limit as usize)),
         )?;
-        let possible = multibyte_possible(document, schema, seed, shortest, usize::MAX)?;
-        let wide = if possible {
-            find_pair(document, schema, None, byte_pairs(seed, limit as usize))?
+        let possible = multibyte_possible(document, oracle, seed, shortest, usize::MAX)?;
+        // A short ASCII alternative can hide a longer multibyte match from
+        // the shortest-length probe. Try the byte edge when no ASCII pair fits.
+        let wide = if possible || (ascii.is_none() && !dominated) {
+            find_pair(document, oracle, None, byte_pairs(seed, limit as usize))?
         } else {
             None
         };
+        let test_multibyte = possible || wide.is_some();
         let exact = ascii.or_else(|| wide.clone());
         evidence.settle(("maxBytes", Some("maxBytes+1")), limit, exact, dominated);
-        if possible {
+        if test_multibyte {
             evidence.settle(
                 ("multibyte maxBytes", Some("multibyte maxBytes+1")),
                 limit,
@@ -1024,51 +1065,275 @@ fn string_bounds(
     Ok(())
 }
 
-const STRADDLE: &str = "supplied candidates must straddle the boundary: include a value the schema accepts and one it refuses that differs from it by ONE character added, removed or changed";
+const MISSING_PATTERN: &str = "the pattern has no derivable length bounds; supply boundary candidates or annotate it with x-omg-pattern-boundaries";
+const STRADDLE: &str = "supplied candidates must straddle the boundary: include a value the schema accepts and one it refuses that differs from it by one edit at the applicable edge (one character or one whole repeated unit)";
 
-/// Do the `(candidate, schema verdict)` pairs hold an accepted value and a
-/// refused one within edit distance 1 of it? Two candidates far apart (`0` and
-/// sixteen digits) prove nothing about WHERE the boundary lies.
-fn straddles(verdicts: &[(String, bool)]) -> bool {
-    fn one_edit(a: &str, b: &str) -> bool {
-        let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
-        let (short, long) = if a.len() <= b.len() {
-            (&a, &b)
+#[path = "supplied_boundaries.rs"]
+mod supplied_boundaries;
+
+use supplied_boundaries::{
+    ByteDominance, Edge, PatternSource, SchemaStep, pattern_width, wider_patterns,
+};
+
+struct PatternBoundary<'a> {
+    expression: &'a str,
+    maximum: Option<u64>,
+    wider: Vec<(String, usize)>,
+}
+
+/// Derive each expression once. All owners at this location share the work limit.
+fn pattern_boundaries<'a>(
+    expressions: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<PatternBoundary<'a>>> {
+    let mut remaining = 64 * 1024;
+    expressions
+        .into_iter()
+        .map(|expression| {
+            let width = pattern_width(expression);
+            let wider = match &width {
+                Some(w) => wider_patterns(expression, w.chars, &mut remaining)?,
+                None => Vec::new(),
+            };
+            Ok(PatternBoundary {
+                expression,
+                maximum: width.map(|w| w.chars as u64),
+                wider,
+            })
+        })
+        .collect()
+}
+
+/// A supplied pair settles only the pattern whose one-keyword relaxation
+/// admits the refused request. Bounds that already cover the whole location
+/// retain their ordinary shared boundary check.
+fn settle_patterns(
+    source: &PatternSource,
+    schemas: &ApplicableSchemas,
+    rules: &ByteDominance,
+    location: &str,
+    verdicts: Option<&[(String, bool)]>,
+    notes: &mut Notes,
+    mut confirms: impl FnMut(Edge<'_>, &str, &str) -> Result<bool>,
+) -> Result<()> {
+    let is_string = types(&schemas.nodes).contains("string");
+    let needs_witness = is_string && rules.needs_pattern_witness;
+    let mut stale = is_string
+        && (schemas.annotated_simple_pattern
+            || (schemas.annotated_complex_pattern && !needs_witness));
+    let mut witnessed = false;
+    if let Some(verdicts) = verdicts {
+        let mut check =
+            |patterns: &[PatternBoundary], site: Option<&[SchemaStep]>, notes: &mut Notes| {
+                straddles(
+                    &schemas.nodes,
+                    patterns,
+                    rules,
+                    verdicts,
+                    notes,
+                    |keyword, bound, replacement, accepted, refused| {
+                        confirms(
+                            Edge {
+                                keyword,
+                                bound,
+                                replacement,
+                                site,
+                            },
+                            accepted,
+                            refused,
+                        )
+                    },
+                )
+            };
+        if needs_witness {
+            let uses = source.uses()?;
+            for boundary in pattern_boundaries(uses.keys().copied())? {
+                let complex = simple_bounds(boundary.expression).is_none();
+                for owner in &uses[boundary.expression] {
+                    let covered = check(std::slice::from_ref(&boundary), Some(&owner.site), notes)?;
+                    witnessed |= covered;
+                    if complex && !owner.annotated {
+                        *notes
+                            .pattern_witnesses
+                            .entry((location.to_owned(), owner.site.clone()))
+                            .or_default() |= covered;
+                    }
+                    stale |= owner.annotated && covered;
+                }
+            }
         } else {
-            (&b, &a)
-        };
-        match long.len() - short.len() {
-            0 => short.iter().zip(long).filter(|(x, y)| x != y).count() == 1,
-            1 => (0..long.len()).any(|skip| {
-                long.iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i != skip)
-                    .map(|(_, c)| c)
-                    .eq(short.iter())
-            }),
-            _ => false,
+            let boundaries = pattern_boundaries(strings(&schemas.nodes, "pattern"))?;
+            witnessed = check(&boundaries, None, notes)?;
         }
     }
-    verdicts.iter().any(|(accepted, ok)| {
-        *ok && verdicts
-            .iter()
-            .any(|(refused, ok)| !*ok && one_edit(accepted, refused))
-    })
+    if verdicts.is_none() && needs_witness && schemas.unannotated_complex_pattern {
+        notes
+            .problems
+            .push(format!("{location}: {MISSING_PATTERN}"));
+    }
+    if stale {
+        notes.problems.push(format!("{location}: {PATTERN_BOUNDARIES} is stale: the pattern, a length cap or its supplied candidates already cover its boundaries; delete it"));
+    }
+    if verdicts.is_some() {
+        *notes.supplied_pairs.entry(location.to_owned()).or_default() |= witnessed;
+    }
+    Ok(())
+}
+
+/// An adjacent accepted/refused pair at the effective limit. Byte caps and
+/// JSON Schema character limits use different units for the same candidate.
+fn straddles(
+    nodes: &[&Value],
+    patterns: &[PatternBoundary],
+    rules: &ByteDominance,
+    verdicts: &[(String, bool)],
+    notes: &mut Notes,
+    mut confirms: impl FnMut(&str, &Value, Option<&Value>, &str, &str) -> Result<bool>,
+) -> Result<bool> {
+    let maximum = patterns.iter().filter_map(|p| p.maximum).min();
+    let char_cap = distinct_u64(nodes, "maxLength").first().copied();
+    let byte_cap = distinct_u64(nodes, MAX_BYTES).first().copied();
+    let edge = maximum.map(|width| rules.max_chars.unwrap_or(width).min(width));
+    let byte_dominates = edge
+        .or(char_cap)
+        .is_some_and(|target| rules.excludes(target));
+    // The extra repetition may contain several scalars (a hex byte, for
+    // example). The rest of the string must agree before and after it.
+    fn insertion(short: &str, long: &str) -> bool {
+        if long.len() <= short.len() {
+            return false;
+        }
+        let common = short
+            .chars()
+            .zip(long.chars())
+            .take_while(|(a, b)| a == b)
+            .map(|(c, _)| c.len_utf8())
+            .sum::<usize>();
+        long[common..].ends_with(&short[common..])
+    }
+    for (accepted, _) in verdicts.iter().filter(|(_, ok)| *ok) {
+        for (refused, _) in verdicts.iter().filter(|(_, ok)| !*ok) {
+            let at = accepted.chars().count() as u64;
+            let over = refused.chars().count() as u64;
+            let adjacent = match over.cmp(&at) {
+                std::cmp::Ordering::Equal => {
+                    accepted
+                        .chars()
+                        .zip(refused.chars())
+                        .filter(|(a, b)| a != b)
+                        .count()
+                        == 1
+                }
+                std::cmp::Ordering::Less => at - over == 1 && insertion(refused, accepted),
+                std::cmp::Ordering::Greater => over - at == 1 && insertion(accepted, refused),
+            };
+            if let Some(edge) = edge {
+                if adjacent
+                    && at < edge
+                    && over <= edge
+                    && let Some(cap) = rules.cap
+                    && byte_dominates
+                    && accepted.len() as u64 == cap
+                    && refused.len() as u64 > cap
+                    && confirms(MAX_BYTES, &json!(cap), None, accepted, refused)?
+                {
+                    notes.dominated_patterns += 1;
+                    return Ok(true);
+                }
+                // An alternative matching the seed can end before the actual
+                // character cap. A whole-schema verdict change proves the
+                // supplied pair reaches an independent maxLength edge.
+                if adjacent
+                    && over == at + 1
+                    && rules.max_chars == Some(at)
+                    && confirms("maxLength", &json!(at), None, accepted, refused)?
+                {
+                    notes.dominated_patterns += 1;
+                    return Ok(true);
+                }
+                if at != edge
+                    || over <= edge
+                    || !insertion(accepted, refused)
+                    || maximum.is_some_and(|width| edge < width)
+                {
+                    continue;
+                }
+            }
+            if maximum.is_none() && !adjacent {
+                continue;
+            }
+            if patterns.is_empty() {
+                return Ok(true);
+            }
+            // A supplied value can also witness an explicit cap beside an
+            // unbounded pattern (for example a printable name with maxLength).
+            if maximum.is_none() && !rules.needs_pattern_witness {
+                for (key, limit, at, over) in [
+                    (
+                        "maxLength",
+                        char_cap,
+                        accepted.chars().count(),
+                        refused.chars().count(),
+                    ),
+                    (MAX_BYTES, byte_cap, accepted.len(), refused.len()),
+                ] {
+                    if let Some(cap) = limit
+                        && at as u64 == cap
+                        && over as u64 > cap
+                        && (key != MAX_BYTES
+                            || char_cap.is_none()
+                            || (byte_dominates && Some(cap) == rules.cap))
+                        && confirms(key, &json!(cap), None, accepted, refused)?
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+            for boundary in patterns {
+                let pattern = boundary.expression;
+                let wider = &boundary.wider;
+                if maximum.is_some() && boundary.maximum != maximum
+                    || !super::validation::pattern_validator(pattern)?.is_valid(&json!(accepted))
+                    || super::validation::pattern_validator(pattern)?.is_valid(&json!(refused))
+                {
+                    continue;
+                }
+                if wider.is_empty() {
+                    if adjacent && confirms("pattern", &json!(pattern), None, accepted, refused)? {
+                        notes.shape_only_patterns += usize::from(boundary.maximum.is_some());
+                        return Ok(true);
+                    }
+                } else {
+                    for (variant, step) in wider {
+                        if over - at <= *step as u64
+                            && super::validation::pattern_validator(variant)?
+                                .is_valid(&json!(refused))
+                            && confirms(
+                                "pattern",
+                                &json!(pattern),
+                                Some(&json!(variant)),
+                                accepted,
+                                refused,
+                            )?
+                        {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// The candidates of one location and the decisive kinds it could not produce.
 struct Mutations {
+    implied: usize,
     vectors: Vec<(&'static str, Value)>,
     /// Decisive vectors of one bound, by label (`maxLength+1@64`): built from
     /// candidates that satisfy the other constraints, see [`length_pair`].
     labelled: Vec<(String, &'static str, Value)>,
     /// Labels (or kinds) the harness could not send or build meaningfully.
     dropped: Vec<String>,
-    /// The location has a pattern with no derivable length bounds, no reviewed
-    /// [`PATTERN_BOUNDARIES`] and no supplied candidates.
-    needs_candidates: bool,
-    /// [`PATTERN_BOUNDARIES`] is present but nothing needs it any more.
-    stale_pattern_boundaries: bool,
 }
 
 /// Every `const` value and `enum` member a schema declares, including those of
@@ -1107,16 +1372,15 @@ fn declared_values(
 fn scalar_mutations(
     document: &Value,
     schema: &Value,
-    nodes: &[&Value],
+    oracle: &BoundaryOracle,
+    schemas: &ApplicableSchemas<'_>,
     value: &Value,
     query: bool,
-    candidates: usize,
 ) -> Result<Mutations> {
+    let nodes = schemas.nodes.as_slice();
     let mut out: Vec<(&'static str, Value)> = Vec::new();
     let mut evidence = Evidence::default();
     let mut dropped: Vec<String> = Vec::new();
-    let mut needs_candidates = false;
-    let mut stale_pattern_boundaries = false;
     let kinds = types(nodes);
     if !query {
         for wrong in [
@@ -1305,28 +1569,10 @@ fn scalar_mutations(
     // String bounds are derived from the VALID value so the alphabet stays valid.
     if kinds.contains("string") {
         let seed = value.as_str().unwrap_or("a");
-        string_bounds(document, schema, nodes, seed, &mut out, &mut evidence)?;
+        string_bounds(document, oracle, nodes, seed, &mut out, &mut evidence)?;
         dropped.append(&mut evidence.dropped);
-        if let Some(pattern) = first(nodes, "pattern").and_then(Value::as_str) {
-            // A pattern is bounded by its own shape, or by `maxLength` /
-            // `x-omg-max-bytes` (a `minLength` alone bounds nothing from above),
-            // or by a reviewed reason.
-            let bounded = simple_bounds(pattern).is_some()
-                || !distinct_u64(nodes, "maxLength").is_empty()
-                || nodes.iter().any(|node| {
-                    node.get(MAX_BYTES).is_some() || node.get(PATTERN_BOUNDARIES).is_some()
-                });
-            needs_candidates = !bounded && candidates == 0;
-            // The reviewed reason is for a pattern whose bounds cannot be
-            // derived and for which no candidates are supplied; once the
-            // pattern, a maxLength/maxBytes or candidates cover it, it is stale.
-            let own = simple_bounds(pattern).is_some()
-                || !distinct_u64(nodes, "maxLength").is_empty()
-                || nodes.iter().any(|node| node.get(MAX_BYTES).is_some());
-            stale_pattern_boundaries = nodes
-                .iter()
-                .any(|node| node.get(PATTERN_BOUNDARIES).is_some())
-                && (own || candidates > 0);
+        let patterns = strings(nodes, "pattern");
+        for pattern in patterns {
             let (shapes, lengths) = pattern_candidates(pattern, seed, &mut dropped);
             for (length, candidate) in lengths {
                 let kind = if accepts(document, schema, &json!(candidate))? {
@@ -1351,15 +1597,17 @@ fn scalar_mutations(
                 out.push((kind, json!(candidate)));
             }
         }
-        if let Some(format) = first(nodes, "format").and_then(Value::as_str) {
-            let bad: &[&str] = match format {
-                "date" => &["2024-02-30", "2024-13-01", "not-a-date"],
-                "date-time" => &["yesterday", "2024-01-01"],
-                "uuid" => &["not-a-uuid"],
-                "email" => &["not-an-email"],
-                "uri" => &["not a uri"],
-                _ => &[],
-            };
+        let formats = strings(nodes, "format");
+        if formats.contains("uuid") && formats.contains("uri") {
+            out.push(("format violation", json!("urn:example:resource")));
+            out.push((
+                "format violation",
+                json!("123e4567e89b12d3a456426614174000"),
+            ));
+        }
+        for format in formats {
+            let bad = format_violations(format)
+                .with_context(|| format!("no request violation vectors for format {format}"))?;
             for candidate in bad {
                 out.push(("format violation", json!(candidate)));
             }
@@ -1371,11 +1619,10 @@ fn scalar_mutations(
         }
     }
     Ok(Mutations {
+        implied: evidence.implied,
         vectors: out,
         labelled: evidence.labelled,
         dropped,
-        needs_candidates,
-        stale_pattern_boundaries,
     })
 }
 
@@ -1401,6 +1648,28 @@ fn render(value: &Value) -> String {
         Value::String(text) => text.clone(),
         other => other.to_string(),
     }
+}
+
+/// Gather the possible wire types before a typed value can select a union arm.
+fn query_type_nodes<'a>(
+    document: &'a Value,
+    schema: &'a Value,
+    out: &mut Vec<&'a Value>,
+    depth: usize,
+) -> Result<()> {
+    ensure!(depth < 16, "query schema nesting too deep");
+    for node in chain(document, schema)? {
+        out.push(node);
+        for branch in ["allOf", "anyOf", "oneOf"]
+            .iter()
+            .flat_map(|k| node[k].as_array().into_iter().flatten())
+            .chain(node.get("then"))
+            .chain(node.get("else"))
+        {
+            query_type_nodes(document, branch, out, depth + 1)?;
+        }
+    }
+    Ok(())
 }
 
 /// A raw query string value as the typed JSON the schema describes (query
@@ -1516,16 +1785,28 @@ pub(super) fn query_plan(
             .find(|(n, _)| n == name)
             .map(|(_, v)| v.as_str())
             .context("every documented query parameter needs a valid base or seed value")?;
-        let mut nodes = Vec::new();
-        let kinds = {
-            applicable(document, schema, &json!(raw), &mut nodes, 0)?;
-            types(&nodes)
+        let mut type_nodes = Vec::new();
+        query_type_nodes(document, schema, &mut type_nodes, 0)?;
+        let kinds = types(&type_nodes);
+        let wire_value = |schema: &Value, raw: &str| -> Result<Value> {
+            let typed = coerce(&kinds, raw);
+            // A numeric-looking value may already satisfy a string arm.
+            if !typed.is_string()
+                && kinds.contains("string")
+                && accepts(document, schema, &json!(raw))?
+            {
+                return Ok(json!(raw));
+            }
+            Ok(typed)
         };
+        let typed = wire_value(schema, raw)?;
+        let mut schemas = ApplicableSchemas::default();
+        applicable(document, schema, &typed, &mut schemas, 0)?;
+        let nodes = schemas.nodes.as_slice();
         ensure!(
-            valid(document, schema, &coerce(&kinds, raw))?,
+            accepts(document, schema, &typed)?,
             "the valid base value of a query parameter must satisfy its schema"
         );
-        let mut seen = BTreeSet::from([raw.to_owned()]);
         if base.iter().any(|(n, _)| n == name) {
             out.push(QueryCase {
                 param: name.clone(),
@@ -1539,43 +1820,24 @@ pub(super) fn query_plan(
             .filter(|(n, _)| n == name)
             .map(|(_, v)| v.as_str())
             .collect();
-        let mut mutations = scalar_mutations(
-            document,
-            schema,
-            &nodes,
-            &coerce(&kinds, raw),
-            true,
-            supplied.len(),
-        )?;
-        if mutations.needs_candidates {
-            notes.problems.push(format!(
-                "query parameter {name}: the pattern has no derivable length bounds; supply boundary candidates or annotate it with {PATTERN_BOUNDARIES}"
-            ));
+        let supplied_values: BTreeSet<_> = supplied.iter().copied().collect();
+        // A supplied spelling must have its own planned request, including when
+        // it equals the seed for a parameter omitted by the valid base.
+        let mut seen = BTreeSet::new();
+        if !supplied_values.contains(raw) {
+            seen.insert(raw.to_owned());
         }
-        if mutations.stale_pattern_boundaries {
-            notes.problems.push(format!(
-                "query parameter {name}: {PATTERN_BOUNDARIES} is stale: the pattern, a maxLength or the supplied candidates already cover its boundaries; delete it"
-            ));
-        }
-        if !supplied.is_empty() {
-            let verdicts = supplied
-                .iter()
-                .map(|v| {
-                    Ok((
-                        v.to_string(),
-                        accepts(document, schema, &coerce(&kinds, v))?,
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            if !straddles(&verdicts) {
-                notes
-                    .problems
-                    .push(format!("query parameter {name}: {STRADDLE}"));
-            }
-            mutations
-                .vectors
-                .extend(supplied.iter().map(|v| ("supplied candidate", json!(v))));
-        }
+        let first_case = out.len();
+        let rules = ByteDominance::at(document, schema, &typed, &[], nodes, !supplied.is_empty())?;
+        let oracle = BoundaryOracle {
+            rules,
+            ..BoundaryOracle::leaf(schema)
+        };
+        let mut mutations = scalar_mutations(document, schema, &oracle, &schemas, &typed, true)?;
+        mutations
+            .vectors
+            .extend(supplied.iter().map(|v| ("supplied candidate", json!(v))));
+        notes.implied += mutations.implied;
         let mut dropped = mutations.dropped;
         let mut sent: Vec<String> = Vec::new();
         let all = mutations.labelled.into_iter().chain(
@@ -1610,7 +1872,7 @@ pub(super) fn query_plan(
                 {
                     serde_json::from_str(&raw)?
                 } else {
-                    coerce(&kinds, &raw)
+                    wire_value(schema, &raw)?
                 };
                 let accept = accepts(document, schema, &typed)?;
                 out.push(QueryCase {
@@ -1621,6 +1883,52 @@ pub(super) fn query_plan(
                 });
             }
         }
+        // A schema boundary needs sendable cases where the HTTP runner expects
+        // the handler to agree with the schema.
+        let verdicts: Vec<_> = out[first_case..]
+            .iter()
+            .filter_map(|case| {
+                if let Edit::Set(raw) = &case.edit
+                    && supplied_values.contains(raw.as_str())
+                    && !pins_integer_refusal(document, case.kind)
+                {
+                    Some((raw.clone(), case.accept))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let source = PatternSource {
+            document,
+            schema,
+            seed: &typed,
+            path: &[],
+        };
+        settle_patterns(
+            &source,
+            &schemas,
+            &oracle.rules,
+            &format!("query parameter {name}"),
+            (!supplied.is_empty()).then_some(verdicts.as_slice()),
+            &mut notes,
+            |edge, accepted, refused| {
+                let accepted = wire_value(schema, accepted)?;
+                if !accepted.is_string() {
+                    return Ok(false);
+                }
+                if let ("pattern", Some(pattern)) = (edge.keyword, edge.bound.as_str())
+                    && !super::validation::pattern_validator(pattern)?.is_valid(&accepted)
+                {
+                    return Ok(false);
+                }
+                for variant in source.relaxations(&accepted, edge)? {
+                    if accepts(document, &variant, &wire_value(&variant, refused)?)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            },
+        )?;
         let exempt = *unsendable;
         let before = notes.exempt;
         notes.settle(name, &dropped, &sent, exempt);
@@ -1691,6 +1999,11 @@ fn mismatch(
     )
 }
 
+fn pins_integer_refusal(document: &Value, kind: &str) -> bool {
+    document["x-omg-integer-encoding"] == "json-integer-literal"
+        && kind.starts_with("integer encoding ")
+}
+
 // JSON Schema cannot express this lexical constraint. A declared document
 // pins the divergence rather than pretending these values are schema-invalid.
 fn integer_refusal(
@@ -1699,9 +2012,7 @@ fn integer_refusal(
     schema_accepts: bool,
     probe: &Probe,
 ) -> Result<bool> {
-    if document["x-omg-integer-encoding"] != "json-integer-literal"
-        || !kind.starts_with("integer encoding ")
-    {
+    if !pins_integer_refusal(document, kind) {
         return Ok(false);
     }
     ensure!(
@@ -1792,6 +2103,7 @@ pub(crate) async fn run_query_with<C>(
 /// for a callback, for example); `seeds` give valid values for documented
 /// optional parameters that request does not carry; `send` issues the request
 /// target's query string and returns the exchange with the handler's verdict.
+#[cfg(feature = "integration-tests")]
 pub(crate) async fn query_vectors<C>(
     fixtures: &mut PositiveFixtures,
     method: &str,
@@ -1806,6 +2118,7 @@ pub(crate) async fn query_vectors<C>(
 /// [`query_vectors`] with `candidates`: `(parameter, value)` boundary values for a
 /// parameter whose pattern has no derivable length bounds (the expected verdict
 /// of each is computed from the schema; they must include accepted and refused ones).
+#[cfg(feature = "integration-tests")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn query_vectors_extended<C>(
     fixtures: &mut PositiveFixtures,
@@ -1841,6 +2154,7 @@ pub(crate) async fn query_vectors_extended<C>(
     fixtures.record_vectors(method, template, "query");
 }
 
+#[cfg(feature = "integration-tests")]
 fn own(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
     pairs
         .iter()
@@ -1849,6 +2163,7 @@ fn own(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
 }
 
 /// [`query_vectors`] for operations whose valid request is a fixed query.
+#[cfg(feature = "integration-tests")]
 pub(crate) async fn query_vectors_fixed(
     fixtures: &mut PositiveFixtures,
     method: &str,
@@ -1977,6 +2292,19 @@ struct Walk<'a> {
     walked: std::collections::BTreeMap<String, (Value, BTreeSet<String>)>,
 }
 impl Walk<'_> {
+    fn push_boundary(&mut self, path: &[Step], kind: &'static str, value: Value) -> Result<()> {
+        if !(kind == "pattern candidate" || kind == "pattern violation") {
+            let at_limit = !kind.ends_with("+1") && !kind.ends_with("-1");
+            let body = set(&self.valid_body, path, Some(value.clone()));
+            ensure!(
+                accepts(self.document, self.root_schema, &body)? == at_limit,
+                "{kind} at {}: decisive pair needs a whole-request boundary witness",
+                pointer(path)
+            );
+        }
+        self.push(path, kind, Some(value))
+    }
+
     fn push(&mut self, path: &[Step], kind: &'static str, new: Option<Value>) -> Result<()> {
         let body = set(&self.valid_body, path, new);
         if body == self.valid_body
@@ -2028,7 +2356,7 @@ impl Walk<'_> {
         Ok(())
     }
     /// The caller's seed for an absent declared location: send it ADDED to the
-    /// valid body, then walk the WHOLE seeded body from its root (a seed such as
+    /// valid body, then walk a schema-valid result from its root (a seed such as
     /// `/mode` changes which conditional arms and union branches constrain the
     /// siblings, so the siblings must be mutated in the seeded base too).
     fn seeded(&mut self, path: &mut [Step]) -> Result<()> {
@@ -2038,9 +2366,12 @@ impl Walk<'_> {
         };
         self.used.insert(at);
         self.push(path, "optional added", Some(seed.clone()))?;
-        let base = set(&self.valid_body, path, Some(seed));
+        self.walk_base(set(&self.valid_body, path, Some(seed)))
+    }
+
+    fn walk_base(&mut self, base: Value) -> Result<()> {
         let key = serde_json::to_string(&base)?;
-        if self.bases.insert(key.clone()) {
+        if self.bases.insert(key.clone()) && accepts(self.document, self.root_schema, &base)? {
             let saved = std::mem::replace(&mut self.valid_body, base.clone());
             let saved_key = std::mem::replace(&mut self.valid_key, key);
             let walked = self.walk(self.root_schema, &base, &mut Vec::new());
@@ -2197,7 +2528,7 @@ impl Walk<'_> {
             let validator = relaxed(self.document, schema, key, bound)?;
             let found = find_pair(
                 self.document,
-                schema,
+                &BoundaryOracle::leaf(schema),
                 Some(&validator),
                 std::iter::once((Value::Array(at.clone()), Value::Array(over.clone()))),
             )?;
@@ -2208,6 +2539,7 @@ impl Walk<'_> {
             }
             evidence.settle(kinds, bound, found, dominated);
         }
+        self.notes.implied += evidence.implied;
         let sent: Vec<&str> = evidence
             .labelled
             .iter()
@@ -2223,33 +2555,45 @@ impl Walk<'_> {
             decisively_bounded(nodes),
         );
         for (_, kind, value) in evidence.labelled {
-            self.push(path, kind, Some(value))?;
+            self.push_boundary(path, kind, value)?;
         }
         Ok(())
     }
     fn walk(&mut self, schema: &Value, value: &Value, path: &mut Vec<Step>) -> Result<()> {
         ensure!(path.len() < 12, "request body nesting too deep");
+        let mut schemas = ApplicableSchemas::default();
+        applicable(self.document, schema, value, &mut schemas, 0)?;
+        let nodes = schemas.nodes.as_slice();
         self.walked
             .entry(self.valid_key.clone())
             .or_insert_with(|| (self.valid_body.clone(), BTreeSet::new()))
             .1
             .insert(raw_pointer(path));
-        let mut nodes = Vec::new();
-        applicable(self.document, schema, value, &mut nodes, 0)?;
         let here = pointer(path);
         let supplied = self.candidates.get(&here).cloned().unwrap_or_default();
-        let mutations =
-            scalar_mutations(self.document, schema, &nodes, value, false, supplied.len())?;
-        if mutations.needs_candidates {
-            self.notes.problems.push(format!(
-                "{here}: the pattern has no derivable length bounds; supply boundary candidates or annotate it with {PATTERN_BOUNDARIES}"
-            ));
-        }
-        if mutations.stale_pattern_boundaries {
-            self.notes.problems.push(format!(
-                "{here}: {PATTERN_BOUNDARIES} is stale: the pattern, a maxLength or the supplied candidates already cover its boundaries; delete it"
-            ));
-        }
+        let rules = ByteDominance::at(
+            self.document,
+            self.root_schema,
+            &self.valid_body,
+            path,
+            nodes,
+            !supplied.is_empty(),
+        )?;
+        let oracle = if rules.parent_choice {
+            BoundaryOracle {
+                schema: self.root_schema,
+                body: Some((&self.valid_body, path)),
+                rules,
+            }
+        } else {
+            BoundaryOracle {
+                rules,
+                ..BoundaryOracle::leaf(schema)
+            }
+        };
+        let mutations = scalar_mutations(self.document, schema, &oracle, &schemas, value, false)?;
+        let rules = oracle.rules;
+        self.notes.implied += mutations.implied;
         let sent: Vec<&str> = mutations
             .vectors
             .iter()
@@ -2257,35 +2601,58 @@ impl Walk<'_> {
             .chain(mutations.labelled.iter().map(|(label, ..)| label.as_str()))
             .collect();
         let exempt = nodes.iter().any(|node| node.get(UNSENDABLE).is_some());
-        let bounded = decisively_bounded(&nodes);
+        let bounded = decisively_bounded(nodes);
         if exempt && bounded {
             self.exempt_used.entry(here.clone()).or_insert(false);
         }
         self.settle_at(&here, &mutations.dropped, &sent, exempt, bounded);
         // Decisive kinds first: a body sent twice keeps the first kind's name.
         for (_, kind, new) in mutations.labelled {
-            self.push(path, kind, Some(new))?;
+            self.push_boundary(path, kind, new)?;
         }
         for (kind, new) in mutations.vectors {
             self.push(path, kind, Some(new))?;
         }
         if !supplied.is_empty() {
             self.candidates_used.insert(here.clone());
-            let verdicts = supplied
-                .iter()
-                .map(|candidate| {
-                    Ok((
-                        render(candidate),
-                        accepts(self.document, schema, candidate)?,
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            if !straddles(&verdicts) {
-                self.notes.problems.push(format!("{here}: {STRADDLE}"));
+        }
+        let mut verdicts = Vec::new();
+        let patterned = nodes.iter().any(|node| node.get("pattern").is_some());
+        for candidate in &supplied {
+            let body = set(&self.valid_body, path, Some(candidate.clone()));
+            let verdict = accepts(self.document, self.root_schema, &body)?;
+            if (!patterned || candidate.is_string())
+                && (rules.parent_choice || accepts(self.document, schema, candidate)? == verdict)
+            {
+                verdicts.push((render(candidate), verdict));
             }
-            for candidate in supplied {
-                self.push(path, "supplied candidate", Some(candidate))?;
-            }
+        }
+        let source = PatternSource {
+            document: self.document,
+            schema: self.root_schema,
+            seed: &self.valid_body,
+            path,
+        };
+        settle_patterns(
+            &source,
+            &schemas,
+            &rules,
+            &here,
+            (!supplied.is_empty()).then_some(verdicts.as_slice()),
+            &mut self.notes,
+            |edge, accepted, refused| {
+                let accepted = set(&self.valid_body, path, Some(json!(accepted)));
+                let body = set(&self.valid_body, path, Some(json!(refused)));
+                for schema in source.relaxations(&accepted, edge)? {
+                    if accepts(self.document, &schema, &body)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            },
+        )?;
+        for candidate in supplied {
+            self.push(path, "supplied candidate", Some(candidate))?;
         }
         if !path.is_empty() {
             self.push(path, "omitted", None)?;
@@ -2298,7 +2665,7 @@ impl Walk<'_> {
                 for (name, child) in map {
                     // Only schema-declared names (properties and typed map
                     // values) are walked (and reported).
-                    if let Some(child_schema) = member_schema(&nodes, name)? {
+                    if let Some(child_schema) = member_schema(nodes, name)? {
                         path.push(Step::Key(name.clone()));
                         self.walk(&child_schema, child, path)?;
                         path.pop();
@@ -2313,7 +2680,7 @@ impl Walk<'_> {
                     .filter(|name| !map.contains_key(*name))
                     .collect();
                 for name in absent {
-                    if child_schema(&nodes, name).is_some() {
+                    if child_schema(nodes, name).is_some() {
                         path.push(Step::Key(name.clone()));
                         self.seeded(path)?;
                         path.pop();
@@ -2321,7 +2688,7 @@ impl Walk<'_> {
                 }
             }
             Value::Array(items) => {
-                self.array_bounds(schema, &nodes, items, path)?;
+                self.array_bounds(schema, nodes, items, path)?;
                 self.push(path, "empty array", Some(json!([])))?;
                 // Every positional index, and one element of each distinct
                 // signature (the union arms and conditional branches it matches)
@@ -2329,10 +2696,10 @@ impl Walk<'_> {
                 // another arm is a different location and must be mutated too.
                 let mut signatures = BTreeSet::new();
                 for (i, item) in items.iter().enumerate() {
-                    let Some(item_schema) = element_schema(&nodes, i) else {
+                    let Some(item_schema) = element_schema(nodes, i) else {
                         continue;
                     };
-                    if !positional(&nodes, i) {
+                    if !positional(nodes, i) {
                         let signature = request_reach::reached(self.document, &item_schema, item)?;
                         if !signatures.insert(signature) {
                             continue;
@@ -2343,7 +2710,7 @@ impl Walk<'_> {
                     path.pop();
                 }
                 // The next positional item, when the caller seeded it.
-                if positional(&nodes, items.len()) {
+                if positional(nodes, items.len()) {
                     path.push(Step::Index(items.len()));
                     self.seeded(path)?;
                     path.pop();
@@ -2381,30 +2748,23 @@ fn child_schema<'a>(nodes: &[&'a Value], name: &str) -> Option<Cow<'a, Value>> {
 /// `patternProperties` value whose pattern matches the name, or the schema-valued
 /// `additionalProperties` when neither selects it.
 fn member_schema<'a>(nodes: &[&'a Value], name: &str) -> Result<Option<Cow<'a, Value>>> {
-    let mut parts: Vec<Cow<'a, Value>> = nodes
-        .iter()
-        .filter_map(|node| node["properties"].get(name))
-        .map(Cow::Borrowed)
-        .collect();
-    let mut selected = !parts.is_empty();
+    let mut parts = Vec::new();
     for node in nodes {
+        let property = node["properties"].get(name);
+        let mut selected = property.is_some();
+        parts.extend(property.map(Cow::Borrowed));
         for (pattern, child) in node["patternProperties"].as_object().into_iter().flatten() {
-            if child.is_object()
-                && super::validation::pattern_validator(pattern)?
-                    .is_valid(&Value::String(name.to_owned()))
-            {
+            if super::validation::pattern_validator(pattern)?.is_valid(&json!(name)) {
                 selected = true;
-                parts.push(Cow::Borrowed(child));
+                if child.is_object() {
+                    parts.push(Cow::Borrowed(child));
+                }
             }
         }
-    }
-    if !selected {
-        parts.extend(
-            nodes
-                .iter()
-                .filter_map(|node| node.get("additionalProperties").filter(|v| v.is_object()))
-                .map(Cow::Borrowed),
-        );
+        if !selected && let Some(child) = node.get("additionalProperties").filter(|v| v.is_object())
+        {
+            parts.push(Cow::Borrowed(child));
+        }
     }
     Ok(combine(parts))
 }
@@ -2473,7 +2833,7 @@ fn distinct_variants(
             Value::Null => Vec::new(),
         }
     }
-    let validator = responses::validator(document, schema)?;
+    let validator = responses::request_validator(document, schema)?;
     let mut seen: BTreeSet<String> = taken
         .iter()
         .chain([template])
@@ -2614,9 +2974,17 @@ pub(super) fn body_plan(
         walked: std::collections::BTreeMap::new(),
     };
     walk.walk(schema, valid_body, &mut Vec::new())?;
+    for (_, base) in seeds.iter().filter(|(at, _)| at.is_empty()) {
+        ensure!(
+            accepts(document, schema, base)?,
+            "alternate request body must satisfy its schema"
+        );
+        walk.push(&[], "alternate valid body", Some(base.clone()))?;
+        walk.walk_base(base.clone())?;
+    }
     for (at, _) in seeds {
         ensure!(
-            walk.used.contains(at),
+            at.is_empty() || walk.used.contains(at),
             "seed at {at} names no declared optional location that the valid body omits"
         );
     }
@@ -2759,7 +3127,12 @@ pub(super) fn owns_next(kind: &str, location: &str) -> bool {
 /// in minutes rather than after every vector. `finish` always FAILS such a run
 /// (it is never a contract check); the full run without it is the gate.
 pub(crate) fn plan_only() -> bool {
-    std::env::var_os("OMG_OPENAPI_PLAN_ONLY").is_some_and(|v| v == "1")
+    let enabled = std::env::var_os("OMG_OPENAPI_PLAN_ONLY").is_some_and(|v| v == "1");
+    assert!(
+        !enabled || std::env::var_os("GITHUB_ACTIONS").is_none(),
+        "OMG_OPENAPI_PLAN_ONLY cannot run in GitHub Actions"
+    );
+    enabled
 }
 
 pub(crate) async fn run_body_with(
@@ -2875,8 +3248,9 @@ pub(crate) async fn body_vectors_http(
 /// [`body_vectors_http`] with caller-supplied `seeds`: `(JSON pointer, valid
 /// value)` for declared optional properties (or the next positional item) that
 /// `valid` omits. Each seed is sent ADDED to `valid` (so `{"ids":[x]}` plus
-/// `/all: true` reaches the handler) and its value is walked like any other.
-/// A seed that names nothing the body omits fails the run.
+/// `/all: true` reaches the handler) and a schema-valid result is walked from its root.
+/// The empty pointer supplies another complete valid base. Nonempty pointers
+/// must name an omitted location on at least one walked base.
 pub(crate) async fn body_vectors_seeded(
     fixtures: &mut PositiveFixtures,
     method: &str,
@@ -3078,6 +3452,7 @@ pub(super) async fn run_binary(
 /// body a 413 (over the documented size) or 415 (not the declared media type);
 /// any other status fails the run, and [`Probe::decided`] still overrides the
 /// reading of a status in the expected set.
+#[cfg(feature = "integration-tests")]
 pub(crate) async fn binary_body_vectors_http(
     fixtures: &mut PositiveFixtures,
     method: &str,

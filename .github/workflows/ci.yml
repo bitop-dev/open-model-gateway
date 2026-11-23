@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # 1.100.0, matches rust-toolchain.toml
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: "1.100.0"
           components: rustfmt, clippy
@@ -43,6 +43,7 @@ jobs:
       # The shipped build (default features, no `integration-tests`): code under
       # cfg(not(feature = "integration-tests")) is not compiled in the run above (#502).
       - run: cargo clippy -p open-model-gateway --bins --lib --locked -- -D warnings
+      - run: cargo clippy -p open-model-gateway --all-targets --locked -- -D warnings
 
   sdk-compat:
     runs-on: ubuntu-24.04
@@ -54,7 +55,7 @@ jobs:
       CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # 1.100.0, matches rust-toolchain.toml
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: "1.100.0"
           components: rustfmt, clippy
@@ -102,7 +103,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # 1.100.0, matches rust-toolchain.toml
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: "1.100.0"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -141,7 +142,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Exact version from rust-toolchain.toml, not the floating 'stable' channel (#354);
       # tests/supply-chain.test.mjs fails if this ever disagrees with that file or the Dockerfile.
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # 1.100.0, matches rust-toolchain.toml
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: "1.100.0"
           components: rustfmt, clippy
@@ -210,6 +211,9 @@ jobs:
       - run: npm run test:sdk-bases
       - run: npm run test:demo
       - run: npm run test:supply-chain
+      - run: node scripts/check-action-tags.mjs
+        env:
+          GH_TOKEN: ${{ github.token }}
       - run: node --test tests/oci-tool.test.mjs
       - run: python3 -B -m unittest discover -s tests -p 'oci_*test.py' -v
       - run: npm run test:ci
@@ -472,7 +476,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Exact version from rust-toolchain.toml, not the floating 'stable' channel (#354);
       # tests/supply-chain.test.mjs fails if this ever disagrees with that file or the Dockerfile.
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # 1.100.0, matches rust-toolchain.toml
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: "1.100.0"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -502,8 +506,8 @@ jobs:
     timeout-minutes: 35
     env:
       # Approved staging rehearsal digest pins; same mirror defaults as Compose.
-      STAGING_POSTGRES_IMAGE: mirror.gcr.io/library/postgres@sha256:858bb5e98eed02eb8cafbcdc007f9a65d1b613972028944a8ec2133ccaf80d27
-      STAGING_CADDY_IMAGE: mirror.gcr.io/library/caddy@sha256:d8542f48d34a9cf4e4c11a478865229840e87e4c96ea3f439101f31a5d35f75f
+      STAGING_POSTGRES_IMAGE: mirror.gcr.io/library/postgres@sha256:837bed18782820fe967067cb5328b02b0d9992c1be9a37ee0c9c492cfc03af3b
+      STAGING_CADDY_IMAGE: mirror.gcr.io/library/caddy@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

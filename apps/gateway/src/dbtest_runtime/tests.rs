@@ -304,19 +304,20 @@ async fn passed_database_is_dropped_failed_and_panicked_ones_are_kept() {
     let (pass, fail, panic) = (path("pass"), path("fail"), path("panic"));
 
     templates
-        .run_test(&template.name, pass, passes)
+        .run_test(&template.name, pass, |pool| Box::pin(passes(pool)))
         .await
         .unwrap();
     assert_eq!(
         templates
-            .run_test(&template.name, fail, fails)
+            .run_test(&template.name, fail, |pool| Box::pin(fails(pool)))
             .await
             .unwrap_err(),
         "deliberate failure"
     );
-    let caught = AssertUnwindSafe(templates.run_test(&template.name, panic, panics))
-        .catch_unwind()
-        .await;
+    let caught =
+        AssertUnwindSafe(templates.run_test(&template.name, panic, |pool| Box::pin(panics(pool))))
+            .catch_unwind()
+            .await;
     assert!(caught.is_err());
 
     let mut conn = templates.maintenance_connection().await.unwrap();
@@ -353,13 +354,13 @@ async fn a_rerun_replaces_the_database_a_failed_run_kept() {
     );
 
     templates
-        .run_test(&template.name, path, fails)
+        .run_test(&template.name, path, |pool| Box::pin(fails(pool)))
         .await
         .unwrap_err();
     let mut conn = templates.maintenance_connection().await.unwrap();
     assert!(database_exists(&mut conn, &db_name).await);
     templates
-        .run_test(&template.name, path, passes)
+        .run_test(&template.name, path, |pool| Box::pin(passes(pool)))
         .await
         .unwrap();
     let gone = !database_exists(&mut conn, &db_name).await && !recorded(&mut conn, &db_name).await;
