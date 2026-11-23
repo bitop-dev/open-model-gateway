@@ -406,7 +406,7 @@ async fn a_file_rekey_does_not_block_the_batch_input_fk(pool: PgPool) {
     consistent(&w.f).await;
 }
 
-async fn make_unknown(w: &World, job: &JobRow) {
+pub(super) async fn make_unknown(w: &World, job: &JobRow) {
     sqlx::query("UPDATE governance_reservations SET lease_expires_at=now()-interval '1 second' WHERE execution_id=$1")
         .bind(job.execution_id).execute(&w.f.store.pool).await.unwrap();
     assert_eq!(reconcile_expired(&w.f.store, 100).await.unwrap(), 1);

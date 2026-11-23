@@ -426,13 +426,29 @@ pub(super) async fn finish_batch_tx(
     id: Uuid,
     f: &Finished<'_>,
 ) -> Result<JobRow> {
-    let job: JobRow = sqlx::query_as(&format!(
+    let job = lock_batch_for_finish(tx, id).await?;
+    finish_locked_batch(tx, job, f).await
+}
+
+pub(super) async fn lock_batch_for_finish(
+    tx: &mut Transaction<'_, Postgres>,
+    id: Uuid,
+) -> Result<JobRow> {
+    sqlx::query_as(&format!(
         "SELECT {JOB_COLUMNS} FROM async_jobs WHERE id=$1 FOR NO KEY UPDATE"
     ))
     .bind(id)
     .fetch_one(&mut **tx)
     .await
-    .map_err(job_storage)?;
+    .map_err(job_storage)
+}
+
+pub(super) async fn finish_locked_batch(
+    tx: &mut Transaction<'_, Postgres>,
+    job: JobRow,
+    f: &Finished<'_>,
+) -> Result<JobRow> {
+    let id = job.id;
     if !matches!(job.state.as_str(), "queued" | "in_progress") {
         return Ok(job);
     }
@@ -462,20 +478,11 @@ pub(super) async fn finish_batch_tx(
         }
     }
 
-    // A cancellation acknowledged while results were assembled wins over completion.
-    let state = if f.state == JobState::Completed
-        && job.mode() == Some(BatchMode::Gateway)
-        && job.cancel_requested_at.is_some()
-    {
-        JobState::Cancelled
-    } else {
-        f.state
-    };
     sqlx::query_as(&format!(
         "UPDATE async_jobs SET state=$2,upstream_status=$2,error_code=coalesce(error_code,$3),output_file_id=coalesce(output_file_id,$4),error_file_id=coalesce(error_file_id,$5),request_total=coalesce($6,request_total),request_completed=coalesce($7,request_completed),request_failed=coalesce($8,request_failed),completed_at=coalesce(completed_at,clock_timestamp()) WHERE id=$1 RETURNING {JOB_COLUMNS}"
     ))
     .bind(id)
-    .bind(state.as_str())
+    .bind(f.state.as_str())
     .bind(f.error_code)
     .bind(f.output_file)
     .bind(f.error_file)

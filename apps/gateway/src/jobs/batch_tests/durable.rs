@@ -21,6 +21,7 @@ enum Boundary {
 enum Case {
     Fault(Boundary, Loss),
     FinalizeCancel { cancel_first: bool },
+    CancelUnavailable,
     Group,
     NestedTakeover,
     Quota,
@@ -196,7 +197,7 @@ async fn run_case(pool: PgPool, case: Case) {
     let size = match case {
         Case::Fault(..) | Case::FailedCommit { .. } => 3,
         Case::Group => 32,
-        Case::NestedTakeover | Case::FinalizeCancel { .. } => 2,
+        Case::NestedTakeover | Case::FinalizeCancel { .. } | Case::CancelUnavailable => 2,
         Case::Pressure => 24,
         Case::Quota | Case::Retry { .. } => 1,
         Case::Measure(size) => size,
@@ -291,6 +292,10 @@ async fn run_case(pool: PgPool, case: Case) {
     .await
     .unwrap();
     w.jobs = loopback_jobs(store, engine, files, concurrency);
+    if matches!(case, Case::CancelUnavailable) {
+        check_cancel_unavailable(&w, &job, &client, &gateway.base, &auth, &calls).await;
+        return;
+    }
     if let Case::Retry { cancel } = case {
         check_backoff_retry(&w, &job, &client, &gateway.base, &auth, &calls, cancel).await;
         return;
@@ -645,6 +650,95 @@ async fn run_case(pool: PgPool, case: Case) {
             );
         }
     }
+}
+
+async fn check_cancel_unavailable(
+    w: &World,
+    job: &JobRow,
+    client: &reqwest::Client,
+    base: &str,
+    auth: &str,
+    calls: &AtomicUsize,
+) {
+    w.jobs.soft_loss.store(true, Ordering::SeqCst);
+    assert!(Runner::new(w.jobs.clone()).run_next().await.unwrap());
+    assert_eq!(w.reload(job).await.request_completed, Some(1));
+    super::envelope::make_unknown(w, job).await;
+    let held = reservation(&w.f, job.execution_id).await;
+    w.jobs.finalize_hold.arm();
+    let runner = start(w);
+    tokio::time::timeout(Duration::from_secs(20), w.jobs.finalize_hold.reached())
+        .await
+        .unwrap();
+    let stale_error: Uuid = sqlx::query_scalar(
+        "SELECT id FROM stored_files WHERE workspace_id=$1 AND filename=$2 AND deleted_at IS NULL",
+    )
+    .bind(job.workspace_id)
+    .bind(format!("batch_{}_error.jsonl", job.id.simple()))
+    .fetch_one(&w.f.store.pool)
+    .await
+    .unwrap();
+    let stale_records = w.read(job.workspace_id, Some(stale_error)).await;
+    assert_eq!(stale_records.len(), 1);
+    assert_eq!(stale_records[0]["error"]["code"], "batch_hold_unavailable");
+    let response = client
+        .post(format!(
+            "{base}/v1/batches/{}/cancel",
+            client_id("batch_", job.id)
+        ))
+        .header("authorization", auth)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["status"],
+        "cancelling"
+    );
+    w.jobs.finalize_hold.release();
+    assert!(runner.await.unwrap().unwrap());
+    let done = w.reload(job).await;
+    assert_eq!(done.state, "cancelled");
+    assert_eq!(done.error_code, None);
+    assert!(file_deleted(&w.f, Some(stale_error)).await);
+    assert_eq!(
+        (done.request_completed, done.request_failed),
+        (Some(1), Some(0))
+    );
+    assert!(done.settled_at.is_some());
+    // Each published JSONL file contains exactly one JSON record.
+    let record = |file: Option<Uuid>| async move {
+        let file = crate::filestore::files::public_id(file.unwrap());
+        client
+            .get(format!("{base}/v1/files/{file}/content"))
+            .header("authorization", auth)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()
+    };
+    let output = record(done.output_file_id).await;
+    assert_eq!(output["custom_id"], "0");
+    assert_eq!(
+        output["response"]["body"]["choices"][0]["message"]["content"],
+        "answer"
+    );
+    let error = record(done.error_file_id).await;
+    assert_eq!(error["custom_id"], "1");
+    assert_eq!(error["error"]["code"], "batch_cancelled");
+    assert_eq!(reservation(&w.f, job.execution_id).await, held);
+    assert!(!Runner::new(w.jobs.clone()).run_next().await.unwrap());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[dbtest::test]
+async fn finalization_cancel_after_hold_unavailable_files(pool: PgPool) {
+    run_case(pool, Case::CancelUnavailable).await;
 }
 
 #[dbtest::test]

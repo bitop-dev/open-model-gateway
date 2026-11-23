@@ -75,7 +75,7 @@ Three different "leases" exist:
   the 0029 SQL ([`w.expires_at>clock_timestamp() FOR SHARE`](../../apps/gateway/enterprise_migrations/0029_work_leases.sql#L72)) and is held until commit. The money
   path itself uses none: reconciliation is a `SKIP LOCKED` queue on every replica.
 * A third: the gateway-run batch runner claim (`async_jobs.runner_id` / `runner_epoch` /
-  `runner_lease_until`, [`runner_epoch=runner_epoch+1`](../../apps/gateway/src/jobs/store.rs#L507)). It was unfenced when this model was written and
+  `runner_lease_until`, [`runner_epoch=runner_epoch+1`](../../apps/gateway/src/jobs/store.rs#L536)). It was unfenced when this model was written and
   is fenced since 0081 (#638): see finding 1.
 
 ## 2. What is modelled, and what is not
@@ -114,7 +114,7 @@ wide runs dominate).
 | 2 | "Never delete unknown reservations"; a hold is never released before settlement or reconciliation (request path) | `UnknownRetainsHold`, `HoldNeverReleased` (action) | `reconcile_batch` only flips state; the settlement UPDATE keeps or raises `held`; docs/governance.md "Cancellation, reconciliation and retention" |
 | 3 | Settlement exactly once; no un-settling | `SettleOnce`, `LedgerConsistent`, `SettledTerminal` (action) | row lock + the state reads/predicates in section 1; ledger UNIQUE; `finished` flag in `ExecutionGuard` |
 | 4 | "Never treat unknown usage as zero" | `SettledMatchesTruth` | `finish_unobserved` ([`record.outcome == Outcome::Succeeded && input.is_some() && output.is_some()`](../../apps/gateway/src/governance/settlement.rs#L636)), `free_rejection` |
-| 5 | A fenced runner never writes | `NoStaleCommit`, `NoReorder` (`LeaseFence`) | `omg_lease_fence` + `FOR SHARE` (0029 SQL, `Fence::check`); the batch runner had none when this was written; since 0081 it has the claim epoch checked under [`runner_id=$2 AND runner_epoch=$3 FOR KEY SHARE`](../../apps/gateway/src/jobs/fence.rs#L104) / [`runner_id=$2 AND runner_epoch=$3 FOR NO KEY UPDATE`](../../apps/gateway/src/jobs/fence.rs#L107) of the job row (#638) |
+| 5 | A fenced runner never writes | `NoStaleCommit`, `NoReorder` (`LeaseFence`) | `omg_lease_fence` + `FOR SHARE` (0029 SQL, `Fence::check`); the batch runner had none when this was written; since 0081 it has the claim epoch checked under [`runner_id=$2 AND runner_epoch=$3 FOR KEY SHARE`](../../apps/gateway/src/jobs/fence.rs#L110) / [`runner_id=$2 AND runner_epoch=$3 FOR NO KEY UPDATE`](../../apps/gateway/src/jobs/fence.rs#L113) of the job row (#638) |
 | + | "Failover ... never after a stream is returned" | `NoFailoverAfterStream` | checks the model's own guard; in the code [`return AttemptEnd::Failover(telemetry)`](../../apps/gateway/src/inference/attempt.rs#L159) exists only in the error arm |
 | + | Rows coherent (pending <=> execution started) | `ExecConsistent` | `reconcile_batch` aborts on [`changed != ids.len() as u64`](../../apps/gateway/src/governance/reconcile.rs#L58) |
 | + | A pending reservation always leaves `pending` (settled or unknown), under fairness | `Resolves` (liveness) | reconciler on every replica ([`crate::governance::reconcile_expired(store, 100)`](../../apps/gateway/src/maintenance.rs#L149)), restart |
@@ -268,7 +268,7 @@ money.
    batch's job row is written in its admission transaction ([`insert_batch(&mut tx, job`](../../apps/gateway/src/governance/batch.rs#L376)), with the envelope's final lease (poll
    deadline plus grace), and a video's lease extension and job row are one transaction. A gateway-run
    batch that an earlier release left with an `unknown` envelope now ends `failed` with
-   [`Some(Stop::HoldUnavailable) => Some("hold_unavailable")`](../../apps/gateway/src/jobs/runner.rs#L572) instead of every line failing as a provider configuration error. The text
+   [`Some(Stop::HoldUnavailable) => Some("hold_unavailable")`](../../apps/gateway/src/jobs/runner.rs#L482) instead of every line failing as a provider configuration error. The text
    below is the finding as made. `admit_batch` used `ADMISSION_LEASE_SECONDS = 600`
    (`jobs/batch.rs`), then `insert_batch`, then `hold_until` -> `extend_lease`. If the process dies
    or the extension fails (it only logs) the reconciler marks the envelope `unknown` after 10
