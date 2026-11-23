@@ -80,10 +80,22 @@ docker compose -p omg-enterprise-demo -f deploy/demo/compose.yaml stop
 Stopping the issuer/gateway is separate. Do not use `down -v` as a recovery or upgrade procedure.
 
 `bootstrap-dev` is a separate minimal development fixture. It requires
-`GATEWAY_ENV=development` and a TCP database connection to `127.0.0.1` or `::1`.
-The command rejects Unix socket overrides before connecting. On a fresh, explicitly selected migrated database it creates
-an admin and prints two inference keys once; keep that terminal output private.
-It refuses existing users, workspaces or execution history unless its own
-successful bootstrap marker and developer identity are present. Repeating a
-successful bootstrap makes no changes and never prints or rotates existing keys.
-It does not reset databases or enable upstream providers.
+`GATEWAY_ENV=development` and a TCP database connection whose host is the
+literal address `127.0.0.1` or `::1` (written `[::1]` in a URL). A host name
+such as `localhost` is refused, and so are Unix socket overrides and `PGHOST` or
+`PGHOSTADDR` values (used only when the URL names no host) that are not one of
+those addresses, all before connecting. Tests that call `bootstrap::seed` need
+the same kind of `DATABASE_URL`. On a fresh, explicitly selected migrated
+database it creates an admin and prints two inference keys once; keep that
+terminal output private.
+
+It refuses an installation that is already in use: any account, platform role
+or membership grant, workspace, key, provider connection, model, deployment,
+model grant, audit event or execution history, or any configuration change
+since migration (a nonzero `config_versions` topic, which settings, policy,
+catalog and access changes bump). The only exception is a repeat run: when the
+installation carries its own successful bootstrap marker and developer identity,
+the command makes no changes and never prints or rotates existing keys. It does
+not reset databases or enable upstream providers. The host check cannot tell a
+loopback forwarder (an SSH tunnel or `kubectl port-forward`) from a local
+server: point `bootstrap-dev` only at a database you created for development.

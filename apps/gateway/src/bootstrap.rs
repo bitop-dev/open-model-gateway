@@ -86,16 +86,35 @@ fn ensure_dev_config(
     anyhow::ensure!(
         options.get_socket().is_none()
             && matches!(options.get_host(), "127.0.0.1" | "::1" | "[::1]"),
-        "bootstrap-dev requires a loopback database (127.0.0.1 or ::1)"
+        "bootstrap-dev requires a loopback database given as a literal address: write the host in DATABASE_URL as 127.0.0.1 or [::1], not a name such as localhost, with no Unix socket and no PGHOST or PGHOSTADDR that is not one of those (tests that call bootstrap::seed need the same DATABASE_URL)"
     );
     Ok(())
 }
 
+/// An installation is empty when nothing a development seed writes exists
+/// yet (identities, grants, workspaces, keys, the catalog, audit history),
+/// there is no execution history, and no configuration has changed since
+/// migration (every `config_versions` topic is still 0; catalog, access, key,
+/// policy and settings writes bump it at commit and it never moves back).
+/// A freshly migrated database is empty. Callers hold the exclusive catalog
+/// lock and the installation row, which every account-creating path (OIDC
+/// sign-in, SCIM, provisioning) also takes first, so no account can commit
+/// between this check and the seed.
 pub(crate) async fn ensure_empty(tx: &mut sqlx::PgConnection) -> Result<()> {
-    let occupied: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users) OR EXISTS(SELECT 1 FROM workspaces) OR EXISTS(SELECT 1 FROM inference_executions)").fetch_one(&mut *tx).await?;
+    let occupied: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM users) OR EXISTS(SELECT 1 FROM platform_role_grants) \
+         OR EXISTS(SELECT 1 FROM workspaces) OR EXISTS(SELECT 1 FROM workspace_membership_grants) \
+         OR EXISTS(SELECT 1 FROM api_keys) OR EXISTS(SELECT 1 FROM provider_connections) \
+         OR EXISTS(SELECT 1 FROM models) OR EXISTS(SELECT 1 FROM deployments) \
+         OR EXISTS(SELECT 1 FROM workspace_model_grants) OR EXISTS(SELECT 1 FROM audit_events) \
+         OR EXISTS(SELECT 1 FROM inference_executions) \
+         OR EXISTS(SELECT 1 FROM config_versions WHERE version>0)",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
     anyhow::ensure!(
         !occupied,
-        "Local bootstrap requires an empty dedicated installation; existing identities/history are never replaced"
+        "Local bootstrap requires an empty dedicated installation (no accounts, grants, workspaces, keys, catalog entries, audit or execution history, and no configuration changes since migration); nothing existing is ever replaced"
     );
     Ok(())
 }
@@ -233,6 +252,16 @@ mod config_tests {
             assert!(ensure_dev_config(Environment::Development, &options).is_ok());
             assert!(ensure_dev_config(Environment::Production, &options).is_err());
         }
+        let localhost =
+            sqlx::postgres::PgConnectOptions::from_str("postgres://user@localhost/db").unwrap();
+        let message = ensure_dev_config(Environment::Development, &localhost)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("127.0.0.1 or [::1]") && message.contains("localhost"),
+            "{message}"
+        );
+        assert!(message.contains("bootstrap::seed"), "{message}");
         for url in [
             "postgres://user@example.invalid/db",
             "postgres://user@localhost/db",
@@ -303,6 +332,107 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+    /// Rows `seed` would write next to, or configuration changes, mean the
+    /// installation is in use: nothing is seeded and no admin is created.
+    async fn assert_refused(pool: &sqlx::PgPool, what: &str) {
+        let store = Store::new(pool.clone());
+        let error = seed(&store, Environment::Development).await.err();
+        assert!(
+            error.is_some_and(|e| e.to_string().contains("requires an empty")),
+            "{what}"
+        );
+        let written: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM platform_role_grants),(SELECT count(*) FROM api_keys),(SELECT count(*) FROM users WHERE email='developer@local.invalid')").fetch_one(pool).await.unwrap();
+        assert_eq!(written, (0, 0, 0), "{what}");
+    }
+    #[dbtest::test]
+    async fn dev_bootstrap_refuses_a_catalog_only_installation(pool: sqlx::PgPool) {
+        let connection = Uuid::new_v4();
+        sqlx::query("INSERT INTO provider_connections(id,name,provider,credential_ref) VALUES($1,'Existing','openai','env:OPENAI_API_KEY')")
+            .bind(connection).execute(&pool).await.unwrap();
+        assert_refused(&pool, "a provider connection").await;
+        sqlx::query("DELETE FROM provider_connections")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO models(id,public_name) VALUES($1,'existing/model')")
+            .bind(Uuid::new_v4())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_refused(&pool, "a model").await;
+    }
+    #[dbtest::test]
+    async fn dev_bootstrap_refuses_a_changed_configuration(pool: sqlx::PgPool) {
+        sqlx::query("UPDATE installation_settings SET support_url='https://support.example.test'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_refused(&pool, "changed installation settings").await;
+    }
+    #[dbtest::test]
+    async fn dev_bootstrap_refuses_an_installation_with_only_audit_history(pool: sqlx::PgPool) {
+        sqlx::query("INSERT INTO audit_events(id,action,resource_type) VALUES($1,'settings.updated','installation')")
+            .bind(Uuid::new_v4())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_refused(&pool, "audit history").await;
+    }
+    #[dbtest::test]
+    async fn dev_bootstrap_refuses_an_installation_with_only_executions(pool: sqlx::PgPool) {
+        // History whose keys and workspaces are gone, as after a partial
+        // restore: the parent and accounting triggers are off for the insert.
+        let mut tx = crate::db::begin(&pool).await.unwrap();
+        sqlx::query("ALTER TABLE inference_executions DISABLE TRIGGER USER")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO inference_executions(id,workspace_id,api_key_id,deployment_id,public_model,provider,streamed,state,workload_kind,started_at,root_request_id,attempt_number) VALUES($1,$2,$3,$4,'restored/model','openai',false,'succeeded','generation',now(),$1,1)")
+            .bind(Uuid::new_v4()).bind(Uuid::new_v4()).bind(Uuid::new_v4()).bind(Uuid::new_v4())
+            .execute(&mut *tx).await.unwrap();
+        sqlx::query("ALTER TABLE inference_executions ENABLE TRIGGER USER")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let occupied: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM inference_executions),(SELECT count(*) FROM workspaces),(SELECT count(*) FROM api_keys)").fetch_one(&pool).await.unwrap();
+        assert_eq!(occupied, (1, 0, 0));
+        assert_refused(&pool, "execution history").await;
+    }
+    /// A freshly migrated installation is empty, and a repeat run finds the
+    /// installation's own bootstrap marker before checking emptiness.
+    #[dbtest::test]
+    async fn dev_bootstrap_seeds_a_fresh_installation_and_repeats_without_changes(
+        pool: sqlx::PgPool,
+    ) {
+        let store = Store::new(pool.clone());
+        assert!(
+            seed(&store, Environment::Development)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let changed: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM config_versions WHERE version>0)")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            changed,
+            "the seed's own catalog rows bump configuration versions"
+        );
+        assert!(
+            seed(&store, Environment::Development)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let keys: i64 = sqlx::query_scalar("SELECT count(*) FROM api_keys")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(keys, 2);
     }
     #[dbtest::test]
     async fn dev_bootstrap_never_adopts_existing_developer_email(pool: sqlx::PgPool) {

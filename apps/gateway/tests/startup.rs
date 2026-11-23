@@ -797,6 +797,90 @@ fn bootstrap_dev_refuses_remote_database_before_connecting_or_printing_keys() {
     }
 }
 
+/// libpq-style variables fill in a host the URL leaves out; the guard judges
+/// the result, and a URL host always wins over them.
+#[test]
+fn bootstrap_dev_judges_ambient_host_variables_before_connecting() {
+    let f = Fixture::new();
+    for (variable, value) in [
+        ("PGHOST", "example.invalid"),
+        ("PGHOST", "localhost"),
+        ("PGHOST", "/var/run/postgresql"),
+        ("PGHOSTADDR", "192.0.2.1"),
+    ] {
+        let output = f.run(
+            &["bootstrap-dev"],
+            [
+                ("GATEWAY_ENV", "development"),
+                ("DATABASE_URL", "postgres:///db?password=private-marker"),
+                (variable, value),
+            ],
+        );
+        assert_eq!(output.status.code(), Some(1), "{variable}={value}");
+        assert!(output.stdout.is_empty());
+        let stderr = text(&output.stderr);
+        assert!(
+            stderr.contains("bootstrap-dev requires a loopback database"),
+            "{variable}={value}: {stderr}"
+        );
+        assert!(!stderr.contains("could not connect"), "{stderr}");
+        assert!(!stderr.contains("private-marker"));
+    }
+    // The variables are honoured: a literal loopback one passes the guard
+    // and the command tries that address (a closed port here).
+    for variable in ["PGHOST", "PGHOSTADDR"] {
+        let output = f.run(
+            &["bootstrap-dev"],
+            [
+                ("GATEWAY_ENV", "development"),
+                ("DATABASE_URL", "postgres:///db"),
+                (variable, "127.0.0.1"),
+                ("PGPORT", "1"),
+            ],
+        );
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = text(&output.stderr);
+        assert!(
+            stderr.contains("could not connect to PostgreSQL"),
+            "{variable}: {stderr}"
+        );
+    }
+    // An ambient address never redirects a URL that names loopback: this
+    // connects to the URL's closed port, not to the variable's host.
+    for variable in ["PGHOST", "PGHOSTADDR"] {
+        let output = f.run(
+            &["bootstrap-dev"],
+            [
+                ("GATEWAY_ENV", "development"),
+                ("DATABASE_URL", "postgres://gateway@127.0.0.1:1/db"),
+                (variable, "192.0.2.1"),
+            ],
+        );
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = text(&output.stderr);
+        assert!(
+            stderr.contains("could not connect to PostgreSQL"),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
+fn bootstrap_dev_tells_a_localhost_user_what_to_write_instead() {
+    let f = Fixture::new();
+    let output = f.run(
+        &["bootstrap-dev"],
+        [
+            ("GATEWAY_ENV", "development"),
+            ("DATABASE_URL", "postgres://gateway@localhost:5432/db"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = text(&output.stderr);
+    assert!(stderr.contains("127.0.0.1 or [::1]"), "{stderr}");
+    assert!(stderr.contains("localhost"), "{stderr}");
+}
+
 #[test]
 fn bootstrap_dev_requires_the_database_to_be_named_in_the_url() {
     let f = Fixture::new();
@@ -908,20 +992,31 @@ async fn bootstrap_dev_cli_seeds_through_ipv6_loopback(pool: sqlx::PgPool) {
             });
         }
     });
-    let output = tokio::task::spawn_blocking(move || {
-        Fixture::new().run(
-            &["bootstrap-dev"],
-            [
-                ("GATEWAY_ENV", "development"),
-                ("DATABASE_URL", database.as_str()),
-            ],
-        )
-    })
-    .await;
+    // The same forwarder named as a bare `hostaddr` (no brackets): the
+    // repeat run connects through it and changes nothing.
+    let mut by_address = database.clone();
+    by_address.set_host(Some("127.0.0.1")).unwrap();
+    by_address.query_pairs_mut().append_pair("hostaddr", "::1");
+    let run = |url: String| {
+        tokio::task::spawn_blocking(move || {
+            Fixture::new().run(
+                &["bootstrap-dev"],
+                [
+                    ("GATEWAY_ENV", "development"),
+                    ("DATABASE_URL", url.as_str()),
+                ],
+            )
+        })
+    };
+    let output = run(database.to_string()).await;
+    let repeated = run(by_address.to_string()).await;
     forwarder.abort();
 
     let output = output.unwrap();
     assert!(output.status.success(), "{}", text(&output.stderr));
+    let repeated = repeated.unwrap();
+    assert!(repeated.status.success(), "{}", text(&repeated.stderr));
+    assert!(text(&repeated.stdout).contains("already initialized"));
     let users: i64 =
         sqlx::query_scalar("SELECT count(*) FROM users WHERE email='developer@local.invalid'")
             .fetch_one(&pool)
