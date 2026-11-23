@@ -6,7 +6,11 @@ The project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). 
 
 ## [Unreleased]
 
-Changes after v0.18.0: [unreleased notes](docs/releases/unreleased.md).
+Changes after v0.19.0: [unreleased notes](docs/releases/unreleased.md).
+
+## [0.19.0]
+
+Gateway-managed batch recovery, cancellation and route capacity, scheduled-report delivery, and the first gateway release under the Bitop organization. Drain replicas and apply migrations **0084–0087** and the matching runtime grants. [Notes](docs/releases/v0.19.0.md).
 
 ## [0.18.0]
 
@@ -126,7 +130,8 @@ Alerts, key safety, model compare, SCIM, JWKS refresh, metrics and backup toolin
 
 The single-enterprise rebuild: Team, Project and personal workspaces, OIDC platform roles, catalogs, multimodal workloads across five provider families, immutable micro-USD accounting, logs and Admin settings. Migrations `0001` to `0010`. Notes: [`docs/releases/v0.1.0.md`](docs/releases/v0.1.0.md).
 
-[Unreleased]: https://github.com/bitop-dev/open-model-gateway/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/bitop-dev/open-model-gateway/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/bitop-dev/open-model-gateway/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/bitop-dev/open-model-gateway/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/bitop-dev/open-model-gateway/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/bitop-dev/open-model-gateway/compare/v0.15.1...v0.16.0

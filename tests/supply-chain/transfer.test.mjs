@@ -77,9 +77,9 @@ printf '%s' '{"linux/amd64":{"SPDX":{"spdxVersion":"SPDX-2.3"}},"linux/arm64":{"
   } finally { rmSync(work, { recursive: true, force: true }); }
 });
 
-test("current compare links and next-release upgrade guidance cover the transfer", () => {
+test("current compare links and organization transfer upgrade guidance cover the transfer", () => {
   assert.doesNotMatch(text("CHANGELOG.md").split("\n").filter(line => /^\[[^\]]+\]:/.test(line)).join("\n"), /github\.com\/ncecere/);
-  const notes = text("docs/releases/unreleased.md");
+  const notes = text("docs/releases/v0.19.0.md");
   for (const phrase of ["ghcr.io/bitop-dev/open-model-gateway", "ghcr.io/ncecere/open-model-gateway", "v0.18.0", "image.repository", "signature"]) {
     assert.ok(notes.includes(phrase), `upgrade guidance missing ${phrase}`);
   }
