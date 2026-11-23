@@ -4212,3 +4212,80 @@ fn keyword_scope_sibling_cap_cannot_witness_the_finite_pattern() {
         }
     }
 }
+
+#[test]
+fn supplied_query_witness_must_fit_the_encoded_request() {
+    let schema = json!({"type":"string","allOf":[
+        {"pattern":"^(é+|é+b)$"},{"pattern":"^(é+|é+c)$"}
+    ]});
+    let mut document = query_document();
+    document["paths"][TEMPLATE]["get"]["parameters"] = json!([parameter("s", false, schema)]);
+    let plan = |values: &[&str]| {
+        let candidates = values
+            .iter()
+            .map(|s| ("s".into(), (*s).into()))
+            .collect::<Vec<_>>();
+        super::http_vectors::query_plan(
+            &document,
+            &document["paths"][TEMPLATE]["get"],
+            &[],
+            &[("s".into(), "é".into())],
+            &candidates,
+        )
+    };
+    let long = "é".repeat(10_000);
+    let over = format!("{long}c");
+    let error = plan(&["é", "éb", &long, &over])
+        .err()
+        .expect("the encoded A witness exceeds the query budget");
+    assert!(
+        error.to_string().contains("supply boundary candidates"),
+        "{error}"
+    );
+    let cases = plan(&["é", "éb", "éc", &long, &over]).unwrap().cases;
+    for (value, accept) in [("é", true), ("éb", false), ("éc", false)] {
+        assert!(
+            cases
+                .iter()
+                .any(|case| case.edit == Edit::Set(value.into()) && case.accept == accept)
+        );
+    }
+    assert!(
+        !cases
+            .iter()
+            .any(|case| matches!(&case.edit, Edit::Set(s) if s == &long || s == &over))
+    );
+}
+
+#[test]
+fn supplied_body_witness_can_be_masked_in_one_valid_base() {
+    let doc = body_only(json!({"type":"object","required":["mode","s"],
+        "properties":{"mode":{"enum":["fixed","free"]},"s":{"type":"string","pattern":"^(a+|b+)$"}},
+        "if":{"properties":{"mode":{"const":"fixed"}}},"then":{"properties":{"s":{"const":"aaa"}}}
+    }));
+    let base = |mode: &str| json!({"mode":mode,"s":"aaa"});
+    let plan = |mode: &str, seeds: &[(String, Value)]| {
+        super::http_vectors::body_plan(
+            &doc,
+            &doc["paths"][TEMPLATE]["post"],
+            &base(mode),
+            seeds,
+            &["aaa", "aba"].map(|v| ("/s".into(), json!(v))),
+        )
+    };
+    assert!(
+        plan("fixed", &[])
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("straddle")
+    );
+    for (first, other) in [("fixed", "free"), ("free", "fixed")] {
+        let cases = plan(first, &[("".into(), base(other))]).unwrap().cases;
+        assert!(
+            cases
+                .iter()
+                .any(|c| c.body == json!({"mode":"free","s":"aba"}) && !c.accept)
+        );
+    }
+}
