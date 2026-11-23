@@ -26,11 +26,13 @@ pub enum Claim {
 pub(crate) enum RetryClaim {
     Started,
     Cancelled,
+    /// Recovery verified the new running claim, but cancellation preceded dispatch.
+    CancelledAfterCommit,
     Full,
     LineChanged,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration-tests"))]
 #[derive(Clone, Copy)]
 pub(crate) enum RetryCommitFault {
     Rollback,
@@ -163,7 +165,7 @@ impl Scheduler {
         tx.commit().await.map_err(job_storage)?;
         Ok(match cancelled {
             Some(false) => RetryClaim::Started,
-            Some(true) => RetryClaim::Cancelled,
+            Some(true) => RetryClaim::CancelledAfterCommit,
             None => RetryClaim::LineChanged,
         })
     }
@@ -172,13 +174,16 @@ impl Scheduler {
         &self,
         tx: sqlx::Transaction<'_, sqlx::Postgres>,
     ) -> Result<(), sqlx::Error> {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "integration-tests"))]
         {
             let fault = self.retry_commit_fault.lock().unwrap().take();
             if let Some(fault) = fault {
                 match fault {
                     RetryCommitFault::Rollback => tx.rollback().await?,
-                    RetryCommitFault::LostAck => tx.commit().await?,
+                    RetryCommitFault::LostAck => {
+                        tx.commit().await?;
+                        self.retry_after_commit.pause().await;
+                    }
                 }
                 return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset).into());
             }

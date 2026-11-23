@@ -548,8 +548,10 @@ type MetricsSlot = Arc<tokio::sync::Mutex<Option<(Instant, Result<Reading, &'sta
 
 /// One process's view of route gates (cached; the claim itself is durable).
 pub struct Scheduler {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "integration-tests"))]
     pub(crate) retry_commit_fault: Mutex<Option<claims::RetryCommitFault>>,
+    #[cfg(all(test, feature = "integration-tests"))]
+    pub(crate) retry_after_commit: Arc<super::FinalizeHold>,
     store: Store,
     approvals: Option<Arc<ApprovedEndpoints>>,
     pub(crate) timings: Timings,
@@ -594,8 +596,10 @@ impl Scheduler {
             live: Mutex::default(),
             metrics: Mutex::default(),
             signals: Mutex::default(),
-            #[cfg(test)]
+            #[cfg(all(test, feature = "integration-tests"))]
             retry_commit_fault: Mutex::default(),
+            #[cfg(all(test, feature = "integration-tests"))]
+            retry_after_commit: Arc::default(),
         }
     }
     pub fn with_timings(mut self, timings: Timings) -> Self {

@@ -20,6 +20,7 @@ enum Boundary {
 
 #[derive(Clone, Copy)]
 enum RetryCase {
+    CancelAfterCommit,
     Cancel,
     Normal,
     CommitFault(RetryCommitFault),
@@ -1092,6 +1093,11 @@ async fn retry_claim_commit_lost_ack(pool: PgPool) {
 }
 
 #[dbtest::test]
+async fn retry_claim_commit_lost_ack_cancelled(pool: PgPool) {
+    run_case(pool, Case::Retry(RetryCase::CancelAfterCommit)).await;
+}
+
+#[dbtest::test]
 async fn retry_claim_commit_rollback(pool: PgPool) {
     run_case(
         pool,
@@ -1110,23 +1116,54 @@ async fn check_backoff_retry(
     retry: RetryCase,
 ) {
     let pool = &w.f.store.pool;
-    let cancel = matches!(retry, RetryCase::Cancel);
+    let cancel_after_commit = matches!(retry, RetryCase::CancelAfterCommit);
+    let cancel = cancel_after_commit || matches!(retry, RetryCase::Cancel);
     let failed = cancel || matches!(retry, RetryCase::CommitFault(RetryCommitFault::Rollback));
     w.jobs.finalize_hold.arm();
     let runner = Runner::new(w.jobs.clone());
-    if let RetryCase::CommitFault(fault) = retry {
+    let after_commit = runner.scheduler.retry_after_commit.clone();
+    if cancel_after_commit {
+        after_commit.arm();
+        *runner.scheduler.retry_commit_fault.lock().unwrap() = Some(RetryCommitFault::LostAck);
+    } else if let RetryCase::CommitFault(fault) = retry {
         *runner.scheduler.retry_commit_fault.lock().unwrap() = Some(fault);
     }
     let runner = tokio::spawn(async move { runner.run_next().await });
-    let first: Uuid = tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            if let Some(execution) = sqlx::query_scalar("SELECT execution_id FROM batch_lines WHERE job_id=$1 AND attempts=1 AND state='failed' AND deployment_id IS NOT NULL")
-                .bind(job.id).fetch_optional(pool).await.unwrap() {
-                break execution;
+    let first: Uuid = if cancel_after_commit {
+        tokio::time::timeout(Duration::from_secs(15), after_commit.reached())
+            .await
+            .expect("retry committed before recovery");
+        let (first, claimed): (Uuid, Uuid) = sqlx::query_as(
+            "SELECT e.id, l.execution_id FROM batch_lines l
+             JOIN inference_executions e ON e.batch_job_id=l.job_id
+             WHERE l.job_id=$1 AND l.attempts=2 AND l.state='running'",
+        )
+        .bind(job.id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_ne!(first, claimed);
+        first
+    } else {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if let Some(execution) = sqlx::query_scalar(
+                    "SELECT execution_id FROM batch_lines WHERE job_id=$1 AND attempts=1
+                     AND state='failed' AND deployment_id IS NOT NULL",
+                )
+                .bind(job.id)
+                .fetch_optional(pool)
+                .await
+                .unwrap()
+                {
+                    break execution;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }).await.expect("first routed attempt has failed and released capacity");
+        })
+        .await
+        .expect("first routed attempt has failed and released capacity")
+    };
     let ledger_count = || {
         sqlx::query_scalar::<_,i64>("SELECT count(*) FROM monetary_ledger l JOIN inference_executions e ON e.id=l.execution_id WHERE e.batch_job_id=$1")
         .bind(job.id).fetch_one(pool)
@@ -1145,6 +1182,9 @@ async fn check_backoff_retry(
             .unwrap()
             .error_for_status()
             .unwrap();
+    }
+    if cancel_after_commit {
+        after_commit.release();
     }
     tokio::time::timeout(Duration::from_secs(20), w.jobs.finalize_hold.reached())
         .await
@@ -1173,8 +1213,21 @@ async fn check_backoff_retry(
             .await
             .unwrap();
     assert_eq!(state, if failed { "failed" } else { "succeeded" });
-    assert_eq!(count as usize, attempts);
+    assert_eq!(count as usize, attempts + usize::from(cancel_after_commit));
     assert_eq!(reservations.last(), Some(&execution));
+    if cancel_after_commit {
+        let lines: Vec<(String, i16, String, bool)> = sqlx::query_as(
+            "SELECT state,status_code,error_code,segment IS NOT NULL FROM batch_lines WHERE job_id=$1",
+        )
+        .bind(job.id)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            lines,
+            [("failed".into(), 502, "upstream_unavailable".into(), true)]
+        );
+    }
     let done = w.reload(job).await;
     assert_eq!(done.request_total, Some(1));
     assert_eq!(done.request_completed, Some(i32::from(!failed)));
@@ -1211,6 +1264,7 @@ async fn check_backoff_retry(
     assert_eq!(records[0]["custom_id"], "0");
     assert_eq!(response["request_id"], execution.to_string());
     if failed {
+        assert_eq!(response["status_code"], 502);
         assert_eq!(ledger_count().await.unwrap(), first_entries);
         assert_eq!(response["body"]["error"]["code"], "upstream_unavailable");
     } else {

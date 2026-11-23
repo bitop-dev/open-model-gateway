@@ -39,6 +39,14 @@ pub(crate) struct BatchFence {
     pub(crate) epoch: i64,
 }
 
+/// A recovered claim cancelled before dispatch, with the preceding provider failure.
+pub(crate) struct UndispatchedRetry {
+    pub execution: Uuid,
+    pub attempt: i16,
+    pub status: u16,
+    pub code: &'static str,
+}
+
 /// A fenced write that did not happen.
 #[derive(Debug)]
 pub(crate) enum FenceError {
@@ -328,23 +336,46 @@ impl BatchFence {
         Ok(changed)
     }
 
-    /// Count a provisional retry failure only while that execution still owns
-    /// the failed row. An unconfirmed retry claim cannot publish its old error.
+    /// Count the known provider failure under its execution ID. A committed
+    /// but undispatched retry retains its claim count, while the result
+    /// belongs to the earlier execution that actually failed.
     pub(crate) async fn count_retry_failure(
         &self,
         store: &Store,
         line: i32,
         execution: Uuid,
+        recovered: Option<UndispatchedRetry>,
     ) -> FenceResult<bool> {
         let mut tx = self.begin(store, Hold::Update).await?;
-        let failed: Option<i32> = sqlx::query_scalar("SELECT line_no FROM batch_lines WHERE job_id=$1 AND line_no=$2 AND execution_id=$3 AND state='failed' AND segment IS NULL FOR UPDATE")
-            .bind(self.job).bind(line).bind(execution)
-            .fetch_optional(&mut *tx).await.map_err(job_storage)?;
-        if failed.is_some() {
+        let failed = if let Some(retry) = recovered {
+            sqlx::query(
+                "UPDATE batch_lines SET state='failed', execution_id=$5, status_code=$6,
+                        error_code=$7, finished_at=clock_timestamp()
+                 WHERE job_id=$1 AND line_no=$2 AND execution_id=$3 AND attempts=$4
+                   AND state='running' AND segment IS NULL AND NOT awaiting_segment",
+            )
+            .bind(self.job)
+            .bind(line)
+            .bind(retry.execution)
+            .bind(retry.attempt)
+            .bind(execution)
+            .bind(retry.status as i16)
+            .bind(retry.code)
+            .execute(&mut *tx)
+            .await
+            .map_err(job_storage)?
+            .rows_affected()
+                == 1
+        } else {
+            sqlx::query_scalar::<_, i32>("SELECT line_no FROM batch_lines WHERE job_id=$1 AND line_no=$2 AND execution_id=$3 AND state='failed' AND segment IS NULL FOR UPDATE")
+                .bind(self.job).bind(line).bind(execution)
+                .fetch_optional(&mut *tx).await.map_err(job_storage)?.is_some()
+        };
+        if failed {
             count_lines(&mut tx, self.job, 0, 1).await?;
         }
         tx.commit().await.map_err(job_storage)?;
-        Ok(failed.is_some())
+        Ok(failed)
     }
 
     /// Release the route once the provider attempt has settled. Recovery
