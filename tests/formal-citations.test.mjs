@@ -32,6 +32,15 @@ test("text that is gone or no longer identifies one line fails", () => {
   assert.throws(() => resolveCitations(`${cite(1)} ${cite(5)}`, () => "FOR UPDATE OF r"), /cited 2 time\(s\) and occurs on 1 line/);
 });
 
+test("quoted text matches whole words at its ends", () => {
+  const lock = cite(9, "lock(&mut tx).await?");
+  // The catalog lock above is another guard: only the second line holds the text.
+  assert.deepEqual(lines(resolveCitations(lock, () => "catalog_lock(&mut tx).await?;\n    lock(&mut tx).await?;")), [2]);
+  assert.throws(() => resolveCitations(lock, () => "catalog_lock(&mut tx).await?;"), /no longer contains/);
+  assert.throws(() => resolveCitations(cite(1, "fn accept_job"), () => "fn accept_job_v2("), /no longer contains/);
+  assert.deepEqual(lines(resolveCitations(cite(3, ".request_timeout"), () => ".request_timeout\n.request_timeouts")), [1]);
+});
+
 test("empty inventories and malformed source citations fail closed", () => {
   assert.throws(() => resolveCitations("", () => ""), /no citations/);
   for (const malformed of [cite(2).replace("#L2", "#2"), cite(2).replaceAll("`", "")]) {

@@ -5,7 +5,7 @@
 //     node scripts/formal-citations.mjs --fix    # rewrite the line numbers to where the text is now
 //
 // `npm run test:rules` runs the same check (tests/formal-citations.test.mjs).
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 export const README = new URL("../spec/formal/README.md", import.meta.url);
@@ -22,6 +22,19 @@ const fail = message => { throw new Error(message); };
 // of it in that file, taken in order. Text that is gone, or that occurs more
 // often than it is cited, fails: the guard changed, or the citation no longer
 // says which occurrence it means.
+//
+// The text matches as whole words at its ends: `lock(` is not found inside
+// `catalog_lock(`, nor `fn accept_job` inside `fn accept_job_v2`.
+function holds(line, token) {
+  const word = c => c !== undefined && /[A-Za-z0-9_]/.test(c);
+  for (let at = line.indexOf(token); at !== -1; at = line.indexOf(token, at + 1)) {
+    const before = word(token[0]) && word(line[at - 1]);
+    const after = word(token.at(-1)) && word(line[at + token.length]);
+    if (!before && !after) return true;
+  }
+  return false;
+}
+
 export function resolveCitations(markdown, readSource) {
   const citations = [...markdown.matchAll(INLINE)].map(match => ({
     text: match[0], token: match[1], path: match[2], cited: Number(match[3]), index: match.index, line: null,
@@ -39,7 +52,7 @@ export function resolveCitations(markdown, readSource) {
   for (const group of groups.values()) {
     const { path, token } = group[0];
     const lines = readSource(path).split(/\r?\n/);
-    const holding = lines.flatMap((line, i) => line.includes(token) ? [i + 1] : []);
+    const holding = lines.flatMap((line, i) => holds(line, token) ? [i + 1] : []);
     if (!holding.length) fail(`${path} no longer contains ${token}`);
     const moved = [];
     for (const citation of group) {
@@ -68,7 +81,8 @@ export function renumber(markdown, citations) {
 
 export const readFromReadme = path => readFileSync(new URL(path, README), "utf8");
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// Compared by real path: Node resolves a symlinked script for `import.meta.url`.
+if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
   try {
     const args = process.argv.slice(2);
     if (args.length > 1 || (args.length === 1 && args[0] !== "--fix")) fail("usage: formal-citations.mjs [--fix]");
