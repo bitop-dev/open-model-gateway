@@ -73,24 +73,35 @@ fn choose_endpoint(
         .min_by_key(|(_, c)| *c)
         .map(|(i, _)| (i, "cheapest", 0))
 }
+/// The endpoint's provider name, else its tag, as at most 64 characters of
+/// printable ASCII: whitespace (line and paragraph separators included)
+/// becomes one space, and every other character is dropped, so invisible,
+/// bidirectional and look-alike characters from other scripts cannot change
+/// the apparent identity in an operator warning.
 pub(super) fn provider_label(e: &Value) -> String {
-    e["provider_name"]
-        .as_str()
-        .or(e["tag"].as_str())
-        .unwrap_or("unnamed provider")
-        .chars()
-        .filter(|c| !c.is_control() && !is_format(*c))
-        .take(64)
-        .collect()
+    ["provider_name", "tag"]
+        .iter()
+        .filter_map(|key| e[*key].as_str())
+        .map(printable)
+        .find(|label| !label.is_empty())
+        .unwrap_or_else(|| "unnamed provider".into())
 }
-// Unicode General_Category=Cf: invisible formatting and bidi controls must
-// not change the apparent provider identity in an operator warning.
-fn is_format(c: char) -> bool {
-    matches!(c as u32, 0x00ad | 0x0600..=0x0605 | 0x061c | 0x06dd | 0x070f |
-        0x0890..=0x0891 | 0x08e2 | 0x180e | 0x200b..=0x200f | 0x202a..=0x202e |
-        0x2060..=0x2064 | 0x2066..=0x206f | 0xfeff | 0xfff9..=0xfffb | 0x110bd |
-        0x110cd | 0x13430..=0x1343f | 0x1bca0..=0x1bca3 | 0x1d173..=0x1d17a |
-        0xe0001 | 0xe0020..=0xe007f)
+fn printable(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.chars() {
+        if out.len() >= 64 {
+            break;
+        }
+        if c.is_whitespace() {
+            if !out.is_empty() && !out.ends_with(' ') {
+                out.push(' ');
+            }
+        } else if c.is_ascii_graphic() {
+            out.push(c);
+        }
+    }
+    out.truncate(out.trim_end().len());
+    out
 }
 /// `map` priced from one concrete endpoint when the endpoint list is known.
 pub(crate) fn map_with_endpoints(
@@ -100,22 +111,21 @@ pub(crate) fn map_with_endpoints(
     endpoints: Option<&Value>,
     evidence: &[Evidence],
 ) -> Value {
-    if !model.is_object()
-        || !limits::mapping_value(model)
-        || endpoints.is_some_and(|e| !limits::mapping_value(e))
-        || evidence.len() > limits::MAX_ITEMS
-    {
+    let read = model
+        .is_object()
+        .then(|| limits::model_fields(model))
+        .flatten();
+    let list = endpoints.map(limits::endpoint_list).transpose();
+    let (Some(read), Ok(list)) = (read, list) else {
+        return limits::refused(model, workload);
+    };
+    if evidence.len() > limits::MAX_ITEMS {
         return limits::refused(model, workload);
     }
-    let list = endpoints
-        .and_then(|v| {
-            v["data"]["endpoints"]
-                .as_array()
-                .or(v["endpoints"].as_array())
-        })
-        .filter(|l| !l.is_empty());
-    let Some((list, (index, selection, matched))) =
-        list.and_then(|l| choose_endpoint(l, evidence).map(|c| (l, c)))
+    let model = &read;
+    let Some((list, (index, selection, matched))) = list
+        .flatten()
+        .and_then(|l| choose_endpoint(&l, evidence).map(|c| (l, c)))
     else {
         let mut out = map(model, workload, images);
         if workload != WorkloadKind::Images && !all_rates_unknown(&out) {
@@ -141,7 +151,7 @@ pub(crate) fn map_with_endpoints(
         );
         out["needs_review"] = json!(true);
     }
-    describe_endpoint(&mut out, list, endpoint, selection, matched);
+    describe_endpoint(&mut out, &list, endpoint, selection, matched);
     if tiers_dropped {
         push_warning(
             &mut out,
@@ -216,6 +226,21 @@ fn describe_endpoint(
         );
         out["needs_review"] = json!(true);
     }
+    // An integer status other than 0 is down, which "current" already
+    // excludes. Any other status is unknown: the endpoint may be up and
+    // cheaper, so the cheapest claim needs review.
+    if selection != "evidence"
+        && list
+            .iter()
+            .filter(complete)
+            .any(|e| e.get("status").is_some_and(|s| s.as_i64().is_none()))
+    {
+        push_warning(
+            out,
+            "An endpoint with comparable rates reports an unreadable status and was excluded; review its price before publishing.",
+        );
+        out["needs_review"] = json!(true);
+    }
     if selection == "evidence"
         && endpoint
             .get("status")
@@ -228,28 +253,28 @@ fn describe_endpoint(
         out["needs_review"] = json!(true);
     }
     let label = provider_label(endpoint);
-    let rate = |e: &Value| {
+    let input_rate = |e: &Value| {
         price_str(&e["pricing"], "prompt")
             .and_then(|p| microusd(&p, 1_000_000))
             .map(|x| format!("{}/M input tokens", crate::billing::v3::format_usd(x.0)))
     };
-    let chosen_rate = rate(endpoint).unwrap_or_else(|| "an unlisted input rate".into());
+    let chosen_rates = compared_rates(endpoint);
     let highest = list
         .iter()
         .filter_map(|e| reference_cost(&e["pricing"]).map(|c| (c, e)))
         .max_by_key(|(c, _)| *c);
     let pricier =
         highest.filter(|(c, _)| reference_cost(&endpoint["pricing"]).is_some_and(|own| *c > own));
-    out["endpoint"] = json!({"provider":label,"selection":selection,"matched_attempts":matched,"endpoint_count":list.len(),"input_rate":rate(endpoint)});
+    out["endpoint"] = json!({"provider":label,"selection":selection,"matched_attempts":matched,"endpoint_count":list.len(),"input_rate":input_rate(endpoint)});
     push_warning(
         out,
         &match selection {
             "evidence" => format!(
-                "Priced from the {label} endpoint ({chosen_rate}), which matches the provider-reported cost of {matched} recent request{}.",
+                "Priced from the {label} endpoint ({chosen_rates}), which matches the provider-reported cost of {matched} recent request{}.",
                 if matched == 1 { "" } else { "s" }
             ),
             _ => format!(
-                "Priced from the {label} endpoint ({chosen_rate}), the cheapest of {} comparable current endpoint{}.",
+                "Priced from the {label} endpoint ({chosen_rates}), the cheapest of {} comparable current endpoint{} for one million input and one million output tokens plus one request.",
                 comparable_up,
                 if comparable_up == 1 { "" } else { "s" }
             ),
@@ -268,8 +293,8 @@ fn describe_endpoint(
         push_warning(
             out,
             &format!(
-                "OpenRouter may route to another endpoint at a higher price ({} on {}); budget holds use the imported price.",
-                rate(top).unwrap_or_else(|| "unlisted".into()),
+                "OpenRouter may route to another endpoint at a higher combined price ({} on {}); budget holds use the imported price.",
+                compared_rates(top),
                 provider_label(top)
             ),
         );
@@ -278,17 +303,38 @@ fn describe_endpoint(
         }
     }
 }
+/// The rates endpoints are compared on, as words: input and output per
+/// million tokens, plus a nonzero per-request fee. Only endpoints with a
+/// `reference_cost` reach this, so every rate is readable.
+fn compared_rates(e: &Value) -> String {
+    let usd = |key: &str, units: u64| {
+        price_str(&e["pricing"], key)
+            .and_then(|p| microusd(&p, units))
+            .map_or_else(
+                || "an unlisted rate".into(),
+                |x| crate::billing::v3::format_usd(x.0),
+            )
+    };
+    let mut text = format!(
+        "{}/M input and {}/M output tokens",
+        usd("prompt", 1_000_000),
+        usd("completion", 1_000_000)
+    );
+    if request_fee(&e["pricing"]).is_some_and(|fee| fee != 0) {
+        text.push_str(&format!(" plus {} per request", usd("request", 1)));
+    }
+    text
+}
+/// `map` leaves `SELECTION_WARNINGS` slots for these, one per distinct
+/// selection warning, so none is dropped; the bound is still enforced.
 fn push_warning(out: &mut Value, w: &str) {
     if let Some(list) = out["warnings"].as_array_mut() {
         if list.iter().any(|v| v.as_str() == Some(w)) {
             return;
         }
-        if list.len() < limits::MAX_WARNINGS - 1 {
+        if list.len() < limits::MAX_WARNINGS {
             list.push(json!(w));
-        } else if list.len() == limits::MAX_WARNINGS - 1 {
-            list.push(json!(
-                "Additional catalog warnings were omitted; review all rates before publishing."
-            ));
+        } else {
             out["needs_review"] = json!(true);
         }
     }

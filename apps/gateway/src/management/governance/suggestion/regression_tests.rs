@@ -217,7 +217,7 @@ fn refused_imports_keep_the_models_token_ceilings() {
     let too_many = vec![Value::Null; limits::MAX_ITEMS + 1];
     let mut oversized_model = model.clone();
     oversized_model["pricing"]["overrides"] = json!(too_many);
-    let oversized_endpoints = json!({"endpoints":too_many});
+    let oversized_endpoints = json!({"endpoints":vec![Value::Null; limits::MAX_ENDPOINTS + 1]});
     for (entry, endpoints) in [
         (&oversized_model, None),
         (&model, Some(&oversized_endpoints)),
@@ -473,7 +473,7 @@ proptest::proptest! {
         proptest::prop_assert!(out.to_string().len() < 16_384);
         proptest::prop_assert_eq!(&out["needs_review"], &json!(true));
         proptest::prop_assert!(out["draft"]["price_lines"].as_array().unwrap().iter().all(|p|p["unknown"] == true));
-        let endpoints = json!({"endpoints": vec![json!({"pricing":{"prompt":"0","completion":"0","request":"0"}});count]});
+        let endpoints = json!({"endpoints": vec![json!({"pricing":{"prompt":"0","completion":"0","request":"0"}});limits::MAX_ENDPOINTS - 64 + count]});
         let out = map_with_endpoints(&json!({"id":"v/m"}), WorkloadKind::Generation, None, Some(&endpoints), &[]);
         proptest::prop_assert!(out.to_string().len() < 16_384);
         proptest::prop_assert_eq!(&out["needs_review"], &json!(true));
@@ -495,7 +495,7 @@ fn decoded_complexity_and_warnings_are_bounded_before_mapping() {
         warnings.push(format!("Warning {n}"));
         warnings.push(format!("Warning {n}"));
     }
-    assert_eq!(warnings.items.len(), 64);
+    assert_eq!(warnings.items.len(), limits::MAPPER_WARNINGS);
     assert!(warnings.items.last().unwrap().contains("omitted"));
     let overrides: Vec<_> = (1..=64)
         .map(|n| {
@@ -507,7 +507,10 @@ fn decoded_complexity_and_warnings_are_bounded_before_mapping() {
     let full = json!({"context_length":4096,"top_provider":{"max_completion_tokens":100},"pricing":{"prompt":"0","completion":"0","request":"0","input_cache_read":"0","input_cache_write":"0","input_cache_write_1h":"0","overrides":overrides}});
     let out = map(&full, WorkloadKind::Generation, None);
     assert!(out["display_lines"].is_array(), "otherwise fully priced");
-    assert_eq!(out["warnings"].as_array().unwrap().len(), 64);
+    assert_eq!(
+        out["warnings"].as_array().unwrap().len(),
+        limits::MAPPER_WARNINGS
+    );
     assert_eq!(out["needs_review"], true, "omitted warnings require review");
     let model = json!({"pricing":{"overrides":vec![json!({});64]}});
     let out = map(&model, WorkloadKind::Generation, None);

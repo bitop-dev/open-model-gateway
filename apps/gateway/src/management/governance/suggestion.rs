@@ -1,9 +1,10 @@
 //! Draft pricing-v3 lines from OpenRouter's public catalog (no key is sent).
 //!
 //! Server-side HTTPS fetch of a fixed origin with no redirects, ambient proxies
-//! or retries, a 5-second deadline, a 4 MiB body cap and a 10-minute cache. Units
-//! are never inferred from a bare catalog key: the workload decides the meter,
-//! and model-specific or ambiguous units are returned with `needs_review:true`.
+//! or retries, a 5-second deadline, a 4 MiB body cap, one fetch at a time and a
+//! 10-minute cache of at most 16 MiB. Units are never inferred from a bare
+//! catalog key: the workload decides the meter, and model-specific or
+//! ambiguous units are returned with `needs_review:true`.
 //! The result is only a draft; publishing remains the immutable price POST.
 use super::*;
 use crate::{
@@ -23,6 +24,8 @@ mod mapping;
 mod selection;
 pub(crate) use selection::map_with_endpoints;
 #[cfg(test)]
+mod catalog_shape_tests;
+#[cfg(test)]
 mod mapping_property_tests;
 #[cfg(test)]
 mod regression_tests;
@@ -31,6 +34,7 @@ pub(crate) use mapping::map;
 const BODY_CAP: usize = 4 * 1024 * 1024;
 const CACHE_TTL: Duration = Duration::from_secs(600);
 const CACHE_ENTRIES: usize = 64;
+const CACHE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug)]
 enum CatalogError {
@@ -44,6 +48,10 @@ pub(crate) struct OpenRouterCatalog {
     base: String,
     timeout: Duration,
     cache: tokio::sync::Mutex<Cache>,
+    /// Held for each upstream fetch: concurrent misses of one document wait
+    /// for the first and read its cached copy, and at most one body is in
+    /// flight.
+    fetch: tokio::sync::Mutex<()>,
 }
 impl OpenRouterCatalog {
     fn build(base: String, timeout: Duration) -> anyhow::Result<Self> {
@@ -59,6 +67,7 @@ impl OpenRouterCatalog {
             base,
             timeout,
             cache: tokio::sync::Mutex::new(HashMap::new()),
+            fetch: tokio::sync::Mutex::new(()),
         })
     }
     pub(crate) fn production() -> anyhow::Result<Self> {
@@ -75,12 +84,19 @@ impl OpenRouterCatalog {
         assert_eq!(url.host_str(), Some("127.0.0.1"));
         Self::build(base, timeout).unwrap()
     }
+    async fn cached(&self, url: &str) -> Option<Arc<Vec<u8>>> {
+        let cache = self.cache.lock().await;
+        let (at, body) = cache.get(url)?;
+        (at.elapsed() < CACHE_TTL).then(|| body.clone())
+    }
     async fn get(&self, path: &str) -> Result<Arc<Vec<u8>>, CatalogError> {
         let url = format!("{}{path}", self.base);
-        if let Some((at, body)) = self.cache.lock().await.get(&url)
-            && at.elapsed() < CACHE_TTL
-        {
-            return Ok(body.clone());
+        if let Some(body) = self.cached(&url).await {
+            return Ok(body);
+        }
+        let _fetch = self.fetch.lock().await;
+        if let Some(body) = self.cached(&url).await {
+            return Ok(body);
         }
         let body = tokio::time::timeout(self.timeout, async {
             let response = self
@@ -125,14 +141,19 @@ impl OpenRouterCatalog {
         limits::catalog_json(&body)?;
         let body = Arc::new(body);
         let images = path.starts_with("/images/");
-        if path.ends_with("/endpoints") && !limits::mapping_json(&body) {
-            // Image mapping applies its limits to the raw body. Token
-            // mapping uses a value tree, which can collapse duplicate fields.
-            return if images {
-                Ok(body)
-            } else {
-                Err(CatalogError::Limit)
-            };
+        if images && !limits::mapping_json(&body) {
+            // Image mapping applies its limits to the raw body and reports
+            // the refusal; the response is not cached.
+            return Ok(body);
+        }
+        // The mapper would refuse these endpoints. Do not cache them, so a
+        // corrected response is read on the next preview.
+        if !images
+            && path.ends_with("/endpoints")
+            && serde_json::from_slice::<Value>(&body)
+                .is_ok_and(|v| limits::endpoint_list(&v).is_err())
+        {
+            return Err(CatalogError::Limit);
         }
         if images {
             let endpoints = image_endpoint_arrays(&body);
@@ -149,8 +170,18 @@ impl OpenRouterCatalog {
         }
         let mut cache = self.cache.lock().await;
         cache.retain(|_, (at, _)| at.elapsed() < CACHE_TTL);
-        if cache.len() >= CACHE_ENTRIES {
-            cache.clear();
+        // Oldest first until the new body fits; a body is at most BODY_CAP.
+        while cache.len() >= CACHE_ENTRIES
+            || cache.values().map(|(_, b)| b.len()).sum::<usize>() + body.len() > CACHE_BYTES
+        {
+            let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            cache.remove(&oldest);
         }
         cache.insert(url, (Instant::now(), body.clone()));
         Ok(body)
@@ -466,18 +497,22 @@ impl Draft {
         self.push_line(v);
     }
 }
+/// The mapper's warnings, at most `MAPPER_WARNINGS` including the notice
+/// that more were omitted; the rest of `MAX_WARNINGS` is endpoint selection's.
 #[derive(Default)]
 struct Warnings {
     items: Vec<String>,
+    omitted: bool,
 }
 impl Warnings {
     fn push(&mut self, w: String) {
         if self.items.contains(&w) {
             return;
         }
-        if self.items.len() < limits::MAX_WARNINGS - 1 {
+        if self.items.len() < limits::MAPPER_WARNINGS - 1 {
             self.items.push(w);
-        } else if self.items.len() == limits::MAX_WARNINGS - 1 {
+        } else if !self.omitted {
+            self.omitted = true;
             self.items.push(
                 "Additional catalog warnings were omitted; review all rates before publishing."
                     .into(),
@@ -1090,11 +1125,13 @@ pub(crate) mod tests {
         assert_eq!(v["needs_review"], true);
         let w = v["warnings"].to_string();
         assert!(
-            w.contains("PrimeIntellect endpoint ($0.021/M input tokens)"),
+            w.contains("PrimeIntellect endpoint ($0.021/M input and $0/M output tokens)"),
             "{w}"
         );
         assert!(
-            w.contains("higher price ($0.09/M input tokens on Cloudflare)"),
+            w.contains(
+                "higher combined price ($0.09/M input and $0/M output tokens on Cloudflare)"
+            ),
             "{w}"
         );
         // Evidence: 145 input tokens cost 14 µUSD → the Cloudflare endpoint.
