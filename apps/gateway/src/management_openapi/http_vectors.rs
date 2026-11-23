@@ -415,6 +415,8 @@ pub(super) struct Notes {
     /// Locations whose vectors cannot be trusted (unbounded patterns without
     /// candidates, one-sided candidates).
     pub(super) problems: Vec<String>,
+    /// Whether any valid base demonstrated a supplied pair at this instance.
+    supplied_pairs: std::collections::BTreeMap<String, bool>,
     /// Supplied evidence across valid bases of this plan, by instance and declaring use.
     pattern_witnesses: std::collections::BTreeMap<(String, Vec<SchemaStep>), bool>,
 }
@@ -450,6 +452,11 @@ impl Notes {
             .collect();
         for location in missing {
             problems.push(format!("{location}: {MISSING_PATTERN}; {STRADDLE}"));
+        }
+        for (location, covered) in &self.supplied_pairs {
+            if !covered {
+                problems.push(format!("{location}: {STRADDLE}"));
+            }
         }
         ensure!(problems.is_empty(), "{}", problems.join("; "));
         ensure!(
@@ -1166,8 +1173,8 @@ fn settle_patterns(
     if stale {
         notes.problems.push(format!("{location}: {PATTERN_BOUNDARIES} is stale: the pattern, a length cap or its supplied candidates already cover its boundaries; delete it"));
     }
-    if verdicts.is_some() && !witnessed {
-        notes.problems.push(format!("{location}: {STRADDLE}"));
+    if verdicts.is_some() {
+        *notes.supplied_pairs.entry(location.to_owned()).or_default() |= witnessed;
     }
     Ok(())
 }
@@ -1800,7 +1807,6 @@ pub(super) fn query_plan(
             accepts(document, schema, &typed)?,
             "the valid base value of a query parameter must satisfy its schema"
         );
-        let mut seen = BTreeSet::from([raw.to_owned()]);
         if base.iter().any(|(n, _)| n == name) {
             out.push(QueryCase {
                 param: name.clone(),
@@ -1814,52 +1820,20 @@ pub(super) fn query_plan(
             .filter(|(n, _)| n == name)
             .map(|(_, v)| v.as_str())
             .collect();
+        let supplied_values: BTreeSet<_> = supplied.iter().copied().collect();
+        // A supplied spelling must have its own planned request, including when
+        // it equals the seed for a parameter omitted by the valid base.
+        let mut seen = BTreeSet::new();
+        if !supplied_values.contains(raw) {
+            seen.insert(raw.to_owned());
+        }
+        let first_case = out.len();
         let rules = ByteDominance::at(document, schema, &typed, &[], nodes, !supplied.is_empty())?;
         let oracle = BoundaryOracle {
             rules,
             ..BoundaryOracle::leaf(schema)
         };
         let mut mutations = scalar_mutations(document, schema, &oracle, &schemas, &typed, true)?;
-        let verdicts = supplied
-            .iter()
-            .map(|v| {
-                Ok((
-                    v.to_string(),
-                    accepts(document, schema, &wire_value(schema, v)?)?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let source = PatternSource {
-            document,
-            schema,
-            seed: &typed,
-            path: &[],
-        };
-        settle_patterns(
-            &source,
-            &schemas,
-            &oracle.rules,
-            &format!("query parameter {name}"),
-            (!supplied.is_empty()).then_some(verdicts.as_slice()),
-            &mut notes,
-            |edge, accepted, refused| {
-                let accepted = wire_value(schema, accepted)?;
-                if !accepted.is_string() {
-                    return Ok(false);
-                }
-                if let ("pattern", Some(pattern)) = (edge.keyword, edge.bound.as_str())
-                    && !super::validation::pattern_validator(pattern)?.is_valid(&accepted)
-                {
-                    return Ok(false);
-                }
-                for variant in source.relaxations(&accepted, edge)? {
-                    if accepts(document, &variant, &wire_value(&variant, refused)?)? {
-                        return Ok(true);
-                    }
-                }
-                Ok(false)
-            },
-        )?;
         mutations
             .vectors
             .extend(supplied.iter().map(|v| ("supplied candidate", json!(v))));
@@ -1909,6 +1883,50 @@ pub(super) fn query_plan(
                 });
             }
         }
+        // Only cases admitted by the encoded request-size check can prove an edge.
+        let verdicts: Vec<_> = out[first_case..]
+            .iter()
+            .filter_map(|case| {
+                if let Edit::Set(raw) = &case.edit
+                    && supplied_values.contains(raw.as_str())
+                {
+                    Some((raw.clone(), case.accept))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let source = PatternSource {
+            document,
+            schema,
+            seed: &typed,
+            path: &[],
+        };
+        settle_patterns(
+            &source,
+            &schemas,
+            &oracle.rules,
+            &format!("query parameter {name}"),
+            (!supplied.is_empty()).then_some(verdicts.as_slice()),
+            &mut notes,
+            |edge, accepted, refused| {
+                let accepted = wire_value(schema, accepted)?;
+                if !accepted.is_string() {
+                    return Ok(false);
+                }
+                if let ("pattern", Some(pattern)) = (edge.keyword, edge.bound.as_str())
+                    && !super::validation::pattern_validator(pattern)?.is_valid(&accepted)
+                {
+                    return Ok(false);
+                }
+                for variant in source.relaxations(&accepted, edge)? {
+                    if accepts(document, &variant, &wire_value(&variant, refused)?)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            },
+        )?;
         let exempt = *unsendable;
         let before = notes.exempt;
         notes.settle(name, &dropped, &sent, exempt);
