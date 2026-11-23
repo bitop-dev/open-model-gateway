@@ -3871,6 +3871,19 @@ fn check_empty_pattern_candidates(plan: impl Fn(Value) -> anyhow::Result<()>) {
                 "{cap}: {error}"
             ),
         }
+        let reason = json!("The handler fixture checks this pattern's length boundary.");
+        let mut annotated = schema.clone();
+        annotated["anyOf"][1]["x-omg-pattern-boundaries"] = reason.clone();
+        let error =
+            plan(annotated).expect_err("a sibling annotation cannot excuse the finite pattern");
+        assert!(
+            error.to_string().contains("supply boundary candidates"),
+            "{error}"
+        );
+
+        let mut annotated_owner = schema.clone();
+        annotated_owner["anyOf"][0]["x-omg-pattern-boundaries"] = reason;
+        plan(annotated_owner).expect("the exemption belongs to the finite pattern");
         let mut shared = schema.clone();
         shared["anyOf"][0][cap] = json!(4);
         plan(shared.clone()).expect("every string arm has the same cap");
