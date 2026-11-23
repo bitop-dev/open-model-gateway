@@ -14,20 +14,32 @@ pub(crate) enum Failure {
     Unavailable,
     Throttled,
     Disconnect,
-    Timeout,
+    Timeout(std::time::Duration),
 }
-impl Failure {
-    pub(crate) const ALL: [Self; 4] = [
-        Self::Unavailable,
-        Self::Throttled,
-        Self::Disconnect,
-        Self::Timeout,
-    ];
+// Separate libtest cases keep every observation visible when a retry cap changes.
+macro_rules! attempt_cases {
+    ($module:ident, $run:ident, $timeout_seconds:literal $(, $arg:expr)*) => {
+        mod $module {
+            use super::*;
+            #[tokio::test]
+            async fn bare_429() { $run(Failure::Throttled $(, $arg)*).await; }
+            #[tokio::test]
+            async fn bare_503() { $run(Failure::Unavailable $(, $arg)*).await; }
+            #[tokio::test]
+            async fn disconnect_on_accept() { $run(Failure::Disconnect $(, $arg)*).await; }
+            #[tokio::test]
+            async fn headers_withheld() {
+                $run(Failure::Timeout(std::time::Duration::from_secs($timeout_seconds)) $(, $arg)*).await;
+            }
+        }
+    };
 }
+pub(crate) use attempt_cases;
 
 pub(crate) struct Fixture {
     pub(crate) endpoint: String,
     attempts: Arc<AtomicUsize>,
+    requests: Arc<AtomicUsize>,
     server: JoinHandle<()>,
 }
 
@@ -37,6 +49,8 @@ impl Fixture {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let attempts = Arc::new(AtomicUsize::new(0));
         let seen = attempts.clone();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let received = requests.clone();
         let server = tokio::spawn(async move {
             let mut stalled_connections = Vec::new();
             loop {
@@ -61,14 +75,15 @@ impl Fixture {
                         break;
                     }
                 }
+                received.fetch_add(1, Ordering::SeqCst);
                 let status = match failure {
                     Failure::Unavailable => "503 Service Unavailable",
                     Failure::Throttled => "429 Too Many Requests",
-                    Failure::Timeout => {
-                        // Advance to the production deadline only after the request arrived.
+                    Failure::Timeout(elapsed) => {
+                        // Cross the selected deadline only after reading the request headers.
                         stalled_connections.push(socket);
                         tokio::time::pause();
-                        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+                        tokio::time::advance(elapsed).await;
                         tokio::time::resume();
                         continue;
                     }
@@ -86,13 +101,22 @@ impl Fixture {
         Self {
             endpoint,
             attempts,
+            requests,
             server,
         }
     }
 
     pub(crate) fn assert_one(&self, failure: Failure) {
         assert!(!self.server.is_finished(), "loopback server failed");
-        assert_eq!(self.attempts.load(Ordering::SeqCst), 1, "{failure:?}");
+        let expected_requests = usize::from(!matches!(failure, Failure::Disconnect));
+        assert_eq!(
+            (
+                self.attempts.load(Ordering::SeqCst),
+                self.requests.load(Ordering::SeqCst)
+            ),
+            (1, expected_requests),
+            "{failure:?}: (accepted sockets, complete request headers)"
+        );
     }
 }
 impl Drop for Fixture {

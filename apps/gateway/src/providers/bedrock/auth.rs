@@ -250,7 +250,7 @@ pub(super) fn profile_provider(
     builder.build()
 }
 
-/// Pin Retry Behavior 2.1 without adopting later SDK timeout defaults.
+/// The later v2026_11_17 selector introduces a default read timeout.
 #[allow(deprecated)]
 pub(crate) fn sdk_behavior_version() -> BehaviorVersion {
     BehaviorVersion::v2026_11_10()
