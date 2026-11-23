@@ -22,6 +22,7 @@ use std::{pin::Pin, time::Duration};
 
 use futures_util::{Sink, Stream};
 use serde_json::Value;
+use tracing::Instrument;
 
 pub mod context;
 pub use context::ResponseBound;
@@ -399,11 +400,15 @@ impl RealtimeSession {
         // cancelled, it must observe the write's commit or failure first.
         let (completed, waiting) = tokio::sync::oneshot::channel();
         self.response_write = Some(waiting);
-        let result = HandOff::new(async move {
-            let result = realtime_settlement(write).await;
-            let _ = completed.send(());
-            result
-        })
+        // A write finished on a spawned task keeps the session's log span.
+        let result = HandOff::new(
+            async move {
+                let result = realtime_settlement(write).await;
+                let _ = completed.send(());
+                result
+            }
+            .in_current_span(),
+        )
         .await;
         self.response_write = None;
         result.map_err(|_| InferenceError::Storage)??;
@@ -466,6 +471,9 @@ impl RealtimeSession {
             }
             result
         }
+        // In `Drop` too: the detached write logs under the span it was
+        // dropped in.
+        .in_current_span()
     }
     /// Durably finish the session. An open response or unopened request keeps
     /// its window as unknown usage.

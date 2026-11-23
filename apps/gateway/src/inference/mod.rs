@@ -118,6 +118,13 @@ impl Engine {
         })
     }
 
+    /// Concurrency permits not held by a request, a session or a detached
+    /// write that still carries one.
+    #[cfg(all(test, feature = "integration-tests"))]
+    pub(crate) fn available_capacity(&self) -> usize {
+        self.capacity.available_permits()
+    }
+
     /// Attaches the bounded trace recorder (#98). None disables tracing for
     /// every request through this engine.
     pub fn with_telemetry(mut self, recorder: Option<telemetry::Recorder>) -> Self {

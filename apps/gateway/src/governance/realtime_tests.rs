@@ -492,6 +492,8 @@ async fn pricing_must_be_v3_and_unpriced_sessions_stay_unknown(pool: PgPool) {
         amounts(&f, start.id).await,
         ("unknown".into(), None, None, true)
     );
+    // Without a price nothing is known about its cost, not even a floor.
+    assert_eq!(unknown_entry(&f, start.id).await, None);
     // Zero responses settle at a known zero.
     let empty = ExecutionStart {
         streamed: true,
@@ -513,6 +515,76 @@ async fn pricing_must_be_v3_and_unpriced_sessions_stay_unknown(pool: PgPool) {
     assert_eq!(
         admit_workload_for_deployment(&f.store, &v1, &admission(50), 960, &d).await,
         Err(InferenceError::Configuration)
+    );
+}
+
+/// The amount of the session's one `unknown` ledger entry.
+async fn unknown_entry(f: &Fixture, id: Uuid) -> Option<i64> {
+    sqlx::query_scalar(
+        "SELECT amount_microusd FROM monetary_ledger WHERE execution_id=$1 AND kind='unknown'",
+    )
+    .bind(id)
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap()
+}
+
+/// `response.created` was recorded in the database, but the session never
+/// learnt it (its open was cancelled or timed out as it committed), so it
+/// finishes with the request still unopened. The response row is that
+/// request's window: it is retained once, never again as an unopened one.
+#[dbtest::test]
+async fn an_open_the_session_did_not_record_is_held_once(pool: PgPool) {
+    let f = fixture(pool).await;
+    let d = realtime_model(&f, Some(lines())).await;
+    let start = ExecutionStart {
+        streamed: true,
+        ..f.start()
+    };
+    admit_workload_for_deployment(&f.store, &start, &admission(100), 960, &d)
+        .await
+        .unwrap();
+    realtime::open_response(&f.store, start.id, 1, admitted())
+        .await
+        .unwrap();
+    realtime::finish(
+        &f.store,
+        &RealtimeFinish {
+            window: admitted(),
+            ..finished(start.id, true)
+        },
+    )
+    .await
+    .unwrap();
+    let responses: Vec<(i32, String, Option<i64>)> = sqlx::query_as("SELECT sequence,state,window_hold_microusd FROM realtime_responses WHERE execution_id=$1 ORDER BY sequence")
+        .bind(start.id).fetch_all(&f.store.pool).await.unwrap();
+    assert_eq!(responses, vec![(1, "unknown".into(), Some(ADMISSION))]);
+    assert_eq!(
+        amounts(&f, start.id).await,
+        ("unknown".into(), Some(ADMISSION), None, false)
+    );
+    assert_eq!(unknown_entry(&f, start.id).await, Some(0));
+
+    // Without that row the unopened request keeps its own window.
+    let other = ExecutionStart {
+        streamed: true,
+        ..f.start()
+    };
+    admit_workload_for_deployment(&f.store, &other, &admission(100), 960, &d)
+        .await
+        .unwrap();
+    realtime::finish(
+        &f.store,
+        &RealtimeFinish {
+            window: admitted(),
+            ..finished(other.id, true)
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        amounts(&f, other.id).await,
+        ("unknown".into(), Some(ADMISSION), None, false)
     );
 }
 
