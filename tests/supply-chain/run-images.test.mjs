@@ -16,6 +16,29 @@ for (const [kind, document] of Object.entries(documents)) {
       assert.deepEqual(check(`docker run --name 2${redirect}log ${pinned}`), []);
     });
   }
+  test(`${kind} inventories commands on both sides of a sh redirect`, () => {
+    for (const redirect of ["&>", "&>>"]) {
+      const inspect = run => {
+        const data = document(run);
+        const step = kind === "action" ? data.runs.steps[0] : data.jobs.check.steps[0];
+        step.shell = "sh";
+        return imageBuildViolations(kind, data, { pinned: new Set(), composeFiles: new Set() });
+      };
+      assert.match(inspect(`true ${redirect}log docker pull floating`).join(), /digest/);
+      assert.match(inspect(`docker ${redirect}log pull floating`).join(), /digest/);
+      assert.deepEqual(inspect(`true ${redirect}log docker pull ${pinned}`), []);
+      assert.deepEqual(check(`true ${redirect}log docker pull floating`), []);
+    }
+  });
+  test(`${kind} keeps escaped heredoc data out of the shell grammar`, () => {
+    const data = String.raw`cat <<'END'
+\x45ND
+<<!
+END
+`;
+    assert.deepEqual(check(data + "true"), []);
+    assert.match(check(data + "docker pull floating").join(), /digest/);
+  });
   test(`${kind} ends Compose option parsing at the service`, () => {
     assert.deepEqual(check("docker compose run --rm -- gateway tool --build"), []);
     assert.deepEqual(check("docker compose run -e --build gateway"), []);
@@ -82,4 +105,18 @@ test("the release digest exception is scoped to the step, verb and exact operand
     [name, "docker pull alpine:latest"],
   ]) assert.match(check(step, run).join(), /digest/);
   assert.match(check(name, "docker compose -f unknown.yml run service").join(), /checked Compose file/);
+});
+
+test("the effective run shell follows step, job, workflow and container defaults", () => {
+  const run = "true &>log docker pull floating";
+  const check = (step, job, workflow) => imageBuildViolations("workflow", {
+    ...workflow, jobs: { check: { ...job, steps: [{ run, ...step }] } },
+  }, { pinned: new Set(), composeFiles: new Set() });
+  const sh = { defaults: { run: { shell: "sh" } } };
+  const bash = { defaults: { run: { shell: "bash" } } };
+  assert.match(check({}, {}, sh).join(), /digest/);
+  assert.match(check({}, sh, bash).join(), /digest/);
+  assert.match(check({}, { container: pinned }, {}).join(), /digest/);
+  assert.deepEqual(check({}, bash, sh), []);
+  assert.deepEqual(check({ shell: "bash" }, sh, sh), []);
 });

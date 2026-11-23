@@ -670,7 +670,26 @@ function heredocBody(source, start, { delimiter, stripTabs, literal }) {
 // Simple commands of a script: continuations joined, split at newlines, ; & | && || ( ) $( and
 // backticks, comments dropped, words shell-split (quotes removed; `DOCKER_""HOST` is one word).
 // Each word records whether it holds a `$` expansion.
-export function shellCommands(s) {
+export function shellCommands(s, shell = "sh") {
+  // The same heredoc can occur in both readings of its header. Parse its
+  // body once per recipient shell, including when shell inputs are nested.
+  const bodies = new Map();
+  const readBody = (body, interpreter) => {
+    const key = interpreter + "\n" + body;
+    if (!bodies.has(key)) bodies.set(key, shellCommands(body, interpreter));
+    return bodies.get(key);
+  };
+  const bash = tokenizeCommands(s, true, readBody);
+  if (shell === "bash" || !bash.sawCombinedRedirect) return bash.commands;
+  // sh may be Bash or a POSIX shell such as dash. Inventory commands unique
+  // to the interpretation that treats & as a separator before the redirect.
+  const seen = new Set(bash.commands.map(words => JSON.stringify(words)));
+  const posix = tokenizeCommands(s, false, readBody);
+  return bash.commands.concat(posix.commands.filter(words => !seen.has(JSON.stringify(words))));
+}
+
+function tokenizeCommands(s, combinedRedirects, readBody) {
+  let sawCombinedRedirect = false;
   // Comments and single quotes consume physical lines. Outside them, an
   // unescaped backslash-newline can join parts of a word or shell operator.
   const skipContinuations = offset => {
@@ -701,7 +720,7 @@ export function shellCommands(s) {
     }
     if (quoted) {
       if (c === '"') quoted = false;
-      else if (c === "\\" && i + 1 < s.length) add(s[++i]);
+      else if (c === "\\" && ['"', "\\", "$", "`"].includes(s[i + 1])) add(s[++i]);
       else add(c, c === "$");
       continue;
     }
@@ -711,7 +730,8 @@ export function shellCommands(s) {
     if (c === "#" && word === null) { const j = s.indexOf("\n", i); i = j === -1 ? s.length : j - 1; continue; }
     if (c === ")" && stack.at(-1)?.close === ")") { close(); continue; }
     const next = skipContinuations(i + 1);
-    const combined = c === "&" && s[next] === ">";
+    const combined = combinedRedirects && c === "&" && s[next] === ">";
+    sawCombinedRedirect ||= combined;
     if (!combined && "\n;&|()".includes(c)) {
       if (heredoc) {
         if (c !== "\n" || stack.length) throw new Error("unsupported compound heredoc command");
@@ -722,7 +742,8 @@ export function shellCommands(s) {
         // Other recipients may interpret their input. Keep that text in the
         // command inventory, isolated from the shell after the delimiter.
         if (program?.text !== "cat" || program.variable) {
-          for (const command of shellCommands(body)) commands.push(command);
+          const shell = program?.text === "bash" && !program.variable ? "bash" : "sh";
+          for (const command of readBody(body, shell)) commands.push(command);
         }
         heredoc = undefined;
         i = end;
@@ -758,7 +779,7 @@ export function shellCommands(s) {
   while (stack.length) close();
   endCommand();
   // Redirections and their targets are not words of the command.
-  return commands.map(commandWords).filter(ws => ws.length);
+  return { commands: commands.map(commandWords).filter(ws => ws.length), sawCombinedRedirect };
 }
 
 function commandWords(words) {
@@ -909,19 +930,22 @@ let composeFilesCache;
 export const checkedComposeFiles = () => (composeFilesCache ??= new Set(repoComposeFiles()));
 
 export function runBuildViolations(where, script, composeFiles = checkedComposeFiles()) {
-  return shellCommands(script).flatMap(words => {
+  return buildCommandViolations(where, shellCommands(script), composeFiles);
+}
+
+function buildCommandViolations(where, commands, composeFiles) {
+  return commands.flatMap(words => {
     const reason = commandViolation(words, composeFiles);
     return reason ? [`${where}: ${reason} (${JSON.stringify(words.map(w => w.text).join(" ").slice(0, 60))}); only a pinned job builds or publishes an image`] : [];
   });
 }
 
 // The DOCKER_ENV names a run script mentions, after the shell removes quotes.
-// printf and echo -e escapes (\xHH, \uHHHH, \NNN) are decoded first.
+// Interpret printf and echo -e escapes only when looking for environment names.
 const decodeEscapes = text => text.replace(/\\x([0-9a-fA-F]{2})|\\u([0-9a-fA-F]{4})|\\0?([0-7]{1,3})/g, (_, x, u, o) => String.fromCharCode(parseInt(x ?? u ?? o, x || u ? 16 : 8)));
-function dockerEnvViolations(where, script) {
-  script = decodeEscapes(script);
-  const words = shellCommands(script).flat().map(w => w.text).join(" ");
-  const names = new Set([...(`${script} ${words}`.match(/[A-Z][A-Z0-9_]*/g) ?? [])].filter(name => DOCKER_ENV.test(name)));
+function dockerEnvViolations(where, script, commands) {
+  const words = commands.flat().map(w => w.text).join(" ");
+  const names = new Set([...(decodeEscapes(`${script} ${words}`).match(/[A-Z][A-Z0-9_]*/g) ?? [])].filter(name => DOCKER_ENV.test(name)));
   return [...names].map(name => `${where}: ${name} selects a builder or changes the Docker client; only a pinned job may set it`);
 }
 
@@ -1023,15 +1047,15 @@ export function imageBuildViolations(file, data, { composeFiles = checkedCompose
     if (typeof step.run === "string") {
       const releaseJob = /^\.github\/workflows\/image\.yml: job '(probe-prepare|verify)'$/.exec(where);
       const releaseStep = releaseJob && isPinned ? releaseJob[1] + ":" + step.name : null;
-      for (const words of shellCommands(step.run)) {
+      const shell = step.shell ?? job?.defaults?.run?.shell ?? data?.defaults?.run?.shell ?? (job?.container ? "sh" : "bash");
+      const commands = shellCommands(step.run, shell);
+      for (const words of commands) {
         const reason = runImageViolation(words, releaseStep, composeFiles);
         if (reason) out.push(`${where}: ${reason}`);
       }
+      if (!isPinned) out.push(...buildCommandViolations(where, commands, composeFiles), ...dockerEnvViolations(where, step.run, commands));
     }
-    if (!isPinned) {
-      out.push(...shellViolation(where, step.shell));
-      if (typeof step.run === "string") out.push(...runBuildViolations(where, step.run, composeFiles), ...dockerEnvViolations(where, step.run));
-    }
+    if (!isPinned) out.push(...shellViolation(where, step.shell));
     const action = actionName(step.uses ?? "");
     if (action === "docker/setup-buildx-action" && (!isMapping(step.with) || JSON.stringify(Object.entries(step.with).sort()) !== JSON.stringify(Object.entries(BUILDX_INPUTS)))) {
       out.push(`${where}: setup-buildx-action: with: must be exactly driver-opts: image=${BUILDKIT_IMAGE}`);

@@ -155,6 +155,7 @@ test("the run-command parser refuses builds, builder and endpoint switches and u
 });
 
 const ESCAPED_ENV = [
+  String.raw`printf "DOCKER_""\x48OST=x"`,
   "printf 'DOCKER_\\x48OST=tcp://evil:2375\\n' >> \"$GITHUB_ENV\"",
   "echo -e 'DOCKER_\\x48OST=tcp://evil:2375' >> \"$GITHUB_ENV\"",
   "printf 'DOCKER_\\110OST=tcp://evil:2375\\n' >> \"$GITHUB_ENV\"",
