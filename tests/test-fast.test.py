@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""Unit tests for scripts/test-fast.py: the selection only, no cargo and no git."""
+"""Unit tests for scripts/test-fast.py: selection and preparation without invoking Cargo or Git."""
+import contextlib
 import importlib.util
+import io
 import os
 import pathlib
 import unittest
@@ -38,6 +40,14 @@ def select(paths, **kwargs):
 
 
 class Preparation(unittest.TestCase):
+    def test_prepare_refuses_a_test_run_or_selection_plan(self):
+        for flag in ("--all", "--plan", "--contract"):
+            with self.subTest(flag=flag), patch.object(fast, "run") as run:
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                    fast.main(["--prepare", flag])
+                self.assertEqual(error.exception.code, 2)
+                run.assert_not_called()
+
     def test_prepare_builds_the_normal_lib_and_propagates_failure(self):
         with patch.object(fast, "changed_files", side_effect=AssertionError("unexpected diff")), \
              patch.object(fast, "run", return_value=17) as run:
@@ -136,8 +146,6 @@ class Selection(unittest.TestCase):
         self.assertTrue(any("runtime-grants.sql" in reason for reason in uncovered))
 
     def test_main_lists_the_tests_for_a_contract_document_or_build_script_change(self):
-        import contextlib
-        import io
         for path, expected in (("docs/openapi/management/operations.json", 3),
                                ("apps/gateway/build.rs", len(TESTS) - 2)):
             fast.changed_files = lambda base, path=path: [path]
@@ -148,8 +156,6 @@ class Selection(unittest.TestCase):
             self.assertIn(f"selected: {expected} of {len(TESTS)} lib tests", out.getvalue())
 
     def test_a_run_that_covers_nothing_does_not_say_passed(self):
-        import contextlib
-        import io
         fast.changed_files = lambda base: ["apps/gateway/tests/common/mod.rs"]
         fast.list_tests = lambda jobs: TESTS
         fast.run = lambda command: 0
