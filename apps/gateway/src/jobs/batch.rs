@@ -361,11 +361,10 @@ impl Jobs {
 
     /// Cancel a batch the caller is allowed to manage.
     pub async fn cancel(&self, job: JobRow) -> JobResult<JobRow> {
+        let finished =
+            || JobError::Conflict("batch_not_cancellable", "This batch has already finished");
         if job.job_state().is_terminal() {
-            return Err(JobError::Conflict(
-                "batch_not_cancellable",
-                "This batch has already finished",
-            ));
+            return Err(finished());
         }
         match job.mode() {
             Some(BatchMode::Native) if job.upstream_id.is_none() => {
@@ -390,8 +389,9 @@ impl Jobs {
                 }
             }
             Some(BatchMode::Gateway) => {
-                store::mark_cancel_requested(&self.store, job.id).await?;
-                store::set_status(&self.store, job.id, "cancelling").await?;
+                return store::cancel_gateway_batch(&self.store, job.id)
+                    .await?
+                    .ok_or_else(finished);
             }
             Some(BatchMode::Native) | None => {
                 let (target, adapter) = self.target(&job).await?;

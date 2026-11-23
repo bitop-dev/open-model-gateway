@@ -609,7 +609,7 @@ impl Runner {
         };
         let _ = segments;
         self.settle_finished(&job, files, state).await?;
-        crate::metrics::METRICS.observe_batch_finished("gateway", final_state.as_str());
+        crate::metrics::METRICS.observe_batch_finished("gateway", job.job_state().as_str());
         Ok(())
     }
 

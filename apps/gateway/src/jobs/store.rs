@@ -290,6 +290,19 @@ pub(crate) async fn mark_settled(store: &Store, id: Uuid) -> Result<()> {
         .await.map_err(job_storage)?;
     Ok(())
 }
+/// Serialize the cancellation decision with the runner's terminal write.
+pub(crate) async fn cancel_gateway_batch(store: &Store, id: Uuid) -> Result<Option<JobRow>> {
+    sqlx::query_as(&format!(
+        "UPDATE async_jobs SET cancel_requested_at=coalesce(cancel_requested_at,clock_timestamp()),
+         upstream_status='cancelling' WHERE id=$1 AND batch_mode='gateway'
+         AND state IN('queued','in_progress') RETURNING {JOB_COLUMNS}"
+    ))
+    .bind(id)
+    .fetch_optional(&store.pool)
+    .await
+    .map_err(job_storage)
+}
+
 pub(crate) async fn mark_cancel_requested(store: &Store, id: Uuid) -> Result<()> {
     sqlx::query(
         "UPDATE async_jobs SET cancel_requested_at=coalesce(cancel_requested_at,clock_timestamp()) WHERE id=$1",
@@ -449,11 +462,20 @@ pub(super) async fn finish_batch_tx(
         }
     }
 
+    // A cancellation acknowledged while results were assembled wins over completion.
+    let state = if f.state == JobState::Completed
+        && job.mode() == Some(BatchMode::Gateway)
+        && job.cancel_requested_at.is_some()
+    {
+        JobState::Cancelled
+    } else {
+        f.state
+    };
     sqlx::query_as(&format!(
         "UPDATE async_jobs SET state=$2,upstream_status=$2,error_code=coalesce(error_code,$3),output_file_id=coalesce(output_file_id,$4),error_file_id=coalesce(error_file_id,$5),request_total=coalesce($6,request_total),request_completed=coalesce($7,request_completed),request_failed=coalesce($8,request_failed),completed_at=coalesce(completed_at,clock_timestamp()) WHERE id=$1 RETURNING {JOB_COLUMNS}"
     ))
     .bind(id)
-    .bind(f.state.as_str())
+    .bind(state.as_str())
     .bind(f.error_code)
     .bind(f.output_file)
     .bind(f.error_file)

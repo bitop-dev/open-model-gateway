@@ -204,7 +204,7 @@ impl BatchFence {
 
     /// Display status of an unfinished batch.
     pub(crate) async fn set_status(&self, store: &Store, status: &str) -> FenceResult<()> {
-        let query = self.query("UPDATE async_jobs SET upstream_status=$4,finalizing_at=CASE WHEN $4='finalizing' THEN coalesce(finalizing_at,clock_timestamp()) ELSE finalizing_at END WHERE id=$1 AND runner_id=$2 AND runner_epoch=$3 AND state IN('queued','in_progress')");
+        let query = self.query("UPDATE async_jobs SET upstream_status=CASE WHEN cancel_requested_at IS NULL THEN $4 ELSE upstream_status END,finalizing_at=CASE WHEN $4='finalizing' THEN coalesce(finalizing_at,clock_timestamp()) ELSE finalizing_at END WHERE id=$1 AND runner_id=$2 AND runner_epoch=$3 AND state IN('queued','in_progress')");
         self.update(store, query.bind(status)).await
     }
 

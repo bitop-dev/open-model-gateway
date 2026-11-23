@@ -321,6 +321,8 @@ GRANT UPDATE(held_unknown_microusd,unresolved_unknown) ON public.budget_totals T
 -- pending reservation until its poll deadline (lease_expires_at, extended
 -- under the installation lock). The upstream-id CHECK needs EXECUTE.
 GRANT SELECT,INSERT ON public.async_jobs,public.async_job_files TO gateway_runtime;
+-- Gateway batch cancellation updates cancel_requested_at and upstream_status together
+-- and returns the row using the job SELECT grant.
 GRANT UPDATE(state,upstream_status,progress,error_code,completed_at,expires_at,cancel_requested_at,
  deleted_at,next_poll_at,last_polled_at,poll_failures,settled_at,request_total,request_completed,
  request_failed) ON public.async_jobs TO gateway_runtime;
