@@ -20,8 +20,8 @@ Open Model Gateway is pre-1.0 development software. Security fixes are made on `
 
 | Version | Supported |
 |---|---|
-| 0.10.x (latest patch) | Yes |
-| 0.9.x and earlier builds | No |
+| 0.19.x (latest patch) | Yes |
+| 0.18.x and earlier builds | No |
 
 Release images are signed from v0.3.0. Verify an image before you deploy it, using the [image path and signing identity for that release](docs/staging.md#image-paths-and-signature-identities). Releases through v0.18.0 retain their original `ncecere` image path and certificate identity after the repository transfer to `bitop-dev`.
 
