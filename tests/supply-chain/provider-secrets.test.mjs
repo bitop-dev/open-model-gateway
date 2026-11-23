@@ -419,6 +419,18 @@ test("npm forwards literal script operands to the main lifecycle event", () => {
   assert.throws(() => check("node runner.js"), /env.TOKEN/);
 });
 
+test("npm forwards arguments to the last command in each shell reading", () => {
+  const files = new Map([["check.sh", "cargo test"]]);
+  const check = script => {
+    files.set("package.json", JSON.stringify({ scripts: { check: script } }));
+    checkInputs({ jobs: { job: credentialJob("npm run check -- check.sh") } },
+      "fixture.yml", new Map(), path => files.get(path));
+  };
+  assert.throws(() => check("true &>log printf fixture; bash"), /env.TOKEN/);
+  assert.throws(() => check("true &>log bash"), /env.TOKEN/);
+  check("true &>log printf fixture; cat");
+});
+
 test("a shell environment prefix preserves the npm script's Cargo classification", () => {
   const files = new Map([["package.json", JSON.stringify({
     scripts: { verify: "cargo test", notify: "printf fixture" },

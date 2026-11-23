@@ -4,30 +4,25 @@ import { imageBuildViolations } from "./policy.mjs";
 
 const pinned = "example.invalid/probe:1@sha256:" + "a".repeat(64);
 const documents = {
-  workflow: run => ({ jobs: { check: { steps: [{ run }] } } }),
-  action: run => ({ runs: { using: "composite", steps: [{ shell: "bash", run }] } }),
+  workflow: (run, shell) => ({ jobs: { check: { steps: [{ run, shell }] } } }),
+  action: (run, shell = "bash") => ({ runs: { using: "composite", steps: [{ shell, run }] } }),
 };
 for (const [kind, document] of Object.entries(documents)) {
-  const check = run => imageBuildViolations(kind, document(run), { pinned: new Set(), composeFiles: new Set(["compose.yaml"]) });
+  const check = (run, shell) => imageBuildViolations(kind, document(run, shell), { pinned: new Set(), composeFiles: new Set(["compose.yaml"]) });
   for (const redirect of ["&>", "&>>"]) {
-    test(`${kind} inventories Docker operands across ${redirect}`, () => {
-      assert.deepEqual(check(`docker pull ${redirect}log ${pinned}`), []);
-      assert.match(check(`docker ${redirect}log pull alpine`).join(), /digest/);
-      assert.deepEqual(check(`docker run --name 2${redirect}log ${pinned}`), []);
+    test(`${kind} inventories Bash Docker operands across ${redirect}`, () => {
+      assert.deepEqual(check(`docker pull ${redirect}log ${pinned}`, "bash"), []);
+      assert.match(check(`docker ${redirect}log pull alpine`, "bash").join(), /digest/);
+      assert.deepEqual(check(`docker run --name 2${redirect}log ${pinned}`, "bash"), []);
     });
   }
   test(`${kind} inventories commands on both sides of a sh redirect`, () => {
     for (const redirect of ["&>", "&>>"]) {
-      const inspect = run => {
-        const data = document(run);
-        const step = kind === "action" ? data.runs.steps[0] : data.jobs.check.steps[0];
-        step.shell = "sh";
-        return imageBuildViolations(kind, data, { pinned: new Set(), composeFiles: new Set() });
-      };
+      const inspect = run => check(run, "sh");
       assert.match(inspect(`true ${redirect}log docker pull floating`).join(), /digest/);
       assert.match(inspect(`docker ${redirect}log pull floating`).join(), /digest/);
       assert.deepEqual(inspect(`true ${redirect}log docker pull ${pinned}`), []);
-      assert.deepEqual(check(`true ${redirect}log docker pull floating`), []);
+      assert.deepEqual(check(`true ${redirect}log docker pull floating`, "bash"), []);
     }
   });
   test(`${kind} keeps escaped heredoc data out of the shell grammar`, () => {
@@ -114,6 +109,7 @@ test("the effective run shell follows step, job, workflow and container defaults
   }, { pinned: new Set(), composeFiles: new Set() });
   const sh = { defaults: { run: { shell: "sh" } } };
   const bash = { defaults: { run: { shell: "bash" } } };
+  assert.match(check({}, {}, {}).join(), /digest/);
   assert.match(check({}, {}, sh).join(), /digest/);
   assert.match(check({}, sh, bash).join(), /digest/);
   assert.match(check({}, { container: pinned }, {}).join(), /digest/);

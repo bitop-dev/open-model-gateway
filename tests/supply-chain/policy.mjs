@@ -671,6 +671,14 @@ function heredocBody(source, start, { delimiter, stripTabs, literal }) {
 // backticks, comments dropped, words shell-split (quotes removed; `DOCKER_""HOST` is one word).
 // Each word records whether it holds a `$` expansion.
 export function shellCommands(s, shell = "sh") {
+  const [bash, posix] = shellCommandReadings(s, shell);
+  if (!posix) return bash;
+  const seen = new Set(bash.map(words => JSON.stringify(words)));
+  return bash.concat(posix.filter(words => !seen.has(JSON.stringify(words))));
+}
+
+// Order-sensitive consumers need the final command in each interpretation.
+export function shellCommandReadings(s, shell = "sh") {
   // The same heredoc can occur in both readings of its header. Parse its
   // body once per recipient shell, including when shell inputs are nested.
   const bodies = new Map();
@@ -680,12 +688,8 @@ export function shellCommands(s, shell = "sh") {
     return bodies.get(key);
   };
   const bash = tokenizeCommands(s, true, readBody);
-  if (shell === "bash" || !bash.sawCombinedRedirect) return bash.commands;
-  // sh may be Bash or a POSIX shell such as dash. Inventory commands unique
-  // to the interpretation that treats & as a separator before the redirect.
-  const seen = new Set(bash.commands.map(words => JSON.stringify(words)));
-  const posix = tokenizeCommands(s, false, readBody);
-  return bash.commands.concat(posix.commands.filter(words => !seen.has(JSON.stringify(words))));
+  if (shell === "bash" || !bash.sawCombinedRedirect) return [bash.commands];
+  return [bash.commands, tokenizeCommands(s, false, readBody).commands];
 }
 
 function tokenizeCommands(s, combinedRedirects, readBody) {
@@ -1047,7 +1051,7 @@ export function imageBuildViolations(file, data, { composeFiles = checkedCompose
     if (typeof step.run === "string") {
       const releaseJob = /^\.github\/workflows\/image\.yml: job '(probe-prepare|verify)'$/.exec(where);
       const releaseStep = releaseJob && isPinned ? releaseJob[1] + ":" + step.name : null;
-      const shell = step.shell ?? job?.defaults?.run?.shell ?? data?.defaults?.run?.shell ?? (job?.container ? "sh" : "bash");
+      const shell = step.shell ?? job?.defaults?.run?.shell ?? data?.defaults?.run?.shell ?? "sh";
       const commands = shellCommands(step.run, shell);
       for (const words of commands) {
         const reason = runImageViolation(words, releaseStep, composeFiles);
