@@ -71,16 +71,9 @@ fn load(
     out: &mut Vec<Source>,
 ) {
     let text = read(rel).unwrap_or_else(|| panic!("{}: cannot read", rel.display()));
-    let mut file = syn::parse_file(&text).unwrap_or_else(|e| panic!("{}: {e}", rel.display()));
-    if cfg_excludes(&file.attrs) {
+    let Some(file) = production_items(rel, &text, |_| true) else {
         return;
-    }
-    prune(&mut file.items);
-    Unreadable {
-        from: rel,
-        in_block: false,
-    }
-    .visit_file(&file);
+    };
     let name = rel.file_name().and_then(|n| n.to_str()).unwrap_or_default();
     let parent = rel.parent().unwrap_or(Path::new(""));
     let children = if children_beside_file || name == "mod.rs" {
@@ -107,6 +100,26 @@ fn load(
     for (child, module, explicit) in files {
         load(read, &child, module, bin, explicit, out);
     }
+}
+
+/// Parse a production file and apply the reader's checks to the selected top-level items.
+pub(super) fn production_items(
+    rel: &Path,
+    text: &str,
+    keep: impl FnMut(&Item) -> bool,
+) -> Option<syn::File> {
+    let mut file = syn::parse_file(text).unwrap_or_else(|e| panic!("{}: {e}", rel.display()));
+    if cfg_excludes(&file.attrs) {
+        return None;
+    }
+    file.items.retain(keep);
+    prune(&mut file.items);
+    Unreadable {
+        from: rel,
+        in_block: false,
+    }
+    .visit_file(&file);
+    Some(file)
 }
 
 /// Constructs that add code the scan would not read.

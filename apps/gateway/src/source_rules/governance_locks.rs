@@ -70,7 +70,7 @@ fn sql_rule(sql: &str, helper: bool) -> Option<&'static str> {
     // Keep original case while finding the matching dollar-quote delimiter.
     let separator = |c: char| !c.is_alphanumeric() && c != '_' && c != '$';
     let mut rest = sql;
-    let mut previous_for = false;
+    let mut prefix = "";
     loop {
         rest = after_trivia(rest);
         let Some(first) = rest.chars().next() else {
@@ -106,10 +106,22 @@ fn sql_rule(sql: &str, helper: bool) -> Option<&'static str> {
         let quoted = first == '"';
         let lower = word.to_ascii_lowercase();
         let word = if quoted { word } else { lower.as_str() };
-        if previous_for && !quoted && word == "share" {
-            return Some("FOR SHARE");
+        prefix = match (prefix, if quoted { "" } else { word }) {
+            ("for", "share") => return Some("FOR SHARE"),
+            ("for", "update") => return Some("FOR UPDATE"),
+            ("for", "no") => "for no",
+            ("for no", "key") => "for no key",
+            ("for no key", "update") => return Some("FOR NO KEY UPDATE"),
+            ("for", "key") => "for key",
+            ("for key", "share") => return Some("FOR KEY SHARE"),
+            ("lock", "table") => return Some("LOCK TABLE"),
+            (_, "for") => "for",
+            (_, "lock") => "lock",
+            _ => "",
+        };
+        if word == "lock_installation" && after_trivia(rest).starts_with('(') {
+            return Some("installation lock");
         }
-        previous_for = !quoted && word == "for";
         if !helper
             && after_trivia(rest).starts_with('(')
             && matches!(
@@ -134,6 +146,43 @@ fn sql_rule(sql: &str, helper: bool) -> Option<&'static str> {
     None
 }
 
+const INSTALLATION: &str = "SELECT id FROM installation WHERE singleton FOR NO KEY UPDATE";
+const ROW_LOCKS: &[(&str, &str)] = &[
+    ("governance::installation_lock", INSTALLATION),
+    (
+        "governance::batch::admit_line_unobserved",
+        "SELECT r.state,r.held_microusd,r.api_key_id,r.admitted_at FROM governance_reservations r JOIN async_jobs j ON j.execution_id=r.execution_id WHERE r.execution_id=$1 AND r.workspace_id=$2 AND j.id=$3 AND j.batch_mode='gateway' FOR UPDATE OF r",
+    ),
+    (
+        "governance::batch::close_batch_once",
+        "SELECT workspace_id,api_key_id,admitted_at FROM governance_reservations WHERE execution_id=$1 AND state='pending' FOR UPDATE",
+    ),
+    (
+        "governance::pressure::prune_fenced",
+        "DELETE FROM admission_lock_waits WHERE (minute_start,scope_kind,scope_id) IN (SELECT minute_start,scope_kind,scope_id FROM admission_lock_waits WHERE minute_start<clock_timestamp()-make_interval(hours=>$1::int) ORDER BY 1,2,3 LIMIT $2 FOR UPDATE SKIP LOCKED)",
+    ),
+    (
+        "governance::rates::prune_fenced",
+        "DELETE FROM rate_minute_counters WHERE (minute_start,scope_kind,scope_id) IN (SELECT minute_start,scope_kind,scope_id FROM rate_minute_counters WHERE minute_start<date_trunc('minute',clock_timestamp(),'UTC')-make_interval(mins=>$1) ORDER BY 1,2,3 LIMIT $2 FOR UPDATE SKIP LOCKED)",
+    ),
+    (
+        "governance::realtime::session",
+        "SELECT r.workspace_id,r.api_key_id,r.deployment_id,r.price_id,r.state,r.admitted_at,r.minute_start,r.held_microusd,r.unbounded_cost,e.workload_kind,e.public_model FROM governance_reservations r JOIN inference_executions e ON e.id=r.execution_id WHERE r.execution_id=$1 FOR UPDATE OF r",
+    ),
+    (
+        "governance::realtime::settle_response_once",
+        "SELECT state,window_hold_microusd FROM realtime_responses WHERE execution_id=$1 AND sequence=$2 FOR UPDATE",
+    ),
+    (
+        "governance::reconcile::reconcile_batch",
+        "SELECT execution_id,workspace_id,api_key_id,admitted_at FROM governance_reservations WHERE state='pending' AND lease_expires_at<=clock_timestamp() ORDER BY lease_expires_at,execution_id LIMIT $1 FOR UPDATE SKIP LOCKED",
+    ),
+    (
+        "governance::settlement::reservation",
+        "SELECT r.workspace_id,r.api_key_id,r.admitted_at,r.deployment_id,r.price_id,r.state,r.input_tokens,r.output_tokens,r.billing_usage,e.workload_kind,r.reserved_tokens,r.meter_usage,r.output_image_variant,r.provider_cost_microusd,e.provider,e.public_model,r.request_count,r.price_tier FROM governance_reservations r JOIN inference_executions e ON e.id=r.execution_id WHERE r.execution_id=$1 FOR UPDATE OF r",
+    ),
+];
+
 struct Scan<'a> {
     path: &'a str,
     module: String,
@@ -148,12 +197,24 @@ impl Scan<'_> {
         self.function.as_deref() == Some(item) && !self.used.contains(item)
     }
 
+    fn authority(&self) -> bool {
+        self.path == "auth.rs" && self.module == "auth"
+    }
+
     fn helper(&self) -> bool {
         self.path == "governance/locks.rs" && self.module == "governance::locks"
     }
 
     fn check(&mut self, literal: &LitStr) {
-        if let Some(rule) = sql_rule(&literal.value(), self.helper()) {
+        let sql = literal.value();
+        if let Some(rule) = sql_rule(&sql, self.helper()) {
+            if let Some((owner, _)) = ROW_LOCKS
+                .iter()
+                .find(|(owner, allowed)| self.at(owner) && *allowed == sql)
+            {
+                self.used.insert(owner);
+                return;
+            }
             self.findings.push(format!(
                 "{}:{} ({}): {rule}",
                 self.path,
@@ -224,6 +285,16 @@ impl<'ast> Visit<'ast> for Scan<'_> {
     }
 
     fn visit_ident(&mut self, ident: &'ast syn::Ident) {
+        if self.authority()
+            && matches!(
+                ident.unraw().to_string().as_str(),
+                "ADMISSION_SQL" | "UNLOCKED" | "lock"
+            )
+        {
+            self.findings.push(format!(
+                "auth.rs: unexpected use of {ident} in authority query"
+            ));
+        }
         if !self.helper() && ident.unraw() == "PgAdvisoryLock" {
             self.findings.push(format!(
                 "{}:{}: PgAdvisoryLock outside governance::locks",
@@ -261,11 +332,17 @@ impl<'ast> Visit<'ast> for Scan<'_> {
         const ITEM: &str = "governance::jobs::accept_job";
         if self.at(ITEM)
             && condition.to_token_stream().to_string() == quote!(!scoped(store)).to_string()
-            && let Some((first, rest)) = branch.then_branch.stmts.split_first()
+            && let [first, second, rest @ ..] = branch.then_branch.stmts.as_slice()
             && first.to_token_stream().to_string()
                 == quote!(
                     sqlx::query("SELECT pg_advisory_xact_lock_shared(72419502)")
                         .execute(&mut *tx).await.map_err(accepted_storage)?;
+                )
+                .to_string()
+            && second.to_token_stream().to_string()
+                == quote!(
+                    sqlx::query_scalar::<_, Uuid>(#INSTALLATION,)
+                        .fetch_one(&mut *tx).await.map_err(accepted_storage)?;
                 )
                 .to_string()
         {
@@ -282,6 +359,12 @@ impl<'ast> Visit<'ast> for Scan<'_> {
     }
 
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if self.authority()
+            && auth_query::selection(call)
+            && self.used.insert(auth_query::SELECTION)
+        {
+            return;
+        }
         // The singleton catalog fence uses the separate one-bigint key space.
         const ITEM: &str = "governance::catalog_lock";
         if self.at(ITEM)
@@ -438,7 +521,7 @@ impl Scan<'_> {
     }
 }
 
-fn violations(source: &Source) -> Vec<String> {
+fn scan_source(source: &Source) -> Scan<'_> {
     let mut scan = Scan {
         path: &source.path,
         module: source.module.clone(),
@@ -447,14 +530,25 @@ fn violations(source: &Source) -> Vec<String> {
         in_block: false,
         used: HashSet::new(),
     };
-    scan.visit_file(&source.file);
-    scan.findings
+    if scan.authority() {
+        auth_query::scan(&mut scan, &source.file);
+    } else {
+        scan.visit_file(&source.file);
+    }
+    scan
+}
+
+fn violations(source: &Source) -> Vec<String> {
+    scan_source(source).findings
 }
 
 #[test]
 fn production_governance_lock_sql() {
-    let files = tree::production("governance.rs");
+    let mut files = tree::production("governance.rs");
+    let auth = std::fs::read_to_string(tree::src_dir().join("auth.rs")).expect("read auth.rs");
+    files.push(auth_query::source(&auth));
     for required in [
+        "auth.rs",
         "governance/admission.rs",
         "governance/settlement.rs",
         "governance/locks.rs",
@@ -464,7 +558,18 @@ fn production_governance_lock_sql() {
             "missing {required}"
         );
     }
-    let problems: Vec<_> = files.iter().flat_map(violations).collect();
+    let mut problems = Vec::new();
+    let mut used = HashSet::new();
+    for file in &files {
+        let scan = scan_source(file);
+        problems.extend(scan.findings);
+        used.extend(scan.used);
+    }
+    for (owner, _) in ROW_LOCKS {
+        if !used.contains(owner) {
+            problems.push(format!("{owner}: remove stale row-lock exception"));
+        }
+    }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 #[test]
@@ -501,7 +606,7 @@ fn macros_helpers_and_global_branches() {
         ),
         (
             "governance/settlement.rs",
-            r#"fn f() { q!("select 'FOR SHARE', 1 /* pg_advisory_lock(1) */ FOR UPDATE"); }"#,
+            r#"fn f() { q!("select 'FOR SHARE', 1 /* pg_advisory_lock(1) FOR UPDATE */"); }"#,
             0,
         ),
         (
@@ -576,29 +681,6 @@ fn catalog_exception_belongs_to_one_root_item_per_file() {
             "{rust}"
         );
     }
-}
-
-#[test]
-fn path_attribute_does_not_grant_module_identity() {
-    let read = |path: &std::path::Path| {
-        Some(
-            match path.to_str()? {
-                "governance.rs" => r#"#[path = "governance/jobs.rs"] mod other;"#,
-                "governance/jobs.rs" => {
-                    r#"fn accept_job() {
-            if !scoped(store) {
-                sqlx::query("SELECT pg_advisory_xact_lock_shared(72419502)")
-                    .execute(&mut *tx).await.map_err(accepted_storage)?;
-            }
-        }"#
-                }
-                _ => return None,
-            }
-            .to_owned(),
-        )
-    };
-    let files = tree::load_tree(&read, "governance.rs", false);
-    assert_eq!(files.iter().flat_map(violations).count(), 1);
 }
 
 #[test]
@@ -748,3 +830,6 @@ fn renamed_sqlx_namespace_and_file_modules_in_blocks_require_inspection() {
         );
     }
 }
+
+mod auth_query;
+mod lock_site_tests;
