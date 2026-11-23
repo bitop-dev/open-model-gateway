@@ -806,7 +806,7 @@ pub async fn observe_metrics(store: &Store) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
-mod claims;
+pub(crate) mod claims;
 mod visibility;
 pub use visibility::{batch_waits, route_status, settings_document};
 
