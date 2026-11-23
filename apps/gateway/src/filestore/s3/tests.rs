@@ -563,3 +563,36 @@ async fn failed_multipart_uploads_are_aborted() {
     assert_eq!(last.method, "DELETE", "{seen:#?}");
     assert!(last.uri.contains("uploadId=up-1"));
 }
+
+use aws_auth::attempt_fixture::{Failure, Fixture, ResponseStatus, attempt_cases};
+
+async fn s3_attempt(failure: Failure) {
+    let key = ObjectKey::new(Purpose::Export, Scope::Installation).unwrap();
+    let fixture = Fixture::new(failure, "HEAD /files/gw/test/").await;
+    let mut store = store_for(&fixture.endpoint).await;
+    let status = ResponseStatus::default();
+    let config = store
+        .backend
+        .client
+        .config()
+        .to_builder()
+        .interceptor(status.clone())
+        .build();
+    store.backend.client = Client::from_conf(config);
+    let expected = if matches!(failure, Failure::Timeout(_)) {
+        FileStoreError::Timeout
+    } else {
+        FileStoreError::Unavailable
+    };
+    assert_eq!(
+        failure
+            .check_header_deadline(store.head(&key))
+            .await
+            .unwrap_err(),
+        expected
+    );
+    assert_eq!(status.observed(), failure.expected_status());
+    fixture.assert_one(failure);
+}
+
+attempt_cases!(aws_attempt_matrix_s3, s3_attempt, 61);

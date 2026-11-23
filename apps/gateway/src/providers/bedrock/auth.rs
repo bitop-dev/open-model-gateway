@@ -250,10 +250,10 @@ pub(super) fn profile_provider(
     builder.build()
 }
 
-/// Bedrock, STS and S3 retain their current retry and timeout defaults.
+/// The later v2026_11_17 selector introduces a default read timeout.
 #[allow(deprecated)]
 pub(crate) fn sdk_behavior_version() -> BehaviorVersion {
-    BehaviorVersion::v2026_01_12()
+    BehaviorVersion::v2026_11_10()
 }
 
 /// STS client configuration for AssumeRole: the server's identity, the connection's region
@@ -465,3 +465,7 @@ fn valid_model_arn(arn: &str, region: &str) -> bool {
         && id.as_bytes()[0].is_ascii_alphanumeric()
         && charset(id, b"._:/-")
 }
+
+#[cfg(test)]
+#[path = "attempt_fixture_tests.rs"]
+pub(crate) mod attempt_fixture;
