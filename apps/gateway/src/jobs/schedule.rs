@@ -768,13 +768,11 @@ impl Scheduler {
 
     /// Batch lines running on `deployment` (all batches, all processes).
     pub async fn running_lines(&self, deployment: Uuid) -> Result<i64, sqlx::Error> {
-        sqlx::query_scalar(
-            "SELECT count(*) FROM batch_lines WHERE deployment_id=$1 AND state='running' AND NOT awaiting_segment",
-        )
-        .bind(deployment)
-        .fetch_one(&self.store.pool)
-        .await
-        .map_err(job_storage)
+        sqlx::query_scalar(claims::ROUTE_OCCUPANCY)
+            .bind(deployment)
+            .fetch_one(&self.store.pool)
+            .await
+            .map_err(job_storage)
     }
 }
 
