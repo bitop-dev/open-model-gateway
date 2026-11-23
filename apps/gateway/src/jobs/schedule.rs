@@ -548,6 +548,10 @@ type MetricsSlot = Arc<tokio::sync::Mutex<Option<(Instant, Result<Reading, &'sta
 
 /// One process's view of route gates (cached; the claim itself is durable).
 pub struct Scheduler {
+    #[cfg(all(test, feature = "integration-tests"))]
+    pub(crate) retry_commit_fault: Mutex<Option<claims::RetryCommitFault>>,
+    #[cfg(all(test, feature = "integration-tests"))]
+    pub(crate) retry_after_commit: Arc<super::FinalizeHold>,
     store: Store,
     approvals: Option<Arc<ApprovedEndpoints>>,
     pub(crate) timings: Timings,
@@ -557,17 +561,7 @@ pub struct Scheduler {
     signals: Mutex<HashMap<Uuid, (Instant, Option<Pause>)>>,
 }
 
-/// Outcome of a claim attempt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Claim {
-    Claimed,
-    /// The line was already claimed (never run it again).
-    Taken,
-    /// The route runs its maximum.
-    Full,
-    /// Another batch's turn.
-    Wait,
-}
+pub use claims::Claim;
 
 /// One batch's demand on one route.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -602,6 +596,10 @@ impl Scheduler {
             live: Mutex::default(),
             metrics: Mutex::default(),
             signals: Mutex::default(),
+            #[cfg(all(test, feature = "integration-tests"))]
+            retry_commit_fault: Mutex::default(),
+            #[cfg(all(test, feature = "integration-tests"))]
+            retry_after_commit: Arc::default(),
         }
     }
     pub fn with_timings(mut self, timings: Timings) -> Self {

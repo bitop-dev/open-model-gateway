@@ -1,6 +1,7 @@
 //! One claimed line's execution: why a batch stops, its shared run state,
 //! and running a line (with its explicit retries) through the engine.
 use super::*;
+use crate::jobs::{fence::UndispatchedRetry, schedule::claims::RetryClaim};
 use gateway_datetime_compat::UtcInstant;
 
 /// Why a batch stopped dispatching.
@@ -329,13 +330,39 @@ impl LineRun {
         }
         tokio::time::sleep(Duration::from_secs(1u64 << attempt)).await;
         let next = Uuid::now_v7();
-        if self.claim_retry(line, attempt, next, pin).await {
-            return Retry::Started(next);
+        let route = pin.map(|pin| (pin.deployment, pin.max_concurrency));
+        let mut recovered = None;
+        while !self.state.should_stop(&self.job) {
+            match self
+                .scheduler
+                .claim_retry(&self.state.fence, line, attempt, next, route)
+                .await
+            {
+                Ok(RetryClaim::Started) => return Retry::Started(next),
+                Ok(RetryClaim::Full) => tokio::time::sleep(POLL).await,
+                Ok(claim @ (RetryClaim::Cancelled | RetryClaim::CancelledAfterCommit)) => {
+                    self.state.cancel.store(true, Ordering::SeqCst);
+                    if claim == RetryClaim::CancelledAfterCommit {
+                        recovered = Some(UndispatchedRetry {
+                            execution: next,
+                            attempt: attempt + 1,
+                            status,
+                            code: error.code(),
+                        });
+                    }
+                    break;
+                }
+                Err(FenceError::Stale) => {
+                    self.state.lose();
+                    return Retry::Unconfirmed;
+                }
+                Ok(RetryClaim::LineChanged) | Err(_) => break,
+            }
         }
         let counted = self
             .state
             .fence
-            .count_retry_failure(&self.store, line, execution)
+            .count_retry_failure(&self.store, line, execution, recovered)
             .await;
         if self.confirmed(line, execution, counted) {
             Retry::ConfirmedFailure
@@ -380,34 +407,6 @@ impl LineRun {
             let value = lines::failure_line(custom_id, Some(execution), self.endpoint, error);
             self.emit_error(records, n, execution, value).await;
         }
-    }
-
-    /// Claim an explicit retry: on its route, within the route's concurrency
-    /// (waiting for room; a stop leaves the failure standing).
-    async fn claim_retry(&self, n: i32, attempts: i16, execution: Uuid, pin: Option<Pin>) -> bool {
-        use crate::jobs::schedule::claims::RetryClaim;
-
-        let route = pin.map(|pin| (pin.deployment, pin.max_concurrency));
-        while !self.state.should_stop(&self.job) {
-            match self
-                .scheduler
-                .claim_retry(&self.state.fence, n, attempts, execution, route)
-                .await
-            {
-                Ok(RetryClaim::Started) => return true,
-                Ok(RetryClaim::Full) => tokio::time::sleep(POLL).await,
-                Ok(RetryClaim::Cancelled) => {
-                    self.state.cancel.store(true, Ordering::SeqCst);
-                    return false;
-                }
-                Err(FenceError::Stale) => {
-                    self.state.lose();
-                    return false;
-                }
-                Ok(RetryClaim::LineChanged) | Err(_) => return false,
-            }
-        }
-        false
     }
 
     /// Execute one attempt pinned to its route, with the route's priority
