@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 
 use proc_macro2::{Delimiter, Group, TokenStream, TokenTree};
 use quote::ToTokens;
+use syn::ext::IdentExt;
 use syn::visit::{self, Visit};
 
 use super::tree::{Scope, Source, flat, parse_fixture, production};
@@ -17,6 +18,9 @@ struct Finder<'a> {
     reads: Vec<Reads>,
     // Local patterns and their initializers in the metric implementation.
     bindings: Vec<(String, BTreeSet<String>, String)>,
+    // The names `Metrics` and `Info` go by in this file (aliases included).
+    metrics_types: BTreeSet<String>,
+    info_types: BTreeSet<String>,
 }
 
 // One physical line per entry, including when a literal spans source lines.
@@ -42,7 +46,8 @@ const KEYWORDS: &[&str] = &[
 /// list of a call or tuple struct (a parenthesised group after a name that is
 /// not a keyword): there an entry ignores it. It is kept everywhere else,
 /// where it can change meaning: a parenthesised one-element tuple (`(a,)` is
-/// not `(a)`) and anything inside a macro invocation (a macro may match it).
+/// not `(a)`), anything inside a macro invocation and the body of a
+/// `macro_rules!` definition (a macro may match it).
 fn without_list_commas(stream: TokenStream) -> TokenStream {
     let tokens: Vec<TokenTree> = stream.into_iter().collect();
     let mut out = Vec::with_capacity(tokens.len());
@@ -52,7 +57,10 @@ fn without_list_commas(stream: TokenStream) -> TokenStream {
             continue;
         };
         let before = &tokens[..at];
-        if matches!(before, [.., TokenTree::Punct(bang)] if bang.as_char() == '!') {
+        let macro_body = matches!(before, [.., TokenTree::Punct(bang)] if bang.as_char() == '!')
+            || matches!(before, [.., TokenTree::Ident(rules), TokenTree::Punct(bang), TokenTree::Ident(_)]
+                if rules == "macro_rules" && bang.as_char() == '!');
+        if macro_body {
             out.push(token.clone());
             continue;
         }
@@ -75,6 +83,17 @@ fn without_list_commas(stream: TokenStream) -> TokenStream {
     out.into_iter().collect()
 }
 
+/// The files that encode OTLP payloads.
+const OTLP_FILES: &[&str] = &["otlp.rs", "ops_log.rs", "metrics_export.rs", "telemetry.rs"];
+
+/// Whether `tokens` contain the string literal `"attributes"`: an OTLP
+/// attribute list is read, written or built there.
+fn mentions_attributes(tokens: &impl ToTokens) -> bool {
+    flat(tokens.to_token_stream())
+        .iter()
+        .any(|t| matches!(t, TokenTree::Literal(l) if l.to_string() == "\"attributes\""))
+}
+
 /// Calls that give a registry constant labels or register a collector that
 /// encodes its own (prometheus-client `Registry`).
 const CONSTANT_LABELS: &[&str] = &[
@@ -85,15 +104,46 @@ const CONSTANT_LABELS: &[&str] = &[
     "register_collector",
 ];
 
-/// A path naming a method of `Metrics` (`Metrics::observe_cache`).
-fn metrics_method_path(path: &syn::Path) -> bool {
-    let segments: Vec<_> = path.segments.iter().collect();
-    matches!(segments.as_slice(), [.., ty, method]
-        if ty.ident == "Metrics" && metric_methods().contains(&method.ident.to_string()))
+/// An identifier as written without its raw prefix (`r#name` is `name`).
+fn name(ident: &proc_macro2::Ident) -> String {
+    ident.unraw().to_string()
+}
+
+/// The names a type goes by in a file: its own name, `use .. as` renames of
+/// it and `type` aliases of it.
+fn type_names(file: &syn::File, target: &str) -> BTreeSet<String> {
+    struct Aliases<'a>(&'a str, BTreeSet<String>);
+    impl Visit<'_> for Aliases<'_> {
+        fn visit_use_rename(&mut self, rename: &syn::UseRename) {
+            if name(&rename.ident) == self.0 {
+                self.1.insert(name(&rename.rename));
+            }
+        }
+        fn visit_item_type(&mut self, item: &syn::ItemType) {
+            if matches!(&*item.ty, syn::Type::Path(p)
+                if p.path.segments.last().is_some_and(|s| name(&s.ident) == self.0))
+            {
+                self.1.insert(name(&item.ident));
+            }
+            visit::visit_item_type(self, item);
+        }
+    }
+    let mut aliases = Aliases(target, BTreeSet::from([target.to_owned()]));
+    aliases.visit_file(file);
+    aliases.1
 }
 
 fn is_self(expr: &syn::Expr) -> bool {
     matches!(expr, syn::Expr::Path(p) if p.path.is_ident("self"))
+}
+
+fn raw_text(value: &impl ToTokens) -> String {
+    value
+        .to_token_stream()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 fn identifiers(tokens: &impl ToTokens) -> BTreeSet<String> {
@@ -108,12 +158,35 @@ fn identifiers(tokens: &impl ToTokens) -> BTreeSet<String> {
 
 impl Finder<'_> {
     fn record(&mut self, kind: &str, value: &impl ToTokens) {
+        // Tokens taken out of a macro body keep every comma: the macro may
+        // match it, and the extracted tokens no longer show that context.
+        let text = if kind.starts_with("macro") {
+            raw_text(value)
+        } else {
+            token_text(value)
+        };
         self.entries.push(format!(
-            "{} :: {} :: {kind} :: {}",
+            "{} :: {} :: {kind} :: {text}",
             self.path,
             self.scope.path(),
-            token_text(value)
         ));
+    }
+
+    /// A path naming a method of `Metrics`: `Metrics::m`, an alias's `M::m`,
+    /// `<Metrics>::m` or `<Metrics as Trait>::m`.
+    fn metrics_method_path(&self, qself: Option<&syn::QSelf>, path: &syn::Path) -> bool {
+        let Some(method) = path.segments.last() else {
+            return false;
+        };
+        if !metric_methods().contains(&name(&method.ident)) {
+            return false;
+        }
+        if let Some(qself) = qself {
+            return matches!(&*qself.ty, syn::Type::Path(p)
+                if p.path.segments.last().is_some_and(|s| self.metrics_types.contains(&name(&s.ident))));
+        }
+        let segments: Vec<_> = path.segments.iter().collect();
+        matches!(segments.as_slice(), [.., ty, _] if self.metrics_types.contains(&name(&ty.ident)))
     }
 
     fn scoped(&mut self, visit: impl FnOnce(&mut Self)) {
@@ -197,52 +270,105 @@ impl Finder<'_> {
                     &tokens[at..at + 2].iter().cloned().collect::<TokenStream>(),
                 );
             }
-            if let [
-                TokenTree::Ident(receiver),
-                TokenTree::Punct(dot),
-                TokenTree::Ident(method),
-                TokenTree::Group(args),
-                ..,
-            ] = &tokens[at..]
-                && dot.as_char() == '.'
-                && args.delimiter() == Delimiter::Parenthesis
-                && (receiver == "METRICS"
-                    || method == "phase"
-                    || self.metric_receiver(
-                        receiver == "self",
-                        &method.to_string(),
-                        !args.stream().is_empty(),
-                    ))
-            {
-                self.record(
-                    if method == "phase" {
-                        "macro phase label"
-                    } else {
-                        "macro metrics call"
-                    },
-                    &tokens[at..at + 4].iter().cloned().collect::<TokenStream>(),
-                );
-            }
-            if let [
-                TokenTree::Ident(ty),
-                TokenTree::Punct(a),
-                TokenTree::Punct(b),
-                TokenTree::Ident(method),
-                TokenTree::Group(args),
-                ..,
-            ] = &tokens[at..]
-                && ty == "Metrics"
-                && a.as_char() == ':'
-                && b.as_char() == ':'
-                && args.delimiter() == Delimiter::Parenthesis
-                && metric_methods().contains(&method.to_string())
-            {
-                self.record(
-                    "macro metrics call",
-                    &tokens[at..at + 5].iter().cloned().collect::<TokenStream>(),
-                );
-            }
+            self.macro_method_call(&tokens[at..]);
+            self.macro_path_call(&tokens[at..]);
         }
+    }
+
+    // `<receiver> . <method> (args)` in a macro body; the receiver is a name
+    // or a parenthesised group (`(*m).observe_cache(..)`).
+    fn macro_method_call(&mut self, tokens: &[TokenTree]) {
+        let [
+            receiver,
+            TokenTree::Punct(dot),
+            TokenTree::Ident(method),
+            TokenTree::Group(args),
+            ..,
+        ] = tokens
+        else {
+            return;
+        };
+        let receiver = match receiver {
+            TokenTree::Ident(r) => name(r),
+            TokenTree::Group(g) if g.delimiter() == Delimiter::Parenthesis => String::new(),
+            _ => return,
+        };
+        let method = name(method);
+        if dot.as_char() != '.' || args.delimiter() != Delimiter::Parenthesis {
+            return;
+        }
+        let kind = if method == "phase" {
+            "macro phase label"
+        } else if method == "attribute" {
+            "macro span attribute"
+        } else if CONSTANT_LABELS.contains(&method.as_str()) {
+            "macro registry labels"
+        } else if receiver == "METRICS"
+            || self.metric_receiver(receiver == "self", &method, !args.stream().is_empty())
+        {
+            "macro metrics call"
+        } else {
+            return;
+        };
+        self.record(kind, &tokens[..4].iter().cloned().collect::<TokenStream>());
+    }
+
+    // `<Type> :: <name> (args)` in a macro body: a `Metrics` method in call
+    // form, `Info::new` or a constant-label constructor.
+    fn macro_path_call(&mut self, tokens: &[TokenTree]) {
+        let [
+            TokenTree::Ident(ty),
+            TokenTree::Punct(a),
+            TokenTree::Punct(b),
+            TokenTree::Ident(method),
+            TokenTree::Group(args),
+            ..,
+        ] = tokens
+        else {
+            return;
+        };
+        let (ty, method) = (name(ty), name(method));
+        if a.as_char() != ':' || b.as_char() != ':' || args.delimiter() != Delimiter::Parenthesis {
+            return;
+        }
+        let kind = if self.metrics_types.contains(&ty) && metric_methods().contains(&method) {
+            "macro metrics call"
+        } else if (self.info_types.contains(&ty) && method == "new")
+            || CONSTANT_LABELS.contains(&method.as_str())
+        {
+            "macro registry labels"
+        } else {
+            return;
+        };
+        self.record(kind, &tokens[..5].iter().cloned().collect::<TokenStream>());
+    }
+
+    /// Call forms of label sources: `Family::get_or_create(&family, labels)`
+    /// and `Metrics::observe_cache(&METRICS, ..)` (`true`: recorded and its
+    /// arguments visited), and constant labels (`Registry::with_labels`,
+    /// `Info::new` under any alias of `Info`).
+    fn call_form(&mut self, func: &syn::ExprPath, last: &str, call: &syn::ExprCall) -> bool {
+        if last == "get_or_create" || last == "get_or_create_owned" {
+            self.label_args("family", call, &call.args);
+            return true;
+        }
+        if self.metrics_method_path(func.qself.as_ref(), &func.path) {
+            self.record("metrics call", call);
+            for arg in &call.args {
+                self.visit_expr(arg);
+            }
+            return true;
+        }
+        if CONSTANT_LABELS.contains(&last) {
+            self.record("registry labels", call);
+        }
+        let segments: Vec<_> = func.path.segments.iter().collect();
+        if matches!(segments.as_slice(), [.., ty, _]
+            if last == "new" && self.info_types.contains(&name(&ty.ident)))
+        {
+            self.record("info metric", call);
+        }
+        false
     }
 
     fn label_use(&mut self, kind: &str, call: &syn::ExprMethodCall) {
@@ -276,7 +402,7 @@ impl<'ast> Visit<'ast> for Finder<'_> {
     fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
         // A call's own path is handled in `visit_expr_call`; here it is a
         // method passed as a value.
-        if metrics_method_path(&path.path) {
+        if self.metrics_method_path(path.qself.as_ref(), &path.path) {
             self.record("metrics method", path);
         }
         if !self.reads.is_empty()
@@ -381,13 +507,23 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             self.record("metrics call", call);
         } else if self.metric_receiver(
             is_self(&call.receiver),
-            &call.method.to_string(),
+            &name(&call.method),
             !call.args.is_empty(),
         ) {
             self.record("metrics call", call);
-        } else if CONSTANT_LABELS.contains(&call.method.to_string().as_str()) {
+        } else if CONSTANT_LABELS.contains(&name(&call.method).as_str()) {
             self.record("registry labels", call);
-        } else if call.method == "attribute" && identifiers(&call.args).contains("Attribute") {
+        } else if OTLP_FILES.contains(&self.path) && mentions_attributes(&call.receiver) {
+            // A push or other change of an OTLP attribute list, recorded once
+            // at the outermost call of the chain.
+            self.record("OTLP labels", call);
+            for arg in &call.args {
+                self.visit_expr(arg);
+            }
+            return;
+        } else if name(&call.method) == "attribute" && call.args.len() == 1 {
+            // Every one-argument `attribute` call, so an alias of
+            // `telemetry::Attribute` or a value bound first is still pinned.
             self.record("span attribute", call);
         }
         visit::visit_expr_method_call(self, call);
@@ -395,39 +531,22 @@ impl<'ast> Visit<'ast> for Finder<'_> {
 
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
         if let syn::Expr::Path(p) = &*call.func
-            && let Some(name) = p.path.segments.last()
+            && let Some(last) = p.path.segments.last()
         {
-            if name.ident == "emit"
+            let last = name(&last.ident);
+            if last == "emit"
                 && (p.path.is_ident("emit") || p.path.segments.iter().any(|s| s.ident == "ops_log"))
             {
                 self.record("event", call);
             }
-            if self.path == "ops_log.rs" && name.ident == "log_record" {
+            if self.path == "ops_log.rs" && last == "log_record" {
                 self.record("record inputs", call);
             }
-            if self.path == "metrics/registry.rs" && name.ident == "series" {
+            if self.path == "metrics/registry.rs" && last == "series" {
                 self.record("precreated labels", call);
             }
-            // Call forms: `Family::get_or_create(&family, labels)` and
-            // `Metrics::observe_cache(&METRICS, ..)`.
-            if name.ident == "get_or_create" || name.ident == "get_or_create_owned" {
-                self.label_args("family", call, &call.args);
+            if self.call_form(p, &last, call) {
                 return;
-            }
-            if metrics_method_path(&p.path) {
-                self.record("metrics call", call);
-                for arg in &call.args {
-                    self.visit_expr(arg);
-                }
-                return;
-            }
-            if CONSTANT_LABELS.contains(&name.ident.to_string().as_str()) {
-                self.record("registry labels", call);
-            }
-            let segments: Vec<_> = p.path.segments.iter().collect();
-            if matches!(segments.as_slice(), [.., ty, new] if ty.ident == "Info" && new.ident == "new")
-            {
-                self.record("info metric", call);
             }
         }
         visit::visit_expr_call(self, call);
@@ -441,12 +560,9 @@ impl<'ast> Visit<'ast> for Finder<'_> {
     }
 
     fn visit_expr_assign(&mut self, expr: &'ast syn::ExprAssign) {
-        if self.path == "metrics_export.rs"
-            && let syn::Expr::Index(index) = &*expr.left
-            && let syn::Expr::Lit(key) = &*index.index
-            && let syn::Lit::Str(key) = &key.lit
-            && key.value() == "attributes"
-        {
+        // Any write to an OTLP attribute list, wherever it sits in the
+        // encoder (`x["attributes"] = ..`, `x["resource"]["attributes"] = ..`).
+        if OTLP_FILES.contains(&self.path) && mentions_attributes(&expr.left) {
             self.record("OTLP labels", expr);
         }
         visit::visit_expr_assign(self, expr);
@@ -472,7 +588,13 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             };
         let names = identifiers(&mac.tokens);
         let family = names.contains("get_or_create") || names.contains("get_or_create_owned");
-        if fixed_values || family || names.contains("OpsEvent") || names.contains("ops_log") {
+        let otlp_attributes = OTLP_FILES.contains(&self.path) && mentions_attributes(&mac.tokens);
+        if fixed_values
+            || family
+            || otlp_attributes
+            || names.contains("OpsEvent")
+            || names.contains("ops_log")
+        {
             self.record("macro", mac);
         }
         // Macro syntax is opaque. Alongside a family macro's complete tokens,
@@ -496,21 +618,28 @@ impl<'ast> Visit<'ast> for Finder<'_> {
     }
 
     fn visit_item(&mut self, item: &'ast syn::Item) {
-        // A collector encodes its own families and labels; a derived label
-        // set is the label names of a family.
-        let collector = matches!(item, syn::Item::Impl(i)
-            if i.trait_.as_ref().is_some_and(|(t, _)| t.segments.last().is_some_and(|s| s.ident == "Collector")));
+        // A collector encodes its own families and labels; a label set
+        // (derived, also under `cfg_attr`, or implemented) is the label names
+        // and values of a family.
+        let label_trait = |n: &str| n == "EncodeLabelSet" || n == "EncodeLabelValue";
+        let implemented = match item {
+            syn::Item::Impl(i) => i
+                .trait_
+                .as_ref()
+                .and_then(|(t, _)| t.segments.last())
+                .map(|s| s.ident.to_string()),
+            _ => None,
+        };
+        let collector = implemented.as_deref() == Some("Collector");
         let attrs = match item {
             syn::Item::Struct(i) => i.attrs.as_slice(),
             syn::Item::Enum(i) => i.attrs.as_slice(),
             _ => &[],
         };
-        let label_set = attrs.iter().any(|a| {
-            a.path().is_ident("derive")
-                && identifiers(&a.meta)
-                    .iter()
-                    .any(|n| n == "EncodeLabelSet" || n == "EncodeLabelValue")
-        });
+        let label_set = implemented.as_deref().is_some_and(label_trait)
+            || attrs
+                .iter()
+                .any(|a| identifiers(&a.meta).iter().any(|n| label_trait(n)));
         if collector {
             self.record("collector", item);
         } else if label_set {
@@ -563,6 +692,8 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                 "metrics.rs",
                 "bounded" | "denial_scope" | "admission_outcome"
             ) | ("otlp.rs", "resource_attributes")
+                | ("metrics_export.rs", "impl Encoder::envelope")
+                | ("ops_log.rs", "impl Exporter::body")
                 | (
                     "telemetry.rs",
                     "impl Attribute::value" | "impl Span::serialize" | "impl Exporter::body"
@@ -604,7 +735,7 @@ fn metric_methods() -> &'static BTreeSet<String> {
 }
 
 fn is_metrics(ty: &syn::Type) -> bool {
-    matches!(ty, syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "Metrics"))
+    matches!(ty, syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| name(&s.ident) == "Metrics"))
 }
 
 fn inventory(source: &Source) -> Vec<String> {
@@ -614,6 +745,8 @@ fn inventory(source: &Source) -> Vec<String> {
         entries: Vec::new(),
         bindings: Vec::new(),
         reads: Vec::new(),
+        metrics_types: type_names(&source.file, "Metrics"),
+        info_types: type_names(&source.file, "Info"),
     };
     finder.visit_file(&source.file);
     finder.entries
