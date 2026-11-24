@@ -134,18 +134,51 @@ pub(crate) struct NewJob<'a> {
     pub execution_id: Uuid,
     pub public_model: &'a str,
     pub provider: &'a str,
-    pub upstream_id: &'a UpstreamId,
+    /// `None` for a video recorded before its provider create (#662): the
+    /// row then records `submit_started_at` and is first due for a poll after
+    /// `first_poll_after`, when an unrecorded outcome counts as interrupted.
+    pub upstream_id: Option<&'a UpstreamId>,
+    pub first_poll_after: TimeDelta,
     pub poll_deadline_at: UtcInstant,
     pub video_seconds: Option<i32>,
     pub video_size: Option<&'a str>,
     pub batch_endpoint: Option<&'a str>,
 }
 /// The video job record, on the connection of the transaction that also
-/// extends its reservation's lease (`governance::jobs::accept_job`).
+/// extends its reservation's lease (`governance::jobs::accept_job`). Written
+/// before the provider create (#662), without an upstream id: its failure
+/// means nothing was sent, so it is counted at `job_storage`.
 pub(crate) async fn insert_job(conn: &mut sqlx::PgConnection, job: &NewJob<'_>) -> Result<JobRow> {
-    sqlx::query_as(&format!("INSERT INTO async_jobs(id,kind,workspace_id,api_key_id,deployment_id,execution_id,public_model,provider,upstream_id,poll_deadline_at,video_seconds,video_size,batch_endpoint) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING {JOB_COLUMNS}"))
-        .bind(job.id).bind(job.kind.as_str()).bind(job.workspace_id).bind(job.api_key_id).bind(job.deployment_id).bind(job.execution_id).bind(job.public_model).bind(job.provider).bind(job.upstream_id.as_str()).bind(job.poll_deadline_at).bind(job.video_seconds).bind(job.video_size).bind(job.batch_endpoint)
-        .fetch_one(conn).await.map_err(job_settlement)
+    let first_poll = job.first_poll_after.whole_seconds() as f64;
+    sqlx::query_as(&format!("INSERT INTO async_jobs(id,kind,workspace_id,api_key_id,deployment_id,execution_id,public_model,provider,upstream_id,poll_deadline_at,video_seconds,video_size,batch_endpoint,submit_started_at,next_poll_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,CASE WHEN $9::text IS NULL THEN clock_timestamp() END,clock_timestamp()+make_interval(secs=>$14)) RETURNING {JOB_COLUMNS}"))
+        .bind(job.id).bind(job.kind.as_str()).bind(job.workspace_id).bind(job.api_key_id).bind(job.deployment_id).bind(job.execution_id).bind(job.public_model).bind(job.provider).bind(job.upstream_id.map(UpstreamId::as_str)).bind(job.poll_deadline_at).bind(job.video_seconds).bind(job.video_size).bind(job.batch_endpoint).bind(first_poll)
+        .fetch_one(conn).await.map_err(job_storage)
+}
+/// Fill in the provider id of a video recorded before its create (#662).
+/// `None` when the row is no longer a queued video without an id (the
+/// create-grace rule already failed it). The provider has accepted the job
+/// at this point, so a failure is counted at `job_settlement`.
+pub(crate) async fn record_video_upstream(
+    store: &Store,
+    id: Uuid,
+    upstream: &UpstreamId,
+) -> Result<Option<JobRow>> {
+    sqlx::query_as(&format!("UPDATE async_jobs SET upstream_id=$2 WHERE id=$1 AND kind='video' AND upstream_id IS NULL AND state='queued' RETURNING {JOB_COLUMNS}"))
+        .bind(id).bind(upstream.as_str())
+        .fetch_optional(&store.pool).await.map_err(job_settlement)
+}
+/// End a video that has no provider id as `failed` with `code`, only while it
+/// is still queued without one and, with `older_than`, only once its create
+/// started at least that long ago. `None` when it no longer qualifies.
+pub(crate) async fn fail_unrecorded_video(
+    store: &Store,
+    id: Uuid,
+    code: &str,
+    older_than: Option<TimeDelta>,
+) -> Result<Option<JobRow>> {
+    sqlx::query_as(&format!("UPDATE async_jobs SET state='failed',upstream_status='failed',error_code=$2,completed_at=clock_timestamp() WHERE id=$1 AND kind='video' AND upstream_id IS NULL AND state='queued' AND ($3::float8 IS NULL OR submit_started_at<=clock_timestamp()-make_interval(secs=>$3)) RETURNING {JOB_COLUMNS}"))
+        .bind(id).bind(code).bind(older_than.map(|d| d.whole_seconds() as f64))
+        .fetch_optional(&store.pool).await.map_err(job_storage)
 }
 /// A new engine batch (0021): created before any upstream work, in the
 /// transaction that admits its envelope reservation.

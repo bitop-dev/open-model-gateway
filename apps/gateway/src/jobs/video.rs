@@ -64,6 +64,38 @@ pub(crate) fn settlement(job: &JobRow, v: &UpstreamVideo) -> Option<Settlement> 
     }
 }
 
+/// How long a video may stay without a provider id before its create counts
+/// as interrupted: the create call is bounded at 60 s, with at most one
+/// keyed resend, so a create still unanswered after this never returns.
+pub(crate) const VIDEO_CREATE_GRACE: TimeDelta = TimeDelta::minutes(10);
+
+/// A create failure after which the provider may still have the video.
+fn unconfirmed(error: InferenceError) -> bool {
+    matches!(
+        error,
+        InferenceError::Timeout
+            | InferenceError::UpstreamUnavailable
+            | InferenceError::InvalidUpstream
+    )
+}
+/// A create failure a keyed resend may resolve (not an unparseable answer,
+/// which a resend would repeat).
+fn resendable(error: InferenceError) -> bool {
+    matches!(
+        error,
+        InferenceError::Timeout | InferenceError::UpstreamUnavailable
+    )
+}
+/// The settlement of a video whose create never recorded an outcome: usage
+/// unknown, hold kept.
+fn interrupted() -> Settlement {
+    Settlement {
+        outcome: Outcome::Cancelled,
+        error: None,
+        usage: Usage::default(),
+    }
+}
+
 pub fn render(job: &JobRow) -> Value {
     let unix = |t: Option<gateway_datetime_compat::UtcInstant>| t.map(|t| t.timestamp());
     let state = job.job_state();
@@ -119,12 +151,8 @@ impl Jobs {
             .await?;
         let size = request.size;
         let seconds = request.seconds;
-        let upstream = match call(adapter.create_video(&target, request)).await {
-            Ok(v) => v,
-            Err(e) => return Err(attempt.fail(e).await.into()),
-        };
-        attempt.accepted();
         let deadline = UtcInstant::now() + VIDEO_POLL_WINDOW;
+        let grace = self.video_create_grace();
         let new = store::NewJob {
             id: Uuid::new_v4(),
             kind: JobKind::Video,
@@ -134,16 +162,19 @@ impl Jobs {
             execution_id: request_id,
             public_model: &model,
             provider: &target.provider,
-            upstream_id: &upstream.id,
+            upstream_id: None,
+            first_poll_after: grace,
             poll_deadline_at: deadline,
             video_seconds: Some(seconds as i32),
             video_size: Some(size.as_str()),
             batch_endpoint: None,
         };
-        // The job record and the extension of its reservation's lease to the
-        // poll deadline are one transaction: no job is polled under the short
-        // admission lease.
-        let job = crate::governance::jobs::accept_job(
+        // Record first (#662): the job row, without a provider id, and the
+        // extension of its reservation's lease to the poll deadline are one
+        // transaction written before the provider is called, so a provider
+        // that accepts the video can never leave it untracked. If this fails,
+        // nothing has been sent: the attempt settles as a known zero.
+        let job = match crate::governance::jobs::accept_job(
             &self.store,
             request_id,
             deadline + LEASE_GRACE,
@@ -154,10 +185,120 @@ impl Jobs {
             },
         )
         .await
-        .inspect_err(|_| {
-            tracing::error!(execution_id = %request_id, "video job record failed after upstream acceptance; hold kept until reconciliation");
-        })?;
+        {
+            Ok(job) => job,
+            Err(e) => return Err(attempt.fail_unsent(e).await.into()),
+        };
+        let key = VideoCreateKey::for_job(job.id);
+        // Inside the dispatch scope (`inference::dispatch`): a create that
+        // built no request proves nothing was sent.
+        let (created, nothing_sent) = crate::inference::dispatch::observe(call(
+            adapter.create_video_keyed(&target, request.clone(), &key),
+        ))
+        .await;
+        // At most one resend, with the same key, only where the provider makes
+        // that the same job and only when the first outcome is unknown.
+        let created = match created {
+            Err(e)
+                if !nothing_sent && resendable(e) && adapter.idempotent_video_create(&target) =>
+            {
+                call(adapter.create_video_keyed(&target, request, &key)).await
+            }
+            other => other,
+        };
+        let upstream = match created {
+            Ok(v) => v,
+            Err(e) => return Err(self.create_failed(job, attempt, e, nothing_sent).await),
+        };
+        attempt.accepted();
+        // The provider has the video: its id is the evidence of acceptance.
+        // If this write fails the row stays queued without an id, reported
+        // as queued, until the create-grace rule ends it (hold kept).
+        let recorded = store::record_video_upstream(&self.store, job.id, &upstream.id)
+            .await
+            .inspect_err(|_| {
+                tracing::error!(execution_id = %request_id, "video provider id not recorded after upstream acceptance; the job ends interrupted with its hold kept");
+            })?;
+        let Some(job) = recorded else {
+            tracing::error!(execution_id = %request_id, "video provider id arrived after the job ended; hold kept");
+            return Err(InferenceError::Storage.into());
+        };
         self.apply_video(&job, &upstream).await
+    }
+
+    /// A create that did not return a job: the row ends `failed` and the
+    /// attempt is recorded. Nothing sent: a known zero (`create_failed`). The
+    /// provider answered without a job: `create_failed`, hold per the usual
+    /// rules. The outcome is unknown (the provider may have the video):
+    /// `create_unconfirmed`, hold kept.
+    async fn create_failed(
+        &self,
+        job: JobRow,
+        attempt: Attempt,
+        error: InferenceError,
+        nothing_sent: bool,
+    ) -> JobError {
+        let code = if !nothing_sent && unconfirmed(error) {
+            "create_unconfirmed"
+        } else {
+            "create_failed"
+        };
+        let ended = store::fail_unrecorded_video(&self.store, job.id, code, None).await;
+        let error = if nothing_sent {
+            attempt.fail_unsent(error).await
+        } else {
+            attempt.fail(error).await
+        };
+        // The reservation is finished; the row is settled once it is
+        // terminal (a later refresh does it if this write fails).
+        if let Ok(Some(ended)) = ended {
+            let _ = store::mark_settled(&self.store, ended.id).await;
+        }
+        error.into()
+    }
+
+    /// The create grace: how long a video may stay without a provider id
+    /// before its create counts as interrupted.
+    #[cfg(not(test))]
+    pub(crate) fn video_create_grace(&self) -> TimeDelta {
+        VIDEO_CREATE_GRACE
+    }
+    /// Tests may shorten the grace.
+    #[cfg(test)]
+    pub(crate) fn video_create_grace(&self) -> TimeDelta {
+        self.video_create_grace
+    }
+
+    /// A video recorded before its create that has no provider id. It is
+    /// never sent upstream (there is nothing to poll): while its create may
+    /// still be running it stays queued; once the grace has passed without
+    /// an outcome it ends `failed` (`create_interrupted`) and settles as
+    /// cancelled with unknown usage (hold kept). A terminal one that is not
+    /// settled yet (its create failed and the settled mark was lost) is
+    /// marked settled; its attempt was already recorded.
+    async fn refresh_unrecorded_video(&self, job: JobRow) -> JobResult<JobRow> {
+        if job.job_state().is_terminal() {
+            if job.settled_at.is_none() {
+                self.settle(&job, interrupted()).await?;
+                return Ok(store::reload(&self.store, job.id).await?);
+            }
+            return Ok(job);
+        }
+        let grace = self.video_create_grace();
+        let started = job.submit_started_at.ok_or(InferenceError::Storage)?;
+        if UtcInstant::now() - started < grace {
+            return Ok(job);
+        }
+        match store::fail_unrecorded_video(&self.store, job.id, "create_interrupted", Some(grace))
+            .await?
+        {
+            Some(ended) => {
+                self.settle(&ended, interrupted()).await?;
+                Ok(store::reload(&self.store, ended.id).await?)
+            }
+            // Its id was recorded meanwhile, or it already ended.
+            None => Ok(store::reload(&self.store, job.id).await?),
+        }
     }
 
     /// Apply an observation and settle a terminal one (idempotent).
@@ -201,6 +342,9 @@ impl Jobs {
     }
 
     pub(crate) async fn refresh_video(&self, job: JobRow) -> JobResult<JobRow> {
+        if job.upstream_id.is_none() {
+            return self.refresh_unrecorded_video(job).await;
+        }
         let (target, adapter) = self.target(&job).await?;
         let upstream_id = job.upstream().ok_or(InferenceError::Storage)?;
         let upstream = call(adapter.retrieve_video(&target, &upstream_id)).await?;
@@ -276,9 +420,12 @@ impl Jobs {
                 "A video can be deleted once it is completed or failed",
             ));
         }
-        let (target, adapter) = self.target(&job).await?;
-        let upstream_id = job.upstream().ok_or(InferenceError::Storage)?;
-        call(adapter.delete_video(&target, &upstream_id)).await?;
+        // A video that never got a provider id has no provider assets.
+        if job.upstream_id.is_some() {
+            let (target, adapter) = self.target(&job).await?;
+            let upstream_id = job.upstream().ok_or(InferenceError::Storage)?;
+            call(adapter.delete_video(&target, &upstream_id)).await?;
+        }
         store::mark_deleted(&self.store, job.id).await?;
         Ok(job)
     }
