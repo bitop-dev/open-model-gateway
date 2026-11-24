@@ -68,11 +68,12 @@ inference/realtime.rs :: impl RealtimeSession::final_write :: event :: crate :: 
 jobs/batch.rs :: impl Jobs::create_batch :: metrics call :: crate :: metrics :: METRICS . observe_batch_created (mode . as_str ())
 jobs/mod.rs :: impl Attempt::drop :: event :: crate :: ops_log :: emit (crate :: ops_log :: OpsEvent :: FinalizationNeedsReconciliation { finalizer : crate :: ops_log :: Finalizer :: JobCancel , trace : None , })
 jobs/mod.rs :: impl Attempt::fail :: event :: crate :: ops_log :: emit (crate :: ops_log :: OpsEvent :: FinalizationNeedsReconciliation { finalizer : crate :: ops_log :: Finalizer :: JobFail , trace : None , })
+jobs/native.rs :: count_finished :: metrics call :: crate :: metrics :: METRICS . observe_batch_finished ("native" , state . as_str ())
+jobs/native.rs :: impl Jobs::count_lines :: metrics call :: crate :: metrics :: METRICS . observe_batch_lines ("native" , & job . provider , u64 :: from (succeeded) , u64 :: from (failed) ,)
+jobs/native.rs :: impl Jobs::record_upstream :: metrics call :: crate :: metrics :: METRICS . observe_batch_late_submission ()
 jobs/mod.rs :: impl Attempt::fail_unsent :: event :: crate :: ops_log :: emit (crate :: ops_log :: OpsEvent :: FinalizationNeedsReconciliation { finalizer : crate :: ops_log :: Finalizer :: JobFail , trace : None , })
-jobs/native.rs :: impl Jobs::collect_native :: metrics call :: crate :: metrics :: METRICS . observe_batch_finished ("native" , state . as_str ())
-jobs/native.rs :: impl Jobs::collect_native :: metrics call :: crate :: metrics :: METRICS . observe_batch_lines ("native" , & job . provider , u64 :: from (succeeded) , u64 :: from (counts . failed) ,)
-jobs/native.rs :: impl Jobs::submit_native :: metrics call :: crate :: metrics :: METRICS . observe_batch_finished ("native" , JobState :: Failed . as_str ())
 jobs/native.rs :: impl Jobs::submit_native :: metrics call :: crate :: metrics :: METRICS . observe_batch_submitted (& job . provider)
+jobs/poller.rs :: impl Jobs::observe_renewal :: metrics call :: crate :: metrics :: METRICS . observe_job_lease_renewal (outcome . as_str ())
 jobs/runner.rs :: impl Runner::finalize :: metrics call :: crate :: metrics :: METRICS . observe_batch_finished ("gateway" , job . job_state () . as_str ())
 jobs/runner.rs :: impl Runner::new :: metrics call :: crate :: metrics :: METRICS . set_batch_workers (workers as u64 , 0)
 jobs/runner.rs :: impl Runner::observe_queue :: metrics call :: crate :: metrics :: METRICS . set_batch_queue (mode , n . max (0) as u64)
@@ -137,11 +138,13 @@ metrics/collection.rs :: impl Metrics::pool_gauges :: family :: self . pool_conn
 metrics/collection.rs :: impl Metrics::pool_gauges :: family :: self . pool_connections . get_or_create (& [("state" , "in_use" . to_owned ())])
 metrics/jobs.rs :: impl Metrics::observe_batch_created :: family :: self . batches . get_or_create (& [("mode" , mode . to_owned ()) , ("event" , "created" . to_owned ())])
 metrics/jobs.rs :: impl Metrics::observe_batch_finished :: family :: self . batches . get_or_create (& [("mode" , mode . to_owned ()) , ("event" , state . to_owned ())])
+metrics/jobs.rs :: impl Metrics::observe_batch_late_submission :: family :: self . batches . get_or_create (& [("mode" , "native" . to_owned ()) , ("event" , "late_submission" . to_owned ()) ,])
 metrics/jobs.rs :: impl Metrics::observe_batch_lines :: family :: self . batch_lines . get_or_create (& [("mode" , mode . to_owned ()) , ("provider" , provider . clone ()) , ("outcome" , outcome . to_owned ()) ,]) :: outcome from (outcome , n) = [("completed" , completed) , ("failed" , failed)] :: provider from provider = bounded (& self . providers , provider)
 metrics/jobs.rs :: impl Metrics::observe_batch_route_pause :: family :: self . batch_route_pauses . get_or_create (& [("reason" , reason . to_owned ())])
 metrics/jobs.rs :: impl Metrics::observe_batch_submitted :: family :: self . batches . get_or_create (& [("mode" , "native" . to_owned ()) , ("event" , "submitted" . to_owned ()) ,])
 metrics/jobs.rs :: impl Metrics::observe_file_store :: family :: self . file_store_ops . get_or_create (& [("backend" , backend . to_owned ()) , ("op" , op . to_owned ()) , ("outcome" , error . unwrap_or ("ok") . to_owned ()) ,])
 metrics/jobs.rs :: impl Metrics::observe_file_store_bytes :: family :: self . file_store_bytes . get_or_create (& [("backend" , backend . to_owned ()) , ("op" , op . to_owned ())])
+metrics/jobs.rs :: impl Metrics::observe_job_lease_renewal :: family :: self . job_lease_renewals . get_or_create (& [("outcome" , outcome . to_owned ())])
 metrics/jobs.rs :: impl Metrics::set_batch_paused_routes :: family :: self . batch_paused_routes . get_or_create (& [("reason" , reason . to_owned ())]) :: reason from reason = ["outside_window" , "live_traffic" , "server_busy" , "metrics_unavailable" , "concurrency" , "fair_share" , "workers" , "rate_limited" ,]
 metrics/jobs.rs :: impl Metrics::set_batch_queue :: family :: self . batch_queue . get_or_create (& [("mode" , mode . to_owned ())])
 metrics/jobs.rs :: impl Metrics::set_batch_route_lines :: family :: self . batch_route_lines . get_or_create (& [("provider" , provider . clone ()) , ("state" , state . to_owned ())]) :: provider from provider = bounded (& self . providers , provider) [(provider , waiting , running) = rows] :: state from (state , n) = [("waiting" , waiting) , ("running" , running)]
@@ -182,6 +185,8 @@ metrics/registry.rs :: impl Metrics::unregistered :: precreated labels :: series
 metrics/registry.rs :: impl Metrics::unregistered :: precreated labels :: series (& families . metric_pushes , "outcome" , | i | { crate :: otlp :: Delivery :: ALL [i] . as_str () . to_owned () })
 metrics/registry.rs :: impl Metrics::unregistered :: precreated labels :: series (& families . trace_drops , "reason" , | i | { crate :: telemetry :: DropReason :: ALL [i] . as_str () . to_owned () })
 metrics/registry.rs :: impl Metrics::unregistered :: precreated labels :: series (& families . trace_exchanges , "outcome" , | i | { crate :: telemetry :: Delivery :: ALL [i] . as_str () . to_owned () })
+metrics/registry.rs :: late_submissions :: family :: family . get_or_create (& [("mode" , "native" . to_owned ()) , ("event" , "late_submission" . to_owned ()) ,])
+metrics/registry.rs :: renewal_outcomes :: family :: family . get_or_create (& [("outcome" , outcome . as_str () . to_owned ())]) :: outcome from outcome = crate :: jobs :: poller :: Renewal :: ALL
 metrics/registry.rs :: series :: family :: family . get_or_create (& [(label , value (i))]) :: i from i
 metrics/requests.rs :: impl Metrics::labels :: statement 1 :: AttemptLabels { provider : bounded (& self . providers , provider) , model : bounded (& self . models , model) , }
 metrics/requests.rs :: impl Metrics::observe_attempt :: family :: self . attempt_errors . get_or_create (& [("provider" , provider . clone ()) , ("code" , error . code () . to_owned ()) ,]) :: error from Some (error) = a . error :: provider from (provider , model) = (a . labels . provider . clone () , a . labels . model . clone ())

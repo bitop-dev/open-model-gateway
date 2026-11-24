@@ -155,6 +155,7 @@ pub(crate) fn populated_registry() -> &'static Metrics {
     m.observe_file_store("local", "put", None);
     m.observe_file_store_bytes("local", "put", 1);
     m.observe_batch_created("gateway");
+    m.observe_job_lease_renewal("renewed");
     m.observe_batch_lines("gateway", "openai", 1, 1);
     m.set_batch_queue("gateway", 0);
     m.set_batch_workers(1, 0);

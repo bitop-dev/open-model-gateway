@@ -63,6 +63,15 @@ fn stopped(fence: &BatchFence) {
     tracing::warn!(job_id = %fence.job, "batch poller no longer holds its batch; it stops working on it");
 }
 
+/// The batch's final state in the metrics, once: by the claim that
+/// `recorded` its finish, right after the finish committed (a settlement that
+/// fails later does not lose it, and a retry does not count it again).
+fn count_finished(recorded: bool, state: JobState) {
+    if recorded {
+        crate::metrics::METRICS.observe_batch_finished("native", state.as_str());
+    }
+}
+
 /// Whether the poller's lease renewal found the claim ended.
 fn lost_claim(lost: &AtomicBool) -> bool {
     lost.load(Ordering::SeqCst)
@@ -119,6 +128,19 @@ impl Jobs {
                 .await;
             held(&fence, observed)?;
             return Ok(());
+        }
+        // A batch whose finish committed and whose settlement did not (its
+        // poller stopped in between): with the provider's aggregate usage it
+        // settles from that, without reading the results again. Without it
+        // the per-line sum is the only usage evidence, so the collection
+        // reads them again and removes the files it writes, because the
+        // finish keeps the first collection's links.
+        if job.job_state().is_terminal()
+            && let Some(usage) = upstream.usage
+        {
+            return self
+                .settle_finished(&job, &target, adapter.as_ref(), &upstream, usage)
+                .await;
         }
         self.collect_native(job, fence, lost, &target, adapter.as_ref(), &upstream)
             .await
@@ -207,7 +229,9 @@ impl Jobs {
             (Ok(Ok(upstream)), produced) => {
                 // An accepted response proves acceptance even if the concurrent
                 // encoder failed. Persist its id before classifying that failure.
-                store::set_upstream(&self.store, job.id, &upstream.id).await?;
+                if !self.record_upstream(&job, &upstream).await? {
+                    return Ok(());
+                }
                 produced.map(|_| upstream)
             }
             (Ok(Err(e)), _) => Err(e),
@@ -239,9 +263,10 @@ impl Jobs {
                         },
                     )
                     .await;
-                let Some(job) = held(&fence, finished)? else {
+                let Some((job, recorded)) = held(&fence, finished)? else {
                     return Ok(());
                 };
+                count_finished(recorded, JobState::Failed);
                 // Partial submission may have reached the provider. Only an explicit
                 // pre-processing rejection can qualify for free-zero settlement.
                 self.settle(
@@ -254,7 +279,6 @@ impl Jobs {
                 )
                 .await?;
                 self.discard_work_file(&job).await;
-                crate::metrics::METRICS.observe_batch_finished("native", JobState::Failed.as_str());
                 Ok(())
             }
         }
@@ -264,7 +288,7 @@ impl Jobs {
     /// retried; the batch fails and its hold is retained as unknown.
     async fn submission_lost(&self, fence: BatchFence) -> JobResult<()> {
         let finished = fence
-            .finish_native(
+            .interrupt_submission(
                 &self.store,
                 &Finished {
                     state: JobState::Failed,
@@ -275,7 +299,7 @@ impl Jobs {
                 },
             )
             .await;
-        let Some(job) = held(&fence, finished)? else {
+        let Some(Some(job)) = held(&fence, finished)? else {
             return Ok(());
         };
         self.settle(
@@ -477,17 +501,16 @@ impl Jobs {
             error_file,
             counts: Some(counts),
         };
-        let Some(job) = self.publish_native(&files, job, fence, &finished).await? else {
+        let Some((job, recorded)) = self.publish_native(&files, job, fence, &finished).await?
+        else {
             return Ok(());
         };
-        // Counted once the claim recorded the lines (a lost claim records
-        // nothing and counts nothing).
-        crate::metrics::METRICS.observe_batch_lines(
-            "native",
-            &job.provider,
-            u64::from(succeeded),
-            u64::from(counts.failed),
-        );
+        // Counted by the claim that recorded the finish only: a lost claim
+        // records and counts nothing, and a collection of a batch that is
+        // finished already (its first poller's settlement did not commit)
+        // counts nothing again.
+        self.count_lines(recorded, &job, succeeded, counts.failed);
+        count_finished(recorded, state);
         #[cfg(test)]
         self.settle_hold.pause().await;
         // The provider's aggregate when it reports one, else the per-line sum
@@ -503,8 +526,68 @@ impl Jobs {
             tracing::warn!(job_id = %job.id, "provider batch copies not deleted");
         }
         self.discard_work_file(&job).await;
-        crate::metrics::METRICS.observe_batch_finished("native", state.as_str());
         Ok(())
+    }
+
+    /// Record the provider's id of a submitted batch. `false` when the batch
+    /// ended while the provider was accepting it (its hold is kept as unknown
+    /// cost): the provider batch runs and is billed but is never polled, so
+    /// it is counted and logged with the provider's id for an operator to
+    /// cancel.
+    async fn record_upstream(&self, job: &JobRow, upstream: &UpstreamBatch) -> JobResult<bool> {
+        if store::set_upstream(&self.store, job.id, &upstream.id).await? {
+            return Ok(true);
+        }
+        crate::metrics::METRICS.observe_batch_late_submission();
+        tracing::warn!(
+            job_id = %job.id,
+            upstream_id = %upstream.id.as_str(),
+            "native batch accepted after it ended; the provider batch is not polled"
+        );
+        Ok(false)
+    }
+
+    /// Settle a batch whose finish committed and whose settlement did not
+    /// from the provider's aggregate `usage`, without reading its results
+    /// again, then delete the provider's copies and the work file. The
+    /// settlement follows the state the finish recorded, not a later
+    /// provider read: the recorded facts are the batch's.
+    async fn settle_finished(
+        &self,
+        job: &JobRow,
+        target: &Deployment,
+        adapter: &dyn ProviderAdapter,
+        upstream: &UpstreamBatch,
+        usage: Usage,
+    ) -> JobResult<()> {
+        if let Some(s) = settlement(job.job_state(), Some(usage)) {
+            self.settle(job, s).await?;
+        }
+        if call(adapter.delete_native_batch(target, upstream))
+            .await
+            .is_err()
+        {
+            tracing::warn!(job_id = %job.id, "provider batch copies not deleted");
+        }
+        self.discard_work_file(job).await;
+        Ok(())
+    }
+
+    /// The batch's lines in the metrics, once: by the claim that
+    /// `recorded` its finish.
+    fn count_lines(&self, recorded: bool, job: &JobRow, succeeded: u32, failed: u32) {
+        if !recorded {
+            return;
+        }
+        #[cfg(test)]
+        self.finish_metrics
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::metrics::METRICS.observe_batch_lines(
+            "native",
+            &job.provider,
+            u64::from(succeeded),
+            u64::from(failed),
+        );
     }
 
     /// Record the collected results under the claim. `None` when the claim
@@ -516,15 +599,15 @@ impl Jobs {
         job: JobRow,
         fence: BatchFence,
         f: &Finished<'_>,
-    ) -> JobResult<Option<JobRow>> {
+    ) -> JobResult<Option<(JobRow, bool)>> {
         let created = [f.output_file, f.error_file];
         match fence.finish_native(&self.store, f).await {
-            Ok(row) => {
+            Ok((row, recorded)) => {
                 let unused = created.map(|f| {
                     f.filter(|f| row.output_file_id != Some(*f) && row.error_file_id != Some(*f))
                 });
                 super::runner::remove_files(files, &row, unused).await;
-                Ok(Some(row))
+                Ok(Some((row, recorded)))
             }
             Err(FenceError::Stale) => {
                 stopped(&fence);

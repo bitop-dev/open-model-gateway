@@ -492,3 +492,181 @@ async fn a_submission_that_fails_after_its_claim_ended_writes_and_settles_nothin
     assert_eq!(count(&w.openai.calls(), "submit"), 1);
     consistent(&w.f).await;
 }
+
+/// A batch's line counts and finished-batch metrics are counted once, by the
+/// claim that recorded its finish: not again by a collection that finds it
+/// finished, nor by the first poller's late settlement.
+#[dbtest::test]
+async fn a_collected_batch_is_counted_once_however_often_it_is_collected(pool: PgPool) {
+    let (w, job) = submitted(pool).await;
+    completed(&w);
+    let counted = || {
+        w.jobs
+            .finish_metrics
+            .load(std::sync::atomic::Ordering::SeqCst)
+    };
+    let before = counted();
+    w.jobs.settle_hold.arm();
+    due(&w, &job).await;
+    let a = {
+        let jobs = w.jobs.clone();
+        tokio::spawn(async move { jobs.poll_once().await })
+    };
+    w.jobs.settle_hold.reached().await;
+    lapse(&w, &job).await;
+    assert_eq!(w.jobs.poll_once().await.unwrap(), 1);
+    w.jobs.settle_hold.release();
+    a.await.unwrap().unwrap();
+    assert!(w.reload(&job).await.settled_at.is_some());
+    assert_eq!(counted() - before, 1);
+}
+
+/// A batch whose finish committed and whose settlement did not is settled
+/// from the provider's aggregate usage, when it reports one, without
+/// downloading its results again.
+#[dbtest::test]
+async fn a_finished_batch_with_aggregate_usage_settles_without_a_second_download(pool: PgPool) {
+    let (w, job) = submitted(pool).await;
+    {
+        let mut s = w.openai.script.lock().unwrap();
+        for _ in 0..2 {
+            let mut done = upstream(BatchStatus::Completed);
+            done.usage = Some(usage(30, 6));
+            s.batches.push_back(done);
+        }
+        s.results = vec![
+            json!({"custom_id":"l0","ok":true,"input":30,"output":6}),
+            json!({"custom_id":"l1","ok":false}),
+        ];
+    }
+    w.jobs.settle_hold.arm();
+    due(&w, &job).await;
+    let a = {
+        let jobs = w.jobs.clone();
+        tokio::spawn(async move { jobs.poll_once().await })
+    };
+    w.jobs.settle_hold.reached().await;
+    let downloads = count(&w.openai.calls(), "results");
+    lapse(&w, &job).await;
+    assert_eq!(w.jobs.poll_once().await.unwrap(), 1);
+    assert_eq!(
+        count(&w.openai.calls(), "results"),
+        downloads,
+        "no second download"
+    );
+    assert_eq!(all_results(&w).await, 2, "no second set of result files");
+    let settled = reservation(&w.f, job.execution_id).await;
+    assert_eq!(settled.0, "settled");
+    w.jobs.settle_hold.release();
+    a.await.unwrap().unwrap();
+    assert_eq!(reservation(&w.f, job.execution_id).await, settled);
+    consistent(&w.f).await;
+}
+
+/// A submission that the provider accepts only after another poller ended
+/// the batch `submission_interrupted` records no upstream id on the settled
+/// row: the late id is counted (and logged) instead, so the provider batch
+/// that runs unpolled is visible. The batch keeps its retained hold.
+#[dbtest::test]
+async fn a_late_accepted_submission_is_counted_not_recorded_on_an_ended_batch(pool: PgPool) {
+    let (mut w, job) = unsubmitted(pool).await;
+    w.jobs.submit_grace = TimeDelta::minutes(0);
+    let held = {
+        let mut s = w.openai.script.lock().unwrap();
+        gate(&mut s.submit_gate)
+    };
+    let late = || crate::metrics::METRICS.batch_event_count("native", "late_submission");
+    let before = late();
+    due(&w, &job).await;
+    let a = {
+        let jobs = w.jobs.clone();
+        tokio::spawn(async move { jobs.poll_once().await })
+    };
+    held.entered.notified().await;
+    // A's lease lapses while its submission is in flight; B ends the batch
+    // as interrupted (the grace has passed) and settles it.
+    lapse(&w, &job).await;
+    w.jobs.poll_once().await.unwrap();
+    let ended = w.reload(&job).await;
+    assert_eq!(
+        (ended.state.as_str(), ended.error_code.as_deref()),
+        ("failed", Some("submission_interrupted"))
+    );
+    assert!(ended.settled_at.is_some());
+    let settled = reservation(&w.f, job.execution_id).await;
+    // The provider accepts A's submission now.
+    held.release.notify_one();
+    a.await.unwrap().unwrap();
+    let after = w.reload(&job).await;
+    assert_eq!(after.upstream_id, None, "no id on an ended batch");
+    assert_eq!(after.state, "failed");
+    assert_eq!(late() - before, 1);
+    assert_eq!(reservation(&w.f, job.execution_id).await, settled);
+    consistent(&w.f).await;
+}
+
+/// Lease renewals are counted by outcome: a held claim renews, and a renewal
+/// refused after a takeover is counted as lost (once: the renewals stop).
+#[dbtest::test]
+async fn lease_renewals_are_counted_by_outcome(pool: PgPool) {
+    use crate::jobs::poller::Renewal;
+    let (mut w, job) = submitted(pool).await;
+    w.jobs.poll_lease = SHORT;
+    completed(&w);
+    let held = gate(&mut w.openai.script.lock().unwrap().results_gate);
+    due(&w, &job).await;
+    let a = {
+        let jobs = w.jobs.clone();
+        tokio::spawn(async move { jobs.poll_once().await })
+    };
+    held.entered.notified().await;
+    tokio::time::sleep(SHORT.renew * 4).await;
+    assert!(
+        w.jobs.renewals(Renewal::Renewed) >= 1,
+        "a held claim renews"
+    );
+    assert_eq!(w.jobs.renewals(Renewal::Lost), 0);
+    take_over(&w, &job, Uuid::new_v4()).await;
+    tokio::time::sleep(SHORT.renew * 12).await;
+    held.release.notify_one();
+    a.await.unwrap().unwrap();
+    assert_eq!(w.jobs.renewals(Renewal::Lost), 1);
+}
+
+/// A poller that finds a started submission past its grace does not end the
+/// batch interrupted when the provider's id landed in the meantime (under
+/// the finish lock): the batch is polled as submitted.
+#[dbtest::test]
+async fn an_upstream_id_that_lands_first_keeps_the_batch_from_being_interrupted(pool: PgPool) {
+    let (mut w, job) = unsubmitted(pool).await;
+    w.jobs.submit_grace = TimeDelta::minutes(0);
+    sqlx::query("UPDATE async_jobs SET submit_started_at=now()-interval '1 hour',next_poll_at=now() WHERE id=$1")
+        .bind(job.id)
+        .execute(&w.f.store.pool)
+        .await
+        .unwrap();
+    // B's claim reads the batch without an upstream id ...
+    let (claimed, fence) = store::claim_due(&w.f.store, Uuid::new_v4(), 30.0, 60.0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(claimed.upstream_id.is_none());
+    // ... then the slow submitter records the provider's id.
+    assert!(
+        store::set_upstream(
+            &w.f.store,
+            job.id,
+            &UpstreamId::parse("batch_late").unwrap()
+        )
+        .await
+        .unwrap()
+    );
+    w.jobs
+        .poll_native(claimed, fence, &AtomicBool::new(false))
+        .await
+        .unwrap();
+    let after = w.reload(&job).await;
+    assert_eq!(after.state, "queued", "not interrupted");
+    assert_eq!(after.upstream_id.as_deref(), Some("batch_late"));
+    assert!(after.settled_at.is_none());
+}
