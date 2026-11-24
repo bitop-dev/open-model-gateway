@@ -13,13 +13,22 @@
 //! * a string literal that starts with a model-family or provider spelling
 //!   ([`MODEL_PREFIXES`], pinned), or that is the argument of `starts_with`,
 //!   `contains`, `ends_with`, `strip_prefix`, `strip_suffix`, `find` or
-//!   `eq_ignore_ascii_case` and contains one of [`MODEL_SPELLINGS`];
+//!   `eq_ignore_ascii_case` and contains one of [`MODEL_SPELLINGS`]. The
+//!   prefixes are model-name spellings (`claude`, `gpt-`, `gemini`, ...,
+//!   and `bedrock`) and the routing forms of provider names (`anthropic/`,
+//!   `anthropic.`, `openai/`, `openrouter/`); a provider name followed by
+//!   other text (`"openai-beta"`, `"Anthropic API"`, `"vLLM-compatible"`)
+//!   is not a model name and passes this rule, while the bare id in any
+//!   case is caught by the first;
 //! * a reference to an adapter type (`AnthropicAdapter`, `LocalAdapter`, ...)
 //!   or to a provider module (`providers::anthropic`, `providers::local`,
 //!   `providers::messages`, ...);
 //! * a variant of any provider-kind enum (`Provider::Anthropic`,
-//!   `ProviderClass::Bedrock`, `UpstreamClient::Local`), also through
-//!   `use ... as P` and by a glob import of the enum.
+//!   `ProviderClass::Bedrock`, `UpstreamClient::Local`, `Profile::Vllm`),
+//!   also through `use ... as P` and by a glob import of the enum. Every
+//!   variant of such an enum is refused, including the ones that are not
+//!   providers (`UpstreamClient::S3`, `UpstreamClient::Export`), so a
+//!   provider added to an enum is refused without a list to update.
 //!
 //! A fifth rule: the only items the scanned files may take from `providers`
 //! are `ProviderAdapter`, `ProviderRegistry` and the items of a shared
@@ -36,26 +45,43 @@
 //! A shared submodule is a file `providers/<module>/<name>.rs` of a provider
 //! module that is not adapter code: it implements no `ProviderAdapter`, never
 //! reaches back into its module (no `super` path, no `providers::<module>`
-//! path) and names no provider id, model family or adapter type. Naming it
-//! (`providers::local::endpoints::ApprovedEndpoints`, the server-controlled
-//! approval of local destinations) is not a provider switch; it is read from
-//! the tree too, with a pinned floor.
+//! path; `pub(super)` visibility names nothing) and has no hit of the scan
+//! above, except the egress client class of its own module,
+//! `UpstreamClient::<module>` (`UpstreamClient::Local` in `providers/local/`:
+//! the pool idle timeout and the lost-connection label of the clients it
+//! builds). Naming it (`providers::local::endpoints::ApprovedEndpoints`, the
+//! server-controlled approval of local destinations) is not a provider
+//! switch. The set is read from the tree and pinned exactly, so a new shared
+//! submodule is a reviewed change.
 //!
 //! Scanned, with no exceptions: the engine (`inference/`) and the code that
 //! admits, routes, plans and schedules its requests ([`STRICT`]). A
 //! provider-specific behaviour there is an adapter capability instead (for
-//! example `ProviderAdapter::forwards_cache_controls`).
+//! example `ProviderAdapter::forwards_cache_controls`). Outside the scope and
+//! outside `providers/`, the files that name a provider id or a provider-kind
+//! variant are pinned ([`OUT_OF_SCOPE`]), so a new module on the admission
+//! path cannot name one unreviewed.
 //!
 //! Cannot see: a provider named by a string built at run time or read from
-//! configuration; ids read through a `const` defined elsewhere (the literal is
-//! caught where the const is defined, if that file is scanned, not where it is
-//! used); a helper defined outside the scanned files that does the comparison
-//! (`deployment.is_anthropic()`); a comparison of two values neither of which
-//! is a literal (`a.provider == b.provider` is allowed, it is not a switch); a
-//! different spelling of the id ("open-ai"); a model family not in the pinned
-//! list; a provider type behind an alias made outside the scanned files;
-//! behaviour keyed on a capability that is really a proxy for one provider; a
-//! shared submodule whose code is provider-specific without naming a provider.
+//! configuration; an id read through a `const` defined elsewhere (the
+//! literal is caught where the const is defined, if that file is scanned,
+//! not where it is used); a helper defined outside the scanned files that
+//! does the comparison (`deployment.is_anthropic()`); a comparison of two
+//! values neither of which is a literal (`a.provider == b.provider`,
+//! `d.provider == name.as_str()`); a provider id inside a longer string (SQL
+//! `WHERE provider='anthropic'`, a format string), unless the string starts
+//! with a pinned prefix or is searched for; a partial literal
+//! (`starts_with("anth")`), a length (`provider.len() == 9`), a literal
+//! assembled by `concat!` or `stringify!`; an index into a table
+//! (`Provider::ALL[1]`); a variant reached through a qualified path
+//! (`<Provider>::Anthropic`, `<T as Trait>::Anthropic`); a different
+//! spelling of the id ("open-ai") or a model family not in the pinned list;
+//! a provider-kind type behind an alias made outside the scanned files, or an
+//! enum with fewer than three provider-spelled variants; behaviour keyed on a
+//! capability that is really a proxy for one provider; a shared submodule
+//! whose code is provider-specific without naming a provider, or that
+//! compares through its own module's client class
+//! (`UpstreamClient::Anthropic.as_str()` is the id `anthropic`).
 use std::collections::{BTreeMap, BTreeSet};
 
 use proc_macro2::TokenTree;
@@ -141,6 +167,41 @@ const PROVIDER_VARIANTS: &[&str] = &[
     "sglang",
 ];
 
+/// The provider-kind enum whose variant for its own module a shared
+/// submodule may name: the egress client class of the clients it builds.
+const EGRESS_CLIENT: &str = "UpstreamClient";
+
+/// Production files outside [`STRICT`] and outside `providers/` that name a
+/// provider id or a provider-spelled variant of a provider-kind enum, and
+/// why. A file on the admission path must not appear here: provider-specific
+/// behaviour there is an adapter capability.
+const OUT_OF_SCOPE: &[(&str, &str)] = &[
+    (
+        "egress_upstream.rs",
+        "defines UpstreamClient, the pooled client classes and their labels",
+    ),
+    (
+        "telemetry.rs",
+        "defines Provider, the provider ids and their telemetry spelling",
+    ),
+    (
+        "management/governance/suggestion.rs",
+        "OpenRouter catalog price suggestions: an OpenRouter connection only, its client class",
+    ),
+    (
+        "management/models_ux.rs",
+        "model display: the OpenRouter free-variant feature",
+    ),
+    (
+        "management/requests.rs",
+        "connection display: the OpenRouter data policy",
+    ),
+    (
+        "management/resources.rs",
+        "connection validation per provider kind (endpoint, region, credentials)",
+    ),
+];
+
 /// Modules of `providers` that are not adapters but name a provider kind.
 const EXTRA_MODULES: &[&str] = &["messages"];
 
@@ -169,7 +230,7 @@ const FLOOR_ADAPTERS: &[&str] = &[
     "OpenAiAdapter",
     "OpenRouterAdapter",
 ];
-const FLOOR_ENUMS: &[&str] = &["Provider", "ProviderClass", "UpstreamClient"];
+const FLOOR_ENUMS: &[&str] = &["Profile", "Provider", "ProviderClass", "UpstreamClient"];
 const FLOOR_SHARED: &[(&str, &str)] = &[("local", "endpoints")];
 
 #[derive(Default, Debug)]
@@ -344,7 +405,8 @@ fn submodule_of(path: &str) -> Option<(&str, &str)> {
 }
 
 /// A submodule file that is not adapter code: no `impl ProviderAdapter`, no
-/// path back into its module, no provider id, model family or adapter type.
+/// path back into its module, and no scan hit but its own module's egress
+/// client class.
 fn self_contained(source: &Source, module: &str, names: &Names) -> bool {
     let mut reader = IdReader::default();
     reader.visit_file(&source.file);
@@ -362,7 +424,16 @@ fn self_contained(source: &Source, module: &str, names: &Names) -> bool {
         && !back.found
         && scan(source, names)
             .keys()
-            .all(|hit| hit.what.starts_with("provider-kind variant "))
+            .all(|hit| own_client_class(&hit.what, module))
+}
+
+/// `provider-kind variant UpstreamClient::<module>`, the variant whose
+/// normalized name is `module`.
+fn own_client_class(what: &str, module: &str) -> bool {
+    what.strip_prefix("provider-kind variant ")
+        .and_then(|rest| rest.strip_prefix(EGRESS_CLIENT))
+        .and_then(|rest| rest.strip_prefix("::"))
+        .is_some_and(|variant| normalized(variant) == module)
 }
 
 /// A `super` path segment, or a `providers::<module>` path, anywhere.
@@ -569,14 +640,15 @@ impl Finder<'_> {
                 let shared = segments
                     .get(at + 2)
                     .is_some_and(|sub| self.names.shared.contains(&(pair[1].clone(), sub.clone())));
-                if shared {
-                } else if self.names.modules.contains(&pair[1]) {
-                    self.hit(format!("provider module providers::{}", pair[1]));
-                } else if !PROVIDER_ITEMS.contains(&pair[1].as_str()) {
-                    self.hit(format!(
-                        "providers::{} (only ProviderAdapter, ProviderRegistry and shared submodules)",
-                        pair[1]
-                    ));
+                if !shared {
+                    if self.names.modules.contains(&pair[1]) {
+                        self.hit(format!("provider module providers::{}", pair[1]));
+                    } else if !PROVIDER_ITEMS.contains(&pair[1].as_str()) {
+                        self.hit(format!(
+                            "providers::{} (only ProviderAdapter, ProviderRegistry and shared submodules)",
+                            pair[1]
+                        ));
+                    }
                 }
             }
             if let Some(variants) = self.names.enums.get(&pair[0])
@@ -802,7 +874,8 @@ mod tests {
         });
         let local = parse_fixture(
             "providers/local/mod.rs",
-            r#"impl ProviderAdapter for LocalAdapter { fn id(&self) -> &'static str { match 1 { _ => "vllm" } } }"#,
+            r#"pub enum Profile { OpenAiCompatible, Vllm, Sglang, Ollama }
+               impl ProviderAdapter for LocalAdapter { fn id(&self) -> &'static str { match 1 { _ => "vllm" } } }"#,
         );
         let telemetry = parse_fixture(
             "telemetry.rs",
@@ -823,8 +896,10 @@ mod tests {
         names(&all)
     }
 
-    /// Submodules of provider modules: one shared, three adapter code.
-    fn submodules() -> [Source; 4] {
+    /// Submodules of provider modules: one shared, five that are not (three
+    /// adapter code, two that name a provider-kind variant other than their
+    /// own module's client class).
+    fn submodules() -> [Source; 6] {
         [
             parse_fixture(
                 "providers/local/endpoints.rs",
@@ -843,6 +918,14 @@ pub fn line() {}",
             parse_fixture(
                 "providers/openai/jobs.rs",
                 "pub fn poll() { let _ = crate::providers::openai::client(); }",
+            ),
+            parse_fixture(
+                "providers/local/kinds.rs",
+                "pub fn special(provider: &str) -> bool { provider == crate::telemetry::Provider::Anthropic.as_str() }",
+            ),
+            parse_fixture(
+                "providers/local/pool.rs",
+                "pub fn idle() { let _ = crate::egress::UpstreamClient::Anthropic.pool_idle_timeout(); }",
             ),
         ]
     }
@@ -864,7 +947,10 @@ pub fn line() {}",
         assert!(names.adapters.contains("LocalAdapter"));
         assert!(names.modules.contains("local") && names.modules.contains("messages"));
         let enums: Vec<&String> = names.enums.keys().collect();
-        assert_eq!(enums, ["Provider", "ProviderClass", "UpstreamClient"]);
+        assert_eq!(
+            enums,
+            ["Profile", "Provider", "ProviderClass", "UpstreamClient"]
+        );
         assert!(names.enums["Provider"].contains("Sglang"));
     }
 
@@ -1107,8 +1193,8 @@ pub fn line() {}",
                 )]
             );
         }
-        // The scheduler's former profile list, a second identical hit, and a
-        // variant: each is counted.
+        // A table of profile names, a comparison made twice and a variant:
+        // each is reported, the doubled comparison as x2.
         let found = problems(
             &[parse_fixture(
                 "jobs/schedule.rs",
@@ -1172,6 +1258,14 @@ pub fn line() {}",
                 "provider module providers::openai",
             ),
             (
+                "use crate::providers::local::kinds::special;",
+                "provider module providers::local",
+            ),
+            (
+                "fn f() { crate::providers::local::pool::idle(); }",
+                "provider module providers::local",
+            ),
+            (
                 "fn f() { let _ = crate::providers::endpoints::X; }",
                 "providers::endpoints (only ProviderAdapter",
             ),
@@ -1203,13 +1297,72 @@ pub fn line() {}",
 
     #[test]
     fn the_real_shared_submodules() {
-        // Not pinned beyond the floor; printed for review of a new one.
         let names = names(&real());
-        eprintln!("shared submodules: {:?}", names.shared);
+        assert_eq!(
+            names.shared,
+            BTreeSet::from([("local".to_owned(), "endpoints".to_owned())]),
+            "the shared submodules changed: the scanned code may name every item of a shared \
+             submodule, so a new one is a reviewed change (pin it here and in docs/verification.md)"
+        );
+    }
+
+    #[test]
+    fn a_provider_spelling_searched_for_inside_a_longer_literal_is_refused() {
+        // None of these literals is a provider id or starts with a pinned
+        // prefix: only the search-argument rule refuses them.
+        for code in [
+            r#"fn f(m: &str) -> bool { m.contains("/gpt-") }"#,
+            r#"fn f(m: &str) -> bool { m.ends_with("-claude") }"#,
+            r#"fn f(m: &str) -> bool { m.contains("us.anthropic.") }"#,
+            r#"fn f(m: &str) -> Option<&str> { m.strip_suffix("@vllm") }"#,
+            r#"fn f(m: &[u8]) -> bool { m.ends_with(b"-ollama") }"#,
+        ] {
+            let found = engine(code);
+            assert!(
+                found.len() == 1 && found[0].contains("provider or model spelling searched for"),
+                "{code}: {found:?}"
+            );
+        }
+        // The same literals outside a search are not refused.
+        assert!(engine(r#"fn f() { let _ = ("/gpt-", "-claude", "@vllm"); }"#).is_empty());
+    }
+
+    /// A hit that names a provider: an id, a provider-spelled variant of a
+    /// provider-kind enum (not `UpstreamClient::S3` or `::Export`), or a glob
+    /// import of such an enum.
+    fn names_a_provider(what: &str) -> bool {
+        let variant = what
+            .strip_prefix("provider-kind variant ")
+            .and_then(|path| path.rsplit("::").next())
+            .is_some_and(|v| PROVIDER_VARIANTS.contains(&normalized(v).as_str()));
+        variant
+            || what.starts_with("provider id literal ")
+            || what.starts_with("glob import of the provider-kind enum ")
+    }
+
+    #[test]
+    fn the_files_outside_the_scope_that_name_a_provider_are_pinned() {
+        let lib = real();
+        let names = names(&lib);
+        let bin = production("main.rs");
         assert!(
-            names
-                .shared
-                .contains(&("local".to_owned(), "endpoints".to_owned()))
+            bin.iter().any(|s| s.path == "commands/serve.rs"),
+            "the binary's modules are scanned"
+        );
+        let found: BTreeSet<&str> = lib
+            .iter()
+            .chain(&bin)
+            .filter(|s| !applies(&s.path, STRICT) && !s.path.starts_with("providers/"))
+            .filter(|s| scan(s, &names).keys().any(|h| names_a_provider(&h.what)))
+            .map(|s| s.path.as_str())
+            .collect();
+        let pinned: BTreeSet<&str> = OUT_OF_SCOPE.iter().map(|(path, _)| *path).collect();
+        assert_eq!(
+            found, pinned,
+            "the production files outside the scanned scope and outside providers/ that name a \
+             provider changed: code on the admission, routing or scheduling path belongs in \
+             STRICT and uses adapter capabilities; anything else is listed in OUT_OF_SCOPE with \
+             its reason (and in docs/verification.md)"
         );
     }
 
