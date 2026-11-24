@@ -341,3 +341,15 @@ fn native_messages_batch_preserves_tool_result_flags() {
         );
     }
 }
+
+/// A native result line that names a member twice is not decoded: a reader
+/// would keep one of the values, so usage or an error could hide.
+#[test]
+fn a_native_line_with_a_duplicate_member_is_not_decoded() {
+    let message = r#"{"id":"m","type":"message","role":"assistant","model":"claude","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":3,"output_tokens":2},"usage":{"input_tokens":0,"output_tokens":0}}"#;
+    let line =
+        format!(r#"{{"custom_id":"l0","result":{{"type":"succeeded","message":{message}}}}}"#);
+    assert!(decode_native_result(BatchEndpoint::Messages, line.as_bytes()).is_err());
+    let hidden = r#"{"custom_id":"l0","result":{"type":"succeeded","message":{"id":"m","type":"message","role":"assistant","model":"claude","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":3,"output_tokens":2},"error":{"type":"rate_limit_error"},"error":null}}}"#;
+    assert!(decode_native_result(BatchEndpoint::Messages, hidden.as_bytes()).is_err());
+}

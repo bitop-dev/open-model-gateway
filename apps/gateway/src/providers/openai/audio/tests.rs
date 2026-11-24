@@ -255,11 +255,18 @@ async fn transcription_errors_are_sanitized_and_bounded() {
             r#"{"text":"x","segments":[{"text":"x"}]}"#,
             InferenceError::InvalidUpstream,
         ),
+        // A 200 error with no readable name is an unavailable provider (#665).
         (
             200,
             "application/json",
             r#"{"error":{"message":"x"}}"#,
-            InferenceError::InvalidUpstream,
+            InferenceError::UpstreamUnavailable,
+        ),
+        (
+            200,
+            "application/json",
+            r#"{"error":{"code":"rate_limit_exceeded","message":"sk-secret"}}"#,
+            InferenceError::Busy,
         ),
     ] {
         let mock = Mock::serve(status, content_type, vec![body.as_bytes().to_vec()], false).await;
@@ -341,10 +348,7 @@ async fn speech_passes_binary_audio_through_with_explicit_content_type() {
 #[tokio::test]
 async fn speech_rejects_wrong_media_types_and_empty_bodies() {
     for (content_type, chunks) in [
-        (
-            "application/json",
-            vec![br#"{"error":{"message":"x"}}"#.to_vec()],
-        ),
+        ("application/json", vec![br#"{"ok":true}"#.to_vec()]),
         ("audio/wav", vec![b"RIFF".to_vec()]),
         ("text/html", vec![b"<html>".to_vec()]),
         ("audio/mpeg", vec![]),

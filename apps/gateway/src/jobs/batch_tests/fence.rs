@@ -585,6 +585,7 @@ async fn a_stale_claim_admits_no_line(pool: PgPool) {
                 &deployment,
                 None,
                 50,
+                false,
                 None,
             )
             .await

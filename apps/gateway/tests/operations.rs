@@ -40,6 +40,7 @@ impl ProviderAdapter for OpsMock {
         _target: &Deployment,
         _request: ChatRequest,
     ) -> Result<ProviderOutput, InferenceError> {
+        open_model_gateway::inference::dispatch::started();
         Ok(ProviderOutput::Complete(ChatResponse {
             messages_content: None,
             reasoning: None,

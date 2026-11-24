@@ -19,13 +19,25 @@ pub enum Profile {
     Ollama,
 }
 impl Profile {
-    fn id(self) -> &'static str {
+    pub(crate) const ALL: [Self; 4] = [
+        Self::OpenAiCompatible,
+        Self::Vllm,
+        Self::Sglang,
+        Self::Ollama,
+    ];
+    pub(crate) fn id(self) -> &'static str {
         match self {
             Self::OpenAiCompatible => "openai_compatible",
             Self::Vllm => "vllm",
             Self::Sglang => "sglang",
             Self::Ollama => "ollama",
         }
+    }
+    /// Servers of this profile accept vLLM's `priority` request field, so a
+    /// route's batch scheduling may set a priority hint
+    /// (`capabilities::accepts_priority_hint`) and its batch lines carry it.
+    pub(crate) fn accepts_priority_hint(self) -> bool {
+        matches!(self, Self::Vllm | Self::OpenAiCompatible)
     }
 }
 pub struct LocalAdapter {
@@ -87,7 +99,7 @@ impl LocalAdapter {
     ) -> Result<serde_json::Value> {
         let (client, _) = self.connection(target)?;
         let response = self
-            .authenticate(client.post(url), target)?
+            .authenticated_post(client, url, target)?
             .json(payload)
             .send()
             .await
@@ -95,13 +107,17 @@ impl LocalAdapter {
         framing::status(response.status())?;
         framing::body(response).await
     }
-    fn authenticate(
+    /// A POST to `url` with the connection's credential. The credential is
+    /// resolved before the request is built, so a reference that cannot be
+    /// resolved fails with nothing sent (`inference::dispatch`).
+    fn authenticated_post(
         &self,
-        builder: reqwest::RequestBuilder,
+        client: &crate::egress::HttpClient,
+        url: impl reqwest::IntoUrl,
         target: &Deployment,
     ) -> Result<reqwest::RequestBuilder> {
         if target.credential_ref == "none" {
-            return Ok(builder);
+            return Ok(client.post(url));
         }
         // Only environment references may cross an approved local connection.
         if !target.credential_ref.starts_with("env:") {
@@ -112,7 +128,9 @@ impl LocalAdapter {
             reqwest::header::HeaderValue::from_str(&format!("Bearer {}", secret.expose()))
                 .map_err(|_| InferenceError::Configuration)?;
         header.set_sensitive(true);
-        Ok(builder.header(reqwest::header::AUTHORIZATION, header))
+        Ok(client
+            .post(url)
+            .header(reqwest::header::AUTHORIZATION, header))
     }
     fn encode_chat(&self, target: &Deployment, request: &ChatRequest) -> Result<serde_json::Value> {
         super::messages::validate(request, super::messages::ProviderClass::Local)?;
@@ -137,7 +155,8 @@ impl LocalAdapter {
     /// to this exact route (its scheduling settings opt in) and the profile
     /// is vLLM-compatible. Never sent otherwise.
     fn batch_priority(&self, target: &Deployment) -> Option<i32> {
-        matches!(self.profile, Profile::Vllm | Profile::OpenAiCompatible)
+        self.profile
+            .accepts_priority_hint()
             .then(|| crate::inference::scheduling::priority_for(target.id))
             .flatten()
     }
@@ -147,21 +166,16 @@ pub fn adapters(
     approvals: ApprovedEndpoints,
 ) -> Vec<Arc<dyn ProviderAdapter>> {
     let approvals = Arc::new(approvals);
-    [
-        Profile::OpenAiCompatible,
-        Profile::Vllm,
-        Profile::Sglang,
-        Profile::Ollama,
-    ]
-    .into_iter()
-    .map(|profile| {
-        Arc::new(LocalAdapter::new(
-            profile,
-            resolver.clone(),
-            approvals.clone(),
-        )) as Arc<dyn ProviderAdapter>
-    })
-    .collect()
+    Profile::ALL
+        .into_iter()
+        .map(|profile| {
+            Arc::new(LocalAdapter::new(
+                profile,
+                resolver.clone(),
+                approvals.clone(),
+            )) as Arc<dyn ProviderAdapter>
+        })
+        .collect()
 }
 #[async_trait]
 impl ProviderAdapter for LocalAdapter {
@@ -207,7 +221,7 @@ impl ProviderAdapter for LocalAdapter {
         let payload = self.encode_chat(target, &request)?;
         let (client, base) = self.connection(target)?;
         let response = self
-            .authenticate(client.post(format!("{base}/chat/completions")), target)?
+            .authenticated_post(client, format!("{base}/chat/completions"), target)?
             .json(&payload)
             .send()
             .await
@@ -262,7 +276,7 @@ impl ProviderAdapter for LocalAdapter {
             (format!("{base}/embeddings"), payload)
         };
         let response = self
-            .authenticate(client.post(url), target)?
+            .authenticated_post(client, url, target)?
             .json(&payload)
             .send()
             .await
@@ -272,7 +286,7 @@ impl ProviderAdapter for LocalAdapter {
         if native {
             embeddings::decode_ollama(&value, &request)
         } else {
-            embeddings::decode(&value, &request)
+            embeddings::decode(&value, &request, framing::status_error)
         }
     }
     async fn execute_rerank(

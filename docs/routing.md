@@ -33,9 +33,10 @@ Labels are 1–64 lowercase ASCII letters/digits and `._-`, starting with a lett
 | --- | --- |
 | Provider Busy | With attempts remaining |
 | Upstream unavailable / ambiguous transport | Only with `allow_ambiguous_failover:true` and attempts remaining |
+| Nothing sent: the route failed before any request to the provider was built (an unresolvable credential or endpoint, a provider SDK that found no identity), with class Busy, Overloaded, upstream unavailable or provider configuration | With attempts remaining, without `allow_ambiguous_failover`: it is not ambiguous |
 | Timeout, invalid output/request, unsupported capability, storage/configuration failure | No |
 
-Ambiguous failover may duplicate upstream work or charges. It is not idempotent delivery. No fallback occurs after a provider stream is returned, even before the first event is polled. Deadlines do not restart between attempts. Local capacity/admission rejection is not a provider-health observation.
+"Nothing sent" is proved by the gateway, not inferred from the error: every provider request is built through one client type, which marks the attempt when it builds one (see [governance](governance.md#settlement-and-holds)). The same classes after a request was built (an upstream 401 is a configuration failure too) follow the rows above. Each attempt is admitted and reserved on its own, and the unsent one settles at zero. Ambiguous failover may duplicate upstream work or charges. It is not idempotent delivery. No fallback occurs after a provider stream is returned, even before the first event is polled. Deadlines do not restart between attempts. Local capacity/admission rejection is not a provider-health observation.
 
 ## Passive observations
 

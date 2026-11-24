@@ -2,6 +2,7 @@ mod attempt;
 pub mod audio;
 pub mod client;
 mod deadline_stream;
+pub mod dispatch;
 mod embeddings;
 pub mod error;
 pub(crate) mod evidence;
@@ -531,3 +532,5 @@ mod steering_tests;
 mod telemetry_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, feature = "integration-tests"))]
+mod unsent_tests;
