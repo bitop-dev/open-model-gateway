@@ -39,6 +39,48 @@ impl AnthropicAdapter {
         adapter
     }
 }
+/// A token count reply is one small object.
+const COUNT_RESPONSE_LIMIT: usize = 16 * 1024;
+impl AnthropicAdapter {
+    /// POSTs `payload` to the fixed origin with the connection's own key.
+    /// The connection is validated before the credential is resolved.
+    async fn send(
+        &self,
+        target: &Deployment,
+        request: &ChatRequest,
+        path: &str,
+        payload: &Value,
+    ) -> Result<reqwest::Response> {
+        if target.provider != "anthropic"
+            || target.credential_ref == "none"
+            || target.endpoint.is_some()
+            || target.region.as_deref().is_some_and(|v| !v.is_empty())
+        {
+            return Err(InferenceError::Configuration);
+        }
+        let secret = self.resolver.resolve(&target.credential_ref)?;
+        let mut key = reqwest::header::HeaderValue::from_str(secret.expose())
+            .map_err(|_| InferenceError::Configuration)?;
+        key.set_sensitive(true);
+        let mut outbound = self
+            .client
+            .post(format!("{}{path}", self.base))
+            .header("anthropic-version", "2023-06-01")
+            .header("x-api-key", key);
+        if let Some(options) = &request.messages_options {
+            // Header name is fixed; append each original value, never synthesize
+            // betas or copy arbitrary headers (especially inference credentials).
+            for beta in &options.beta_headers {
+                outbound = outbound.header("anthropic-beta", beta);
+            }
+        }
+        outbound
+            .json(payload)
+            .send()
+            .await
+            .map_err(send_error(crate::egress::UpstreamClient::Anthropic))
+    }
+}
 #[async_trait]
 impl ProviderAdapter for AnthropicAdapter {
     fn id(&self) -> &'static str {
@@ -110,36 +152,37 @@ impl ProviderAdapter for AnthropicAdapter {
     async fn delete_native_batch(&self, target: &Deployment, batch: &UpstreamBatch) -> Result<()> {
         batches::delete_native_batch(self, target, batch).await
     }
+    /// Anthropic's own count (`POST /v1/messages/count_tokens`): the same
+    /// validated encoding as generation without `max_tokens` and `stream`,
+    /// which the counting endpoint does not take. Never billed upstream and
+    /// never an attempt here; errors keep the Messages classification.
+    async fn count_input_tokens(
+        &self,
+        target: &Deployment,
+        request: &ChatRequest,
+    ) -> Result<Option<u64>> {
+        let mut payload = encode(&target.upstream_model, request)?;
+        if let Some(fields) = payload.as_object_mut() {
+            fields.remove("max_tokens");
+            fields.remove("stream");
+        }
+        let response = self
+            .send(target, request, "/messages/count_tokens", &payload)
+            .await?;
+        let response = super::framing::anthropic_generation_status(response).await?;
+        let value = super::framing::body_limit(response, COUNT_RESPONSE_LIMIT).await?;
+        // Only the count is read; nothing else from the reply is returned.
+        let count = value
+            .as_object()
+            .and_then(|o| o.get("input_tokens"))
+            .and_then(Value::as_u64)
+            .filter(|n| *n <= i64::MAX as u64)
+            .ok_or(InferenceError::InvalidUpstream)?;
+        Ok(Some(count))
+    }
     async fn execute(&self, target: &Deployment, request: ChatRequest) -> Result<ProviderOutput> {
-        if target.provider != "anthropic"
-            || target.credential_ref == "none"
-            || target.endpoint.is_some()
-            || target.region.as_deref().is_some_and(|v| !v.is_empty())
-        {
-            return Err(InferenceError::Configuration);
-        }
         let payload = encode(&target.upstream_model, &request)?;
-        let secret = self.resolver.resolve(&target.credential_ref)?;
-        let mut key = reqwest::header::HeaderValue::from_str(secret.expose())
-            .map_err(|_| InferenceError::Configuration)?;
-        key.set_sensitive(true);
-        let mut outbound = self
-            .client
-            .post(format!("{}/messages", self.base))
-            .header("anthropic-version", "2023-06-01")
-            .header("x-api-key", key);
-        if let Some(options) = &request.messages_options {
-            // Header name is fixed; append each original value, never synthesize
-            // betas or copy arbitrary headers (especially inference credentials).
-            for beta in &options.beta_headers {
-                outbound = outbound.header("anthropic-beta", beta);
-            }
-        }
-        let response = outbound
-            .json(&payload)
-            .send()
-            .await
-            .map_err(send_error(crate::egress::UpstreamClient::Anthropic))?;
+        let response = self.send(target, &request, "/messages", &payload).await?;
         let response = if request.messages_options.is_some() {
             super::framing::anthropic_generation_status(response).await?
         } else {

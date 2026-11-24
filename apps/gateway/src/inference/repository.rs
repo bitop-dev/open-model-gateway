@@ -157,6 +157,17 @@ pub trait InferenceRepository: Send + Sync {
     ) -> Result<Vec<Deployment>, InferenceError> {
         self.deployments(principal, model).await
     }
+    /// The deployments of a request that has no admission (a token count,
+    /// `super::count`): read live, never from a per-replica cache, because
+    /// no later admission re-checks the key, the workspace grant or the key
+    /// restriction. Default: `deployments`.
+    async fn live_candidates(
+        &self,
+        principal: &Principal,
+        model: &str,
+    ) -> Result<Vec<Deployment>, InferenceError> {
+        self.deployments(principal, model).await
+    }
     async fn start(&self, record: &ExecutionStart) -> Result<(), InferenceError>;
     async fn finish(&self, record: &ExecutionFinish) -> Result<(), InferenceError>;
     /// Finish with attempt telemetry (finish reason, timings). Telemetry is
@@ -320,6 +331,16 @@ impl InferenceRepository for Store {
         Ok(deployments)
     }
 
+    async fn live_candidates(
+        &self,
+        principal: &Principal,
+        model: &str,
+    ) -> Result<Vec<Deployment>, InferenceError> {
+        if !super::types::model_name_is_queryable(model) {
+            return Ok(Vec::new());
+        }
+        self.live_deployments(principal, model).await
+    }
     async fn start(&self, record: &ExecutionStart) -> Result<(), InferenceError> {
         self.start_unaccounted(record).await
     }

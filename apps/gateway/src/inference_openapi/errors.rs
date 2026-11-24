@@ -354,7 +354,7 @@ pub(super) fn components() -> Result<Value> {
 
 /// Envelope components every operation of a path may reference.
 fn allowed_envelopes(path: &str) -> &'static [&'static str] {
-    if path == "/v1/messages" {
+    if super::generator::ANTHROPIC_PATHS.contains(&path) {
         &["AnthropicErrorEnvelope"]
     } else if path.starts_with("/v1/videos") || path.starts_with("/v1/batches") {
         &["JobErrorEnvelope", "OpenAiErrorEnvelope"]

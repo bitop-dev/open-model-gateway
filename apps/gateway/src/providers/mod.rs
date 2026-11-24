@@ -100,6 +100,21 @@ pub trait ProviderAdapter: Send + Sync {
     ) -> Result<EmbeddingResponse, InferenceError> {
         Err(InferenceError::Unsupported)
     }
+    /// The provider's own input-token count for a Messages request
+    /// (`POST /v1/messages/count_tokens`), or `None` when this adapter has no
+    /// native counter and the gateway estimates instead
+    /// (`inference::count`). A count is never generation: it creates no
+    /// execution, reservation or ledger entry, and its result is never an
+    /// admission bound. The upstream credential is resolved as for
+    /// `execute`; the client's inference key is never forwarded. Dropping
+    /// the future must cancel the upstream request.
+    async fn count_input_tokens(
+        &self,
+        _target: &Deployment,
+        _request: &ChatRequest,
+    ) -> Result<Option<u64>, InferenceError> {
+        Ok(None)
+    }
     // Non-generation workloads (see `inference::workload`). Each is gated by
     // `supports_protocol` and defaults to an explicit `Unsupported`. Dropping
     // the future MUST cancel upstream work; never retry internally.

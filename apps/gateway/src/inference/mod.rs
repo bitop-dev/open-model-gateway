@@ -1,6 +1,7 @@
 mod attempt;
 pub mod audio;
 pub mod client;
+pub mod count;
 mod deadline_stream;
 mod embeddings;
 pub mod error;
@@ -68,6 +69,8 @@ pub struct EngineLimits {
     pub request_timeout: Duration,
     pub workloads: workload::WorkloadLimits,
     pub audio: audio::AudioLimits,
+    /// Token counts this process admits per key per UTC minute (`count`).
+    pub counts_per_key_per_minute: u32,
 }
 impl Default for EngineLimits {
     fn default() -> Self {
@@ -76,6 +79,7 @@ impl Default for EngineLimits {
             request_timeout: Duration::from_secs(120),
             workloads: workload::WorkloadLimits::default(),
             audio: audio::AudioLimits::default(),
+            counts_per_key_per_minute: count::COUNTS_PER_KEY_PER_MINUTE,
         }
     }
 }
@@ -92,6 +96,8 @@ pub struct Engine {
     /// tracing, in which case the request path never allocates a
     /// RequestTelemetry context or hashes a request id.
     recorder: Option<telemetry::Recorder>,
+    /// Per-key token-count windows of this process (`count`).
+    counts: Arc<count::Limiter>,
 }
 
 impl Engine {
@@ -105,7 +111,8 @@ impl Engine {
                 && limits.max_concurrent <= Semaphore::MAX_PERMITS
                 && !limits.request_timeout.is_zero()
                 && limits.workloads.validate()
-                && limits.audio.validate(),
+                && limits.audio.validate()
+                && limits.counts_per_key_per_minute > 0,
             "invalid inference limits"
         );
         Ok(Self {
@@ -115,6 +122,7 @@ impl Engine {
             limits,
             realtime: realtime::RealtimeLimits::default(),
             recorder: None,
+            counts: Arc::default(),
         })
     }
 
@@ -146,6 +154,7 @@ impl Engine {
             // interactive-generation tracing: never wrapped in telemetry,
             // same as every other non-interactive admission path.
             recorder: None,
+            counts: self.counts.clone(),
         }
     }
 
@@ -516,6 +525,8 @@ impl Drop for ExecutionGuard {
 
 #[cfg(all(test, feature = "integration-tests"))]
 pub(crate) mod admission_validation_tests;
+#[cfg(all(test, feature = "integration-tests"))]
+mod count_db_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod settlement_disconnect_tests;
 #[cfg(all(test, feature = "integration-tests"))]

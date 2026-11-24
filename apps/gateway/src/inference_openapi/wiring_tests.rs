@@ -38,7 +38,7 @@ fn inference_openapi_route_parity_is_three_way() {
         .filter(|(_, path)| path.starts_with("/v1/"))
         .collect();
     let artifact = operations(&generated());
-    assert_eq!(table.len(), 27, "the inference route inventory changed");
+    assert_eq!(table.len(), 28, "the inference route inventory changed");
     assert_eq!(table, scan, "route table and source scan disagree");
     assert_eq!(table, artifact, "route table and artifact disagree");
 }
@@ -333,7 +333,7 @@ fn inference_openapi_completed_areas_have_no_incomplete_references() {
             }
         }
     }
-    assert_eq!(count, 27);
+    assert_eq!(count, 28);
     // Groups are disjoint and every area names real operations.
     let mut seen = BTreeSet::new();
     for (_, group) in AREA_GROUPS {

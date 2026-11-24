@@ -642,6 +642,7 @@ fn inference_limits_from_env() -> Result<crate::inference::EngineLimits> {
             std::env::var(name).ok()
         })?,
         audio: crate::inference::audio::AudioLimits::from_lookup(|name| std::env::var(name).ok())?,
+        counts_per_key_per_minute: crate::inference::count::COUNTS_PER_KEY_PER_MINUTE,
     })
 }
 

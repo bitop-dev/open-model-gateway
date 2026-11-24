@@ -852,7 +852,12 @@ async fn generation_gateway(pool: &PgPool) -> (axum::Router, DevelopmentKeys) {
         .bind(cache).execute(pool).await.unwrap();
     let mut registry = ProviderRegistry::default();
     registry.register(Arc::new(GenerationAdapter)).unwrap();
-    let engine = Engine::new(Arc::new(store.clone()), registry, EngineLimits::default()).unwrap();
+    // The vector journeys send many token counts with one key.
+    let limits = EngineLimits {
+        counts_per_key_per_minute: u32::MAX,
+        ..EngineLimits::default()
+    };
+    let engine = Engine::new(Arc::new(store.clone()), registry, limits).unwrap();
     (http::router_with_engine(store, None, engine), keys)
 }
 
@@ -999,7 +1004,79 @@ async fn generation_real_handler_fixtures(pool: PgPool, shard: usize) -> Fixture
                 .await;
         }
     }
+    count_tokens_fixtures(&app, &key, &mut fixtures).await;
     fixtures
+}
+
+/// `POST /v1/messages/count_tokens` (#72) on the fixture route, which has no
+/// native counter: every accepted body is an estimate, and nothing executes.
+const COUNT_FIELDS: [(&str, usize); 7] = [
+    ("model", 0),
+    ("messages", 1),
+    ("system", 2),
+    ("tools", 9),
+    ("tool_choice", 10),
+    ("thinking", 12),
+    ("output_config", 13),
+];
+/// A count body with the count fields of a Messages fixture (object or the
+/// positional form, whose Messages positions are the second tuple field).
+fn count_body(messages: &Value) -> Value {
+    match messages {
+        Value::Array(items) => Value::Array(
+            COUNT_FIELDS
+                .iter()
+                .map(|(_, index)| items[*index].clone())
+                .collect(),
+        ),
+        Value::Object(fields) => Value::Object(
+            COUNT_FIELDS
+                .iter()
+                .filter_map(|(name, _)| fields.get(*name).map(|v| ((*name).to_owned(), v.clone())))
+                .collect(),
+        ),
+        _ => unreachable!("fixture bodies are objects or arrays"),
+    }
+}
+async fn count_tokens_fixtures(app: &axum::Router, key: &str, fixtures: &mut Fixtures) {
+    let path = "/v1/messages/count_tokens";
+    let mut bodies =
+        vec![json!({"model":"company/smart","messages":[{"role":"user","content":"text"}]})];
+    bodies.extend(
+        generation_full_requests("/v1/messages")
+            .iter()
+            .map(count_body),
+    );
+    for body in bodies {
+        super::generation::validate_request(r::artifact(), path, &body)
+            .expect("valid count fixture request");
+        let captured = capture(
+            "POST",
+            path,
+            app.clone()
+                .oneshot(generation_http(path, key, &body))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(captured.status, StatusCode::OK, "count fixture status");
+        assert_eq!(
+            captured.headers["x-omg-token-count"],
+            "estimate; method=utf8-bytes-div-4"
+        );
+        fixtures.observe(&captured);
+        let send = async |body: Value| {
+            let response = app
+                .clone()
+                .oneshot(generation_http(path, key, &body))
+                .await
+                .unwrap();
+            probe(capture("POST", path, response).await)
+        };
+        fixtures
+            .body_vectors("POST", path, body, &[], &[], send)
+            .await;
+    }
 }
 
 #[dbtest::test]
