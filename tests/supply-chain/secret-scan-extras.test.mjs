@@ -95,6 +95,35 @@ test("the same bytes under an archive name and a text name are still opened as a
   assert.deepEqual(list(r, "archives").map(n => n.replace(/^\d+-/, "")), ["z.zip"]);
 }));
 
+test("zero-filled binary is not taken for UTF-16 text", () => withRepo(r => {
+  writeFileSync(join(r.dir, "zeros.bin"), Buffer.alloc(4096));
+  const head = commitAll(r.dir, "zeros");
+  const done = run(r, [`${r.start}..${head}`], { SECRET_SCAN_EXTRAS_MAX_BLOB: "100" });
+  assert.equal(done.status, 0, done.stderr);
+  assert.deepEqual(list(r, "utf16"), []);
+}));
+
+test("a long file name is shortened in the output and keeps its extension", () => withRepo(r => {
+  const name = `${"n".repeat(240)}.tgz`;
+  writeFileSync(join(r.dir, name), "x\n");
+  const head = commitAll(r.dir, "long");
+  const done = run(r, [`${r.start}..${head}`]);
+  assert.equal(done.status, 0, done.stderr);
+  const [archive] = list(r, "archives");
+  assert.ok(archive.endsWith(".tar.gz") && archive.length < 120, archive);
+  assert.match(read(r, "names.txt"), new RegExp(`^${name.replace(".", "\\.")}\n$`));
+}));
+
+test("a blob that is not kept is skipped whatever its size; an error names the blob, not the path", () => withRepo(r => {
+  writeFileSync(join(r.dir, "big.txt"), "x".repeat(500));
+  writeFileSync(join(r.dir, "secret-looking-name.zip"), "y".repeat(500));
+  const head = commitAll(r.dir, "sizes");
+  const done = run(r, [`${r.start}..${head}`], { SECRET_SCAN_EXTRAS_MAX_BLOB: "100" });
+  assert.equal(done.status, 3);
+  assert.match(done.stderr, /blob [0-9a-f]{40} \(entry \d+\) is 500 bytes/);
+  assert.doesNotMatch(done.stderr, /secret-looking-name/);
+}));
+
 test("a submodule entry (gitlink) has no blob and is skipped", () => withRepo(r => {
   git(r.dir, "update-index", "--add", "--cacheinfo", `160000,${r.start},sub`);
   git(r.dir, "commit", "-q", "-m", "submodule");

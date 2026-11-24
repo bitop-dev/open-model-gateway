@@ -450,6 +450,16 @@ regexes = ['''^${value}$''']
     noLeak(r, key);
   }));
 
+  test("real: a base config the scanner cannot read fails the job (#603)", real(repo => {
+    writeFileSync(join(repo.dir, CONFIG_FILE), "this is [not toml\n");
+    const base = commitAll(repo.dir, "broken config");
+    writeFileSync(join(repo.dir, CONFIG_FILE), readFileSync(join(root, CONFIG_FILE), "utf8"));
+    writeFileSync(join(repo.dir, "c.txt"), "clean\n");
+    const head = commitAll(repo.dir, "fixed config");
+    const r = runStep(repo, prEnv(repo, { BASE_SHA: base, HEAD_SHA: head, AFTER_SHA: head }));
+    assert.notEqual(r.status, 0, r.stdout + r.stderr);
+  }));
+
   test("real: an allowlist entry that lands before its fixture passes both configs (#603)", real(repo => {
     const key = fakes.aws();
     appendConfig(repo, allowEntry("fixture.txt", key));

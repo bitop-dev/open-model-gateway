@@ -66,8 +66,11 @@ def utf16(head):
     even = sample[0::2]
     odd = sample[1::2]
     # ASCII text in UTF-16 has a NUL in every other byte (odd bytes for
-    # little-endian, even bytes for big-endian).
-    return odd.count(0) >= 0.9 * len(odd) or even.count(0) >= 0.9 * len(even)
+    # little-endian, even bytes for big-endian) and almost none in the others;
+    # zero-filled binary has NULs in both and is not text.
+    def text(nuls, chars):
+        return nuls.count(0) >= 0.9 * len(nuls) and chars.count(0) <= 0.05 * len(chars)
+    return text(odd, even) or text(even, odd)
 
 
 def decode16(blob):
@@ -155,23 +158,31 @@ def main(argv):
         if len(header) != 3:
             fail(2, f"git cat-file did not return {blob}")
         size = int(header[2])
-        data = batch.stdout.read(size)
-        batch.stdout.read(1)
-        if header[1] != b"blob":
-            continue
+        # The start decides; a blob that is not kept is skipped in chunks, and one
+        # over the bound fails before it is read whole.
+        head = batch.stdout.read(min(size, UTF16_SNIFF))
         suffix = archive_name(path)
-        if suffix is None and not utf16(data[:UTF16_SNIFF]):
+        keep = header[1] == b"blob" and (suffix is not None or utf16(head))
+        if keep and size > MAX_BLOB:
+            fail(3, f"blob {blob} (entry {index}) is {size} bytes, over the {MAX_BLOB}-byte bound for an archive or UTF-16 blob")
+        rest = size - len(head)
+        if not keep:
+            while rest > 0:
+                rest -= len(batch.stdout.read(min(rest, 1 << 20)))
+            batch.stdout.read(1)
             continue
-        if size > MAX_BLOB:
-            fail(3, f"{path} is {size} bytes, over the {MAX_BLOB}-byte bound for an archive or UTF-16 blob")
+        data = head + batch.stdout.read(rest)
+        batch.stdout.read(1)
         total += size
         if total > MAX_TOTAL:
             fail(3, f"archives and UTF-16 blobs pass the {MAX_TOTAL}-byte bound")
-        base = os.path.basename(path) or "blob"
+        # A name of at most 100 characters: git allows 255-byte path components,
+        # and the index prefix and suffix must still fit.
+        base = (os.path.basename(path) or "blob")[-100:]
         if suffix is not None:
             lower = base.lower()
             cut = 4 if lower.endswith(".tgz") else len(suffix)
-            stem = base[:-cut] if len(base) > cut else "archive"
+            stem = (base[:-cut] if len(base) > cut else "archive")[-100:]
             with open(os.path.join(out, "archives", f"{index:06d}-{stem}{suffix}"), "wb") as f:
                 f.write(data)
             archives += 1

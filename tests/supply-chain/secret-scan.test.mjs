@@ -57,6 +57,8 @@ function scriptViolations(run) {
   const bad = (cond, message) => { if (cond) out.push(message); };
   const lines = run.split("\n").map(l => l.trim()).filter(l => l && !l.startsWith("#"));
   bad(lines[0] !== "set -euo pipefail", "the script must start with set -euo pipefail");
+  bad(lines[1] !== 'echo "::stop-commands::$(cat /proc/sys/kernel/random/uuid)"', "workflow commands are switched off before anything prints a file name");
+  bad(lines.filter(l => l.includes("::stop-commands::")).length !== 1 || /::[0-9a-f-]{36}::|\$\{?stop/.test(run), "workflow commands stay off for the whole step");
   bad(/set \+[eo]|set \+o errexit|\|\|\s*(true|:)(\s|$)|;\s*true(\s|$)|\btrap\b.*\bERR\b/.test(run), "nothing may switch off errexit or swallow a failure");
   bad(JSON.stringify(lines.filter(l => l.startsWith("common="))) !== JSON.stringify([COMMON]), "common must be exactly the reviewed option list");
   bad((run.match(/--config/g) ?? []).length !== CALLS.length, "--config appears only in the reviewed gitleaks calls");
@@ -193,6 +195,7 @@ const MUTATIONS = [
   ["no redaction", d => set(d, t => t.replace("--redact ", "")), /common must be exactly/],
   ["inline allow comments honoured", d => set(d, t => t.replace("--ignore-gitleaks-allow ", "")), /common must be exactly/],
   ["verbose findings", d => set(d, t => t.replace("--log-level info ", "--log-level info --verbose ")), /common must be exactly|narrows/],
+  ["workflow commands left on", d => set(d, t => t.replace(/\n\s*echo "::stop-commands::\$\(cat \/proc\/sys\/kernel\/random\/uuid\)"/, "")), /workflow commands are switched off/],
   ["the message of what is scanned removed", d => set(d, t => t.replace('echo "scanning ${commits} commits of ${range}"', "true")), /say what it scans/],
 ];
 for (const [label, mutate, reason] of MUTATIONS) {
@@ -202,6 +205,22 @@ for (const [label, mutate, reason] of MUTATIONS) {
     assert.match(jobViolations(data).join("\n"), reason);
   });
 }
+
+// ---- the real-scanner tests in CI (#603) ----
+
+test("the web job runs the secret-scan tests with the real scanner, at the secret-scan job's pin", () => {
+  const data = copy();
+  const steps = stepsOf(data.jobs.web);
+  const install = steps.findIndex(s => typeof s.run === "string" && s.run.includes("gitleaks_") && s.run.includes("fetch-verified.sh"));
+  const tests = steps.findIndex(s => s.run === "npm run test:supply-chain");
+  assert.ok(install >= 0 && install < tests, "gitleaks is installed before npm run test:supply-chain");
+  const run = steps[install].run;
+  const pin = pinOf(jobOf(data));
+  assert.ok(run.includes(`${FETCH} ${pin.url} ${pin.sha256} `), "the same URL and checksum as the secret-scan job");
+  assert.match(run, /echo "GITLEAKS_BIN=\$\{RUNNER_TEMP\}\/gitleaks" >> "\$\{GITHUB_ENV\}"/);
+  assert.equal(steps[install].if, undefined);
+  assert.equal(steps[install]["continue-on-error"], undefined);
+});
 
 // ---- the scheduled full-history scan (#603) ----
 
