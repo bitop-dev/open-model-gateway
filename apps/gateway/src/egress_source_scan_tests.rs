@@ -605,7 +605,7 @@ const PROBES: &[&str] = &[
 // Pin the sanctioned build/override statements, each as a whole, so the
 // transport assignment stays explicit and nothing else rides on the `expect`.
 const BEDROCK_SERVICE_CONFIG: &str = "builder . behavior_version ( auth : : sdk_behavior_version ( ) ) . region ( Region : : new ( plan . region . clone ( ) ) ) . credentials_provider ( credentials ) . retry_config ( RetryConfig : : standard ( ) . with_max_attempts ( 1 ) ) . disable_clock_skew_correction ( true ) . identity_cache ( aws_sdk_bedrockruntime : : config : : IdentityCache : : lazy ( ) . load_timeout ( Duration : : from_secs ( 5 ) ) . build ( ) , ) . timeout_config ( self . operation_timeouts ( ) ) . http_client ( self . http . clone ( ) ) . build ( )";
-const BEDROCK_STREAM: &str = "client . converse_stream ( ) . model_id ( & target . upstream_model ) . set_messages ( Some ( input . messages ) ) . set_system ( input . system ) . inference_config ( input . inference ) . set_tool_config ( input . tools ) . customize ( ) . config_override ( aws_sdk_bedrockruntime : : Config : : builder ( ) . http_client ( self . streaming_http . clone ( ) ) , )";
+const BEDROCK_STREAM: &str = "client . converse_stream ( ) . model_id ( & target . upstream_model ) . set_messages ( Some ( input . messages ) ) . set_system ( input . system ) . inference_config ( input . inference ) . set_tool_config ( input . tools ) . set_output_config ( input . output ) . customize ( ) . config_override ( aws_sdk_bedrockruntime : : Config : : builder ( ) . http_client ( self . streaming_http . clone ( ) ) , )";
 
 fn aws_transport(reason: &str) -> Option<AwsTransport> {
     match reason {
