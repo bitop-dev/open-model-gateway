@@ -2072,10 +2072,6 @@ async fn budget_exhaustion_mid_batch_stops_and_keeps_partial_results(pool: PgPoo
     consistent(f).await;
 }
 
-/// A key revoked after its gateway-run batch was created: every line that
-/// runs afterwards fails exactly as the interactive endpoint refuses the key
-/// (401 `authentication_error`, never `model_not_found`), and nothing reaches
-/// a provider.
 /// A gateway-run line whose route's credential cannot be resolved (the real
 /// OpenAI adapter, nothing allowed to resolve) fails before any request is
 /// built: it settles at a known zero with its own ledger entry, nothing
@@ -2155,6 +2151,10 @@ async fn a_line_whose_credential_cannot_be_resolved_settles_as_a_known_zero(pool
     consistent(f).await;
 }
 
+/// A key revoked after its gateway-run batch was created: every line that
+/// runs afterwards fails exactly as the interactive endpoint refuses the key
+/// (401 `authentication_error`, never `model_not_found`), and nothing reaches
+/// a provider.
 #[dbtest::test]
 async fn lines_of_a_revoked_key_fail_with_the_authentication_error(pool: PgPool) {
     let w = world(pool, false, false, 1).await;

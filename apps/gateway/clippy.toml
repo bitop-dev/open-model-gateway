@@ -51,6 +51,7 @@ disallowed-methods = [
   { path = "reqwest::Client::new", reason = "build HTTP clients with crate::egress::client_builder (#509)" },
   { path = "reqwest::Client::builder", reason = "build HTTP clients with crate::egress::client_builder (#509)" },
   { path = "reqwest::ClientBuilder::new", reason = "build HTTP clients with crate::egress::client_builder (#509)" },
+  { path = "reqwest::RequestBuilder::try_clone", reason = "it copies a builder that crate::egress::HttpClient never built, so the attempt's dispatch mark (crate::inference::dispatch) is skipped; build each request through crate::egress::HttpClient" },
   { path = "reqwest::RequestBuilder::build_split", reason = "it returns a raw reqwest client; send requests through crate::egress::HttpClient (#569)" },
   { path = "reqwest::RequestBuilder::from_parts", reason = "it takes a raw reqwest client; send requests through crate::egress::HttpClient (#569)" },
   { path = "reqwest::get", reason = "send requests with a client from crate::egress::client_builder (#509)" },

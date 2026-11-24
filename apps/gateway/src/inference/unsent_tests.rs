@@ -521,3 +521,123 @@ async fn the_same_class_after_the_request_was_sent_does_not_fail_over(pool: PgPo
     assert_eq!(rows.len(), 1);
     assert_eq!((rows[0].1.as_str(), rows[0].3), ("unknown", None));
 }
+
+/// The non-generation path (`Engine::execute_workload`): an embeddings
+/// request whose credential cannot be resolved settles at zero like a chat
+/// request, input-only usage included.
+#[dbtest::test]
+async fn an_embeddings_request_that_sent_nothing_settles_as_a_known_zero(pool: PgPool) {
+    let mut f = fixture(pool).await;
+    let token = issue_key(&mut f).await;
+    sqlx::query("UPDATE models SET supported_protocols=ARRAY['embeddings']")
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE deployments SET enabled=false WHERE model_id=$1")
+        .bind(f.model)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    add_deployment(&f, "openai", "env:OMG_UNSENT_TEST_KEY", None, "embed", 0).await;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let (mock_base, _mock) = serve(counting(hits.clone(), StatusCode::OK)).await;
+    let mut registry = ProviderRegistry::default();
+    registry
+        .register(Kind::OpenAi.adapter(&mock_base, false))
+        .unwrap();
+    let (base, _gateway) = start_gateway(&f, registry).await;
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("{base}/v1/embeddings"))
+        .bearer_auth(&token)
+        .json(&json!({"model":"company/smart","input":"hi"}))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let id: Uuid = response.headers()["x-request-id"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let body = response.text().await.unwrap();
+    assert!(!status.is_success(), "{status} {body}");
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    let rows = recorded(&f.store.pool, id).await;
+    assert_eq!(rows.len(), 1, "{body}");
+    let (execution, reservation, held, actual, input, output, ledger) = &rows[0];
+    assert_eq!(execution, "failed");
+    assert!(held.is_some_and(|h| h > 0));
+    assert_eq!(
+        (reservation.as_str(), *actual, *input, *output),
+        ("settled", Some(0), Some(0), Some(0))
+    );
+    assert_eq!(
+        ledger,
+        &vec![("hold".into(), *held), ("settlement".into(), Some(0))]
+    );
+}
+
+/// A pricing v3 version that charges per request as well as per token (its
+/// admission holds no finite amount without unit ceilings): an attempt that
+/// sent nothing is still a zero, with no components (they would value the
+/// request line), not a one-request charge or an unknown.
+#[dbtest::test]
+async fn a_per_request_price_line_is_not_charged_when_nothing_was_sent(pool: PgPool) {
+    use crate::billing::v3::Meter;
+    let mut f = fixture(pool).await;
+    let token = issue_key(&mut f).await;
+    sqlx::query("UPDATE deployments SET enabled=false WHERE model_id=$1")
+        .bind(f.model)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    let deployment =
+        add_unpriced_deployment(&f, "openai", "env:OMG_UNSENT_TEST_KEY", None, "m", 0).await;
+    let lines: Vec<serde_json::Value> = Meter::ALL
+        .into_iter()
+        .map(|m| match m {
+            Meter::InputTokens | Meter::OutputTokens | Meter::Requests => {
+                let batch = m.batches()[0];
+                let rate = if m == Meter::Requests { "1000" } else { "1000000" };
+                json!({"meter":m.as_str(),"microusd_per_batch":rate,"batch":batch,"unit_label":m.unit_label(batch).unwrap(),"sku_label":"Priced"})
+            }
+            m => json!({"meter":m.as_str(),"not_applicable":true}),
+        })
+        .collect();
+    sqlx::query("INSERT INTO deployment_prices(id,deployment_id,input_token_limit,output_token_limit,pricing_version,price_lines,max_units) VALUES($1,$2,1000,1000,3,$3,'{}')")
+        .bind(Uuid::new_v4()).bind(deployment).bind(json!(lines)).execute(&f.store.pool).await.unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let (mock_base, _mock) = serve(counting(hits.clone(), StatusCode::OK)).await;
+    let mut registry = ProviderRegistry::default();
+    registry
+        .register(Kind::OpenAi.adapter(&mock_base, false))
+        .unwrap();
+    let (base, _gateway) = start_gateway(&f, registry).await;
+    let w = World {
+        f,
+        token,
+        base,
+        hits,
+        _servers: vec![_mock, _gateway],
+    };
+    let (status, id, body) = call(&w, Kind::OpenAi, false).await;
+    assert!(!status.is_success(), "{body}");
+    assert_eq!(w.hits.load(Ordering::SeqCst), 0);
+    let rows = recorded(&w.f.store.pool, id).await;
+    assert_eq!(rows.len(), 1, "{body}");
+    assert_eq!(
+        (rows[0].1.as_str(), rows[0].3, rows[0].4, rows[0].5),
+        ("settled", Some(0), Some(0), Some(0))
+    );
+    let components: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT r.cost_components FROM governance_reservations r JOIN inference_executions e ON e.id=r.execution_id WHERE e.root_request_id=$1",
+    )
+    .bind(id)
+    .fetch_one(&w.f.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(components, None);
+}

@@ -354,12 +354,16 @@ async fn call_upstream(
     attempt_request.max_output_tokens = admission.max_output_tokens;
     // The dispatch scope is outermost, so a timeout that drops the adapter
     // call still reports whether it had built a request.
-    let ((output, invalid_body_usage), nothing_sent) =
-        super::dispatch::observe(evidence::capture(timeout_at(
+    let ((output, invalid_body_usage), nothing_sent) = super::dispatch::observe(async {
+        // The adapter call itself is evaluated inside the scope too, so a
+        // request built before its future is first polled is still seen.
+        evidence::capture(timeout_at(
             deadline,
             adapter.execute_protocol(deployment, attempt_request, protocol),
-        )))
-        .await;
+        ))
+        .await
+    })
+    .await;
     // Only a failure can be "nothing sent": a returned response or stream
     // came from the provider.
     guard.telemetry.nothing_sent = nothing_sent && !matches!(output, Ok(Ok(_)));

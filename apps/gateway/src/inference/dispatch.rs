@@ -2,8 +2,11 @@
 //!
 //! Every outbound HTTP request of a provider adapter is built through
 //! `crate::egress::HttpClient` (Clippy's `disallowed-types` and the client
-//! module scan refuse any other reqwest client), and each of its request
-//! constructors calls [`started`] before it returns a builder. The engine
+//! module scan refuse any other reqwest client, and Clippy refuses
+//! `RequestBuilder::try_clone`, which would copy a builder without building
+//! it), and each of its request constructors calls [`started`] before it
+//! returns a builder. The realtime WebSocket, the one provider connection
+//! that does not use it, calls [`started`] before it connects. The engine
 //! runs each attempt's adapter call inside [`observe`]; if that call ended
 //! without [`started`] having run, no request to the provider was even built,
 //! so not one byte of it can have been written. That proof is structural (it
