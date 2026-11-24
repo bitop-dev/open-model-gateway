@@ -252,6 +252,11 @@ pub struct RealtimeFinish {
     pub unopened_request: bool,
     /// The reserved window of that request.
     pub window: ResponseBound,
+    /// The highest response sequence this session saw recorded as opened (0
+    /// before its first response). Each open writes the next sequence, so a
+    /// pending response above it was opened by a write whose result the
+    /// session never saw: the unopened request's own response.
+    pub recorded_sequence: i32,
 }
 
 /// An admitted, connected realtime session (one upstream attempt).
@@ -315,7 +320,14 @@ impl RealtimeSession {
     /// one window sized from the session's context. A reserved but unused
     /// window (admission's, or a rejected request's) is resized; otherwise a
     /// new window is added. Growth is budget-checked; shrinking releases.
+    ///
+    /// One request or response at a time: while a response is open or a
+    /// forwarded request is unresolved this is refused and the armed window is
+    /// left as it is, so finishing can attribute every response row.
     pub async fn reserve_window(&mut self, max_output_tokens: u32) -> Result<(), InferenceError> {
+        if self.open.is_some() || self.requested {
+            return Err(InferenceError::InvalidRequest);
+        }
         if !(1..=self.window_output_tokens).contains(&max_output_tokens) {
             return Err(InferenceError::InvalidRequest);
         }
@@ -440,6 +452,7 @@ impl RealtimeSession {
             window: self
                 .armed
                 .unwrap_or(ResponseBound::unknown(self.window_output_tokens)),
+            recorded_sequence: self.sequence,
         }
     }
     fn final_write(

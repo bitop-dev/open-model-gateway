@@ -562,18 +562,23 @@ async fn finish_once(store: &Store, record: &RealtimeFinish) -> Result<Finished,
     // The ledger row is written directly: its components are the per-key sum
     // of the settled responses' (validated) components.
     // A forwarded request that never resolved may be running upstream: its
-    // window is retained as an unknown response. A session has at most one
-    // request or response in flight, so a pending response row here is that
-    // request's response, opened by a write whose result the session never saw
-    // (cancelled or past its deadline as it committed): the window is already
-    // retained through that row and is never added twice.
+    // window is retained as an unknown response, unless that request already
+    // has a response row. Each open inserts the session's next sequence, and
+    // the session records the sequence only once it sees the insert succeed,
+    // so a pending row above `recorded_sequence` was opened by a write whose
+    // result the session never saw (cancelled or past its deadline as it
+    // committed). `RealtimeSession::reserve_window` arms no request while
+    // another is unresolved or a response is open, so such a row is this
+    // request's own response: its window is already retained and is not added
+    // again. A pending row at or below `recorded_sequence` is a response the
+    // session saw open; it never stands in for this request's window.
     if record.unopened_request {
         let hold = match pinned(&mut tx, &s).await? {
             Some(p) => p.realtime_window(record.window)?,
             None => None,
         };
-        sqlx::query("INSERT INTO realtime_responses(execution_id,sequence,state,window_hold_microusd,unbounded_cost,completed_at) SELECT $1,coalesce(max(sequence),0)+1,'unknown',$2,$3,clock_timestamp() FROM realtime_responses WHERE execution_id=$1 HAVING NOT coalesce(bool_or(state='pending'),false)")
-            .bind(record.id).bind(hold).bind(hold.is_none())
+        sqlx::query("INSERT INTO realtime_responses(execution_id,sequence,state,window_hold_microusd,unbounded_cost,completed_at) SELECT $1,coalesce(max(sequence),0)+1,'unknown',$2,$3,clock_timestamp() FROM realtime_responses WHERE execution_id=$1 HAVING NOT coalesce(bool_or(state='pending' AND sequence>$4),false)")
+            .bind(record.id).bind(hold).bind(hold.is_none()).bind(record.recorded_sequence)
             .execute(&mut *tx).await.map_err(storage)?;
     }
     // Responses still open at the end never reported usage.

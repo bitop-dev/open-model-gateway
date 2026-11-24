@@ -3,6 +3,7 @@
 //! the maintained budget totals and the engine's concurrency permit.
 use super::*;
 use crate::inference::{
+    error::InferenceError,
     realtime::{RealtimeSession, RealtimeUsage, ResponseStatus},
     repository::Outcome,
 };
@@ -75,7 +76,7 @@ async fn waiter(g: &Gateway, pids: &[i32], except: Option<i32>) -> i32 {
             {
                 return p;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(POLL).await;
         }
     })
     .await
@@ -326,6 +327,117 @@ async fn drop_then_the_response_write_fails(pool: PgPool) {
 #[dbtest::test]
 async fn drop_then_the_response_write_times_out(pool: PgPool) {
     failed_response_write(pool, Failure::Deadline).await;
+}
+
+/// The advisory lock the commit gate waits on; no gateway code takes it.
+const COMMIT_GATE: i64 = 0x0742_0803_0000_0001;
+
+/// The owner is aborted while the response insert of its `open_response` is
+/// committing (a deferred trigger holds the COMMIT on a lock the test owns).
+/// The row commits, but the session never learns it and finishes with the
+/// request unopened: the response's window is retained once, not twice.
+#[dbtest::test]
+async fn an_open_committed_after_its_owner_is_aborted_is_held_once(pool: PgPool) {
+    let g = gateway(pool, Init::Safe, vec![], limits()).await;
+    let full = g.engine.available_capacity();
+    let (mut session, id) = open(&g).await;
+    session.reserve_window(100).await.unwrap();
+    sqlx::raw_sql(&format!("CREATE FUNCTION realtime_open_commit_gate() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock({COMMIT_GATE}); RETURN NULL; END $$; CREATE CONSTRAINT TRIGGER realtime_open_commit_gate AFTER INSERT ON realtime_responses DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION realtime_open_commit_gate()"))
+        .execute(&g.pool)
+        .await
+        .unwrap();
+    let mut gate = g.pool.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(COMMIT_GATE)
+        .execute(&mut *gate)
+        .await
+        .unwrap();
+    let gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *gate)
+        .await
+        .unwrap();
+
+    let owner = tokio::spawn(async move {
+        let _ = session.open_response("one".into()).await;
+    });
+    // Only the open's COMMIT (its deferred trigger) waits on the gate.
+    let open_pid = waiter(&g, &[gate_pid], None).await;
+    owner.abort();
+    assert!(owner.await.unwrap_err().is_cancelled());
+    // The dropped session's final write queues behind the committing open,
+    // which still holds the reservation row.
+    waiter(&g, &[open_pid], None).await;
+    let _: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
+        .bind(COMMIT_GATE)
+        .fetch_one(&mut *gate)
+        .await
+        .unwrap();
+
+    let row = tokio::time::timeout(SETTLE_BOUND, g.finished())
+        .await
+        .expect("session finalization completed");
+    assert_eq!(row["state"], "cancelled");
+    assert_eq!(row["reservation"], "unknown");
+    assert_eq!(row["actual"], Value::Null);
+    let responses = g.responses(&id.to_string()).await;
+    assert_eq!(responses.len(), 1, "{responses:?}");
+    assert_eq!(responses[0]["sequence"], 1);
+    assert_eq!(responses[0]["state"], "unknown");
+    let window = responses[0]["window"].as_i64().unwrap();
+    assert!(window > 0);
+    assert_eq!(row["held"], window);
+    let ledger = g.ledger(&id.to_string()).await;
+    assert_eq!(settlements(&ledger), vec![&("unknown".into(), Some(0))]);
+    assert_eq!(totals(&g).await, vec![(0, window, 0, 1); 2]);
+    permits_return(&g, full).await;
+}
+
+/// The window held for the session's reservation.
+async fn held(g: &Gateway, id: Uuid) -> Option<i64> {
+    sqlx::query_scalar("SELECT held_microusd FROM governance_reservations WHERE execution_id=$1")
+        .bind(id)
+        .fetch_one(&g.pool)
+        .await
+        .unwrap()
+}
+
+/// One request or response at a time: a second window is refused while a
+/// forwarded request is unresolved or a response is open, and the armed
+/// window is left as it was.
+#[dbtest::test]
+async fn reserve_window_refuses_while_a_request_or_response_is_in_flight(pool: PgPool) {
+    let g = gateway(pool, Init::Safe, vec![], limits()).await;
+    let (mut session, id) = open(&g).await;
+    session.reserve_window(100).await.unwrap();
+    let armed = held(&g, id).await;
+    // A smaller window would resize the armed one.
+    assert_eq!(
+        session.reserve_window(10).await,
+        Err(InferenceError::InvalidRequest)
+    );
+    assert_eq!(held(&g, id).await, armed);
+    session.open_response("one".into()).await.unwrap();
+    assert_eq!(
+        g.responses(&id.to_string()).await[0]["window"],
+        json!(armed)
+    );
+    assert_eq!(
+        session.reserve_window(100).await,
+        Err(InferenceError::InvalidRequest)
+    );
+    assert_eq!(held(&g, id).await, armed);
+    session
+        .settle_response("one", COMPLETED, usage())
+        .await
+        .unwrap();
+    // Once the response is done, and after a rejected request, it is accepted.
+    session.reserve_window(100).await.unwrap();
+    session.request_rejected();
+    session.reserve_window(10).await.unwrap();
+    session
+        .finish(Outcome::Succeeded, None, None)
+        .await
+        .unwrap();
 }
 
 /// Dropped on a thread without a Tokio runtime, a session spawns nothing:

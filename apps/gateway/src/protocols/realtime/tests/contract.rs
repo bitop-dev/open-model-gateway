@@ -935,6 +935,47 @@ async fn a_rejected_request_keeps_its_window_for_the_next_one(pool: PgPool) {
     assert_eq!(responses[0]["unbounded"], false);
 }
 
+/// A second `response.create` while a response is open is refused by the
+/// gateway itself: an `error` event for its event id, nothing forwarded, no
+/// window reserved, and the session stays open.
+#[dbtest::test]
+async fn a_second_request_while_one_is_open_is_refused(pool: PgPool) {
+    let g = gateway(pool, Init::Safe, vec![Reply::Hang], limits()).await;
+    let mut client = g.connect().await;
+    opened(&mut client).await;
+    speak(&mut client).await;
+    send(
+        &mut client,
+        json!({"type":"response.create","event_id":"first"}),
+    )
+    .await;
+    until(&mut client, "response.created").await;
+    send(
+        &mut client,
+        json!({"type":"response.create","event_id":"second"}),
+    )
+    .await;
+    let error = until(&mut client, "error").await;
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        error["error"]["code"],
+        "conversation_already_has_active_response"
+    );
+    assert_eq!(
+        error["error"]["message"],
+        "A response is already in progress"
+    );
+    assert_eq!(error["error"]["event_id"], "second");
+    // Still open: the client's own close ends it, with the open response's
+    // window retained and no other.
+    client.close(None).await.unwrap();
+    let row = g.finished().await;
+    assert_eq!(row["reservation"], "unknown");
+    let responses = g.responses(row["id"].as_str().unwrap()).await;
+    assert_eq!(responses.len(), 1);
+    assert_eq!(row["held"], responses[0]["window"]);
+}
+
 #[dbtest::test]
 async fn event_rate_and_message_size_caps_close_with_an_error(pool: PgPool) {
     let tight = RealtimeLimits {
