@@ -469,6 +469,32 @@ async fn concurrent_resolutions_of_one_response_settle_it_once(pool: PgPool) {
     assert_eq!(amounts(&f, id).await.2, Some(2 * RESPONSE));
 }
 
+#[dbtest::test]
+async fn a_settled_response_without_components_leaves_the_session_without_them(pool: PgPool) {
+    let f = fixture(pool).await;
+    let d = realtime_model(&f, true).await;
+    let id = unknown_session(&f, f.team, &d, 1).await;
+    // A settled response whose components were not recorded (the schema
+    // allows it): the session's components could not total its actual.
+    sqlx::query("INSERT INTO realtime_responses(execution_id,sequence,state,status,window_hold_microusd,actual_microusd,input_text_tokens,cached_text_tokens,input_audio_tokens,cached_audio_tokens,output_text_tokens,output_audio_tokens,completed_at) VALUES($1,3,'settled','completed',0,7,0,0,0,0,0,0,clock_timestamp())")
+        .bind(id)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        resolve_response(&f.store, f.team.workspace_id, id, 2, U, "invoice", f.owner).await,
+        Ok(Resolved::Session)
+    );
+    let session: (String, Option<i64>, Option<Value>) = sqlx::query_as(
+        "SELECT state,actual_microusd,cost_components FROM governance_reservations WHERE execution_id=$1",
+    )
+    .bind(id)
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(session, ("settled".into(), Some(2 * RESPONSE + 7), None));
+}
+
 /// A session whose process died (lease expiry), reserving as
 /// `RealtimeSession` does (the first request resizes admission's window):
 /// response 1 done with `first` (unknown without usage), response 2 open;

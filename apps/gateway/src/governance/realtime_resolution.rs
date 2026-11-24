@@ -273,7 +273,15 @@ async fn settle_session(
     q: &Request<'_>,
     t: &Totals,
 ) -> Result<(), InferenceError> {
-    let components = t.components.as_ref().filter(|_| t.settled > 0);
+    // The per-key sum totals the actual only when every settled response
+    // recorded its components (a settled row may have none); otherwise the
+    // session records its actual without them.
+    let complete: bool = sqlx::query_scalar("SELECT coalesce(bool_and(cost_components IS NOT NULL),false) FROM realtime_responses WHERE execution_id=$1 AND state='settled'")
+        .bind(q.execution)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(storage)?;
+    let components = t.components.as_ref().filter(|_| complete);
     let meters = MeterUsage {
         output_images: Some(0),
         input_characters: Some(0),
