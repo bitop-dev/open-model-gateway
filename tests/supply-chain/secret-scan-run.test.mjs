@@ -5,11 +5,11 @@
 // are made up at run time.
 import assert from "node:assert/strict";
 import { spawnSync } from "../process.mjs";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { bashPath, runBash } from "../bash-preflight.mjs";
-import { CONFIG_FILE, HOOK, RULES_IN_CANARY, ZEROS, commitAll, copy, fakes, gitEnv, git, makeRepo, pinOf, readCalls, scanStep } from "./secret-scan-lib.mjs";
+import { CONFIG_FILE, EXTRAS, HOOK, RULES_IN_CANARY, ZEROS, commitAll, copy, fakes, gitEnv, git, makeRepo, pinOf, readCalls, scanStep } from "./secret-scan-lib.mjs";
 import { root } from "./lib.mjs";
 
 bashPath();
@@ -34,7 +34,9 @@ const pushEnv = (repo, over = {}) => ({ EVENT_NAME: "push", BASE_SHA: "", HEAD_S
 // The range scan (git) and the tree scan (dir ".") are the calls on "."; the others are canaries.
 const rangeScan = calls => calls.filter(c => c.argv[0] === "git" && c.argv.at(-1) === ".");
 const treeScan = calls => calls.filter(c => c.argv[0] === "dir" && c.argv.at(-1) === ".");
-const canaryScans = calls => calls.filter(c => c.argv.at(-1) !== ".");
+const extrasScan = calls => calls.filter(c => c.argv[0] === "dir" && c.argv.at(-1).endsWith("/extras"));
+const canaryScans = calls => calls.filter(c => c.argv.at(-1) !== "." && !c.argv.at(-1).endsWith("/extras"));
+const BASE_CONFIG = /\/base-config\.toml$/;
 const logOpts = call => call.argv.find(a => a.startsWith("--log-opts="));
 
 // ---- ranges ----
@@ -66,12 +68,12 @@ test("an empty range scans no history, still scans the tree, and says so", () =>
   const r = runStep(repo, prEnv(repo, { BASE_SHA: repo.c3 }));
   assert.equal(r.status, 0, r.stderr);
   assert.equal(rangeScan(r.calls).length, 0);
-  assert.equal(treeScan(r.calls).length, 1);
+  assert.equal(treeScan(r.calls).length, 2, "the tree, with this checkout's config and the base's");
   assert.match(r.stdout, /holds no commits/);
 }));
 
 test("an unexpected event is refused", () => withRepo(repo => {
-  for (const event of ["workflow_dispatch", "schedule", ""]) {
+  for (const event of ["issue_comment", "pull_request_target", ""]) {
     const r = runStep(repo, prEnv(repo, { EVENT_NAME: event }));
     assert.equal(r.status, 1, event);
     assert.match(r.stderr, /unexpected event/);
@@ -104,6 +106,101 @@ test("a push with a bad after sha fails closed", () => withRepo(repo => {
   for (const [, bad] of BAD_SHAS) assert.notEqual(runStep(repo, pushEnv(repo, { AFTER_SHA: bad })).status, 0, bad);
 }));
 
+// ---- the base's config and the scheduled scan (#603) ----
+
+const configsOf = calls => [...new Set([...rangeScan(calls), ...extrasScan(calls), ...treeScan(calls)].map(c => (BASE_CONFIG.test(c.config) ? "base" : c.config)))];
+
+test("a pull request is also scanned with the base's own config, read from its git objects", () => withRepo(repo => {
+  // The head widens its config; the base's text is what the second pass reads.
+  writeFileSync(join(repo.dir, CONFIG_FILE), `${readFileSync(join(repo.dir, CONFIG_FILE), "utf8")}\n# widened\n`);
+  const head = commitAll(repo.dir, "widen");
+  const r = runStep(repo, prEnv(repo, { HEAD_SHA: head }));
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(configsOf(r.calls), [".gitleaks.toml", "base"]);
+  for (const scans of [rangeScan, extrasScan, treeScan]) assert.equal(scans(r.calls).length, 2);
+  const base = r.calls.find(c => BASE_CONFIG.test(c.config ?? ""));
+  assert.equal(base.config_text, git(repo.dir, "show", `${repo.c1}:${CONFIG_FILE}`) + "\n");
+  assert.doesNotMatch(base.config_text, /# widened/);
+  assert.match(r.stdout, new RegExp(`also scanning with the \\.gitleaks\\.toml of the base ${repo.c1}`));
+}));
+
+test("a push is also scanned with the config of the commit before it", () => withRepo(repo => {
+  const r = runStep(repo, pushEnv(repo, { BEFORE_SHA: repo.c2 }));
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(configsOf(r.calls), [".gitleaks.toml", "base"]);
+  assert.match(r.stdout, new RegExp(`of the base ${repo.c2}`));
+}));
+
+for (const [label, before] of [["a first push (all-zero before)", ZEROS], ["a forced push whose old tip is gone", "1234567890abcdef1234567890abcdef12345678"]]) {
+  test(`${label} has no base and says it scans with this checkout's config only`, () => withRepo(repo => {
+    const r = runStep(repo, pushEnv(repo, { BEFORE_SHA: before }));
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(configsOf(r.calls), [".gitleaks.toml"]);
+    assert.match(r.stdout, /no base commit/);
+  }));
+}
+
+test("a base without a .gitleaks.toml is scanned with this checkout's config and says so", () => withRepo(repo => {
+  git(repo.dir, "rm", "-q", CONFIG_FILE);
+  const base = commitAll(repo.dir, "no config");
+  writeFileSync(join(repo.dir, CONFIG_FILE), readFileSync(join(root, CONFIG_FILE), "utf8"));
+  const head = commitAll(repo.dir, "config again");
+  const r = runStep(repo, prEnv(repo, { BASE_SHA: base, HEAD_SHA: head }));
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(configsOf(r.calls), [".gitleaks.toml"]);
+  assert.match(r.stdout, new RegExp(`the base ${base} has no \\.gitleaks\\.toml`));
+}));
+
+for (const event of ["schedule", "workflow_dispatch"]) {
+  test(`a ${event} run scans the whole history of origin/main and every tag, with tag messages`, () => withRepo(repo => {
+    git(repo.dir, "update-ref", "refs/remotes/origin/main", repo.c3);
+    git(repo.dir, "tag", "-a", "v0", "-m", "release message", repo.c2);
+    const r = runStep(repo, { EVENT_NAME: event, BASE_SHA: "", HEAD_SHA: "", BEFORE_SHA: "", AFTER_SHA: repo.c3 }, { stub: { STUB_TREE: "1" } });
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(logOpts(rangeScan(r.calls)[0]), `--log-opts=-m --text ${repo.c3} --tags`);
+    assert.deepEqual(configsOf(r.calls), [".gitleaks.toml"]);
+    const extras = extrasScan(r.calls)[0].tree;
+    assert.match(extras["tags.txt"], /tag v0\nrelease message/);
+    for (const message of ["config", "one", "two"]) assert.match(extras["messages.txt"], new RegExp(`\\n${message}\\n`));
+    assert.match(r.stdout, /whole history of origin\/main and 1 tags/);
+  }));
+}
+
+test("a scheduled run without origin/main in the checkout fails before scanning", () => withRepo(repo => {
+  const r = runStep(repo, { EVENT_NAME: "schedule", BASE_SHA: "", HEAD_SHA: "", BEFORE_SHA: "", AFTER_SHA: repo.c3 });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /origin\/main is not in this checkout/);
+  assert.equal(rangeScan(r.calls).length + treeScan(r.calls).length, 0);
+}));
+
+test("the extras of a pull request hold the messages and paths of its commits only", () => withRepo(repo => {
+  const r = runStep(repo, prEnv(repo), { stub: { STUB_TREE: "1" } });
+  assert.equal(r.status, 0, r.stderr);
+  const extras = extrasScan(r.calls)[0].tree;
+  assert.match(extras["messages.txt"], /\none\n/);
+  assert.match(extras["messages.txt"], /\ntwo\n/);
+  assert.doesNotMatch(extras["messages.txt"], /\nconfig\n/);
+  assert.equal(extras["names.txt"], "a.txt\nb.txt\n");
+  assert.equal(extras["tags.txt"], undefined, "tag messages are the scheduled scan's");
+}));
+
+test("an extras canary that is not detected, or misses one source, fails the job before the real scans", () => withRepo(repo => {
+  for (const stub of [{ STUB_CANARY_EXTRAS: "miss" }, ...["messages.txt", "tags.txt", "names.txt", "utf16/", "archives/"].map(s => ({ STUB_EXTRAS_SKIP: s }))]) {
+    const r = runStep(repo, prEnv(repo), { stub });
+    assert.equal(r.status, 1, JSON.stringify(stub));
+    assert.match(r.stderr, /canary \(extras\)/);
+    assert.equal(rangeScan(r.calls).length, 0);
+  }
+}));
+
+test("a finding in the extras or under the base's config fails the job", () => withRepo(repo => {
+  for (const stub of [{ STUB_SCAN_EXTRAS: "find" }, { STUB_SCAN_BASE: "find" }]) {
+    const r = runStep(repo, prEnv(repo), { stub });
+    assert.notEqual(r.status, 0, JSON.stringify(stub));
+    assert.match(r.stdout, /finding rule=generic-api-key/);
+  }
+}));
+
 // ---- canaries ----
 
 test("a canary that is not detected fails the job, in dir mode and in git mode", () => withRepo(repo => {
@@ -134,14 +231,16 @@ const options = call => {
 test("the canaries use the same invocation form and options as the real scans", () => withRepo(repo => {
   const r = runStep(repo, prEnv(repo));
   const canaries = canaryScans(r.calls);
-  assert.deepEqual(canaries.map(c => c.argv[0]), ["dir", "git"]);
+  assert.deepEqual(canaries.map(c => c.argv[0]), ["dir", "git", "dir"]);
   assert.equal(logOpts(canaries[1]), "--log-opts=-m --text HEAD");
-  const expected = options(rangeScan(r.calls)[0]);
-  assert.equal(expected.filter(a => a === "--config").length, 1);
-  for (const call of [...canaries, ...rangeScan(r.calls), ...treeScan(r.calls)]) {
-    assert.deepEqual(options(call), expected);
-    assert.equal(call.config, ".gitleaks.toml");
+  assert.ok(canaries[2].argv.at(-1).endsWith("/extras-canary"));
+  const withoutConfig = call => options(call).filter((a, i, all) => a !== "--config" && all[i - 1] !== "--config");
+  const expected = withoutConfig(rangeScan(r.calls)[0]);
+  for (const call of [...canaries, ...rangeScan(r.calls), ...extrasScan(r.calls), ...treeScan(r.calls)]) {
+    assert.deepEqual(withoutConfig(call), expected);
+    assert.equal(options(call).filter(a => a === "--config").length, 1);
   }
+  for (const call of canaries) assert.equal(call.config, ".gitleaks.toml");
 }));
 
 test("the canary data is planted in a temporary directory and not left behind", () => withRepo(repo => {
@@ -157,7 +256,7 @@ test("the tree is scanned last, from the repository root", () => withRepo(repo =
   assert.equal(r.status, 0, r.stderr);
   const last = r.calls.at(-1);
   assert.deepEqual([last.argv[0], last.argv.at(-1), last.cwd.endsWith("/repo")], ["dir", ".", true]);
-  assert.equal(treeScan(r.calls).length, 1);
+  assert.equal(treeScan(r.calls).length, 2);
 }));
 
 test("a finding in the history scan or the tree scan fails the job", () => withRepo(repo => {
@@ -208,9 +307,20 @@ function behaviourViolations(script) {
     must("an empty head sha", prEnv(repo, { HEAD_SHA: "" }));
     must("an unknown base sha", prEnv(repo, { BASE_SHA: "1234567890abcdef1234567890abcdef12345678" }));
     must("a malformed before sha", pushEnv(repo, { BEFORE_SHA: "main" }));
-    must("an unexpected event", prEnv(repo, { EVENT_NAME: "schedule" }));
+    must("an unexpected event", prEnv(repo, { EVENT_NAME: "issue_comment" }));
+    must("an extras canary that is not detected", prEnv(repo), { STUB_CANARY_EXTRAS: "miss" });
+    for (const source of ["messages.txt", "tags.txt", "names.txt", "utf16/", "archives/"]) must(`an extras canary that misses ${source}`, prEnv(repo), { STUB_EXTRAS_SKIP: source });
+    must("a finding in the extras", prEnv(repo), { STUB_SCAN_EXTRAS: "find" });
+    must("a finding under the base's config only", prEnv(repo), { STUB_SCAN_BASE: "find" });
+    must("a finding under the base's config on a push", pushEnv(repo), { STUB_SCAN_BASE: "find" });
+    must("a scheduled scan without origin/main", { ...prEnv(repo), EVENT_NAME: "schedule" });
     const calls = readCalls(repo.log);
     if (!calls.some(c => c.argv[0] === "dir" && c.argv.at(-1) === ".")) out.push("the tree is never scanned");
+    // A head that widens its config (the stand-in then finds nothing under that config) must
+    // still fail under the base's config, which lacks the widening.
+    writeFileSync(join(repo.dir, CONFIG_FILE), `${readFileSync(join(repo.dir, CONFIG_FILE), "utf8")}\n# widened\n`);
+    const widened = commitAll(repo.dir, "widen");
+    must("a config widened by the change itself", prEnv(repo, { HEAD_SHA: widened }), { STUB_FIND_UNLESS: "# widened" });
     return out;
   });
 }
@@ -227,7 +337,14 @@ const BEHAVIOUR_MUTATIONS = [
   ["the range scan's status ignored", t => t.replace('[ "${status}" -eq 0 ] || exit "${status}"', "true")],
   ["the commit count check removed", t => t.replace(/grep -Eq '\[0-9\]\+ commits scanned'[^\n]*\n/, "")],
   ["sha validation made a no-op", t => t.replace('[[ "$1" =~ ^[0-9a-f]{40}$ ]] && git cat-file -e "$1^{commit}" 2>/dev/null', "true")],
-  ["the tree scan removed", t => t.replace(/\n\s*gitleaks dir "\$\{common\[@\]\}" \.\s*$/, "\n")],
+  ["the tree scan removed", t => t.replace(/\n\s*gitleaks dir "\$\{common\[@\]\}" --config "\$\{config\}" \.\n/, "\n")],
+  ["the base config never added", t => t.replace(/\n\s*configs\+=\("\$\{work\}\/base-config\.toml"\)/, "")],
+  ["the base config taken from the head", t => t.replace('git cat-file blob "${base}:.gitleaks.toml"', 'git cat-file blob "HEAD:.gitleaks.toml"')],
+  ["the push base not used", t => t.replace('range="${BEFORE_SHA}..${AFTER_SHA}"; base="${BEFORE_SHA}";', 'range="${BEFORE_SHA}..${AFTER_SHA}";')],
+  ["the extras scan removed", t => t.replace(/\n\s*gitleaks dir "\$\{common\[@\]\}" --config "\$\{config\}" "\$\{work\}\/extras"/, "")],
+  ["the extras canary's exit removed", t => t.replace(/(canary \(extras\): nothing was detected[^\n]*\n)\s*exit 1/, "$1").replace('grep -q "finding rule=aws-access-token file=${work}/extras-canary/${source}" <<<"${report}" ||', "true ||")],
+  ["the extras canary's source check removed", t => t.replace('grep -q "finding rule=aws-access-token file=${work}/extras-canary/${source}" <<<"${report}" ||', "true ||")],
+  ["the scheduled range check removed", t => t.replace("'refs/remotes/origin/main^{commit}'", "'HEAD^{commit}'")],
   ["the event check removed", t => t.replace(/\*\)\n\s*echo "unexpected event \$\{EVENT_NAME\}" >&2\n\s*exit 1/, "*)\n              range=HEAD")],
   ["the empty base accepted", t => t.replace('is_commit "${BASE_SHA}" ||', 'true ||')],
 ];
@@ -305,6 +422,87 @@ if (REAL) {
     const r = runStep(repo, prEnv(repo, { HEAD_SHA: head, AFTER_SHA: head }));
     failsWith(r, "omg-gateway-key");
     assert.match(r.stdout, /file=nul\.cfg/);
+    noLeak(r, key);
+  }));
+
+  // An allowlist entry for `value` in `file`, as the config requires them (#596).
+  const allowEntry = (file, value) => `
+[[allowlists]]
+description = "Fixture in ${file} for a secret-scan test."
+condition = "AND"
+targetRules = ["aws-access-token"]
+paths = ['''^${file.replace(".", "\\.")}$''']
+regexes = ['''^${value}$''']
+`;
+  const appendConfig = (repo, text) => writeFileSync(join(repo.dir, CONFIG_FILE), readFileSync(join(repo.dir, CONFIG_FILE), "utf8") + text);
+
+  test("real: a change that excuses its own new secret in .gitleaks.toml fails under the base's config (#603)", real(repo => {
+    const key = fakes.aws();
+    writeFileSync(join(repo.dir, "planted.txt"), `aws = ${key}\n`);
+    appendConfig(repo, allowEntry("planted.txt", key));
+    const head = commitAll(repo.dir, "widen and plant");
+    // Under its own config the change passes: the entry is valid and excuses the key.
+    const own = spawnSync(REAL, ["git", "--config", CONFIG_FILE, "--no-banner", "--log-level", "warn", `--log-opts=-m --text ${repo.c3}..${head}`, "."], { cwd: repo.dir, encoding: "utf8" });
+    assert.equal(own.status, 0, own.stdout + own.stderr);
+    const r = runStep(repo, prEnv(repo, { HEAD_SHA: head, AFTER_SHA: head }));
+    failsWith(r, "aws-access-token");
+    assert.match(r.stdout, /also scanning with the \.gitleaks\.toml of the base/);
+    noLeak(r, key);
+  }));
+
+  test("real: an allowlist entry that lands before its fixture passes both configs (#603)", real(repo => {
+    const key = fakes.aws();
+    appendConfig(repo, allowEntry("fixture.txt", key));
+    const entry = commitAll(repo.dir, "allowlist entry first");
+    writeFileSync(join(repo.dir, "fixture.txt"), `aws = ${key}\n`);
+    const head = commitAll(repo.dir, "then the fixture");
+    const r = runStep(repo, prEnv(repo, { BASE_SHA: entry, HEAD_SHA: head, AFTER_SHA: head }));
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+  }));
+
+  // Builds archive and UTF-16 fixtures with Python's standard library.
+  const pyWrite = (dir, program, ...args) => {
+    const r = spawnSync("python3", ["-I", "-c", program, dir, ...args], { encoding: "utf8" });
+    assert.equal(r.status, 0, r.stderr);
+  };
+  const ARCHIVES = `
+import io, sys, tarfile, zipfile
+dir, line = sys.argv[1], sys.argv[2].encode()
+def tar(name, members, mode):
+    with tarfile.open(f"{dir}/{name}", mode) as t:
+        for member, data in members:
+            info = tarfile.TarInfo(member); info.size = len(data); t.addfile(info, io.BytesIO(data))
+tar("bundle.tgz", [("creds.txt", line)], "w:gz")
+inner = io.BytesIO()
+with zipfile.ZipFile(inner, "w", zipfile.ZIP_DEFLATED) as z: z.writestr("deep.txt", line)
+tar("nested.tar.gz", [("n/inner.zip", inner.getvalue())], "w:gz")
+`;
+
+  for (const [label, plant] of [
+    ["a commit message", (repo, key) => { writeFileSync(join(repo.dir, "x.txt"), "x\n"); git(repo.dir, "add", "-A"); git(repo.dir, "commit", "-q", "-m", `rotate aws = ${key}`); }],
+    ["a file name", (repo, key) => { writeFileSync(join(repo.dir, `${key}.txt`), "x\n"); commitAll(repo.dir, "name"); }],
+    ["a UTF-16 file", (repo, key) => { writeFileSync(join(repo.dir, "wide.txt"), Buffer.from(`aws = ${key}\n`, "utf16le")); commitAll(repo.dir, "wide"); }],
+    ["a .tgz archive", (repo, key) => { pyWrite(repo.dir, ARCHIVES, `aws = ${key}\n`); git(repo.dir, "rm", "-q", "--cached", "--ignore-unmatch", "nested.tar.gz"); rmSync(join(repo.dir, "nested.tar.gz")); commitAll(repo.dir, "tgz"); }],
+    ["a zip inside a .tar.gz", (repo, key) => { pyWrite(repo.dir, ARCHIVES, `aws = ${key}\n`); rmSync(join(repo.dir, "bundle.tgz")); commitAll(repo.dir, "nested"); }],
+  ]) {
+    test(`real: a secret only in ${label} is found, also after it is removed (#603)`, real(repo => {
+      const key = fakes.aws();
+      plant(repo, key);
+      for (const file of git(repo.dir, "ls-files").split("\n").filter(f => !["a.txt", "b.txt", CONFIG_FILE, EXTRAS].includes(f))) git(repo.dir, "rm", "-q", "--", file);
+      const head = git(repo.dir, "status", "--porcelain") ? commitAll(repo.dir, "remove") : git(repo.dir, "rev-parse", "HEAD");
+      const r = runStep(repo, prEnv(repo, { HEAD_SHA: head, AFTER_SHA: head }));
+      failsWith(r, "aws-access-token");
+      noLeak(r, key);
+    }));
+  }
+
+  test("real: a secret in a tag message is found by the scheduled scan (#603)", real(repo => {
+    const key = fakes.aws();
+    git(repo.dir, "update-ref", "refs/remotes/origin/main", repo.c3);
+    git(repo.dir, "tag", "-a", "v0", "-m", `release with aws = ${key}`, repo.c2);
+    const r = runStep(repo, { EVENT_NAME: "schedule", BASE_SHA: "", HEAD_SHA: "", BEFORE_SHA: "", AFTER_SHA: repo.c3 });
+    failsWith(r, "aws-access-token");
+    assert.match(r.stdout, /file=[^ ]*\/extras\/tags\.txt/);
     noLeak(r, key);
   }));
 
