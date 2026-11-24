@@ -1,10 +1,10 @@
 //! #804: a Platform Admin resolves the unknown responses of a finished
-//! realtime session from evidence (`realtime::resolve_response`), on a
+//! realtime session from evidence (`realtime_resolution::resolve_response`), on a
 //! disposable database. The refusals mirror request resolution
 //! (`resolve_usage`): never zero without proof, never a second settlement,
 //! no lowering of recorded usage, nothing while the session is open, live
 //! Platform Admin authority, personal workspaces only for their owner.
-use super::realtime::{Resolved, resolve_response};
+use super::realtime_resolution::{Resolved, resolve_response};
 use super::tests::db::{Fixture, amounts, fixture};
 use super::*;
 use crate::inference::{
@@ -489,9 +489,16 @@ async fn expired_session(
     realtime::open_response(&f.store, id, 1, FULL)
         .await
         .unwrap();
-    realtime::settle_response(&f.store, id, 1, Some(ResponseStatus::Completed), first, FULL)
-        .await
-        .unwrap();
+    realtime::settle_response(
+        &f.store,
+        id,
+        1,
+        Some(ResponseStatus::Completed),
+        first,
+        FULL,
+    )
+    .await
+    .unwrap();
     realtime::reserve_window(&f.store, &principal, id, "company/smart", FULL, None)
         .await
         .unwrap();
@@ -509,7 +516,7 @@ async fn expired_session(
         .await
         .unwrap();
     assert_eq!(reconcile_expired(&f.store, 10).await.unwrap(), 1);
-    assert_eq!(response(&f, id, 2).await.0, "unknown");
+    assert_eq!(response(f, id, 2).await.0, "unknown");
     id
 }
 
@@ -520,7 +527,16 @@ async fn a_lease_expired_session_settles_once_its_rows_explain_its_hold(pool: Pg
     let id = expired_session(&f, f.team, &d, Some(U), false).await;
     assert_eq!(amounts(&f, id).await.1, Some(RESPONSE + WINDOW));
     assert_eq!(
-        resolve_response(&f.store, f.team.workspace_id, id, 2, U, "invoice:2", f.owner).await,
+        resolve_response(
+            &f.store,
+            f.team.workspace_id,
+            id,
+            2,
+            U,
+            "invoice:2",
+            f.owner
+        )
+        .await,
         Ok(Resolved::Session)
     );
     assert_eq!(amounts(&f, id).await.2, Some(2 * RESPONSE));

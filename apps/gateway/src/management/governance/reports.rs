@@ -762,7 +762,7 @@ pub(super) async fn reconcile_realtime_response(
         output_text_tokens: count(&p.output_text_tokens)?,
         output_audio_tokens: count(&p.output_audio_tokens)?,
     };
-    crate::governance::realtime::resolve_response(
+    crate::governance::realtime_resolution::resolve_response(
         &s,
         ws,
         execution,

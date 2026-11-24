@@ -193,7 +193,6 @@ pub async fn resolve_usage(
         resolve_usage_once(store, workspace, execution, usage, evidence, actor).await
     )
 }
-#[cfg_attr(not(test), expect(clippy::too_many_lines, reason = "#499"))]
 async fn resolve_usage_once(
     store: &Store,
     workspace: Uuid,

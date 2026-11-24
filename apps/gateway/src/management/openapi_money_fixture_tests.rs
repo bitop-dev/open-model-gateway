@@ -1527,11 +1527,13 @@ async fn slice4_money_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
     let realtime = seed_realtime(&pool, f.team, id(&team_key), deployment).await;
     observe(&mut seen,&client,&base,&admin,"POST",&format!("{wsbase}/costs/{realtime}/realtime-responses/1/reconcile"),Some(json!({"input_text_tokens":"3","cached_text_tokens":"1","input_audio_tokens":"0","cached_audio_tokens":"0","output_text_tokens":"2","output_audio_tokens":"0","evidence":"contract:receipt"}))).await;
     assert_eq!(
-        sqlx::query_scalar::<_, String>("SELECT state FROM governance_reservations WHERE execution_id=$1")
-            .bind(realtime)
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM governance_reservations WHERE execution_id=$1"
+        )
+        .bind(realtime)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
         "settled",
         "the contract fixture resolved the session's last unknown response"
     );

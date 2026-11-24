@@ -175,8 +175,8 @@ const ROW_LOCKS: &[(&str, &str)] = &[
     ),
     // #804: after the session's reservation row (canonical order).
     (
-        "governance::realtime::resolve_response_once",
-        "SELECT state,input_text_tokens,cached_text_tokens,input_audio_tokens,cached_audio_tokens,output_text_tokens,output_audio_tokens,evidence FROM realtime_responses WHERE execution_id=$1 AND sequence=$2 FOR UPDATE",
+        "governance::realtime_resolution::load_response",
+        "SELECT state,input_text_tokens,cached_text_tokens,input_audio_tokens,cached_audio_tokens,output_text_tokens,output_audio_tokens,evidence,floor_microusd FROM realtime_responses WHERE execution_id=$1 AND sequence=$2 FOR UPDATE",
     ),
     (
         "governance::reconcile::reconcile_batch",
