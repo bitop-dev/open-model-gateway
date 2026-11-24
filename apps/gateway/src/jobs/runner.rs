@@ -769,7 +769,7 @@ async fn assemble_results(
 }
 
 /// Delete result files nothing references.
-async fn remove_files(
+pub(super) async fn remove_files(
     files: &crate::filestore::FileStorage,
     job: &JobRow,
     created: [Option<Uuid>; 2],

@@ -128,7 +128,7 @@ class Selection(unittest.TestCase):
         import io
         for path, expected in (("docs/openapi/management/operations.json", 3),
                                ("apps/gateway/build.rs", len(TESTS) - 2)):
-            fast.changed_files = lambda base, path=path: [path]
+            fast.changed_files = lambda base, path=path: ([path], [])
             fast.list_tests = lambda jobs: TESTS
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
@@ -138,7 +138,7 @@ class Selection(unittest.TestCase):
     def test_a_run_that_covers_nothing_does_not_say_passed(self):
         import contextlib
         import io
-        fast.changed_files = lambda base: ["apps/gateway/tests/common/mod.rs"]
+        fast.changed_files = lambda base: (["apps/gateway/tests/common/mod.rs"], [])
         fast.list_tests = lambda jobs: TESTS
         fast.run = lambda command: 0
         out = io.StringIO()
@@ -146,6 +146,15 @@ class Selection(unittest.TestCase):
             self.assertEqual(fast.main([]), 0)
         self.assertIn("no test for this change", out.getvalue())
         self.assertNotIn("passed", out.getvalue())
+
+    def test_untracked_files_are_counted_apart_and_located(self):
+        changed = [SRC + "auth.rs"] + [f".scratch/out/{n}.txt" for n in range(40)] + ["notes.md"]
+        untracked = changed[1:]
+        lines = fast.describe_changes(changed, untracked, "origin/main")
+        self.assertEqual(lines[0], "1 changed files against origin/main, 41 untracked")
+        self.assertEqual(lines[1:], ["  untracked: 40 under .scratch/", "  untracked: 1 under notes.md"])
+        self.assertEqual(fast.describe_changes([SRC + "auth.rs"], [], "origin/main"),
+                         ["1 changed files against origin/main"])
 
 
 if __name__ == "__main__":
