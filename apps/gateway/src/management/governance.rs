@@ -21,6 +21,7 @@ pub(crate) use prices::batch_meters_refused;
 #[cfg(all(test, feature = "integration-tests"))]
 mod holds_tests;
 pub(super) mod prices;
+mod realtime_resolution;
 pub(crate) mod reports;
 pub(crate) mod suggestion;
 #[cfg(test)]
@@ -55,11 +56,11 @@ pub(super) fn routes() -> Router<Store> {
         )
         .route(
             "/api/v1/workspaces/{ws}/costs/{execution}/realtime-responses/{sequence}/reconcile",
-            post(reports::reconcile_realtime_response),
+            post(realtime_resolution::reconcile_realtime_response),
         )
         .route(
             "/api/v1/workspaces/{ws}/costs/{execution}/realtime-session/reconcile",
-            post(reports::reconcile_realtime_session),
+            post(realtime_resolution::reconcile_realtime_session),
         )
 }
 pub(super) fn platform_routes() -> Router<Store> {

@@ -713,14 +713,14 @@ async fn every_json_management_write_rejects_unknown_fields_after_valid_control(
         json!({"input_tokens":"1","output_tokens":"1","billing_usage":null,"evidence":"configuration control"})
     );
     case!(
-        "governance::reports::reconcile_realtime_response",
+        "governance::realtime_resolution::reconcile_realtime_response",
         "POST",
         format!("{workspace}/costs/{realtime}/realtime-responses/1/reconcile"),
         &f.admin,
         json!({"input_text_tokens":"1","cached_text_tokens":"0","input_audio_tokens":"0","cached_audio_tokens":"0","output_text_tokens":"1","output_audio_tokens":"0","evidence":"configuration control"})
     );
     case!(
-        "governance::reports::reconcile_realtime_session",
+        "governance::realtime_resolution::reconcile_realtime_session",
         "POST",
         format!("{workspace}/costs/{idle}/realtime-session/reconcile"),
         &f.admin,
