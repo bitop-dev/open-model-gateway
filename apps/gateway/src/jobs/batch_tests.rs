@@ -3441,6 +3441,7 @@ mod fence;
 mod http_support;
 mod poller;
 mod poller_concurrency;
+mod poller_http;
 
 /// Streaming classification must not change the non-stream classes that drive
 /// explicit line retries: OpenAI invalid output is not retryable; OpenRouter's
