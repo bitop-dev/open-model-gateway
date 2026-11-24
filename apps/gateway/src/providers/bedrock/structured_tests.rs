@@ -111,14 +111,14 @@ async fn requests_without_structured_controls_send_no_output_config() {
     }
 }
 
-fn reasoning_complete() -> Value {
+pub(super) fn reasoning_complete() -> Value {
     json!({"output":{"message":{"role":"assistant","content":[
         {"reasoningContent":{"reasoningText":{"text":"think first","signature":"opaque-signature"}}},
         {"reasoningContent":{"redactedContent":"b3BhcXVl"}},
         {"text":"Hello"},
     ]}},"stopReason":"end_turn","usage":{"inputTokens":3,"outputTokens":5,"totalTokens":8},"metrics":{"latencyMs":2}})
 }
-fn reasoning_events() -> Vec<(&'static str, Value)> {
+pub(super) fn reasoning_events() -> Vec<(&'static str, Value)> {
     vec![
         ("messageStart", json!({"role":"assistant"})),
         (
@@ -287,6 +287,172 @@ fn reasoning_and_text_never_share_a_stream_block() {
                 "think".into(),
             )),
         )),
+        Err(InferenceError::InvalidUpstream)
+    ));
+}
+
+/// The Converse schema string counts toward the request-size bound, as tool
+/// schemas do: content plus schema at the bound is accepted, one byte more
+/// is refused before any credential or network work.
+#[test]
+fn the_output_schema_counts_toward_the_request_size_bound() {
+    let base = messages(json!({}));
+    let content = base
+        .messages
+        .iter()
+        .map(|m| m.content.as_ref().map_or(0, String::len))
+        .sum::<usize>();
+    let schema_of = |len: usize| {
+        let empty = serde_json::to_string(&json!({"type":"object","description":""}))
+            .unwrap()
+            .len();
+        json!({"type":"object","description":"x".repeat(len - empty)})
+    };
+    for (len, accepted) in [
+        (OUTPUT_LIMIT - content, true),
+        (OUTPUT_LIMIT - content + 1, false),
+    ] {
+        let mut request = base.clone();
+        let schema = schema_of(len);
+        assert_eq!(serde_json::to_string(&schema).unwrap().len(), len);
+        request.messages_options.as_mut().unwrap().output_config =
+            Some(json!({"format":{"type":"json_schema","schema":schema}}));
+        let result = encode(&request);
+        assert_eq!(result.is_ok(), accepted, "{len}");
+        if !accepted {
+            assert!(matches!(result, Err(InferenceError::InvalidRequest)));
+        }
+    }
+}
+
+fn started(state: &mut stream::State) {
+    state
+        .push(aws::ConverseStreamOutput::MessageStart(
+            aws::MessageStartEvent::builder()
+                .role(aws::ConversationRole::Assistant)
+                .build()
+                .unwrap(),
+        ))
+        .unwrap();
+}
+fn reasoning_delta(
+    index: i32,
+    delta: aws::ReasoningContentBlockDelta,
+) -> aws::ConverseStreamOutput {
+    aws::ConverseStreamOutput::ContentBlockDelta(
+        aws::ContentBlockDeltaEvent::builder()
+            .content_block_index(index)
+            .delta(aws::ContentBlockDelta::ReasoningContent(delta))
+            .build()
+            .unwrap(),
+    )
+}
+
+/// Reasoning text, signatures and redacted content are never all returned,
+/// but every byte of them counts toward the reply's output bound.
+#[test]
+fn streamed_reasoning_text_signature_and_redacted_content_are_bounded() {
+    use aws::ReasoningContentBlockDelta as D;
+    let pieces: [fn(usize) -> D; 3] = [
+        |n| D::Text("x".repeat(n)),
+        |n| D::Signature("x".repeat(n)),
+        |n| D::RedactedContent(aws_smithy_types::Blob::new(vec![0; n])),
+    ];
+    for (i, piece) in pieces.into_iter().enumerate() {
+        for messages in [false, true] {
+            let mut state = stream::State::for_test_with_limit(messages, 8);
+            started(&mut state);
+            assert!(state.push(reasoning_delta(0, piece(8))).is_ok(), "{i}");
+            assert!(
+                matches!(
+                    state.push(reasoning_delta(0, piece(1))),
+                    Err(InferenceError::InvalidUpstream)
+                ),
+                "{i} messages={messages}"
+            );
+        }
+    }
+}
+
+#[test]
+fn complete_reasoning_signature_and_redacted_content_are_bounded() {
+    let reply = |block: aws::ReasoningContentBlock| {
+        aws_sdk_bedrockruntime::operation::converse::ConverseOutput::builder()
+            .output(aws::ConverseOutput::Message(
+                aws::Message::builder()
+                    .role(aws::ConversationRole::Assistant)
+                    .content(aws::ContentBlock::ReasoningContent(block))
+                    .build()
+                    .unwrap(),
+            ))
+            .stop_reason(aws::StopReason::EndTurn)
+            .build()
+            .unwrap()
+    };
+    let signed = |n: usize| {
+        aws::ReasoningContentBlock::ReasoningText(
+            aws::ReasoningTextBlock::builder()
+                .text("")
+                .signature("x".repeat(n))
+                .build()
+                .unwrap(),
+        )
+    };
+    let redacted = |n: usize| {
+        aws::ReasoningContentBlock::RedactedContent(aws_smithy_types::Blob::new(vec![0; n]))
+    };
+    for messages in [false, true] {
+        assert!(decode_complete_limit(reply(signed(8)), 8, messages).is_ok());
+        assert!(decode_complete_limit(reply(redacted(8)), 8, messages).is_ok());
+        assert!(matches!(
+            decode_complete_limit(reply(signed(9)), 8, messages),
+            Err(InferenceError::InvalidUpstream)
+        ));
+        assert!(matches!(
+            decode_complete_limit(reply(redacted(9)), 8, messages),
+            Err(InferenceError::InvalidUpstream)
+        ));
+    }
+}
+
+/// Reasoning belongs to its own block: never on a tool-use block, and
+/// nothing may follow `messageStop`.
+#[test]
+fn reasoning_on_a_tool_block_or_after_the_stop_is_refused() {
+    let text = || aws::ReasoningContentBlockDelta::Text("think".into());
+    let mut state = stream::State::for_test(true);
+    started(&mut state);
+    state
+        .push(aws::ConverseStreamOutput::ContentBlockStart(
+            aws::ContentBlockStartEvent::builder()
+                .content_block_index(0)
+                .start(aws::ContentBlockStart::ToolUse(
+                    aws::ToolUseBlockStart::builder()
+                        .tool_use_id("call_1")
+                        .name("weather")
+                        .build()
+                        .unwrap(),
+                ))
+                .build()
+                .unwrap(),
+        ))
+        .unwrap();
+    assert!(matches!(
+        state.push(reasoning_delta(0, text())),
+        Err(InferenceError::InvalidUpstream)
+    ));
+    let mut state = stream::State::for_test(true);
+    started(&mut state);
+    state
+        .push(aws::ConverseStreamOutput::MessageStop(
+            aws::MessageStopEvent::builder()
+                .stop_reason(aws::StopReason::EndTurn)
+                .build()
+                .unwrap(),
+        ))
+        .unwrap();
+    assert!(matches!(
+        state.push(reasoning_delta(0, text())),
         Err(InferenceError::InvalidUpstream)
     ));
 }

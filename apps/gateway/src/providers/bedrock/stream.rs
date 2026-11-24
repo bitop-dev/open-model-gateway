@@ -34,6 +34,14 @@ impl State {
             ..Self::default()
         }
     }
+    #[cfg(test)]
+    pub(super) fn for_test_with_limit(messages: bool, limit: usize) -> Self {
+        Self {
+            messages,
+            limit: Some(limit),
+            ..Self::default()
+        }
+    }
     pub(super) fn push(&mut self, event: aws::ConverseStreamOutput) -> Result<Vec<ChatEvent>> {
         use aws::ConverseStreamOutput as E;
         let mut result = Vec::new();

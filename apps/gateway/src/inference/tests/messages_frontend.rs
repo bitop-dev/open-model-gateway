@@ -702,3 +702,28 @@ async fn unrequested_streamed_reasoning_never_reaches_the_messages_client() {
         assert_eq!(text.contains("\"thinking\""), shown, "{thinking:?}: {text}");
     }
 }
+
+/// The deprecated top-level `output_format` (Anthropic's beta-only spelling
+/// of `output_config.format`) is not in the grammar: 400 naming it, before
+/// admission or any upstream call.
+#[tokio::test]
+async fn deprecated_output_format_is_refused_naming_the_field() {
+    let captures = Captures::default();
+    let mock = upstream(200, json!({}), captures.clone()).await;
+    let (app, repository) = frontend(mock.url.clone());
+    let response = app
+        .oneshot(wire(json!({"model":"m","max_tokens":32,
+            "output_format":{"type":"json_schema","schema":{"type":"object"}},
+            "messages":[{"role":"user","content":"hi"}]})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(response.into_body(), 2048)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["error"]["type"], "invalid_request_error");
+    assert_eq!(value["error"]["message"], "Unknown field: output_format");
+    assert_eq!(repository.starts.load(Ordering::SeqCst), 0);
+    assert!(captures.lock().unwrap().is_empty());
+}

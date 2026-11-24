@@ -257,6 +257,7 @@ fn encode(request: &ChatRequest) -> Result<Input> {
     let (names, tools) = tool_specs(request, &mut size)?;
     let choice = tool_choice(request, &names, tools.is_empty())?;
     let tools = tool_config(tools, choice)?;
+    let output = output_config(request, &mut size)?;
     let mut turns = Turns {
         messages: Vec::new(),
         system: Vec::new(),
@@ -268,7 +269,7 @@ fn encode(request: &ChatRequest) -> Result<Input> {
         turns.push(message)?;
     }
     let mut input = turns.finish(request, tools)?;
-    input.output = output_config(request)?;
+    input.output = output;
     Ok(input)
 }
 
@@ -278,7 +279,9 @@ fn encode(request: &ChatRequest) -> Result<Input> {
 /// constrain its output is Bedrock's decision: an unsupported model fails with
 /// a validation error. Effort and task budgets are not mapped here (see
 /// `providers::messages::validate`), so nothing else is sent.
-fn output_config(request: &ChatRequest) -> Result<Option<aws::OutputConfig>> {
+/// The schema string counts toward the request-size bound in `size`, as tool
+/// schemas do (`tool_specs`).
+fn output_config(request: &ChatRequest, size: &mut usize) -> Result<Option<aws::OutputConfig>> {
     let Some(format) = request
         .messages_options
         .as_ref()
@@ -293,6 +296,10 @@ fn output_config(request: &ChatRequest) -> Result<Option<aws::OutputConfig>> {
         return Err(refuse());
     }
     let schema = serde_json::to_string(&format["schema"]).map_err(|_| refuse())?;
+    *size = size.saturating_add(schema.len());
+    if *size > OUTPUT_LIMIT {
+        return Err(invalid());
+    }
     let definition = aws::JsonSchemaDefinition::builder()
         .schema(schema)
         .build()
