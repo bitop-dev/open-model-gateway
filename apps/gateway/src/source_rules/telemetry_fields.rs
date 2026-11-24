@@ -2,7 +2,7 @@
 //! Keep literals intact: spaces inside a fixed label are part of its value.
 use std::collections::BTreeSet;
 
-use proc_macro2::{Delimiter, TokenStream, TokenTree};
+use proc_macro2::{Delimiter, Group, TokenStream, TokenTree};
 use quote::ToTokens;
 use syn::visit::{self, Visit};
 
@@ -21,12 +21,79 @@ struct Finder<'a> {
 
 // One physical line per entry, including when a literal spans source lines.
 fn token_text(value: &impl ToTokens) -> String {
-    value
-        .to_token_stream()
+    without_list_commas(value.to_token_stream())
         .to_string()
         .replace('\\', "\\\\")
         .replace('\n', "\\n")
         .replace('\r', "\\r")
+}
+
+/// Keywords after which a parenthesised group is a value or a type, not a
+/// list: `return (a,)` is a tuple, `return (a)` is not.
+const KEYWORDS: &[&str] = &[
+    "as", "async", "await", "box", "break", "const", "continue", "crate", "dyn", "else", "enum",
+    "extern", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+    "ref", "return", "self", "static", "struct", "super", "trait", "try", "type", "unsafe", "use",
+    "where", "while", "yield",
+];
+
+/// rustfmt adds or drops the trailing comma of a list when it reflows it,
+/// which changes no meaning in a bracket or brace group, nor in the argument
+/// list of a call or tuple struct (a parenthesised group after a name that is
+/// not a keyword): there an entry ignores it. It is kept everywhere else,
+/// where it can change meaning: a parenthesised one-element tuple (`(a,)` is
+/// not `(a)`) and anything inside a macro invocation (a macro may match it).
+fn without_list_commas(stream: TokenStream) -> TokenStream {
+    let tokens: Vec<TokenTree> = stream.into_iter().collect();
+    let mut out = Vec::with_capacity(tokens.len());
+    for (at, token) in tokens.iter().enumerate() {
+        let TokenTree::Group(group) = token else {
+            out.push(token.clone());
+            continue;
+        };
+        let before = &tokens[..at];
+        if matches!(before, [.., TokenTree::Punct(bang)] if bang.as_char() == '!') {
+            out.push(token.clone());
+            continue;
+        }
+        let list = match group.delimiter() {
+            Delimiter::Bracket | Delimiter::Brace => true,
+            Delimiter::Parenthesis => matches!(
+                before,
+                [.., TokenTree::Ident(name)] if !KEYWORDS.contains(&name.to_string().as_str())
+            ),
+            Delimiter::None => false,
+        };
+        let mut inner: Vec<TokenTree> = without_list_commas(group.stream()).into_iter().collect();
+        if list && matches!(inner.last(), Some(TokenTree::Punct(comma)) if comma.as_char() == ',') {
+            inner.pop();
+        }
+        let mut rebuilt = Group::new(group.delimiter(), inner.into_iter().collect());
+        rebuilt.set_span(group.span());
+        out.push(TokenTree::Group(rebuilt));
+    }
+    out.into_iter().collect()
+}
+
+/// Calls that give a registry constant labels or register a collector that
+/// encodes its own (prometheus-client `Registry`).
+const CONSTANT_LABELS: &[&str] = &[
+    "with_labels",
+    "with_prefix_and_labels",
+    "sub_registry_with_label",
+    "sub_registry_with_labels",
+    "register_collector",
+];
+
+/// A path naming a method of `Metrics` (`Metrics::observe_cache`).
+fn metrics_method_path(path: &syn::Path) -> bool {
+    let segments: Vec<_> = path.segments.iter().collect();
+    matches!(segments.as_slice(), [.., ty, method]
+        if ty.ident == "Metrics" && metric_methods().contains(&method.ident.to_string()))
+}
+
+fn is_self(expr: &syn::Expr) -> bool {
+    matches!(expr, syn::Expr::Path(p) if p.path.is_ident("self"))
 }
 
 fn identifiers(tokens: &impl ToTokens) -> BTreeSet<String> {
@@ -59,6 +126,16 @@ impl Finder<'_> {
         self.path == "metrics.rs"
             || self.path.starts_with("metrics/")
             || (self.path == "http.rs" && self.scope.path() == "request_context")
+    }
+
+    /// A call of a `Metrics` method on a receiver other than the `METRICS`
+    /// path: an alias, a `&Metrics` binding, a field or a sink. `self` is
+    /// `Metrics` only inside its own `impl`; a call without arguments carries
+    /// no label value.
+    fn metric_receiver(&self, receiver_is_self: bool, method: &str, has_args: bool) -> bool {
+        has_args
+            && metric_methods().contains(method)
+            && (!receiver_is_self || self.scope.path().starts_with("impl Metrics::"))
     }
 
     fn read_sources(&mut self, visit: impl FnOnce(&mut Self)) -> Reads {
@@ -127,9 +204,15 @@ impl Finder<'_> {
                 TokenTree::Group(args),
                 ..,
             ] = &tokens[at..]
-                && (receiver == "METRICS" || method == "phase")
                 && dot.as_char() == '.'
                 && args.delimiter() == Delimiter::Parenthesis
+                && (receiver == "METRICS"
+                    || method == "phase"
+                    || self.metric_receiver(
+                        receiver == "self",
+                        &method.to_string(),
+                        !args.stream().is_empty(),
+                    ))
             {
                 self.record(
                     if method == "phase" {
@@ -140,15 +223,44 @@ impl Finder<'_> {
                     &tokens[at..at + 4].iter().cloned().collect::<TokenStream>(),
                 );
             }
+            if let [
+                TokenTree::Ident(ty),
+                TokenTree::Punct(a),
+                TokenTree::Punct(b),
+                TokenTree::Ident(method),
+                TokenTree::Group(args),
+                ..,
+            ] = &tokens[at..]
+                && ty == "Metrics"
+                && a.as_char() == ':'
+                && b.as_char() == ':'
+                && args.delimiter() == Delimiter::Parenthesis
+                && metric_methods().contains(&method.to_string())
+            {
+                self.record(
+                    "macro metrics call",
+                    &tokens[at..at + 5].iter().cloned().collect::<TokenStream>(),
+                );
+            }
         }
     }
 
     fn label_use(&mut self, kind: &str, call: &syn::ExprMethodCall) {
-        self.record(kind, call);
-        let entry = self.entries.len() - 1;
         self.visit_expr(&call.receiver);
+        self.label_args(kind, call, &call.args);
+    }
+
+    /// Record `node` with the visible sources of the bindings `args` read.
+    fn label_args<'a>(
+        &mut self,
+        kind: &str,
+        node: &impl ToTokens,
+        args: impl IntoIterator<Item = &'a syn::Expr>,
+    ) {
+        self.record(kind, node);
+        let entry = self.entries.len() - 1;
         let reads = self.read_sources(|this| {
-            for arg in &call.args {
+            for arg in args {
                 this.visit_expr(arg);
             }
         });
@@ -162,6 +274,11 @@ impl<'ast> Visit<'ast> for Finder<'_> {
     track_scope!();
 
     fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+        // A call's own path is handled in `visit_expr_call`; here it is a
+        // method passed as a value.
+        if metrics_method_path(&path.path) {
+            self.record("metrics method", path);
+        }
         if !self.reads.is_empty()
             && let Some(name) = path.path.get_ident()
             && let Some(source) = self.visible(&name.to_string())
@@ -262,6 +379,16 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                 return;
             }
             self.record("metrics call", call);
+        } else if self.metric_receiver(
+            is_self(&call.receiver),
+            &call.method.to_string(),
+            !call.args.is_empty(),
+        ) {
+            self.record("metrics call", call);
+        } else if CONSTANT_LABELS.contains(&call.method.to_string().as_str()) {
+            self.record("registry labels", call);
+        } else if call.method == "attribute" && identifiers(&call.args).contains("Attribute") {
+            self.record("span attribute", call);
         }
         visit::visit_expr_method_call(self, call);
     }
@@ -280,6 +407,27 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             }
             if self.path == "metrics/registry.rs" && name.ident == "series" {
                 self.record("precreated labels", call);
+            }
+            // Call forms: `Family::get_or_create(&family, labels)` and
+            // `Metrics::observe_cache(&METRICS, ..)`.
+            if name.ident == "get_or_create" || name.ident == "get_or_create_owned" {
+                self.label_args("family", call, &call.args);
+                return;
+            }
+            if metrics_method_path(&p.path) {
+                self.record("metrics call", call);
+                for arg in &call.args {
+                    self.visit_expr(arg);
+                }
+                return;
+            }
+            if CONSTANT_LABELS.contains(&name.ident.to_string().as_str()) {
+                self.record("registry labels", call);
+            }
+            let segments: Vec<_> = p.path.segments.iter().collect();
+            if matches!(segments.as_slice(), [.., ty, new] if ty.ident == "Info" && new.ident == "new")
+            {
+                self.record("info metric", call);
             }
         }
         visit::visit_expr_call(self, call);
@@ -310,8 +458,9 @@ impl<'ast> Visit<'ast> for Finder<'_> {
         self.macro_calls(mac.tokens.clone());
         let fixed_values = mac.path.is_ident("fixed_enum")
             && match self.path {
-                "ops_log.rs" => true,
-                "otlp.rs" | "metrics_export.rs" | "telemetry.rs" => {
+                // Telemetry's tables are span names and attribute values.
+                "ops_log.rs" | "telemetry.rs" => true,
+                "otlp.rs" | "metrics_export.rs" => {
                     let expected = if self.path == "otlp.rs" {
                         "Delivery"
                     } else {
@@ -346,10 +495,39 @@ impl<'ast> Visit<'ast> for Finder<'_> {
         }
     }
 
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        // A collector encodes its own families and labels; a derived label
+        // set is the label names of a family.
+        let collector = matches!(item, syn::Item::Impl(i)
+            if i.trait_.as_ref().is_some_and(|(t, _)| t.segments.last().is_some_and(|s| s.ident == "Collector")));
+        let attrs = match item {
+            syn::Item::Struct(i) => i.attrs.as_slice(),
+            syn::Item::Enum(i) => i.attrs.as_slice(),
+            _ => &[],
+        };
+        let label_set = attrs.iter().any(|a| {
+            a.path().is_ident("derive")
+                && identifiers(&a.meta)
+                    .iter()
+                    .any(|n| n == "EncodeLabelSet" || n == "EncodeLabelValue")
+        });
+        if collector {
+            self.record("collector", item);
+        } else if label_set {
+            self.record("label set", item);
+        }
+        visit::visit_item(self, item);
+    }
+
     fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
         if self.path == "ops_log.rs" && item.ident == "OpsEvent" {
             for variant in &item.variants {
                 self.record("event variant", variant);
+            }
+        }
+        if self.path == "telemetry.rs" && item.ident == "Attribute" {
+            for variant in &item.variants {
+                self.record("span attribute variant", variant);
             }
         }
         visit::visit_item_enum(self, item);
@@ -384,7 +562,13 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             ) | (
                 "metrics.rs",
                 "bounded" | "denial_scope" | "admission_outcome"
-            )
+            ) | ("otlp.rs", "resource_attributes")
+                | (
+                    "telemetry.rs",
+                    "impl Attribute::value" | "impl Span::serialize" | "impl Exporter::body"
+                )
+                // The columns the attempt labels are read from.
+                | ("governance/settlement.rs", "reservation")
         );
         if wire || label_helper {
             for (i, stmt) in block.stmts.iter().enumerate() {
@@ -394,6 +578,33 @@ impl<'ast> Visit<'ast> for Finder<'_> {
         }
         self.scoped(|this| visit::visit_block(this, block));
     }
+}
+
+/// The names of the methods of `Metrics` (its `impl` blocks in `metrics.rs`
+/// and `metrics/`), read from the production tree: a call of one of these on
+/// any receiver is a metric call.
+fn metric_methods() -> &'static BTreeSet<String> {
+    static NAMES: std::sync::LazyLock<BTreeSet<String>> = std::sync::LazyLock::new(|| {
+        production("lib.rs")
+            .iter()
+            .filter(|s| s.path == "metrics.rs" || s.path.starts_with("metrics/"))
+            .flat_map(|s| s.file.items.iter())
+            .filter_map(|item| match item {
+                syn::Item::Impl(i) if i.trait_.is_none() && is_metrics(&i.self_ty) => Some(i),
+                _ => None,
+            })
+            .flat_map(|i| i.items.iter())
+            .filter_map(|item| match item {
+                syn::ImplItem::Fn(f) if f.sig.receiver().is_some() => Some(f.sig.ident.to_string()),
+                _ => None,
+            })
+            .collect()
+    });
+    &NAMES
+}
+
+fn is_metrics(ty: &syn::Type) -> bool {
+    matches!(ty, syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "Metrics"))
 }
 
 fn inventory(source: &Source) -> Vec<String> {
