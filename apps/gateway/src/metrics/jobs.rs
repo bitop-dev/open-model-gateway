@@ -38,6 +38,29 @@ impl Metrics {
             ])
             .inc();
     }
+    /// A native batch the provider accepted after the gateway had ended it
+    /// (its id was not recorded): the provider batch runs unpolled.
+    pub(crate) fn observe_batch_late_submission(&self) {
+        self.batches
+            .get_or_create(&[
+                ("mode", "native".to_owned()),
+                ("event", "late_submission".to_owned()),
+            ])
+            .inc();
+    }
+    /// One `batches` series so far (tests).
+    #[cfg(all(test, feature = "integration-tests"))]
+    pub(crate) fn batch_event_count(&self, mode: &str, event: &str) -> u64 {
+        self.batches
+            .get_or_create(&[("mode", mode.to_owned()), ("event", event.to_owned())])
+            .get()
+    }
+    /// One lease renewal of a poller claim (`outcome` is a fixed set).
+    pub(crate) fn observe_job_lease_renewal(&self, outcome: &'static str) {
+        self.job_lease_renewals
+            .get_or_create(&[("outcome", outcome.to_owned())])
+            .inc();
+    }
     /// `state` is a terminal job state (fixed set).
     pub fn observe_batch_finished(&self, mode: &'static str, state: &'static str) {
         self.batches

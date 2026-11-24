@@ -33,20 +33,16 @@
 //! a native batch's row up to and including its finish goes through the
 //! fenced methods below; what follows a committed finish (the idempotent
 //! settlement, the deletion of the provider's copies) is not fenced
-//! (`jobs::native`). Video and 0016 batch observations are not fenced: only
-//! their `state` change is compare-and-set (`store::observe`), while
-//! progress, counts and display status take whatever the observation read,
-//! so a stale poller, or a client read outside any claim (`get_video`), can
-//! write older values. Their claim only keeps two pollers from refreshing one
-//! job at once.
+//! (`jobs::native`). Video and 0016 batch observations (`store::observe`)
+//! carry their writer: a poller's write checks its owner and epoch, a client
+//! read outside any claim (`get_video`) writes only while no poller holds the
+//! job, and progress and counts only grow, so neither a stale poller nor a
+//! client read writes older values; `state` stays compare-and-set.
 use sqlx::{Postgres, Transaction, postgres::PgArguments, query::Query};
 use uuid::Uuid;
 
 use super::{
-    store::{
-        self, Finished, JobRow, finish_batch_tx, finish_locked_batch, job_storage,
-        lock_batch_for_finish,
-    },
+    store::{self, Finished, JobRow, finish_locked_batch, job_storage, lock_batch_for_finish},
     types::RequestCounts,
 };
 use crate::store::Store;
@@ -536,14 +532,19 @@ impl BatchFence {
 
     /// Record a native batch's terminal state and result files. A batch that
     /// is terminal already keeps what it recorded; the row says which files
-    /// it links.
+    /// it links, and the flag whether this call recorded the finish (so a
+    /// finish is counted once, by the claim that made it).
     pub(crate) async fn finish_native(
         &self,
         store: &Store,
         f: &Finished<'_>,
-    ) -> FenceResult<JobRow> {
+    ) -> FenceResult<(JobRow, bool)> {
         let mut tx = self.begin(store, Hold::Update).await?;
-        let row = finish_batch_tx(&mut tx, self.job, f)
+        let locked = lock_batch_for_finish(&mut tx, self.job)
+            .await
+            .map_err(finish_error)?;
+        let recorded = matches!(locked.state.as_str(), "queued" | "in_progress");
+        let row = finish_locked_batch(&mut tx, locked, f)
             .await
             .map_err(finish_error)?;
         // An error at COMMIT cannot authorize cleanup (as for a runner).
@@ -551,7 +552,37 @@ impl BatchFence {
             job_storage(e);
             FenceError::Unknown
         })?;
-        Ok(row)
+        Ok((row, recorded))
+    }
+
+    /// End a started submission that never recorded its provider id as
+    /// `f` (interrupted), only if the id is still absent under the finish
+    /// lock: an id that a slow submitter recorded after this claim read the
+    /// batch means the batch is submitted and is polled, not interrupted.
+    /// `None` when nothing was recorded.
+    pub(crate) async fn interrupt_submission(
+        &self,
+        store: &Store,
+        f: &Finished<'_>,
+    ) -> FenceResult<Option<JobRow>> {
+        let mut tx = self.begin(store, Hold::Update).await?;
+        let locked = lock_batch_for_finish(&mut tx, self.job)
+            .await
+            .map_err(finish_error)?;
+        if locked.upstream_id.is_some()
+            || !matches!(locked.state.as_str(), "queued" | "in_progress")
+        {
+            tx.commit().await.map_err(job_storage)?;
+            return Ok(None);
+        }
+        let row = finish_locked_batch(&mut tx, locked, f)
+            .await
+            .map_err(finish_error)?;
+        tx.commit().await.map_err(|e| {
+            job_storage(e);
+            FenceError::Unknown
+        })?;
+        Ok(Some(row))
     }
 
     /// End the poller's claim; after a failed refresh also back off

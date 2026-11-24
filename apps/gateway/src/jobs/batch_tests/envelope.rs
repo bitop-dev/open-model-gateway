@@ -429,7 +429,10 @@ async fn a_native_batch_with_an_unknown_envelope_finishes_and_keeps_its_hold(poo
     assert!(job.settled_at.is_some());
     assert_eq!(reservation(&w.f, job.execution_id).await.0, "unknown");
     assert_eq!(reservation(&w.f, job.execution_id).await.2, None);
-    assert_eq!(w.openai.calls(), ["submit", "retrieve", "delete"]);
+    assert_eq!(
+        w.openai.calls(),
+        ["submit", "retrieve", "results", "delete"]
+    );
     consistent(&w.f).await;
 }
 

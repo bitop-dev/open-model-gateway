@@ -70,7 +70,7 @@ impl Metrics {
             collection_errors: Family::default(),
             file_store_ops: Family::default(),
             file_store_bytes: Family::default(),
-            batches: Family::default(),
+            batches: late_submissions(),
             batch_lines: Family::default(),
             batch_queue: Family::default(),
             batch_workers: Family::default(),
@@ -86,6 +86,7 @@ impl Metrics {
             egress_denied: Family::default(),
             upstream_connection_lost: every_client(),
             upstream_connections_opened: every_client(),
+            job_lease_renewals: renewal_outcomes(),
             audit_export_deliveries: Family::default(),
             audit_export_rejected_records: Counter::default(),
             trace_dropped_spans: series(&families.trace_drops, "reason", |i| {
@@ -302,8 +303,13 @@ impl Metrics {
         );
         registry.register(
             "batches",
-            "Batches by mode (native, gateway) and event (created, submitted, or the final state)",
+            "Batches by mode (native, gateway) and event (created, submitted, the final state, or late_submission: a native batch its provider accepted after the gateway ended it)",
             self.batches.clone(),
+        );
+        registry.register(
+            "job_lease_renewals",
+            "Lease renewals of poller claims on provider jobs by outcome (renewed, failed: the renewal did not complete in time or the database refused it, lost: another poller holds the job). Failed renewals let the lease lapse; lost ones end the claim",
+            self.job_lease_renewals.clone(),
         );
         registry.register(
             "batch_lines",
@@ -536,6 +542,28 @@ impl Metrics {
             self.alert_oldest_pending_age.clone(),
         );
     }
+}
+
+/// The `batches` family with its `late_submission` series pre-created at
+/// zero: the event is rare and alerted on, so its first increment must be
+/// visible to `increase()`.
+fn late_submissions() -> Family<L2, Counter> {
+    let family = Family::default();
+    let _ = family.get_or_create(&[
+        ("mode", "native".to_owned()),
+        ("event", "late_submission".to_owned()),
+    ]);
+    family
+}
+
+/// The poller's renewal outcomes, each pre-created at zero so a fresh
+/// process exports them and `rate()` sees the first increment.
+fn renewal_outcomes() -> Family<L1, Counter> {
+    let family = Family::default();
+    for outcome in crate::jobs::poller::Renewal::ALL {
+        let _ = family.get_or_create(&[("outcome", outcome.as_str().to_owned())]);
+    }
+    family
 }
 
 /// A `client` family with every outbound client's series pre-created at
