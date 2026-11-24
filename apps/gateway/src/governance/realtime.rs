@@ -453,6 +453,8 @@ async fn settle_response_once(
     if state != "pending" {
         return Err(InferenceError::Storage);
     }
+    // Without a pinned price no floor is known (missing rates are not zero).
+    let priced = s.price_id.is_some();
     let (actual, floor, violated, components) = match (pinned(&mut tx, &s).await?, usage) {
         (Some(p), Some(u)) => value_response(&p, u, window)?,
         (Some(_), None) => (None, 0, false, None),
@@ -478,7 +480,7 @@ async fn settle_response_once(
         .bind(id).bind(sequence)
         .bind(if actual.is_some() { "settled" } else { "unknown" })
         .bind(status.map(ResponseStatus::as_str))
-        .bind(actual).bind((actual.is_none() && usage.is_some()).then_some(floor))
+        .bind(actual).bind((priced && actual.is_none() && usage.is_some()).then_some(floor))
         .bind(violated)
         .bind(count(|u| u.input_text_tokens)).bind(count(|u| u.cached_text_tokens))
         .bind(count(|u| u.input_audio_tokens)).bind(count(|u| u.cached_audio_tokens))
@@ -560,14 +562,23 @@ async fn finish_once(store: &Store, record: &RealtimeFinish) -> Result<Finished,
     // The ledger row is written directly: its components are the per-key sum
     // of the settled responses' (validated) components.
     // A forwarded request that never resolved may be running upstream: its
-    // window is retained as an unknown response.
+    // window is retained as an unknown response, unless that request already
+    // has a response row. Each open inserts the session's next sequence, and
+    // the session records the sequence only once it sees the insert succeed,
+    // so a pending row above `recorded_sequence` was opened by a write whose
+    // result the session never saw (cancelled or past its deadline as it
+    // committed). `RealtimeSession::reserve_window` arms no request while
+    // another is unresolved or a response is open, so such a row is this
+    // request's own response: its window is already retained and is not added
+    // again. A pending row at or below `recorded_sequence` is a response the
+    // session saw open; it never stands in for this request's window.
     if record.unopened_request {
         let hold = match pinned(&mut tx, &s).await? {
             Some(p) => p.realtime_window(record.window)?,
             None => None,
         };
-        sqlx::query("INSERT INTO realtime_responses(execution_id,sequence,state,window_hold_microusd,unbounded_cost,completed_at) SELECT $1,coalesce(max(sequence),0)+1,'unknown',$2,$3,clock_timestamp() FROM realtime_responses WHERE execution_id=$1")
-            .bind(record.id).bind(hold).bind(hold.is_none())
+        sqlx::query("INSERT INTO realtime_responses(execution_id,sequence,state,window_hold_microusd,unbounded_cost,completed_at) SELECT $1,coalesce(max(sequence),0)+1,'unknown',$2,$3,clock_timestamp() FROM realtime_responses WHERE execution_id=$1 HAVING NOT coalesce(bool_or(state='pending' AND sequence>$4),false)")
+            .bind(record.id).bind(hold).bind(hold.is_none()).bind(record.recorded_sequence)
             .execute(&mut *tx).await.map_err(storage)?;
     }
     // Responses still open at the end never reported usage.
@@ -622,11 +633,20 @@ async fn finish_once(store: &Store, record: &RealtimeFinish) -> Result<Finished,
         .bind(!all_settled).bind(held).bind(t.unbounded || (!all_settled && held.is_none()))
         .bind(&meter_json)
         .execute(&mut *tx).await.map_err(storage)?;
+    // An unknown entry's amount is the floor the pinned price proves (the
+    // settled responses' actuals plus the unknown ones' known floors), as in
+    // request settlement; it is never spend, the hold is. Without a pinned
+    // price nothing is proven, not even zero.
+    let amount = if all_settled {
+        actual
+    } else {
+        s.price_id.and(t.actual.checked_add(t.known_floor))
+    };
     // admitted_at (0030): the ledger is partitioned with its reservation.
     sqlx::query("INSERT INTO monetary_ledger(id,execution_id,kind,amount_microusd,input_tokens,output_tokens,billing_usage,cost_components,evidence,meter_usage,admitted_at) SELECT $1,$2,$3,$4,$5,$6,NULL,$7,NULL,$8,r.admitted_at FROM governance_reservations r WHERE r.execution_id=$2")
         .bind(Uuid::now_v7()).bind(record.id)
         .bind(if all_settled { "settlement" } else { "unknown" })
-        .bind(actual.or(t.actual.checked_add(t.known_floor)))
+        .bind(amount)
         .bind(input).bind(output).bind(&components).bind(&meter_json)
         .execute(&mut *tx).await.map_err(storage)?;
     tx.commit().await.map_err(storage)?;

@@ -22,6 +22,7 @@ use std::{pin::Pin, time::Duration};
 
 use futures_util::{Sink, Stream};
 use serde_json::Value;
+use tracing::Instrument;
 
 pub mod context;
 pub use context::ResponseBound;
@@ -251,6 +252,11 @@ pub struct RealtimeFinish {
     pub unopened_request: bool,
     /// The reserved window of that request.
     pub window: ResponseBound,
+    /// The highest response sequence this session saw recorded as opened (0
+    /// before its first response). Each open writes the next sequence, so a
+    /// pending response above it was opened by a write whose result the
+    /// session never saw: the unopened request's own response.
+    pub recorded_sequence: i32,
 }
 
 /// An admitted, connected realtime session (one upstream attempt).
@@ -314,7 +320,14 @@ impl RealtimeSession {
     /// one window sized from the session's context. A reserved but unused
     /// window (admission's, or a rejected request's) is resized; otherwise a
     /// new window is added. Growth is budget-checked; shrinking releases.
+    ///
+    /// One request or response at a time: while a response is open or a
+    /// forwarded request is unresolved this is refused and the armed window is
+    /// left as it is, so finishing can attribute every response row.
     pub async fn reserve_window(&mut self, max_output_tokens: u32) -> Result<(), InferenceError> {
+        if self.open.is_some() || self.requested {
+            return Err(InferenceError::InvalidRequest);
+        }
         if !(1..=self.window_output_tokens).contains(&max_output_tokens) {
             return Err(InferenceError::InvalidRequest);
         }
@@ -399,11 +412,15 @@ impl RealtimeSession {
         // cancelled, it must observe the write's commit or failure first.
         let (completed, waiting) = tokio::sync::oneshot::channel();
         self.response_write = Some(waiting);
-        let result = HandOff::new(async move {
-            let result = realtime_settlement(write).await;
-            let _ = completed.send(());
-            result
-        })
+        // A write finished on a spawned task keeps the session's log span.
+        let result = HandOff::new(
+            async move {
+                let result = realtime_settlement(write).await;
+                let _ = completed.send(());
+                result
+            }
+            .in_current_span(),
+        )
         .await;
         self.response_write = None;
         result.map_err(|_| InferenceError::Storage)??;
@@ -435,6 +452,7 @@ impl RealtimeSession {
             window: self
                 .armed
                 .unwrap_or(ResponseBound::unknown(self.window_output_tokens)),
+            recorded_sequence: self.sequence,
         }
     }
     fn final_write(
@@ -466,6 +484,9 @@ impl RealtimeSession {
             }
             result
         }
+        // In `Drop` too: the detached write logs under the span it was
+        // dropped in.
+        .in_current_span()
     }
     /// Durably finish the session. An open response or unopened request keeps
     /// its window as unknown usage.
