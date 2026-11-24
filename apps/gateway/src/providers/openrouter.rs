@@ -451,8 +451,7 @@ fn normalize_choices(value: &mut Value) -> Result<Option<String>> {
 /// a token budget, never both: an explicit effort wins over a thinking budget,
 /// and disabled thinking turns reasoning off whatever the effort. Thinking
 /// `display:"omitted"` asks OpenRouter not to return the text. Structured
-/// output and strict tools set `require_parameters`, so OpenRouter routes only
-/// to providers that support every sent parameter rather than ignoring them.
+/// output sets `require_parameters` (see `require_parameters`).
 fn messages_controls(body: &mut Value, request: &ChatRequest) {
     let Some(options) = &request.messages_options else {
         return;
@@ -483,11 +482,19 @@ fn messages_controls(body: &mut Value, request: &ChatRequest) {
     if !reasoning.is_empty() {
         body["reasoning"] = Value::Object(reasoning);
     }
-    let format = config.and_then(|c| c.get("format"));
-    if let Some(format) = format {
+    if let Some(format) = config.and_then(|c| c.get("format")) {
         body["response_format"] = openai::json_schema_format(&format["schema"]);
+        body["provider"]["require_parameters"] = json!(true);
     }
-    if format.is_some() || request.tools.iter().any(|t| t.strict == Some(true)) {
+}
+
+/// OpenRouter may route to a provider that silently ignores a parameter it
+/// does not support. A strict tool (from any client protocol) or structured
+/// output constrains what the model may return, so it sets
+/// `provider.require_parameters`: OpenRouter then routes only to providers
+/// that support every sent parameter, or fails the request.
+fn require_parameters(body: &mut Value, request: &ChatRequest) {
+    if request.tools.iter().any(|t| t.strict == Some(true)) {
         body["provider"]["require_parameters"] = json!(true);
     }
 }
@@ -675,6 +682,7 @@ impl ProviderAdapter for OpenRouterAdapter {
         body["provider"] = self.provider_preferences();
         body["usage"] = json!({"include": true});
         messages_controls(&mut body, &request);
+        require_parameters(&mut body, &request);
         let response = self
             .post_inner(
                 target,
