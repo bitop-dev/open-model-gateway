@@ -40,10 +40,13 @@ pub(super) fn validate_request(
         }
         "/v1/responses" => crate::protocols::responses::openapi_normalize(body.clone()),
         "/v1/messages" => crate::protocols::messages::openapi_normalize(body.clone()),
+        "/v1/messages/count_tokens" => {
+            crate::protocols::messages::openapi_count_normalize(body.clone())
+        }
         _ => anyhow::bail!("unknown generation route"),
     };
     parsed.map_err(|_| anyhow::anyhow!("generation request semantic constraint"))?;
-    if path != "/v1/messages" {
+    if !super::generator::ANTHROPIC_PATHS.contains(&path) {
         let metadata = body.get("metadata").or_else(|| body.get(11));
         let metadata = metadata
             .filter(|v| !v.is_null())
@@ -104,7 +107,7 @@ pub(super) fn validate_request_headers(
     headers: &axum::http::HeaderMap,
 ) -> anyhow::Result<()> {
     use anyhow::{Context, ensure};
-    if path != "/v1/messages" {
+    if !super::generator::ANTHROPIC_PATHS.contains(&path) {
         return Ok(());
     }
     for parameter in document["paths"][path]["post"]["parameters"]

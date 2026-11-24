@@ -308,3 +308,14 @@ for (const stream of [false, true]) {
     assert.equal(result, "Tool result received");
   } else assert.equal(reply.content[0].text, "Tool result received");
 }
+
+// Token counting (#72). The fixture route has no native counter, so the
+// gateway estimates and says so. A count is not an attempt: the Rust caller's
+// execution, reservation and ledger totals do not include these calls.
+const countBody = { model: "company/smart", system: "be brief", messages: [{ role: "user", content: "hello there" }] };
+const { data: counted, response: countResponse } = await ordinaryAnthropic.messages.countTokens(countBody).withResponse();
+assert.equal(counted.input_tokens, 5); // 19 UTF-8 bytes / 4, rounded up
+assert.equal(countResponse.headers.get("x-omg-token-count"), "estimate; method=utf8-bytes-div-4");
+await assert.rejects(anthropic.messages.countTokens({ ...countBody, model: "company/unknown" }), (e) => e instanceof Anthropic.NotFoundError);
+await assert.rejects(anthropic.messages.countTokens({ ...countBody, max_tokens: 5 }), (e) => e instanceof Anthropic.BadRequestError && e.message.includes("max_tokens"));
+console.log("Token counting SDK contracts passed");

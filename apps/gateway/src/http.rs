@@ -117,6 +117,7 @@ fn inference_routes(store: &Store) -> Router<Store> {
         .route("/v1/chat/completions", post(chat_completions::handle))
         .route("/v1/responses", post(responses::handle))
         .route("/v1/messages", post(messages::handle))
+        .route("/v1/messages/count_tokens", post(messages::count_tokens))
         .route("/v1/embeddings", post(embeddings::handle))
         // Explicitly unsupported realtime companions (never minted upstream).
         .route(
@@ -239,8 +240,14 @@ fn dashboard_routes(identity: Option<IdentityState>) -> (Router<Store>, Router<S
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PublicCache;
 
+/// The Anthropic-protocol routes: Anthropic error shapes and the `x-api-key`
+/// credential form. Exact paths; a query (`?beta=true`) is not part of them.
+fn anthropic_path(path: &str) -> bool {
+    matches!(path, "/v1/messages" | "/v1/messages/count_tokens")
+}
+
 async fn request_context(mut request: Request, next: Next) -> Response {
-    let messages = request.uri().path() == "/v1/messages";
+    let messages = anthropic_path(request.uri().path());
     // Generate our own ID; do not reflect arbitrary client-supplied values into logs.
     // UUIDv7: time-ordered ids append to the partitioned history indexes.
     let id = Uuid::now_v7();
@@ -381,7 +388,7 @@ async fn authenticate_with(
     next: Next,
     cached: bool,
 ) -> Response {
-    let protocol = if request.uri().path() == "/v1/messages" {
+    let protocol = if anthropic_path(request.uri().path()) {
         Protocol::Anthropic
     } else {
         Protocol::OpenAi
