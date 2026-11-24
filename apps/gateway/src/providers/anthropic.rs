@@ -23,6 +23,7 @@ impl AnthropicAdapter {
             ))
             .connect_timeout(Duration::from_secs(10))
             .pool_idle_timeout(crate::egress::UpstreamClient::Anthropic.pool_idle_timeout())
+            .count_connections(crate::egress::UpstreamClient::Anthropic)
             .build()
             .map_err(|_| anyhow::anyhow!("Unable to initialize provider transport"))?,
             resolver,

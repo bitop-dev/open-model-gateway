@@ -121,6 +121,7 @@ pub(super) fn client(ca_bundle: Option<&super::S3CaBundle>) -> anyhow::Result<Sh
         crate::egress::client_builder(crate::egress::resolver(crate::egress::Purpose::Storage))
             .connect_timeout(Duration::from_secs(10))
             .pool_idle_timeout(crate::egress::UpstreamClient::S3.pool_idle_timeout())
+            .count_connections(crate::egress::UpstreamClient::S3)
             .read_timeout(Duration::from_secs(60));
     if let Some(bundle) = ca_bundle {
         builder = crate::egress::add_root_certificates(builder, bundle)?;

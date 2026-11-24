@@ -186,6 +186,7 @@ impl OpenRouterAdapter {
         .https_only(true)
         .connect_timeout(Duration::from_secs(10))
         .pool_idle_timeout(crate::egress::UpstreamClient::Openrouter.pool_idle_timeout())
+        .count_connections(crate::egress::UpstreamClient::Openrouter)
         .build()
         .map_err(|_| anyhow::anyhow!("Unable to initialize provider transport"))?;
         Ok(Self {

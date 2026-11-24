@@ -487,3 +487,60 @@ tests:
           # One first observation for each of the two counters.
           - labels: '{}'
             value: 2
+  # s3 loses one request per ten new connections: pending, then firing after
+  # 30 minutes. local opens connections without losses, and openai's ratio is
+  # high but on two losses in 30 minutes: neither fires. gateway-b is an older
+  # replica with losses and no connection counter; gateway-c opened nothing:
+  # neither has a ratio.
+  - name: upstream connection loss per new connection
+    interval: 1m
+    input_series:
+      - series: gateway_upstream_connection_lost_total{job="open-model-gateway",instance="gateway-a",client="s3"}
+        values: 0+1x70
+      - series: gateway_upstream_connections_opened_total{job="open-model-gateway",instance="gateway-a",client="s3"}
+        values: 0+10x70
+      - series: gateway_upstream_connection_lost_total{job="open-model-gateway",instance="gateway-a",client="local"}
+        values: 0+0x70
+      - series: gateway_upstream_connections_opened_total{job="open-model-gateway",instance="gateway-a",client="local"}
+        values: 0+50x70
+      - series: gateway_upstream_connection_lost_total{job="open-model-gateway",instance="gateway-a",client="openai"}
+        values: 0+0x30 1+0x19 2+0x20
+      - series: gateway_upstream_connections_opened_total{job="open-model-gateway",instance="gateway-a",client="openai"}
+        values: 1+0x30 2+0x19 3+0x20
+      - series: gateway_upstream_connection_lost_total{job="open-model-gateway",instance="gateway-b",client="export"}
+        values: 0+1x70
+      - series: gateway_upstream_connection_lost_total{job="open-model-gateway",instance="gateway-c",client="export"}
+        values: 0+0x70
+      - series: gateway_upstream_connections_opened_total{job="open-model-gateway",instance="gateway-c",client="export"}
+        values: 0+0x70
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: GatewayUpstreamConnectionLoss
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: GatewayUpstreamConnectionLoss
+        exp_alerts:
+          - exp_labels:
+              job: open-model-gateway
+              instance: gateway-a
+              client: s3
+              severity: info
+            exp_annotations:
+              summary: s3 on gateway-a loses more than one request per 100 new connections
+              description: "See docs/operations.md \"Lost connections\": compare with the client's pool idle timeout and its upstream's keep-alive."
+  # Cold start: both series exist at zero from startup, so a burst of losses
+  # in the first minute is seen (the alert is pending). Without the zero
+  # sample, `increase()` of a series that starts at 3 would be 0.
+  - name: upstream connection loss right after startup
+    interval: 1m
+    input_series:
+      - series: gateway_upstream_connection_lost_total{job="open-model-gateway",instance="gateway-a",client="local"}
+        values: 0 3+0x60
+      - series: gateway_upstream_connections_opened_total{job="open-model-gateway",instance="gateway-a",client="local"}
+        values: 0 10+0x60
+    promql_expr_test:
+      - expr: ALERTS{alertname="GatewayUpstreamConnectionLoss"}
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="ALERTS",alertname="GatewayUpstreamConnectionLoss",alertstate="pending",client="local",instance="gateway-a",job="open-model-gateway",severity="info"}'
+            value: 1

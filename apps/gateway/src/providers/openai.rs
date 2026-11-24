@@ -37,6 +37,7 @@ impl OpenAiAdapter {
         ))
         .connect_timeout(Duration::from_secs(10))
         .pool_idle_timeout(crate::egress::UpstreamClient::Openai.pool_idle_timeout())
+        .count_connections(crate::egress::UpstreamClient::Openai)
         .build()
         .map_err(|_| anyhow::anyhow!("Unable to initialize provider transport"))?;
         Ok(Self {
