@@ -90,8 +90,19 @@ identity reference and endpoint (at most 64; the oldest key is evicted).
   request model; Responses is not supported.
 - Text user/assistant turns and a leading sequence of nonempty system messages.
   Developer messages, late system messages, and assistant prefills are rejected.
-- Function tool definitions with object JSON schemas. `strict: true` is rejected
-  rather than silently weakened; absent/false strictness is supported.
+- Function tool definitions with object JSON schemas. `strict: true` is sent as
+  Converse `toolSpec.strict: true`, for Chat Completions and Messages clients;
+  absent/false strictness is Converse's default and sends nothing. Bedrock decides
+  whether the model supports strict tools: a model that does not returns a
+  validation error, surfaced as HTTP 400, rather than a weakened schema.
+- Messages `output_config.format` (`json_schema`) is sent as Converse
+  `outputConfig.textFormat` with `type: "json_schema"` and the client's schema as
+  the `structure.jsonSchema.schema` JSON string, unchanged in content (object key
+  order is not preserved: keys are serialized sorted); no name or description is
+  added.
+  Model support is again Bedrock's decision (validation error, HTTP 400). The
+  gateway keeps no per-model list for either feature, so a model family released
+  later is not refused by the gateway. `output_config.effort` is still not sent.
 - Auto, required/any, and named-function tool choice. A named function must be
   declared. Explicit `none` tool choice is rejected because Converse has no
   equivalent that preserves the complete supplied tool configuration.
@@ -105,8 +116,17 @@ identity reference and endpoint (at most 64; the oldest key is evicted).
   `1..=i32::MAX`. Omitted settings remain unset for AWS/model defaults. Tighter
   model-specific limits are reported as provider rejections, not clamped.
 
-Unsupported output content (images, reasoning, citations, native server tool
-results, unknown variants) fails closed rather than being silently removed.
+Returned reasoning content (`reasoningContent` text, signatures and redacted
+content, from models that reason by default) is decoded and counts toward the
+output bound. Its text reaches only Messages clients, as unsigned `thinking`, and
+only when the request asked for thinking, which Bedrock routes refuse (400
+`thinking`): so it is currently always withheld. A model that reasons by default
+and returns only reasoning (for example, cut off at `max_tokens` while still
+reasoning) therefore yields a Messages reply with empty `content` and the
+provider's stop reason (`max_tokens` there). Signatures and redacted
+reasoning are never returned. A content block never mixes reasoning and text.
+Other unsupported output content (images, citations, native server tool results,
+unknown variants) fails closed rather than being silently removed.
 Malformed JSON tool arguments, negative token usage, inconsistent tool-use finish
 reasons, and unknown stop reasons also fail closed. Model-specific unsupported
 settings are sanitized provider rejections; there is no retry with altered input.

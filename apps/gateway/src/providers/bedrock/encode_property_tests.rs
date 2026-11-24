@@ -4,16 +4,16 @@
 //!
 //! * It never panics. Its only errors are `InvalidRequest` (malformed or
 //!   out-of-bounds input), `Unsupported` (a capability Bedrock's Converse
-//!   mapping cannot carry: a strict tool, `tool_choice: none`, the developer
-//!   role) and `InvalidField(name)` (a Messages
-//!   option this provider class refuses: image, strict, top_k, output_config
-//!   format, a bad or denied beta header). Each fault below is refused with its
+//!   mapping cannot carry: `tool_choice: none`, the developer role) and
+//!   `InvalidField(name)` (a Messages option this provider class refuses:
+//!   image, top_k, a malformed output_config format, a bad or denied beta
+//!   header). Each fault below is refused with its
 //!   own class, not a catch-all.
 //! * Whatever it accepts is carried whole: every system message becomes a
 //!   system block, every other message becomes content in order (tool results
 //!   of one turn merged into one user message, as documented), every tool
 //!   call keeps its id, name and JSON arguments, every tool keeps its name,
-//!   description and schema, the tool choice maps one to one, and the
+//!   description, schema and `strict:true`, the tool choice maps one to one, and the
 //!   temperature, token limit, `top_p` and stop sequences are present exactly
 //!   when set. Nothing is invented and nothing is dropped.
 //! * Messages options other than `top_p` and `stop_sequences` (thinking, cache
@@ -354,6 +354,15 @@ fn check_carried(request: &ChatRequest, input: &Input) -> std::result::Result<()
     // Conversation.
     prop_assert_eq!(actual_messages(input), expected_messages(request));
     // Tools and choice.
+    // Only a Messages `output_config.format` produces Converse output config.
+    prop_assert_eq!(
+        input.output.is_some(),
+        request
+            .messages_options
+            .as_ref()
+            .and_then(|o| o.output_config.as_ref())
+            .is_some_and(|c| c.get("format").is_some())
+    );
     match &input.tools {
         None => {
             prop_assert!(request.tools.is_empty());
@@ -371,6 +380,8 @@ fn check_carried(request: &ChatRequest, input: &Input) -> std::result::Result<()
                     panic!("no schema")
                 };
                 prop_assert_eq!(value_of(schema), want.parameters.clone());
+                // `strict:true` is carried; `false` is Converse's default.
+                prop_assert_eq!(spec.strict, (want.strict == Some(true)).then_some(true));
             }
             match (&config.tool_choice, &request.tool_choice) {
                 (None, None) => {}
@@ -411,6 +422,7 @@ fn same(a: &Result<Input>, b: &Result<Input>) -> bool {
                 && a.system == b.system
                 && a.inference == b.inference
                 && a.tools == b.tools
+                && a.output == b.output
         }
         (Err(a), Err(b)) => a == b,
         _ => false,
@@ -435,7 +447,6 @@ enum Fault {
     TooManyTools,
     Temperature(f64),
     MaxTokens(u32),
-    StrictTool,
     BadToolName(String),
     DuplicateToolName,
     ParametersNotAnObject(Value),
@@ -458,7 +469,6 @@ enum Fault {
     DuplicateCallId,
     BadCallId(String),
     BadCallArguments(String),
-    OptionStrict,
     OptionImages,
     OptionTopK,
     OptionOutputFormat,
@@ -486,7 +496,6 @@ fn fault() -> impl Strategy<Value = Fault> {
         Fault::NoMessages,
         Fault::TooManyMessages,
         Fault::TooManyTools,
-        Fault::StrictTool,
         Fault::DuplicateToolName,
         Fault::ChoiceNoneWithTools,
         Fault::ChoiceUnknownFunction,
@@ -500,7 +509,6 @@ fn fault() -> impl Strategy<Value = Fault> {
         Fault::LastIsAssistant,
         Fault::Oversize,
         Fault::DuplicateCallId,
-        Fault::OptionStrict,
         Fault::OptionImages,
         Fault::OptionTopK,
         Fault::OptionOutputFormat,
@@ -586,13 +594,6 @@ fn inject(r: &mut ChatRequest, fault: &Fault) -> InferenceError {
         Fault::MaxTokens(n) => {
             r.max_output_tokens = Some(*n);
             InvalidRequest
-        }
-        Fault::StrictTool => {
-            if r.tools.is_empty() {
-                r.tools.push(a_tool("t0"));
-            }
-            r.tools[0].strict = Some(true);
-            Unsupported
         }
         Fault::BadToolName(n) => {
             r.tools.push(a_tool(n));
@@ -735,10 +736,6 @@ fn inject(r: &mut ChatRequest, fault: &Fault) -> InferenceError {
             a.tool_calls = vec![call];
             r.messages.push(a);
             InvalidRequest
-        }
-        Fault::OptionStrict => {
-            options(r).strict_tools = true;
-            InvalidField("strict")
         }
         Fault::OptionImages => {
             options(r).images = vec![json!({"type": "image"})];

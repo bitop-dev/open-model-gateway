@@ -11,6 +11,8 @@ mod stream_decode_tests;
 mod stream_error_tests;
 #[path = "stream_transport_tests.rs"]
 mod stream_transport_tests;
+#[path = "structured_tests.rs"]
+mod structured_tests;
 #[path = "timeout_tests.rs"]
 mod timeout_tests;
 use crate::timestamp::TimestampFormat as _;
@@ -393,15 +395,7 @@ async fn no_argument_tool_defaults_preserve_converse_wire_and_correlation() {
         for strict in [None, Some(false), Some(true)] {
             let mut r = request.clone();
             r.tools[0].strict = strict;
-            if strict == Some(true) {
-                assert!(matches!(encode(&r), Err(InferenceError::Unsupported)));
-                assert!(matches!(
-                    adapter.execute(&target(), r).await,
-                    Err(InferenceError::Unsupported)
-                ));
-            } else {
-                adapter.execute(&target(), r).await.unwrap();
-            }
+            adapter.execute(&target(), r).await.unwrap();
         }
         // Empty content is not permission to detach a result from its call.
         for id in [None, Some("wrong-call".into())] {
@@ -420,13 +414,13 @@ async fn no_argument_tool_defaults_preserve_converse_wire_and_correlation() {
         ));
     }
     let capture = mock.requests.lock().unwrap();
-    assert_eq!(
-        capture.len(),
-        6,
-        "strict/correlation refusals never dispatch"
-    );
-    for captured in capture.iter() {
+    assert_eq!(capture.len(), 9, "correlation refusals never dispatch");
+    for (i, captured) in capture.iter().enumerate() {
         let body = &captured.body;
+        assert_eq!(
+            body["toolConfig"]["tools"][0]["toolSpec"].get("strict"),
+            (i % 3 == 2).then_some(&json!(true))
+        );
         assert_eq!(
             body["toolConfig"]["tools"][0]["toolSpec"]["inputSchema"]["json"],
             json!({"type":"object","properties":{},"additionalProperties":false})
@@ -693,7 +687,9 @@ async fn incomplete_tool_arguments_unknown_content_and_stop_reason_fail() {
     bad[5].1["delta"]["toolUse"]["input"] = json!("broken");
     assert_bad_stream(wire(bad)).await;
     let mut bad = events(false);
-    bad[1].1["delta"] = json!({"reasoningContent":{"text":"hidden reasoning"}});
+    // Content the gateway cannot return (here a citation) fails the stream.
+    // Reasoning content is decoded (`structured_tests`).
+    bad[1].1["delta"] = json!({"citation":{"title":"hidden source"}});
     assert_bad_stream(wire(bad)).await;
     let mut bad = events(false);
     bad[3].1["stopReason"] = json!("new_future_reason");
@@ -808,10 +804,6 @@ fn validates_semantics_without_silent_loss() {
     check(req);
     let mut req = request();
     req.messages[0].role = Role::Developer;
-    check(req);
-    let mut req = request();
-    req.tools.push(tool());
-    req.tools[0].strict = Some(true);
     check(req);
     let mut req = request();
     req.tools.push(tool());
@@ -1200,4 +1192,73 @@ async fn assert_bedrock_tool_status_refusal(pool: sqlx::PgPool, upstream_model: 
             ])
         );
     }
+}
+
+/// Official Anthropic SDK -> listening gateway -> Bedrock adapter -> mock, for
+/// a model family the gateway has never listed: structured output and the
+/// strict tool reach Converse, and Bedrock alone decides model support.
+#[cfg(feature = "integration-tests")]
+#[dbtest::test]
+async fn structured_output_sdk_bedrock(pool: sqlx::PgPool) {
+    let text = r#"{"answer":"yes"}"#;
+    let complete = json!({"output":{"message":{"role":"assistant","content":[{"text":text}]}},"stopReason":"end_turn","usage":{"inputTokens":3,"outputTokens":5,"totalTokens":8},"metrics":{"latencyMs":2}});
+    let mut frames = events(false);
+    frames[1].1["delta"]["text"] = json!(text);
+    let mock = Mock::serve(complete, wire(frames), 200).await;
+    let mut deployment = target();
+    deployment.upstream_model = "new-region.newvendor.future-model-v9:0".into();
+    let attempts = super::super::contract::run_messages_sdk(
+        pool,
+        Arc::new(mock.adapter()),
+        deployment,
+        "structured-output.mjs",
+        &[],
+        true,
+    )
+    .await;
+    assert_eq!(attempts, 2, "one attempt per SDK request");
+    let capture = mock.requests.lock().unwrap();
+    assert_eq!(capture.len(), 2);
+    for (captured, operation) in capture.iter().zip(["/converse", "/converse-stream"]) {
+        assert!(captured.uri.path().ends_with(operation));
+        let format = &captured.body["outputConfig"]["textFormat"];
+        assert_eq!(format["type"], "json_schema");
+        let schema: Value = serde_json::from_str(
+            format["structure"]["jsonSchema"]["schema"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(schema, super::super::contract::output_schema());
+        assert_eq!(
+            captured.body["toolConfig"]["tools"][0]["toolSpec"]["strict"],
+            true
+        );
+    }
+}
+
+/// A model without structured-output support: Bedrock's validation error
+/// reaches the client as Anthropic's 400, with no upstream text.
+#[cfg(feature = "integration-tests")]
+#[dbtest::test]
+async fn structured_output_sdk_bedrock_model_refusal(pool: sqlx::PgPool) {
+    let mock = Mock::serve(
+        json!({"__type":"ValidationException","message":"SECRET model does not support outputConfig"}),
+        vec![],
+        400,
+    )
+    .await;
+    let mut deployment = target();
+    deployment.upstream_model = "us.meta.llama3-1-70b-instruct-v1:0".into();
+    let attempts = super::super::contract::run_messages_sdk(
+        pool,
+        Arc::new(mock.adapter()),
+        deployment,
+        "structured-output.mjs",
+        &["refused"],
+        true,
+    )
+    .await;
+    assert_eq!(attempts, 2);
+    assert_eq!(mock.requests.lock().unwrap().len(), 2);
 }

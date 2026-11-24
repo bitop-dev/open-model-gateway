@@ -327,6 +327,13 @@ async fn no_argument_tool_defaults_preserve_openrouter_wire_and_explicit_strict(
             1 => assert_eq!(function["strict"], false),
             _ => assert_eq!(function["strict"], true),
         }
+        // A strict tool from any client protocol may only be routed to a
+        // provider that honours `strict`; others would ignore it silently.
+        let mut provider = json!({"data_collection":"deny"});
+        if i % 3 == 2 {
+            provider["require_parameters"] = json!(true);
+        }
+        assert_eq!(body["provider"], provider, "case {i}");
         assert_eq!(body["messages"][1]["tool_calls"][0]["id"], "ping-call");
         assert_eq!(body["messages"][2]["tool_call_id"], "ping-call");
         assert_eq!(body["messages"][2]["content"], "");
@@ -1488,10 +1495,11 @@ async fn messages_refusal_on_openrouter_ends_the_reply_without_its_text() {
 }
 
 /// A Chat Completions request with a strict tool is sent as the shared
-/// OpenAI encoding plus only OpenRouter's fixed provider preferences and
-/// usage accounting: no `require_parameters`, no `reasoning`.
+/// OpenAI encoding plus OpenRouter's fixed provider preferences, usage
+/// accounting and `require_parameters` (a provider without strict support
+/// would ignore `strict`); there is no `reasoning`.
 #[tokio::test]
-async fn chat_strict_tools_are_sent_unchanged() {
+async fn chat_strict_tools_require_parameter_support() {
     let mock = Mock::json(glm_complete()).await;
     let mut request = chat(false);
     request.tools = vec![FunctionTool {
@@ -1506,12 +1514,11 @@ async fn chat_strict_tools_are_sent_unchanged() {
         .unwrap();
     let (_, _, body) = mock.last();
     let mut expected = super::super::openai::encode("private", &request);
-    expected["provider"] = json!({"data_collection":"deny"});
+    expected["provider"] = json!({"data_collection":"deny","require_parameters":true});
     expected["usage"] = json!({"include":true});
     assert_eq!(body, expected);
     assert_eq!(body["tools"][0]["function"]["strict"], true);
     assert!(body.get("reasoning").is_none());
-    assert!(body["provider"].get("require_parameters").is_none());
 }
 
 /// For Messages, a frame that carries reasoning is content, never the
