@@ -412,7 +412,10 @@ async fn the_state_machine_is_forward_only_and_identity_immutable(pool: PgPool) 
         .unwrap();
     // An observed regression is ignored.
     fake.push_video(upstream_video(JobState::Queued, Some(8)));
-    let row = j.refresh_video(job.clone()).await.unwrap();
+    let row = j
+        .refresh_video(job.clone(), super::store::Observer::Client)
+        .await
+        .unwrap();
     assert_eq!(row.state, "in_progress");
     // The database refuses invalid transitions and identity changes.
     for sql in [
@@ -1021,7 +1024,10 @@ async fn a_video_reconciled_during_the_provider_call_is_recorded_and_finishes(po
     let job = job.unwrap();
     assert_eq!(amounts(&f, request_id).await.0, "unknown");
     fake.push_video(upstream_video(JobState::Completed, Some(8)));
-    let job = j.refresh_video(job).await.unwrap();
+    let job = j
+        .refresh_video(job, super::store::Observer::Client)
+        .await
+        .unwrap();
     assert_eq!(job.state, "completed");
     assert!(job.settled_at.is_some());
     assert_eq!(amounts(&f, request_id).await.0, "unknown");
@@ -1069,4 +1075,84 @@ async fn an_accepted_video_global_prefix_failure_is_a_settlement_failure(pool: P
         [("job_settlement", "lock_timeout")]
     );
     store.pool.close().await;
+}
+
+/// Video and 0016 batch observations: a poller writes only under its current
+/// claim, a client read writes only while no poller holds the job, and
+/// progress and counts never go back (#802). `state` stays compare-and-set.
+#[dbtest::test]
+async fn video_observations_are_fenced_and_never_go_back(pool: PgPool) {
+    use super::store::{Observation, Observer, claim_due, observe, reload};
+    let f = fixture(pool).await;
+    video_setup(&f).await;
+    let fake = Fake::default();
+    let j = jobs(&f, &fake, true);
+    fake.push_video(upstream_video(JobState::InProgress, Some(8)));
+    let job = j
+        .create_video(f.principal, video_request(), Uuid::new_v4())
+        .await
+        .unwrap();
+    let obs = |progress: u8, counts: u32| Observation {
+        state: JobState::InProgress,
+        upstream_status: "in_progress",
+        progress: Some(progress),
+        completed_at: None,
+        expires_at: None,
+        error: None,
+        counts: Some(RequestCounts {
+            total: 10,
+            completed: counts,
+            failed: 0,
+        }),
+    };
+    let due = async || {
+        sqlx::query("UPDATE async_jobs SET next_poll_at=now(),runner_lease_until=CASE WHEN runner_lease_until IS NULL THEN NULL ELSE now()-interval '1 second' END WHERE id=$1")
+            .bind(job.id)
+            .execute(&f.store.pool)
+            .await
+            .unwrap();
+    };
+    due().await;
+    let (_, a) = claim_due(&f.store, Uuid::new_v4(), 30.0, 60.0)
+        .await
+        .unwrap()
+        .unwrap();
+    due().await;
+    let (_, b) = claim_due(&f.store, Uuid::new_v4(), 30.0, 60.0)
+        .await
+        .unwrap()
+        .unwrap();
+    let current = reload(&f.store, job.id).await.unwrap();
+    // B holds the job: B writes, A's (stale) claim and a client read do not.
+    observe(&f.store, &current, &obs(50, 5), 30.0, Observer::Claim(&b))
+        .await
+        .unwrap();
+    let row = reload(&f.store, job.id).await.unwrap();
+    assert_eq!((row.progress, row.request_completed), (Some(50), Some(5)));
+    for observer in [Observer::Claim(&a), Observer::Client] {
+        observe(&f.store, &row, &obs(90, 9), 30.0, observer)
+            .await
+            .unwrap();
+        let unchanged = reload(&f.store, job.id).await.unwrap();
+        assert_eq!(
+            (unchanged.progress, unchanged.request_completed),
+            (Some(50), Some(5))
+        );
+    }
+    // An older observation under the current claim never lowers them.
+    observe(&f.store, &row, &obs(20, 2), 30.0, Observer::Claim(&b))
+        .await
+        .unwrap();
+    let row = reload(&f.store, job.id).await.unwrap();
+    assert_eq!((row.progress, row.request_completed), (Some(50), Some(5)));
+    // Once no poller holds it, a client read writes, forward only.
+    b.end_poll(&f.store, None).await.unwrap();
+    observe(&f.store, &row, &obs(10, 1), 30.0, Observer::Client)
+        .await
+        .unwrap();
+    observe(&f.store, &row, &obs(70, 7), 30.0, Observer::Client)
+        .await
+        .unwrap();
+    let row = reload(&f.store, job.id).await.unwrap();
+    assert_eq!((row.progress, row.request_completed), (Some(70), Some(7)));
 }

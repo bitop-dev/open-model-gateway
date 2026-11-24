@@ -106,7 +106,10 @@ async fn accepted_failed_video_preserves_unknown_usage(pool: PgPool) {
             .unwrap();
         let held = amounts(&f, id).await.1;
         fake.push_video(upstream_video(JobState::Failed, None));
-        let failed = jobs.refresh_video(job.clone()).await.unwrap();
+        let failed = jobs
+            .refresh_video(job.clone(), crate::jobs::store::Observer::Client)
+            .await
+            .unwrap();
         assert_eq!(failed.state, "failed");
         assert!(failed.settled_at.is_some());
         // Stale settlement replay and terminal retrieval cannot append evidence.
@@ -275,7 +278,11 @@ async fn accepted_failed_legacy_batch_preserves_unknown_usage(pool: PgPool) {
             failed.id = job.upstream().unwrap();
             failed.usage = observed;
             w.openai.script.lock().unwrap().batches.push_back(failed);
-            let terminal = w.jobs.refresh_legacy(job.clone()).await.unwrap();
+            let terminal = w
+                .jobs
+                .refresh_legacy(job.clone(), crate::jobs::store::Observer::Client)
+                .await
+                .unwrap();
             assert_eq!(terminal.state, "failed");
             assert!(terminal.settled_at.is_some());
             w.jobs

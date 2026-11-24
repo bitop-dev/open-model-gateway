@@ -157,13 +157,20 @@ impl Jobs {
         .inspect_err(|_| {
             tracing::error!(execution_id = %request_id, "video job record failed after upstream acceptance; hold kept until reconciliation");
         })?;
-        self.apply_video(&job, &upstream).await
+        self.apply_video(&job, &upstream, store::Observer::Client)
+            .await
     }
 
     /// Apply an observation and settle a terminal one (idempotent).
-    async fn apply_video(&self, job: &JobRow, upstream: &UpstreamVideo) -> JobResult<JobRow> {
+    async fn apply_video(
+        &self,
+        job: &JobRow,
+        upstream: &UpstreamVideo,
+        observer: store::Observer<'_>,
+    ) -> JobResult<JobRow> {
         let interval = self.poll_seconds();
-        let job = store::observe(&self.store, job, &observation(upstream), interval).await?;
+        let job =
+            store::observe(&self.store, job, &observation(upstream), interval, observer).await?;
         if job.job_state().is_terminal()
             && job.settled_at.is_none()
             && let Some(s) = settlement(&job, upstream)
@@ -197,14 +204,18 @@ impl Jobs {
         if job.job_state().is_terminal() && job.settled_at.is_some() {
             return Ok(job);
         }
-        self.refresh_video(job).await
+        self.refresh_video(job, store::Observer::Client).await
     }
 
-    pub(crate) async fn refresh_video(&self, job: JobRow) -> JobResult<JobRow> {
+    pub(crate) async fn refresh_video(
+        &self,
+        job: JobRow,
+        observer: store::Observer<'_>,
+    ) -> JobResult<JobRow> {
         let (target, adapter) = self.target(&job).await?;
         let upstream_id = job.upstream().ok_or(InferenceError::Storage)?;
         let upstream = call(adapter.retrieve_video(&target, &upstream_id)).await?;
-        self.apply_video(&job, &upstream).await
+        self.apply_video(&job, &upstream, observer).await
     }
 
     pub async fn list_videos(

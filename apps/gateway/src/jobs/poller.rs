@@ -273,14 +273,16 @@ impl Jobs {
     async fn poll_job(&self, job: JobRow, fence: BatchFence, lost: &AtomicBool) -> JobResult<()> {
         match job.job_kind() {
             Some(JobKind::Video) => {
-                self.refresh_video(job).await?;
+                self.refresh_video(job, store::Observer::Claim(&fence))
+                    .await?;
             }
             Some(JobKind::Batch) => match job.mode() {
                 Some(BatchMode::Native) => self.poll_native(job, fence, lost).await?,
                 // Gateway-run batches belong to the batch runner.
                 Some(BatchMode::Gateway) => {}
                 None => {
-                    self.refresh_legacy(job).await?;
+                    self.refresh_legacy(job, store::Observer::Claim(&fence))
+                        .await?;
                 }
             },
             None => return Err(InferenceError::Storage.into()),

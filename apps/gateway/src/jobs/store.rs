@@ -245,12 +245,26 @@ pub(crate) struct Observation<'a> {
 fn at(unix: Option<i64>) -> Option<UtcInstant> {
     unix.and_then(|s| UtcInstant::from_timestamp(s, 0))
 }
+/// Who writes an observation of a video or 0016 batch.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Observer<'a> {
+    /// A poller under its claim: the write is refused once the claim ended.
+    Claim(&'a BatchFence),
+    /// A client read outside any claim: it writes only while no poller
+    /// holds the job, whose own observation is newer.
+    Client,
+}
 /// Apply `obs` to `job` (regressions are ignored). Returns the current row.
+/// The write happens only for `observer` (a current claim, or a client read
+/// while no claim is live); progress and request counts only ever grow, so
+/// an older observation never lowers them, and `state` moves only along the
+/// state machine.
 pub(crate) async fn observe(
     store: &Store,
     job: &JobRow,
     obs: &Observation<'_>,
     poll_interval_seconds: f64,
+    observer: Observer<'_>,
 ) -> Result<JobRow> {
     let current = job.job_state();
     let next = if current.may_become(obs.state) {
@@ -259,12 +273,17 @@ pub(crate) async fn observe(
         current
     };
     // A terminal row keeps its recorded terminal facts.
-    let changed: Option<JobRow> = sqlx::query_as(&format!("UPDATE async_jobs SET state=$3,upstream_status=CASE WHEN state IN('queued','in_progress') THEN $4 ELSE upstream_status END,progress=coalesce($5,progress),completed_at=CASE WHEN $3 IN('completed','failed','cancelled','expired') THEN coalesce(completed_at,$6,clock_timestamp()) ELSE completed_at END,expires_at=coalesce($7,expires_at),error_code=coalesce(error_code,$8),request_total=coalesce($9,request_total),request_completed=coalesce($10,request_completed),request_failed=coalesce($11,request_failed),last_polled_at=clock_timestamp(),poll_failures=0,next_poll_at=clock_timestamp()+make_interval(secs=>$12) WHERE id=$1 AND state=$2 RETURNING {JOB_COLUMNS}"))
-        .bind(job.id).bind(current.as_str()).bind(next.as_str()).bind(obs.upstream_status).bind(obs.progress.map(i16::from)).bind(at(obs.completed_at)).bind(at(obs.expires_at)).bind(obs.error.map(|e| e.as_str())).bind(obs.counts.map(|c| c.total as i32)).bind(obs.counts.map(|c| c.completed as i32)).bind(obs.counts.map(|c| c.failed as i32)).bind(poll_interval_seconds)
+    let (runner, epoch) = match observer {
+        Observer::Claim(fence) => (Some(fence.runner), Some(fence.epoch)),
+        Observer::Client => (None, None),
+    };
+    let changed: Option<JobRow> = sqlx::query_as(&format!("UPDATE async_jobs SET state=$3,upstream_status=CASE WHEN state IN('queued','in_progress') THEN $4 ELSE upstream_status END,progress=greatest(progress,$5),completed_at=CASE WHEN $3 IN('completed','failed','cancelled','expired') THEN coalesce(completed_at,$6,clock_timestamp()) ELSE completed_at END,expires_at=coalesce($7,expires_at),error_code=coalesce(error_code,$8),request_total=greatest(request_total,$9),request_completed=greatest(request_completed,$10),request_failed=greatest(request_failed,$11),last_polled_at=clock_timestamp(),poll_failures=0,next_poll_at=clock_timestamp()+make_interval(secs=>$12) WHERE id=$1 AND state=$2 AND CASE WHEN $13::uuid IS NULL THEN runner_lease_until IS NULL OR runner_lease_until<clock_timestamp() ELSE runner_id=$13 AND runner_epoch=$14 END RETURNING {JOB_COLUMNS}"))
+        .bind(job.id).bind(current.as_str()).bind(next.as_str()).bind(obs.upstream_status).bind(obs.progress.map(i16::from)).bind(at(obs.completed_at)).bind(at(obs.expires_at)).bind(obs.error.map(|e| e.as_str())).bind(obs.counts.map(|c| c.total as i32)).bind(obs.counts.map(|c| c.completed as i32)).bind(obs.counts.map(|c| c.failed as i32)).bind(poll_interval_seconds).bind(runner).bind(epoch)
         .fetch_optional(&store.pool).await.map_err(job_storage)?;
     match changed {
         Some(row) => Ok(row),
-        // A concurrent observer moved the row first.
+        // A concurrent observer moved the row first, the claim ended, or a
+        // poller holds the job (a client read): the row as it is.
         None => reload(store, job.id).await,
     }
 }

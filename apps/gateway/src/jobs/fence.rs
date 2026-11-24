@@ -33,12 +33,11 @@
 //! a native batch's row up to and including its finish goes through the
 //! fenced methods below; what follows a committed finish (the idempotent
 //! settlement, the deletion of the provider's copies) is not fenced
-//! (`jobs::native`). Video and 0016 batch observations are not fenced: only
-//! their `state` change is compare-and-set (`store::observe`), while
-//! progress, counts and display status take whatever the observation read,
-//! so a stale poller, or a client read outside any claim (`get_video`), can
-//! write older values. Their claim only keeps two pollers from refreshing one
-//! job at once.
+//! (`jobs::native`). Video and 0016 batch observations (`store::observe`)
+//! carry their writer: a poller's write checks its owner and epoch, a client
+//! read outside any claim (`get_video`) writes only while no poller holds the
+//! job, and progress and counts only grow, so neither a stale poller nor a
+//! client read writes older values; `state` stays compare-and-set.
 use sqlx::{Postgres, Transaction, postgres::PgArguments, query::Query};
 use uuid::Uuid;
 
