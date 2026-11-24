@@ -794,3 +794,110 @@ async fn empty_text_pieces_never_split_translated_blocks() {
         assert_eq!(actual, expected);
     }
 }
+
+/// Unrequested translated reasoning is withheld by the codec only after the
+/// accumulator has seen it: it still counts toward the output bound and is
+/// still refused after Finish, and blocks are numbered without it.
+#[tokio::test]
+async fn withheld_reasoning_is_still_bounded_and_ordered() {
+    let render_hidden = |events: Vec<Result<ChatEvent>>| async move {
+        let response = render_messages(
+            ProviderOutput::Stream(Box::pin(futures_util::stream::iter(events))),
+            "id".into(),
+            "public".into(),
+            false,
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 2 * OUTPUT_LIMIT + 4096)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    };
+    let shown = render_hidden(vec![
+        Ok(ChatEvent::Reasoning("hidden".into())),
+        Ok(ChatEvent::Delta {
+            text: Some("answer".into()),
+            tool_calls: vec![],
+        }),
+        Ok(ChatEvent::Finish(FinishReason::Stop)),
+        Ok(ChatEvent::Done),
+    ])
+    .await;
+    assert!(!shown.contains("hidden") && !shown.contains("thinking"));
+    let starts: Vec<_> = sse_values(&shown)
+        .into_iter()
+        .filter(|v| v["type"] == "content_block_start")
+        .map(|v| (v["index"].clone(), v["content_block"]["type"].clone()))
+        .collect();
+    assert_eq!(starts, vec![(json!(0), json!("text"))]);
+    assert!(shown.contains("event: message_stop"));
+    for events in [
+        vec![
+            Ok(ChatEvent::Reasoning("r".repeat(OUTPUT_LIMIT))),
+            Ok(ChatEvent::Delta {
+                text: Some("x".into()),
+                tool_calls: vec![],
+            }),
+            Ok(ChatEvent::Finish(FinishReason::Stop)),
+            Ok(ChatEvent::Done),
+        ],
+        vec![
+            Ok(ChatEvent::Delta {
+                text: Some("x".into()),
+                tool_calls: vec![],
+            }),
+            Ok(ChatEvent::Finish(FinishReason::Stop)),
+            Ok(ChatEvent::Reasoning("late".into())),
+            Ok(ChatEvent::Done),
+        ],
+    ] {
+        let text = render_hidden(events).await;
+        assert!(text.contains("event: error") && !text.contains("event: message_stop"));
+    }
+    let response = render_messages(
+        ProviderOutput::Complete(ChatResponse {
+            messages_content: None,
+            reasoning: Some("hidden".into()),
+            content: Some("answer".into()),
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: Usage::default(),
+        }),
+        "id".into(),
+        "public".into(),
+        false,
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), OUTPUT_LIMIT)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["content"], json!([{"type":"text","text":"answer"}]));
+}
+
+#[test]
+fn thinking_is_shown_only_when_requested() {
+    for (thinking, shown) in [
+        (None, false),
+        (Some(json!({"type":"disabled"})), false),
+        (Some(json!({"type":"adaptive","display":"omitted"})), false),
+        (Some(json!({"type":"adaptive"})), true),
+        (
+            Some(json!({"type":"adaptive","display":"summarized"})),
+            true,
+        ),
+        (
+            Some(json!({"type":"enabled","budget_tokens":1024,"display":"summarized"})),
+            true,
+        ),
+    ] {
+        let mut extra = json!({});
+        if let Some(thinking) = &thinking {
+            extra["thinking"] = thinking.clone();
+        }
+        let parsed = request(extra).unwrap();
+        assert_eq!(
+            crate::providers::messages::shows_thinking(&parsed),
+            shown,
+            "{thinking:?}"
+        );
+    }
+}

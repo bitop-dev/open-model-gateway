@@ -1330,7 +1330,10 @@ async fn messages_receive_openrouter_reasoning_text() {
                 .execute(&target("private"), messages_request(extra))
                 .await
                 .unwrap();
-            assert_eq!(reasoning_and_text(output).await.0, None, "{thinking:?}");
+            // A complete reply drops it here; a stream keeps its events for
+            // the attempt and bound checks, and the Messages codec withholds them.
+            let expected = stream.then(|| "plan".to_owned());
+            assert_eq!(reasoning_and_text(output).await.0, expected, "{thinking:?}");
         }
     }
     // Reasoning still has to be a string or null.

@@ -236,12 +236,18 @@ async fn messages_receive_local_reasoning_text_under_either_field_name() {
             for stream in [false, true] {
                 let output = adapter.execute(&target, request(stream)).await.unwrap();
                 assert_eq!(reasoning_and_text(output).await.0, None);
-                // A Messages client that did not ask for thinking gets none.
+                // A Messages client that did not ask for thinking gets none:
+                // dropped here from a complete reply; a stream keeps its events
+                // for the attempt and bound checks and the codec withholds them.
                 let output = adapter
                     .execute(&target, messages_request(json!({"stream":stream})))
                     .await
                     .unwrap();
-                assert_eq!(reasoning_and_text(output).await, (None, Some("OK".into())));
+                let expected = stream.then(|| "The user wants".to_owned());
+                assert_eq!(
+                    reasoning_and_text(output).await,
+                    (expected, Some("OK".into()))
+                );
             }
         }
         task.abort();

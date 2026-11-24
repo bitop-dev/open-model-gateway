@@ -1,9 +1,8 @@
 //! Explicit Messages provider policy. Native fidelity is opt-in, never passthrough.
 use crate::inference::{
     error::InferenceError,
-    types::{ChatEvent, ChatRequest, ProviderOutput},
+    types::{ChatRequest, ProviderOutput},
 };
-use futures_util::StreamExt;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderClass {
@@ -149,20 +148,25 @@ pub(crate) fn validate(request: &ChatRequest, class: ProviderClass) -> Result<()
 /// returned only when the client asked for thinking (`enabled` or `adaptive`)
 /// without `display:"omitted"`. Otherwise it is withheld, as a native route
 /// would never return it; its tokens stay in the reported output count.
-pub(crate) fn thinking_display(request: &ChatRequest, output: ProviderOutput) -> ProviderOutput {
-    let shown = request
+pub(crate) fn shows_thinking(request: &ChatRequest) -> bool {
+    request
         .messages_options
         .as_ref()
         .and_then(|o| o.thinking.as_ref())
-        .is_some_and(|t| t["type"] != "disabled" && t["display"] != "omitted");
+        .is_some_and(|t| t["type"] != "disabled" && t["display"] != "omitted")
+}
+
+/// Withholds unrequested reasoning from a complete reply (gateway-run batch
+/// lines have no other place to apply it). The whole body was already read
+/// within the response bound. Streams keep their reasoning events so the
+/// attempt and output-bound checks see them; the Messages codec withholds
+/// them after those checks.
+pub(crate) fn thinking_display(request: &ChatRequest, output: ProviderOutput) -> ProviderOutput {
     match output {
-        _ if shown => output,
-        ProviderOutput::Complete(mut response) => {
+        ProviderOutput::Complete(mut response) if !shows_thinking(request) => {
             response.reasoning = None;
             ProviderOutput::Complete(response)
         }
-        ProviderOutput::Stream(stream) => ProviderOutput::Stream(Box::pin(
-            stream.filter(|e| std::future::ready(!matches!(e, Ok(ChatEvent::Reasoning(_))))),
-        )),
+        output => output,
     }
 }

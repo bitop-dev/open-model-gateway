@@ -125,6 +125,7 @@ pub async fn handle(
         options.beta_headers = betas;
     }
     let model = request.model.clone();
+    let show_thinking = crate::providers::messages::shows_thinking(&request);
     let id = format!("msg_{}", request_id.0.simple());
     let output = match labels
         .scope(engine.execute_protocol(principal, request, request_id.0, ApiProtocol::Messages))
@@ -133,7 +134,7 @@ pub async fn handle(
         Ok(v) => v,
         Err(e) => return error_response(e),
     };
-    render(output, id, model)
+    render_messages(output, id, model, show_thinking)
 }
 fn usage_json(usage: Usage) -> Value {
     let mut value = json!({});
@@ -236,12 +237,29 @@ fn snapshot(id: &str, model: &str, response: &ChatResponse) -> Result<Value> {
         json!({"id":id,"type":"message","role":"assistant","model":model,"content":content,"stop_reason":stop,"stop_sequence":null,"usage":usage_json(response.usage)}),
     )
 }
+#[cfg(test)]
 fn render(output: ProviderOutput, id: String, model: String) -> Response {
+    render_messages(output, id, model, true)
+}
+/// `show_thinking` (`providers::messages::shows_thinking`) withholds translated
+/// reasoning the client did not ask for. It is still pushed through the
+/// accumulator first, so it stays bounded and refused after Finish.
+fn render_messages(
+    output: ProviderOutput,
+    id: String,
+    model: String,
+    show_thinking: bool,
+) -> Response {
     match output {
-        ProviderOutput::Complete(response) => match snapshot(&id, &model, &response) {
-            Ok(v) => Json(v).into_response(),
-            Err(e) => error_response(e),
-        },
+        ProviderOutput::Complete(mut response) => {
+            if !show_thinking {
+                response.reasoning = None;
+            }
+            match snapshot(&id, &model, &response) {
+                Ok(v) => Json(v).into_response(),
+                Err(e) => error_response(e),
+            }
+        }
         ProviderOutput::Stream(mut stream) => {
             let events = async_stream::stream! {
                 // Sent when the upstream stream opens, before any usage is observed (#23).
@@ -276,7 +294,7 @@ fn render(output: ProviderOutput, id: String, model: String) -> Response {
                             }
                             // Empty pieces (OpenAI-wire `"content":""` beside reasoning)
                             // never open or switch a block; see the empty text block below.
-                            if let Some((thinking, piece)) = piece.filter(|(_, p)| !native && !p.is_empty()) {
+                            if let Some((thinking, piece)) = piece.filter(|(t, p)| !native && !p.is_empty() && (show_thinking || !t)) {
                                 let index = match open {
                                     Some((index, kind)) if kind == thinking => index,
                                     previous => {
