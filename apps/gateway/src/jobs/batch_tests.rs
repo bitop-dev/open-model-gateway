@@ -3416,16 +3416,16 @@ mod fence;
 mod http_support;
 mod poller;
 
-/// Streaming classification must not change the non-stream classes that drive
-/// explicit line retries: OpenAI invalid output is not retryable; OpenRouter's
-/// pre-existing unavailable class is. Neither becomes Busy.
-#[dbtest::test]
-async fn openai_non_stream_200_errors_preserve_batch_retry_semantics(pool: PgPool) {
+/// A gateway-run batch line retries a clean 200-wrapped rate limit under its
+/// retry policy, as it retries an HTTP 429 (#665), and never retries the same
+/// error next to output: the provider may have processed that line.
+#[sqlx::test(migrations = "./enterprise_migrations")]
+async fn openai_non_stream_200_rate_limits_retry_only_when_clean(pool: PgPool) {
     non_stream_200_batch_error(pool, crate::providers::stream_class_tests::Kind::OpenAi).await;
 }
 
-#[dbtest::test]
-async fn openrouter_non_stream_200_errors_preserve_batch_retry_semantics(pool: PgPool) {
+#[sqlx::test(migrations = "./enterprise_migrations")]
+async fn openrouter_non_stream_200_rate_limits_retry_only_when_clean(pool: PgPool) {
     non_stream_200_batch_error(pool, crate::providers::stream_class_tests::Kind::OpenRouter).await;
 }
 
@@ -3433,7 +3433,7 @@ async fn non_stream_200_batch_error(
     pool: PgPool,
     kind: crate::providers::stream_class_tests::Kind,
 ) {
-    use crate::providers::stream_class_tests::{Kind, Step, response, serve};
+    use crate::providers::stream_class_tests::{Step, response, serve};
     use std::sync::atomic::Ordering;
     let mut w = world(pool.clone(), false, false, 1).await;
     sqlx::query("UPDATE provider_connections SET provider=$1,credential_ref=$2 WHERE id=(SELECT provider_connection_id FROM deployments WHERE id=$3)")
@@ -3441,16 +3441,17 @@ async fn non_stream_200_batch_error(
             .execute(&w.f.store.pool).await.unwrap();
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let seen = calls.clone();
-    let app = axum::Router::new().fallback(move || {
+    // The first line's body is a clean rate limit; the second's carries output.
+    let app = axum::Router::new().fallback(move |body: axum::body::Bytes| {
         seen.fetch_add(1, Ordering::SeqCst);
-        async {
-            response(
-                200,
-                "application/json",
-                vec![Step::Bytes(
-                    br#"{"error":{"code":"rate_limit_exceeded"}}"#.to_vec(),
-                )],
-            )
+        let partial = String::from_utf8_lossy(&body).contains("partial please");
+        async move {
+            let answer = if partial {
+                br#"{"error":{"code":"rate_limit_exceeded"},"choices":[{"index":0,"message":{"role":"assistant","content":"partial"},"finish_reason":"stop"}]}"#.to_vec()
+            } else {
+                br#"{"error":{"code":"rate_limit_exceeded"}}"#.to_vec()
+            };
+            response(200, "application/json", vec![Step::Bytes(answer)])
         }
     });
     let (base, _mock) = serve(app).await;
@@ -3468,7 +3469,13 @@ async fn non_stream_200_batch_error(
         .with_files(Some(runtime))
         .with_engine(engine);
     let file = w
-        .upload(&w.f.principal, &[chat_line("a", "company/smart", "hi")])
+        .upload(
+            &w.f.principal,
+            &[
+                chat_line("a", "company/smart", "hi"),
+                chat_line("b", "company/smart", "partial please"),
+            ],
+        )
         .await;
     let job = w
         .create(
@@ -3480,32 +3487,42 @@ async fn non_stream_200_batch_error(
         .await
         .unwrap();
     Runner::new(w.jobs.clone()).run_next().await.unwrap();
-    let attempts: Vec<(i16, String, Option<String>)> =
-        sqlx::query_as("SELECT attempts,state,error_code FROM batch_lines WHERE job_id=$1")
-            .bind(job.id)
-            .fetch_all(&w.f.store.pool)
-            .await
-            .unwrap();
-    let (n, code) = if kind == Kind::OpenAi {
-        (1, "invalid_upstream_response")
-    } else {
-        (2, "upstream_unavailable")
-    };
-    assert_eq!(
-        attempts,
-        [(n, "failed".into(), Some(code.into()))],
-        "{kind:?}"
-    );
-    assert_eq!(calls.load(Ordering::SeqCst), n as usize, "{kind:?}");
-    let executions: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM inference_executions WHERE batch_job_id=$1 AND error_code=$2",
+    let lines: Vec<(i32, i16, String, Option<String>)> = sqlx::query_as(
+        "SELECT line_no,attempts,state,error_code FROM batch_lines WHERE job_id=$1 ORDER BY line_no",
     )
     .bind(job.id)
-    .bind(code)
-    .fetch_one(&w.f.store.pool)
+    .fetch_all(&w.f.store.pool)
     .await
     .unwrap();
-    assert_eq!(executions, i64::from(n));
+    assert_eq!(
+        lines,
+        [
+            (0, 2, "failed".into(), Some("rate_limit_error".into())),
+            (
+                1,
+                1,
+                "failed".into(),
+                Some("invalid_upstream_response".into())
+            ),
+        ],
+        "{kind:?}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 3, "{kind:?}");
+    let executions: Vec<(Option<String>, i64)> = sqlx::query_as(
+        "SELECT error_code,count(*) FROM inference_executions WHERE batch_job_id=$1 GROUP BY error_code ORDER BY error_code",
+    )
+    .bind(job.id)
+    .fetch_all(&w.f.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        executions,
+        [
+            (Some("invalid_upstream_response".into()), 1),
+            (Some("rate_limit_error".into()), 2),
+        ],
+        "{kind:?}: one execution per attempt"
+    );
 }
 
 mod accepted_failure_tests;

@@ -328,7 +328,7 @@ impl<'ast> Visit<'ast> for Scan<'_> {
             self.used.insert(item);
             return;
         }
-        // Job acceptance maps storage errors differently after upstream acceptance.
+        // The job record (before the provider call) maps storage errors to the job stage.
         const ITEM: &str = "governance::jobs::accept_job";
         if self.at(ITEM)
             && condition.to_token_stream().to_string() == quote!(!scoped(store)).to_string()
@@ -336,13 +336,13 @@ impl<'ast> Visit<'ast> for Scan<'_> {
             && first.to_token_stream().to_string()
                 == quote!(
                     sqlx::query("SELECT pg_advisory_xact_lock_shared(72419502)")
-                        .execute(&mut *tx).await.map_err(accepted_storage)?;
+                        .execute(&mut *tx).await.map_err(record_storage)?;
                 )
                 .to_string()
             && second.to_token_stream().to_string()
                 == quote!(
                     sqlx::query_scalar::<_, Uuid>(#INSTALLATION,)
-                        .fetch_one(&mut *tx).await.map_err(accepted_storage)?;
+                        .fetch_one(&mut *tx).await.map_err(record_storage)?;
                 )
                 .to_string()
         {

@@ -189,12 +189,21 @@ async fn messages_parallel_calls_and_results_preserve_openai_turns() {
     super::super::contract::assert_parallel_chat_wire(&capture[0].body);
 }
 
+/// A clean 200 rate limit is `Busy` for every profile that shares this
+/// decoder (#665); next to output it is an invalid response.
 #[test]
-fn non_messages_error_decoding_preserves_shared_adapter_behavior() {
+fn a_200_rate_limit_is_busy_for_every_profile_unless_it_has_output() {
     let value = json!({"error":{"code":"rate_limit_exceeded","message":"prompt is too long"}});
+    let mut with_output = value.clone();
+    with_output["choices"] =
+        json!([{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}]);
     for profile in [None, Some("vllm"), Some("ollama")] {
         assert_error(
             decode_complete_profile(&value, profile),
+            InferenceError::Busy,
+        );
+        assert_error(
+            decode_complete_profile(&with_output, profile),
             InferenceError::InvalidUpstream,
         );
     }
@@ -1312,4 +1321,70 @@ fn streamed_refusal_text_is_bounded_by_the_messages_output_limit() {
         state.decode(&frame).err(),
         Some(InferenceError::InvalidUpstream)
     );
+}
+
+/// A refusal decides the finish whatever reason the provider sent with it,
+/// only on the cloud wire and only when the reply has no output at all;
+/// an absent, null or empty `refusal` is an ordinary reply.
+#[test]
+fn a_refusal_overrides_the_finish_reason_and_is_not_read_from_local_servers() {
+    let complete_with = |message: Value, reason: &str| {
+        let mut value = complete();
+        value["choices"][0]["message"] = message;
+        value["choices"][0]["finish_reason"] = json!(reason);
+        value
+    };
+    let refused = json!({"role":"assistant","content":null,"refusal":"no"});
+    for reason in ["stop", "length", "content_filter", "tool_calls"] {
+        let response =
+            decode_complete_protocol(&complete_with(refused.clone(), reason), None, true).unwrap();
+        assert_eq!(response.finish_reason, FinishReason::Refusal, "{reason}");
+        assert!(response.content.is_none(), "{reason}");
+
+        let mut state = StreamState::new(None, true);
+        let piece = serde_json::to_vec(&chunk(json!({"refusal":"no"}), Value::Null)).unwrap();
+        assert!(state.decode(&piece).unwrap().is_empty());
+        let last = serde_json::to_vec(&chunk(json!({}), json!(reason))).unwrap();
+        assert!(
+            matches!(
+                state.decode(&last).unwrap()[..],
+                [ChatEvent::Finish(FinishReason::Refusal)]
+            ),
+            "{reason}"
+        );
+    }
+
+    for profile in ["vllm", "ollama"] {
+        assert_error(
+            decode_complete_protocol(&complete_with(refused.clone(), "stop"), Some(profile), true),
+            InferenceError::InvalidUpstream,
+        );
+        let mut state = StreamState::new(Some(profile), true);
+        let piece = serde_json::to_vec(&chunk(json!({"refusal":"no"}), Value::Null)).unwrap();
+        assert_eq!(
+            state.decode(&piece).err(),
+            Some(InferenceError::InvalidUpstream),
+            "{profile}"
+        );
+    }
+
+    let blank = json!({"role":"assistant","content":" ","refusal":"no"});
+    assert_error(
+        decode_complete_protocol(&complete_with(blank, "stop"), None, true),
+        InferenceError::InvalidUpstream,
+    );
+    let mut state = StreamState::new(None, true);
+    let blank = serde_json::to_vec(&chunk(json!({"content":" ","refusal":"no"}), Value::Null));
+    assert_eq!(
+        state.decode(&blank.unwrap()).err(),
+        Some(InferenceError::InvalidUpstream)
+    );
+
+    for none in [json!(""), Value::Null] {
+        let message = json!({"role":"assistant","content":"answer","refusal":none});
+        let response = decode_complete_protocol(&complete_with(message, "length"), None, true);
+        let response = response.unwrap();
+        assert_eq!(response.finish_reason, FinishReason::Length);
+        assert_eq!(response.content.as_deref(), Some("answer"));
+    }
 }

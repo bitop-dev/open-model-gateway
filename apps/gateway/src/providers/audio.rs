@@ -177,7 +177,40 @@ fn transcription_usage(
     Ok(usage)
 }
 
+/// The members of a transcription body that carry what the provider
+/// transcribed (any of them non-empty next to an error means it may have
+/// processed the audio), and the ones that report usage (`error_envelope`).
+pub(crate) const TRANSCRIPTION_OUTPUT: &[&str] = &["text", "segments", "words", "logprobs"];
+pub(crate) const TRANSCRIPTION_USAGE: &[&str] = &["usage", "duration"];
+/// The members a JSON speech answer could carry audio in: OpenAI's speech
+/// stream events name it `audio`; `data` is the common JSON wrapper. Audio
+/// next to an error means speech may have been synthesised.
+pub(crate) const SPEECH_OUTPUT: &[&str] = &["audio", "data"];
+
+/// The usage a transcription body reports, as evidence for a failed
+/// attempt: `None` without a usage object.
+pub(crate) fn transcription_evidence(
+    bytes: &[u8],
+    value: &Value,
+    request: &TranscriptionRequest,
+) -> Option<Result<Usage>> {
+    if !value["usage"].is_object() {
+        return None;
+    }
+    let probe: SecondsProbe = match serde_json::from_slice(bytes) {
+        Ok(probe) => probe,
+        Err(_) => return Some(Err(InferenceError::InvalidUpstream)),
+    };
+    let seconds = probe.usage.and_then(|u| u.seconds).map(RawValue::get);
+    Some(transcription_usage(
+        &value["usage"],
+        seconds,
+        request.duration_ms,
+    ))
+}
+
 /// Decode a JSON transcription body (`response_format:"json"` upstream).
+/// The caller has checked its error envelope (`error_envelope`) first.
 pub(crate) fn decode_transcription(
     bytes: &[u8],
     value: &Value,

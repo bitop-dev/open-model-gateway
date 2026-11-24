@@ -237,6 +237,10 @@ pub struct Jobs {
     /// is [`native::SUBMIT_GRACE`]).
     #[cfg(test)]
     pub(crate) submit_grace: TimeDelta,
+    /// Test-only create grace of a video without a provider id (the
+    /// production value is [`video::VIDEO_CREATE_GRACE`]).
+    #[cfg(test)]
+    pub(crate) video_create_grace: TimeDelta,
 }
 /// The next finishing run waits here once armed (tests).
 #[cfg(test)]
@@ -295,6 +299,8 @@ impl Jobs {
             settle_hold: Arc::default(),
             #[cfg(test)]
             submit_grace: native::SUBMIT_GRACE,
+            #[cfg(test)]
+            video_create_grace: video::VIDEO_CREATE_GRACE,
         }
     }
     /// Attach the approved local endpoints (batch scheduling load signals).
@@ -514,14 +520,15 @@ impl Attempt {
             elapsed_ms: self.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
         }
     }
-    /// The provider did not accept the job: record the failed attempt.
-    pub(crate) async fn fail(mut self, error: InferenceError) -> InferenceError {
+    /// The provider did not accept the job: record the failed attempt. Says
+    /// whether it was recorded.
+    pub(crate) async fn fail(mut self, error: InferenceError) -> (InferenceError, bool) {
         self.done = true;
         let record = self.record(Outcome::Failed, Some(error));
-        if crate::governance::finish(&self.store, &record)
+        let recorded = crate::governance::finish(&self.store, &record)
             .await
-            .is_err()
-        {
+            .is_ok();
+        if !recorded {
             tracing::error!(execution_id = %self.id, "job attempt finalization failed; reconciliation required");
             // Job events remain uncorrelated (#294): no trace id.
             crate::ops_log::emit(crate::ops_log::OpsEvent::FinalizationNeedsReconciliation {
@@ -529,7 +536,30 @@ impl Attempt {
                 trace: None,
             });
         }
-        error
+        (error, recorded)
+    }
+    /// The job failed before any request to the provider was sent (its
+    /// record could not be written, or its create built no request): a known
+    /// zero (`governance::settlement`, `nothing_sent`).
+    /// Says whether the attempt was recorded.
+    pub(crate) async fn fail_unsent(mut self, error: InferenceError) -> (InferenceError, bool) {
+        self.done = true;
+        let record = self.record(Outcome::Failed, Some(error));
+        let telemetry = crate::inference::repository::AttemptTelemetry {
+            nothing_sent: true,
+            ..Default::default()
+        };
+        let recorded = crate::governance::finish_with_telemetry(&self.store, &record, &telemetry)
+            .await
+            .is_ok();
+        if !recorded {
+            tracing::error!(execution_id = %self.id, "job attempt finalization failed; reconciliation required");
+            crate::ops_log::emit(crate::ops_log::OpsEvent::FinalizationNeedsReconciliation {
+                finalizer: crate::ops_log::Finalizer::JobFail,
+                trace: None,
+            });
+        }
+        (error, recorded)
     }
     /// The provider accepted the job; settlement follows its terminal state.
     pub(crate) fn accepted(mut self) {

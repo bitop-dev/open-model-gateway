@@ -45,14 +45,14 @@ and the held amount for pending or unknown rows ([`ELSE coalesce(r.held_microusd
 | `unknown` -> `settled` (operator evidence) | [`fn resolve_usage_once`](../../apps/gateway/src/governance/reconcile.rs#L140) | [`p.role='admin'`](../../apps/gateway/src/governance/reconcile.rs#L183) re-checked in the tx; [`reservation(&mut tx, execution, scoped(store))`](../../apps/gateway/src/governance/reconcile.rs#L177) or the installation row in global mode ([`lock(&mut tx).await?`](../../apps/gateway/src/governance/reconcile.rs#L163)); read [`r.state != "unknown"`](../../apps/gateway/src/governance/reconcile.rs#L230) and require a terminal execution ([`SELECT state<>'started' FROM inference_executions`](../../apps/gateway/src/governance/reconcile.rs#L204)); the UPDATE itself has no state predicate |
 | `settled` -> anything | nobody | Every writer above refuses; since 0088 the database refuses any change to a settled row's money and usage columns ([`CONSTRAINT='reservation_settled_change'`](../../apps/gateway/enterprise_migrations/0088_reservation_transitions.sql#L50)) and `unknown` -> `pending` ([`CONSTRAINT='reservation_state_transition'`](../../apps/gateway/enterprise_migrations/0088_reservation_transitions.sql#L57)), before any CHECK (section 4 assumption 2, finding 4) |
 | `held` changed | settlement raises with [`greatest(held_microusd,$20)`](../../apps/gateway/src/governance/settlement.rs#L705); the batch envelope transfer (`admit_line`, [`SET held_microusd=held_microusd-$2`](../../apps/gateway/src/governance/batch.rs#L611)) moves hold into a line's own reservation; the **realtime** paths (window growth [`SET held_microusd=held_microusd+$2,reserved_tokens=reserved_tokens+$3`](../../apps/gateway/src/governance/realtime.rs#L306) and finalization [`r.checked_add(t.actual)`](../../apps/gateway/src/governance/realtime.rs#L609)) can also change it | realtime is out of scope (section 2); `HoldNeverReleased` is stated for the request path. Since 0088 the database refuses a decrease except as the row settles, an unknown ending's floor of an unbounded hold, a pending realtime session ([`e.workload_kind='realtime'`](../../apps/gateway/enterprise_migrations/0088_reservation_transitions.sql#L81)) and a pending gateway-run envelope ([`j.batch_mode='gateway'`](../../apps/gateway/enterprise_migrations/0088_reservation_transitions.sql#L83)) |
-| lease extended | [`fn accept_job`](../../apps/gateway/src/governance/jobs.rs#L23) for video (a batch has its final lease from admission) | [`SET lease_expires_at=greatest(lease_expires_at,$2) WHERE execution_id=$1 AND state='pending'`](../../apps/gateway/src/governance/jobs.rs#L47) |
+| lease extended | [`fn accept_job`](../../apps/gateway/src/governance/jobs.rs#L23) for video, with its job row and before the provider call since #662 (a batch has its final lease from admission) | [`SET lease_expires_at=greatest(lease_expires_at,$2) WHERE execution_id=$1 AND state='pending'`](../../apps/gateway/src/governance/jobs.rs#L46) |
 
 The request thread awaits admission, then runs [`let output = call_upstream(`](../../apps/gateway/src/inference/attempt.rs#L139) under the request deadline.
 It settles the outcome ([`settle_complete(&mut telemetry, &mut guard, span, response)`](../../apps/gateway/src/inference/attempt.rs#L172), [`ProviderOutput::Stream(track_stream(`](../../apps/gateway/src/inference/attempt.rs#L175)).
 `ExecutionGuard` marks settlement started ([`self.finished = true`](../../apps/gateway/src/inference/mod.rs#L460)) and calls
-[`fn settle_to_completion`](../../apps/gateway/src/inference/attempt.rs#L582) with
+[`fn settle_to_completion`](../../apps/gateway/src/inference/attempt.rs#L583) with
 [`SETTLEMENT_DEADLINE: Duration = Duration::from_secs(3)`](../../apps/gateway/src/inference/mod.rs#L374).
-The pending write uses [`HandOff::new(`](../../apps/gateway/src/inference/attempt.rs#L606), whose drop path spawns the unfinished future ([`runtime.spawn(async move`](../../apps/gateway/src/inference/hand_off.rs#L75)).
+The pending write uses [`HandOff::new(`](../../apps/gateway/src/inference/attempt.rs#L607), whose drop path spawns the unfinished future ([`runtime.spawn(async move`](../../apps/gateway/src/inference/hand_off.rs#L75)).
 [`impl Drop for ExecutionGuard`](../../apps/gateway/src/inference/mod.rs#L479) queues a detached cancellation settlement only if `finished` is false. Failover
 is decided only in the `Err(error)` arm of `Engine::attempt` (so structurally never after a
 stream was returned), only after settlement succeeds ([`let failing_over = settled.is_ok()`](../../apps/gateway/src/inference/attempt.rs#L155)), and only for
@@ -76,7 +76,7 @@ Three different "leases" exist:
   the 0029 SQL ([`w.expires_at>clock_timestamp() FOR SHARE`](../../apps/gateway/enterprise_migrations/0029_work_leases.sql#L72)) and is held until commit. The money
   path itself uses none: reconciliation is a `SKIP LOCKED` queue on every replica.
 * A third: the gateway-run batch runner claim (`async_jobs.runner_id` / `runner_epoch` /
-  `runner_lease_until`, [`runner_epoch=runner_epoch+1`](../../apps/gateway/src/jobs/store.rs#L565)). It was unfenced when this model was written and
+  `runner_lease_until`, [`runner_epoch=runner_epoch+1`](../../apps/gateway/src/jobs/store.rs#L598)). It was unfenced when this model was written and
   is fenced since 0081 (#638): see finding 1.
 
 ## 2. What is modelled, and what is not
@@ -258,7 +258,7 @@ money.
    marked `finished = true` before the write, so a client disconnect while the inline settlement was
    awaited (`settle_complete`, `track_stream`) dropped the write and `Drop` did nothing. A failed or
    timed-out write still leaves `pending`, by design (test
-   [`fn diagnostic_settlement_timeout_is_not_cancellation_or_a_drop_retry`](../../apps/gateway/src/inference/tests.rs#L871) asserts no retry); the rest
+   [`fn diagnostic_settlement_timeout_is_not_cancellation_or_a_drop_retry`](../../apps/gateway/src/inference/tests.rs#L872) asserts no retry); the rest
    of this item describes that case and the original symptom. The reconciler then marks it
    `unknown`; the hold is kept (spend overstated) until an operator resolves it with evidence.
    `MoneyPathDiag` shows it (Receive usage, ClientCancel while `settling`, ExpireLease, Reconcile);
@@ -269,7 +269,8 @@ money.
 3. **Batch and video envelopes are admitted with a 10-minute lease and extended in a second
    transaction: confirmed by reading, low. Fixed in #640; the model was not re-run for that fix.** Since #640 a
    batch's job row is written in its admission transaction ([`insert_batch(&mut tx, job`](../../apps/gateway/src/governance/batch.rs#L376)), with the envelope's final lease (poll
-   deadline plus grace), and a video's lease extension and job row are one transaction. A gateway-run
+   deadline plus grace), and a video's lease extension and job row are one transaction, written before
+   the provider call since #662 (a video without a provider id ends by its create-grace rule). A gateway-run
    batch that an earlier release left with an `unknown` envelope now ends `failed` with
    [`Some(Stop::HoldUnavailable) => Some("hold_unavailable")`](../../apps/gateway/src/jobs/runner.rs#L482) instead of every line failing as a provider configuration error. The text
    below is the finding as made. `admit_batch` used `ADMISSION_LEASE_SECONDS = 600`

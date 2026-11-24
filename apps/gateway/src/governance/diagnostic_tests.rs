@@ -119,8 +119,9 @@ async fn deadlock_reruns_signal_only_when_exhausted() {
 
 /// #389: every accounting transaction start in the governance sources that
 /// maps its error to `InferenceError` uses `begin_storage` for
-/// `pool_acquire_and_begin`, except accepted-video recording: upstream work
-/// already exists, so that start must use the critical `job_settlement` stage. The other
+/// `pool_acquire_and_begin`, except the video job record (`accept_job`),
+/// which is counted at `job_storage` with the job module: it is written before
+/// the provider call (#662) and a failure leaves nothing held. The other
 /// starts (maintenance) return the driver error unchanged with `.await?`.
 /// A start is a call of `db::begin` or `db::begin_with_setup`, however it is
 /// named: `crate::db::begin(`, `db::begin(` or an imported `begin(`.
@@ -184,7 +185,7 @@ fn every_governance_transaction_start_records_its_required_stage() {
                     });
             if path == src.join("governance/jobs.rs")
                 && accepted_range.is_some_and(|(start, end)| start < at && at < end)
-                && statement == "begin(&store.pool).await.map_err(accepted_storage)?"
+                && statement == "begin(&store.pool).await.map_err(record_storage)?"
             {
                 accepted += 1;
                 continue;
@@ -198,7 +199,7 @@ fn every_governance_transaction_start_records_its_required_stage() {
     }
     assert_eq!(
         accepted, 1,
-        "only accepted-video recording starts at job_settlement"
+        "only the video job record starts at job_storage"
     );
     assert!(
         mapped + accepted >= 16,

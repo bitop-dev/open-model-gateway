@@ -27,6 +27,7 @@ use reqwest::header::{self, HeaderValue};
 use serde::Deserialize;
 use serde_json::{Value, json, value::RawValue};
 
+use super::error_envelope::empty;
 use super::{
     ProviderAdapter, embeddings, metering, openai,
     secrets::SecretResolver,
@@ -186,6 +187,7 @@ impl OpenRouterAdapter {
         .https_only(true)
         .connect_timeout(Duration::from_secs(10))
         .pool_idle_timeout(crate::egress::UpstreamClient::Openrouter.pool_idle_timeout())
+        .count_connections(crate::egress::UpstreamClient::Openrouter)
         .build()
         .map_err(|_| anyhow::anyhow!("Unable to initialize provider transport"))?;
         Ok(Self {
@@ -312,34 +314,52 @@ fn status_error(status: u16) -> InferenceError {
     }
 }
 
-fn empty(value: &Value) -> bool {
-    match value {
-        Value::Null => true,
-        Value::String(s) => s.is_empty(),
-        Value::Array(a) => a.is_empty(),
-        Value::Object(o) => o.is_empty(),
-        _ => false,
+/// The response path's class of HTTP `code` for the error body `value`:
+/// `status_error`, and for a Messages client a validation status refined by
+/// the body (`generation_error`), as `post_inner` applies it.
+fn error_status(value: &Value, messages: bool, code: u16) -> InferenceError {
+    if messages && matches!(code, 400 | 413 | 422) {
+        super::framing::generation_error(code, Some(value), super::framing::classified_error)
+    } else {
+        status_error(code)
     }
 }
 
-/// A 200 body (or stream frame) carrying `error` is a failure, mapped by code.
-fn embedded_error(value: &Value) -> Result<()> {
-    embedded_error_protocol(value, false)
-}
-fn embedded_error_protocol(value: &Value, messages: bool) -> Result<()> {
-    if empty(&value["error"]) {
+/// A 200 body carrying `error` (`error_envelope`), for an endpoint whose
+/// answer is in `output` and whose usage is in `usage_members`, classified
+/// with `as_http`. `cost` is the body's exact `usage.cost`: a positive or
+/// unreadable one is usage too, so the error is `InvalidUpstream`. On an
+/// error, the endpoint's token or duration usage (`usage`, parsed without
+/// the cost) and the exact cost are kept as independent evidence: one being
+/// malformed does not drop the other. The body's `model` is not recorded.
+fn embedded_error(
+    value: &Value,
+    output: &[&str],
+    usage_members: &[&str],
+    cost: &Result<Option<i64>>,
+    as_http: impl FnOnce(u16) -> InferenceError,
+    usage: impl FnOnce() -> Option<Result<Usage>>,
+) -> Result<()> {
+    let Err(class) = super::error_envelope::check(value, output, usage_members, as_http) else {
         return Ok(());
-    }
-    if let Some(code) = value["error"]["code"]
-        .as_u64()
-        .and_then(|c| u16::try_from(c).ok())
-    {
-        return Err(status_error(code));
-    }
-    Err(if messages {
-        super::framing::classified_error(value).unwrap_or(InferenceError::UpstreamUnavailable)
+    };
+    let class = if matches!(cost, Ok(None | Some(0))) {
+        class
     } else {
-        InferenceError::UpstreamUnavailable
+        InferenceError::InvalidUpstream
+    };
+    let cost = cost.as_ref().ok().copied().flatten();
+    evidence::preserve(Err(class), || match usage() {
+        Some(Ok(mut observed)) => {
+            observed.provider_cost_microusd = cost;
+            Some(Ok(observed))
+        }
+        _ => cost.map(|cost| {
+            Ok(Usage {
+                provider_cost_microusd: Some(cost),
+                ..Usage::default()
+            })
+        }),
     })
 }
 
@@ -348,11 +368,7 @@ fn stream_embedded_error(value: &Value, messages: bool) -> Result<()> {
         return Ok(());
     }
     Err(super::stream_error::classify(&value["error"], |code| {
-        if messages && matches!(code, 400 | 413 | 422) {
-            super::framing::generation_error(code, Some(value), super::framing::classified_error)
-        } else {
-            status_error(code)
-        }
+        error_status(value, messages, code)
     }))
 }
 
@@ -396,204 +412,15 @@ fn provider_cost(bytes: &[u8]) -> Result<Option<i64>> {
         .transpose()
 }
 
-/// JSON object body plus exact provider cost evidence.
-fn parse(bytes: &[u8]) -> Result<(Value, Option<i64>)> {
-    parse_protocol(bytes, false)
-}
-fn parse_protocol(bytes: &[u8], messages: bool) -> Result<(Value, Option<i64>)> {
-    let value: Value =
-        serde_json::from_slice(bytes).map_err(|_| InferenceError::InvalidUpstream)?;
+/// A JSON object body. The caller checks its `error` (`embedded_error`)
+/// before reading its exact cost (`provider_cost`), so a malformed cost next
+/// to an error is evidence of processing rather than a parse failure.
+fn object(bytes: &[u8]) -> Result<Value> {
+    let value: Value = super::framing::json(bytes)?;
     if !value.is_object() {
         return Err(InferenceError::InvalidUpstream);
     }
-    embedded_error_protocol(&value, messages)?;
-    Ok((value, provider_cost(bytes)?))
-}
-
-/// Remove OpenRouter-only choice fields after type-checking them, so the
-/// shared OpenAI decoder still rejects every other unknown content field.
-/// Returns the nonempty `reasoning` text (the decoder allows one choice).
-fn normalize_choices(value: &mut Value) -> Result<Option<String>> {
-    let mut reasoning = None;
-    let Some(choices) = value.get_mut("choices").and_then(Value::as_array_mut) else {
-        return Ok(reasoning);
-    };
-    for choice in choices {
-        let Some(choice) = choice.as_object_mut() else {
-            return Err(InferenceError::InvalidUpstream);
-        };
-        if let Some(native) = choice.remove("native_finish_reason")
-            && !(native.is_null() || native.is_string())
-        {
-            return Err(InferenceError::InvalidUpstream);
-        }
-        for key in ["message", "delta"] {
-            if let Some(message) = choice.get_mut(key).and_then(Value::as_object_mut) {
-                match message.remove("reasoning") {
-                    Some(Value::String(text)) if !text.is_empty() => reasoning = Some(text),
-                    Some(text) if !(text.is_null() || text.is_string()) => {
-                        return Err(InferenceError::InvalidUpstream);
-                    }
-                    _ => {}
-                }
-                if let Some(details) = message.remove("reasoning_details")
-                    && !(details.is_null() || details.is_array())
-                {
-                    return Err(InferenceError::InvalidUpstream);
-                }
-            }
-        }
-    }
-    Ok(reasoning)
-}
-
-/// OpenRouter's controls for Messages fields. `reasoning` takes an effort or
-/// a token budget, never both: an explicit effort wins over a thinking budget,
-/// and disabled thinking turns reasoning off whatever the effort. Thinking
-/// `display:"omitted"` asks OpenRouter not to return the text. Structured
-/// output sets `require_parameters` (see `require_parameters`).
-fn messages_controls(body: &mut Value, request: &ChatRequest) {
-    let Some(options) = &request.messages_options else {
-        return;
-    };
-    let config = options.output_config.as_ref();
-    let mut reasoning = serde_json::Map::new();
-    if let Some(thinking) = &options.thinking
-        && thinking["type"] == "disabled"
-    {
-        reasoning.insert("enabled".into(), json!(false));
-    } else {
-        if let Some(effort) = config.and_then(|c| c.get("effort")) {
-            reasoning.insert("effort".into(), effort.clone());
-        } else if let Some(thinking) = &options.thinking {
-            match thinking.get("budget_tokens") {
-                Some(budget) => reasoning.insert("max_tokens".into(), budget.clone()),
-                None => reasoning.insert("enabled".into(), json!(true)),
-            };
-        }
-        if options
-            .thinking
-            .as_ref()
-            .is_some_and(|t| t["display"] == "omitted")
-        {
-            reasoning.insert("exclude".into(), json!(true));
-        }
-    }
-    if !reasoning.is_empty() {
-        body["reasoning"] = Value::Object(reasoning);
-    }
-    if let Some(format) = config.and_then(|c| c.get("format")) {
-        body["response_format"] = openai::json_schema_format(&format["schema"]);
-        body["provider"]["require_parameters"] = json!(true);
-    }
-}
-
-/// OpenRouter may route to a provider that silently ignores a parameter it
-/// does not support. A strict tool (from any client protocol) or structured
-/// output constrains what the model may return, so it sets
-/// `provider.require_parameters`: OpenRouter then routes only to providers
-/// that support every sent parameter, or fails the request.
-fn require_parameters(body: &mut Value, request: &ChatRequest) {
-    if request.tools.iter().any(|t| t.strict == Some(true)) {
-        body["provider"]["require_parameters"] = json!(true);
-    }
-}
-
-fn decode_chat(bytes: &[u8], messages: bool) -> Result<ChatResponse> {
-    let (mut value, cost) = parse_protocol(bytes, messages)?;
-    let reasoning = normalize_choices(&mut value)?;
-    let mut response = openai::decode_complete_protocol(&value, None, messages)?;
-    response.usage.provider_cost_microusd = cost;
-    // Only Messages clients receive the trace.
-    response.reasoning = reasoning.filter(|_| messages);
-    Ok(response)
-}
-
-/// Normalize one SSE data frame. `finish` is the first finish reason seen.
-/// Returns the frame for the shared decoder, its cost and reasoning text.
-fn normalize_frame(
-    data: &[u8],
-    finish: &mut Option<String>,
-    messages: bool,
-) -> Result<(Vec<u8>, Option<i64>, Option<String>)> {
-    if data == b"[DONE]" {
-        return Ok((data.to_vec(), None, None));
-    }
-    let mut value: Value =
-        serde_json::from_slice(data).map_err(|_| InferenceError::InvalidUpstream)?;
-    if !value.is_object() {
-        return Err(InferenceError::InvalidUpstream);
-    }
-    stream_embedded_error(&value, messages)?;
-    let cost = provider_cost(data)?;
-    let reasoning = normalize_choices(&mut value)?;
-    // For Messages, a frame carrying reasoning is content, never the
-    // accounting repeat; other clients never receive reasoning.
-    if let Some(previous) = finish.as_deref()
-        && (reasoning.is_none() || !messages)
-        && !value["usage"].is_null()
-        && let Some([choice]) = value["choices"].as_array().map(Vec::as_slice)
-    {
-        let delta = &choice["delta"];
-        let accounting = delta.as_object().is_some_and(|d| {
-            d.iter().all(|(k, v)| match k.as_str() {
-                "content" | "tool_calls" => empty(v),
-                "role" => v.is_null() || v == "assistant",
-                _ => false,
-            })
-        }) && (choice["finish_reason"].is_null()
-            || choice["finish_reason"].as_str() == Some(previous))
-            && choice["index"].as_u64() == Some(0);
-        if accounting {
-            value["choices"] = json!([]);
-        }
-    }
-    if finish.is_none()
-        && let Some(reason) = value["choices"][0]["finish_reason"].as_str()
-    {
-        *finish = Some(reason.to_owned());
-    }
-    Ok((
-        serde_json::to_vec(&value).map_err(|_| InferenceError::InvalidUpstream)?,
-        cost,
-        reasoning,
-    ))
-}
-
-fn decode_chat_stream(response: reqwest::Response, messages: bool) -> EventStream {
-    Box::pin(async_stream::try_stream! {
-        let mut chunks = response.bytes_stream();
-        let mut decoder = openai::SseDecoder::new();
-        let mut state = openai::StreamState::new(None, messages);
-        let mut finish = None;
-        while let Some(chunk) = chunks.next().await {
-            let chunk = chunk.map_err(transport)?;
-            for &byte in chunk.iter() {
-                if let Some(data) = decoder.push(byte)? {
-                    let (frame, cost, reasoning) = normalize_frame(&data, &mut finish, messages)?;
-                    // The frame is validated before its reasoning is released.
-                    let events = state.decode(&frame)?;
-                    if let Some(reasoning) = reasoning.filter(|_| messages) {
-                        yield ChatEvent::Reasoning(reasoning);
-                    }
-                    for event in events {
-                        let event = match event {
-                            ChatEvent::Usage(mut usage) => {
-                                usage.provider_cost_microusd = cost;
-                                ChatEvent::Usage(usage)
-                            }
-                            other => other,
-                        };
-                        let done = matches!(event, ChatEvent::Done);
-                        yield event;
-                        if done { return; }
-                    }
-                }
-            }
-        }
-        // Only [DONE] proves completion.
-        Err(super::framing::TRANSPORT)?;
-    })
+    Ok(value)
 }
 
 /// Embedding models with a fixed output width that rejects other `dimensions`.
@@ -719,12 +546,10 @@ impl ProviderAdapter for OpenRouterAdapter {
         body["provider"] = self.provider_preferences();
         let response = self.post(target, "/embeddings", &body).await?;
         let bytes = read(response).await?;
-        let value: Value =
-            serde_json::from_slice(&bytes).map_err(|_| InferenceError::InvalidUpstream)?;
+        let value: Value = super::framing::json(&bytes)?;
         if !value.is_object() {
             return Err(InferenceError::InvalidUpstream);
         }
-        embedded_error(&value)?;
         let cost = provider_cost(&bytes);
         // Independent evidence: bad token metering must not erase a valid
         // reported cost, nor may bad cost erase valid token observations.
@@ -735,9 +560,12 @@ impl ProviderAdapter for OpenRouterAdapter {
         });
         observed.meters = Some(metering::text_workload_meters(Some(0)));
         observed.provider_cost_microusd = cost.as_ref().ok().copied().flatten();
+        embedded_error(&value, &["data"], &["usage"], &cost, status_error, || {
+            value["usage"].is_object().then_some(Ok(observed))
+        })?;
         evidence::preserve(
             cost.and_then(|_| {
-                let mut decoded = embeddings::decode(&value, &request)?;
+                let mut decoded = embeddings::decode(&value, &request, status_error)?;
                 decoded.usage = observed;
                 if let Some(width) = fixed_dimensions(&target.upstream_model)
                     && decoded.embeddings.iter().any(|v| v.len() != width as usize)
@@ -766,8 +594,22 @@ impl ProviderAdapter for OpenRouterAdapter {
             body["top_n"] = json!(request.result_limit());
         }
         let response = self.post(target, "/rerank", &body).await?;
-        let (value, cost) = parse(&read(response).await?)?;
-        let usage = rerank_usage(&value["usage"], cost)?;
+        let bytes = read(response).await?;
+        let value = object(&bytes)?;
+        let cost = provider_cost(&bytes);
+        embedded_error(
+            &value,
+            &["results"],
+            &["usage"],
+            &cost,
+            status_error,
+            || {
+                value["usage"]
+                    .is_object()
+                    .then(|| rerank_usage(&value["usage"], None))
+            },
+        )?;
+        let usage = rerank_usage(&value["usage"], cost?)?;
         evidence::preserve(
             rerank_results(&value, &request).map(|results| RerankResponse { results, usage }),
             || Some(Ok(usage)),
@@ -783,8 +625,22 @@ impl ProviderAdapter for OpenRouterAdapter {
         let mut body = request.wire(&target.upstream_model);
         body["provider"] = self.provider_preferences();
         let response = self.post(target, "/systemone", &body).await?;
-        let (value, cost) = parse(&read(response).await?)?;
-        let usage = systemone_usage(&value["usage"], cost)?;
+        let bytes = read(response).await?;
+        let value = object(&bytes)?;
+        let cost = provider_cost(&bytes);
+        embedded_error(
+            &value,
+            &["answers"],
+            &["usage"],
+            &cost,
+            status_error,
+            || {
+                value["usage"]
+                    .is_object()
+                    .then(|| systemone_usage(&value["usage"], None))
+            },
+        )?;
+        let usage = systemone_usage(&value["usage"], cost?)?;
         evidence::preserve(
             parse_answers(&value["answers"], &request)
                 .map(|answers| SystemoneResponse { answers, usage }),
@@ -794,6 +650,8 @@ impl ProviderAdapter for OpenRouterAdapter {
 }
 
 mod audio;
+mod chat;
+use chat::{decode_chat, decode_chat_stream, messages_controls, require_parameters};
 mod images;
 #[cfg(test)]
 mod tests;
