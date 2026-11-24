@@ -733,17 +733,23 @@ mod tests {
     /// path it cannot resolve only as a warning, and not at all under
     /// `allow-invalid`, so a version change must bring the entries up for
     /// review: update the paths, re-run a planted probe, then this table.
-    const REVIEWED_CRATES: [(&str, &[&str]); 12] = [
+    const REVIEWED_CRATES: [(&str, &[&str]); 18] = [
         ("aws-config", &["1"]),
         ("aws-sdk-bedrockruntime", &["1"]),
         ("aws-sdk-s3", &["1"]),
         ("aws-types", &["1"]),
         ("crypto-common", &["0.1", "0.2"]),
+        ("hyper", &["1"]),
+        ("hyper-rustls", &["0.27"]),
+        ("hyper-util", &["0.1"]),
+        ("libc", &["0.2"]),
         ("oauth2", &["5"]),
         ("openidconnect", &["4"]),
         ("reqwest", &["0.12"]),
         ("rustls", &["0.23"]),
         ("sqlx", &["0.8"]),
+        ("tokio", &["1"]),
+        ("tokio-tungstenite", &["0.29", "0.30"]),
         ("tower", &["0.5"]),
         ("tungstenite", &["0.29", "0.30"]),
     ];

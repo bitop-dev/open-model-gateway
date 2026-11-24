@@ -127,13 +127,43 @@ pub(crate) fn init_event(setup: &RealtimeSetup) -> Value {
 /// `Sec-WebSocket-Key` from its own generator; that is a per-connection
 /// protocol nonce sent to the provider, not a gateway secret, so this is the
 /// one sanctioned call (#511). Secrets come from `crate::entropy`.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "tungstenite's Sec-WebSocket-Key is a handshake nonce, not a secret (#511)"
-)]
 fn handshake_request(url: String) -> Result<tungstenite::handshake::client::Request> {
-    url.into_client_request()
-        .map_err(|_| InferenceError::Configuration)
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "tungstenite's Sec-WebSocket-Key is a handshake nonce, not a secret (#511)"
+    )]
+    let request = url.into_client_request();
+    request.map_err(|_| InferenceError::Configuration)
+}
+
+/// The session's socket, all within `deadline`: `host` resolved through the
+/// egress policy, the attempt marked as possibly sent, then the first allowed
+/// address that answers. The one provider connection not built through
+/// `egress::HttpClient` is marked like one (`inference::dispatch`), although
+/// realtime sessions settle from their own windows today.
+async fn dial(
+    egress: &crate::egress::Policy,
+    host: &str,
+    port: u16,
+    deadline: Instant,
+) -> Result<tokio::net::TcpStream> {
+    let addresses = timeout_at(
+        deadline,
+        crate::egress::resolve(egress, crate::egress::Purpose::Provider, host, port),
+    )
+    .await
+    .map_err(|_| InferenceError::Timeout)?
+    .map_err(|_| InferenceError::UpstreamUnavailable)?;
+    crate::inference::dispatch::started();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the realtime session dials addresses from crate::egress::resolve (#606)"
+    )]
+    let connecting = tokio::net::TcpStream::connect(&addresses[..]);
+    timeout_at(deadline, connecting)
+        .await
+        .map_err(|_| InferenceError::Timeout)?
+        .map_err(|_| InferenceError::UpstreamUnavailable)
 }
 
 pub(super) async fn connect(
@@ -155,22 +185,7 @@ pub(super) async fn connect(
     let port = parsed
         .port_or_known_default()
         .ok_or(InferenceError::Configuration)?;
-    let egress = egress_policy(secure);
-    let addresses = timeout_at(
-        deadline,
-        crate::egress::resolve(&egress, crate::egress::Purpose::Provider, &host, port),
-    )
-    .await
-    .map_err(|_| InferenceError::Timeout)?
-    .map_err(|_| InferenceError::UpstreamUnavailable)?;
-    // The one provider connection not built through `egress::HttpClient`:
-    // mark it as possibly sent like one (`inference::dispatch`), although
-    // realtime sessions settle from their own windows today.
-    crate::inference::dispatch::started();
-    let stream = timeout_at(deadline, tokio::net::TcpStream::connect(&addresses[..]))
-        .await
-        .map_err(|_| InferenceError::Timeout)?
-        .map_err(|_| InferenceError::UpstreamUnavailable)?;
+    let stream = dial(&egress_policy(secure), &host, port, deadline).await?;
     stream
         .set_nodelay(true)
         .map_err(|_| InferenceError::UpstreamUnavailable)?;

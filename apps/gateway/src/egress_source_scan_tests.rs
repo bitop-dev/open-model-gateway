@@ -69,6 +69,12 @@ enum Finding {
     /// macro body that `syn` cannot parse. The scan fails closed on these.
     Unreadable(String),
     AwsTransport(String),
+    /// A sanctioned statement whose binding or expression is not the
+    /// reviewed one (#606).
+    SocketSite(String),
+    /// A `cfg` or `cfg_attr` predicate naming `clippy` or `debug_assertions`:
+    /// code that no Clippy run compiles (#606).
+    LintCfg(String),
 }
 
 fn path_name(path: &syn::Path) -> String {
@@ -297,7 +303,25 @@ impl<'ast> Visit<'ast> for Scan<'_> {
                 && let Some(transport) = aws_transport(reason)
                 && !transport.matches(local)
             {
-                self.findings.push(Finding::AwsTransport(on));
+                self.findings.push(Finding::AwsTransport(on.clone()));
+                break;
+            }
+        }
+        for finding in &self.findings[before..] {
+            if let Finding::Level {
+                reason: Some(reason),
+                ..
+            } = finding
+                && let Some(expected) = socket_site(reason)
+                // One plain binding of exactly the reviewed expression: no
+                // pattern that destructures and no `else` block, which the
+                // `expect` would cover too.
+                && (!matches!(&local.pat, syn::Pat::Ident(p) if p.subpat.is_none() && p.by_ref.is_none())
+                    || local.init.as_ref().is_none_or(|init| {
+                        init.diverge.is_some() || text(init.expr.to_token_stream()) != expected
+                    }))
+            {
+                self.findings.push(Finding::SocketSite(on));
                 break;
             }
         }
@@ -352,7 +376,48 @@ fn scan(src: &Path, file: &Path, source: &str) -> Vec<Finding> {
         read: std::collections::HashSet::new(),
     };
     scan.visit_file(&ast);
+    let mut cfgs = LintCfgs(Vec::new());
+    cfgs.visit_file(&ast);
+    scan.findings.extend(cfgs.0);
     scan.findings
+}
+
+/// `cfg`/`cfg_attr` predicates that name `clippy` or `debug_assertions`
+/// (#606): code under `cfg(not(clippy))` is built but never linted, and code
+/// under `cfg(not(debug_assertions))` exists only in release builds, which
+/// no Clippy run compiles. Only the predicate counts (`cfg_attr(test,
+/// allow(clippy::x))` names a lint, not a configuration).
+struct LintCfgs(Vec<Finding>);
+
+impl<'ast> Visit<'ast> for LintCfgs {
+    fn visit_attribute(&mut self, attribute: &'ast syn::Attribute) {
+        let predicate = match &attribute.meta {
+            Meta::List(list) if list.path.is_ident("cfg") => Some(list.tokens.clone()),
+            Meta::List(list) if list.path.is_ident("cfg_attr") => Some(
+                list.tokens
+                    .clone()
+                    .into_iter()
+                    .take_while(|t| !matches!(t, TokenTree::Punct(p) if p.as_char() == ','))
+                    .collect(),
+            ),
+            _ => None,
+        };
+        if let Some(predicate) = predicate
+            && has_lint_cfg(predicate)
+        {
+            self.0
+                .push(Finding::LintCfg(text(attribute.to_token_stream())));
+        }
+        syn::visit::visit_attribute(self, attribute);
+    }
+}
+
+fn has_lint_cfg(tokens: TokenStream) -> bool {
+    tokens.into_iter().any(|t| match t {
+        TokenTree::Ident(i) => i.unraw() == "clippy" || i.unraw() == "debug_assertions",
+        TokenTree::Group(g) => has_lint_cfg(g.stream()),
+        _ => false,
+    })
 }
 
 fn files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -398,7 +463,6 @@ const BEDROCK_STREAM_TRANSPORT: &str = "Bedrock streaming installs the gateway t
 const STS_EXCEPTION: &str = "EGR-3: regional STS AssumeRole uses the SDK credential transport";
 
 enum AwsTransport {
-    GatewayTail(&'static str),
     S3Client,
     Exact(&'static str),
 }
@@ -410,7 +474,6 @@ impl AwsTransport {
         };
         let expression = text(init.expr.to_token_stream());
         match self {
-            Self::GatewayTail(tail) => expression.ends_with(tail),
             Self::Exact(expected) => expression == *expected,
             Self::S3Client => {
                 let syn::Expr::Call(call) = init.expr.as_ref() else {
@@ -425,24 +488,163 @@ impl AwsTransport {
     }
 }
 
-// Pin transport selection at the sanctioned build/override expressions. Earlier
-// builder settings can change; the final transport assignment must stay explicit.
+const HEALTH_PROBE: &str = "the health probe dials the gateway's own listener (#606)";
+const DB_BEGIN: &str = "the one sanctioned pool begin (cancellation-safe wrapper)";
+const HANDSHAKE_NONCE: &str =
+    "tungstenite's Sec-WebSocket-Key is a handshake nonce, not a secret (#511)";
+const EGRESS_SOCKET: &str = "dials an address resolve() allowed (#606)";
+const REALTIME_SOCKET: &str =
+    "the realtime session dials addresses from crate::egress::resolve (#606)";
+
+/// The sanctioned statements outside the AWS ones and `egress_http.rs`,
+/// pinned by expression (#606): every one switches off the whole shared lint
+/// (reqwest, sockets, entropy, transactions), so it may hold its one reviewed
+/// call and nothing else. The three socket statements dial addresses the
+/// gateway chose (the health probe's target, or `crate::egress::resolve` in
+/// `egress::connect_tcp` and the realtime `dial`; those functions are pinned
+/// whole by [`SOCKET_FUNCTIONS`]).
+fn socket_site(reason: &str) -> Option<&'static str> {
+    match reason {
+        DB_BEGIN => Some("pool . begin_with ( \"BEGIN ISOLATION LEVEL READ COMMITTED\" )"),
+        HANDSHAKE_NONCE => Some("url . into_client_request ( )"),
+        HEALTH_PROBE => Some("TcpStream : : connect_timeout ( & address , remaining ( ) ? )"),
+        EGRESS_SOCKET => Some(
+            "tokio : : time : : timeout ( per_address , tokio : : net : : TcpStream : : connect ( address ) )",
+        ),
+        REALTIME_SOCKET => Some("tokio : : net : : TcpStream : : connect ( & addresses [ . . ] )"),
+        _ => None,
+    }
+}
+
+/// The three functions that open sockets (#606), each pinned whole (token
+/// text without doc comments): where their addresses come from, their
+/// visibility and every statement around the sanctioned one. A change is a
+/// reviewed change to this list.
+const SOCKET_FUNCTIONS: &[(&str, &str, &str)] = &[
+    (
+        "egress.rs",
+        "connect_tcp",
+        "pub ( crate ) async fn connect_tcp ( policy : & Policy , purpose : Purpose , host : & str , port : u16 , per_address : std : : time : : Duration , ) - > anyhow : : Result < tokio : : net : : TcpStream > { for address in resolve ( policy , purpose , host , port ) . await ? { # [ expect ( clippy : : disallowed_methods , reason = \"dials an address resolve() allowed (#606)\" ) ] let connecting = tokio : : time : : timeout ( per_address , tokio : : net : : TcpStream : : connect ( address ) ) ; if let Ok ( Ok ( stream ) ) = connecting . await { return Ok ( stream ) ; } } anyhow : : bail ! ( \"could not connect to {host}\" ) }",
+    ),
+    (
+        "providers/openai/realtime.rs",
+        "dial",
+        "async fn dial ( egress : & crate : : egress : : Policy , host : & str , port : u16 , deadline : Instant , ) - > Result < tokio : : net : : TcpStream > { let addresses = timeout_at ( deadline , crate : : egress : : resolve ( egress , crate : : egress : : Purpose : : Provider , host , port ) , ) . await . map_err ( | _ | InferenceError : : Timeout ) ? . map_err ( | _ | InferenceError : : UpstreamUnavailable ) ? ; crate : : inference : : dispatch : : started ( ) ; # [ expect ( clippy : : disallowed_methods , reason = \"the realtime session dials addresses from crate::egress::resolve (#606)\" ) ] let connecting = tokio : : net : : TcpStream : : connect ( & addresses [ . . ] ) ; timeout_at ( deadline , connecting ) . await . map_err ( | _ | InferenceError : : Timeout ) ? . map_err ( | _ | InferenceError : : UpstreamUnavailable ) }",
+    ),
+    (
+        "healthcheck.rs",
+        "connect",
+        "fn connect ( target : & Target , allow_non_loopback : bool , remaining : & dyn Fn ( ) - > Result < Duration > , ) - > Result < TcpStream > { let mut last_error = None ; for address in target . addresses ( allow_non_loopback ) ? { # [ expect ( clippy : : disallowed_methods , reason = \"the health probe dials the gateway's own listener (#606)\" ) ] let connecting = TcpStream : : connect_timeout ( & address , remaining ( ) ? ) ; match connecting { Ok ( connected ) = > return Ok ( connected ) , Err ( error ) = > last_error = Some ( error ) , } } Err ( anyhow ! ( \"could not connect to {}: {}\" , target . host_header ( ) , last_error . map_or_else ( | | \"no address\" . to_owned ( ) , | e | e . to_string ( ) ) ) ) }",
+    ),
+];
+
+#[test]
+fn the_socket_functions_are_the_reviewed_ones() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    for (file, name, expected) in SOCKET_FUNCTIONS {
+        let ast = syn::parse_file(&std::fs::read_to_string(src.join(file)).unwrap()).unwrap();
+        let found: Vec<String> = ast
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                syn::Item::Fn(f) if f.sig.ident == name => Some(text(f.to_token_stream())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            found,
+            [*expected],
+            "{file}: `{name}` opens a socket; it changed, so review it and update SOCKET_FUNCTIONS (#606)"
+        );
+    }
+}
+
+/// The functions of `egress_rule_probes_tests.rs`, one per refused
+/// connection constructor (#606).
+const PROBES: &[&str] = &[
+    "hyper_http1_handshake",
+    "hyper_http1_builder",
+    "hyper_http1_builder_handshake",
+    "hyper_http2_handshake",
+    "hyper_http2_builder",
+    "hyper_http2_builder_handshake",
+    "hyper_util_client_builder",
+    "hyper_util_builder_new",
+    "hyper_util_builder_build",
+    "hyper_util_builder_build_http",
+    "hyper_util_http_connector",
+    "hyper_util_http_connector_with_resolver",
+    "hyper_rustls_connector",
+    "hyper_rustls_build",
+    "hyper_rustls_wrap_connector",
+    "hyper_rustls_connector_builder",
+    "tungstenite_connect",
+    "tungstenite_connect_with_config",
+    "tungstenite_connect_async",
+    "tungstenite_connect_async_with_config",
+    "tungstenite_connect_async_tls_with_config",
+    "tokio_tcp_stream_connect",
+    "tokio_tcp_socket_connect",
+    "tokio_udp_socket_bind",
+    "std_tcp_stream_connect",
+    "std_tcp_stream_connect_timeout",
+    "std_udp_socket_bind",
+    "aws_imds_client",
+    "aws_imds_credentials",
+    "aws_ecs_credentials",
+    "aws_web_identity_credentials",
+    "aws_sso_credentials",
+    "aws_sso_token",
+    "aws_credential_process",
+    "libc_socket",
+    "libc_connect",
+    "libc_sendto",
+    "libc_sendmsg",
+];
+
+// Pin the sanctioned build/override statements, each as a whole, so the
+// transport assignment stays explicit and nothing else rides on the `expect`.
+const BEDROCK_SERVICE_CONFIG: &str = "builder . behavior_version ( auth : : sdk_behavior_version ( ) ) . region ( Region : : new ( plan . region . clone ( ) ) ) . credentials_provider ( credentials ) . retry_config ( RetryConfig : : standard ( ) . with_max_attempts ( 1 ) ) . disable_clock_skew_correction ( true ) . identity_cache ( aws_sdk_bedrockruntime : : config : : IdentityCache : : lazy ( ) . load_timeout ( Duration : : from_secs ( 5 ) ) . build ( ) , ) . timeout_config ( self . operation_timeouts ( ) ) . http_client ( self . http . clone ( ) ) . build ( )";
+const BEDROCK_STREAM: &str = "client . converse_stream ( ) . model_id ( & target . upstream_model ) . set_messages ( Some ( input . messages ) ) . set_system ( input . system ) . inference_config ( input . inference ) . set_tool_config ( input . tools ) . set_output_config ( input . output ) . customize ( ) . config_override ( aws_sdk_bedrockruntime : : Config : : builder ( ) . http_client ( self . streaming_http . clone ( ) ) , )";
+
 fn aws_transport(reason: &str) -> Option<AwsTransport> {
-    let tail = match reason {
-        S3_TRANSPORT => return Some(AwsTransport::S3Client),
-        BEDROCK_CLIENT => {
-            return Some(AwsTransport::Exact(
-                "Client : : from_conf ( self . service_config ( plan , credentials ) )",
-            ));
+    match reason {
+        S3_TRANSPORT => Some(AwsTransport::S3Client),
+        BEDROCK_CLIENT => Some(AwsTransport::Exact(
+            "Client : : from_conf ( self . service_config ( plan , credentials ) )",
+        )),
+        // The whole statement, not only its transport: the `expect` covers
+        // every call in it.
+        BEDROCK_TRANSPORT => Some(AwsTransport::Exact(BEDROCK_SERVICE_CONFIG)),
+        BEDROCK_STREAM_TRANSPORT => Some(AwsTransport::Exact(BEDROCK_STREAM)),
+        STS_EXCEPTION => Some(AwsTransport::Exact("builder . build ( )")),
+        _ => None,
+    }
+}
+
+/// The initializer of the sanctioned `let` in `file` whose `expect` gives
+/// `reason`, as parseable source.
+fn real_initializer(file: &str, reason: &str) -> String {
+    struct Find<'a>(&'a str, Option<String>);
+    impl<'ast> Visit<'ast> for Find<'_> {
+        fn visit_local(&mut self, local: &'ast syn::Local) {
+            if local
+                .attrs
+                .iter()
+                .any(|a| a.to_token_stream().to_string().contains(self.0))
+                && let Some(init) = &local.init
+            {
+                self.1 = Some(init.expr.to_token_stream().to_string());
+            }
+            syn::visit::visit_local(self, local);
         }
-        BEDROCK_TRANSPORT => " . http_client ( self . http . clone ( ) ) . build ( )",
-        BEDROCK_STREAM_TRANSPORT => {
-            " . config_override ( aws_sdk_bedrockruntime : : Config : : builder ( ) . http_client ( self . streaming_http . clone ( ) ) , )"
-        }
-        STS_EXCEPTION => return Some(AwsTransport::Exact("builder . build ( )")),
-        _ => return None,
-    };
-    Some(AwsTransport::GatewayTail(tail))
+    }
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(file);
+    let ast = syn::parse_file(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let mut find = Find(reason, None);
+    find.visit_file(&ast);
+    find.1
+        .unwrap_or_else(|| panic!("{file}: no sanctioned statement for {reason}"))
 }
 
 #[test]
@@ -458,10 +660,10 @@ fn aws_transport_must_be_set_on_the_sanctioned_expression() {
         );
         scan(src, &file, &source) == [level("expect", false, &[], Some(reason), "let in fixture")]
     };
-    assert!(matches(
-        BEDROCK_TRANSPORT,
-        "builder.http_client(self.http.clone()).build()"
-    ));
+    let service = real_initializer("providers/bedrock.rs", BEDROCK_TRANSPORT);
+    assert!(matches(BEDROCK_TRANSPORT, service.as_str()));
+    let prefixed = service.replacen("builder", "{ probe(); builder }", 1);
+    assert!(!matches(BEDROCK_TRANSPORT, prefixed.as_str()));
     for initializer in [
         "builder.build()",
         "builder.other(mock.http_client(self.http.clone())).build()",
@@ -469,10 +671,10 @@ fn aws_transport_must_be_set_on_the_sanctioned_expression() {
     ] {
         assert!(!matches(BEDROCK_TRANSPORT, initializer), "{initializer}");
     }
-    assert!(matches(
-        BEDROCK_STREAM_TRANSPORT,
-        "operation.config_override(aws_sdk_bedrockruntime::Config::builder().http_client(self.streaming_http.clone()),)"
-    ));
+    let stream = real_initializer("providers/bedrock.rs", BEDROCK_STREAM_TRANSPORT);
+    assert!(matches(BEDROCK_STREAM_TRANSPORT, stream.as_str()));
+    let prefixed = stream.replacen("client", "{ probe(); client }", 1);
+    assert!(!matches(BEDROCK_STREAM_TRANSPORT, prefixed.as_str()));
     assert!(!matches(
         BEDROCK_STREAM_TRANSPORT,
         "operation.config_override(aws_sdk_bedrockruntime::Config::builder())"
@@ -495,6 +697,89 @@ fn aws_transport_must_be_set_on_the_sanctioned_expression() {
     ));
     assert!(matches(STS_EXCEPTION, "builder.build()"));
     assert!(!matches(STS_EXCEPTION, "other.build()"));
+}
+
+/// A sanctioned socket statement (#606) covers its one reviewed call only:
+/// another destination, another constructor or an extra call in the same
+/// statement is a finding.
+#[test]
+fn a_sanctioned_socket_statement_must_keep_its_expression() {
+    let src = Path::new("/repo/apps/gateway/src");
+    let matches = |reason, initializer| {
+        let file = src.join("fixture.rs");
+        let source = format!(
+            "fn fixture() {{
+                #[expect(clippy::disallowed_methods, reason = {reason:?})]
+                let connecting = {initializer};
+            }}"
+        );
+        scan(src, &file, &source) == [level("expect", false, &[], Some(reason), "let in fixture")]
+    };
+    assert!(matches(
+        HEALTH_PROBE,
+        "TcpStream::connect_timeout(&address, remaining()?)"
+    ));
+    assert!(matches(
+        EGRESS_SOCKET,
+        "tokio::time::timeout(per_address, tokio::net::TcpStream::connect(address))"
+    ));
+    assert!(matches(
+        REALTIME_SOCKET,
+        "tokio::net::TcpStream::connect(&addresses[..])"
+    ));
+    for (reason, initializer) in [
+        (
+            HEALTH_PROBE,
+            "TcpStream::connect_timeout(&other, remaining()?)",
+        ),
+        (HEALTH_PROBE, "TcpStream::connect(address)"),
+        (
+            EGRESS_SOCKET,
+            "tokio::time::timeout(per_address, tokio::net::TcpStream::connect(\"203.0.113.1:514\"))",
+        ),
+        (
+            EGRESS_SOCKET,
+            "tokio::time::timeout(per_address, tokio::net::TcpStream::connect(address)).and(hyper_util::client::legacy::connect::HttpConnector::new())",
+        ),
+        (
+            REALTIME_SOCKET,
+            "tokio::net::TcpStream::connect(&addresses[1..])",
+        ),
+        (
+            REALTIME_SOCKET,
+            "tokio::net::TcpStream::connect(\"203.0.113.1:443\")",
+        ),
+        (REALTIME_SOCKET, "tokio_tungstenite::connect_async(url)"),
+    ] {
+        assert!(!matches(reason, initializer), "{initializer}");
+    }
+    // The reviewed expression with an `else` block or a destructuring
+    // pattern: the `expect` would cover the extra code.
+    let file = src.join("fixture.rs");
+    for statement in [
+        "let Ok(connecting) = TcpStream::connect_timeout(&address, remaining()?) else { drop(TcpStream::connect(other)); return; };",
+        "let connecting = TcpStream::connect_timeout(&address, remaining()?) else { drop(TcpStream::connect(other)); return; };",
+        "let (connecting) = TcpStream::connect_timeout(&address, remaining()?);",
+        "let connecting @ _ = TcpStream::connect_timeout(&address, remaining()?);",
+    ] {
+        let source = format!(
+            "fn fixture() {{
+                #[expect(clippy::disallowed_methods, reason = {HEALTH_PROBE:?})]
+                {statement}
+            }}"
+        );
+        assert_ne!(
+            scan(src, &file, &source),
+            [level(
+                "expect",
+                false,
+                &[],
+                Some(HEALTH_PROBE),
+                "let in fixture"
+            )],
+            "{statement}"
+        );
+    }
 }
 
 /// The sanctioned sites of each file under `src/`; nothing for any other.
@@ -549,16 +834,51 @@ fn sanctioned(name: &str) -> Vec<Finding> {
             guarded("fn pinned_client_builder"),
             guarded("fn add_root_certificates"),
         ],
-        "db.rs" => vec![level("allow", false, &[], None, "let in start")],
+        "db.rs" => vec![level("expect", false, &[], Some(DB_BEGIN), "let in start")],
         // tungstenite fills the upstream handshake's Sec-WebSocket-Key from
         // its own generator: a protocol nonce, not a gateway secret (#511).
-        "providers/openai/realtime.rs" => vec![level(
+        // The session's socket is opened on addresses the egress resolver
+        // returned (#606).
+        "providers/openai/realtime.rs" => vec![
+            level(
+                "expect",
+                false,
+                &[],
+                Some(HANDSHAKE_NONCE),
+                "let in handshake_request",
+            ),
+            level("expect", false, &[], Some(REALTIME_SOCKET), "let in dial"),
+        ],
+        "healthcheck.rs" => vec![level(
             "expect",
             false,
             &[],
-            Some("tungstenite's Sec-WebSocket-Key is a handshake nonce, not a secret (#511)"),
-            "fn handshake_request",
+            Some(HEALTH_PROBE),
+            "let in connect",
         )],
+        // The one TCP helper for other egress (the audit export): it dials
+        // only what `resolve` allowed (#606).
+        "egress.rs" => vec![level(
+            "expect",
+            false,
+            &[],
+            Some(EGRESS_SOCKET),
+            "let in connect_tcp",
+        )],
+        // Test-only probes, never called: each proves one clippy.toml entry
+        // still fires (#606).
+        "egress_rule_probes_tests.rs" => PROBES
+            .iter()
+            .map(|probe| {
+                level(
+                    "expect",
+                    false,
+                    &[],
+                    Some("probe of a refused constructor (#606)"),
+                    &format!("fn {probe}"),
+                )
+            })
+            .collect(),
         "lib.rs" => vec![
             level("allow", true, &["test"], None, "crate"),
             level_of(TYPES, "allow", true, &["test"], None, "crate"),
@@ -654,6 +974,12 @@ fn the_scan_sees_every_spelling_of_a_lint_switch() {
         "fn f() { include!(\"../../x.rs\") }",
         "fn f() { std::include!(\"x.rs\") }",
         "macro_rules! m { () => { include!(\"x.rs\"); } }",
+        "#[cfg(not(clippy))] fn f() {}",
+        "#[cfg(all(not(test), not(r#clippy)))] fn f() {}",
+        "#[cfg_attr(clippy, path = \"x.rs\")] mod m;",
+        "#[cfg(not(debug_assertions))] fn f() {}",
+        "impl S { #[cfg(not(clippy))] fn f() {} }",
+        "fn f() { #[cfg(not(clippy))] let x = 1; }",
     ] {
         assert!(finds(source), "missed: {source}");
     }
@@ -1528,15 +1854,21 @@ fn sanctioned_attributes_count_only_on_their_own_items() {
             "accepted: {rogue}"
         );
     }
-    let allow = "#[allow(clippy::disallowed_methods)]";
+    let allow = format!("#[expect(clippy::disallowed_methods, reason = {DB_BEGIN:?})]");
+    let begin = "pool.begin_with(\"BEGIN ISOLATION LEVEL READ COMMITTED\")";
     assert!(finds(
         "db.rs",
-        &format!("async fn start() {{ async move {{ {allow} let begin = 1; }}; }}")
+        &format!("async fn start() {{ async move {{ {allow} let begin = {begin}; }}; }}")
     ));
     for rogue in [
         format!("{allow} mod m {{ fn rogue() {{}} }}"),
         format!("{allow} fn start() {{}}"),
-        format!("fn other() {{ {allow} let begin = 1; }}"),
+        format!("fn other() {{ {allow} let begin = {begin}; }}"),
+        format!(
+            "async fn start() {{ async move {{ {allow} let begin = {{ probe(); {begin} }}; }}; }}"
+        ),
+        "async fn start() { async move { #[allow(clippy::disallowed_methods)] let begin = 1; }; }"
+            .to_owned(),
     ] {
         assert!(!finds("db.rs", &rogue), "accepted: {rogue}");
     }
