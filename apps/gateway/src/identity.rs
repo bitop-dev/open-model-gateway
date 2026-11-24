@@ -684,6 +684,9 @@ pub async fn prune_sessions_fenced(
 use login::{CallbackQuery, LoginQuery, consume_attempt, resolve_identity, resolve_identity_with};
 #[cfg(test)]
 use oidc::{EnterpriseIdToken, SignedClaims};
+#[cfg(all(test, feature = "integration-tests"))]
+#[path = "identity/bootstrap_race_tests.rs"]
+mod bootstrap_race_tests;
 #[cfg(test)]
 #[path = "identity/tests.rs"]
 pub(crate) mod tests;
