@@ -86,11 +86,12 @@ fn claude_code_field_rules_by_provider_class() {
                     field,
                     "cache_control" | "thinking" | "context_management" | "defer_loading"
                 );
-            // Anthropic forwards images; OpenAI-style routes map structured
-            // output and strict tools to their own JSON-schema controls.
+            // Anthropic forwards images. Anthropic forwards structured output
+            // and strict tools; OpenAI-style and Bedrock routes map them to
+            // their own JSON-schema controls. Only local profiles refuse them.
             let supported = (field == "image" && class == ProviderClass::Anthropic)
                 || (matches!(field, "output_config.format" | "strict")
-                    && class == ProviderClass::OpenAi);
+                    && class != ProviderClass::Local);
             if bedrock_refuses || (always_refuse && !supported) {
                 assert!(
                     matches!(verdict, Err(InferenceError::InvalidField(f)) if f == field),
@@ -170,18 +171,19 @@ fn wire_strict_presence_does_not_reinterpret_shared_adapter_tool_settings() {
             json!({"tools":[{"name":"lookup","input_schema":{"type":"object"},"strict":strict}]}),
         )
         .unwrap();
-        // OpenAI-style routes map wire `strict` to `function.strict`.
-        assert!(crate::providers::messages::validate(&r, ProviderClass::OpenAi).is_ok());
+        // Anthropic forwards wire `strict`; OpenAI-style routes map it to
+        // `function.strict` and Bedrock to `toolSpec.strict`.
         for class in [
             ProviderClass::Anthropic,
+            ProviderClass::OpenAi,
             ProviderClass::Bedrock,
-            ProviderClass::Local,
         ] {
-            assert!(matches!(
-                crate::providers::messages::validate(&r, class),
-                Err(InferenceError::InvalidField("strict"))
-            ));
+            assert!(crate::providers::messages::validate(&r, class).is_ok());
         }
+        assert!(matches!(
+            crate::providers::messages::validate(&r, ProviderClass::Local),
+            Err(InferenceError::InvalidField("strict"))
+        ));
     }
 }
 

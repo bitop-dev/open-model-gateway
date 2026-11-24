@@ -235,3 +235,30 @@ async fn preserves_converse_sampling_stops_and_custom_tools(pool: PgPool) {
         );
     }
 }
+
+#[dbtest::test]
+async fn maps_structured_output_and_strict_tools_through_admission(pool: PgPool) {
+    let mock = Mock::serve(complete(false), wire(events(false)), 200).await;
+    let (base, token, _gateway) = route(pool, &mock).await;
+    let schema = json!({"type":"object","properties":{"a":{"type":"string"}},"required":["a"],"additionalProperties":false});
+    let extra = json!({
+        "output_config":{"format":{"type":"json_schema","schema":schema}},
+        "tools":[{"name":"weather","input_schema":schema,"strict":true}],
+    });
+    for stream in [false, true] {
+        let response = post(&base, &token, stream, extra.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK, "stream={stream}");
+        let _ = response.bytes().await.unwrap();
+    }
+    let requests = mock.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        let structure = &request.body["outputConfig"]["textFormat"]["structure"]["jsonSchema"];
+        let sent: Value = serde_json::from_str(structure["schema"].as_str().unwrap()).unwrap();
+        assert_eq!(sent, schema);
+        assert_eq!(
+            request.body["toolConfig"]["tools"][0]["toolSpec"]["strict"],
+            true
+        );
+    }
+}

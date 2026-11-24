@@ -4,6 +4,10 @@ use aws_smithy_types::event_stream::RawMessage;
 
 struct Block {
     tool: Option<u32>,
+    /// For a non-tool block: `Some(true)` once it carries reasoning, `Some(false)`
+    /// once it carries text, `None` while an explicit empty start awaits its
+    /// first delta. A block never mixes the two.
+    reasoning: Option<bool>,
     arguments: String,
     closed: bool,
 }
@@ -17,8 +21,19 @@ pub(super) struct State {
     tools: u32,
     blocks: BTreeMap<i32, Block>,
     ids: BTreeSet<String>,
+    /// A Messages request: returned reasoning text is emitted as
+    /// `ChatEvent::Reasoning` for the Messages codec, which withholds it unless
+    /// thinking was requested. Other protocols have no reasoning output.
+    messages: bool,
 }
 impl State {
+    #[cfg(test)]
+    pub(super) fn for_test(messages: bool) -> Self {
+        Self {
+            messages,
+            ..Self::default()
+        }
+    }
     pub(super) fn push(&mut self, event: aws::ConverseStreamOutput) -> Result<Vec<ChatEvent>> {
         use aws::ConverseStreamOutput as E;
         let mut result = Vec::new();
@@ -88,6 +103,7 @@ impl State {
         self.blocks.insert(
             start.content_block_index,
             Block {
+                reasoning: tool.map(|_| false),
                 tool,
                 arguments: String::new(),
                 closed: false,
@@ -95,7 +111,9 @@ impl State {
         );
         Ok(())
     }
-    /// A text or tool-input delta; a text delta may open its block implicitly.
+    /// A text, reasoning or tool-input delta; a text or reasoning delta may open
+    /// its block implicitly. Reasoning text counts toward the output bound;
+    /// signatures and redacted reasoning are bounded too, and never returned.
     fn block_delta(
         &mut self,
         delta: aws::ContentBlockDeltaEvent,
@@ -107,7 +125,13 @@ impl State {
         }
         if !self.blocks.contains_key(&delta.content_block_index) {
             if self.blocks.len() >= MAX_BLOCKS
-                || !matches!(delta.delta, Some(aws::ContentBlockDelta::Text(_)))
+                || !matches!(
+                    delta.delta,
+                    Some(
+                        aws::ContentBlockDelta::Text(_)
+                            | aws::ContentBlockDelta::ReasoningContent(_)
+                    )
+                )
             {
                 return Err(invalid());
             }
@@ -115,6 +139,7 @@ impl State {
                 delta.content_block_index,
                 Block {
                     tool: None,
+                    reasoning: None,
                     arguments: String::new(),
                     closed: false,
                 },
@@ -128,12 +153,35 @@ impl State {
             return Err(invalid());
         }
         match delta.delta {
-            Some(aws::ContentBlockDelta::Text(text)) if block.tool.is_none() => {
+            Some(aws::ContentBlockDelta::Text(text))
+                if block.tool.is_none() && block.reasoning != Some(true) =>
+            {
+                block.reasoning = Some(false);
                 self.size += text.len();
                 result.push(ChatEvent::Delta {
                     text: Some(text),
                     tool_calls: Vec::new(),
                 });
+            }
+            Some(aws::ContentBlockDelta::ReasoningContent(reasoning))
+                if block.tool.is_none() && block.reasoning != Some(false) =>
+            {
+                block.reasoning = Some(true);
+                match reasoning {
+                    aws::ReasoningContentBlockDelta::Text(text) => {
+                        self.size += text.len();
+                        if self.messages && !text.is_empty() {
+                            result.push(ChatEvent::Reasoning(text));
+                        }
+                    }
+                    aws::ReasoningContentBlockDelta::Signature(signature) => {
+                        self.size += signature.len();
+                    }
+                    aws::ReasoningContentBlockDelta::RedactedContent(data) => {
+                        self.size += data.as_ref().len();
+                    }
+                    _ => return Err(invalid()),
+                }
             }
             Some(aws::ContentBlockDelta::ToolUse(tool)) if block.tool.is_some() => {
                 self.size += tool.input.len();
@@ -341,7 +389,7 @@ pub(super) fn decode(
     messages: bool,
 ) -> EventStream {
     Box::pin(async_stream::try_stream! {
-        let mut state = State { limit: Some(limit), ..State::default() };
+        let mut state = State { limit: Some(limit), messages, ..State::default() };
         loop {
             // The transport bounds active body reads. Timing the whole SDK
             // receive would also time unpolled backpressure while a partial

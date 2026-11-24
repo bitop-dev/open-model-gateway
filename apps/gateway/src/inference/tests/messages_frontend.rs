@@ -304,19 +304,21 @@ async fn messages_nonstream_provider_bound_allows_over_four_mib_and_refuses_over
 }
 
 #[tokio::test]
-async fn native_anthropic_unsupported_fields_do_not_admit_or_dispatch() {
-    let captures = Captures::default();
-    let mock = upstream(200, json!({}), captures.clone()).await;
-    for (extra, field) in [
+async fn native_anthropic_structured_fields_admit_and_dispatch_once_exactly() {
+    for (extra, path, expected) in [
         (
-            json!({"output_config":{"format":{"type":"json_schema","schema":{"type":"object"}}}}),
-            "output_config.format",
+            json!({"output_config":{"format":{"type":"json_schema","schema":{"type":"object","additionalProperties":false}}}}),
+            "output_config",
+            json!({"format":{"type":"json_schema","schema":{"type":"object","additionalProperties":false}}}),
         ),
         (
             json!({"tools":[{"name":"lookup","input_schema":{"type":"object"},"strict":true}]}),
-            "strict",
+            "tools",
+            json!([{"name":"lookup","input_schema":{"type":"object"},"strict":true}]),
         ),
     ] {
+        let captures = Captures::default();
+        let mock = upstream(200, json!({"id":"private","type":"message","role":"assistant","model":"private","content":[{"type":"text","text":"{}"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":3,"output_tokens":1}}), captures.clone()).await;
         let adapter = crate::providers::anthropic::AnthropicAdapter::for_test(
             Arc::new(Resolver),
             mock.url.clone(),
@@ -330,15 +332,15 @@ async fn native_anthropic_unsupported_fields_do_not_admit_or_dispatch() {
         let mut request = wire(body);
         request.headers_mut().remove("anthropic-beta");
         let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let bytes = axum::body::to_bytes(response.into_body(), 2048)
-            .await
-            .unwrap();
-        let value: Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(value["error"]["message"].as_str().unwrap().contains(field));
-        assert_eq!(repository.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert_eq!(repository.starts.load(Ordering::SeqCst), 1, "{path}");
+        let captures = captures.lock().unwrap();
+        assert_eq!(captures.len(), 1, "{path}");
+        let (headers, sent) = &captures[0];
+        // Generally available: no beta header is required or invented.
+        assert!(!headers.contains_key("anthropic-beta"), "{path}");
+        assert_eq!(sent[path], expected, "{path}");
     }
-    assert!(captures.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

@@ -21,6 +21,9 @@ use crate::inference::{error::InferenceError, types::*};
 
 #[path = "bedrock/auth.rs"]
 pub(crate) mod auth;
+#[path = "bedrock/complete.rs"]
+mod complete;
+use complete::*;
 #[cfg(test)]
 #[path = "bedrock/encode_property_tests.rs"]
 mod encode_property_tests;
@@ -198,6 +201,7 @@ impl ProviderAdapter for BedrockAdapter {
                 .set_system(input.system)
                 .inference_config(input.inference)
                 .set_tool_config(input.tools)
+                .set_output_config(input.output)
                 // Operation settings and the credential cache stay shared. Only
                 // the streaming HTTP body omits the fixed total lifetime cap.
                 .customize()
@@ -222,13 +226,18 @@ impl ProviderAdapter for BedrockAdapter {
                 .set_system(input.system)
                 .inference_config(input.inference)
                 .set_tool_config(input.tools)
+                .set_output_config(input.output)
                 .send()
                 .await
                 .map_err(|e| sdk_messages_error(e, request.messages_options.is_some()))?;
-            Ok(ProviderOutput::Complete(decode_complete_limit(
-                output,
-                request.response_limit(),
-            )?))
+            Ok(super::messages::thinking_display(
+                &request,
+                ProviderOutput::Complete(decode_complete_limit(
+                    output,
+                    request.response_limit(),
+                    request.messages_options.is_some(),
+                )?),
+            ))
         }
     }
 }
@@ -238,6 +247,7 @@ struct Input {
     system: Option<Vec<aws::SystemContentBlock>>,
     inference: aws::InferenceConfiguration,
     tools: Option<aws::ToolConfiguration>,
+    output: Option<aws::OutputConfig>,
 }
 
 fn encode(request: &ChatRequest) -> Result<Input> {
@@ -257,7 +267,44 @@ fn encode(request: &ChatRequest) -> Result<Input> {
     for message in &request.messages {
         turns.push(message)?;
     }
-    turns.finish(request, tools)
+    let mut input = turns.finish(request, tools)?;
+    input.output = output_config(request)?;
+    Ok(input)
+}
+
+/// A Messages `output_config.format` as Converse `outputConfig.textFormat`.
+/// Converse takes the schema as a JSON string and an optional name and
+/// description; Messages has neither, so none is sent. Whether the model can
+/// constrain its output is Bedrock's decision: an unsupported model fails with
+/// a validation error. Effort and task budgets are not mapped here (see
+/// `providers::messages::validate`), so nothing else is sent.
+fn output_config(request: &ChatRequest) -> Result<Option<aws::OutputConfig>> {
+    let Some(format) = request
+        .messages_options
+        .as_ref()
+        .and_then(|o| o.output_config.as_ref())
+        .and_then(|c| c.get("format"))
+    else {
+        return Ok(None);
+    };
+    let refuse = || InferenceError::InvalidField("output_config.format");
+    // The Messages grammar admits only `{"type":"json_schema","schema":{...}}`.
+    if format["type"] != "json_schema" || !format["schema"].is_object() {
+        return Err(refuse());
+    }
+    let schema = serde_json::to_string(&format["schema"]).map_err(|_| refuse())?;
+    let definition = aws::JsonSchemaDefinition::builder()
+        .schema(schema)
+        .build()
+        .map_err(|_| refuse())?;
+    let format = aws::OutputFormat::builder()
+        .r#type(aws::OutputFormatType::JsonSchema)
+        .structure(aws::OutputFormatStructure::JsonSchema(definition))
+        .build()
+        .map_err(|_| refuse())?;
+    Ok(Some(
+        aws::OutputConfig::builder().text_format(format).build(),
+    ))
 }
 
 fn invalid() -> InferenceError {
@@ -290,10 +337,6 @@ fn tool_specs(
     let mut names = BTreeSet::new();
     let mut tools = Vec::new();
     for tool in &request.tools {
-        // Bedrock's strict support is model-specific; never silently weaken a strict schema.
-        if tool.strict == Some(true) {
-            return Err(InferenceError::Unsupported);
-        }
         if !identifier(&tool.name)
             || !names.insert(tool.name.clone())
             || !tool.parameters.is_object()
@@ -314,6 +357,10 @@ fn tool_specs(
                 .name(&tool.name)
                 .set_description(tool.description.clone())
                 .input_schema(aws::ToolInputSchema::Json(document(&tool.parameters)?))
+                // Strict support is model-specific and evaluated by Bedrock: an
+                // unsupported model refuses the request rather than weakening
+                // the schema. `false` is Converse's default and is not sent.
+                .set_strict((tool.strict == Some(true)).then_some(true))
                 .build()
                 .map_err(|_| invalid())?,
         ));
@@ -553,6 +600,7 @@ impl Turns {
             system: (!system.is_empty()).then_some(system),
             tools,
             inference: inference_config(request),
+            output: None,
         })
     }
 }
@@ -657,83 +705,6 @@ fn usage(value: &aws::TokenUsage) -> Result<Usage> {
     }
     super::metering::bedrock(&wire)
 }
-fn decode_complete_limit(
-    output: aws_sdk_bedrockruntime::operation::converse::ConverseOutput,
-    limit: usize,
-) -> Result<ChatResponse> {
-    let Some(aws::ConverseOutput::Message(message)) = output.output else {
-        return Err(InferenceError::InvalidUpstream);
-    };
-    if message.role != aws::ConversationRole::Assistant || message.content.len() > MAX_BLOCKS {
-        return Err(InferenceError::InvalidUpstream);
-    }
-    let mut text = String::new();
-    let mut calls = Vec::new();
-    let mut ids = BTreeSet::new();
-    let mut size = 0;
-    for block in message.content {
-        match block {
-            aws::ContentBlock::Text(value) => {
-                size += value.len();
-                text.push_str(&value);
-            }
-            aws::ContentBlock::ToolUse(value) => {
-                if !identifier(&value.tool_use_id)
-                    || !identifier(&value.name)
-                    || !ids.insert(value.tool_use_id.clone())
-                    || calls.len() >= MAX_TOOLS
-                {
-                    return Err(InferenceError::InvalidUpstream);
-                }
-                let args = json_document(&value.input)?;
-                if !args.is_object() {
-                    return Err(InferenceError::InvalidUpstream);
-                }
-                let arguments =
-                    serde_json::to_string(&args).map_err(|_| InferenceError::InvalidUpstream)?;
-                size += arguments.len() + value.name.len() + value.tool_use_id.len();
-                calls.push(ToolCall {
-                    id: value.tool_use_id,
-                    name: value.name,
-                    arguments,
-                });
-            }
-            _ => return Err(InferenceError::InvalidUpstream),
-        }
-        if size > limit {
-            return Err(InferenceError::InvalidUpstream);
-        }
-    }
-    let reason = finish(&output.stop_reason)?;
-    if (reason == FinishReason::ToolCalls) != !calls.is_empty() {
-        return Err(InferenceError::InvalidUpstream);
-    }
-    let mut usage = output
-        .usage
-        .as_ref()
-        .map(usage)
-        .transpose()?
-        .unwrap_or_default();
-    usage.reported_model =
-        invoked_model(output.trace.as_ref().and_then(|t| t.prompt_router.as_ref()));
-    Ok(ChatResponse {
-        messages_content: None,
-        reasoning: None,
-        content: (!text.is_empty()).then_some(text),
-        tool_calls: calls,
-        finish_reason: reason,
-        usage,
-    })
-}
-/// Telemetry only: Converse reports the served model only for prompt routers
-/// (`trace.promptRouter.invokedModelId`). Otherwise it is unknown and Logs
-/// show the configured model id. Invalid values are unknown, never an error.
-fn invoked_model(trace: Option<&aws::PromptRouterTrace>) -> Option<ReportedModel> {
-    trace
-        .and_then(|t| t.invoked_model_id.as_deref())
-        .and_then(ReportedModel::parse)
-}
-
 fn sdk_messages_error<E: ProvideErrorMetadata>(
     error: SdkError<E>,
     messages: bool,
