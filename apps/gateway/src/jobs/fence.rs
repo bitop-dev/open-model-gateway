@@ -25,10 +25,30 @@
 //! A frozen runner inside a fenced transaction would hold the row against
 //! every claim: each fenced transaction therefore ends the session after
 //! [`IDLE_IN_TRANSACTION`] without a statement, which releases the lock.
+//!
+//! The poller claims provider jobs (videos, native and 0016 batches) with the
+//! same columns and the same rule (`store::claim_due`): the runner and the
+//! poller never claim the same row, because the runner takes only
+//! gateway-run batches and the poller every other job. Every poller write to
+//! a native batch's row up to and including its finish goes through the
+//! fenced methods below; what follows a committed finish (the idempotent
+//! settlement, the deletion of the provider's copies) is not fenced
+//! (`jobs::native`). Video and 0016 batch observations are not fenced: only
+//! their `state` change is compare-and-set (`store::observe`), while
+//! progress, counts and display status take whatever the observation read,
+//! so a stale poller, or a client read outside any claim (`get_video`), can
+//! write older values. Their claim only keeps two pollers from refreshing one
+//! job at once.
 use sqlx::{Postgres, Transaction, postgres::PgArguments, query::Query};
 use uuid::Uuid;
 
-use super::store::{Finished, JobRow, finish_locked_batch, job_storage, lock_batch_for_finish};
+use super::{
+    store::{
+        self, Finished, JobRow, finish_batch_tx, finish_locked_batch, job_storage,
+        lock_batch_for_finish,
+    },
+    types::RequestCounts,
+};
 use crate::store::Store;
 
 /// What a runner holds for one claim of a batch.
@@ -266,15 +286,9 @@ impl BatchFence {
                 return Ok(Publication::RebuildExpired);
             }
         }
-        let row =
-            finish_locked_batch(&mut tx, job, &result)
-                .await
-                .map_err(|error| match &error {
-                    sqlx::Error::Database(e) if e.code().as_deref() == Some("55P03") => {
-                        FenceError::FileBusy
-                    }
-                    _ => FenceError::Storage,
-                })?;
+        let row = finish_locked_batch(&mut tx, job, &result)
+            .await
+            .map_err(finish_error)?;
         // An error at COMMIT cannot authorize cleanup. The sweeper can
         // check whether the job links actually committed.
         tx.commit().await.map_err(|e| {
@@ -466,6 +480,97 @@ impl BatchFence {
             })?;
             return Ok(seq);
         }
+    }
+}
+
+/// Poller writes to a native batch. A refused hold ([`FenceError::Stale`])
+/// means another poller holds the batch: nothing was written.
+impl BatchFence {
+    /// Claim the submission: exclusive with an early cancel, and refused once
+    /// the claim ended, so a poller that lost the batch never submits it.
+    pub(crate) async fn claim_submit(&self, store: &Store) -> FenceResult<bool> {
+        let claimed = self.query("UPDATE async_jobs SET submit_started_at=clock_timestamp() WHERE id=$1 AND runner_id=$2 AND runner_epoch=$3 AND submit_started_at IS NULL AND upstream_id IS NULL AND cancel_requested_at IS NULL AND state='queued'")
+            .execute(&store.pool).await.map_err(job_storage)?.rows_affected();
+        Ok(claimed == 1)
+    }
+
+    /// Display status of an unfinished native batch, with the provider's
+    /// counts when it reported them.
+    pub(crate) async fn native_status(
+        &self,
+        store: &Store,
+        counts: Option<RequestCounts>,
+        status: &str,
+    ) -> FenceResult<()> {
+        let mut tx = self.begin(store, Hold::Update).await?;
+        if let Some(counts) = counts {
+            store::observe_counts(&mut tx, self.job, counts).await?;
+        }
+        store::observe_status(&mut tx, self.job, status).await?;
+        tx.commit().await.map_err(job_storage)?;
+        Ok(())
+    }
+
+    /// One provider observation of an unfinished native batch: its counts,
+    /// whether it runs, its display status and the next poll, together.
+    pub(crate) async fn observe_native(
+        &self,
+        store: &Store,
+        counts: Option<RequestCounts>,
+        running: bool,
+        status: &str,
+        interval_seconds: f64,
+    ) -> FenceResult<()> {
+        let mut tx = self.begin(store, Hold::Update).await?;
+        if let Some(counts) = counts {
+            store::observe_counts(&mut tx, self.job, counts).await?;
+        }
+        if running {
+            store::mark_running(&mut tx, self.job).await?;
+        }
+        store::observe_status(&mut tx, self.job, status).await?;
+        store::poll_ok(&mut tx, self.job, interval_seconds).await?;
+        tx.commit().await.map_err(job_storage)?;
+        Ok(())
+    }
+
+    /// Record a native batch's terminal state and result files. A batch that
+    /// is terminal already keeps what it recorded; the row says which files
+    /// it links.
+    pub(crate) async fn finish_native(
+        &self,
+        store: &Store,
+        f: &Finished<'_>,
+    ) -> FenceResult<JobRow> {
+        let mut tx = self.begin(store, Hold::Update).await?;
+        let row = finish_batch_tx(&mut tx, self.job, f)
+            .await
+            .map_err(finish_error)?;
+        // An error at COMMIT cannot authorize cleanup (as for a runner).
+        tx.commit().await.map_err(|e| {
+            job_storage(e);
+            FenceError::Unknown
+        })?;
+        Ok(row)
+    }
+
+    /// End the poller's claim; after a failed refresh also back off
+    /// (interval × 2^failures, at most 32×). Refused once the claim ended:
+    /// the next poll belongs to the claim that holds the job.
+    pub(crate) async fn end_poll(&self, store: &Store, failed: Option<f64>) -> FenceResult<()> {
+        let query = match failed {
+            None => self.query("UPDATE async_jobs SET runner_lease_until=NULL WHERE id=$1 AND runner_id=$2 AND runner_epoch=$3"),
+            Some(interval) => self.query("UPDATE async_jobs SET runner_lease_until=NULL,poll_failures=poll_failures+1,last_polled_at=clock_timestamp(),next_poll_at=clock_timestamp()+make_interval(secs=>$4*power(2,least(poll_failures,5))) WHERE id=$1 AND runner_id=$2 AND runner_epoch=$3").bind(interval),
+        };
+        self.update(store, query).await
+    }
+}
+
+/// A lock wait on a result file (`NOWAIT`) is [`FenceError::FileBusy`].
+fn finish_error(error: sqlx::Error) -> FenceError {
+    match &error {
+        sqlx::Error::Database(e) if e.code().as_deref() == Some("55P03") => FenceError::FileBusy,
+        _ => FenceError::Storage,
     }
 }
 
