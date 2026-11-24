@@ -87,7 +87,7 @@ impl LocalAdapter {
     ) -> Result<serde_json::Value> {
         let (client, _) = self.connection(target)?;
         let response = self
-            .authenticate(client.post(url), target)?
+            .authenticated_post(client, url, target)?
             .json(payload)
             .send()
             .await
@@ -95,13 +95,17 @@ impl LocalAdapter {
         framing::status(response.status())?;
         framing::body(response).await
     }
-    fn authenticate(
+    /// A POST to `url` with the connection's credential. The credential is
+    /// resolved before the request is built, so a reference that cannot be
+    /// resolved fails with nothing sent (`inference::dispatch`).
+    fn authenticated_post(
         &self,
-        builder: reqwest::RequestBuilder,
+        client: &crate::egress::HttpClient,
+        url: impl reqwest::IntoUrl,
         target: &Deployment,
     ) -> Result<reqwest::RequestBuilder> {
         if target.credential_ref == "none" {
-            return Ok(builder);
+            return Ok(client.post(url));
         }
         // Only environment references may cross an approved local connection.
         if !target.credential_ref.starts_with("env:") {
@@ -112,7 +116,9 @@ impl LocalAdapter {
             reqwest::header::HeaderValue::from_str(&format!("Bearer {}", secret.expose()))
                 .map_err(|_| InferenceError::Configuration)?;
         header.set_sensitive(true);
-        Ok(builder.header(reqwest::header::AUTHORIZATION, header))
+        Ok(client
+            .post(url)
+            .header(reqwest::header::AUTHORIZATION, header))
     }
     fn encode_chat(&self, target: &Deployment, request: &ChatRequest) -> Result<serde_json::Value> {
         super::messages::validate(request, super::messages::ProviderClass::Local)?;
@@ -207,7 +213,7 @@ impl ProviderAdapter for LocalAdapter {
         let payload = self.encode_chat(target, &request)?;
         let (client, base) = self.connection(target)?;
         let response = self
-            .authenticate(client.post(format!("{base}/chat/completions")), target)?
+            .authenticated_post(client, format!("{base}/chat/completions"), target)?
             .json(&payload)
             .send()
             .await
@@ -262,7 +268,7 @@ impl ProviderAdapter for LocalAdapter {
             (format!("{base}/embeddings"), payload)
         };
         let response = self
-            .authenticate(client.post(url), target)?
+            .authenticated_post(client, url, target)?
             .json(&payload)
             .send()
             .await

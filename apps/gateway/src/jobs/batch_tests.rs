@@ -483,6 +483,17 @@ async fn world(
     anthropic_native: bool,
     concurrency: usize,
 ) -> World {
+    world_with(pool, openai_native, anthropic_native, concurrency, None).await
+}
+/// [`world`] with `openai` registered in place of the OpenAI fake (which
+/// stays in `World::openai`, unregistered).
+async fn world_with(
+    pool: PgPool,
+    openai_native: bool,
+    anthropic_native: bool,
+    concurrency: usize,
+    openai_adapter: Option<Arc<dyn crate::providers::ProviderAdapter>>,
+) -> World {
     let f = fixture(pool).await;
     sqlx::query("UPDATE installation_settings SET file_batch_enabled=true WHERE singleton")
         .execute(&f.store.pool)
@@ -507,7 +518,9 @@ async fn world(
     let openai = Fake::new("openai", openai_native);
     let anthropic = Fake::new("anthropic", anthropic_native);
     let mut registry = ProviderRegistry::default();
-    registry.register(Arc::new(openai.clone())).unwrap();
+    registry
+        .register(openai_adapter.unwrap_or_else(|| Arc::new(openai.clone())))
+        .unwrap();
     registry.register(Arc::new(anthropic.clone())).unwrap();
     let engine = Engine::new(
         Arc::new(f.store.clone()),
@@ -2063,6 +2076,85 @@ async fn budget_exhaustion_mid_batch_stops_and_keeps_partial_results(pool: PgPoo
 /// runs afterwards fails exactly as the interactive endpoint refuses the key
 /// (401 `authentication_error`, never `model_not_found`), and nothing reaches
 /// a provider.
+/// A gateway-run line whose route's credential cannot be resolved (the real
+/// OpenAI adapter, nothing allowed to resolve) fails before any request is
+/// built: it settles at a known zero with its own ledger entry, nothing
+/// reaches the upstream, and the batch's envelope still closes.
+#[dbtest::test]
+async fn a_line_whose_credential_cannot_be_resolved_settles_as_a_known_zero(pool: PgPool) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counted = hits.clone();
+    let (upstream, _server) = crate::inference::admission_validation_tests::serve(
+        axum::Router::new().fallback(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }
+        }),
+    )
+    .await;
+    let adapter = Arc::new(crate::providers::openai::OpenAiAdapter::for_test(
+        Arc::new(crate::providers::secrets::EnvSecrets::new(Vec::new())),
+        format!("{upstream}/v1"),
+    ));
+    let w = world_with(pool, false, false, 1, Some(adapter)).await;
+    let f = &w.f;
+    let file = w
+        .upload(
+            &f.principal,
+            &[
+                chat_line("a", "company/smart", "one"),
+                chat_line("b", "company/smart", "two"),
+            ],
+        )
+        .await;
+    let job = w
+        .create(
+            f.principal,
+            &file,
+            BatchEndpoint::ChatCompletions,
+            // The real OpenAI adapter would otherwise run it natively.
+            Some(json!({"omg_mode": "gateway"})),
+        )
+        .await
+        .unwrap();
+    let _ = Runner::new(w.jobs.clone()).run_next().await;
+    let job = w.reload(&job).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    let errors = w.read(f.principal.workspace_id, job.error_file_id).await;
+    assert_eq!(errors.len(), 2, "{} {:?}", job.state, job.error_code);
+    type Line = (Uuid, String, String, Option<i64>, Option<i64>, Option<i64>);
+    let lines: Vec<Line> = sqlx::query_as(
+        "SELECT r.execution_id,e.state,r.state,r.actual_microusd,r.input_tokens,r.output_tokens FROM batch_lines b JOIN governance_reservations r ON r.execution_id=b.execution_id JOIN inference_executions e ON e.id=r.execution_id WHERE b.job_id=$1 ORDER BY b.line_no",
+    )
+    .bind(job.id)
+    .fetch_all(&f.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(lines.len(), 2);
+    for (execution, state, reservation, actual, input, output) in lines {
+        assert_eq!(
+            (state.as_str(), reservation.as_str(), actual, input, output),
+            ("failed", "settled", Some(0), Some(0), Some(0))
+        );
+        let ledger: Vec<(String, Option<i64>)> = sqlx::query_as(
+            "SELECT kind,amount_microusd FROM monetary_ledger WHERE execution_id=$1 ORDER BY kind",
+        )
+        .bind(execution)
+        .fetch_all(&f.store.pool)
+        .await
+        .unwrap();
+        assert_eq!(ledger.len(), 2, "{ledger:?}");
+        assert_eq!(ledger[1], ("settlement".into(), Some(0)));
+    }
+    let open: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM governance_reservations WHERE state<>'settled'")
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(open, 0, "the envelope and both lines are settled");
+    consistent(f).await;
+}
+
 #[dbtest::test]
 async fn lines_of_a_revoked_key_fail_with_the_authentication_error(pool: PgPool) {
     let w = world(pool, false, false, 1).await;

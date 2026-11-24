@@ -464,11 +464,15 @@ impl Engine {
             );
             let evidence_ok =
                 |u: Usage| valid_usage(u) && (!input_only || u.output_tokens == Some(0));
-            let (result, invalid_body_usage) = evidence::capture(timeout_at(
-                deadline,
-                request.clone().dispatch(adapter.as_ref(), target),
-            ))
-            .await;
+            // As for generation (`attempt::call_upstream`): the dispatch scope
+            // is outermost, and only a failure can be "nothing sent".
+            let ((result, invalid_body_usage), nothing_sent) =
+                super::dispatch::observe(evidence::capture(timeout_at(
+                    deadline,
+                    request.clone().dispatch(adapter.as_ref(), target),
+                )))
+                .await;
+            guard.telemetry.nothing_sent = nothing_sent && !matches!(result, Ok(Ok(_)));
             if let Some(observed) = invalid_body_usage.filter(|u| evidence_ok(*u)) {
                 guard.usage = observed;
             }
@@ -518,7 +522,9 @@ impl Engine {
                     guard.finish(Outcome::Failed, Some(error), None).await?;
                     if attempt + 1 < plan.max_attempts
                         && attempt + 1 < plan.deployment_ids.len()
-                        && crate::routing::may_failover(&plan, error)
+                        && (crate::routing::may_failover(&plan, error)
+                            || (guard.telemetry.nothing_sent
+                                && crate::routing::may_fail_over_unsent(&plan, error)))
                     {
                         continue;
                     }

@@ -154,7 +154,9 @@ impl Engine {
                 let failing_over = settled.is_ok()
                     && attempt + 1 < plan.max_attempts
                     && attempt + 1 < plan.deployment_ids.len()
-                    && crate::routing::may_failover(plan, error);
+                    && (crate::routing::may_failover(plan, error)
+                        || (guard.telemetry.nothing_sent
+                            && crate::routing::may_fail_over_unsent(plan, error)));
                 if failing_over {
                     return AttemptEnd::Failover(telemetry);
                 }
@@ -350,11 +352,17 @@ async fn call_upstream(
     // own default from its own immutable price, never from this cap.
     let mut attempt_request = request.clone();
     attempt_request.max_output_tokens = admission.max_output_tokens;
-    let (output, invalid_body_usage) = evidence::capture(timeout_at(
-        deadline,
-        adapter.execute_protocol(deployment, attempt_request, protocol),
-    ))
-    .await;
+    // The dispatch scope is outermost, so a timeout that drops the adapter
+    // call still reports whether it had built a request.
+    let ((output, invalid_body_usage), nothing_sent) =
+        super::dispatch::observe(evidence::capture(timeout_at(
+            deadline,
+            adapter.execute_protocol(deployment, attempt_request, protocol),
+        )))
+        .await;
+    // Only a failure can be "nothing sent": a returned response or stream
+    // came from the provider.
+    guard.telemetry.nothing_sent = nothing_sent && !matches!(output, Ok(Ok(_)));
     // A body that failed validation still fails, but its valid usage
     // object is retained as observed evidence (the hold is kept).
     if let Some(observed) = invalid_body_usage.filter(|u| valid_usage(*u)) {
