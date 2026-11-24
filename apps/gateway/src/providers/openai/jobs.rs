@@ -329,7 +329,7 @@ pub(super) fn encode_native_line(
     request: &BatchRequest,
 ) -> Result<Vec<u8>> {
     let body = match (request, endpoint.is_generation()) {
-        (BatchRequest::Chat(r), true) if !r.stream => super::encode(&target.upstream_model, r),
+        (BatchRequest::Chat(r), true) if !r.stream => super::encode_chat(&target.upstream_model, r),
         (BatchRequest::Embeddings(r), false) => {
             crate::providers::embeddings::validate(r)?;
             crate::providers::embeddings::encode(&target.upstream_model, r)

@@ -500,7 +500,8 @@ fn track_stream(
                     guard.first_token(text, &[]);
                     Ok(ChatEvent::MessagesBlock(value))
                 }
-                Ok(ChatEvent::Delta { .. }) if finished_choice => Err(InferenceError::InvalidUpstream),
+                Ok(ChatEvent::Reasoning(_) | ChatEvent::Delta { .. }) if finished_choice => Err(InferenceError::InvalidUpstream),
+                Ok(ChatEvent::Reasoning(text)) => { guard.first_token(Some(&text), &[]); Ok(ChatEvent::Reasoning(text)) }
                 Ok(ChatEvent::Delta { text, tool_calls }) => { guard.first_token(text.as_deref(), &tool_calls); Ok(ChatEvent::Delta { text, tool_calls }) }
                 Ok(ChatEvent::Finish(_)) if finished_choice => Err(InferenceError::InvalidUpstream),
                 Ok(ChatEvent::Finish(reason)) => { finished_choice = true; guard.telemetry.finish_reason = Some(reason.into()); Ok(ChatEvent::Finish(reason)) }

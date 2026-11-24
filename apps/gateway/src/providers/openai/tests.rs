@@ -1099,3 +1099,72 @@ async fn error_tool_sdk_openai(pool: sqlx::PgPool) {
         super::super::contract::assert_error_tool_chat_wire(&captured.body, error, &text);
     }
 }
+
+/// Messages effort/format/strict reach OpenAI Chat's own controls. Thinking has
+/// no Chat control (no budget or on/off switch), so it never reaches the wire.
+#[tokio::test]
+async fn messages_reasoning_and_structured_output_use_openai_chat_controls() {
+    use super::super::contract::{messages_request, output_schema};
+    let mock = Mock::json(complete()).await;
+    let format = json!({"type":"json_schema","json_schema":{"name":"output","schema":output_schema(),"strict":true}});
+    for (extra, effort, structured, strict) in [
+        (
+            json!({"thinking":{"type":"enabled","budget_tokens":2048},
+                "output_config":{"effort":"max","format":{"type":"json_schema","schema":output_schema()}},
+                "tools":[{"name":"lookup","input_schema":{"type":"object"},"strict":true}]}),
+            Some("max"),
+            true,
+            Some(true),
+        ),
+        (
+            json!({"tools":[{"name":"lookup","input_schema":{"type":"object"},"strict":false}]}),
+            None,
+            false,
+            Some(false),
+        ),
+        (json!({"thinking":{"type":"adaptive"}}), None, false, None),
+        (
+            json!({"thinking":{"type":"disabled"},"output_config":{"effort":"low"}}),
+            Some("low"),
+            false,
+            None,
+        ),
+        (
+            json!({"output_config":{"effort":"xhigh"}}),
+            Some("xhigh"),
+            false,
+            None,
+        ),
+    ] {
+        let request = messages_request(extra.clone());
+        mock.adapter().validate_chat_request(&request).unwrap();
+        mock.adapter().execute(&target(), request).await.unwrap();
+        let capture = mock.requests.lock().unwrap();
+        let body = &capture.last().unwrap().body;
+        assert_eq!(
+            body.get("reasoning_effort"),
+            effort.map(|e| json!(e)).as_ref(),
+            "{extra}"
+        );
+        assert_eq!(
+            body.get("response_format"),
+            structured.then_some(&format),
+            "{extra}"
+        );
+        assert_eq!(
+            body["tools"][0]["function"].get("strict"),
+            strict.map(|s| json!(s)).as_ref()
+        );
+        for absent in ["reasoning", "thinking", "output_config", "budget_tokens"] {
+            assert!(body.get(absent).is_none(), "{absent}");
+        }
+    }
+    // Chat Completions requests keep their own refusal of these controls.
+    mock.adapter()
+        .execute(&target(), request(false))
+        .await
+        .unwrap();
+    let capture = mock.requests.lock().unwrap();
+    let body = &capture.last().unwrap().body;
+    assert!(body.get("reasoning_effort").is_none() && body.get("response_format").is_none());
+}

@@ -617,3 +617,27 @@ fn native_messages_batch_marks_failed_tool_results_on_chat_wire() {
         assert_error_tool_chat_wire(&line["body"], failed, &text);
     }
 }
+
+/// A Messages batch line carries the same OpenAI controls as an interactive
+/// request: effort and structured output are never silently dropped.
+#[test]
+fn native_messages_lines_map_reasoning_and_structured_output() {
+    use crate::providers::contract::{messages_request, output_schema};
+    let request = messages_request(json!({"output_config":{"effort":"high",
+        "format":{"type":"json_schema","schema":output_schema()}}}));
+    let line: Value = serde_json::from_slice(
+        &encode_native_line(
+            &target("gpt-fixture"),
+            BatchEndpoint::Messages,
+            "l0",
+            &BatchRequest::Chat(request),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(line["body"]["reasoning_effort"], "high");
+    assert_eq!(
+        line["body"]["response_format"],
+        json!({"type":"json_schema","json_schema":{"name":"output","schema":output_schema(),"strict":true}})
+    );
+}

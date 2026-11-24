@@ -381,6 +381,7 @@ fn decode_shape(value: &Value, messages: bool) -> Result<ChatResponse> {
     }
     Ok(ChatResponse {
         messages_content: messages.then(|| blocks.clone()),
+        reasoning: None,
         content: if text.is_empty() { None } else { Some(text) },
         tool_calls: calls,
         finish_reason: finish(&value["stop_reason"])?,

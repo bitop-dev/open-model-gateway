@@ -82,15 +82,29 @@ pub(crate) fn validate(request: &ChatRequest, class: ProviderClass) -> Result<()
     if class != ProviderClass::Anthropic && !options.images.is_empty() {
         return refuse("image");
     }
-    if options
-        .output_config
-        .as_ref()
-        .is_some_and(|v| v.get("format").is_some())
-    {
-        return refuse("output_config.format");
+    // OpenAI-style adapters map structured output and strict tools to their
+    // JSON-schema controls; no other route has a faithful mapping yet.
+    if class != ProviderClass::OpenAi {
+        if options
+            .output_config
+            .as_ref()
+            .is_some_and(|v| v.get("format").is_some())
+        {
+            return refuse("output_config.format");
+        }
+        if options.strict_tools {
+            return refuse("strict");
+        }
     }
-    if options.strict_tools {
-        return refuse("strict");
+    // A native route forwards history with its signature; an unsigned block
+    // (a translated reply replayed) cannot be forwarded and is refused.
+    if class == ProviderClass::Anthropic
+        && options
+            .history_thinking
+            .iter()
+            .any(|b| b["type"] == "thinking" && b.get("signature").is_none())
+    {
+        return refuse("thinking");
     }
     if class == ProviderClass::Bedrock {
         // The Converse mapping cannot carry these Messages controls.

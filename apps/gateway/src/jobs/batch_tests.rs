@@ -253,6 +253,7 @@ impl ProviderAdapter for Fake {
                 billing.cache_read_input_tokens = Some(5);
                 Ok(ProviderOutput::Complete(ChatResponse {
                     messages_content: None,
+                    reasoning: None,
                     content: Some("cached answer".into()),
                     tool_calls: vec![],
                     finish_reason: FinishReason::Stop,
@@ -261,6 +262,7 @@ impl ProviderAdapter for Fake {
             }
             "oversized-result" => Ok(ProviderOutput::Complete(ChatResponse {
                 messages_content: None,
+                reasoning: None,
                 content: Some("\0".repeat(super::io::RESULT_LINE_BYTES / 6)),
                 tool_calls: vec![],
                 finish_reason: FinishReason::Stop,
@@ -272,6 +274,7 @@ impl ProviderAdapter for Fake {
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 Ok(ProviderOutput::Complete(ChatResponse {
                     messages_content: None,
+                    reasoning: None,
                     content: Some("ok".into()),
                     tool_calls: vec![],
                     finish_reason: FinishReason::Stop,
@@ -280,6 +283,7 @@ impl ProviderAdapter for Fake {
             }
             "huge" => Ok(ProviderOutput::Complete(ChatResponse {
                 messages_content: None,
+                reasoning: None,
                 content: Some("ok".into()),
                 tool_calls: vec![],
                 finish_reason: FinishReason::Stop,
@@ -287,6 +291,7 @@ impl ProviderAdapter for Fake {
             })),
             _ => Ok(ProviderOutput::Complete(ChatResponse {
                 messages_content: None,
+                reasoning: None,
                 content: Some(format!("answer to {text}")),
                 tool_calls: vec![],
                 finish_reason: FinishReason::Stop,
@@ -416,6 +421,7 @@ impl ProviderAdapter for Fake {
         let outcome = if v["ok"] == json!(true) {
             NativeOutcome::Succeeded(Box::new(BatchResponse::Chat(ChatResponse {
                 messages_content: None,
+                reasoning: None,
                 content: Some("native answer".into()),
                 tool_calls: vec![],
                 finish_reason: FinishReason::Stop,

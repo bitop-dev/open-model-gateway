@@ -284,7 +284,7 @@ impl ProviderAdapter for OpenAiAdapter {
             .client
             .post(format!("{}/chat/completions", self.base))
             .header(header::AUTHORIZATION, authorization)
-            .json(&encode(&target.upstream_model, &request))
+            .json(&encode_chat(&target.upstream_model, &request))
             .send()
             .await
             .map_err(transport_error)?;
@@ -350,6 +350,8 @@ fn transport_error(error: reqwest::Error) -> InferenceError {
 fn check_status(status: StatusCode) -> Result<()> {
     super::framing::status(status)
 }
+
+pub(super) use chat_controls::{encode_chat, json_schema_format};
 
 pub(super) fn encode(model: &str, request: &ChatRequest) -> Value {
     let messages: Vec<Value> = request
@@ -480,34 +482,9 @@ fn known_fields(value: &Value, allowed: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Local servers (SGLang, vLLM, Ollama) add stop metadata to a choice
-/// (`matched_stop`, `stop_reason`: the matched stop token id or string) and,
-/// with a reasoning parser, a separate reasoning trace to the message or delta
-/// (`reasoning_content`, `reasoning`). As on OpenRouter, the trace is not
-/// returned to clients; its tokens stay in `completion_tokens`. The extras are
-/// accepted only for local profiles and only with those scalar shapes.
-type LocalExtras = (&'static [&'static str], fn(&Value) -> bool);
-const LOCAL_STOP_FIELDS: LocalExtras = (&["matched_stop", "stop_reason"], |v| {
-    v.is_null() || v.is_string() || v.is_u64() || v.is_i64()
-});
-const LOCAL_REASONING_FIELDS: LocalExtras = (&["reasoning_content", "reasoning"], |v| {
-    v.is_null() || v.is_string()
-});
-fn known_profile_fields(
-    value: &Value,
-    allowed: &[&str],
-    profile: Option<&str>,
-    (extras, valid): LocalExtras,
-) -> Result<()> {
-    if profile.is_none() {
-        return known_fields(value, allowed);
-    }
-    if extras.iter().any(|key| !valid(&value[*key])) {
-        return Err(InferenceError::InvalidUpstream);
-    }
-    let all: Vec<&str> = allowed.iter().chain(extras).copied().collect();
-    known_fields(value, &all)
-}
+use local_fields::{
+    LOCAL_REASONING_FIELDS, LOCAL_STOP_FIELDS, known_profile_fields, local_reasoning,
+};
 
 fn finish(value: &Value) -> Result<FinishReason> {
     match string(value)? {
@@ -634,8 +611,14 @@ fn decode_shape(value: &Value, profile: Option<&str>, messages: bool) -> Result<
             });
         }
     }
+    // Only Messages clients receive a local trace (as unsigned thinking).
+    let reasoning = match profile {
+        Some(_) if messages => local_reasoning(message)?,
+        _ => None,
+    };
     Ok(ChatResponse {
         messages_content: None,
+        reasoning,
         content,
         tool_calls,
         finish_reason: finish(&choice["finish_reason"])?,
@@ -729,6 +712,12 @@ impl StreamState {
                         arguments: optional_string(&function["arguments"])?,
                     });
                 }
+            }
+            if self.messages
+                && self.profile.is_some()
+                && let Some(reasoning) = local_reasoning(delta)?
+            {
+                events.push(ChatEvent::Reasoning(reasoning));
             }
             if text.is_some() || !tool_calls.is_empty() {
                 events.push(ChatEvent::Delta { text, tool_calls });
@@ -857,8 +846,10 @@ pub(super) fn decode_stream_profile(
 }
 
 mod audio;
+mod chat_controls;
 mod images;
 mod jobs;
+mod local_fields;
 pub(crate) mod realtime;
 #[cfg(test)]
 mod tests;

@@ -14,8 +14,9 @@
 //!   micro-USD (rounded up) for `provider_cost_microusd` evidence only; it is
 //!   never the gateway charge.
 //! - Chat: OpenRouter-only fields (`native_finish_reason`, reasoning traces)
-//!   are normalized away; reasoning traces are not returned to clients but
-//!   their tokens stay in `completion_tokens`. The final streaming accounting
+//!   are normalized away. The `reasoning` text reaches only Messages clients
+//!   (as unsigned thinking); `reasoning_details` is never returned. Reasoning
+//!   tokens stay in `completion_tokens`. The final streaming accounting
 //!   frame (repeated finish choice with an empty delta plus `usage`) is treated
 //!   as usage, not as a second terminal event.
 use std::{sync::Arc, time::Duration};
@@ -411,9 +412,11 @@ fn parse_protocol(bytes: &[u8], messages: bool) -> Result<(Value, Option<i64>)> 
 
 /// Remove OpenRouter-only choice fields after type-checking them, so the
 /// shared OpenAI decoder still rejects every other unknown content field.
-fn normalize_choices(value: &mut Value) -> Result<()> {
+/// Returns the nonempty `reasoning` text (the decoder allows one choice).
+fn normalize_choices(value: &mut Value) -> Result<Option<String>> {
+    let mut reasoning = None;
     let Some(choices) = value.get_mut("choices").and_then(Value::as_array_mut) else {
-        return Ok(());
+        return Ok(reasoning);
     };
     for choice in choices {
         let Some(choice) = choice.as_object_mut() else {
@@ -426,10 +429,12 @@ fn normalize_choices(value: &mut Value) -> Result<()> {
         }
         for key in ["message", "delta"] {
             if let Some(message) = choice.get_mut(key).and_then(Value::as_object_mut) {
-                if let Some(text) = message.remove("reasoning")
-                    && !(text.is_null() || text.is_string())
-                {
-                    return Err(InferenceError::InvalidUpstream);
+                match message.remove("reasoning") {
+                    Some(Value::String(text)) if !text.is_empty() => reasoning = Some(text),
+                    Some(text) if !(text.is_null() || text.is_string()) => {
+                        return Err(InferenceError::InvalidUpstream);
+                    }
+                    _ => {}
                 }
                 if let Some(details) = message.remove("reasoning_details")
                     && !(details.is_null() || details.is_array())
@@ -439,25 +444,73 @@ fn normalize_choices(value: &mut Value) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(reasoning)
+}
+
+/// OpenRouter's controls for Messages fields. `reasoning` takes an effort or
+/// a token budget, never both: an explicit effort wins over a thinking budget,
+/// and disabled thinking turns reasoning off whatever the effort. Thinking
+/// `display:"omitted"` asks OpenRouter not to return the text. Structured
+/// output and strict tools set `require_parameters`, so OpenRouter routes only
+/// to providers that support every sent parameter rather than ignoring them.
+fn messages_controls(body: &mut Value, request: &ChatRequest) {
+    let Some(options) = &request.messages_options else {
+        return;
+    };
+    let config = options.output_config.as_ref();
+    let mut reasoning = serde_json::Map::new();
+    if let Some(thinking) = &options.thinking
+        && thinking["type"] == "disabled"
+    {
+        reasoning.insert("enabled".into(), json!(false));
+    } else {
+        if let Some(effort) = config.and_then(|c| c.get("effort")) {
+            reasoning.insert("effort".into(), effort.clone());
+        } else if let Some(thinking) = &options.thinking {
+            match thinking.get("budget_tokens") {
+                Some(budget) => reasoning.insert("max_tokens".into(), budget.clone()),
+                None => reasoning.insert("enabled".into(), json!(true)),
+            };
+        }
+        if options
+            .thinking
+            .as_ref()
+            .is_some_and(|t| t["display"] == "omitted")
+        {
+            reasoning.insert("exclude".into(), json!(true));
+        }
+    }
+    if !reasoning.is_empty() {
+        body["reasoning"] = Value::Object(reasoning);
+    }
+    let format = config.and_then(|c| c.get("format"));
+    if let Some(format) = format {
+        body["response_format"] = openai::json_schema_format(&format["schema"]);
+    }
+    if format.is_some() || request.tools.iter().any(|t| t.strict == Some(true)) {
+        body["provider"]["require_parameters"] = json!(true);
+    }
 }
 
 fn decode_chat(bytes: &[u8], messages: bool) -> Result<ChatResponse> {
     let (mut value, cost) = parse_protocol(bytes, messages)?;
-    normalize_choices(&mut value)?;
+    let reasoning = normalize_choices(&mut value)?;
     let mut response = openai::decode_complete(&value)?;
     response.usage.provider_cost_microusd = cost;
+    // Only Messages clients receive the trace.
+    response.reasoning = reasoning.filter(|_| messages);
     Ok(response)
 }
 
 /// Normalize one SSE data frame. `finish` is the first finish reason seen.
+/// Returns the frame for the shared decoder, its cost and reasoning text.
 fn normalize_frame(
     data: &[u8],
     finish: &mut Option<String>,
     messages: bool,
-) -> Result<(Vec<u8>, Option<i64>)> {
+) -> Result<(Vec<u8>, Option<i64>, Option<String>)> {
     if data == b"[DONE]" {
-        return Ok((data.to_vec(), None));
+        return Ok((data.to_vec(), None, None));
     }
     let mut value: Value =
         serde_json::from_slice(data).map_err(|_| InferenceError::InvalidUpstream)?;
@@ -466,8 +519,10 @@ fn normalize_frame(
     }
     stream_embedded_error(&value, messages)?;
     let cost = provider_cost(data)?;
-    normalize_choices(&mut value)?;
+    let reasoning = normalize_choices(&mut value)?;
+    // A frame carrying reasoning is content, never the accounting repeat.
     if let Some(previous) = finish.as_deref()
+        && reasoning.is_none()
         && !value["usage"].is_null()
         && let Some([choice]) = value["choices"].as_array().map(Vec::as_slice)
     {
@@ -493,6 +548,7 @@ fn normalize_frame(
     Ok((
         serde_json::to_vec(&value).map_err(|_| InferenceError::InvalidUpstream)?,
         cost,
+        reasoning,
     ))
 }
 
@@ -506,8 +562,13 @@ fn decode_chat_stream(response: reqwest::Response, messages: bool) -> EventStrea
             let chunk = chunk.map_err(transport)?;
             for &byte in chunk.iter() {
                 if let Some(data) = decoder.push(byte)? {
-                    let (frame, cost) = normalize_frame(&data, &mut finish, messages)?;
-                    for event in state.decode(&frame)? {
+                    let (frame, cost, reasoning) = normalize_frame(&data, &mut finish, messages)?;
+                    // The frame is validated before its reasoning is released.
+                    let events = state.decode(&frame)?;
+                    if let Some(reasoning) = reasoning.filter(|_| messages) {
+                        yield ChatEvent::Reasoning(reasoning);
+                    }
+                    for event in events {
                         let event = match event {
                             ChatEvent::Usage(mut usage) => {
                                 usage.provider_cost_microusd = cost;
@@ -612,6 +673,7 @@ impl ProviderAdapter for OpenRouterAdapter {
         let mut body = openai::encode(&target.upstream_model, &request);
         body["provider"] = self.provider_preferences();
         body["usage"] = json!({"include": true});
+        messages_controls(&mut body, &request);
         let response = self
             .post_inner(
                 target,

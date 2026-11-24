@@ -86,9 +86,12 @@ fn claude_code_field_rules_by_provider_class() {
                     field,
                     "cache_control" | "thinking" | "context_management" | "defer_loading"
                 );
-            if bedrock_refuses
-                || (always_refuse && (field != "image" || class != ProviderClass::Anthropic))
-            {
+            // Anthropic forwards images; OpenAI-style routes map structured
+            // output and strict tools to their own JSON-schema controls.
+            let supported = (field == "image" && class == ProviderClass::Anthropic)
+                || (matches!(field, "output_config.format" | "strict")
+                    && class == ProviderClass::OpenAi);
+            if bedrock_refuses || (always_refuse && !supported) {
                 assert!(
                     matches!(verdict, Err(InferenceError::InvalidField(f)) if f == field),
                     "{field}"
@@ -167,9 +170,10 @@ fn wire_strict_presence_does_not_reinterpret_shared_adapter_tool_settings() {
             json!({"tools":[{"name":"lookup","input_schema":{"type":"object"},"strict":strict}]}),
         )
         .unwrap();
+        // OpenAI-style routes map wire `strict` to `function.strict`.
+        assert!(crate::providers::messages::validate(&r, ProviderClass::OpenAi).is_ok());
         for class in [
             ProviderClass::Anthropic,
-            ProviderClass::OpenAi,
             ProviderClass::Bedrock,
             ProviderClass::Local,
         ] {
@@ -532,4 +536,174 @@ fn beta_query_uses_the_same_exact_route_policy() {
     assert_eq!(entries[0].access, Access::InferenceKey);
     assert_eq!(entries[0].token_policy, TokenPolicy::Denied);
     assert!(ROUTES.iter().all(|r| !r.path.contains('?')));
+}
+
+/// Translated replies return thinking without a signature, so Claude Code
+/// replays unsigned blocks. Translated routes remove them like any foreign
+/// history; a native Anthropic route cannot forward a block without its
+/// signature and refuses it, as Bedrock refuses all thinking history.
+#[test]
+fn unsigned_thinking_history_is_removed_or_refused_by_route() {
+    let parsed = request(json!({"messages":[{"role":"user","content":"hello"},
+        {"role":"assistant","content":[{"type":"thinking","thinking":"plan"},{"type":"text","text":"answer"}]},
+        {"role":"user","content":"continue"}]}))
+    .unwrap();
+    for (class, verdict) in [
+        (ProviderClass::Anthropic, Some("thinking")),
+        (ProviderClass::Bedrock, Some("thinking")),
+        (ProviderClass::OpenAi, None),
+        (ProviderClass::Local, None),
+    ] {
+        let result = crate::providers::messages::validate(&parsed, class);
+        match verdict {
+            Some(field) => {
+                assert!(matches!(result, Err(InferenceError::InvalidField(f)) if f == field))
+            }
+            None => assert!(result.is_ok()),
+        }
+    }
+    // Signed history is still forwarded natively; other fields stay strict.
+    let signed = request(json!({"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"plan","signature":"opaque"}]},{"role":"user","content":"go"}]})).unwrap();
+    assert!(crate::providers::messages::validate(&signed, ProviderClass::Anthropic).is_ok());
+    for block in [
+        json!({"type":"thinking","thinking":"plan","signature":null}),
+        json!({"type":"thinking","thinking":"plan","signature":7}),
+        json!({"type":"thinking"}),
+        json!({"type":"thinking","thinking":"plan","extra":true}),
+    ] {
+        assert!(request(json!({"messages":[{"role":"assistant","content":[block]},{"role":"user","content":"go"}]})).is_err());
+    }
+}
+
+fn sse_values(text: &str) -> Vec<Value> {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect()
+}
+
+/// Translated reasoning streams as unsigned `thinking` blocks in arrival
+/// order, each closed before the next block opens; tools follow at the next
+/// indexes. The JSON reply puts the reasoning first. No signature is invented.
+#[tokio::test]
+async fn translated_reasoning_renders_as_unsigned_thinking_blocks() {
+    let call = ToolCallDelta {
+        index: 0,
+        id: Some("call".into()),
+        name: Some("lookup".into()),
+        arguments: Some("{}".into()),
+    };
+    let events = vec![
+        Ok(ChatEvent::Reasoning("think ".into())),
+        Ok(ChatEvent::Reasoning("more".into())),
+        Ok(ChatEvent::Delta {
+            text: Some("answer".into()),
+            tool_calls: vec![],
+        }),
+        Ok(ChatEvent::Reasoning("again".into())),
+        Ok(ChatEvent::Delta {
+            text: Some("done".into()),
+            tool_calls: vec![call],
+        }),
+        Ok(ChatEvent::Finish(FinishReason::ToolCalls)),
+        Ok(ChatEvent::Done),
+    ];
+    let response = render(
+        ProviderOutput::Stream(Box::pin(futures_util::stream::iter(events))),
+        "id".into(),
+        "public".into(),
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), OUTPUT_LIMIT)
+        .await
+        .unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(!text.contains("signature"));
+    let blocks: Vec<_> = sse_values(text)
+        .into_iter()
+        .filter(|v| v["type"].as_str().unwrap().starts_with("content_block_"))
+        .collect();
+    let thinking = |index: u32| json!({"type":"content_block_start","index":index,"content_block":{"type":"thinking","thinking":""}});
+    let text_start = |index: u32| json!({"type":"content_block_start","index":index,"content_block":{"type":"text","text":""}});
+    let delta = |index: u32, kind: &str, field: &str, value: &str| json!({"type":"content_block_delta","index":index,"delta":{"type":kind,field:value}});
+    let stop = |index: u32| json!({"type":"content_block_stop","index":index});
+    assert_eq!(
+        blocks,
+        vec![
+            thinking(0),
+            delta(0, "thinking_delta", "thinking", "think "),
+            delta(0, "thinking_delta", "thinking", "more"),
+            stop(0),
+            text_start(1),
+            delta(1, "text_delta", "text", "answer"),
+            stop(1),
+            thinking(2),
+            delta(2, "thinking_delta", "thinking", "again"),
+            stop(2),
+            text_start(3),
+            delta(3, "text_delta", "text", "done"),
+            stop(3),
+            json!({"type":"content_block_start","index":4,"content_block":{"type":"tool_use","id":"call","name":"lookup","input":{}}}),
+            delta(4, "input_json_delta", "partial_json", "{}"),
+            stop(4),
+        ]
+    );
+    assert!(text.contains("event: message_stop"));
+
+    let response = render(
+        ProviderOutput::Complete(ChatResponse {
+            messages_content: None,
+            reasoning: Some("plan".into()),
+            content: Some("answer".into()),
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: Usage::default(),
+        }),
+        "id".into(),
+        "public".into(),
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), OUTPUT_LIMIT)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        value["content"],
+        json!([{"type":"thinking","thinking":"plan"},{"type":"text","text":"answer"}])
+    );
+}
+
+/// Reasoning counts toward the Messages output bound like text does.
+#[tokio::test]
+async fn translated_reasoning_counts_toward_the_output_bound() {
+    let events = vec![
+        Ok(ChatEvent::Reasoning("r".repeat(OUTPUT_LIMIT))),
+        Ok(ChatEvent::Delta {
+            text: Some("x".into()),
+            tool_calls: vec![],
+        }),
+        Ok(ChatEvent::Finish(FinishReason::Stop)),
+        Ok(ChatEvent::Done),
+    ];
+    let response = render(
+        ProviderOutput::Stream(Box::pin(futures_util::stream::iter(events))),
+        "id".into(),
+        "public".into(),
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), 2 * OUTPUT_LIMIT + 4096)
+        .await
+        .unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(text.contains("event: error") && !text.contains("event: message_stop"));
+    let response = render(
+        ProviderOutput::Complete(ChatResponse {
+            messages_content: None,
+            reasoning: Some("r".repeat(OUTPUT_LIMIT)),
+            content: Some("x".into()),
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: Usage::default(),
+        }),
+        "id".into(),
+        "public".into(),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
 }

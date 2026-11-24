@@ -66,6 +66,7 @@ impl ProviderAdapter for FixtureAdapter {
         assert_eq!(target.upstream_model, "fixture-upstream-id");
         Ok(ProviderOutput::Complete(ChatResponse {
             messages_content: None,
+            reasoning: None,
             content: Some("hello".into()),
             tool_calls: vec![],
             finish_reason: FinishReason::Stop,

@@ -2939,6 +2939,7 @@
         ]
       },
       "GenThinkingBlock": {
+        "$comment": "Assistant history only. This is the native Anthropic form: a native route refuses a thinking block without signature (400 thinking). Translated routes return thinking without a signature, also accept it back without one, and remove all thinking history before dispatch.",
         "additionalProperties": false,
         "properties": {
           "signature": {
@@ -10030,7 +10031,7 @@
             "code": null,
             "envelope": "AnthropicErrorEnvelope",
             "status": 400,
-            "trigger": "strict tools, output_config.format, disable_parallel_tool_use, hosted/server tools, remote image sources or denied beta prefixes"
+            "trigger": "strict tools or output_config.format outside OpenAI-style routes, disable_parallel_tool_use, hosted/server tools, remote image sources or denied beta prefixes"
           },
           {
             "code": null,

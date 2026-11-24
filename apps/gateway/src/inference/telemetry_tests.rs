@@ -168,6 +168,7 @@ impl ProviderAdapter for Adapter {
         match mode.unwrap_or(Mode::Error(InferenceError::Storage)) {
             Mode::Complete(usage) => Ok(ProviderOutput::Complete(ChatResponse {
                 messages_content: None,
+                reasoning: None,
                 content: Some("hello".into()),
                 tool_calls: vec![],
                 finish_reason: FinishReason::Stop,

@@ -1,3 +1,7 @@
 # Open Model Gateway: unreleased
 
 Notes for changes on `main` after [v0.19.0](v0.19.0.md). They become the next release's notes.
+
+## Gateway behavior
+
+- **Claude Code on OpenAI-style models: reasoning and structured output** (#70, delivery 3). Messages requests to OpenAI and OpenRouter models now map `output_config.effort`, `thinking`, `output_config.format` and tool `strict` to the provider's own controls instead of dropping or refusing them. OpenAI Chat receives `reasoning_effort` and a strict `json_schema` `response_format`; it has no thinking control, so `thinking` is still dropped there. OpenRouter receives its `reasoning` object, the same `response_format` and `provider.require_parameters:true`, so it routes only to providers that support the sent parameters. Reasoning text returned by OpenRouter and by local reasoning parsers (vLLM, SGLang, Ollama) now reaches Messages clients as `thinking` blocks without a signature, in JSON and SSE. Chat Completions and Responses clients still never receive it. Claude Code may replay those unsigned blocks: translated routes remove them as before, and a native Anthropic route refuses them with 400 `thinking`. Local profiles keep dropping reasoning controls and refusing `output_config.format`/`strict`. Bedrock and native Anthropic are unchanged. Reasoning tokens remain inside the reported output count; holds, settlement and missing-usage handling are unchanged. No migration, runtime grant or route changes. [Claude Code field rules](../protocol-matrix.md#claude-code-field-rules)

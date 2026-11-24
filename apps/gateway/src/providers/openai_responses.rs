@@ -230,6 +230,7 @@ fn decode_shape(value: &Value) -> Result<ChatResponse> {
     }
     Ok(ChatResponse {
         messages_content: None,
+        reasoning: None,
         content: if text.is_empty() { None } else { Some(text) },
         finish_reason: if reason == FinishReason::Stop && !calls.is_empty() {
             FinishReason::ToolCalls

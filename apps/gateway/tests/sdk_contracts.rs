@@ -96,6 +96,7 @@ impl ProviderAdapter for Fixture {
         } else {
             Ok(ProviderOutput::Complete(ChatResponse {
                 messages_content: None,
+                reasoning: None,
                 content: Some(text.into()),
                 tool_calls: calls,
                 finish_reason,

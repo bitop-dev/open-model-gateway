@@ -1163,3 +1163,218 @@ async fn error_tool_sdk_openrouter(pool: sqlx::PgPool) {
         super::super::contract::assert_error_tool_chat_wire(&captured.body, error, &text);
     }
 }
+
+/// Messages thinking/effort map to OpenRouter's unified `reasoning` object.
+/// It takes an effort or a token budget, never both, so an explicit effort
+/// wins over a thinking budget. Structured output and strict tools require
+/// every routed provider to support the sent parameters.
+#[tokio::test]
+async fn messages_reasoning_and_structured_output_use_openrouter_controls() {
+    use super::super::contract::{messages_request, output_schema};
+    let mock = Mock::json(glm_complete()).await;
+    let budget = json!({"type":"enabled","budget_tokens":2048});
+    let format = json!({"type":"json_schema","schema":output_schema()});
+    let strict_tool =
+        |strict: bool| json!([{"name":"lookup","input_schema":{"type":"object"},"strict":strict}]);
+    for (extra, reasoning, required) in [
+        (
+            json!({"thinking":budget}),
+            Some(json!({"max_tokens":2048})),
+            false,
+        ),
+        (
+            json!({"thinking":{"type":"adaptive"}}),
+            Some(json!({"enabled":true})),
+            false,
+        ),
+        (
+            json!({"thinking":{"type":"adaptive","display":"omitted"}}),
+            Some(json!({"enabled":true,"exclude":true})),
+            false,
+        ),
+        (
+            json!({"thinking":{"type":"enabled","budget_tokens":2048,"display":"summarized"}}),
+            Some(json!({"max_tokens":2048})),
+            false,
+        ),
+        (
+            json!({"thinking":{"type":"adaptive"},"output_config":{"effort":"high"}}),
+            Some(json!({"effort":"high"})),
+            false,
+        ),
+        (
+            json!({"thinking":budget,"output_config":{"effort":"max"}}),
+            Some(json!({"effort":"max"})),
+            false,
+        ),
+        (
+            json!({"output_config":{"effort":"xhigh"}}),
+            Some(json!({"effort":"xhigh"})),
+            false,
+        ),
+        (
+            json!({"thinking":{"type":"disabled"}}),
+            Some(json!({"enabled":false})),
+            false,
+        ),
+        (
+            json!({"thinking":{"type":"disabled"},"output_config":{"effort":"low"}}),
+            Some(json!({"enabled":false})),
+            false,
+        ),
+        (json!({}), None, false),
+        (json!({"output_config":{"format":format}}), None, true),
+        (json!({"tools":strict_tool(true)}), None, true),
+        (json!({"tools":strict_tool(false)}), None, false),
+    ] {
+        let request = messages_request(extra.clone());
+        mock.adapter().validate_chat_request(&request).unwrap();
+        mock.adapter()
+            .execute(&target("private"), request)
+            .await
+            .unwrap();
+        let (_, _, body) = mock.last();
+        assert_eq!(body.get("reasoning"), reasoning.as_ref(), "{extra}");
+        let mut provider = json!({"data_collection":"deny"});
+        if required {
+            provider["require_parameters"] = json!(true);
+        }
+        assert_eq!(body["provider"], provider, "{extra}");
+        let structured = extra["output_config"].get("format").is_some();
+        assert_eq!(
+            body.get("response_format"),
+            structured
+                .then(|| json!({"type":"json_schema","json_schema":{"name":"output","schema":output_schema(),"strict":true}}))
+                .as_ref(),
+            "{extra}"
+        );
+        assert_eq!(
+            body["tools"][0]["function"].get("strict"),
+            extra["tools"][0].get("strict")
+        );
+        for absent in ["reasoning_effort", "thinking", "output_config"] {
+            assert!(body.get(absent).is_none(), "{absent}");
+        }
+    }
+    // Chat Completions requests are unchanged.
+    mock.adapter()
+        .execute(&target("private"), chat(false))
+        .await
+        .unwrap();
+    let (_, _, body) = mock.last();
+    assert!(body.get("reasoning").is_none() && body.get("response_format").is_none());
+    assert_eq!(body["provider"], json!({"data_collection":"deny"}));
+}
+
+/// OpenRouter's `reasoning` text reaches Messages clients as reasoning (the
+/// codec renders it as unsigned `thinking`), complete and streamed, before
+/// the answer. Other clients still never receive it. `reasoning_details`
+/// duplicates the text with provider-specific envelopes and is not returned.
+#[tokio::test]
+async fn messages_receive_openrouter_reasoning_text() {
+    use super::super::contract::{messages_request, reasoning_and_text};
+    let mut complete = glm_complete();
+    complete["choices"][0]["message"]["content"] = json!("answer");
+    complete["choices"][0]["finish_reason"] = json!("stop");
+    for messages in [true, false] {
+        let mock = Mock::json(complete.clone()).await;
+        let mut request = messages_request(json!({"thinking":{"type":"adaptive"}}));
+        if !messages {
+            request = chat(false);
+        }
+        let output = mock
+            .adapter()
+            .execute(&target("private"), request)
+            .await
+            .unwrap();
+        let expected = messages.then(|| "thinking".to_owned());
+        assert_eq!(
+            reasoning_and_text(output).await,
+            (expected, Some("answer".into()))
+        );
+        let mock = Mock::sse(glm_stream(), 7).await;
+        let mut request = messages_request(json!({"stream":true}));
+        if !messages {
+            request = chat(true);
+        }
+        let output = mock
+            .adapter()
+            .execute(&target("private"), request)
+            .await
+            .unwrap();
+        let expected = messages.then(|| "plan".to_owned());
+        assert_eq!(
+            reasoning_and_text(output).await,
+            (expected, Some("Hé 世界".into()))
+        );
+    }
+    // Reasoning still has to be a string or null.
+    complete["choices"][0]["message"]["reasoning"] = json!(["not", "text"]);
+    let mock = Mock::json(complete).await;
+    let request = messages_request(json!({}));
+    assert!(matches!(
+        mock.adapter().execute(&target("private"), request).await,
+        Err(InferenceError::InvalidUpstream)
+    ));
+}
+
+/// Official Anthropic SDK -> listening gateway -> OpenRouter adapter -> mock.
+#[cfg(feature = "integration-tests")]
+#[dbtest::test]
+async fn translated_reasoning_sdk_openrouter(pool: sqlx::PgPool) {
+    let mut complete = glm_complete();
+    complete["choices"][0]["message"]["content"] = json!("answer");
+    complete["choices"][0]["message"]["reasoning"] = json!("plan");
+    complete["choices"][0]["finish_reason"] = json!("stop");
+    complete["choices"][0]["native_finish_reason"] = json!("stop");
+    let complete = serde_json::to_vec(&complete).unwrap();
+    let stream = [
+        chunk(
+            json!({"role":"assistant","content":"","reasoning":"plan"}),
+            None,
+            None,
+        ),
+        chunk(json!({"content":"answer"}), None, None),
+        chunk(json!({"content":""}), Some("stop"), None),
+        chunk(json!({"content":""}), Some("stop"), Some(glm_usage())),
+        "data: [DONE]\n\n".to_owned(),
+    ]
+    .concat()
+    .into_bytes();
+    let mock = Mock::reply(move |body| {
+        if body["stream"] == true {
+            (200, "text/event-stream", vec![stream.clone()], None)
+        } else {
+            (200, "application/json", vec![complete.clone()], None)
+        }
+    })
+    .await;
+    let attempts = super::super::contract::run_messages_sdk(
+        pool,
+        Arc::new(mock.adapter()),
+        target("private"),
+        "translated-reasoning.mjs",
+        &[],
+        false,
+    )
+    .await;
+    assert_eq!(attempts, 4, "one attempt per SDK request");
+    let capture = mock.requests.lock().unwrap();
+    assert_eq!(capture.len(), 4);
+    for asked in &capture[..3] {
+        assert_eq!(asked.body["reasoning"], json!({"effort":"high"}));
+        assert_eq!(asked.body["provider"], json!({"data_collection":"deny"}));
+    }
+    // The replayed unsigned thinking block never reaches the upstream.
+    assert_eq!(
+        capture[2].body["messages"],
+        json!([{"role":"user","content":"hello"},{"role":"assistant","content":"answer"},{"role":"user","content":"continue"}])
+    );
+    let structured = &capture[3].body;
+    assert_eq!(
+        structured["response_format"]["json_schema"]["schema"],
+        super::super::contract::output_schema()
+    );
+    assert_eq!(structured["tools"][0]["function"]["strict"], true);
+    assert_eq!(structured["provider"]["require_parameters"], true);
+}

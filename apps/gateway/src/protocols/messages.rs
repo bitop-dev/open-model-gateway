@@ -189,6 +189,7 @@ pub(crate) fn batch_error_body(e: InferenceError) -> Value {
 }
 fn snapshot(id: &str, model: &str, response: &ChatResponse) -> Result<Value> {
     let size = response.content.as_ref().map_or(0, String::len)
+        + response.reasoning.as_ref().map_or(0, String::len)
         + response
             .tool_calls
             .iter()
@@ -198,6 +199,10 @@ fn snapshot(id: &str, model: &str, response: &ChatResponse) -> Result<Value> {
         return Err(InferenceError::InvalidUpstream);
     }
     let mut content = vec![];
+    // Translated reasoning has no signature, and none is invented.
+    if let Some(thinking) = &response.reasoning {
+        content.push(json!({"type":"thinking","thinking":thinking}));
+    }
     if let Some(text) = &response.content {
         content.push(json!({"type":"text","text":text}));
     }
@@ -247,12 +252,19 @@ fn render(output: ProviderOutput, id: String, model: String) -> Response {
                 // turn unknown output into zero. Gateway accounting never uses these values.
                 yield Ok::<_, Infallible>(event("message_start", json!({"message":{"id":id,"type":"message","role":"assistant","model":model,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0}}})));
                 // Native Anthropic preserves validated block lifecycles. Translated
-                // streams put text in block 0 and buffer tools after it, retaining
-                // their previous behavior. Both paths wait for engine Done.
-                let mut accumulator = Accumulator::with_limit(OUTPUT_LIMIT); let mut done = false; let mut text_open = false; let mut native = false;
+                // streams open one block per run of reasoning (unsigned `thinking`)
+                // or text, in arrival order, closing each before the next opens;
+                // tools are buffered after them. Both paths wait for engine Done.
+                let mut accumulator = Accumulator::with_limit(OUTPUT_LIMIT); let mut done = false; let mut native = false;
+                // (index, is_thinking) of the open translated block; `blocks` counts opened blocks.
+                let mut open: Option<(usize, bool)> = None; let mut blocks = 0_usize;
                 while let Some(next) = stream.next().await {
                     let block = match &next { Ok(ChatEvent::MessagesBlock(v)) => Some(v.clone()), _ => None };
-                    let delta = match &next { Ok(ChatEvent::Delta { text: Some(text), .. }) => Some(text.clone()), _ => None };
+                    let piece = match &next {
+                        Ok(ChatEvent::Delta { text: Some(text), .. }) => Some((false, text.clone())),
+                        Ok(ChatEvent::Reasoning(text)) => Some((true, text.clone())),
+                        _ => None,
+                    };
                     match next.and_then(|e| accumulator.push(e)) {
                         Ok(finished) => {
                             if let Some(block) = block {
@@ -262,12 +274,21 @@ fn render(output: ProviderOutput, id: String, model: String) -> Response {
                                 };
                                 yield Ok(event(kind, block.clone()));
                             }
-                            if let Some(delta) = delta.filter(|_| !native) {
-                                if !text_open {
-                                    text_open = true;
-                                    yield Ok(event("content_block_start", json!({"index":0,"content_block":{"type":"text","text":""}})));
-                                }
-                                yield Ok(event("content_block_delta", json!({"index":0,"delta":{"type":"text_delta","text":delta}})));
+                            if let Some((thinking, piece)) = piece.filter(|_| !native) {
+                                let index = match open {
+                                    Some((index, kind)) if kind == thinking => index,
+                                    previous => {
+                                        if let Some((index, _)) = previous {
+                                            yield Ok(event("content_block_stop", json!({"index":index})));
+                                        }
+                                        let index = blocks; blocks += 1; open = Some((index, thinking));
+                                        let start = if thinking { json!({"type":"thinking","thinking":""}) } else { json!({"type":"text","text":""}) };
+                                        yield Ok(event("content_block_start", json!({"index":index,"content_block":start})));
+                                        index
+                                    }
+                                };
+                                let delta = if thinking { json!({"type":"thinking_delta","thinking":piece}) } else { json!({"type":"text_delta","text":piece}) };
+                                yield Ok(event("content_block_delta", json!({"index":index,"delta":delta})));
                             }
                             if finished { done = true; break; }
                         }
@@ -279,13 +300,17 @@ fn render(output: ProviderOutput, id: String, model: String) -> Response {
                 let Some(content) = terminal["content"].as_array() else {
                     yield Ok(event("error", error_body(InferenceError::InvalidUpstream))); return;
                 };
-                for (index, block) in content.iter().enumerate().filter(|_| !native) {
-                    if block["type"] != "text" {
+                if !native {
+                    if let Some((index, _)) = open {
+                        yield Ok(event("content_block_stop", json!({"index":index})));
+                    }
+                    for block in content.iter().filter(|b| b["type"] == "tool_use") {
+                        let index = blocks; blocks += 1;
                         let mut start = block.clone(); start["input"] = json!({});
                         yield Ok(event("content_block_start", json!({"index":index,"content_block":start})));
                         yield Ok(event("content_block_delta", json!({"index":index,"delta":{"type":"input_json_delta","partial_json":block["input"].to_string()}})));
+                        yield Ok(event("content_block_stop", json!({"index":index})));
                     }
-                    yield Ok(event("content_block_stop", json!({"index":index})));
                 }
                 yield Ok(event("message_delta", json!({"delta":{"stop_reason":terminal["stop_reason"],"stop_sequence":null},"usage":terminal["usage"]})));
                 yield Ok(event("message_stop", json!({})));

@@ -380,7 +380,9 @@ fn content_block(
         Some("thinking") if role == Role::Assistant => {
             object(block, &["type", "thinking", "signature"], "thinking")?;
             string(&block["thinking"])?;
-            string(&block["signature"])?;
+            // Translated replies return unsigned thinking, which clients
+            // replay; `providers::messages` decides per route what it means.
+            block.get("signature").map(string).transpose()?;
             options.history_thinking.push(block.clone());
         }
         Some("redacted_thinking") if role == Role::Assistant => {

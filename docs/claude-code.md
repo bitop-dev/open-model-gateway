@@ -2,7 +2,9 @@
 
 The Messages frontend accepts Claude Code's request grammar on `POST /v1/messages`, including `?beta=true`. It uses ordinary inference-key authentication, workspace model grants, routing, admission, per-attempt reservations and settlement. It is not an unmetered proxy.
 
-**Claude Code now works on native Anthropic routes within the documented subset (#70, deliveries 1–2).** System/cache blocks, beta values, thinking controls and signed history, images, context-management hints, deferred tools and task budgets are preserved. Thinking/signature/redacted-thinking blocks stream back without reconstruction. Structured output, strict tools and server tools remain refused; translated reasoning mapping follows in delivery 3. See the [per-field matrix](protocol-matrix.md#claude-code-field-rules). This is protocol support, not a claim of paid real-client acceptance (#73).
+**Claude Code now works on native Anthropic routes within the documented subset (#70, deliveries 1–2).** System/cache blocks, beta values, thinking controls and signed history, images, context-management hints, deferred tools and task budgets are preserved. Thinking/signature/redacted-thinking blocks stream back without reconstruction. Structured output, strict tools and server tools remain refused on these routes.
+
+**On OpenAI and OpenRouter models (#70, delivery 3)**, effort, thinking, structured output and strict tools map to the provider's own reasoning and JSON-schema controls. Reasoning text from OpenRouter and from local reasoning parsers comes back as `thinking` blocks without a signature. See [OpenAI-style routes](#openai-style-routes) and the [per-field matrix](protocol-matrix.md#claude-code-field-rules). This is protocol support, not a claim of paid real-client acceptance (#73).
 
 ## Configure models by name
 
@@ -44,9 +46,23 @@ Operators may set `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` on clients to disab
 
 For native cache hints, ask the administrator to publish a compatible immutable v2/v3 deployment price. Cache reads must always be explicitly priced. The 5-minute cache-write category must be priced for absent/5-minute TTL, and the 1-hour category for `ttl:1h`. Mixed requests need both write categories; the conservative monetary hold must also be finite. Missing prices, v1 single-rate prices and unknown/not-applicable required categories refuse with 400 naming `cache_control` before any reservation or upstream request. The `extended-cache-ttl-*` beta is allowed; its paired `cache_control.ttl:1h` is priced or refused by this cache gate, not the beta filter. Anthropic's usual write prices are 1.25× base input for 5 minutes and 2× for 1 hour; publish the applicable model's rates. Holds use the existing conservative full-input bound for each priced cache category plus `max_tokens`; settlement charges observed disjoint counts without double charging aggregate writes. Cache-enabled batch lines use gateway-run per-line admission rather than native Message Batches.
 
+## OpenAI-style routes
+
+When the model is served by OpenAI or OpenRouter, the gateway maps Claude Code's reasoning and structured-output fields to the provider's controls ([exact rules](protocol-matrix.md#reasoning-and-structured-output-on-openai-style-routes)):
+
+| Claude Code sends | OpenAI Chat | OpenRouter | Local profiles |
+|---|---|---|---|
+| `output_config.effort` | `reasoning_effort` (same value) | `reasoning.effort` (same value) | Dropped |
+| `thinking` | Dropped: Chat has no thinking control | `reasoning`: budget → `max_tokens`, adaptive → `enabled:true`, disabled → `enabled:false`, omitted display → `exclude:true`; an explicit effort wins over a budget | Dropped |
+| `output_config.format` | Strict `json_schema` `response_format` | Same, with `provider.require_parameters:true` | 400 |
+| Tool `strict` | `function.strict` | `function.strict`; `true` adds `require_parameters` | 400 |
+| Reasoning text in the reply | None returned by OpenAI | `thinking` blocks, no signature | `thinking` blocks, no signature |
+
+A model that does not support the mapped control refuses it upstream with HTTP 400. For example, a non-reasoning OpenAI model refuses `reasoning_effort`; the gateway does not retry without the field. Unsigned thinking blocks that Claude Code sends back in the history are removed on these routes. If a conversation that contains them is moved to a native Anthropic route, the gateway returns 400 `thinking`, because Anthropic requires the signature. Start a new conversation, or clear the history, when switching to an Anthropic model.
+
 ## Current behavior and limits
 
-- Text, ordinary function tools, sampling controls and `metadata.user_id` follow the matrix. Bedrock Converse returns 400 before admission for thinking controls and history, cache controls, context management and deferred loading. OpenAI-style and local routes drop these hints and omit foreign thinking history. Translated routes also drop effort hints and task budgets.
+- Text, ordinary function tools, sampling controls and `metadata.user_id` follow the matrix. Bedrock Converse returns 400 before admission for thinking controls and history, cache controls, context management and deferred loading, and drops effort hints and task budgets. OpenAI-style and local routes drop cache hints, context management, deferred loading and task budgets, and omit foreign thinking history. Local routes also drop thinking and effort; OpenAI-style routes map them as described [below](#openai-style-routes).
 - Native Anthropic accepts base64 PNG/JPEG/GIF/WebP images in messages and tool results: strict padded base64, matching format magic, at most 5 MiB decoded per image and 20 images per request. The 2 MiB HTTP body cap still applies. URL sources are refused before dispatch; neither the gateway nor the provider fetches client URLs. Translated routes still return 400 naming `image`.
 - Native Anthropic preserves `tool_result.is_error` exactly, including explicit false. Translated OpenAI/OpenRouter and local Chat routes prefix failed result text with `[tool_error]` and one newline; Bedrock Converse sets `toolResult.status:"error"` and keeps the original text. AWS documents this field for Amazon Nova and Anthropic Claude 3 and 4 models. [Bedrock field reference](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ToolResultBlock.html). False/omitted flags leave translated results unchanged. See the exact [provider rules](protocol-matrix.md#messages).
 - Server tools such as web search and code execution return 400 naming `tools.type`, even on native Anthropic routes: their additional charges are not priced yet.

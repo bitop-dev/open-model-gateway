@@ -307,6 +307,10 @@ pub struct ChatResponse {
     /// Validated native Anthropic blocks, preserving order and opaque signatures.
     /// Used only by the Messages codec, never logged as telemetry.
     pub messages_content: Option<Vec<serde_json::Value>>,
+    /// Translated provider reasoning text, set only for Messages requests and
+    /// returned to that client as unsigned `thinking`. Never logged; its tokens
+    /// are already inside the reported output count.
+    pub reasoning: Option<String>,
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: FinishReason,
@@ -327,6 +331,9 @@ pub enum ChatEvent {
     /// Validated native Anthropic content-block lifecycle event. Canonical
     /// text/tool deltas accompany it for accounting/telemetry and other codecs.
     MessagesBlock(serde_json::Value),
+    /// Translated provider reasoning text for a Messages request (see
+    /// `ChatResponse::reasoning`). Adapters never emit it for other protocols.
+    Reasoning(String),
     Delta {
         text: Option<String>,
         tool_calls: Vec<ToolCallDelta>,
