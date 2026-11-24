@@ -168,6 +168,7 @@ pub(crate) fn populated_registry() -> &'static Metrics {
     m.key_issuance_refused("holder", "create");
     m.egress_denied("telemetry");
     m.upstream_connection_lost("local");
+    m.upstream_connection_opened("local");
     m.audit_export_delivery("delivered");
     m.set_lease_held("metrics", true);
     m.observe_lease_term("metrics");

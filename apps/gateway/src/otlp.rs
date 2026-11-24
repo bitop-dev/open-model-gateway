@@ -283,6 +283,7 @@ pub(crate) fn export_http_client_with_policy(
         .timeout(exchange_timeout)
         .connect_timeout(connect_timeout)
         .pool_idle_timeout(crate::egress::UpstreamClient::Export.pool_idle_timeout())
+        .count_connections(crate::egress::UpstreamClient::Export)
         .build()
         .map_err(|_| anyhow::anyhow!("cannot build the export client"))?;
     Ok(client)
