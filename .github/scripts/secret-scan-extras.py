@@ -81,17 +81,26 @@ def decode16(blob):
 
 
 def added_blobs(revs):
-    """(blob id, path) of every blob the commits in `revs` add, change or rename to."""
+    """(blob id, path) of every blob the commits in `revs` add, change or rename to.
+
+    `-z` keeps paths as they are: without it git quotes a path with a tab, a newline or a
+    non-ASCII byte, and the quoted name would no longer end in its extension.
+    """
     out = []
-    raw = git("log", "-m", "--format=", "--raw", "--no-abbrev", "--no-renames", *revs)
-    for line in raw.decode("utf-8", "surrogateescape").splitlines():
-        if not line.startswith(":"):
+    raw = git("log", "-m", "-z", "--format=", "--raw", "--no-abbrev", "--no-renames", *revs)
+    fields = raw.decode("utf-8", "surrogateescape").split("\0")
+    at = 0
+    while at < len(fields):
+        meta = fields[at].lstrip("\n")
+        at += 1
+        if not meta.startswith(":"):
             continue
-        meta, _, path = line.partition("\t")
-        fields = meta.split()
-        if len(fields) < 5 or fields[4] == "D" or fields[1] == "160000":
+        path = fields[at] if at < len(fields) else ""
+        at += 1
+        parts = meta.split()
+        if len(parts) < 5 or parts[4] == "D" or parts[1] == "160000":
             continue
-        out.append((fields[3], path))
+        out.append((parts[3], path))
     return out
 
 
@@ -121,12 +130,14 @@ def main(argv):
     with open(os.path.join(out, "names.txt"), "w", encoding="utf-8", errors="surrogateescape") as f:
         f.write("".join(f"{name}\n" for name in names))
 
+    # One entry per blob and archive kind: the same bytes committed as `x.zip` and as
+    # `x.txt` must still be opened as an archive.
     unique = {}
     for blob, path in blobs:
-        unique.setdefault(blob, path)
+        unique.setdefault((blob, archive_name(path)), path)
     total = 0
     archives = texts = 0
-    ordered = sorted(unique.items(), key=lambda item: item[1])
+    ordered = sorted(((blob, path) for (blob, _), path in unique.items()), key=lambda item: item[1])
     # One `git cat-file --batch` for every blob, read in order: a process per blob
     # would take minutes over the whole history.
     # The ids go in from a thread: written all at once before reading, they would

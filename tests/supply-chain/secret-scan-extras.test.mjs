@@ -75,6 +75,26 @@ test("UTF-16 blobs, with or without a byte order mark, are decoded; ASCII and bi
   for (const f of files) assert.equal(read(r, `utf16/${f}`), text);
 }));
 
+test("paths with a tab, a newline or non-ASCII characters keep their names and extensions", () => withRepo(r => {
+  const names = ["tab\tname.zip", "new\nline.tgz", "café.txt"];
+  for (const name of names) writeFileSync(join(r.dir, name), "x\n");
+  writeFileSync(join(r.dir, "wide\tone.txt"), Buffer.from("made up\n", "utf16le"));
+  const head = commitAll(r.dir, "odd names");
+  const done = run(r, [`${r.start}..${head}`]);
+  assert.equal(done.status, 0, done.stderr);
+  assert.equal(read(r, "names.txt"), [...names, "wide\tone.txt"].sort().map(n => `${n}\n`).join(""));
+  assert.deepEqual(list(r, "archives").map(n => n.replace(/^\d+-/, "")).sort(), ["new\nline.tar.gz", "tab\tname.zip"]);
+  assert.deepEqual(list(r, "utf16").map(n => n.replace(/^\d+-/, "")), ["wide\tone.txt.txt"]);
+}));
+
+test("the same bytes under an archive name and a text name are still opened as an archive", () => withRepo(r => {
+  writeFileSync(join(r.dir, "a.txt"), "same bytes\n");
+  writeFileSync(join(r.dir, "z.zip"), "same bytes\n");
+  const head = commitAll(r.dir, "twins");
+  assert.equal(run(r, [`${r.start}..${head}`]).status, 0);
+  assert.deepEqual(list(r, "archives").map(n => n.replace(/^\d+-/, "")), ["z.zip"]);
+}));
+
 test("a submodule entry (gitlink) has no blob and is skipped", () => withRepo(r => {
   git(r.dir, "update-index", "--add", "--cacheinfo", `160000,${r.start},sub`);
   git(r.dir, "commit", "-q", "-m", "submodule");
