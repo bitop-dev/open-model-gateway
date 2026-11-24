@@ -2539,6 +2539,50 @@ async fn native_anthropic_messages_batch_with_errored_lines(pool: PgPool) {
     consistent(f).await;
 }
 
+/// Migration 0088 lets a pending reservation's hold decrease outside
+/// settlement only for a gateway-run batch envelope (its transfer into a
+/// line) and a realtime session. A native batch's reservation, also a
+/// `batches` execution, is not an envelope: the database refuses it.
+async fn lower_a_pending_batch_hold(pool: PgPool, native: bool) {
+    let w = world(pool, native, false, 1).await;
+    let f = &w.f;
+    let file = w
+        .upload(&f.principal, &[chat_line("a", "company/smart", "x")])
+        .await;
+    let metadata = (!native).then(|| json!({"omg_mode": "gateway"}));
+    let job = w
+        .create(f.principal, &file, BatchEndpoint::ChatCompletions, metadata)
+        .await
+        .unwrap();
+    let (state, held, _, _) = reservation(f, job.execution_id).await;
+    assert_eq!(state, "pending");
+    assert!(held.is_some_and(|h| h > 0));
+    let lowered = sqlx::query(
+        "UPDATE governance_reservations SET held_microusd=held_microusd-1 WHERE execution_id=$1",
+    )
+    .bind(job.execution_id)
+    .execute(&f.store.pool)
+    .await;
+    if native {
+        let error = lowered.expect_err("a native batch is not an envelope");
+        assert_eq!(
+            error.as_database_error().and_then(|e| e.constraint()),
+            Some("reservation_hold_change")
+        );
+        assert_eq!(reservation(f, job.execution_id).await.1, held);
+    } else {
+        assert_eq!(lowered.unwrap().rows_affected(), 1);
+    }
+}
+#[dbtest::test]
+async fn a_gateway_envelope_may_lower_its_pending_hold(pool: PgPool) {
+    lower_a_pending_batch_hold(pool, false).await;
+}
+#[dbtest::test]
+async fn a_native_batch_may_not_lower_its_pending_hold(pool: PgPool) {
+    lower_a_pending_batch_hold(pool, true).await;
+}
+
 #[dbtest::test]
 async fn native_cancel_before_submission_releases_the_hold(pool: PgPool) {
     let w = world(pool, true, false, 2).await;

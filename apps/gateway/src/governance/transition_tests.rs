@@ -1,9 +1,14 @@
 //! Migration 0088: the database refuses a reservation state transition other
-//! than pending -> settled/unknown and unknown -> settled, any hold change on
-//! a settled reservation, and a hold decrease outside the write that ends a
-//! pending reservation. The code's own guards still answer first: each test
-//! drives the code path that would make the refused write and gets its usual
-//! result, then makes the same write directly and gets the database's error.
+//! than pending -> settled/unknown and unknown -> settled, any change to a
+//! settled reservation, clearing an unbounded-cost marker, and a hold decrease
+//! outside settlement. Where a code path would make the refused write, the
+//! test drives it first and gets its usual result (its own guard answers
+//! first), then makes the same write directly and gets the database's error.
+//! No code path lowers an ordinary request's hold, so those cases are direct
+//! writes only; the batch-envelope and realtime exceptions are tested with
+//! their own fixtures (`jobs::batch_tests::a_gateway_envelope_may_lower_its_pending_hold`,
+//! `a_native_batch_may_not_lower_its_pending_hold` and
+//! `governance::realtime_tests::windows_extend_settle_and_finish_on_one_reservation`).
 use super::*;
 use crate::governance::tests::db::{Fixture, done, fixture, request};
 use sqlx::PgPool;
@@ -26,6 +31,9 @@ fn transition() -> (String, String) {
 }
 fn hold() -> (String, String) {
     ("reservation_hold_change".into(), "23514".into())
+}
+fn settled_change() -> (String, String) {
+    ("reservation_settled_change".into(), "23514".into())
 }
 async fn row(f: &Fixture, id: Uuid) -> (String, Option<i64>, Option<i64>) {
     sqlx::query_as(
@@ -56,6 +64,12 @@ async fn a_settled_reservation_never_changes_state(pool: PgPool) {
     let f = fixture(pool).await;
     f.price(1_000_000).await;
     let id = admitted(&f).await;
+    // Its lease has run out, so only the state keeps reconciliation away.
+    sqlx::query("UPDATE governance_reservations SET lease_expires_at=now()-interval '1 second' WHERE execution_id=$1")
+        .bind(id)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
     finish(&f.store, &done(id, Some(3), Some(2))).await.unwrap();
     let settled = row(&f, id).await;
     assert_eq!(settled.0, "settled");
@@ -69,19 +83,17 @@ async fn a_settled_reservation_never_changes_state(pool: PgPool) {
         finish(&f.store, &failed).await,
         Err(InferenceError::Storage)
     );
-    sqlx::query("UPDATE governance_reservations SET lease_expires_at=now()-interval '1 second' WHERE execution_id=$1")
-        .bind(id)
-        .execute(&f.store.pool)
-        .await
-        .unwrap();
     assert_eq!(reconcile_expired(&f.store, 50).await.unwrap(), 0);
-    // The database: settled -> unknown (actual cleared so no CHECK applies
-    // first) and settled -> pending.
+    // The database: settled -> unknown or pending (actual cleared so no CHECK
+    // applies first), and a rewritten amount or usage, which would refund the
+    // budget totals derived from it.
     for sql in [
         "UPDATE governance_reservations SET state='unknown',actual_microusd=NULL WHERE execution_id=$1",
         "UPDATE governance_reservations SET state='pending',actual_microusd=NULL WHERE execution_id=$1",
+        "UPDATE governance_reservations SET actual_microusd=0,cost_components=NULL WHERE execution_id=$1",
+        "UPDATE governance_reservations SET input_tokens=0 WHERE execution_id=$1",
     ] {
-        assert_eq!(refused(&f, sql, id).await, transition(), "{sql}");
+        assert_eq!(refused(&f, sql, id).await, settled_change(), "{sql}");
     }
     assert_eq!(row(&f, id).await, settled);
 }
@@ -155,7 +167,7 @@ async fn a_settled_reservation_never_changes_its_hold(pool: PgPool) {
         "UPDATE governance_reservations SET held_microusd=0 WHERE execution_id=$1",
         "UPDATE governance_reservations SET held_microusd=NULL WHERE execution_id=$1",
     ] {
-        assert_eq!(refused(&f, sql, id).await, hold(), "{sql}");
+        assert_eq!(refused(&f, sql, id).await, settled_change(), "{sql}");
     }
     assert_eq!(row(&f, id).await, settled);
 }
@@ -167,20 +179,18 @@ async fn a_hold_never_decreases_outside_settlement(pool: PgPool) {
     let pending = admitted(&f).await;
     let unknown = admitted(&f).await;
     expire(&f, unknown).await;
-    // Neither is a batch envelope, so no code path lowers their holds; the
-    // envelope transfer (`admit_line`) is the one that may, and its own
-    // statement already requires `state='pending' AND held_microusd>=$2`.
+    let decreases = [
+        "UPDATE governance_reservations SET held_microusd=held_microusd-1 WHERE execution_id=$1",
+        "UPDATE governance_reservations SET held_microusd=0 WHERE execution_id=$1",
+    ];
     for id in [pending, unknown] {
         let before = row(&f, id).await;
         assert!(before.1.is_some_and(|h| h > 0));
-        for sql in [
-            "UPDATE governance_reservations SET held_microusd=held_microusd-1 WHERE execution_id=$1",
-            "UPDATE governance_reservations SET held_microusd=0 WHERE execution_id=$1",
-        ] {
+        for sql in decreases {
             assert_eq!(refused(&f, sql, id).await, hold(), "{} {sql}", before.0);
         }
         assert_eq!(row(&f, id).await, before);
-        // An increase, or a hold becoming unbounded, is not a decrease.
+        // Growing is not a decrease, nor is becoming unbounded (NULL).
         for sql in [
             "UPDATE governance_reservations SET held_microusd=held_microusd+1 WHERE execution_id=$1",
             "UPDATE governance_reservations SET held_microusd=NULL WHERE execution_id=$1",
@@ -191,7 +201,7 @@ async fn a_hold_never_decreases_outside_settlement(pool: PgPool) {
                 .await
                 .unwrap();
         }
-        // ... and from unbounded back to a value is one.
+        // From unbounded back to a value is one.
         assert_eq!(
             refused(
                 &f,
@@ -202,19 +212,70 @@ async fn a_hold_never_decreases_outside_settlement(pool: PgPool) {
             hold()
         );
     }
-    // The write that ends a pending reservation may set its hold: settlement
-    // of the still-pending one, with a lower hold in the same statement.
-    sqlx::query("UPDATE governance_reservations SET held_microusd=1 WHERE execution_id=$1")
-        .bind(pending)
-        .execute(&f.store.pool)
-        .await
-        .expect_err("unbounded to a value is a decrease");
-    let done = sqlx::query("UPDATE governance_reservations SET state='unknown',held_microusd=1 WHERE execution_id=$1 AND state='pending'")
-        .bind(pending)
+    // Ending a pending attempt as unknown keeps its hold: unknown cost
+    // retains holds. Only the known floor of an unbounded hold may be
+    // recorded, and only with the unbounded marker kept (settlement's
+    // greatest(NULL, floor)).
+    let ending = admitted(&f).await;
+    for sql in [
+        "UPDATE governance_reservations SET state='unknown',held_microusd=held_microusd-1 WHERE execution_id=$1",
+        "UPDATE governance_reservations SET state='unknown',held_microusd=0 WHERE execution_id=$1",
+    ] {
+        assert_eq!(refused(&f, sql, ending).await, hold(), "{sql}");
+    }
+    sqlx::query("UPDATE governance_reservations SET held_microusd=NULL,unbounded_cost=true WHERE execution_id=$1")
+        .bind(ending)
         .execute(&f.store.pool)
         .await
         .unwrap();
-    assert_eq!(done.rows_affected(), 1);
+    assert_eq!(
+        refused(
+            &f,
+            "UPDATE governance_reservations SET state='unknown',held_microusd=5,unbounded_cost=false WHERE execution_id=$1",
+            ending
+        )
+        .await,
+        hold()
+    );
+    sqlx::query("UPDATE governance_reservations SET state='unknown',held_microusd=5 WHERE execution_id=$1 AND state='pending'")
+        .bind(ending)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(row(&f, ending).await, ("unknown".into(), Some(5), None));
+    // Settling counts the amount, not the hold: any hold may go with it.
+    let settling = admitted(&f).await;
+    sqlx::query("UPDATE governance_reservations SET state='settled',actual_microusd=0,input_tokens=0,output_tokens=0,held_microusd=0 WHERE execution_id=$1")
+        .bind(settling)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+}
+
+#[dbtest::test]
+async fn an_unbounded_marker_is_never_cleared(pool: PgPool) {
+    let f = fixture(pool).await;
+    f.price(1_000_000).await;
+    let pending = admitted(&f).await;
+    let unknown = admitted(&f).await;
+    expire(&f, unknown).await;
+    for id in [pending, unknown] {
+        // Setting it is the conservative direction (every writer only ORs it).
+        sqlx::query("UPDATE governance_reservations SET unbounded_cost=true WHERE execution_id=$1")
+            .bind(id)
+            .execute(&f.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            refused(
+                &f,
+                "UPDATE governance_reservations SET unbounded_cost=false WHERE execution_id=$1",
+                id
+            )
+            .await,
+            hold()
+        );
+    }
 }
 
 /// The trigger is cloned onto every attached partition, the legacy one and
@@ -265,6 +326,6 @@ async fn every_reservation_partition_has_the_guard(pool: PgPool) {
             moved
         )
         .await,
-        transition()
+        settled_change()
     );
 }
