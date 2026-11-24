@@ -13,17 +13,31 @@
 //! - **Accounting.** No execution, reservation, hold or ledger entry is
 //!   written, nothing is billed, and the result is never an admission bound.
 //!   Routing health is not observed: a count is not an attempt.
-//! - **Rate.** A count does not consume the key's request-rate allowance:
-//!   that allowance is the per-minute counters that reservation and
-//!   execution rows maintain, and a count writes neither. Counts are still
-//!   metered, because on Anthropic routes they reach the provider: each holds
-//!   one of the engine's concurrency permits, and each gateway process admits
-//!   at most [`COUNTS_PER_KEY_PER_MINUTE`] counts per key per UTC minute
-//!   (`EngineLimits::counts_per_key_per_minute`; 429 beyond that).
+//! - **Rate.** A count does not consume the key's request-rate allowance and
+//!   consults no budget or rate limit: that allowance is the per-minute
+//!   counters that reservation and execution rows maintain, and a count
+//!   writes neither. A key that cannot run inference can still count. Counts
+//!   are metered by their own per-replica bounds instead, because on
+//!   Anthropic routes they reach the provider with the installation's
+//!   credential (`EngineLimits`, configured at startup):
+//!   - `counts_per_key_per_minute` per key per UTC minute;
+//!   - `counts_per_connection_per_minute` provider-backed counts per provider
+//!     connection credential per UTC minute (estimates call no provider);
+//!   - `count_concurrency` counts at once, from a pool separate from
+//!     generation's, so a count never takes a generation permit.
+//!
+//!   Each refusal is the Anthropic-shaped 429 (`Busy`), before any upstream
+//!   call.
 //! - **Cancellation.** The count runs inside the request future; a client
 //!   disconnect drops it, which cancels the upstream request. There is
 //!   nothing to settle.
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::HashMap,
+    hash::Hash,
+    sync::{Arc, Mutex},
+};
+
+use tokio::sync::Semaphore;
 
 use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
@@ -35,9 +49,16 @@ use super::{
 };
 use crate::auth::Principal;
 
-/// Counts one gateway process admits per key per UTC minute, unless a test
-/// engine sets another limit.
+/// Default counts one gateway process admits per key per UTC minute
+/// (`GATEWAY_COUNT_TOKENS_PER_KEY_PER_MINUTE`).
 pub const COUNTS_PER_KEY_PER_MINUTE: u32 = 60;
+/// Default provider-backed counts one gateway process admits per provider
+/// connection credential per UTC minute
+/// (`GATEWAY_COUNT_TOKENS_PER_CONNECTION_PER_MINUTE`).
+pub const COUNTS_PER_CONNECTION_PER_MINUTE: u32 = 600;
+/// Default counts one gateway process runs at once
+/// (`GATEWAY_COUNT_TOKENS_CONCURRENCY`).
+pub const COUNT_CONCURRENCY: usize = 8;
 /// Keys tracked at once; older minutes are dropped first, and a full table
 /// of current-minute keys refuses new keys rather than growing.
 const TRACKED_KEYS: usize = 65_536;
@@ -92,13 +113,20 @@ pub fn estimate(request: &ChatRequest) -> u64 {
     bytes.div_ceil(4)
 }
 
-/// Fixed-window per-key admission of counts in this process.
-#[derive(Default)]
-pub(crate) struct Limiter {
-    windows: Mutex<HashMap<Uuid, (i64, u32)>>,
+/// Fixed-window admission of counts per key (an API key, or a provider
+/// connection credential) in this process.
+pub(crate) struct Limiter<K> {
+    windows: Mutex<HashMap<K, (i64, u32)>>,
 }
-impl Limiter {
-    pub(crate) fn admit(&self, key: Uuid, minute: i64, limit: u32) -> bool {
+impl<K> Default for Limiter<K> {
+    fn default() -> Self {
+        Self {
+            windows: Mutex::new(HashMap::new()),
+        }
+    }
+}
+impl<K: Hash + Eq> Limiter<K> {
+    pub(crate) fn admit(&self, key: K, minute: i64, limit: u32) -> bool {
         let mut windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
         if windows.len() >= TRACKED_KEYS && !windows.contains_key(&key) {
             windows.retain(|_, (m, _)| *m == minute);
@@ -117,6 +145,43 @@ impl Limiter {
         true
     }
 }
+/// The count limits' state in one process: per-key and per-connection
+/// windows, the count-only concurrency pool and the window clock.
+pub(crate) struct Counts {
+    keys: Limiter<Uuid>,
+    connections: Limiter<String>,
+    pool: Arc<Semaphore>,
+    minute: fn() -> i64,
+}
+impl Counts {
+    pub(crate) fn new(concurrency: usize) -> Self {
+        Self {
+            keys: Limiter::default(),
+            connections: Limiter::default(),
+            pool: Arc::new(Semaphore::new(concurrency)),
+            minute: current_minute,
+        }
+    }
+    /// The same limits with a fixed window clock, for deterministic tests.
+    #[cfg(all(test, feature = "integration-tests"))]
+    pub(crate) fn with_clock(concurrency: usize, minute: fn() -> i64) -> Self {
+        Self {
+            minute,
+            ..Self::new(concurrency)
+        }
+    }
+}
+/// The upstream credential a provider-backed count spends: the connection's
+/// provider, credential reference and endpoint (two connections naming the
+/// same credential share its window).
+fn connection(deployment: &super::types::Deployment) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}",
+        deployment.provider,
+        deployment.credential_ref,
+        deployment.endpoint.as_deref().unwrap_or("")
+    )
+}
 fn current_minute() -> i64 {
     let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -125,26 +190,65 @@ fn current_minute() -> i64 {
 }
 
 impl Engine {
+    /// The same engine whose count windows use `minute` as the clock, so a
+    /// test controls the window instead of racing the UTC minute.
+    #[cfg(all(test, feature = "integration-tests"))]
+    pub(crate) fn with_count_clock(mut self, minute: fn() -> i64) -> Self {
+        self.counts = Arc::new(Counts::with_clock(self.limits.count_concurrency, minute));
+        self
+    }
+
     /// Counts the input tokens of a validated Messages request (`max_tokens`
     /// and `stream` absent). See the module documentation for the rules.
+    /// Every outcome is counted in `gateway_token_counts_total{outcome}`
+    /// (no key, workspace or model label).
     pub async fn count_tokens(
         &self,
         principal: Principal,
         request: ChatRequest,
         request_id: Uuid,
     ) -> Result<TokenCount, InferenceError> {
-        if !self.counts.admit(
+        let result = self.count(principal, request, request_id).await;
+        crate::metrics::METRICS.token_count(match &result {
+            Ok(TokenCount {
+                source: TokenCountSource::Provider,
+                ..
+            }) => "provider",
+            Ok(TokenCount {
+                source: TokenCountSource::Estimate,
+                ..
+            }) => "estimate",
+            Err(Limited) => "limited",
+            Err(_) => "error",
+        });
+        result.map_err(|e| match e {
+            Limited => InferenceError::Busy,
+            Failed(e) => e,
+        })
+    }
+
+    async fn count(
+        &self,
+        principal: Principal,
+        request: ChatRequest,
+        request_id: Uuid,
+    ) -> Result<TokenCount, CountError> {
+        let minute = (self.counts.minute)();
+        if !self.counts.keys.admit(
             principal.key_id,
-            current_minute(),
+            minute,
             self.limits.counts_per_key_per_minute,
         ) {
-            return Err(InferenceError::Busy);
+            return Err(Limited);
         }
+        // Never generation's `capacity`: a slow count cannot pin a permit
+        // that inference needs.
         let _permit = self
-            .capacity
+            .counts
+            .pool
             .clone()
             .try_acquire_owned()
-            .map_err(|_| crate::metrics::capacity_denied())?;
+            .map_err(|_| Limited)?;
         let deadline = Instant::now() + self.limits.request_timeout;
         let deployments = timeout_at(
             deadline,
@@ -153,19 +257,20 @@ impl Engine {
         .await
         .map_err(|_| InferenceError::Timeout)??;
         if deployments.is_empty() {
-            return Err(InferenceError::ModelUnavailable);
+            return Err(InferenceError::ModelUnavailable.into());
         }
         let (candidates, refused) =
             self.eligible_candidates(deployments, &request, ApiProtocol::Messages);
         if candidates.is_empty() {
             if refused.is_empty() {
-                return Err(InferenceError::Unsupported);
+                return Err(InferenceError::Unsupported.into());
             }
             return Err(self
                 .refuse(&principal, &request, &refused, request_id, deadline)
                 .await
                 .err()
-                .unwrap_or(InferenceError::Unsupported));
+                .unwrap_or(InferenceError::Unsupported)
+                .into());
         }
         let plan = timeout_at(
             deadline,
@@ -183,6 +288,21 @@ impl Engine {
             .registry
             .get(&deployment.provider)
             .ok_or(InferenceError::Configuration)?;
+        if !adapter.counts_input_tokens() {
+            return Ok(TokenCount {
+                input_tokens: estimate(&request),
+                source: TokenCountSource::Estimate,
+            });
+        }
+        // Checked only now, so a refused or estimated count never spends the
+        // connection's window.
+        if !self.counts.connections.admit(
+            connection(deployment),
+            minute,
+            self.limits.counts_per_connection_per_minute,
+        ) {
+            return Err(Limited);
+        }
         let counted = timeout_at(deadline, adapter.count_input_tokens(deployment, &request))
             .await
             .map_err(|_| InferenceError::Timeout)??;
@@ -196,6 +316,18 @@ impl Engine {
                 source: TokenCountSource::Estimate,
             },
         })
+    }
+}
+
+/// Why a count was not answered: one of its own limits, or any other error.
+enum CountError {
+    Limited,
+    Failed(InferenceError),
+}
+use CountError::{Failed, Limited};
+impl From<InferenceError> for CountError {
+    fn from(error: InferenceError) -> Self {
+        Failed(error)
     }
 }
 

@@ -167,14 +167,13 @@ pub trait InferenceRepository: Send + Sync {
     /// The deployments of a request that has no admission (a token count,
     /// `super::count`): read live, never from a per-replica cache, because
     /// no later admission re-checks the key, the workspace grant or the key
-    /// restriction. Default: `deployments`.
+    /// restriction. Required, with no default: the cached `deployments` is
+    /// exactly what this must not use.
     async fn live_candidates(
         &self,
         principal: &Principal,
         model: &str,
-    ) -> Result<Vec<Deployment>, InferenceError> {
-        self.deployments(principal, model).await
-    }
+    ) -> Result<Vec<Deployment>, InferenceError>;
     async fn start(&self, record: &ExecutionStart) -> Result<(), InferenceError>;
     async fn finish(&self, record: &ExecutionFinish) -> Result<(), InferenceError>;
     /// Finish with attempt telemetry (finish reason, timings). Telemetry is

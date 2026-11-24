@@ -129,6 +129,12 @@ pub trait ProviderAdapter: Send + Sync {
     ) -> Result<Option<u64>, InferenceError> {
         Ok(None)
     }
+    /// Whether `count_input_tokens` asks the provider. The engine spends the
+    /// connection's per-minute count window only for such an adapter, and
+    /// estimates without calling the adapter otherwise.
+    fn counts_input_tokens(&self) -> bool {
+        false
+    }
     // Non-generation workloads (see `inference::workload`). Each is gated by
     // `supports_protocol` and defaults to an explicit `Unsupported`. Dropping
     // the future MUST cancel upstream work; never retry internally.

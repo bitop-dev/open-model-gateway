@@ -164,6 +164,7 @@ pub(crate) fn populated_registry() -> &'static Metrics {
     m.observe_cache("keys", "hit");
     m.observe_config_change("keys");
     m.auth_throttled("login", "pending_cap");
+    m.token_count("provider");
     m.key_issuance_refused("holder", "create");
     m.egress_denied("telemetry");
     m.upstream_connection_lost("local");

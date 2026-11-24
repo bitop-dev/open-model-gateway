@@ -340,7 +340,7 @@ impl<K: Eq + Hash + Clone, V: Clone> ImmutableCache<K, V> {
 
 #[cfg(all(test, feature = "integration-tests"))]
 #[path = "cache/invalidation_tests.rs"]
-mod invalidation_tests;
+pub(crate) mod invalidation_tests;
 
 #[cfg(all(test, feature = "integration-tests"))]
 #[path = "cache/stale_auth_tests.rs"]

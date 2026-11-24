@@ -18,6 +18,14 @@ impl InferenceRepository for Repo {
     async fn deployments(&self, _: &Principal, _: &str) -> Result<Vec<Deployment>, InferenceError> {
         Ok(self.deployments.lock().unwrap().clone())
     }
+    /// An in-memory list: there is no cache to bypass.
+    async fn live_candidates(
+        &self,
+        principal: &Principal,
+        model: &str,
+    ) -> Result<Vec<Deployment>, InferenceError> {
+        self.deployments(principal, model).await
+    }
     async fn start(&self, _: &ExecutionStart) -> Result<(), InferenceError> {
         panic!("workloads must use admit_workload")
     }

@@ -62,6 +62,7 @@ gateway_scope_lock_wait_seconds histogram lock,path Traffic
 gateway_scope_lock_waiting gauge path Traffic
 gateway_settlement_seconds histogram outcome,phase Traffic
 gateway_settlements counter outcome Traffic
+gateway_token_counts counter outcome Traffic
 gateway_trace_deliveries counter outcome System
 gateway_trace_dropped_spans counter reason System
 gateway_trace_rejected_spans counter - System

@@ -131,6 +131,7 @@ classes! {
     "gateway_scope_lock_waiting" => (Traffic, Gauge, "1", ["path"]),
     "gateway_settlement_seconds" => (Traffic, Histogram, "s", ["outcome", "phase"]),
     "gateway_settlements" => (Traffic, Counter, "1", ["outcome"]),
+    "gateway_token_counts" => (Traffic, Counter, "1", ["outcome"]),
     "gateway_trace_deliveries" => (System, Counter, "1", ["outcome"]),
     "gateway_trace_dropped_spans" => (System, Counter, "1", ["reason"]),
     "gateway_trace_rejected_spans" => (System, Counter, "1", []),

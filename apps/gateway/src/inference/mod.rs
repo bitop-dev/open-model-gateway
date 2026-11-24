@@ -72,6 +72,12 @@ pub struct EngineLimits {
     pub audio: audio::AudioLimits,
     /// Token counts this process admits per key per UTC minute (`count`).
     pub counts_per_key_per_minute: u32,
+    /// Provider-backed token counts this process admits per provider
+    /// connection credential per UTC minute (`count`).
+    pub counts_per_connection_per_minute: u32,
+    /// Token counts this process runs at once, from a pool separate from
+    /// generation's `max_concurrent` (`count`).
+    pub count_concurrency: usize,
 }
 impl Default for EngineLimits {
     fn default() -> Self {
@@ -81,6 +87,8 @@ impl Default for EngineLimits {
             workloads: workload::WorkloadLimits::default(),
             audio: audio::AudioLimits::default(),
             counts_per_key_per_minute: count::COUNTS_PER_KEY_PER_MINUTE,
+            counts_per_connection_per_minute: count::COUNTS_PER_CONNECTION_PER_MINUTE,
+            count_concurrency: count::COUNT_CONCURRENCY,
         }
     }
 }
@@ -97,8 +105,8 @@ pub struct Engine {
     /// tracing, in which case the request path never allocates a
     /// RequestTelemetry context or hashes a request id.
     recorder: Option<telemetry::Recorder>,
-    /// Per-key token-count windows of this process (`count`).
-    counts: Arc<count::Limiter>,
+    /// Token-count windows, concurrency and clock of this process (`count`).
+    counts: Arc<count::Counts>,
 }
 
 impl Engine {
@@ -113,7 +121,10 @@ impl Engine {
                 && !limits.request_timeout.is_zero()
                 && limits.workloads.validate()
                 && limits.audio.validate()
-                && limits.counts_per_key_per_minute > 0,
+                && limits.counts_per_key_per_minute > 0
+                && limits.counts_per_connection_per_minute > 0
+                && limits.count_concurrency > 0
+                && limits.count_concurrency <= Semaphore::MAX_PERMITS,
             "invalid inference limits"
         );
         Ok(Self {
@@ -123,7 +134,7 @@ impl Engine {
             limits,
             realtime: realtime::RealtimeLimits::default(),
             recorder: None,
-            counts: Arc::default(),
+            counts: Arc::new(count::Counts::new(limits.count_concurrency)),
         })
     }
 

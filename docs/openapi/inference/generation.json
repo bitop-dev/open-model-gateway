@@ -779,7 +779,7 @@
       "scope": null,
       "operation": {
         "summary": "Count message tokens",
-        "description": "Counts the input tokens of a Messages request (#72). Authorized like POST /v1/messages: the workspace and key come from the validated inference key, and the model must be one the key may use now and must serve the messages protocol. Anthropic routes ask Anthropic's counting endpoint with the connection's own credential; every other route returns the gateway estimate. The route is the first one routing would choose; a count never fails over and is not an attempt. Each gateway process admits at most 60 counts per key per minute (429 beyond that); a count holds an engine concurrency permit but does not consume the key's request-rate allowance. Default root body cap is fixed 2097152 bytes. Unknown fields are 400 invalid_request_error.",
+        "description": "Counts the input tokens of a Messages request (#72). Authorized like POST /v1/messages: the workspace and key come from the validated inference key, and the model must be one the key may use now and must serve the messages protocol. Anthropic routes ask Anthropic's counting endpoint with the connection's own credential; every other route returns the gateway estimate. The route is the first one routing would choose; a count never fails over and is not an attempt. Each gateway process bounds counts by key per minute, by provider connection credential per minute (provider-backed counts only) and by its own concurrency pool, separate from generation (429 beyond any of them). A count consults no budget or rate limit and does not consume the key's request-rate allowance. Default root body cap is fixed 2097152 bytes. Unknown fields are 400 invalid_request_error.",
         "requestBody": {
           "required": true,
           "content": {
@@ -802,7 +802,7 @@
                 "2026-10-21"
               ]
             },
-            "description": "Exactly one occurrence with the literal version 2023-06-01 or 2026-10-21. Under 2026-10-21 the request must not contain temperature, top_p or top_k (400, even at a default value or null; a well-typed value or null names the field and the version; the positional array form always carries those positions, so it is refused under 2026-10-21). Native Anthropic routes send 2023-06-01 upstream for either version.",
+            "description": "Exactly one occurrence with the literal version 2023-06-01 or 2026-10-21. The count body has no sampling fields and no version-dependent rules, so both versions validate the same body; native Anthropic routes send 2023-06-01 upstream.",
             "x-omg-max-occurrences": 1
           },
           {
@@ -1084,19 +1084,19 @@
             "status": 404,
             "envelope": "AnthropicErrorEnvelope",
             "code": null,
-            "trigger": "the model is unknown, not granted to the key's workspace, excluded by the key's restriction, or serves no messages route"
+            "trigger": "the model is unknown, not granted to the key's workspace, or excluded by the key's restriction"
           },
           {
             "status": 429,
             "envelope": "AnthropicErrorEnvelope",
             "code": null,
-            "trigger": "more than 60 counts by this key in this minute on this gateway process, or the engine's concurrency cap"
+            "trigger": "a count limit of this gateway process: counts per key per minute, provider-backed counts per provider connection credential per minute, or count concurrency (all configurable, per replica)"
           },
           {
             "status": 501,
             "envelope": "AnthropicErrorEnvelope",
             "code": null,
-            "trigger": "no configured deployment supports the requested capability"
+            "trigger": "the model is available to the key but no enabled deployment serves the messages protocol, or none supports the requested capability"
           }
         ],
         "x-omg-request-constraints": "generation-normalization",
@@ -1108,8 +1108,18 @@
           },
           "counts_per_key_per_minute": {
             "default": 60,
-            "env": null,
-            "source": "inference/count.rs COUNTS_PER_KEY_PER_MINUTE, per gateway process"
+            "env": "GATEWAY_COUNT_TOKENS_PER_KEY_PER_MINUTE",
+            "source": "inference/count.rs, per gateway process"
+          },
+          "counts_per_connection_per_minute": {
+            "default": 600,
+            "env": "GATEWAY_COUNT_TOKENS_PER_CONNECTION_PER_MINUTE",
+            "source": "inference/count.rs, provider-backed counts per provider connection credential, per gateway process"
+          },
+          "count_concurrency": {
+            "default": 8,
+            "env": "GATEWAY_COUNT_TOKENS_CONCURRENCY",
+            "source": "inference/count.rs, a pool separate from GATEWAY_MAX_CONCURRENT_REQUESTS, per gateway process"
           }
         }
       }

@@ -186,6 +186,9 @@ impl ProviderAdapter for AnthropicAdapter {
             .ok_or(InferenceError::InvalidUpstream)?;
         Ok(Some(count))
     }
+    fn counts_input_tokens(&self) -> bool {
+        true
+    }
     async fn execute(&self, target: &Deployment, request: ChatRequest) -> Result<ProviderOutput> {
         let payload = encode(&target.upstream_model, &request)?;
         let response = self.send(target, &request, "/messages", &payload).await?;

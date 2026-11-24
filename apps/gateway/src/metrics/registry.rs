@@ -82,6 +82,7 @@ impl Metrics {
             config_changes: Family::default(),
             config_poll_failures: Counter::default(),
             auth_throttled: Family::default(),
+            token_counts: Family::default(),
             key_issuance_refused: Family::default(),
             egress_denied: Family::default(),
             upstream_connection_lost: every_client(),
@@ -432,6 +433,11 @@ impl Metrics {
             "upstream_connection_lost",
             "Requests an outbound client sent that failed before a complete response head arrived because the connection was lost (reset, closed or incomplete message; not a connect failure, timeout, failure of the gateways own request body or failure after the head), by client (openai, openrouter, anthropic, bedrock, local, s3, export). Includes connections that were not reused and requests the upstream may have processed (#483)",
             self.upstream_connection_lost.clone(),
+        );
+        registry.register(
+            "token_counts",
+            "POST /v1/messages/count_tokens requests that reached the engine, by outcome (provider: the provider counted; estimate: the gateway estimated; limited: refused by a count limit; error: any other refusal or failure). No key, workspace or model labels",
+            self.token_counts.clone(),
         );
         registry.register(
             "upstream_connections_opened",
