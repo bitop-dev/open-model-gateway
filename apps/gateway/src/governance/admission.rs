@@ -9,6 +9,10 @@ fn generation(max_output_tokens: Option<u32>) -> WorkloadAdmission {
         unit_ceilings: MeterUsage::default(),
     }
 }
+/// Admission without a route adapter: no output limit, and Messages
+/// `cache_control` hints are not priced (as for an adapter that drops them).
+/// The engine admits generation through [`admit_generation`] with the route
+/// adapter's capabilities.
 pub async fn admit(
     store: &Store,
     record: &ExecutionStart,
@@ -22,11 +26,15 @@ pub async fn admit(
         lease_seconds,
         None,
         u32::MAX,
+        false,
         Some(request),
     )
     .await
     .map(|_| ())
 }
+/// [`admit`] for the route the caller resolved (`deployment`). Like [`admit`]
+/// it has no route adapter: no output limit, and `cache_control` hints are
+/// not priced.
 pub async fn admit_for_deployment(
     store: &Store,
     record: &ExecutionStart,
@@ -34,11 +42,22 @@ pub async fn admit_for_deployment(
     lease_seconds: i64,
     deployment: &Deployment,
 ) -> Result<(), InferenceError> {
-    admit_generation(store, record, request, lease_seconds, deployment, u32::MAX)
-        .await
-        .map(|_| ())
+    admit_generation(
+        store,
+        record,
+        request,
+        lease_seconds,
+        deployment,
+        u32::MAX,
+        false,
+    )
+    .await
+    .map(|_| ())
 }
 /// Resolve and reserve the exact output bound before any execution writes.
+/// `output_limit` and `forwards_cache_controls` are the route adapter's
+/// (`ProviderAdapter::generation_output_limit`, `forwards_cache_controls`);
+/// a caller without an adapter passes `u32::MAX` and `false`.
 pub async fn admit_generation(
     store: &Store,
     record: &ExecutionStart,
@@ -46,6 +65,7 @@ pub async fn admit_generation(
     lease_seconds: i64,
     deployment: &Deployment,
     output_limit: u32,
+    forwards_cache_controls: bool,
 ) -> Result<crate::inference::repository::GenerationAdmission, InferenceError> {
     admit_checked(
         store,
@@ -54,6 +74,7 @@ pub async fn admit_generation(
         lease_seconds,
         Some(deployment),
         output_limit,
+        forwards_cache_controls,
         Some(request),
     )
     .await
@@ -107,6 +128,7 @@ pub async fn admit_embeddings_for_deployment(
         lease_seconds,
         Some(deployment),
         u32::MAX,
+        false,
         None,
     )
     .await
@@ -131,11 +153,13 @@ pub async fn admit_workload_for_deployment(
         lease_seconds,
         Some(deployment),
         u32::MAX,
+        false,
         None,
     )
     .await
     .map(|_| ())
 }
+#[allow(clippy::too_many_arguments)]
 async fn admit_checked(
     store: &Store,
     record: &ExecutionStart,
@@ -143,6 +167,7 @@ async fn admit_checked(
     lease_seconds: i64,
     expected: Option<&Deployment>,
     output_limit: u32,
+    forwards_cache_controls: bool,
     generation_request: Option<&ChatRequest>,
 ) -> Result<crate::inference::repository::GenerationAdmission, InferenceError> {
     let mut timer = crate::metrics::PhaseTimer::start();
@@ -155,6 +180,7 @@ async fn admit_checked(
             lease_seconds,
             expected,
             output_limit,
+            forwards_cache_controls,
             generation_request,
             &mut timer
         )

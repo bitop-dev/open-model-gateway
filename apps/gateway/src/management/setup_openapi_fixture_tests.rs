@@ -781,7 +781,10 @@ fn thresholds_with_approved_url(body: &Value) -> Option<bool> {
         _ => return None,
     }
     let settings: crate::jobs::schedule::RouteSettings = serde_json::from_value(body).ok()?;
-    match settings.validate("vllm", &approvals) {
+    match settings.validate(
+        crate::providers::capabilities::accepts_priority_hint("vllm"),
+        &approvals,
+    ) {
         Ok(()) => Some(true),
         Err(THRESHOLD_MISSING | THRESHOLD_RANGE) => Some(false),
         Err(_) => panic!("scheduling vector: a rule other than the thresholds refused the body"),

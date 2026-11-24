@@ -66,6 +66,7 @@ impl ProviderAdapter for FixtureAdapter {
         target: &Deployment,
         request: RerankRequest,
     ) -> Result<RerankResponse, InferenceError> {
+        open_model_gateway::inference::dispatch::started();
         self.calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(target.upstream_model, "private-upstream-id");
         Ok(RerankResponse {
@@ -110,6 +111,7 @@ impl ProviderAdapter for FixtureAdapter {
         target: &Deployment,
         request: SystemoneRequest,
     ) -> Result<SystemoneResponse, InferenceError> {
+        open_model_gateway::inference::dispatch::started();
         self.calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(target.upstream_model, "private-upstream-id");
         Ok(SystemoneResponse {
@@ -133,6 +135,7 @@ impl ProviderAdapter for FixtureAdapter {
         target: &Deployment,
         request: EmbeddingRequest,
     ) -> Result<EmbeddingResponse, InferenceError> {
+        open_model_gateway::inference::dispatch::started();
         self.calls.fetch_add(1, Ordering::SeqCst);
         if target.upstream_model == "embedding-busy-fixture" {
             return Err(InferenceError::Busy);
@@ -174,6 +177,7 @@ impl ProviderAdapter for FixtureAdapter {
         target: &Deployment,
         request: ChatRequest,
     ) -> Result<ProviderOutput, InferenceError> {
+        open_model_gateway::inference::dispatch::started();
         self.calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(target.upstream_model, "private-upstream-id");
         if request

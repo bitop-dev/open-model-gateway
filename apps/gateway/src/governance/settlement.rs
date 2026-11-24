@@ -455,6 +455,59 @@ async fn free_rejection(
         .await?
         .is_some_and(|l| l.all_free_or_not_applicable()))
 }
+/// A failed attempt settles at a known zero on any price, priced or not, when
+/// the engine proved that its adapter call built no upstream request
+/// (`AttemptTelemetry::nothing_sent`, from `inference::dispatch`): the
+/// provider received nothing, so it processed and can charge nothing. The
+/// proof is structural, not the error's class, so the same class after a
+/// request was sent (an upstream 401 is `Configuration` too) stays unknown.
+/// It also requires no returned stream, no accepted job and no usage
+/// evidence at all, any of which would contradict it.
+fn nothing_sent(
+    record: &ExecutionFinish,
+    telemetry: &crate::inference::repository::AttemptTelemetry,
+    job_accepted: bool,
+) -> bool {
+    let u = record.usage;
+    telemetry.nothing_sent
+        && !telemetry.stream_returned
+        && !job_accepted
+        && record.outcome == Outcome::Failed
+        && u.input_tokens.is_none()
+        && u.output_tokens.is_none()
+        && u.billing.is_none()
+        && u.meters.is_none()
+        && u.output_image_variant.is_none()
+        && u.provider_cost_microusd.is_none()
+}
+/// What a terminal finish settles at, from its pinned valuation: the actual
+/// amount (`None` keeps the reservation unknown), its components and whether
+/// the reservation's bound was violated. A settled row records observed token
+/// counts; unreported tokens (other than not-applicable ones) keep it unknown.
+/// A free price's pre-processing rejection without usage is a known zero. An
+/// attempt that sent nothing costs zero whatever the price says (a
+/// per-request line, or no price at all), so its components are kept only
+/// when they value to that zero, and it cannot have violated a bound.
+fn terminal_amount(
+    value: Valuation,
+    complete: bool,
+    free: bool,
+    unsent: bool,
+) -> (Option<i64>, Option<CostBreakdown>, bool) {
+    let actual = if complete {
+        value.actual
+    } else if unsent {
+        Some(0)
+    } else if free && !value.violated {
+        value.actual.filter(|a| *a == 0)
+    } else {
+        None
+    };
+    let components = value
+        .components
+        .filter(|_| actual.is_some() && (!unsent || value.actual == Some(0)));
+    (actual, components, value.violated && !unsent)
+}
 /// Identical terminal finishes include the full normalized breakdown, not just raw counts.
 pub async fn finish(store: &Store, record: &ExecutionFinish) -> Result<(), InferenceError> {
     finish_with_telemetry(
@@ -600,7 +653,9 @@ async fn finish_unobserved(
         job_accepted || telemetry.stream_returned,
     )
     .await?;
-    if free {
+    // An attempt that sent nothing processed no tokens either.
+    let unsent = nothing_sent(record, &telemetry, job_accepted);
+    if free || unsent {
         usage.input_tokens.get_or_insert(0);
         usage.output_tokens.get_or_insert(0);
     }
@@ -630,17 +685,9 @@ async fn finish_unobserved(
         });
     }
     let value = pinned_value(&mut tx, &r, usage).await?;
-    // A settled row records observed token counts; unreported tokens (other
-    // than not-applicable ones above) keep the settlement unknown. A free
-    // price's pre-processing rejection without usage is a known zero.
-    let actual = if record.outcome == Outcome::Succeeded && input.is_some() && output.is_some() {
-        value.actual
-    } else if free && !value.violated {
-        value.actual.filter(|a| *a == 0)
-    } else {
-        None
-    };
-    let components = value.components.filter(|_| actual.is_some());
+    let complete = record.outcome == Outcome::Succeeded && input.is_some() && output.is_some();
+    let floor = value.floor;
+    let (actual, components, violated) = terminal_amount(value, complete, free, unsent);
     timer.phase("read");
     crate::telemetry::mark_phase(crate::telemetry::SpanName::SettlementRead);
     // Scoped: the reservation's totals rows, held from here to commit (its
@@ -660,8 +707,8 @@ async fn finish_unobserved(
       SELECT (SELECT count(*) FROM e),(SELECT count(*) FROM r),(SELECT count(*) FROM l)")
         .bind(record.id).bind(record.outcome.as_str()).bind(record.error.map(|e|e.code())).bind(input).bind(output).bind(&billing).bind(record.elapsed_ms.min(i64::MAX as u64)as i64).bind(&m.meters).bind(&m.variant).bind(m.provider_cost)
         .bind(telemetry.finish_reason.map(|f|f.as_str())).bind(ms(telemetry.time_to_first_token_ms)).bind(ms(telemetry.generation_ms)).bind(reasoning).bind(&reported_model).bind(r.admitted_at)
-        .bind(if actual.is_some(){"settled"}else{"unknown"}).bind(actual).bind(components.map(|c|c.to_value())).bind(value.floor.filter(|_|actual.is_none())).bind(value.violated)
-        .bind(Uuid::now_v7()).bind(if actual.is_some(){"settlement"}else{"unknown"}).bind(actual.or(value.floor))
+        .bind(if actual.is_some(){"settled"}else{"unknown"}).bind(actual).bind(components.map(|c|c.to_value())).bind(floor.filter(|_|actual.is_none())).bind(violated)
+        .bind(Uuid::now_v7()).bind(if actual.is_some(){"settlement"}else{"unknown"}).bind(actual.or(floor))
         .fetch_one(&mut *tx).await.map_err(storage)?;
     if (executions, reservations, entries) != (1, 1, 1) {
         return Err(InferenceError::Storage);
