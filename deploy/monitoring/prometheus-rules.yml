@@ -156,17 +156,21 @@ groups:
           summary: "More than 20% of {{ $labels.provider }} attempts fail"
           description: "See gateway_inference_attempt_errors_total{provider=\"{{ $labels.provider }}\"} by code."
       - alert: GatewayUpstreamConnectionLoss
-        # Lost requests per new connection, by outbound client (#483, #611).
-        # Each request uses a connection, so this bounds the share of
-        # requests lost from above; three losses in 30 minutes are required.
+        # Lost requests per new connection, per replica and outbound client
+        # (#483, #611). Matching by target keeps a replica without the
+        # connection counter (an older version during a rolling upgrade) or
+        # one that opened nothing out of the ratio; three losses in 30
+        # minutes are required.
         expr: |
-          sum by (client) (rate(gateway_upstream_connection_lost_total[30m]))
-            / sum by (client) (rate(gateway_upstream_connections_opened_total[30m])) > 0.01
-          and sum by (client) (increase(gateway_upstream_connection_lost_total[30m])) >= 3
+          (
+            sum by (job, instance, client) (rate(gateway_upstream_connection_lost_total[30m]))
+              / (sum by (job, instance, client) (rate(gateway_upstream_connections_opened_total[30m])) > 0)
+          ) > 0.01
+          and sum by (job, instance, client) (increase(gateway_upstream_connection_lost_total[30m])) >= 3
         for: 30m
         labels: {severity: info}
         annotations:
-          summary: "{{ $labels.client }} loses more than one request per 100 new connections"
+          summary: "{{ $labels.client }} on {{ $labels.instance }} loses more than one request per 100 new connections"
           description: "See docs/operations.md \"Lost connections\": compare with the client's pool idle timeout and its upstream's keep-alive."
       - alert: GatewayTimeToFirstTokenHigh
         expr: |

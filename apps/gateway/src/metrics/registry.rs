@@ -84,7 +84,7 @@ impl Metrics {
             auth_throttled: Family::default(),
             key_issuance_refused: Family::default(),
             egress_denied: Family::default(),
-            upstream_connection_lost: Family::default(),
+            upstream_connection_lost: every_client(),
             upstream_connections_opened: every_client(),
             audit_export_deliveries: Family::default(),
             audit_export_rejected_records: Counter::default(),
@@ -538,11 +538,10 @@ impl Metrics {
     }
 }
 
-/// The series of `family` whose `label` is `value(0)`, `value(1)`, ..., created
-/// in that order.
 /// A `client` family with every outbound client's series pre-created at
-/// zero, so a fresh process exports the family and `rate()` sees the first
-/// increment (#611). The labels are the fixed client set.
+/// zero, so a fresh process exports the family and, once Prometheus has
+/// scraped that zero, `rate()` and `increase()` see the first increment
+/// (#611). The labels are the fixed client set.
 fn every_client() -> Family<L1, Counter> {
     let family = Family::default();
     for client in crate::egress::UpstreamClient::ALL {
@@ -551,6 +550,8 @@ fn every_client() -> Family<L1, Counter> {
     family
 }
 
+/// The series of `family` whose `label` is `value(0)`, `value(1)`, ..., created
+/// in that order.
 fn series<const N: usize>(
     family: &Family<L1, Counter>,
     label: &'static str,

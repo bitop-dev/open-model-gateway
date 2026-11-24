@@ -33,8 +33,8 @@ pub struct HttpClient(reqwest::Client);
 
 /// A builder from [`client_builder`] or [`pinned_client_builder`]. It
 /// exposes only settings that cannot change the safeguards: timeouts, the
-/// idle pool, the connection counter, HTTPS-only and (through [`add_root_certificates`]) extra trust
-/// anchors.
+/// idle pool, the connection counter, HTTPS-only and (through
+/// [`add_root_certificates`]) extra trust anchors.
 #[derive(Debug)]
 #[must_use]
 pub(crate) struct HttpClientBuilder(reqwest::ClientBuilder);
