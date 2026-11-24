@@ -36,7 +36,11 @@ const COUNTED: &[(&str, &str, usize)] = &[
     ("providers/openai.rs", "Openai", 1),
     ("providers/openai_responses.rs", "Openai", 1),
     ("providers/openrouter.rs", "Openrouter", 1),
-    ("management/governance/suggestion/catalog.rs", "Openrouter", 1),
+    (
+        "management/governance/suggestion/catalog.rs",
+        "Openrouter",
+        1,
+    ),
     ("providers/anthropic.rs", "Anthropic", 1),
     ("providers/anthropic/batches.rs", "Anthropic", 2),
     ("providers/local/mod.rs", "Local", 3),
