@@ -175,6 +175,53 @@ async fn a_lost_request_is_counted_once_and_keeps_its_error() {
     assert_eq!(metrics.upstream_connection_lost_count("openai"), 0);
 }
 
+/// A pooled client as production builds one: its pool idle timeout and its
+/// new-connection counter, both under `client`'s label.
+fn counted_client(client: UpstreamClient, idle: Duration) -> HttpClient {
+    client_builder(loopback())
+        .pool_idle_timeout(idle)
+        .count_connections(client)
+        .build()
+        .unwrap()
+}
+
+/// The denominator of the loss counter: every connection the pool opens is
+/// counted once under its client, a reused one is not, and a connection that
+/// never opened (nothing listening) is not.
+#[tokio::test]
+async fn each_new_connection_is_counted_once_under_its_client() {
+    let metrics = fresh_registry();
+    let _sink = upstream::count_here(metrics);
+
+    // Requests further apart than the pool idle timeout: one connection each.
+    let (port, seen) = lazy_close_server(SERVER_IDLE).await;
+    let client = counted_client(UpstreamClient::S3, Duration::from_millis(75));
+    assert_eq!(run(&client, port, 6, PAUSE).await, 0);
+    assert_eq!(seen.connections.load(Ordering::SeqCst), 6);
+    assert_eq!(metrics.upstream_connections_opened_count("s3"), 6);
+
+    // Back-to-back requests reuse one connection: counted once.
+    let (port, seen) = lazy_close_server(Duration::from_secs(5)).await;
+    let client = counted_client(UpstreamClient::Export, Duration::from_secs(2));
+    assert_eq!(run(&client, port, 20, Duration::ZERO).await, 0);
+    assert_eq!(seen.connections.load(Ordering::SeqCst), 1);
+    assert_eq!(metrics.upstream_connections_opened_count("export"), 1);
+
+    // A refused connection opened nothing.
+    let free = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed = free.local_addr().unwrap().port();
+    drop(free);
+    let client = counted_client(UpstreamClient::Local, Duration::from_secs(1));
+    let error = client
+        .get(format!("http://localhost:{closed}/"))
+        .send()
+        .await
+        .expect_err("nothing listens");
+    assert!(error.is_connect(), "{error:?}");
+    assert_eq!(metrics.upstream_connections_opened_count("local"), 0);
+    assert_eq!(metrics.upstream_connections_opened_count("openai"), 0);
+}
+
 async fn expect_not_counted(client: &HttpClient, url: &str) {
     let error = match client.get(url).send().await {
         Err(error) => error,
@@ -372,22 +419,27 @@ fn every_client_has_a_pool_idle_timeout_below_the_default() {
     );
 }
 
-/// The operator reference names the counter and every label value.
+/// The operator reference names both counters and every label value.
 #[test]
-fn the_metric_reference_names_the_counter_and_each_client() {
+fn the_metric_reference_names_the_counters_and_each_client() {
     let reference = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/operations.md"),
     )
     .unwrap();
-    let row = reference
-        .lines()
-        .find(|line| line.starts_with("| `gateway_upstream_connection_lost_total`"))
-        .expect("a row in the metric table");
-    for client in UpstreamClient::ALL {
-        assert!(
-            row.contains(&format!("`{}`", client.as_str())),
-            "{client:?}"
-        );
+    for family in [
+        "gateway_upstream_connection_lost_total",
+        "gateway_upstream_connections_opened_total",
+    ] {
+        let row = reference
+            .lines()
+            .find(|line| line.starts_with(&format!("| `{family}`")))
+            .unwrap_or_else(|| panic!("a row for {family} in the metric table"));
+        for client in UpstreamClient::ALL {
+            assert!(
+                row.contains(&format!("`{}`", client.as_str())),
+                "{family}: {client:?}"
+            );
+        }
     }
 }
 

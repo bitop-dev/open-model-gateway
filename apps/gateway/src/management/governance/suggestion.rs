@@ -54,6 +54,7 @@ impl OpenRouterCatalog {
             ))
             .connect_timeout(timeout)
             .pool_idle_timeout(crate::egress::UpstreamClient::Openrouter.pool_idle_timeout())
+            .count_connections(crate::egress::UpstreamClient::Openrouter)
             .build()
             .map_err(|_| anyhow::anyhow!("Unable to initialize catalog transport"))?,
             base,

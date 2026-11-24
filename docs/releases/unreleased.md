@@ -9,3 +9,7 @@ Notes for changes on `main` after [v0.19.0](v0.19.0.md). They become the next re
 ## Upgrade
 
 No migration or grant change: the claim uses the `runner_id`, `runner_lease_until` and `runner_epoch` columns and grants of 0021 and 0081. The claim protects a job only once every gateway process runs this release. A process of an earlier release still polls with the old 30 s soft claim and ignores the lease, so drain older replicas rather than running them beside this one.
+
+## Metrics
+
+- `gateway_upstream_connections_opened_total{client}` counts the connections each pooled outbound client opens, with the same fixed `client` label as `gateway_upstream_connection_lost_total` (#611). It gives the `s3` and `export` clients a denominator for their loss counter and shows what each pool idle timeout costs. The idle timeouts stay fixed constants: a per-endpoint setting for local endpoints and tuned cloud values wait for what the two counters show in real deployments. [Lost connections](../operations.md#lost-connections-483)

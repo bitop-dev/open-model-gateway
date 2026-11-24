@@ -33,7 +33,7 @@ pub struct HttpClient(reqwest::Client);
 
 /// A builder from [`client_builder`] or [`pinned_client_builder`]. It
 /// exposes only settings that cannot change the safeguards: timeouts, the
-/// idle pool, HTTPS-only and (through [`add_root_certificates`]) extra trust
+/// idle pool, the connection counter, HTTPS-only and (through [`add_root_certificates`]) extra trust
 /// anchors.
 #[derive(Debug)]
 #[must_use]
@@ -108,6 +108,18 @@ impl HttpClientBuilder {
     /// redirect, retry, proxy or resolver safeguard.
     pub fn pool_idle_timeout(self, timeout: Duration) -> Self {
         Self(self.0.pool_idle_timeout(timeout))
+    }
+
+    /// Counts each connection the pool opens under `client`'s label
+    /// (#611). The layer only observes a completed connection and returns it
+    /// unchanged: it changes no destination, resolver, TLS, proxy, redirect
+    /// or retry safeguard, and it is the only connector layer a client gets.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the one connector layer, which only counts (#611)"
+    )]
+    pub fn count_connections(self, client: super::UpstreamClient) -> Self {
+        Self(self.0.connector_layer(client.opened_connections()))
     }
 
     pub fn https_only(self, enabled: bool) -> Self {

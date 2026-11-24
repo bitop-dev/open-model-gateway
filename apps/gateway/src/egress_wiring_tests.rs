@@ -1,11 +1,12 @@
 //! Every pooled outbound client sets its pool idle timeout and counts its
-//! lost requests under its own label (#483).
+//! lost requests (#483) and its new connections (#611) under its own label.
 //!
 //! The wiring is per call site, so a runtime test of the constants cannot
 //! see a site that dropped the call or took another client's label. This
 //! reads the production source with `syn`: each `client_builder(..)` /
 //! `pinned_client_builder(..)` chain must contain
-//! `.pool_idle_timeout(UpstreamClient::X.pool_idle_timeout())` with the `X`
+//! `.pool_idle_timeout(UpstreamClient::X.pool_idle_timeout())` and
+//! `.count_connections(UpstreamClient::X)` with the `X`
 //! listed for its file, and each file that maps a send error must count it
 //! under the listed client, as many times as it has sites.
 use std::{
@@ -50,6 +51,7 @@ const COUNTED: &[(&str, &str, usize)] = &[
 #[derive(Default)]
 struct Chain {
     idle: Option<String>,
+    opened: Option<String>,
     single_connection: bool,
 }
 
@@ -162,6 +164,14 @@ impl<'ast> Visit<'ast> for Found {
                         _ => "?".into(),
                     });
                 }
+                "count_connections" => {
+                    chain.opened = Some(
+                        node.args
+                            .first()
+                            .and_then(client_of)
+                            .unwrap_or_else(|| "?".into()),
+                    );
+                }
                 "pool_max_idle_per_host" => {
                     chain.single_connection = matches!(
                         node.args.first(),
@@ -219,13 +229,13 @@ fn scan() -> Vec<(String, Found)> {
 }
 
 #[test]
-fn every_client_builder_sets_the_pool_idle_timeout_of_its_client() {
+fn every_client_builder_sets_the_pool_idle_timeout_and_counter_of_its_client() {
     let mut seen = Vec::new();
     for (file, found) in scan() {
         for chain in found.chains.values() {
             if file == SINGLE_CONNECTION {
                 assert!(
-                    chain.single_connection && chain.idle.is_none(),
+                    chain.single_connection && chain.idle.is_none() && chain.opened.is_none(),
                     "{file}: identity keeps one connection per request (#417)"
                 );
                 seen.push(file.clone());
@@ -241,6 +251,12 @@ fn every_client_builder_sets_the_pool_idle_timeout_of_its_client() {
                 Some(expected),
                 "{file}: the builder chain must call \
                  .pool_idle_timeout(UpstreamClient::{expected}.pool_idle_timeout())"
+            );
+            assert_eq!(
+                chain.opened.as_deref(),
+                Some(expected),
+                "{file}: the builder chain must call \
+                 .count_connections(UpstreamClient::{expected})"
             );
             seen.push(file.clone());
         }
