@@ -225,6 +225,18 @@ pub struct Jobs {
     /// Test-only: the next finished line of a run turns it soft-lost.
     #[cfg(test)]
     pub(crate) soft_loss: Arc<std::sync::atomic::AtomicBool>,
+    /// Test-only lease term and renewal period of a poller claim (the
+    /// production values are [`poller::PollLease::DEFAULT`]).
+    #[cfg(test)]
+    pub(crate) poll_lease: poller::PollLease,
+    /// Test-only pause of the next native collection after it recorded its
+    /// results and before it settles. Never used outside tests.
+    #[cfg(test)]
+    pub(crate) settle_hold: Arc<FinalizeHold>,
+    /// Test-only grace of a started native submission (the production value
+    /// is [`native::SUBMIT_GRACE`]).
+    #[cfg(test)]
+    pub(crate) submit_grace: TimeDelta,
 }
 /// The next finishing run waits here once armed (tests).
 #[cfg(test)]
@@ -277,6 +289,12 @@ impl Jobs {
             finalize_hold: Arc::default(),
             #[cfg(test)]
             soft_loss: Arc::default(),
+            #[cfg(test)]
+            poll_lease: poller::PollLease::DEFAULT,
+            #[cfg(test)]
+            settle_hold: Arc::default(),
+            #[cfg(test)]
+            submit_grace: native::SUBMIT_GRACE,
         }
     }
     /// Attach the approved local endpoints (batch scheduling load signals).
