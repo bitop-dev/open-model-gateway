@@ -257,6 +257,9 @@ pub struct Jobs {
     /// Test-only count of native finishes counted in the batch metrics.
     #[cfg(test)]
     pub(crate) finish_metrics: Arc<std::sync::atomic::AtomicUsize>,
+    /// Test-only counts of lease renewals by outcome (`poller::Renewal`).
+    #[cfg(test)]
+    pub(crate) renewal_counts: Arc<[std::sync::atomic::AtomicUsize; 3]>,
 }
 /// The next finishing run waits here once armed (tests).
 #[cfg(test)]
@@ -321,6 +324,8 @@ impl Jobs {
             empty_claims: Arc::default(),
             #[cfg(test)]
             finish_metrics: Arc::default(),
+            #[cfg(test)]
+            renewal_counts: Arc::default(),
         }
     }
     /// Attach the approved local endpoints (batch scheduling load signals).

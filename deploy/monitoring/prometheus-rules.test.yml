@@ -487,3 +487,56 @@ tests:
           # One first observation for each of the two counters.
           - labels: '{}'
             value: 2
+  # gateway-a's renewals fail at 20%: pending, then firing after 15 minutes.
+  # gateway-b fails one renewal in ten, under the share and the floor.
+  - name: job lease renewals failing
+    interval: 1m
+    input_series:
+      - series: gateway_job_lease_renewals_total{job="open-model-gateway",instance="gateway-a",outcome="renewed"}
+        values: 0+8x60
+      - series: gateway_job_lease_renewals_total{job="open-model-gateway",instance="gateway-a",outcome="failed"}
+        values: 0+1x60
+      - series: gateway_job_lease_renewals_total{job="open-model-gateway",instance="gateway-a",outcome="lost"}
+        values: 0+1x60
+      - series: gateway_job_lease_renewals_total{job="open-model-gateway",instance="gateway-b",outcome="renewed"}
+        values: 0+9x60
+      - series: gateway_job_lease_renewals_total{job="open-model-gateway",instance="gateway-b",outcome="failed"}
+        values: 0+0x30 1+0x30
+      - series: gateway_job_lease_renewals_total{job="open-model-gateway",instance="gateway-b",outcome="lost"}
+        values: 0+0x60
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: GatewayJobLeaseRenewalsFailing
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: GatewayJobLeaseRenewalsFailing
+        exp_alerts:
+          - exp_labels:
+              job: open-model-gateway
+              instance: gateway-a
+              severity: warning
+            exp_annotations:
+              summary: More than 10% of job lease renewals fail on gateway-a
+              description: "See docs/operations.md \"Job poller\": check database pool saturation (gateway_db_pool_connections) and long native collections."
+  # The series exists at zero from startup: one late submission fires.
+  - name: native batch accepted after it ended
+    interval: 1m
+    input_series:
+      - series: gateway_batches_total{job="open-model-gateway",instance="gateway-a",mode="native",event="late_submission"}
+        values: 0+0x10 1+0x50
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: GatewayBatchAcceptedAfterEnd
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: GatewayBatchAcceptedAfterEnd
+        exp_alerts:
+          - exp_labels:
+              job: open-model-gateway
+              instance: gateway-a
+              mode: native
+              event: late_submission
+              severity: warning
+            exp_annotations:
+              summary: A native batch was accepted by its provider after it ended on gateway-a
+              description: "The WARN log line `native batch accepted after it ended` names the job and the provider batch id: cancel the provider batch there."

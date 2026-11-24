@@ -2555,7 +2555,9 @@ async fn native_openai_batch_charges_published_batch_prices(pool: PgPool) {
     );
     assert_eq!(
         w.openai.calls(),
-        ["submit", "retrieve", "retrieve", "retrieve", "results", "delete"]
+        [
+            "submit", "retrieve", "retrieve", "retrieve", "results", "delete"
+        ]
     );
     assert!(file_deleted(f, job.work_file_id).await);
     consistent(f).await;

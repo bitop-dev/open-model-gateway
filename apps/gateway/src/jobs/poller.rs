@@ -43,6 +43,28 @@ const REFRESH_TIMEOUT: Duration = Duration::from_secs(30 * 60 + 60);
 const LEASE_SECONDS: f64 = 60.0;
 const RENEW: Duration = Duration::from_secs(15);
 
+/// The outcome of one lease renewal, a fixed metric label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Renewal {
+    /// The claim is current (or its batch settled: nothing is left to renew).
+    Renewed,
+    /// The renewal did not complete within its timeout, or the database
+    /// refused it: the lease runs on toward lapsing.
+    Failed,
+    /// Another poller holds the job: the claim ended.
+    Lost,
+}
+impl Renewal {
+    pub(crate) const ALL: [Self; 3] = [Self::Renewed, Self::Failed, Self::Lost];
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Renewed => "renewed",
+            Self::Failed => "failed",
+            Self::Lost => "lost",
+        }
+    }
+}
+
 /// Lease term and renewal period of a poller claim.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PollLease {
@@ -80,6 +102,17 @@ impl Jobs {
     #[cfg(test)]
     fn poll_lease(&self) -> PollLease {
         self.poll_lease
+    }
+
+    fn observe_renewal(&self, outcome: Renewal) {
+        #[cfg(test)]
+        self.renewal_counts[outcome as usize].fetch_add(1, Ordering::SeqCst);
+        crate::metrics::METRICS.observe_job_lease_renewal(outcome.as_str());
+    }
+    /// Renewals of this service's claims with `outcome` so far (tests).
+    #[cfg(test)]
+    pub(crate) fn renewals(&self, outcome: Renewal) -> usize {
+        self.renewal_counts[outcome as usize].load(Ordering::SeqCst)
     }
 
     /// Jobs refreshed at once.
@@ -219,13 +252,20 @@ impl Jobs {
             renew.tick().await;
             let renewed = fence.renew(&self.store, lease.seconds);
             match tokio::time::timeout(lease.renew_timeout(), renewed).await {
-                Ok(Ok(Renewed::Held { .. })) => {}
-                Ok(Ok(Renewed::Settled)) => return,
+                Ok(Ok(Renewed::Held { .. })) => self.observe_renewal(Renewal::Renewed),
+                Ok(Ok(Renewed::Settled)) => {
+                    self.observe_renewal(Renewal::Renewed);
+                    return;
+                }
                 Ok(Ok(Renewed::Fenced)) => {
+                    self.observe_renewal(Renewal::Lost);
                     lost.store(true, Ordering::SeqCst);
                     return;
                 }
-                _ => tracing::warn!(job_id = %fence.job, "async job lease renewal failed"),
+                _ => {
+                    self.observe_renewal(Renewal::Failed);
+                    tracing::warn!(job_id = %fence.job, "async job lease renewal failed");
+                }
             }
         }
     }

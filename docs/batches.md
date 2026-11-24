@@ -225,8 +225,9 @@ Overnight on weekdays, at most 4 batch lines run at once. They pause while 2 or 
   - `batch_stalled`: an unfinished batch without progress for `window_minutes` (5–1440); progress or the end resolves it. A gateway-run batch that is legitimately waiting (its time window, live traffic, server load, concurrency or its turn) is not stalled: its clock starts when the wait ends. Unreadable server metrics are not a legitimate wait.
   - Workspace rules watch their workspace; installation rules watch Teams and Projects.
 - **Metrics** (low cardinality):
-  - `gateway_batches{mode,event}`, where the event is created, submitted or the final state.
+  - `gateway_batches{mode,event}`, where the event is created, submitted, the final state, or `late_submission` (native: the provider accepted a batch after the gateway had ended it, so the provider batch runs unpolled; pre-created at zero). A native batch's final state and its line counts are counted once, by the poller that recorded its finish.
   - `gateway_batch_lines{mode,provider,outcome}`.
+  - `gateway_job_lease_renewals{outcome=renewed|failed|lost}`: lease renewals of poller claims ([job poller](operations.md#job-poller)).
   - `gateway_batch_queue_depth{mode}`.
   - `gateway_batch_workers{state=capacity|busy}`.
   - `gateway_batch_route_lines{provider,state=waiting|running}`: gateway-run lines per route provider kind, installation-wide.

@@ -562,3 +562,73 @@ async fn a_finished_batch_with_aggregate_usage_settles_without_a_second_download
     assert_eq!(reservation(&w.f, job.execution_id).await, settled);
     consistent(&w.f).await;
 }
+
+/// A submission that the provider accepts only after another poller ended
+/// the batch `submission_interrupted` records no upstream id on the settled
+/// row: the late id is counted (and logged) instead, so the provider batch
+/// that runs unpolled is visible. The batch keeps its retained hold.
+#[dbtest::test]
+async fn a_late_accepted_submission_is_counted_not_recorded_on_an_ended_batch(pool: PgPool) {
+    let (mut w, job) = unsubmitted(pool).await;
+    w.jobs.submit_grace = TimeDelta::minutes(0);
+    let held = {
+        let mut s = w.openai.script.lock().unwrap();
+        gate(&mut s.submit_gate)
+    };
+    let late = || crate::metrics::METRICS.batch_event_count("native", "late_submission");
+    let before = late();
+    due(&w, &job).await;
+    let a = {
+        let jobs = w.jobs.clone();
+        tokio::spawn(async move { jobs.poll_once().await })
+    };
+    held.entered.notified().await;
+    // A's lease lapses while its submission is in flight; B ends the batch
+    // as interrupted (the grace has passed) and settles it.
+    lapse(&w, &job).await;
+    w.jobs.poll_once().await.unwrap();
+    let ended = w.reload(&job).await;
+    assert_eq!(
+        (ended.state.as_str(), ended.error_code.as_deref()),
+        ("failed", Some("submission_interrupted"))
+    );
+    assert!(ended.settled_at.is_some());
+    let settled = reservation(&w.f, job.execution_id).await;
+    // The provider accepts A's submission now.
+    held.release.notify_one();
+    a.await.unwrap().unwrap();
+    let after = w.reload(&job).await;
+    assert_eq!(after.upstream_id, None, "no id on an ended batch");
+    assert_eq!(after.state, "failed");
+    assert_eq!(late() - before, 1);
+    assert_eq!(reservation(&w.f, job.execution_id).await, settled);
+    consistent(&w.f).await;
+}
+
+/// Lease renewals are counted by outcome: a held claim renews, and a renewal
+/// refused after a takeover is counted as lost (once: the renewals stop).
+#[dbtest::test]
+async fn lease_renewals_are_counted_by_outcome(pool: PgPool) {
+    use crate::jobs::poller::Renewal;
+    let (mut w, job) = submitted(pool).await;
+    w.jobs.poll_lease = SHORT;
+    completed(&w);
+    let held = gate(&mut w.openai.script.lock().unwrap().results_gate);
+    due(&w, &job).await;
+    let a = {
+        let jobs = w.jobs.clone();
+        tokio::spawn(async move { jobs.poll_once().await })
+    };
+    held.entered.notified().await;
+    tokio::time::sleep(SHORT.renew * 4).await;
+    assert!(
+        w.jobs.renewals(Renewal::Renewed) >= 1,
+        "a held claim renews"
+    );
+    assert_eq!(w.jobs.renewals(Renewal::Lost), 0);
+    take_over(&w, &job, Uuid::new_v4()).await;
+    tokio::time::sleep(SHORT.renew * 12).await;
+    held.release.notify_one();
+    a.await.unwrap().unwrap();
+    assert_eq!(w.jobs.renewals(Renewal::Lost), 1);
+}

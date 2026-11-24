@@ -93,6 +93,7 @@ classes! {
     "gateway_batch_route_pauses" => (Traffic, Counter, "1", ["reason"]),
     "gateway_batch_workers" => (Traffic, Gauge, "1", ["state"]),
     "gateway_batches" => (Traffic, Counter, "1", ["event", "mode"]),
+    "gateway_job_lease_renewals" => (System, Counter, "1", ["outcome"]),
     "gateway_build_info" => (Excluded, Gauge, "1", ["version"]),
     "gateway_cache_lookups" => (Traffic, Counter, "1", ["cache", "result"]),
     "gateway_config_changes" => (System, Counter, "1", ["topic"]),

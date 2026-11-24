@@ -404,10 +404,13 @@ pub(crate) async fn legacy_files(
 
 // ---------------------------------------------------------- Engine batches ----
 
-/// Record a native batch's upstream id (once).
+/// Record a native batch's upstream id (once), only while the batch is still
+/// open: an id the provider returned after the batch ended (another poller
+/// ended it `submission_interrupted`) is not written to the ended row.
+/// `false` when nothing was recorded.
 pub(crate) async fn set_upstream(store: &Store, id: Uuid, upstream: &UpstreamId) -> Result<bool> {
     Ok(
-        sqlx::query("UPDATE async_jobs SET upstream_id=$2 WHERE id=$1 AND upstream_id IS NULL")
+        sqlx::query("UPDATE async_jobs SET upstream_id=$2 WHERE id=$1 AND upstream_id IS NULL AND state IN('queued','in_progress') AND settled_at IS NULL")
             .bind(id)
             .bind(upstream.as_str())
             .execute(&store.pool)

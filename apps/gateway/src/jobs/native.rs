@@ -207,7 +207,19 @@ impl Jobs {
             (Ok(Ok(upstream)), produced) => {
                 // An accepted response proves acceptance even if the concurrent
                 // encoder failed. Persist its id before classifying that failure.
-                store::set_upstream(&self.store, job.id, &upstream.id).await?;
+                if !store::set_upstream(&self.store, job.id, &upstream.id).await? {
+                    // The batch ended while the provider was accepting it
+                    // (its hold is kept as unknown cost): the provider batch
+                    // runs and is billed but is never polled. Counted and
+                    // logged with the provider's id so an operator can cancel it.
+                    crate::metrics::METRICS.observe_batch_late_submission();
+                    tracing::warn!(
+                        job_id = %job.id,
+                        upstream_id = %upstream.id.as_str(),
+                        "native batch accepted after it ended; the provider batch is not polled"
+                    );
+                    return Ok(());
+                }
                 produced.map(|_| upstream)
             }
             (Ok(Err(e)), _) => Err(e),
