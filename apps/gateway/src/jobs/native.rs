@@ -439,7 +439,15 @@ impl Jobs {
                 return Err(e.into());
             }
         };
-        let output_file = out.finish().await?;
+        // A failed output commit must not leave the error sink to commit a
+        // file by being dropped.
+        let output_file = match out.finish().await {
+            Ok(file) => file,
+            Err(e) => {
+                err.abort().await;
+                return Err(e.into());
+            }
+        };
         // A committed output file that no batch will link is removed with
         // the error file's failure, as the runner does.
         let error_file = match err.finish().await {

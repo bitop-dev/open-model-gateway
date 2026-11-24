@@ -223,10 +223,11 @@ async fn all_results(w: &World) -> i64 {
     .unwrap()
 }
 
-/// A short lease, renewed several times a second.
+/// A short lease, renewed several times a second. A stalled runner has the
+/// lease term less one renewal period before a renewal comes too late.
 const SHORT: PollLease = PollLease {
-    seconds: 1.0,
-    renew: Duration::from_millis(200),
+    seconds: 2.0,
+    renew: Duration::from_millis(250),
 };
 
 #[dbtest::test]
@@ -242,7 +243,7 @@ async fn the_lease_is_renewed_while_a_collection_outlives_it(pool: PgPool) {
     };
     held.entered.notified().await;
     // A reads the results for longer than two lease terms.
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    tokio::time::sleep(Duration::from_secs_f64(SHORT.seconds * 2.5)).await;
     let live: bool = sqlx::query_scalar(
         "SELECT runner_lease_until>clock_timestamp() FROM async_jobs WHERE id=$1",
     )
@@ -374,7 +375,7 @@ async fn a_poller_whose_renewal_is_refused_stops_collecting_before_it_writes(poo
     let holder = claim(&w, &job).await;
     // A's next renewals are refused: it knows the claim is lost before it
     // reads a result line.
-    tokio::time::sleep(SHORT.renew * 4).await;
+    tokio::time::sleep(SHORT.renew * 12).await;
     held.release.notify_one();
     a.await.unwrap().unwrap();
     assert_eq!(all_results(&w).await, 0, "no result file was opened");
