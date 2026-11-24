@@ -77,6 +77,7 @@ impl InferenceRepository for TelemetryRepository {
         _lease_seconds: i64,
         _deployment: &Deployment,
         _output_limit: u32,
+        _forwards_cache_controls: bool,
     ) -> Result<GenerationAdmission, InferenceError> {
         use telemetry::SpanName::*;
         for phase in [

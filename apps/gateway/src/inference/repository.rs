@@ -182,6 +182,7 @@ pub trait InferenceRepository: Send + Sync {
         _lease_seconds: i64,
         _deployment: &Deployment,
         output_limit: u32,
+        _forwards_cache_controls: bool,
     ) -> Result<GenerationAdmission, InferenceError> {
         let admission =
             crate::governance::generation_bound(None, request.max_output_tokens, output_limit)?;
@@ -348,6 +349,7 @@ impl InferenceRepository for Store {
         lease_seconds: i64,
         deployment: &Deployment,
         output_limit: u32,
+        forwards_cache_controls: bool,
     ) -> Result<GenerationAdmission, InferenceError> {
         crate::governance::admit_generation(
             self,
@@ -356,6 +358,7 @@ impl InferenceRepository for Store {
             lease_seconds,
             deployment,
             output_limit,
+            forwards_cache_controls,
         )
         .await
     }

@@ -84,20 +84,90 @@ fn ensure_dev_config(
         "bootstrap-dev requires GATEWAY_ENV=development"
     );
     anyhow::ensure!(
-        options.get_socket().is_none()
-            && matches!(options.get_host(), "127.0.0.1" | "::1" | "[::1]"),
-        "bootstrap-dev requires a loopback database (127.0.0.1 or ::1)"
+        literal_loopback_database(options),
+        "bootstrap-dev requires a loopback database given as a literal address: write the host in DATABASE_URL as 127.0.0.1 or [::1], not a name such as localhost, with no Unix socket and no PGHOST or PGHOSTADDR that is not one of those (tests that call bootstrap::seed need the same DATABASE_URL)"
     );
     Ok(())
 }
 
+/// The database is reached over TCP at a literal loopback address: the host
+/// is `127.0.0.1` or `::1` (`[::1]` as a URL writes it) and no Unix socket is
+/// set. sqlx keeps the URL's host when `?host=/dir` (or a host beginning with
+/// `/`) selects a socket and then connects through the socket, which may be a
+/// proxy to anywhere, so the host alone does not say where the connection
+/// goes. A name such as `localhost` is refused because its resolution is not
+/// this process's to decide. `PGHOST` and `PGHOSTADDR` fill in only a host the
+/// URL leaves out, before this runs, so they are judged the same way.
+/// `bootstrap-dev` and the local demo (`bootstrap-demo`, and `serve` with the
+/// demo issuer) share this check and add their own requirements to it.
+pub fn literal_loopback_database(options: &sqlx::postgres::PgConnectOptions) -> bool {
+    options.get_socket().is_none() && matches!(options.get_host(), "127.0.0.1" | "::1" | "[::1]")
+}
+
+/// Every table `seed` or the demo seed (`demo.rs`) inserts into. A row in any
+/// of them means the installation is in use. `workspace_type_policies` is
+/// absent because migration creates its rows (the demo seed updates them, and
+/// changes to it bump the `policy` configuration topic).
+pub(crate) const SEEDED_TABLES: &[&str] = &[
+    "users",
+    "platform_role_grants",
+    "oidc_group_mappings",
+    "cost_centers",
+    "workspaces",
+    "workspace_membership_grants",
+    "service_accounts",
+    "api_keys",
+    "provider_connections",
+    "models",
+    "deployments",
+    "deployment_prices",
+    "catalogs",
+    "catalog_models",
+    "workspace_type_catalogs",
+    "workspace_catalog_overrides",
+    "workspace_catalog_override_items",
+    "workspace_model_grants",
+    "policy_budgets",
+    "audit_events",
+];
+
+/// History no seed writes; a row means the installation has served traffic.
+pub(crate) const HISTORY_TABLES: &[&str] = &["inference_executions"];
+
+/// An installation is empty when none of `SEEDED_TABLES` or `HISTORY_TABLES`
+/// has a row and every `config_versions` topic is still at its migrated 0. The
+/// topics are bumped at commit by the triggers of migration 0028, which cover
+/// catalog, policy, key-selection and installation-settings writes and updates
+/// or deletions of accounts, grants, workspaces, service accounts and keys
+/// (not their inserts), and never move back. So a database that has had any
+/// of those changes, even one later undone, is refused. Not detected: state
+/// only in other tables (the `installation` row's own columns, for example,
+/// or anything a later feature adds that neither seed writes), and a loopback
+/// forwarder to a freshly migrated remote database, which is empty by this
+/// definition. A freshly migrated database is empty. Callers hold the
+/// exclusive catalog lock and the installation row, which every
+/// account-creating path (OIDC sign-in, SCIM, provisioning) also takes first,
+/// so no account can commit between this check and the seed.
 pub(crate) async fn ensure_empty(tx: &mut sqlx::PgConnection) -> Result<()> {
-    let occupied: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users) OR EXISTS(SELECT 1 FROM workspaces) OR EXISTS(SELECT 1 FROM inference_executions)").fetch_one(&mut *tx).await?;
+    let occupied: bool = sqlx::query_scalar(&emptiness_query())
+        .fetch_one(&mut *tx)
+        .await?;
     anyhow::ensure!(
         !occupied,
-        "Local bootstrap requires an empty dedicated installation; existing identities/history are never replaced"
+        "Local bootstrap requires an empty dedicated installation (no accounts, grants, workspaces, keys, catalog or policy entries, cost centers, audit or execution history, and no configuration change recorded since migration); nothing existing is ever replaced"
     );
     Ok(())
+}
+
+/// Built only from the constant table names above, never from input.
+fn emptiness_query() -> String {
+    let rows = SEEDED_TABLES
+        .iter()
+        .chain(HISTORY_TABLES)
+        .map(|table| format!("EXISTS(SELECT 1 FROM {table})"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    format!("SELECT {rows} OR EXISTS(SELECT 1 FROM config_versions WHERE version>0)")
 }
 
 async fn ensure_selected_database(conn: &mut sqlx::PgConnection, selected: &str) -> Result<()> {
@@ -233,6 +303,16 @@ mod config_tests {
             assert!(ensure_dev_config(Environment::Development, &options).is_ok());
             assert!(ensure_dev_config(Environment::Production, &options).is_err());
         }
+        let localhost =
+            sqlx::postgres::PgConnectOptions::from_str("postgres://user@localhost/db").unwrap();
+        let message = ensure_dev_config(Environment::Development, &localhost)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("127.0.0.1 or [::1]") && message.contains("localhost"),
+            "{message}"
+        );
+        assert!(message.contains("bootstrap::seed"), "{message}");
         for url in [
             "postgres://user@example.invalid/db",
             "postgres://user@localhost/db",
@@ -245,6 +325,10 @@ mod config_tests {
         }
     }
 }
+
+#[cfg(all(test, feature = "integration-tests"))]
+#[path = "bootstrap/emptiness_tests.rs"]
+pub(crate) mod emptiness_tests;
 
 #[cfg(all(test, feature = "integration-tests"))]
 mod tests {

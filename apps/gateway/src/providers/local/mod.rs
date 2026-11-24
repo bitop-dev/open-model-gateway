@@ -19,13 +19,25 @@ pub enum Profile {
     Ollama,
 }
 impl Profile {
-    fn id(self) -> &'static str {
+    pub(crate) const ALL: [Self; 4] = [
+        Self::OpenAiCompatible,
+        Self::Vllm,
+        Self::Sglang,
+        Self::Ollama,
+    ];
+    pub(crate) fn id(self) -> &'static str {
         match self {
             Self::OpenAiCompatible => "openai_compatible",
             Self::Vllm => "vllm",
             Self::Sglang => "sglang",
             Self::Ollama => "ollama",
         }
+    }
+    /// Servers of this profile accept vLLM's `priority` request field, so a
+    /// route's batch scheduling may set a priority hint
+    /// (`capabilities::accepts_priority_hint`) and its batch lines carry it.
+    pub(crate) fn accepts_priority_hint(self) -> bool {
+        matches!(self, Self::Vllm | Self::OpenAiCompatible)
     }
 }
 pub struct LocalAdapter {
@@ -143,7 +155,8 @@ impl LocalAdapter {
     /// to this exact route (its scheduling settings opt in) and the profile
     /// is vLLM-compatible. Never sent otherwise.
     fn batch_priority(&self, target: &Deployment) -> Option<i32> {
-        matches!(self.profile, Profile::Vllm | Profile::OpenAiCompatible)
+        self.profile
+            .accepts_priority_hint()
             .then(|| crate::inference::scheduling::priority_for(target.id))
             .flatten()
     }
@@ -153,21 +166,16 @@ pub fn adapters(
     approvals: ApprovedEndpoints,
 ) -> Vec<Arc<dyn ProviderAdapter>> {
     let approvals = Arc::new(approvals);
-    [
-        Profile::OpenAiCompatible,
-        Profile::Vllm,
-        Profile::Sglang,
-        Profile::Ollama,
-    ]
-    .into_iter()
-    .map(|profile| {
-        Arc::new(LocalAdapter::new(
-            profile,
-            resolver.clone(),
-            approvals.clone(),
-        )) as Arc<dyn ProviderAdapter>
-    })
-    .collect()
+    Profile::ALL
+        .into_iter()
+        .map(|profile| {
+            Arc::new(LocalAdapter::new(
+                profile,
+                resolver.clone(),
+                approvals.clone(),
+            )) as Arc<dyn ProviderAdapter>
+        })
+        .collect()
 }
 #[async_trait]
 impl ProviderAdapter for LocalAdapter {
