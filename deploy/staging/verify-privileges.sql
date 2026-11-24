@@ -676,7 +676,13 @@ BEGIN
   INSERT INTO async_jobs(id,kind,workspace_id,api_key_id,deployment_id,execution_id,public_model,provider,upstream_id,poll_deadline_at,batch_endpoint) VALUES(j,'batch',ws,k,d,e,'rollback','openai_compatible','batch_up_'||replace(j::text,'-',''),now()+interval '26 hours','/v1/chat/completions');
   UPDATE async_job_files SET job_id=j WHERE id=fi AND job_id IS NULL;
   INSERT INTO async_job_files(id,workspace_id,api_key_id,deployment_id,public_model,upstream_id,purpose,job_id) VALUES(fo,ws,k,d,'rollback','file-out-'||fo,'batch_output',j) ON CONFLICT DO NOTHING;
-  PERFORM id FROM async_jobs WHERE id IN(SELECT id FROM async_jobs WHERE settled_at IS NULL AND next_poll_at<=clock_timestamp() ORDER BY next_poll_at LIMIT 1 FOR UPDATE SKIP LOCKED);
+  -- The poller claims a job with an owner, a lease and a bumped epoch (#651),
+  -- holds it for its fenced writes, renews it and gives it up.
+  UPDATE async_jobs SET next_poll_at=clock_timestamp()+make_interval(secs=>30),runner_id=gen_random_uuid(),runner_epoch=runner_epoch+1,runner_lease_until=clock_timestamp()+make_interval(secs=>60) WHERE id=(SELECT id FROM async_jobs WHERE id=j AND settled_at IS NULL AND batch_mode IS DISTINCT FROM 'gateway' AND next_poll_at<=clock_timestamp() AND poll_deadline_at>clock_timestamp() AND (runner_lease_until IS NULL OR runner_lease_until<clock_timestamp()) ORDER BY next_poll_at,id LIMIT 1 FOR UPDATE SKIP LOCKED);
+  PERFORM set_config('idle_in_transaction_session_timeout','30s',true) FROM async_jobs WHERE id=j AND runner_id IS NOT NULL AND runner_epoch=1 FOR NO KEY UPDATE;
+  UPDATE async_jobs SET runner_lease_until=clock_timestamp()+make_interval(secs=>60) WHERE id=j AND runner_id IS NOT NULL AND runner_epoch=1 AND runner_lease_until IS NOT NULL;
+  UPDATE async_jobs SET runner_lease_until=NULL,poll_failures=poll_failures+1,last_polled_at=clock_timestamp(),next_poll_at=clock_timestamp()+make_interval(secs=>30*power(2,least(poll_failures,5))) WHERE id=j AND runner_id IS NOT NULL AND runner_epoch=1;
+  IF (SELECT runner_epoch FROM async_jobs WHERE id=j)<>1 THEN RAISE EXCEPTION 'poller claim not recorded'; END IF;
   UPDATE async_jobs SET next_poll_at=clock_timestamp()+make_interval(secs=>30) WHERE id=j;
   UPDATE async_jobs SET state='in_progress',upstream_status='finalizing',progress=50,request_total=2,request_completed=1,request_failed=0,last_polled_at=clock_timestamp(),poll_failures=0 WHERE id=j AND state='queued';
   UPDATE async_jobs SET poll_failures=poll_failures+1 WHERE id=j;

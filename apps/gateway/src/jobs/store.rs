@@ -269,18 +269,16 @@ pub(crate) async fn observe(
     }
 }
 /// A successful poll without a state change (resets the backoff).
-pub(crate) async fn poll_ok(store: &Store, id: Uuid, interval_seconds: f64) -> Result<()> {
+pub(crate) async fn poll_ok(
+    conn: &mut sqlx::PgConnection,
+    id: Uuid,
+    interval_seconds: f64,
+) -> Result<()> {
     sqlx::query("UPDATE async_jobs SET poll_failures=0,last_polled_at=clock_timestamp(),next_poll_at=clock_timestamp()+make_interval(secs=>$2) WHERE id=$1")
         .bind(id)
         .bind(interval_seconds)
-        .execute(&store.pool)
+        .execute(conn)
         .await.map_err(job_storage)?;
-    Ok(())
-}
-/// Poll failure: exponential backoff (interval × 2^failures, at most 32×).
-pub(crate) async fn poll_failed(store: &Store, id: Uuid, interval_seconds: f64) -> Result<()> {
-    sqlx::query("UPDATE async_jobs SET poll_failures=poll_failures+1,last_polled_at=clock_timestamp(),next_poll_at=clock_timestamp()+make_interval(secs=>$2*power(2,least(poll_failures,5))) WHERE id=$1")
-        .bind(id).bind(interval_seconds).execute(&store.pool).await.map_err(job_storage)?;
     Ok(())
 }
 pub(crate) async fn mark_settled(store: &Store, id: Uuid) -> Result<()> {
@@ -322,16 +320,30 @@ pub(crate) async fn mark_deleted(store: &Store, id: Uuid) -> Result<()> {
     .map_err(job_storage)?;
     Ok(())
 }
-/// Claim up to `limit` due, unsettled provider jobs within their poll
-/// deadline, pushing their next poll forward so concurrent pollers skip
-/// them. Gateway-run batches belong to the batch runner, never the poller.
+/// Claim the next due, unsettled provider job within its poll deadline that
+/// no poller holds, for `poller`: a lease that must be renewed while the job
+/// is refreshed. Gateway-run batches belong to the batch runner, never the
+/// poller, so the two never claim the same row. The claim bumps the job's
+/// epoch in the statement that takes it, so an earlier claim of the job is
+/// fenced from then on ([`super::fence`]); it pushes the next poll forward,
+/// so one pass never claims a job twice. A job with a fenced write in flight
+/// is skipped (`SKIP LOCKED`) and taken on a later call.
 pub(crate) async fn claim_due(
     store: &Store,
-    limit: i64,
+    poller: Uuid,
     interval_seconds: f64,
-) -> Result<Vec<JobRow>> {
-    sqlx::query_as(&format!("UPDATE async_jobs SET next_poll_at=clock_timestamp()+make_interval(secs=>$2) WHERE id IN(SELECT id FROM async_jobs WHERE settled_at IS NULL AND batch_mode IS DISTINCT FROM 'gateway' AND next_poll_at<=clock_timestamp() AND poll_deadline_at>clock_timestamp() ORDER BY next_poll_at,id LIMIT $1 FOR UPDATE SKIP LOCKED) RETURNING {JOB_COLUMNS}"))
-        .bind(limit).bind(interval_seconds).fetch_all(&store.pool).await.map_err(job_storage)
+    lease_seconds: f64,
+) -> Result<Option<(JobRow, BatchFence)>> {
+    let claimed: Option<Claimed> = sqlx::query_as(&format!("UPDATE async_jobs SET next_poll_at=clock_timestamp()+make_interval(secs=>$2),runner_id=$1,runner_epoch=runner_epoch+1,runner_lease_until=clock_timestamp()+make_interval(secs=>$3) WHERE id=(SELECT id FROM async_jobs WHERE settled_at IS NULL AND batch_mode IS DISTINCT FROM 'gateway' AND next_poll_at<=clock_timestamp() AND poll_deadline_at>clock_timestamp() AND (runner_lease_until IS NULL OR runner_lease_until<clock_timestamp()) ORDER BY next_poll_at,id LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING {JOB_COLUMNS},runner_epoch"))
+        .bind(poller).bind(interval_seconds).bind(lease_seconds).fetch_optional(&store.pool).await.map_err(job_storage)?;
+    Ok(claimed.map(|c| {
+        let fence = BatchFence {
+            job: c.job.id,
+            runner: poller,
+            epoch: c.runner_epoch,
+        };
+        (c.job, fence)
+    }))
 }
 pub(crate) async fn reservation_pending(store: &Store, execution: Uuid) -> Result<bool> {
     sqlx::query_scalar(
@@ -382,11 +394,6 @@ pub(crate) async fn set_upstream(store: &Store, id: Uuid, upstream: &UpstreamId)
             == 1,
     )
 }
-/// Claim a native batch's submission: exclusive with an early cancel.
-pub(crate) async fn claim_submit(store: &Store, id: Uuid) -> Result<bool> {
-    Ok(sqlx::query("UPDATE async_jobs SET submit_started_at=clock_timestamp() WHERE id=$1 AND submit_started_at IS NULL AND upstream_id IS NULL AND cancel_requested_at IS NULL AND state='queued'")
-        .bind(id).execute(&store.pool).await.map_err(job_storage)?.rows_affected() == 1)
-}
 /// Cancel a native batch whose submission never started (nothing upstream).
 pub(crate) async fn cancel_unsubmitted(store: &Store, id: Uuid) -> Result<bool> {
     Ok(sqlx::query("UPDATE async_jobs SET cancel_requested_at=coalesce(cancel_requested_at,clock_timestamp()),state='cancelled',upstream_status='cancelled',completed_at=clock_timestamp() WHERE id=$1 AND submit_started_at IS NULL AND upstream_id IS NULL AND state='queued'")
@@ -402,10 +409,26 @@ pub(crate) async fn set_status(store: &Store, id: Uuid, status: &str) -> Result<
         .await.map_err(job_storage)?;
     Ok(())
 }
-pub(crate) async fn mark_running(store: &Store, id: Uuid) -> Result<()> {
+/// Display status the poller observed for an unfinished native batch. Once
+/// a client asked to cancel it and it shows `cancelling`, it keeps showing
+/// `cancelling` until it ends, whatever the provider reported before the
+/// cancellation reached it.
+pub(crate) async fn observe_status(
+    conn: &mut sqlx::PgConnection,
+    id: Uuid,
+    status: &str,
+) -> Result<()> {
+    sqlx::query("UPDATE async_jobs SET upstream_status=CASE WHEN cancel_requested_at IS NOT NULL AND upstream_status='cancelling' THEN upstream_status ELSE $2 END,finalizing_at=CASE WHEN $2='finalizing' THEN coalesce(finalizing_at,clock_timestamp()) ELSE finalizing_at END WHERE id=$1 AND state IN('queued','in_progress')")
+        .bind(id)
+        .bind(status)
+        .execute(conn)
+        .await.map_err(job_storage)?;
+    Ok(())
+}
+pub(crate) async fn mark_running(conn: &mut sqlx::PgConnection, id: Uuid) -> Result<()> {
     sqlx::query("UPDATE async_jobs SET state='in_progress',upstream_status=CASE WHEN cancel_requested_at IS NULL THEN 'in_progress' ELSE upstream_status END,in_progress_at=coalesce(in_progress_at,clock_timestamp()),last_progress_at=coalesce(last_progress_at,clock_timestamp()) WHERE id=$1 AND state='queued'")
         .bind(id)
-        .execute(&store.pool)
+        .execute(conn)
         .await.map_err(job_storage)?;
     Ok(())
 }
@@ -494,6 +517,8 @@ pub(super) async fn finish_locked_batch(
     .map_err(job_storage)
 }
 
+/// Unfenced: the runner and the poller finish under their claim (`fence`).
+#[cfg(all(test, feature = "integration-tests"))]
 pub(crate) async fn finish_batch(store: &Store, id: Uuid, f: &Finished<'_>) -> Result<JobRow> {
     let mut tx = crate::db::begin(&store.pool).await.map_err(job_storage)?;
     let row = finish_batch_tx(&mut tx, id, f).await?;
@@ -504,14 +529,18 @@ pub(crate) async fn finish_batch(store: &Store, id: Uuid, f: &Finished<'_>) -> R
 /// Observed provider progress (native): counts and the stall clock. The
 /// gateway counted the lines at admission, so a provider total never replaces
 /// it (OpenAI reports `total: 0` while it is still validating).
-pub(crate) async fn observe_counts(store: &Store, id: Uuid, counts: RequestCounts) -> Result<()> {
+pub(crate) async fn observe_counts(
+    conn: &mut sqlx::PgConnection,
+    id: Uuid,
+    counts: RequestCounts,
+) -> Result<()> {
     sqlx::query("UPDATE async_jobs SET last_progress_at=CASE WHEN request_completed IS DISTINCT FROM $3 OR request_failed IS DISTINCT FROM $4 THEN clock_timestamp() ELSE coalesce(last_progress_at,clock_timestamp()) END,request_total=coalesce(request_total,$2),request_completed=$3,request_failed=$4 WHERE id=$1 AND state IN('queued','in_progress')")
         .bind(id).bind(counts.total as i32).bind(counts.completed as i32).bind(counts.failed as i32)
-        .execute(&store.pool).await.map_err(job_storage)?;
+        .execute(conn).await.map_err(job_storage)?;
     Ok(())
 }
 
-/// A gateway-run batch claimed by this runner with its fence.
+/// A job claimed with its fence.
 #[derive(FromRow)]
 struct Claimed {
     #[sqlx(flatten)]
