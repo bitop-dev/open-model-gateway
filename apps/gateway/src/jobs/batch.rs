@@ -445,11 +445,15 @@ impl Jobs {
     /// Poller step of a 0016 passthrough batch: record the provider's state
     /// and settle a terminal one from the provider's aggregate usage (without
     /// it the hold is retained as unknown; output files are no longer read).
-    pub(crate) async fn refresh_legacy(&self, job: JobRow) -> JobResult<JobRow> {
+    pub(crate) async fn refresh_legacy(
+        &self,
+        job: JobRow,
+        observer: store::Observer<'_>,
+    ) -> JobResult<JobRow> {
         let (target, adapter) = self.target(&job).await?;
         let upstream_id = job.upstream().ok_or(InferenceError::Storage)?;
         let upstream = call(adapter.retrieve_batch(&target, &upstream_id)).await?;
-        let job = store::observe(
+        let (job, recorded) = store::observe(
             &self.store,
             &job,
             &Observation {
@@ -466,10 +470,13 @@ impl Jobs {
                 counts: upstream.counts,
             },
             self.poll_seconds(),
+            observer,
         )
         .await?;
         let state = job.job_state();
-        if state.is_terminal()
+        // Only the recorded observation settles, with its own evidence.
+        if recorded
+            && state.is_terminal()
             && job.settled_at.is_none()
             && let Some(s) = settlement(state, upstream.usage)
         {

@@ -180,6 +180,33 @@ groups:
         annotations:
           summary: "p95 time to first token above 15s for {{ $labels.provider }}"
 
+  - name: open-model-gateway.jobs
+    rules:
+      - alert: GatewayJobLeaseRenewalsFailing
+        # Poller claims whose lease renewals fail or are refused (#802): a
+        # lease that lapses hands the job to another poller, and a long
+        # collection then restarts each time. Renewals share the database
+        # pool with inference traffic.
+        expr: |
+          (
+            sum by (job, instance) (rate(gateway_job_lease_renewals_total{outcome=~"failed|lost"}[15m]))
+              / (sum by (job, instance) (rate(gateway_job_lease_renewals_total[15m])) > 0)
+          ) > 0.1
+          and sum by (job, instance) (increase(gateway_job_lease_renewals_total{outcome=~"failed|lost"}[15m])) >= 5
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "More than 10% of job lease renewals fail on {{ $labels.instance }}"
+          description: "See docs/operations.md \"Job poller\": check database pool saturation (gateway_db_pool_connections) and long native collections."
+      - alert: GatewayBatchAcceptedAfterEnd
+        # A provider accepted a native batch after the gateway had ended it
+        # (#802): the provider batch runs and is billed but is never polled.
+        expr: increase(gateway_batches_total{mode="native",event="late_submission"}[1h]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "A native batch was accepted by its provider after it ended on {{ $labels.instance }}"
+          description: "The WARN log line `native batch accepted after it ended` names the job and the provider batch id: cancel the provider batch there."
+
   - name: open-model-gateway.internals
     rules:
       - alert: GatewayDatabasePoolSaturated
