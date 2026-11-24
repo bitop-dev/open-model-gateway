@@ -332,7 +332,10 @@ async fn no_argument_tool_defaults_preserve_messages_wire() {
         for strict in [None, Some(false), Some(true)] {
             let mut r = request.clone();
             r.tools[0].strict = strict;
-            if strict == Some(true) {
+            // A Chat strict tool has no encoding here and is refused. A
+            // Messages request sends its validated wire tools, so a setting on
+            // the shared tool cannot add or remove `strict` (none was sent).
+            if strict == Some(true) && r.messages_options.is_none() {
                 assert!(matches!(
                     encode("private", &r),
                     Err(InferenceError::Unsupported)
@@ -347,7 +350,7 @@ async fn no_argument_tool_defaults_preserve_messages_wire() {
         }
     }
     let capture = mock.capture.lock().unwrap();
-    assert_eq!(capture.len(), 6, "strict refusals never dispatch");
+    assert_eq!(capture.len(), 8, "strict Chat refusals never dispatch");
     for (_, uri, body) in capture.iter() {
         assert_eq!(uri.path(), "/v1/messages");
         assert_eq!(

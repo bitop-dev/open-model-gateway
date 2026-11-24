@@ -75,6 +75,9 @@ struct Script {
     results_gate: Option<Arc<Gate>>,
     /// The next `submit_native_batch` waits here before it reads the records.
     submit_gate: Option<Arc<Gate>>,
+    /// What `retrieve_batch` answers for one upstream id, every time
+    /// (before `batches` is consulted).
+    by_id: std::collections::HashMap<String, UpstreamBatch>,
 }
 /// A provider call held open by a test: `entered` is signalled when the call
 /// starts and the call returns once `release` is signalled.
@@ -82,6 +85,26 @@ struct Script {
 struct Gate {
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
+    /// Signalled when the held call is dropped before it was released.
+    dropped: tokio::sync::Notify,
+}
+impl Gate {
+    /// Signal `entered`, then wait for `release`; `dropped` if the waiting
+    /// call is dropped first.
+    async fn hold(&self) {
+        struct Waiting<'a>(&'a Gate, bool);
+        impl Drop for Waiting<'_> {
+            fn drop(&mut self) {
+                if !self.1 {
+                    self.0.dropped.notify_one();
+                }
+            }
+        }
+        let mut waiting = Waiting(self, false);
+        self.entered.notify_one();
+        self.release.notified().await;
+        waiting.1 = true;
+    }
 }
 /// A fake provider. `native` enables its batch API. Prompts steer gateway
 /// runs: `fail` → upstream unavailable, `busy` → 429, `huge` → usage far
@@ -225,7 +248,7 @@ impl ProviderAdapter for Fake {
     /// Simulates a real adapter's pure dry-run encoder (#228): the coarse
     /// `capabilities()`/`supports_chat_request` bool stays true (this is not
     /// a model-wide incompatibility), but this exact body is deterministically
-    /// refused, exactly like Anthropic/Bedrock reject a strict function tool.
+    /// refused, exactly like Anthropic rejects a strict Chat function tool.
     fn validate_chat_request(&self, request: &ChatRequest) -> Result<(), InferenceError> {
         let mut script = self.script.lock().unwrap();
         if script.permissive {
@@ -398,12 +421,15 @@ impl ProviderAdapter for Fake {
     async fn retrieve_batch(
         &self,
         _: &Deployment,
-        _: &UpstreamId,
+        id: &UpstreamId,
     ) -> Result<UpstreamBatch, InferenceError> {
         let (batch, gate) = {
             let mut s = self.script.lock().unwrap();
             s.calls.push("retrieve");
-            (s.batches.pop_front(), s.retrieve_gate.take())
+            match s.by_id.get(id.as_str()).cloned() {
+                Some(batch) => (Some(batch), None),
+                None => (s.batches.pop_front(), s.retrieve_gate.take()),
+            }
         };
         if let Some(gate) = gate {
             gate.entered.notify_one();
@@ -424,10 +450,13 @@ impl ProviderAdapter for Fake {
         _: &Deployment,
         _: &UpstreamBatch,
     ) -> Result<ByteStream, InferenceError> {
-        let gate = self.script.lock().unwrap().results_gate.take();
+        let gate = {
+            let mut s = self.script.lock().unwrap();
+            s.calls.push("results");
+            s.results_gate.take()
+        };
         if let Some(gate) = gate {
-            gate.entered.notify_one();
-            gate.release.notified().await;
+            gate.hold().await;
         }
         let lines: Vec<Result<axum::body::Bytes, InferenceError>> = self
             .script
@@ -2532,7 +2561,9 @@ async fn native_openai_batch_charges_published_batch_prices(pool: PgPool) {
     );
     assert_eq!(
         w.openai.calls(),
-        ["submit", "retrieve", "retrieve", "retrieve", "delete"]
+        [
+            "submit", "retrieve", "retrieve", "retrieve", "results", "delete"
+        ]
     );
     assert!(file_deleted(f, job.work_file_id).await);
     consistent(f).await;
@@ -3415,6 +3446,8 @@ mod envelope;
 mod fence;
 mod http_support;
 mod poller;
+mod poller_concurrency;
+mod poller_http;
 
 /// A gateway-run batch line retries a clean 200-wrapped rate limit under its
 /// retry policy, as it retries an HTTP 429 (#665), and never retries the same

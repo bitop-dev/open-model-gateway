@@ -294,8 +294,21 @@ async fn anthropic_temperature_above_range_refusal_is_zero_write_and_zero_upstre
     .await;
 }
 
+/// `tool_choice:"none"` has no Converse equivalent that keeps the tool
+/// configuration, so Bedrock refuses it deterministically before admission.
+/// (Strict tools are sent as `toolSpec.strict`; Bedrock judges their support.)
+fn tool_choice_none_body(model: &str, stream: bool) -> Value {
+    json!({
+        "model": model,
+        "messages": [{"role":"user","content":"ping"}],
+        "tools": [{"type":"function","function":{"name":"ping","parameters":{"type":"object","properties":{}}}}],
+        "tool_choice": "none",
+        "stream": stream,
+    })
+}
+
 #[dbtest::test]
-async fn bedrock_strict_tool_refusal_is_zero_write_and_zero_upstream_call(pool: PgPool) {
+async fn bedrock_tool_choice_none_refusal_is_zero_write_and_zero_upstream_call(pool: PgPool) {
     let mut f = fixture(pool).await;
     let token = issue_key(&mut f).await;
     add_deployment(
@@ -319,7 +332,7 @@ async fn bedrock_strict_tool_refusal_is_zero_write_and_zero_upstream_call(pool: 
         &token,
         &f.store.pool,
         &hits,
-        |stream| strict_tool_body("company/smart", stream),
+        |stream| tool_choice_none_body("company/smart", stream),
         StatusCode::NOT_IMPLEMENTED,
         "unsupported_capability",
     )

@@ -96,9 +96,10 @@ pub(crate) fn validate(request: &ChatRequest, class: ProviderClass) -> Result<()
     if class != ProviderClass::Anthropic && !options.images.is_empty() {
         return refuse("image");
     }
-    // OpenAI-style adapters map structured output and strict tools to their
-    // JSON-schema controls; no other route has a faithful mapping yet.
-    if class != ProviderClass::OpenAi {
+    // Anthropic forwards structured output and strict tools; OpenAI-style and
+    // Bedrock adapters map them to their own JSON-schema controls. Local
+    // profiles have no such control, so the field is refused, never dropped.
+    if class == ProviderClass::Local {
         if options
             .output_config
             .as_ref()

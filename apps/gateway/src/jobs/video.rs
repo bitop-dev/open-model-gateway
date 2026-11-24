@@ -224,7 +224,12 @@ impl Jobs {
             tracing::error!(execution_id = %request_id, "video provider id arrived after the job ended; hold kept");
             return Err(InferenceError::Storage.into());
         };
-        self.apply_video(&job, &upstream).await
+        // The creator's first observation (`Observer::Creator`): inside the
+        // create grace no poller can hold the row (it is first due at the
+        // grace's end); after it, a poller that holds the row observes it
+        // itself.
+        self.apply_video(&job, &upstream, store::Observer::Creator)
+            .await
     }
 
     /// Record first (#662): the job row, without a provider id, and the
@@ -256,11 +261,18 @@ impl Jobs {
         let job = match recorded {
             Ok(job) => job,
             Err(e) => {
-                let (error, _) = attempt.fail_unsent(e).await;
+                let (error, recorded) = attempt.fail_unsent(e).await;
                 // A COMMIT whose acknowledgement was lost may still have
                 // recorded the row: end it now rather than by the grace rule.
-                if let Ok(Some(ended)) =
-                    store::fail_unrecorded_video(&self.store, new.id, "create_failed", None).await
+                if let Ok(Some(ended)) = store::fail_unrecorded_video(
+                    &self.store,
+                    new.id,
+                    "create_failed",
+                    None,
+                    store::Observer::Creator,
+                )
+                .await
+                    && recorded
                 {
                     let _ = store::mark_settled(&self.store, ended.id).await;
                 }
@@ -301,7 +313,9 @@ impl Jobs {
         } else {
             attempt.fail(error).await
         };
-        if let Ok(Some(ended)) = store::fail_unrecorded_video(&self.store, job.id, code, None).await
+        if let Ok(Some(ended)) =
+            store::fail_unrecorded_video(&self.store, job.id, code, None, store::Observer::Creator)
+                .await
             && recorded
         {
             let _ = store::mark_settled(&self.store, ended.id).await;
@@ -327,11 +341,17 @@ impl Jobs {
     /// an outcome it ends `failed` (`create_interrupted`) and settles as
     /// cancelled with unknown usage (hold kept). A terminal one that is not
     /// settled yet (its create failed and the settled mark was lost) is
-    /// marked settled; its attempt was already recorded.
-    async fn refresh_unrecorded_video(&self, job: JobRow) -> JobResult<JobRow> {
+    /// marked settled; its attempt was already recorded. Each write is made
+    /// only for `observer` (a poller under its current claim, or a client
+    /// read while no poller holds the row): a stale claim, or a read during
+    /// a live claim, changes and settles nothing.
+    async fn refresh_unrecorded_video(
+        &self,
+        job: JobRow,
+        observer: store::Observer<'_>,
+    ) -> JobResult<JobRow> {
         if job.job_state().is_terminal() {
-            if job.settled_at.is_none() {
-                self.settle(&job, interrupted()).await?;
+            if job.settled_at.is_none() && self.settle_as(&job, interrupted(), observer).await? {
                 return Ok(store::reload(&self.store, job.id).await?);
             }
             return Ok(job);
@@ -341,30 +361,85 @@ impl Jobs {
         if UtcInstant::now() - started < grace {
             return Ok(job);
         }
-        match store::fail_unrecorded_video(&self.store, job.id, "create_interrupted", Some(grace))
-            .await?
+        match store::fail_unrecorded_video(
+            &self.store,
+            job.id,
+            "create_interrupted",
+            Some(grace),
+            observer,
+        )
+        .await?
         {
+            // Settled under the writer's hold: if the claim ended in
+            // between, the ended row is settled by the writer that holds it.
             Some(ended) => {
-                self.settle(&ended, interrupted()).await?;
+                self.settle_as(&ended, interrupted(), observer).await?;
                 Ok(store::reload(&self.store, ended.id).await?)
             }
-            // Its id was recorded meanwhile, or it already ended.
+            // Its id was recorded meanwhile, it already ended, or another
+            // writer holds it.
             None => Ok(store::reload(&self.store, job.id).await?),
         }
     }
 
     /// Apply an observation and settle a terminal one (idempotent).
-    async fn apply_video(&self, job: &JobRow, upstream: &UpstreamVideo) -> JobResult<JobRow> {
+    async fn apply_video(
+        &self,
+        job: &JobRow,
+        upstream: &UpstreamVideo,
+        observer: store::Observer<'_>,
+    ) -> JobResult<JobRow> {
         let interval = self.poll_seconds();
-        let job = store::observe(&self.store, job, &observation(upstream), interval).await?;
-        if job.job_state().is_terminal()
+        let (job, recorded) =
+            store::observe(&self.store, job, &observation(upstream), interval, observer).await?;
+        // Only the observation that was recorded settles, with its own
+        // evidence: a refused one leaves settlement to the writer that holds
+        // the job.
+        if recorded
+            && job.job_state().is_terminal()
             && job.settled_at.is_none()
             && let Some(s) = settlement(&job, upstream)
         {
-            self.settle(&job, s).await?;
+            self.settle_as(&job, s, observer).await?;
             return Ok(store::reload(&self.store, job.id).await?);
         }
         Ok(job)
+    }
+
+    /// Settle `job` while `observer` holds its row (`store::hold_writer`), so
+    /// no claim can take the job between the writer check and the
+    /// settlement. `false` when the observer may not write the row now (the
+    /// writer that holds it settles it).
+    ///
+    /// The hold is the one place in `jobs` that keeps a pool connection while
+    /// the settlement takes others from the same pool (the reservation read,
+    /// the governance finish, the settled mark). Holders are therefore
+    /// bounded per replica (`Store::video_settle_slots`, one at a time), with
+    /// the permit taken before the hold's transaction begins: a waiting
+    /// settlement holds no connection, so holders can never own every
+    /// connection while each waits for another. The lock order is unchanged:
+    /// the job row first, then the reservation and totals.
+    async fn settle_as(
+        &self,
+        job: &JobRow,
+        finish: Settlement,
+        observer: store::Observer<'_>,
+    ) -> JobResult<bool> {
+        let _slot = self
+            .store
+            .video_settle_slots
+            .acquire()
+            .await
+            .map_err(|_| InferenceError::Storage)?;
+        let mut tx = crate::db::begin(&self.store.pool)
+            .await
+            .map_err(|_| InferenceError::Storage)?;
+        if !store::hold_writer(&mut tx, job.id, observer).await? {
+            return Ok(false);
+        }
+        self.settle(job, finish).await?;
+        tx.commit().await.map_err(|_| InferenceError::Storage)?;
+        Ok(true)
     }
 
     pub(crate) fn poll_seconds(&self) -> f64 {
@@ -390,17 +465,21 @@ impl Jobs {
         if job.job_state().is_terminal() && job.settled_at.is_some() {
             return Ok(job);
         }
-        self.refresh_video(job).await
+        self.refresh_video(job, store::Observer::Client).await
     }
 
-    pub(crate) async fn refresh_video(&self, job: JobRow) -> JobResult<JobRow> {
+    pub(crate) async fn refresh_video(
+        &self,
+        job: JobRow,
+        observer: store::Observer<'_>,
+    ) -> JobResult<JobRow> {
         if job.upstream_id.is_none() {
-            return self.refresh_unrecorded_video(job).await;
+            return self.refresh_unrecorded_video(job, observer).await;
         }
         let (target, adapter) = self.target(&job).await?;
         let upstream_id = job.upstream().ok_or(InferenceError::Storage)?;
         let upstream = call(adapter.retrieve_video(&target, &upstream_id)).await?;
-        self.apply_video(&job, &upstream).await
+        self.apply_video(&job, &upstream, observer).await
     }
 
     pub async fn list_videos(

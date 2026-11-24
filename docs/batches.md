@@ -225,8 +225,9 @@ Overnight on weekdays, at most 4 batch lines run at once. They pause while 2 or 
   - `batch_stalled`: an unfinished batch without progress for `window_minutes` (5–1440); progress or the end resolves it. A gateway-run batch that is legitimately waiting (its time window, live traffic, server load, concurrency or its turn) is not stalled: its clock starts when the wait ends. Unreadable server metrics are not a legitimate wait.
   - Workspace rules watch their workspace; installation rules watch Teams and Projects.
 - **Metrics** (low cardinality):
-  - `gateway_batches{mode,event}`, where the event is created, submitted or the final state.
+  - `gateway_batches{mode,event}`, where the event is created, submitted, the final state, or `late_submission` (native: the provider accepted a batch after the gateway had ended it, so the provider batch runs unpolled; pre-created at zero). A native batch's final state and its line counts are counted once, by the poller that recorded its finish.
   - `gateway_batch_lines{mode,provider,outcome}`.
+  - `gateway_job_lease_renewals{outcome=renewed|failed|lost}`: lease renewals of poller claims ([job poller](operations.md#job-poller)).
   - `gateway_batch_queue_depth{mode}`.
   - `gateway_batch_workers{state=capacity|busy}`.
   - `gateway_batch_route_lines{provider,state=waiting|running}`: gateway-run lines per route provider kind, installation-wide.
@@ -240,6 +241,7 @@ Overnight on weekdays, at most 4 batch lines run at once. They pause while 2 or 
 | `GATEWAY_BATCH_WORKERS` | `4` | Gateway-run lines executing at once per process (`0`–`256`; `0` disables the runner). |
 | `GATEWAY_BATCH_CONCURRENCY` | `2` | Lines of one batch executing at once (`1`–`64`). |
 | `GATEWAY_JOB_POLL_INTERVAL_SECONDS` | `30` | Poller interval: native submission, status and collection (`0` disables native processing). |
+| `GATEWAY_JOB_POLL_CONCURRENCY` | `4` | Provider job refreshes one process runs at once (`1`–`32`): native batch submissions, status refreshes and collections, video and 0016 batch status; one long collection holds one of them ([poller](async-jobs.md#poller)). |
 
 ## Storage and grants
 
@@ -256,6 +258,7 @@ Overnight on weekdays, at most 4 batch lines run at once. They pause while 2 or 
 - **Order:** results follow completion order.
 - **Batch output files:** results from an interrupted finalization may be visible and count toward storage until the orphan sweep or ordinary retention removes them.
 - **Native:** batches never fail over, and native OpenAI chat-like lines always use Chat Completions upstream.
+- **Native re-collection:** a native batch whose finish committed but whose settlement did not (its poller stopped in between, for example on a lost lease) is collected again by the next poller. When the provider reports the batch's aggregate usage, that poller settles from it without reading the results again (#802). Otherwise it downloads and decodes every result again, because the per-line sum is the only usage evidence and settling without it would turn known usage into unknown; it then deletes the result files it wrote, since the finish keeps the first collection's. For a large batch this is one full download of its results per retry until a settlement commits. The batch's line counts and finished-batch metrics are counted once, by the poller that recorded its finish.
 - **Gateway-run routes:** a line is pinned to the route it was scheduled on and does not fail over. Lines of one model wait for the route their routing policy picks for them. A capped route never spills to another (possibly paid) route.
 - **Server load:** only vLLM-compatible Prometheus gauges are read; other servers can use concurrency, live traffic and time windows.
 - **Mixed models:** a mixed-model batch always runs gateway-side, even when every model has a native batch API.

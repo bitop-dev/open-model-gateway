@@ -13,8 +13,8 @@
 //! `#[sqlx::test]` or `#[dbtest::test]` are dropped.
 //!
 //! Fails closed (panics, so the rule tests fail) on what it cannot read: a
-//! block-local file module, a `mod x;` it cannot find, `include!`, a `mod` declared inside a macro
-//! body, and `#[cfg_attr(.., path = ..)]` on a module. Statement-level `cfg`
+//! block-local file module, a `mod x;` it cannot find, `include!` (also inside a
+//! macro body or a macro argument), a `mod` declared inside a macro body, and `#[cfg_attr(.., path = ..)]` on a module. Statement-level `cfg`
 //! is not pruned (rare; the rules over-report).
 use std::path::{Path, PathBuf};
 
@@ -188,6 +188,17 @@ impl<'ast> Visit<'ast> for Unreadable<'_> {
         // A `mod` keyword followed by a `;` before any `{` body, however the
         // name is spelled (`mod hidden;`, `mod $name;`, `pub(crate) mod $n;`).
         let tokens = flat(mac.tokens.clone());
+        // An `include!` in a macro body (a `macro_rules!` that expands to
+        // one, or a macro argument) adds code as a direct one would.
+        if tokens.windows(2).any(|w| {
+            matches!(w, [TokenTree::Ident(i), TokenTree::Punct(bang)]
+                if i.unraw() == "include" && bang.as_char() == '!')
+        }) {
+            panic!(
+                "{}: include! adds code the source rules cannot read",
+                self.from.display()
+            );
+        }
         for (at, token) in tokens.iter().enumerate() {
             if !matches!(token, TokenTree::Ident(m) if m == "mod") {
                 continue;
@@ -826,6 +837,27 @@ mod tests {
     fn a_path_to_a_missing_file_fails_closed() {
         tree(
             &[("lib.rs", "#[path = \"nope.rs\"] mod missing;")],
+            "lib.rs",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "include!")]
+    fn an_include_in_a_macro_body_is_refused() {
+        tree(
+            &[(
+                "lib.rs",
+                r#"macro_rules! load { () => { include!("labels.rs") } } load!();"#,
+            )],
+            "lib.rs",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "include!")]
+    fn an_include_passed_to_a_macro_is_refused() {
+        tree(
+            &[("lib.rs", r#"fn f() { wrap!(include!("labels.rs")); }"#)],
             "lib.rs",
         );
     }
