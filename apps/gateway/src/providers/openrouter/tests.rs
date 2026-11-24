@@ -1293,7 +1293,7 @@ async fn messages_receive_openrouter_reasoning_text() {
             (expected, Some("answer".into()))
         );
         let mock = Mock::sse(glm_stream(), 7).await;
-        let mut request = messages_request(json!({"stream":true}));
+        let mut request = messages_request(json!({"stream":true,"thinking":{"type":"adaptive"}}));
         if !messages {
             request = chat(true);
         }
@@ -1307,6 +1307,31 @@ async fn messages_receive_openrouter_reasoning_text() {
             reasoning_and_text(output).await,
             (expected, Some("Hé 世界".into()))
         );
+    }
+    // Without a thinking request (or with it disabled or its display
+    // omitted) the text is withheld, as a native route would never return it.
+    for thinking in [
+        None,
+        Some(json!({"type":"disabled"})),
+        Some(json!({"type":"adaptive","display":"omitted"})),
+    ] {
+        for stream in [false, true] {
+            let mock = if stream {
+                Mock::sse(glm_stream(), 7).await
+            } else {
+                Mock::json(complete.clone()).await
+            };
+            let mut extra = json!({"stream":stream});
+            if let Some(thinking) = &thinking {
+                extra["thinking"] = thinking.clone();
+            }
+            let output = mock
+                .adapter()
+                .execute(&target("private"), messages_request(extra))
+                .await
+                .unwrap();
+            assert_eq!(reasoning_and_text(output).await.0, None, "{thinking:?}");
+        }
     }
     // Reasoning still has to be a string or null.
     complete["choices"][0]["message"]["reasoning"] = json!(["not", "text"]);

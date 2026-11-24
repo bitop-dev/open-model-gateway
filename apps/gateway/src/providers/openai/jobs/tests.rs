@@ -624,7 +624,8 @@ fn native_messages_batch_marks_failed_tool_results_on_chat_wire() {
 fn native_messages_lines_map_reasoning_and_structured_output() {
     use crate::providers::contract::{messages_request, output_schema};
     let request = messages_request(json!({"output_config":{"effort":"high",
-        "format":{"type":"json_schema","schema":output_schema()}}}));
+        "format":{"type":"json_schema","schema":output_schema()}},
+        "tools":[{"name":"lookup","input_schema":{"type":"object"},"strict":true}]}));
     let line: Value = serde_json::from_slice(
         &encode_native_line(
             &target("gpt-fixture"),
@@ -636,6 +637,7 @@ fn native_messages_lines_map_reasoning_and_structured_output() {
     )
     .unwrap();
     assert_eq!(line["body"]["reasoning_effort"], "high");
+    assert_eq!(line["body"]["tools"][0]["function"]["strict"], true);
     assert_eq!(
         line["body"]["response_format"],
         json!({"type":"json_schema","json_schema":{"name":"output","schema":output_schema(),"strict":true}})

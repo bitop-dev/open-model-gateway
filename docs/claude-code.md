@@ -56,7 +56,7 @@ When the model is served by OpenAI or OpenRouter, the gateway maps Claude Code's
 | `thinking` | Dropped: Chat has no thinking control | `reasoning`: budget → `max_tokens`, adaptive → `enabled:true`, disabled → `enabled:false`, omitted display → `exclude:true`; an explicit effort wins over a budget | Dropped |
 | `output_config.format` | Strict `json_schema` `response_format` | Same, with `provider.require_parameters:true` | 400 |
 | Tool `strict` | `function.strict` | `function.strict`; `true` adds `require_parameters` | 400 |
-| Reasoning text in the reply | None returned by OpenAI | `thinking` blocks, no signature | `thinking` blocks, no signature |
+| Reasoning text in the reply (only when thinking is enabled or adaptive and not `display:"omitted"`) | None returned by OpenAI | `thinking` blocks, no signature | `thinking` blocks, no signature |
 
 A model that does not support the mapped control refuses it upstream with HTTP 400. For example, a non-reasoning OpenAI model refuses `reasoning_effort`; the gateway does not retry without the field. Unsigned thinking blocks that Claude Code sends back in the history are removed on these routes. If a conversation that contains them is moved to a native Anthropic route, the gateway returns 400 `thinking`, because Anthropic requires the signature. Start a new conversation, or clear the history, when switching to an Anthropic model.
 

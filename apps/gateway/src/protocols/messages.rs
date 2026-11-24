@@ -257,7 +257,7 @@ fn render(output: ProviderOutput, id: String, model: String) -> Response {
                 // tools are buffered after them. Both paths wait for engine Done.
                 let mut accumulator = Accumulator::with_limit(OUTPUT_LIMIT); let mut done = false; let mut native = false;
                 // (index, is_thinking) of the open translated block; `blocks` counts opened blocks.
-                let mut open: Option<(usize, bool)> = None; let mut blocks = 0_usize;
+                let mut open: Option<(usize, bool)> = None; let mut blocks = 0_usize; let mut text_streamed = false;
                 while let Some(next) = stream.next().await {
                     let block = match &next { Ok(ChatEvent::MessagesBlock(v)) => Some(v.clone()), _ => None };
                     let piece = match &next {
@@ -274,14 +274,16 @@ fn render(output: ProviderOutput, id: String, model: String) -> Response {
                                 };
                                 yield Ok(event(kind, block.clone()));
                             }
-                            if let Some((thinking, piece)) = piece.filter(|_| !native) {
+                            // Empty pieces (OpenAI-wire `"content":""` beside reasoning)
+                            // never open or switch a block; see the empty text block below.
+                            if let Some((thinking, piece)) = piece.filter(|(_, p)| !native && !p.is_empty()) {
                                 let index = match open {
                                     Some((index, kind)) if kind == thinking => index,
                                     previous => {
                                         if let Some((index, _)) = previous {
                                             yield Ok(event("content_block_stop", json!({"index":index})));
                                         }
-                                        let index = blocks; blocks += 1; open = Some((index, thinking));
+                                        let index = blocks; blocks += 1; open = Some((index, thinking)); text_streamed |= !thinking;
                                         let start = if thinking { json!({"type":"thinking","thinking":""}) } else { json!({"type":"text","text":""}) };
                                         yield Ok(event("content_block_start", json!({"index":index,"content_block":start})));
                                         index
@@ -302,6 +304,12 @@ fn render(output: ProviderOutput, id: String, model: String) -> Response {
                 };
                 if !native {
                     if let Some((index, _)) = open {
+                        yield Ok(event("content_block_stop", json!({"index":index})));
+                    }
+                    // Text that was only ever empty still gets its (empty) block, as in JSON.
+                    if !text_streamed && content.iter().any(|b| b["type"] == "text") {
+                        let index = blocks; blocks += 1;
+                        yield Ok(event("content_block_start", json!({"index":index,"content_block":{"type":"text","text":""}})));
                         yield Ok(event("content_block_stop", json!({"index":index})));
                     }
                     for block in content.iter().filter(|b| b["type"] == "tool_use") {

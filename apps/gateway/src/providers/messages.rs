@@ -1,5 +1,9 @@
 //! Explicit Messages provider policy. Native fidelity is opt-in, never passthrough.
-use crate::inference::{error::InferenceError, types::ChatRequest};
+use crate::inference::{
+    error::InferenceError,
+    types::{ChatEvent, ChatRequest, ProviderOutput},
+};
+use futures_util::StreamExt;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderClass {
@@ -139,4 +143,26 @@ pub(crate) fn validate(request: &ChatRequest, class: ProviderClass) -> Result<()
     }
     validate_beta_headers(options.beta_headers.iter().map(String::as_str))
         .map_err(|_| InferenceError::InvalidField("anthropic-beta"))
+}
+
+/// Translated reasoning text follows Anthropic's rule for thinking text: it is
+/// returned only when the client asked for thinking (`enabled` or `adaptive`)
+/// without `display:"omitted"`. Otherwise it is withheld, as a native route
+/// would never return it; its tokens stay in the reported output count.
+pub(crate) fn thinking_display(request: &ChatRequest, output: ProviderOutput) -> ProviderOutput {
+    let shown = request
+        .messages_options
+        .as_ref()
+        .and_then(|o| o.thinking.as_ref())
+        .is_some_and(|t| t["type"] != "disabled" && t["display"] != "omitted");
+    match output {
+        _ if shown => output,
+        ProviderOutput::Complete(mut response) => {
+            response.reasoning = None;
+            ProviderOutput::Complete(response)
+        }
+        ProviderOutput::Stream(stream) => ProviderOutput::Stream(Box::pin(
+            stream.filter(|e| std::future::ready(!matches!(e, Ok(ChatEvent::Reasoning(_))))),
+        )),
+    }
 }

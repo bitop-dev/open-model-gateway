@@ -520,9 +520,10 @@ fn normalize_frame(
     stream_embedded_error(&value, messages)?;
     let cost = provider_cost(data)?;
     let reasoning = normalize_choices(&mut value)?;
-    // A frame carrying reasoning is content, never the accounting repeat.
+    // For Messages, a frame carrying reasoning is content, never the
+    // accounting repeat; other clients never receive reasoning.
     if let Some(previous) = finish.as_deref()
-        && reasoning.is_none()
+        && (reasoning.is_none() || !messages)
         && !value["usage"].is_null()
         && let Some([choice]) = value["choices"].as_array().map(Vec::as_slice)
     {
@@ -682,18 +683,19 @@ impl ProviderAdapter for OpenRouterAdapter {
                 request.messages_options.is_some(),
             )
             .await?;
-        if request.stream {
+        let output = if request.stream {
             super::framing::check_sse(&response)?;
-            Ok(ProviderOutput::Stream(decode_chat_stream(
+            ProviderOutput::Stream(decode_chat_stream(
                 response,
                 request.messages_options.is_some(),
-            )))
+            ))
         } else {
-            Ok(ProviderOutput::Complete(decode_chat(
+            ProviderOutput::Complete(decode_chat(
                 &read_limit(response, request.response_limit()).await?,
                 request.messages_options.is_some(),
-            )?))
-        }
+            )?)
+        };
+        Ok(super::messages::thinking_display(&request, output))
     }
 
     async fn execute_embeddings(

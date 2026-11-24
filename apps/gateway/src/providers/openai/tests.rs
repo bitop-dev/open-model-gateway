@@ -1159,7 +1159,7 @@ async fn messages_reasoning_and_structured_output_use_openai_chat_controls() {
             assert!(body.get(absent).is_none(), "{absent}");
         }
     }
-    // Chat Completions requests keep their own refusal of these controls.
+    // Chat Completions requests never carry these controls upstream.
     mock.adapter()
         .execute(&target(), request(false))
         .await

@@ -707,3 +707,90 @@ async fn translated_reasoning_counts_toward_the_output_bound() {
     );
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
 }
+
+/// OpenAI-wire servers send `"content":""` beside reasoning and as an opening
+/// frame. Empty pieces never open or split a block, so one reasoning run is
+/// one thinking block; text that was only ever empty still gets its block.
+#[tokio::test]
+async fn empty_text_pieces_never_split_translated_blocks() {
+    let empty = || {
+        Ok(ChatEvent::Delta {
+            text: Some(String::new()),
+            tool_calls: vec![],
+        })
+    };
+    for (events, expected) in [
+        (
+            vec![
+                empty(),
+                Ok(ChatEvent::Reasoning("a".into())),
+                empty(),
+                Ok(ChatEvent::Reasoning("b".into())),
+                empty(),
+                Ok(ChatEvent::Delta {
+                    text: Some("answer".into()),
+                    tool_calls: vec![],
+                }),
+            ],
+            vec![
+                ("content_block_start", 0, "thinking"),
+                ("content_block_delta", 0, "thinking_delta"),
+                ("content_block_delta", 0, "thinking_delta"),
+                ("content_block_stop", 0, ""),
+                ("content_block_start", 1, "text"),
+                ("content_block_delta", 1, "text_delta"),
+                ("content_block_stop", 1, ""),
+            ],
+        ),
+        (
+            vec![Ok(ChatEvent::Reasoning("a".into())), empty()],
+            vec![
+                ("content_block_start", 0, "thinking"),
+                ("content_block_delta", 0, "thinking_delta"),
+                ("content_block_stop", 0, ""),
+                ("content_block_start", 1, "text"),
+                ("content_block_stop", 1, ""),
+            ],
+        ),
+        (
+            vec![empty()],
+            vec![
+                ("content_block_start", 0, "text"),
+                ("content_block_stop", 0, ""),
+            ],
+        ),
+    ] {
+        let mut events = events;
+        events.push(Ok(ChatEvent::Finish(FinishReason::Stop)));
+        events.push(Ok(ChatEvent::Done));
+        let response = render(
+            ProviderOutput::Stream(Box::pin(futures_util::stream::iter(events))),
+            "id".into(),
+            "public".into(),
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), OUTPUT_LIMIT)
+            .await
+            .unwrap();
+        let actual: Vec<_> = sse_values(std::str::from_utf8(&bytes).unwrap())
+            .into_iter()
+            .filter(|v| v["type"].as_str().unwrap().starts_with("content_block_"))
+            .map(|v| {
+                let kind = v["content_block"]["type"]
+                    .as_str()
+                    .or(v["delta"]["type"].as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                (
+                    v["type"].as_str().unwrap().to_owned(),
+                    v["index"].as_u64().unwrap() as usize,
+                    kind,
+                )
+            })
+            .collect();
+        let expected: Vec<_> = expected
+            .into_iter()
+            .map(|(t, i, k)| (t.to_owned(), i as usize, k.to_owned()))
+            .collect();
+        assert_eq!(actual, expected);
+    }
+}

@@ -236,6 +236,12 @@ async fn messages_receive_local_reasoning_text_under_either_field_name() {
             for stream in [false, true] {
                 let output = adapter.execute(&target, request(stream)).await.unwrap();
                 assert_eq!(reasoning_and_text(output).await.0, None);
+                // A Messages client that did not ask for thinking gets none.
+                let output = adapter
+                    .execute(&target, messages_request(json!({"stream":stream})))
+                    .await
+                    .unwrap();
+                assert_eq!(reasoning_and_text(output).await, (None, Some("OK".into())));
             }
         }
         task.abort();
@@ -260,7 +266,10 @@ async fn messages_local_reasoning_fields_must_agree() {
             Arc::new(ApprovedEndpoints::for_test(&base)),
         );
         let result = adapter
-            .execute(&target(Profile::Vllm, &base), messages_request(json!({})))
+            .execute(
+                &target(Profile::Vllm, &base),
+                messages_request(json!({"thinking":{"type":"adaptive"}})),
+            )
             .await;
         if valid {
             assert_eq!(
