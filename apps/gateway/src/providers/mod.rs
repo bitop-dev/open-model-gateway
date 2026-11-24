@@ -297,6 +297,28 @@ pub trait ProviderAdapter: Send + Sync {
     ) -> Result<ProviderOutput, InferenceError>;
 }
 
+/// Every adapter the gateway serves, in registration order. The
+/// composition root (`commands::serve`) registers exactly this list, and
+/// `providers::capability_tests` checks the capabilities each one declares,
+/// so a new adapter added here is checked there.
+pub fn served_adapters(
+    secrets: Arc<dyn secrets::SecretResolver>,
+    openrouter: openrouter::OpenRouterConfig,
+    approvals: local::endpoints::ApprovedEndpoints,
+) -> anyhow::Result<Vec<Arc<dyn ProviderAdapter>>> {
+    let mut adapters: Vec<Arc<dyn ProviderAdapter>> = vec![
+        Arc::new(openai::OpenAiAdapter::new(secrets.clone())?),
+        Arc::new(anthropic::AnthropicAdapter::new(secrets.clone())?),
+        Arc::new(bedrock::BedrockAdapter::new()?),
+        Arc::new(openrouter::OpenRouterAdapter::new(
+            secrets.clone(),
+            openrouter,
+        )?),
+    ];
+    adapters.extend(local::adapters(secrets, approvals));
+    Ok(adapters)
+}
+
 #[derive(Clone, Default)]
 pub struct ProviderRegistry {
     adapters: BTreeMap<String, Arc<dyn ProviderAdapter>>,

@@ -1,33 +1,23 @@
 //! The provider-specific behaviour that admission and batch scheduling read
-//! without naming a provider, checked for every adapter `serve` registers: a
-//! capability wired to the wrong adapter fails here.
+//! without naming a provider, checked for every adapter `serve` registers
+//! (`providers::served_adapters`, the list `serve` registers): a capability
+//! wired to the wrong adapter, or a new adapter without its row, fails here.
 use std::sync::Arc;
 
 use super::{
-    ProviderAdapter, anthropic::AnthropicAdapter, bedrock::BedrockAdapter, capabilities,
-    local::endpoints::ApprovedEndpoints, openai::OpenAiAdapter, openrouter::OpenRouterAdapter,
+    ProviderAdapter, capabilities, local::endpoints::ApprovedEndpoints,
     openrouter::OpenRouterConfig, secrets::EnvSecrets,
 };
 
-/// The adapters `commands::serve` registers, in its order.
+/// The adapters `commands::serve` registers, in its order. Building them
+/// makes no request.
 fn served() -> Vec<Arc<dyn ProviderAdapter>> {
-    let secrets = Arc::new(EnvSecrets::new([]));
-    let base = "http://127.0.0.1:9".to_owned();
-    let mut adapters: Vec<Arc<dyn ProviderAdapter>> = vec![
-        Arc::new(OpenAiAdapter::for_test(secrets.clone(), base.clone())),
-        Arc::new(AnthropicAdapter::for_test(secrets.clone(), base.clone())),
-        Arc::new(BedrockAdapter::for_test(&base)),
-        Arc::new(OpenRouterAdapter::for_test(
-            secrets.clone(),
-            OpenRouterConfig::default(),
-            base.clone(),
-        )),
-    ];
-    adapters.extend(super::local::adapters(
-        secrets,
-        ApprovedEndpoints::for_test(&format!("{base}/v1")),
-    ));
-    adapters
+    super::served_adapters(
+        Arc::new(EnvSecrets::new([])),
+        OpenRouterConfig::default(),
+        ApprovedEndpoints::for_test("http://127.0.0.1:9/v1"),
+    )
+    .unwrap()
 }
 
 #[test]
