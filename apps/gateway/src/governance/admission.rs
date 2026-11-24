@@ -9,6 +9,10 @@ fn generation(max_output_tokens: Option<u32>) -> WorkloadAdmission {
         unit_ceilings: MeterUsage::default(),
     }
 }
+/// Admission without a route adapter: no output limit, and Messages
+/// `cache_control` hints are not priced (as for an adapter that drops them).
+/// The engine admits generation through [`admit_generation`] with the route
+/// adapter's capabilities.
 pub async fn admit(
     store: &Store,
     record: &ExecutionStart,
@@ -28,6 +32,9 @@ pub async fn admit(
     .await
     .map(|_| ())
 }
+/// [`admit`] for the route the caller resolved (`deployment`). Like [`admit`]
+/// it has no route adapter: no output limit, and `cache_control` hints are
+/// not priced.
 pub async fn admit_for_deployment(
     store: &Store,
     record: &ExecutionStart,

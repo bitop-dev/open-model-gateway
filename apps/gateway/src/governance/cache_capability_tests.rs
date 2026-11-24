@@ -189,10 +189,13 @@ async fn cache_control_holds_follow_the_route_adapter(pool: sqlx::PgPool) {
             ));
         }
     }
-    // Recorded on the provider-name comparison this replaces: identical.
-    // The OpenAI route drops the hint, so the upstream reports no cache
-    // allocation against cache-priced v2/v3 rates and the usage stays
-    // unknown (the hold is retained, never treated as zero).
+    // Per route and price version, the hold or refusal: the route adapter
+    // alone decides whether the cache hint is priced. The Anthropic route
+    // forwards it, so it needs pinned TTL write and read prices (refused
+    // without them, before any write). The OpenAI route drops it and is held
+    // as a plain request; its upstream reports no cache allocation against
+    // cache-priced v2/v3 rates, so the usage stays unknown (the hold is
+    // retained, never treated as zero).
     assert_eq!(
         observed,
         [
