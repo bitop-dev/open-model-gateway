@@ -8,8 +8,9 @@
 -- locale's [[:cntrl:]] can be wider).
 --
 -- Locks: ACCESS EXCLUSIVE on realtime_responses until commit, with one
--- validating scan for the new CHECK (one row per realtime response); realtime
--- response writes wait meanwhile. Each lock wait is bounded at 10 s; on a
+-- validating scan for the new CHECK (one row per realtime response), and
+-- SHARE ROW EXCLUSIVE for the new insert trigger; realtime response writes
+-- wait meanwhile. Each lock wait is bounded at 10 s; on a
 -- timeout the migration rolls back and can be run again.
 SET lock_timeout = '10s';
 ALTER TABLE realtime_responses
@@ -55,4 +56,20 @@ BEGIN
  END IF;
  RETURN NEW;
 END $$;
+-- A response row is inserted open (`open_response`), as the unknown row of a
+-- request the session forwarded but never saw created (`finish`), or already
+-- resolved for the remaining window of a session left unknown
+-- (`governance::realtime_resolution::resolve_session`). Only that last one
+-- carries evidence: settled, and only into a session whose reservation is
+-- unknown.
+CREATE FUNCTION realtime_response_insert_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF NEW.evidence IS NOT NULL AND (NEW.state<>'settled' OR NOT EXISTS(
+   SELECT 1 FROM governance_reservations r WHERE r.execution_id=NEW.execution_id AND r.state='unknown')) THEN
+  RAISE EXCEPTION 'realtime responses settle once';
+ END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER realtime_responses_insert_guard BEFORE INSERT ON realtime_responses
+ FOR EACH ROW EXECUTE FUNCTION realtime_response_insert_guard();
 RESET lock_timeout;

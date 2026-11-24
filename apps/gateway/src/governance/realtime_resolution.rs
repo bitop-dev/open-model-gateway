@@ -4,7 +4,7 @@
 //! session settles once its last unknown response is resolved, with one
 //! `reconciliation` ledger entry. The refusals mirror request resolution
 //! ([`super::resolve_usage`]).
-use super::realtime::{Session, Totals, pinned, session, totals, value_response};
+use super::realtime::{Session, Totals, pinned, session, totals, value_requests, value_response};
 use super::*;
 use crate::inference::realtime::{RealtimeUsage, ResponseBound};
 
@@ -280,7 +280,7 @@ async fn resolve_response_once(store: &Store, q: &Request<'_>) -> Result<Resolve
     let t = totals(&mut tx, q.execution).await?;
     let settles = accounted && t.responses == t.settled;
     if settles {
-        settle_session(store, &mut tx, &r, q.execution, q.evidence, &t).await?;
+        settle_session(store, &mut tx, &r, q.execution, q.evidence, &t, 0).await?;
     }
     sqlx::query("INSERT INTO audit_events(id,workspace_id,actor_user_id,action,resource_type,resource_id,metadata,admin_token_id) VALUES($1,$2,$3,'realtime_response.reconciled','execution',$4,jsonb_build_object('sequence',$5::int,'session_settled',$6::boolean),$7)")
         .bind(Uuid::new_v4()).bind(q.workspace).bind(q.actor.user_id).bind(q.execution).bind(q.sequence).bind(settles).bind(q.actor.token_id)
@@ -303,6 +303,7 @@ async fn settle_session(
     execution: Uuid,
     evidence: &str,
     t: &Totals,
+    uncounted: i64,
 ) -> Result<(), InferenceError> {
     // The per-key sum totals the actual only when every settled response
     // recorded its components (a settled row may have none); otherwise the
@@ -319,7 +320,7 @@ async fn settle_session(
         input_audio_seconds_ms: Some(0),
         output_audio_seconds_ms: Some(0),
         search_units: Some(0),
-        requests: Some(t.responses as u64),
+        requests: Some((t.responses - uncounted) as u64),
         ..MeterUsage::default()
     };
     let meter_json = serde_json::to_value(meters).map_err(|_| InferenceError::Storage)?;
@@ -456,7 +457,10 @@ async fn resolve_session_once(
     if t.responses != t.settled {
         return Err(InferenceError::Storage);
     }
-    settle_session(store, &mut tx, &r, q.execution, q.evidence, &t).await?;
+    // A remainder stated as all zero is a request that was never served: it
+    // is recorded (its window and evidence) but counts no request.
+    let uncounted = i64::from(q.remainder.is_some_and(|(_, c)| c == [0; 6]));
+    settle_session(store, &mut tx, &r, q.execution, q.evidence, &t, uncounted).await?;
     sqlx::query("INSERT INTO audit_events(id,workspace_id,actor_user_id,action,resource_type,resource_id,metadata,admin_token_id) VALUES($1,$2,$3,'realtime_session.reconciled','execution',$4,jsonb_build_object('remainder_sequence',$5::int),$6)")
         .bind(Uuid::new_v4()).bind(q.workspace).bind(q.actor.user_id).bind(q.execution).bind(remainder).bind(q.actor.token_id)
         .execute(&mut *tx).await.map_err(storage)?;
@@ -464,16 +468,18 @@ async fn resolve_session_once(
     Ok(Ok(Resolved::Session))
 }
 
-/// A settled session: only the identical resolution again is success (its
-/// `reconciliation` entry carries this evidence and, for a remainder, a
-/// resolved row with this evidence records these counters); nothing is
-/// written either way.
+/// A settled session: only the identical session resolution again is
+/// success, and nothing is written either way. Identical: the session was
+/// settled by this route (its `realtime_session.reconciled` event) with this
+/// evidence (its `reconciliation` entry), and either both stated no
+/// remainder or the remainder row the event names has this evidence and
+/// these counters.
 async fn replay(
     tx: &mut Tx<'_>,
     r: &settlement::Reservation,
     q: &SessionRequest<'_>,
 ) -> Result<Resolved, InferenceError> {
-    let same: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM monetary_ledger WHERE execution_id=$1 AND admitted_at=$2 AND kind='reconciliation' AND evidence=$3) AND ($4::bigint[] IS NULL OR EXISTS(SELECT 1 FROM realtime_responses WHERE execution_id=$1 AND evidence=$3 AND ARRAY[input_text_tokens,cached_text_tokens,input_audio_tokens,cached_audio_tokens,output_text_tokens,output_audio_tokens]=$4::bigint[]))")
+    let same: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM monetary_ledger WHERE execution_id=$1 AND admitted_at=$2 AND kind='reconciliation' AND evidence=$3) AND EXISTS(SELECT 1 FROM audit_events a WHERE a.action='realtime_session.reconciled' AND a.resource_type='execution' AND a.resource_id=$1 AND CASE WHEN $4::bigint[] IS NULL THEN jsonb_typeof(a.metadata->'remainder_sequence')='null' ELSE EXISTS(SELECT 1 FROM realtime_responses x WHERE x.execution_id=$1 AND x.sequence=(a.metadata->>'remainder_sequence')::int AND x.evidence=$3 AND ARRAY[x.input_text_tokens,x.cached_text_tokens,x.input_audio_tokens,x.cached_audio_tokens,x.output_text_tokens,x.output_audio_tokens]=$4::bigint[]) END)")
         .bind(q.execution)
         .bind(r.admitted_at)
         .bind(q.evidence)
@@ -489,9 +495,9 @@ async fn replay(
 }
 
 /// The unrowed request's usage, valued with the pinned price like any
-/// response, as a resolved response row holding the unrowed window (so
-/// [`unrowed`] then finds nothing beyond the rows). Its sequence follows
-/// the session's last.
+/// response (all zero: a request never served, which meters no request), as
+/// a resolved response row holding the unrowed window (so [`unrowed`] then
+/// finds nothing beyond the rows). Its sequence follows the session's last.
 async fn record_remainder(
     tx: &mut Tx<'_>,
     s: &Session,
@@ -504,12 +510,17 @@ async fn record_remainder(
         return Err(InferenceError::Configuration);
     }
     let bound = ResponseBound::unknown(u32::try_from(usage.output_tokens()).unwrap_or(u32::MAX));
-    let (actual, _, _, components) = value_response(&price, usage, bound)?;
+    let requests = u64::from(counts != [0; 6]);
+    let (actual, _, _, components) = value_requests(&price, usage, bound, requests)?;
     let actual = actual.ok_or(InferenceError::Configuration)?;
+    // A window the price could not bound held nothing: recorded as such
+    // (no window, unbounded), as `open_response` records one.
+    let unbounded = window == 0 && s.unbounded_cost;
+    let window = (!unbounded).then_some(window);
     let [it, ct, ia, ca, ot, oa] = counts;
-    sqlx::query_scalar("INSERT INTO realtime_responses(execution_id,sequence,state,window_hold_microusd,actual_microusd,cost_components,input_text_tokens,cached_text_tokens,input_audio_tokens,cached_audio_tokens,output_text_tokens,output_audio_tokens,evidence,resolved_at,completed_at) SELECT $1,coalesce(max(sequence),0)+1,'settled',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,clock_timestamp(),clock_timestamp() FROM realtime_responses WHERE execution_id=$1 RETURNING sequence")
+    sqlx::query_scalar("INSERT INTO realtime_responses(execution_id,sequence,state,window_hold_microusd,unbounded_cost,actual_microusd,cost_components,input_text_tokens,cached_text_tokens,input_audio_tokens,cached_audio_tokens,output_text_tokens,output_audio_tokens,evidence,resolved_at,completed_at) SELECT $1,coalesce(max(sequence),0)+1,'settled',$2,$12,$3,$4,$5,$6,$7,$8,$9,$10,$11,clock_timestamp(),clock_timestamp() FROM realtime_responses WHERE execution_id=$1 RETURNING sequence")
         .bind(q.execution).bind(window).bind(actual).bind(components.map(|c| c.to_value()))
-        .bind(it).bind(ct).bind(ia).bind(ca).bind(ot).bind(oa).bind(q.evidence)
+        .bind(it).bind(ct).bind(ia).bind(ca).bind(ot).bind(oa).bind(q.evidence).bind(unbounded)
         .fetch_one(&mut **tx)
         .await
         .map_err(storage)

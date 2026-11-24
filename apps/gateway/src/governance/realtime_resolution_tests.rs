@@ -850,10 +850,32 @@ async fn an_unrowed_window_is_settled_from_its_stated_usage(pool: PgPool) {
             session_audits(&f, id).await,
             [json!({"remainder_sequence": 2})]
         );
+        // An all-zero remainder is a request never served: it counts none.
+        let requests: String = sqlx::query_scalar(
+            "SELECT meter_usage->>'requests' FROM governance_reservations WHERE execution_id=$1",
+        )
+        .bind(id)
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+        assert_eq!(requests, if usage == ZERO { "1" } else { "2" });
         assert_eq!(
             resolve_session(&f.store, ws, id, Some(usage), "invoice:rest", f.owner).await,
             Ok(Ok(Resolved::Replay))
         );
+        // Only the identical request replays.
+        for remainder in [
+            None,
+            Some(RealtimeUsage {
+                output_text_tokens: 11,
+                ..U
+            }),
+        ] {
+            assert_eq!(
+                resolve_session(&f.store, ws, id, remainder, "invoice:rest", f.owner).await,
+                Err(InferenceError::InvalidRequest)
+            );
+        }
     }
 }
 
@@ -1022,9 +1044,10 @@ async fn an_unbounded_session_states_its_remainder_even_when_its_hold_matches(po
         resolve_session(&f.store, ws, id, Some(ZERO), "invoice:s", f.owner).await,
         Ok(Ok(Resolved::Session))
     );
-    let row: (Option<i64>, Option<i64>) = sqlx::query_as("SELECT window_hold_microusd,actual_microusd FROM realtime_responses WHERE execution_id=$1 AND sequence=3")
+    let row: (Option<i64>, bool, Option<i64>) = sqlx::query_as("SELECT window_hold_microusd,unbounded_cost,actual_microusd FROM realtime_responses WHERE execution_id=$1 AND sequence=3")
         .bind(id).fetch_one(&f.store.pool).await.unwrap();
-    assert_eq!(row, (Some(0), Some(0)));
+    // The unrowed window held nothing: recorded without a window, unbounded.
+    assert_eq!(row, (None, true, Some(0)));
     assert_eq!(amounts(&f, id).await.2, Some(2 * RESPONSE));
 }
 
@@ -1053,5 +1076,109 @@ async fn concurrent_session_resolutions_settle_it_once(pool: PgPool) {
             .bind(id).fetch_one(&f.store.pool).await.unwrap();
         assert_eq!(counts, (1, 2));
         assert_eq!(amounts(&f, id).await.2, Some(2 * RESPONSE));
+    }
+}
+
+#[dbtest::test]
+async fn a_request_never_served_costs_nothing_on_a_per_request_price(pool: PgPool) {
+    let f = fixture(pool).await;
+    let mut price = lines();
+    for line in price.as_array_mut().unwrap() {
+        if line["meter"] == "requests" {
+            line["microusd_per_batch"] = json!("1000");
+        }
+    }
+    let d = realtime_model_priced(&f, Some(price)).await;
+    // Killed while its admission window was its only window.
+    let id = open_session(&f, f.team, &d).await;
+    expire(&f, id).await;
+    assert_eq!(
+        resolve_session(&f.store, f.team.workspace_id, id, None, "invoice", f.owner).await,
+        Ok(Err(SessionRefusal::RemainderRequired))
+    );
+    assert_eq!(
+        resolve_session(
+            &f.store,
+            f.team.workspace_id,
+            id,
+            Some(ZERO),
+            "invoice",
+            f.owner
+        )
+        .await,
+        Ok(Ok(Resolved::Session))
+    );
+    assert_eq!(amounts(&f, id).await.2, Some(0));
+    let requests: String = sqlx::query_scalar(
+        "SELECT meter_usage->>'requests' FROM governance_reservations WHERE execution_id=$1",
+    )
+    .bind(id)
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(requests, "0");
+}
+
+#[dbtest::test]
+async fn a_session_settled_by_its_last_response_is_no_session_replay(pool: PgPool) {
+    let f = fixture(pool).await;
+    let d = realtime_model(&f, true).await;
+    let id = unknown_session(&f, f.team, &d, 1).await;
+    let ws = f.team.workspace_id;
+    assert_eq!(
+        resolve_response(&f.store, ws, id, 2, U, "invoice", f.owner).await,
+        Ok(Resolved::Session)
+    );
+    assert_eq!(
+        resolve_session(&f.store, ws, id, None, "invoice", f.owner).await,
+        Err(InferenceError::InvalidRequest)
+    );
+}
+
+#[dbtest::test]
+async fn a_hold_below_its_rows_is_never_attributed(pool: PgPool) {
+    let f = fixture(pool).await;
+    let d = realtime_model(&f, true).await;
+    let id = idle_session(&f, f.team, &d, false).await;
+    // A row the hold does not contain.
+    sqlx::query("INSERT INTO realtime_responses(execution_id,sequence,state,status,window_hold_microusd,actual_microusd,input_text_tokens,cached_text_tokens,input_audio_tokens,cached_audio_tokens,output_text_tokens,output_audio_tokens,completed_at) VALUES($1,2,'settled','completed',10,7,0,0,0,0,0,0,clock_timestamp())")
+        .bind(id)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    for remainder in [None, Some(ZERO)] {
+        assert_eq!(
+            resolve_session(
+                &f.store,
+                f.team.workspace_id,
+                id,
+                remainder,
+                "invoice",
+                f.owner
+            )
+            .await,
+            Ok(Err(SessionRefusal::Unattributed))
+        );
+    }
+    assert_eq!(amounts(&f, id).await.0, "unknown");
+}
+
+#[dbtest::test]
+async fn a_resolved_row_is_inserted_only_into_an_unknown_session(pool: PgPool) {
+    let f = fixture(pool).await;
+    let d = realtime_model(&f, true).await;
+    let open = open_session(&f, f.team, &d).await;
+    let unknown = idle_session(&f, f.team, &d, true).await;
+    for (id, state) in [(open, "settled"), (unknown, "unknown")] {
+        let error = sqlx::query("INSERT INTO realtime_responses(execution_id,sequence,state,window_hold_microusd,actual_microusd,input_text_tokens,cached_text_tokens,input_audio_tokens,cached_audio_tokens,output_text_tokens,output_audio_tokens,evidence,resolved_at,completed_at) VALUES($1,9,$2,0,CASE WHEN $2='settled' THEN 0 END,0,0,0,0,0,0,'e',now(),now())")
+            .bind(id)
+            .bind(state)
+            .execute(&f.store.pool)
+            .await
+            .expect_err(state);
+        assert!(
+            error.to_string().contains("realtime responses settle once"),
+            "{state}: {error}"
+        );
     }
 }

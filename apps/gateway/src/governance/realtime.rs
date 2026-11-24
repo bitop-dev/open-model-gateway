@@ -344,6 +344,16 @@ pub(super) fn value_response(
     u: RealtimeUsage,
     window: ResponseBound,
 ) -> Result<(Option<i64>, i64, bool, Option<CostBreakdown>), InferenceError> {
+    value_requests(p, u, window, 1)
+}
+/// [`value_response`] metering `requests` requests (0 for a request stated
+/// never to have been served).
+pub(super) fn value_requests(
+    p: &Price,
+    u: RealtimeUsage,
+    window: ResponseBound,
+    requests: u64,
+) -> Result<(Option<i64>, i64, bool, Option<CostBreakdown>), InferenceError> {
     if p.pricing_version != 3 || !u.valid() {
         return Ok((None, 0, true, None));
     }
@@ -366,7 +376,7 @@ pub(super) fn value_response(
         input_audio_seconds_ms: Some(0),
         output_audio_seconds_ms: Some(0),
         search_units: Some(0),
-        requests: Some(1),
+        requests: Some(requests),
         ..MeterUsage::default()
     };
     let priced = billing::v3::value(
