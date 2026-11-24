@@ -94,7 +94,8 @@ impl From<super::types::FinishReason> for FinishLabel {
 }
 
 /// Per-attempt timing and outcome telemetry; `None` = not observed (never a
-/// fabricated zero). Metadata, except `stream_returned`, which settlement reads.
+/// fabricated zero). Metadata, except `stream_returned` and `nothing_sent`,
+/// which settlement reads.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AttemptTelemetry {
     pub finish_reason: Option<FinishLabel>,
@@ -107,6 +108,12 @@ pub struct AttemptTelemetry {
     /// processing" (the provider accepted the request): settlement does not
     /// treat it as a known zero (`governance::free_rejection`). Not stored.
     pub stream_returned: bool,
+    /// The adapter call ended without building any upstream request
+    /// (`inference::dispatch`), so nothing of this attempt reached the
+    /// provider. Settlement records such a failure as a known zero on any
+    /// price. `false` (the default) is the safe value: every path that cannot
+    /// prove it leaves it unset. Not stored.
+    pub nothing_sent: bool,
 }
 impl AttemptTelemetry {
     /// The stored finish reason for an outcome: failures are `error`,
