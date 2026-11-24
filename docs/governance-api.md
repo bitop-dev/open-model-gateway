@@ -332,3 +332,18 @@ The queue uses a read-only reporting snapshot with a ten-second statement timeou
 `billing_usage` must be explicit (nullable for applicable v1 usage). Optional `meter_usage` (all six counters explicit, each a decimal string or null), `output_image_variant` and `provider_cost_microusd` (decimal string) add meter evidence; once recorded, meter counters may only grow and variant/provider cost may not change or be omitted. Evidence is 1–200 non-control characters, not prompts/secrets. Only terminal unresolved records with complete pinned valuation can resolve. All prior raw/normalized observations must be preserved. Identical evidence/full breakdown is idempotent; altered evidence/counts fail closed.
 
 Actual handlers currently return **400** for invalid/conflicting reconciliation evidence, **409** for no complete pinned valuation and **503** for unavailable reconciliation/storage. Do not assume every conflict returns 409 or a machine-specific financial error code: handler errors use the common numeric status-string envelope. This distinction matters when implementing retry/error UI.
+
+### Realtime response resolution
+
+A realtime session is valued per response, so the route above refuses realtime executions (400). `POST /workspaces/{ws}/costs/{execution}/realtime-responses/{sequence}/reconcile` (#804) resolves one unknown response of a **finished** realtime session instead, with the same authority (Platform Admin, browser session or an admin token with `governance:write`, plus normal workspace privacy: another user's personal workspace answers 404 and a Platform Admin resolves personal sessions only in their own personal workspace), and returns `{ok:true}`:
+
+```json
+{
+  "input_text_tokens":"10","cached_text_tokens":"4",
+  "input_audio_tokens":"20","cached_audio_tokens":"5",
+  "output_text_tokens":"10","output_audio_tokens":"40",
+  "evidence":"provider-usage-reference-123"
+}
+```
+
+All six counters are required decimal strings; cached tokens may not exceed their modality's input, and no counter may be lower than one the response already recorded. The response is valued with the session's pinned v3 price exactly as `response.done` would have been, and settles once. When it was the session's last unknown response, the session settles in the same transaction: its actual cost is the sum of its responses' (their per-key cost components summed), its token totals are recorded, and it gets one `reconciliation` ledger entry with this request's evidence. Until then the session stays `unknown` with its whole hold. Refusals: **404** for a session that is not a realtime session of the workspace; **400** for a missing response, invalid or lowered counters, invalid evidence, an actor who is no longer a live Platform Admin, or a response already settled (the identical evidence and counters again return `{ok:true}` and write nothing); **409** while the session or the response is still open, and when the session has no pinned v3 price or a reported meter has no rate (missing rates stay unknown, never zero); **503** when storage is unavailable. Each resolution writes the audit event `realtime_response.reconciled` (metadata: the response sequence and whether the session settled; no usage or evidence). The request page offers the action to a Platform Admin on each unknown response.

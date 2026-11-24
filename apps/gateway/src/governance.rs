@@ -537,6 +537,8 @@ mod rates_tests;
 /// Realtime session accounting: per-response windows on one reservation.
 pub mod realtime;
 #[cfg(all(test, feature = "integration-tests"))]
+mod realtime_resolution_tests;
+#[cfg(all(test, feature = "integration-tests"))]
 mod realtime_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod reconcile_token_tests;

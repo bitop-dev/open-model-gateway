@@ -57,9 +57,9 @@ mod tests {
             "management OpenAPI: {operations} operations; {placeholders} incomplete request/response schemas remaining (#81)"
         );
         // #81 is complete: zero placeholders (a new route fails until its fragment is complete).
-        // 274 operations: #661 adds explicit terminal batch-envelope resolution.
+        // 275 operations: #804 adds the resolution of one unknown realtime response.
         assert_eq!(
-            operations, 274,
+            operations, 275,
             "review route additions and update this progress baseline"
         );
         assert_eq!(

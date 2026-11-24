@@ -510,6 +510,27 @@ struct Totals {
     components: Option<serde_json::Value>,
 }
 
+/// The session's response rows summed: counts, settled actuals and their
+/// per-key components (each response's components total its actual, so their
+/// key-wise sum totals the session's: nothing is counted twice), retained
+/// windows and measured tokens.
+async fn totals(tx: &mut Tx<'_>, id: Uuid) -> Result<Totals, InferenceError> {
+    sqlx::query_as(r#"SELECT count(*) responses,count(*) FILTER(WHERE state='settled') settled,
+        coalesce(sum(actual_microusd) FILTER(WHERE state='settled'),0)::bigint actual,
+        CASE WHEN bool_or(state='unknown' AND window_hold_microusd IS NULL) THEN NULL ELSE coalesce(sum(greatest(window_hold_microusd,coalesce(floor_microusd,0))) FILTER(WHERE state='unknown'),0) END::bigint retained,
+        coalesce(sum(floor_microusd) FILTER(WHERE state='unknown'),0)::bigint known_floor,
+        coalesce(bool_or(unbounded_cost),false) unbounded,
+        count(*) FILTER(WHERE input_text_tokens IS NOT NULL) measured,
+        coalesce(sum(input_text_tokens+input_audio_tokens),0)::bigint input,
+        coalesce(sum(output_text_tokens+output_audio_tokens),0)::bigint output,
+        (SELECT jsonb_object_agg(k,v::text) FROM (SELECT c.key k,sum((c.value#>>'{}')::numeric) v FROM realtime_responses x,jsonb_each(x.cost_components) c WHERE x.execution_id=$1 AND x.state='settled' GROUP BY c.key) a) components
+        FROM realtime_responses WHERE execution_id=$1"#)
+        .bind(id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(storage)
+}
+
 /// Finish the session attempt from its response rows (see module docs).
 pub async fn finish(store: &Store, record: &RealtimeFinish) -> Result<(), InferenceError> {
     use crate::metrics::{AttemptObservation, METRICS, Settlement};
@@ -584,17 +605,7 @@ async fn finish_once(store: &Store, record: &RealtimeFinish) -> Result<Finished,
     // Responses still open at the end never reported usage.
     sqlx::query("UPDATE realtime_responses SET state='unknown',completed_at=clock_timestamp() WHERE execution_id=$1 AND state='pending'")
         .bind(record.id).execute(&mut *tx).await.map_err(storage)?;
-    let t: Totals = sqlx::query_as(r#"SELECT count(*) responses,count(*) FILTER(WHERE state='settled') settled,
-        coalesce(sum(actual_microusd) FILTER(WHERE state='settled'),0)::bigint actual,
-        CASE WHEN bool_or(state='unknown' AND window_hold_microusd IS NULL) THEN NULL ELSE coalesce(sum(greatest(window_hold_microusd,coalesce(floor_microusd,0))) FILTER(WHERE state='unknown'),0) END::bigint retained,
-        coalesce(sum(floor_microusd) FILTER(WHERE state='unknown'),0)::bigint known_floor,
-        coalesce(bool_or(unbounded_cost),false) unbounded,
-        count(*) FILTER(WHERE input_text_tokens IS NOT NULL) measured,
-        coalesce(sum(input_text_tokens+input_audio_tokens),0)::bigint input,
-        coalesce(sum(output_text_tokens+output_audio_tokens),0)::bigint output,
-        (SELECT jsonb_object_agg(k,v::text) FROM (SELECT c.key k,sum((c.value#>>'{}')::numeric) v FROM realtime_responses x,jsonb_each(x.cost_components) c WHERE x.execution_id=$1 AND x.state='settled' GROUP BY c.key) a) components
-        FROM realtime_responses WHERE execution_id=$1"#)
-        .bind(record.id).fetch_one(&mut *tx).await.map_err(storage)?;
+    let t = totals(&mut tx, record.id).await?;
     let all_settled = t.responses == t.settled;
     let actual = all_settled.then_some(t.actual);
     let components = t.components.filter(|_| all_settled && t.settled > 0);
@@ -662,4 +673,203 @@ pub(super) async fn expire_open_responses(tx: &mut Tx<'_>, id: Uuid) -> Result<(
         .await
         .map_err(storage)?;
     Ok(())
+}
+
+/// What a resolution of one realtime response did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resolved {
+    /// The response settled; others of the session are still unknown.
+    Response,
+    /// The response settled and so did its session (the last unknown one).
+    Session,
+    /// The same evidence and counters were already recorded: nothing written.
+    Replay,
+}
+
+/// Resolve unknown response `sequence` of a finished realtime session from an
+/// operator's evidence (#804): the response is valued with the session's
+/// pinned price, exactly as `response.done` would have been, and settles once;
+/// when it was the session's last unknown response, the session settles too,
+/// with one `reconciliation` ledger entry. The refusals mirror
+/// [`super::resolve_usage`]:
+/// - `InvalidRequest`: not a realtime session of `workspace`, no such
+///   response, invalid counters or evidence, counters below what the
+///   response recorded, a response already settled with other evidence, or an
+///   actor who is no longer a live Platform Admin of a shared workspace (or of
+///   their own personal one);
+/// - `Busy`: the session or the response is still open (nothing is resolved
+///   while the session can still settle it);
+/// - `Configuration`: no pinned v3 price, or a counter whose rate is missing
+///   (missing rates stay unknown, never zero);
+/// - `Unauthenticated`: the actor's admin token was revoked meanwhile.
+///
+/// Lock order (`governance::locks`): the shared catalog lock and the actor's
+/// workspace and user authority (or the installation lock in global mode),
+/// then the session's reservation row, then the response row, then the
+/// session's totals rows. Two resolutions of one session therefore serialize
+/// on its reservation row: the second sees what the first wrote, and exactly
+/// one settles the session.
+pub async fn resolve_response(
+    store: &Store,
+    workspace: Uuid,
+    execution: Uuid,
+    sequence: i32,
+    usage: RealtimeUsage,
+    evidence: &str,
+    actor: impl Into<super::ReconcilingActor>,
+) -> Result<Resolved, InferenceError> {
+    let actor = actor.into();
+    if evidence.trim().is_empty()
+        || evidence.chars().count() > 200
+        || evidence.chars().any(char::is_control)
+        || !usage.valid()
+    {
+        return Err(InferenceError::InvalidRequest);
+    }
+    locks::retry_deadlocks!(
+        "reconciliation",
+        resolve_response_once(
+            store, workspace, execution, sequence, usage, evidence, actor
+        )
+        .await
+    )
+}
+
+/// One response row as recorded: state, recorded counters, evidence.
+type ResponseRow = (String, [Option<i64>; 6], Option<String>);
+fn counters(u: RealtimeUsage) -> [u64; 6] {
+    [
+        u.input_text_tokens,
+        u.cached_text_tokens,
+        u.input_audio_tokens,
+        u.cached_audio_tokens,
+        u.output_text_tokens,
+        u.output_audio_tokens,
+    ]
+}
+
+#[cfg_attr(not(test), expect(clippy::too_many_lines, reason = "#499"))]
+async fn resolve_response_once(
+    store: &Store,
+    workspace: Uuid,
+    execution: Uuid,
+    sequence: i32,
+    usage: RealtimeUsage,
+    evidence: &str,
+    actor: super::ReconcilingActor,
+) -> Result<Resolved, InferenceError> {
+    let mut tx = super::reconcile::operator_tx(store, workspace, actor).await?;
+    let r = reservation(&mut tx, execution, scoped(store)).await?;
+    if r.workspace_id != workspace || r.workload_kind != WorkloadKind::Realtime.as_str() {
+        return Err(InferenceError::InvalidRequest);
+    }
+    super::reconcile::operator_authorized(store, &mut tx, actor, workspace).await?;
+    let s = session(&mut tx, execution).await?;
+    let open: bool = sqlx::query_scalar(
+        "SELECT state='started' FROM inference_executions WHERE id=$1 AND started_at=$2",
+    )
+    .bind(execution)
+    .bind(r.admitted_at)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(storage)?;
+    if r.state == "pending" || open {
+        return Err(InferenceError::Busy);
+    }
+    let row: Option<(String, Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<String>)> = sqlx::query_as(
+        "SELECT state,input_text_tokens,cached_text_tokens,input_audio_tokens,cached_audio_tokens,output_text_tokens,output_audio_tokens,evidence FROM realtime_responses WHERE execution_id=$1 AND sequence=$2 FOR UPDATE",
+    )
+    .bind(execution)
+    .bind(sequence)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(storage)?;
+    let Some((state, a, b, c, d, e, f, recorded_evidence)) = row else {
+        return Err(InferenceError::InvalidRequest);
+    };
+    let row: ResponseRow = (state, [a, b, c, d, e, f], recorded_evidence);
+    let wanted = counters(usage).map(|n| i64::try_from(n).ok());
+    if wanted.iter().any(Option::is_none) {
+        return Err(InferenceError::InvalidRequest);
+    }
+    match row.0.as_str() {
+        "settled" => {
+            // Only the identical resolution again is success; nothing is written.
+            return if row.2.as_deref() == Some(evidence) && row.1 == wanted {
+                Ok(Resolved::Replay)
+            } else {
+                Err(InferenceError::InvalidRequest)
+            };
+        }
+        "pending" => return Err(InferenceError::Busy),
+        _ => {}
+    }
+    // Evidence never lowers what the response recorded.
+    if row
+        .1
+        .iter()
+        .zip(wanted.iter())
+        .any(|(recorded, new)| recorded.is_some_and(|old| new.is_some_and(|n| n < old)))
+    {
+        return Err(InferenceError::InvalidRequest);
+    }
+    let price = pinned(&mut tx, &s)
+        .await?
+        .ok_or(InferenceError::Configuration)?;
+    if price.pricing_version != 3 {
+        return Err(InferenceError::Configuration);
+    }
+    // Every input at the context-window cap: the bound only decides whether
+    // the window was exceeded, which no longer matters once usage is known.
+    let bound = ResponseBound::unknown(u32::try_from(usage.output_tokens()).unwrap_or(u32::MAX));
+    let (actual, _, _, components) = value_response(&price, usage, bound)?;
+    let actual = actual.ok_or(InferenceError::Configuration)?;
+    let components = components.map(|c| c.to_value());
+    let [it, ct, ia, ca, ot, oa] = wanted.map(Option::unwrap_or_default);
+    let changed = sqlx::query("UPDATE realtime_responses SET state='settled',actual_microusd=$3,cost_components=$4,input_text_tokens=$5,cached_text_tokens=$6,input_audio_tokens=$7,cached_audio_tokens=$8,output_text_tokens=$9,output_audio_tokens=$10,evidence=$11,resolved_at=clock_timestamp() WHERE execution_id=$1 AND sequence=$2 AND state='unknown'")
+        .bind(execution).bind(sequence).bind(actual).bind(&components)
+        .bind(it).bind(ct).bind(ia).bind(ca).bind(ot).bind(oa).bind(evidence)
+        .execute(&mut *tx).await.map_err(storage)?.rows_affected();
+    if changed != 1 {
+        return Err(InferenceError::Storage);
+    }
+    let t = totals(&mut tx, execution).await?;
+    let settles = t.responses == t.settled;
+    if settles {
+        // The session's last unknown response: it settles once, with the
+        // responses' sum (`finish` would have written the same).
+        let components = t.components.filter(|_| t.settled > 0);
+        let meters = MeterUsage {
+            output_images: Some(0),
+            input_characters: Some(0),
+            input_audio_seconds_ms: Some(0),
+            output_audio_seconds_ms: Some(0),
+            search_units: Some(0),
+            requests: Some(t.responses as u64),
+            ..MeterUsage::default()
+        };
+        let meter_json = serde_json::to_value(meters).map_err(|_| InferenceError::Storage)?;
+        lock_rows(store, &mut tx, &[r.touch()], false).await?;
+        let settled = sqlx::query("UPDATE governance_reservations SET state='settled',actual_microusd=$3,input_tokens=$4,output_tokens=$5,billing_usage=NULL,cost_components=$6,meter_usage=$7 WHERE execution_id=$1 AND admitted_at=$2 AND state='unknown'")
+            .bind(execution).bind(r.admitted_at).bind(t.actual).bind(t.input).bind(t.output).bind(&components).bind(&meter_json)
+            .execute(&mut *tx).await.map_err(storage)?.rows_affected();
+        if settled != 1 {
+            return Err(InferenceError::Storage);
+        }
+        sqlx::query("UPDATE inference_executions SET input_tokens=$3,output_tokens=$4,meter_usage=$5 WHERE id=$1 AND started_at=$2")
+            .bind(execution).bind(r.admitted_at).bind(t.input).bind(t.output).bind(&meter_json)
+            .execute(&mut *tx).await.map_err(storage)?;
+        sqlx::query("INSERT INTO monetary_ledger(id,execution_id,kind,amount_microusd,input_tokens,output_tokens,billing_usage,cost_components,evidence,meter_usage,admitted_at) VALUES($1,$2,'reconciliation',$3,$4,$5,NULL,$6,$7,$8,$9)")
+            .bind(Uuid::now_v7()).bind(execution).bind(t.actual).bind(t.input).bind(t.output).bind(&components).bind(evidence).bind(&meter_json).bind(r.admitted_at)
+            .execute(&mut *tx).await.map_err(storage)?;
+    }
+    sqlx::query("INSERT INTO audit_events(id,workspace_id,actor_user_id,action,resource_type,resource_id,metadata,admin_token_id) VALUES($1,$2,$3,'realtime_response.reconciled','execution',$4,jsonb_build_object('sequence',$5::int,'session_settled',$6::boolean),$7)")
+        .bind(Uuid::new_v4()).bind(workspace).bind(actor.user_id).bind(execution).bind(sequence).bind(settles).bind(actor.token_id)
+        .execute(&mut *tx).await.map_err(storage)?;
+    tx.commit().await.map_err(storage)?;
+    Ok(if settles {
+        Resolved::Session
+    } else {
+        Resolved::Response
+    })
 }

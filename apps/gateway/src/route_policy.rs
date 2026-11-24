@@ -267,6 +267,7 @@ pub(crate) const ROUTES: &[Route] = routes! {
     "GET"                  "/api/v1/workspaces/{ws}/holds" => WorkspaceMetadata, DENIED;
     "GET"                  "/api/v1/workspaces/{ws}/usage-export" => WorkspaceMetadata, PLATFORM_READ;
     "POST"                 "/api/v1/workspaces/{ws}/costs/{execution}/reconcile" => WorkspacePlatformWrite, GOVERNANCE_WRITE;
+    "POST"                 "/api/v1/workspaces/{ws}/costs/{execution}/realtime-responses/{sequence}/reconcile" => WorkspacePlatformWrite, GOVERNANCE_WRITE;
     // File/batch visibility is creator-only by default (or workspace-wide by
     // policy); delete/cancel additionally require creator or workspace admin.
     "GET"                  "/api/v1/workspaces/{ws}/files" => WorkspaceMember, DENIED;

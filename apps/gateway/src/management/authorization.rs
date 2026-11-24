@@ -186,6 +186,10 @@ pub(super) const TOKEN_READY_ROUTES: &[(&str, &str)] = &[
         "POST",
         "/api/v1/workspaces/{ws}/costs/{execution}/reconcile",
     ),
+    (
+        "POST",
+        "/api/v1/workspaces/{ws}/costs/{execution}/realtime-responses/{sequence}/reconcile",
+    ),
     ("GET", "/api/v1/platform/cost-report"),
     ("GET", "/api/v1/platform/holds"),
     ("GET", "/api/v1/platform/deployments/{deployment}/prices"),

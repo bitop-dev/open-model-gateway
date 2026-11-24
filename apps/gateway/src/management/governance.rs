@@ -53,6 +53,10 @@ pub(super) fn routes() -> Router<Store> {
             "/api/v1/workspaces/{ws}/costs/{execution}/reconcile",
             post(reports::reconcile),
         )
+        .route(
+            "/api/v1/workspaces/{ws}/costs/{execution}/realtime-responses/{sequence}/reconcile",
+            post(reports::reconcile_realtime_response),
+        )
 }
 pub(super) fn platform_routes() -> Router<Store> {
     Router::new()

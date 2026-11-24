@@ -2880,6 +2880,101 @@
       "scope": "governance:write",
       "token_policy": "Scope"
     },
+    "POST /api/v1/workspaces/{ws}/costs/{execution}/realtime-responses/{sequence}/reconcile": {
+      "access": "WorkspacePlatformWrite",
+      "operation": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/post_api_v1_workspaces_by_ws_costs_by_execution_realtime_responses_by_sequence_reconcileRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Representation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/post_api_v1_workspaces_by_ws_costs_by_execution_realtime_responses_by_sequence_reconcileResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request parameters, JSON syntax, or handler validation. Framework extraction may return text.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Absent or hidden resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflicting revision, state or configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Unsupported request media type",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid request fields or bounded export/history refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "description": "Resolves one unknown response of a finished realtime session from operator evidence (#804). Requires live Platform Admin write authority AND workspace access; foreign personal executions are hidden (404), and a Platform Admin resolves personal-workspace sessions only in their own personal workspace. The six counters are canonical decimal strings. Rules the schemas cannot express (400): cached tokens may not exceed their modality's input; each input and output counter is at most 2305843009213693951 (i64::MAX / 4, so the session's sums fit); no counter may be lower than one the response already recorded. The response is valued with the session's pinned v3 price exactly as response.done would have been; without a pinned price, or with a missing rate for a reported meter, the request is 409 and nothing is written (missing rates stay unknown, never zero). The session must be finished (its reservation unknown and its execution terminal) and the response unknown; an open session or response is 409. A response that is already settled is refused with 400, except that the identical evidence and counters again answer 200 and write nothing. When this was the session's last unknown response, the session settles in the same transaction: the sum of its responses' actuals and per-key cost components, its token totals, and one reconciliation ledger entry. The answer carries no usage or evidence."
+      },
+      "scope": "governance:write",
+      "token_policy": "Scope"
+    },
     "GET /api/v1/workspaces/{ws}/usage": {
       "access": "WorkspaceMember",
       "operation": {

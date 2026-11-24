@@ -718,6 +718,78 @@ pub(super) async fn reconcile(
     })?;
     Ok(ok())
 }
+/// `POST …/costs/{execution}/realtime-responses/{sequence}/reconcile` (#804):
+/// a Platform Admin settles one unknown response of a finished realtime
+/// session from evidence. The six counters are decimal strings, like the
+/// request-level route's; the answer carries no usage or evidence.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RealtimeReconcile {
+    input_text_tokens: String,
+    cached_text_tokens: String,
+    input_audio_tokens: String,
+    cached_audio_tokens: String,
+    output_text_tokens: String,
+    output_audio_tokens: String,
+    evidence: String,
+}
+pub(super) async fn reconcile_realtime_response(
+    State(s): State<Store>,
+    Extension(u): Extension<ManagementPrincipal>,
+    Path((ws, execution, sequence)): Path<(Uuid, Uuid, i32)>,
+    Json(p): Json<RealtimeReconcile>,
+) -> ApiResult {
+    let (mut tx, _) = resources::workspace_tx(&s, &u, ws).await?;
+    resources::platform_write(&mut tx, &u).await?;
+    sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM inference_executions WHERE workspace_id=$1 AND id=$2 AND workload_kind='realtime'",
+    )
+    .bind(ws)
+    .bind(execution)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(missing)?;
+    tx.commit().await?;
+    let count = |v: &str| money(v, false).map(|n| n as u64);
+    let usage = crate::inference::realtime::RealtimeUsage {
+        input_text_tokens: count(&p.input_text_tokens)?,
+        cached_text_tokens: count(&p.cached_text_tokens)?,
+        input_audio_tokens: count(&p.input_audio_tokens)?,
+        cached_audio_tokens: count(&p.cached_audio_tokens)?,
+        output_text_tokens: count(&p.output_text_tokens)?,
+        output_audio_tokens: count(&p.output_audio_tokens)?,
+    };
+    crate::governance::realtime::resolve_response(
+        &s,
+        ws,
+        execution,
+        sequence,
+        usage,
+        &p.evidence,
+        crate::governance::ReconcilingActor {
+            user_id: u.user_id(),
+            token_id: u.token_id(),
+        },
+    )
+    .await
+    .map_err(|e| match e {
+        InferenceError::InvalidRequest => invalid(),
+        InferenceError::Busy => ApiError(
+            StatusCode::CONFLICT,
+            "The realtime session or response is still open",
+        ),
+        InferenceError::Configuration => ApiError(
+            StatusCode::CONFLICT,
+            "Response has no complete pinned valuation",
+        ),
+        InferenceError::Unauthenticated => denied(),
+        _ => ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Reconciliation unavailable",
+        ),
+    })?;
+    Ok(ok())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
