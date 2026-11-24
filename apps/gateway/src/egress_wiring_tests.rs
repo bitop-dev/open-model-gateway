@@ -24,7 +24,7 @@ const BUILDERS: &[(&str, &str)] = &[
     ("filestore/s3/transport.rs", "S3"),
     ("otlp.rs", "Export"),
     // The catalog is openrouter.ai, the same host as the OpenRouter adapter.
-    ("management/governance/suggestion.rs", "Openrouter"),
+    ("management/governance/suggestion/catalog.rs", "Openrouter"),
 ];
 
 /// The one client without a pool idle timeout: identity requests use one
@@ -36,7 +36,7 @@ const COUNTED: &[(&str, &str, usize)] = &[
     ("providers/openai.rs", "Openai", 1),
     ("providers/openai_responses.rs", "Openai", 1),
     ("providers/openrouter.rs", "Openrouter", 1),
-    ("management/governance/suggestion.rs", "Openrouter", 1),
+    ("management/governance/suggestion/catalog.rs", "Openrouter", 1),
     ("providers/anthropic.rs", "Anthropic", 1),
     ("providers/anthropic/batches.rs", "Anthropic", 2),
     ("providers/local/mod.rs", "Local", 3),
