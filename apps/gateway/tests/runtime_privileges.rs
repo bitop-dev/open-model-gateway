@@ -2385,6 +2385,7 @@ mod jobs_fake {
             _: &Deployment,
             _: ChatRequest,
         ) -> Result<ProviderOutput, InferenceError> {
+            open_model_gateway::inference::dispatch::started();
             self.0.lock().unwrap().push("line");
             Ok(ProviderOutput::Complete(answer()))
         }

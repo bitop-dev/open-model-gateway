@@ -41,7 +41,10 @@ pub(crate) async fn observe<F: Future>(future: F) -> (F::Output, bool) {
 
 /// Record that an upstream request is being built. Called by every request
 /// constructor of `crate::egress::HttpClient`; a no-op outside [`observe`].
-pub(crate) fn started() {
+/// Public so that an adapter outside this crate (a test fake standing for an
+/// upstream call) can mark as a real request builder does: a call can only
+/// turn "nothing sent" into "possibly sent", so it never releases a hold.
+pub fn started() {
     let _ = STARTED.try_with(|cell| cell.set(true));
 }
 

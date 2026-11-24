@@ -2,7 +2,7 @@ mod attempt;
 pub mod audio;
 pub mod client;
 mod deadline_stream;
-pub(crate) mod dispatch;
+pub mod dispatch;
 mod embeddings;
 pub mod error;
 pub(crate) mod evidence;

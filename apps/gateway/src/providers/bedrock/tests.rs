@@ -54,6 +54,7 @@ impl BedrockAdapter {
     /// fails: a named profile (`auth::profile_provider`, the production
     /// profile path) missing from an explicit credentials file, so the SDK
     /// never gets an identity and never calls its connector.
+    #[cfg(feature = "integration-tests")]
     #[allow(deprecated)]
     pub(crate) fn for_test_without_credentials(base: &str) -> Self {
         use aws_config::profile::profile_file::{ProfileFileKind, ProfileFiles};
