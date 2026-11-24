@@ -274,3 +274,91 @@ fn std_tcp_stream_connect_timeout(address: SocketAddr) {
 fn std_udp_socket_bind(address: SocketAddr) {
     drop(std::net::UdpSocket::bind(address));
 }
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "probe of a refused constructor (#606)"
+)]
+fn aws_imds_client() {
+    drop(aws_config::imds::Client::builder().build());
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "probe of a refused constructor (#606)"
+)]
+fn aws_imds_credentials() {
+    drop(aws_config::imds::credentials::ImdsCredentialsProvider::builder().build());
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "probe of a refused constructor (#606)"
+)]
+fn aws_ecs_credentials() {
+    drop(aws_config::ecs::EcsCredentialsProvider::builder().build());
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "probe of a refused constructor (#606)"
+)]
+fn aws_web_identity_credentials() {
+    drop(aws_config::web_identity_token::WebIdentityTokenCredentialsProvider::builder().build());
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "probe of a refused constructor (#606)"
+)]
+fn aws_sso_credentials() {
+    drop(aws_config::sso::SsoCredentialsProvider::builder().build());
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "probe of a refused constructor (#606)"
+)]
+fn aws_sso_token() {
+    drop(aws_config::sso::SsoTokenProvider::builder().build());
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "probe of a refused constructor (#606)"
+)]
+fn aws_credential_process() {
+    drop(aws_config::credential_process::CredentialProcessProvider::new(String::new()));
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "probe of a refused constructor (#606)"
+)]
+fn libc_socket() {
+    let _ = libc::socket;
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "probe of a refused constructor (#606)"
+)]
+fn libc_connect() {
+    let _ = libc::connect;
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "probe of a refused constructor (#606)"
+)]
+fn libc_sendto() {
+    let _ = libc::sendto;
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "probe of a refused constructor (#606)"
+)]
+fn libc_sendmsg() {
+    let _ = libc::sendmsg;
+}

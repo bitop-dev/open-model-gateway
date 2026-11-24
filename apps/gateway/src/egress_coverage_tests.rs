@@ -7,8 +7,11 @@
 //!   reaches (`Cargo.lock` packages without a `source`) is listed with the
 //!   reason it may be there; a new path crate linked into the gateway fails
 //!   until it is reviewed;
-//! - the in-repository path crates' own dependencies are pinned, so one of
-//!   them cannot gain a network client unnoticed;
+//! - the path crates' own dependencies are pinned, so none can gain a
+//!   network crate unnoticed, and the in-repository ones (`crates/datetime`,
+//!   `crates/dbtest`) may not name a networking API in their sources
+//!   (`std::net`, `tokio::net`, sockets, `libc`, HTTP crates), since no
+//!   `clippy.toml` applies to them;
 //! - `build.rs`, which runs on the build machine, is held to its reviewed
 //!   statements and the package has no build dependencies.
 use std::collections::{BTreeMap, BTreeSet};
@@ -48,10 +51,12 @@ fn lock_packages(lock: &str) -> Vec<Package> {
                     .collect()
             })
             .unwrap_or_default();
+        // A `git+file:` source is a local checkout too.
+        let source = field("source");
         packages.push(Package {
             name: field("name").expect("a package name"),
             version: field("version").expect("a package version"),
-            local: field("source").is_none(),
+            local: source.is_none_or(|s| s.starts_with("git+file:")),
             dependencies,
         });
     }
@@ -313,4 +318,105 @@ fn every_spelling_of_build_time_code_is_refused() {
     ] {
         assert!(manifest_problems(line).is_empty(), "{line}");
     }
+}
+
+/// Networking names an in-repository path crate's source may not contain:
+/// no `clippy.toml` applies to those crates, so their code is held to having
+/// no way out at all.
+const NETWORK_NAMES: &[&str] = &[
+    "net",
+    "TcpStream",
+    "TcpListener",
+    "TcpSocket",
+    "UdpSocket",
+    "UnixStream",
+    "UnixDatagram",
+    "UnixListener",
+    "lookup_host",
+    "ToSocketAddrs",
+    "socket2",
+    "libc",
+    "reqwest",
+    "hyper",
+    "hyper_util",
+    "tungstenite",
+    "tokio_tungstenite",
+    "Command",
+];
+
+fn network_names(source: &str) -> BTreeSet<String> {
+    fn walk(tokens: proc_macro2::TokenStream, out: &mut BTreeSet<String>) {
+        for token in tokens {
+            match token {
+                proc_macro2::TokenTree::Ident(i) => {
+                    let name = syn::ext::IdentExt::unraw(&i).to_string();
+                    if NETWORK_NAMES.contains(&name.as_str()) {
+                        out.insert(name);
+                    }
+                }
+                proc_macro2::TokenTree::Group(g) => walk(g.stream(), out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    walk(source.parse().expect("Rust tokens"), &mut out);
+    out
+}
+
+#[test]
+fn the_in_repository_path_crates_name_no_networking_api() {
+    fn rust_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    for dir in ["../../crates/datetime/src", "../../crates/dbtest/src"] {
+        let mut files = Vec::new();
+        rust_files(&root().join(dir), &mut files);
+        assert!(!files.is_empty(), "{dir}: no sources read");
+        for file in files {
+            let found = network_names(&std::fs::read_to_string(&file).unwrap());
+            assert!(
+                found.is_empty(),
+                "{}: names {found:?}; no clippy.toml applies to this crate, so it may not reach the network (#606)",
+                file.display()
+            );
+        }
+    }
+    assert_eq!(
+        network_names("fn f() { let _ = std::net::TcpStream::connect(a); }"),
+        BTreeSet::from(["TcpStream".to_owned(), "net".to_owned()])
+    );
+    assert!(network_names("fn f() { let network = 1; }").is_empty());
+}
+
+#[test]
+fn a_local_git_checkout_counts_as_a_path_crate() {
+    let packages = lock_packages(
+        r#"
+[[package]]
+name = "open-model-gateway"
+version = "0.1.0"
+dependencies = [
+ "checkout",
+]
+
+[[package]]
+name = "checkout"
+version = "0.1.0"
+source = "git+file:///tmp/checkout#0123456789abcdef"
+"#,
+    );
+    let local: Vec<&str> = closure(&packages, "open-model-gateway")
+        .into_iter()
+        .filter(|p| p.local)
+        .map(|p| p.name.as_str())
+        .collect();
+    assert_eq!(local, ["open-model-gateway", "checkout"]);
 }
