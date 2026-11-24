@@ -2231,3 +2231,53 @@ async fn an_observation_the_state_machine_did_not_take_settles_nothing(pool: PgP
     assert_eq!(state, "settled");
     assert!(actual.is_some_and(|a| a > 0));
 }
+
+/// A writer's hold keeps a pool connection while its settlement takes others
+/// from the same pool: more concurrent settlements than connections must
+/// still all return, and the job settles once. Here, client reads of one
+/// terminal, unsettled row without an id on a two-connection pool.
+#[dbtest::test]
+async fn concurrent_settlements_never_exhaust_the_pool(pool: PgPool) {
+    use super::store::{Observer, fail_unrecorded_video};
+    let f = fixture(pool).await;
+    video_setup(&f).await;
+    let fake = Fake::default();
+    let mut j = jobs(&f, &fake, true);
+    let (execution, _hold, create) =
+        held_create(&f, &j, &fake, upstream_video(JobState::InProgress, Some(8))).await;
+    std::mem::forget(create);
+    let row = row_of(&f, execution).await;
+    // The create failed and its settled mark was lost.
+    fail_unrecorded_video(
+        &f.store,
+        row.id,
+        "create_unconfirmed",
+        None,
+        Observer::Creator,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    j.store.pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(crate::config::ACQUIRE_TIMEOUT)
+        .connect_with((*f.store.pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let id = client_id("video_", row.id);
+    let reads = futures::future::join_all((0..6).map(|_| j.get_video(&f.principal, &id)));
+    let reads = tokio::time::timeout(Duration::from_secs(30), reads)
+        .await
+        .expect("every read returns");
+    for read in reads {
+        assert!(read.unwrap().settled_at.is_some());
+    }
+    let (state, held, actual, _) = amounts(&f, execution).await;
+    assert_eq!((state.as_str(), actual), ("unknown", None));
+    assert!(held.is_some_and(|h| h > 0), "the hold is kept");
+    assert_eq!(
+        ledger(&f, execution).await,
+        [("hold".into(), held), ("unknown".into(), Some(0))],
+        "settled once"
+    );
+}

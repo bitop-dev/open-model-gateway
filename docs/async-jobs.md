@@ -90,7 +90,7 @@ The create call is bounded at 60 s, and a record that took over 2 minutes is not
 - **The poller** writes only under its current claim: its runner, its epoch and a live lease. A claim whose lease lapsed or was released writes nothing.
 - **A client read** (GET) writes only while no claim is live.
 
-Only an observation that was recorded, with the state the row took from it, settles the job. Ending a row without an id past its grace, and settling a terminal row whose settled mark was lost (the create's process died between the two writes), are made by the current writer only, under a `FOR KEY SHARE` hold on the job row, which no claim can take until the settlement is done. A row without an id is claimed past its poll deadline too (it is never polled upstream, only ended locally), so it never stays `queued` and unsettled for good.
+Only an observation that was recorded, with the state the row took from it, settles the job. A terminal, unsettled row whose provider now reports a different terminal state is therefore not settled from that read: it settles only from a later read of the state it has, otherwise lease reconciliation keeps its hold as unknown at the poll deadline plus grace (conflicting evidence is never charged). Ending a row without an id past its grace, and settling a terminal row whose settled mark was lost (the create's process died between the two writes), are made by the current writer only, under a `FOR KEY SHARE` hold on the job row, which no claim can take until the settlement is done. A row without an id is claimed past its poll deadline too (it is never polled upstream, only ended locally), so it never stays `queued` and unsettled for good.
 
 Known limits:
 

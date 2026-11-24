@@ -410,12 +410,27 @@ impl Jobs {
     /// no claim can take the job between the writer check and the
     /// settlement. `false` when the observer may not write the row now (the
     /// writer that holds it settles it).
+    ///
+    /// The hold is the one place in `jobs` that keeps a pool connection while
+    /// the settlement takes others from the same pool (the reservation read,
+    /// the governance finish, the settled mark). Holders are therefore
+    /// bounded per replica (`Store::video_settle_slots`, one at a time), with
+    /// the permit taken before the hold's transaction begins: a waiting
+    /// settlement holds no connection, so holders can never own every
+    /// connection while each waits for another. The lock order is unchanged:
+    /// the job row first, then the reservation and totals.
     async fn settle_as(
         &self,
         job: &JobRow,
         finish: Settlement,
         observer: store::Observer<'_>,
     ) -> JobResult<bool> {
+        let _slot = self
+            .store
+            .video_settle_slots
+            .acquire()
+            .await
+            .map_err(|_| InferenceError::Storage)?;
         let mut tx = crate::db::begin(&self.store.pool)
             .await
             .map_err(|_| InferenceError::Storage)?;

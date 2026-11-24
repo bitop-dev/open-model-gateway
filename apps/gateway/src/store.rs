@@ -57,6 +57,10 @@ pub struct Store {
     pub(crate) audit_export: Option<std::sync::Arc<crate::audit_export::Exporter>>,
     /// Subject exports building at once on this replica (#74).
     pub(crate) export_slots: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Video settlements made under a writer's hold on this replica
+    /// (`jobs::video`, `Jobs::settle_as`): at most one at once, because each
+    /// keeps one pool connection while its settlement takes others.
+    pub(crate) video_settle_slots: std::sync::Arc<tokio::sync::Semaphore>,
     /// Bounded trace recorder (`Store::with_traces`, #98); `None` disables
     /// tracing, including the independent background roots this store's own
     /// maintenance jobs (`rate_prune`, `lock_wait_prune`) record.
@@ -388,6 +392,7 @@ impl Store {
             leases: None,
             audit_export: None,
             export_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
+            video_settle_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             traces: None,
             #[cfg(any(test, feature = "integration-tests"))]
             admission_clock: Default::default(),
