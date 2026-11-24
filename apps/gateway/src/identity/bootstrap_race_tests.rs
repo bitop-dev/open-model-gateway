@@ -1,19 +1,22 @@
 //! `bootstrap-dev` against a concurrent first OIDC sign-in, on the real
-//! functions. Both take `lifecycle::lock` (the catalog advisory lock and the
-//! installation row) before reading or writing users: sign-in its shared form
-//! first, the seed its exclusive form before its emptiness check. At READ
-//! COMMITTED each statement sees what committed before it, so the seed either
-//! sees the new account and refuses, or commits before the sign-in starts.
+//! functions. Both take the catalog advisory lock and then the installation
+//! row before reading or writing users: sign-in through `lifecycle::lock`
+//! (the shared form of the advisory lock), the seed inline (its exclusive
+//! form) before its emptiness check. At READ COMMITTED each statement sees
+//! what committed before it, so the seed either sees the new account and
+//! refuses, or commits before the sign-in reads.
 use super::*;
 use std::time::Duration;
 
 const EMAIL: &str = "first@example.test";
 
-/// Waits until some backend is blocked on a lock, so the next step runs
-/// while that transaction is known to be in flight.
+/// Waits until `waiting` backends of this test's database are blocked on a
+/// lock, so the next step runs while those transactions are known to be in
+/// flight. Other tests share the server and block on locks on purpose; they
+/// run in their own databases and are not counted.
 async fn until_waiting(pool: &sqlx::PgPool, waiting: i64) {
     for _ in 0..200 {
-        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE NOT granted")
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock'")
             .fetch_one(pool)
             .await
             .unwrap();
