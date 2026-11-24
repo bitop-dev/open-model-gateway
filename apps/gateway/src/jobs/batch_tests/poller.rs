@@ -492,3 +492,73 @@ async fn a_submission_that_fails_after_its_claim_ended_writes_and_settles_nothin
     assert_eq!(count(&w.openai.calls(), "submit"), 1);
     consistent(&w.f).await;
 }
+
+/// A batch's line counts and finished-batch metrics are counted once, by the
+/// claim that recorded its finish: not again by a collection that finds it
+/// finished, nor by the first poller's late settlement.
+#[dbtest::test]
+async fn a_collected_batch_is_counted_once_however_often_it_is_collected(pool: PgPool) {
+    let (w, job) = submitted(pool).await;
+    completed(&w);
+    let counted = || {
+        w.jobs
+            .finish_metrics
+            .load(std::sync::atomic::Ordering::SeqCst)
+    };
+    let before = counted();
+    w.jobs.settle_hold.arm();
+    due(&w, &job).await;
+    let a = {
+        let jobs = w.jobs.clone();
+        tokio::spawn(async move { jobs.poll_once().await })
+    };
+    w.jobs.settle_hold.reached().await;
+    lapse(&w, &job).await;
+    assert_eq!(w.jobs.poll_once().await.unwrap(), 1);
+    w.jobs.settle_hold.release();
+    a.await.unwrap().unwrap();
+    assert!(w.reload(&job).await.settled_at.is_some());
+    assert_eq!(counted() - before, 1);
+}
+
+/// A batch whose finish committed and whose settlement did not is settled
+/// from the provider's aggregate usage, when it reports one, without
+/// downloading its results again.
+#[dbtest::test]
+async fn a_finished_batch_with_aggregate_usage_settles_without_a_second_download(pool: PgPool) {
+    let (w, job) = submitted(pool).await;
+    {
+        let mut s = w.openai.script.lock().unwrap();
+        for _ in 0..2 {
+            let mut done = upstream(BatchStatus::Completed);
+            done.usage = Some(usage(30, 6));
+            s.batches.push_back(done);
+        }
+        s.results = vec![
+            json!({"custom_id":"l0","ok":true,"input":30,"output":6}),
+            json!({"custom_id":"l1","ok":false}),
+        ];
+    }
+    w.jobs.settle_hold.arm();
+    due(&w, &job).await;
+    let a = {
+        let jobs = w.jobs.clone();
+        tokio::spawn(async move { jobs.poll_once().await })
+    };
+    w.jobs.settle_hold.reached().await;
+    let downloads = count(&w.openai.calls(), "results");
+    lapse(&w, &job).await;
+    assert_eq!(w.jobs.poll_once().await.unwrap(), 1);
+    assert_eq!(
+        count(&w.openai.calls(), "results"),
+        downloads,
+        "no second download"
+    );
+    assert_eq!(all_results(&w).await, 2, "no second set of result files");
+    let settled = reservation(&w.f, job.execution_id).await;
+    assert_eq!(settled.0, "settled");
+    w.jobs.settle_hold.release();
+    a.await.unwrap().unwrap();
+    assert_eq!(reservation(&w.f, job.execution_id).await, settled);
+    consistent(&w.f).await;
+}

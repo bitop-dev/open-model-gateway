@@ -254,6 +254,9 @@ pub struct Jobs {
     /// Test-only: this many next poller claims come back empty.
     #[cfg(test)]
     pub(crate) empty_claims: Arc<std::sync::atomic::AtomicUsize>,
+    /// Test-only count of native finishes counted in the batch metrics.
+    #[cfg(test)]
+    pub(crate) finish_metrics: Arc<std::sync::atomic::AtomicUsize>,
 }
 /// The next finishing run waits here once armed (tests).
 #[cfg(test)]
@@ -316,6 +319,8 @@ impl Jobs {
             claim_statements: Arc::default(),
             #[cfg(test)]
             empty_claims: Arc::default(),
+            #[cfg(test)]
+            finish_metrics: Arc::default(),
         }
     }
     /// Attach the approved local endpoints (batch scheduling load signals).

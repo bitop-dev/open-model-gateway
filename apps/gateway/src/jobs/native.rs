@@ -239,7 +239,7 @@ impl Jobs {
                         },
                     )
                     .await;
-                let Some(job) = held(&fence, finished)? else {
+                let Some((job, recorded)) = held(&fence, finished)? else {
                     return Ok(());
                 };
                 // Partial submission may have reached the provider. Only an explicit
@@ -254,7 +254,10 @@ impl Jobs {
                 )
                 .await?;
                 self.discard_work_file(&job).await;
-                crate::metrics::METRICS.observe_batch_finished("native", JobState::Failed.as_str());
+                if recorded {
+                    crate::metrics::METRICS
+                        .observe_batch_finished("native", JobState::Failed.as_str());
+                }
                 Ok(())
             }
         }
@@ -275,7 +278,7 @@ impl Jobs {
                 },
             )
             .await;
-        let Some(job) = held(&fence, finished)? else {
+        let Some((job, _)) = held(&fence, finished)? else {
             return Ok(());
         };
         self.settle(
@@ -315,6 +318,28 @@ impl Jobs {
         adapter: &dyn ProviderAdapter,
         upstream: &UpstreamBatch,
     ) -> JobResult<()> {
+        // A batch whose finish committed and whose settlement did not (its
+        // poller stopped in between): with the provider's aggregate usage it
+        // settles from that, without reading the results again. Without it
+        // the per-line sum is the only usage evidence, so the results are
+        // read again below, and the files this second collection writes are
+        // removed because the finish keeps the first collection's links.
+        let recorded = job.job_state();
+        if recorded.is_terminal()
+            && let Some(usage) = upstream.usage
+        {
+            if let Some(s) = settlement(recorded, Some(usage)) {
+                self.settle(&job, s).await?;
+            }
+            if call(adapter.delete_native_batch(target, upstream))
+                .await
+                .is_err()
+            {
+                tracing::warn!(job_id = %job.id, "provider batch copies not deleted");
+            }
+            self.discard_work_file(&job).await;
+            return Ok(());
+        }
         let files = self.files()?.clone();
         let endpoint = job.endpoint().ok_or(InferenceError::Storage)?;
         let finalizing = fence.native_status(&self.store, upstream.counts, "finalizing");
@@ -477,17 +502,25 @@ impl Jobs {
             error_file,
             counts: Some(counts),
         };
-        let Some(job) = self.publish_native(&files, job, fence, &finished).await? else {
+        let Some((job, recorded)) = self.publish_native(&files, job, fence, &finished).await?
+        else {
             return Ok(());
         };
-        // Counted once the claim recorded the lines (a lost claim records
-        // nothing and counts nothing).
-        crate::metrics::METRICS.observe_batch_lines(
-            "native",
-            &job.provider,
-            u64::from(succeeded),
-            u64::from(counts.failed),
-        );
+        // Counted by the claim that recorded the finish only: a lost claim
+        // records and counts nothing, and a collection of a batch that is
+        // finished already (its first poller's settlement did not commit)
+        // counts nothing again.
+        if recorded {
+            #[cfg(test)]
+            self.finish_metrics
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            crate::metrics::METRICS.observe_batch_lines(
+                "native",
+                &job.provider,
+                u64::from(succeeded),
+                u64::from(counts.failed),
+            );
+        }
         #[cfg(test)]
         self.settle_hold.pause().await;
         // The provider's aggregate when it reports one, else the per-line sum
@@ -503,7 +536,9 @@ impl Jobs {
             tracing::warn!(job_id = %job.id, "provider batch copies not deleted");
         }
         self.discard_work_file(&job).await;
-        crate::metrics::METRICS.observe_batch_finished("native", state.as_str());
+        if recorded {
+            crate::metrics::METRICS.observe_batch_finished("native", state.as_str());
+        }
         Ok(())
     }
 
@@ -516,15 +551,15 @@ impl Jobs {
         job: JobRow,
         fence: BatchFence,
         f: &Finished<'_>,
-    ) -> JobResult<Option<JobRow>> {
+    ) -> JobResult<Option<(JobRow, bool)>> {
         let created = [f.output_file, f.error_file];
         match fence.finish_native(&self.store, f).await {
-            Ok(row) => {
+            Ok((row, recorded)) => {
                 let unused = created.map(|f| {
                     f.filter(|f| row.output_file_id != Some(*f) && row.error_file_id != Some(*f))
                 });
                 super::runner::remove_files(files, &row, unused).await;
-                Ok(Some(row))
+                Ok(Some((row, recorded)))
             }
             Err(FenceError::Stale) => {
                 stopped(&fence);

@@ -43,10 +43,7 @@ use sqlx::{Postgres, Transaction, postgres::PgArguments, query::Query};
 use uuid::Uuid;
 
 use super::{
-    store::{
-        self, Finished, JobRow, finish_batch_tx, finish_locked_batch, job_storage,
-        lock_batch_for_finish,
-    },
+    store::{self, Finished, JobRow, finish_locked_batch, job_storage, lock_batch_for_finish},
     types::RequestCounts,
 };
 use crate::store::Store;
@@ -536,14 +533,19 @@ impl BatchFence {
 
     /// Record a native batch's terminal state and result files. A batch that
     /// is terminal already keeps what it recorded; the row says which files
-    /// it links.
+    /// it links, and the flag whether this call recorded the finish (so a
+    /// finish is counted once, by the claim that made it).
     pub(crate) async fn finish_native(
         &self,
         store: &Store,
         f: &Finished<'_>,
-    ) -> FenceResult<JobRow> {
+    ) -> FenceResult<(JobRow, bool)> {
         let mut tx = self.begin(store, Hold::Update).await?;
-        let row = finish_batch_tx(&mut tx, self.job, f)
+        let locked = lock_batch_for_finish(&mut tx, self.job)
+            .await
+            .map_err(finish_error)?;
+        let recorded = matches!(locked.state.as_str(), "queued" | "in_progress");
+        let row = finish_locked_batch(&mut tx, locked, f)
             .await
             .map_err(finish_error)?;
         // An error at COMMIT cannot authorize cleanup (as for a runner).
@@ -551,7 +553,7 @@ impl BatchFence {
             job_storage(e);
             FenceError::Unknown
         })?;
-        Ok(row)
+        Ok((row, recorded))
     }
 
     /// End the poller's claim; after a failed refresh also back off

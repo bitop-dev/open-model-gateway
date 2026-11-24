@@ -445,7 +445,11 @@ impl ProviderAdapter for Fake {
         _: &Deployment,
         _: &UpstreamBatch,
     ) -> Result<ByteStream, InferenceError> {
-        let gate = self.script.lock().unwrap().results_gate.take();
+        let gate = {
+            let mut s = self.script.lock().unwrap();
+            s.calls.push("results");
+            s.results_gate.take()
+        };
         if let Some(gate) = gate {
             gate.hold().await;
         }
@@ -2551,7 +2555,7 @@ async fn native_openai_batch_charges_published_batch_prices(pool: PgPool) {
     );
     assert_eq!(
         w.openai.calls(),
-        ["submit", "retrieve", "retrieve", "retrieve", "delete"]
+        ["submit", "retrieve", "retrieve", "retrieve", "results", "delete"]
     );
     assert!(file_deleted(f, job.work_file_id).await);
     consistent(f).await;
