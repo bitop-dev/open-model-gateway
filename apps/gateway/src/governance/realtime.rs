@@ -112,7 +112,7 @@ pub(super) struct Session {
     admitted_at: UtcInstant,
     minute_start: UtcInstant,
     pub(super) held_microusd: Option<i64>,
-    unbounded_cost: bool,
+    pub(super) unbounded_cost: bool,
     workload_kind: String,
     public_model: String,
 }

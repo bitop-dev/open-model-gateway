@@ -9,7 +9,7 @@ import { ActionProvider } from "./ui";
 import { PlatformRequestDetailPage } from "../pages/request-detail";
 import type { DashboardSearch } from "../lib/permissions";
 import { abortRequests } from "../lib/api";
-import { canResolveRealtime, realtimeResolutionBody, realtimeResolutionFields } from "../lib/realtime-resolution";
+import { canResolveRealtime, canSettleRealtimeSession, realtimeResolutionBody, realtimeResolutionFields, realtimeSessionBody } from "../lib/realtime-resolution";
 import type { RealtimeResponse, RequestAttempt, RequestDetail, RequestRow } from "../lib/requests";
 import { admin, auditor, testClient } from "../lib/test-fixtures";
 
@@ -87,5 +87,41 @@ describe("Realtime response resolution", () => {
     render(page());
     await screen.findByText("Response 1");
     expect(screen.queryByRole("button", { name: /Resolve response/ })).toBeNull();
+  });
+
+  it("offers Settle session to a Platform Admin only when no response is unknown, and posts the remainder only when stated", () => {
+    expect(canSettleRealtimeSession(admin, { accounting_state: "unknown", realtime_responses: [settled] })).toBe(true);
+    expect(canSettleRealtimeSession(admin, { accounting_state: "unknown", realtime_responses: [] })).toBe(true);
+    expect(canSettleRealtimeSession(auditor, { accounting_state: "unknown", realtime_responses: [settled] })).toBe(false);
+    expect(canSettleRealtimeSession(admin, { accounting_state: "unknown", realtime_responses: [settled, response()] })).toBe(false);
+    expect(canSettleRealtimeSession(admin, { accounting_state: "settled", realtime_responses: [settled] })).toBe(false);
+    expect(realtimeSessionBody({ evidence: "invoice:9", remainder: "false", input_text_tokens: "5" })).toEqual({ evidence: "invoice:9" });
+    expect(realtimeSessionBody({ evidence: "invoice:9", remainder: "true", input_text_tokens: "0", cached_text_tokens: "0", input_audio_tokens: "0", cached_audio_tokens: "0", output_text_tokens: "0", output_audio_tokens: "9007199254740993" }))
+      .toEqual({ evidence: "invoice:9", remainder: { input_text_tokens: "0", cached_text_tokens: "0", input_audio_tokens: "0", cached_audio_tokens: "0", output_text_tokens: "0", output_audio_tokens: "9007199254740993" } });
+  });
+
+  it("settles an idle-killed session from the request page", async () => {
+    const posts = serve(detail(attempt({ realtime_responses: [settled] })));
+    render(page());
+    await screen.findByText("Response 1");
+    expect(screen.queryByRole("button", { name: /^Resolve response/ })).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Settle session" }));
+    await screen.findByRole("dialog");
+    await userEvent.type(screen.getByRole("textbox", { name: /^Authoritative evidence reference/ }), "invoice:s");
+    await userEvent.click(screen.getByRole("button", { name: "Settle session" }));
+    await waitFor(() => expect(posts).toHaveLength(1));
+    expect(posts[0]).toEqual({ url: `/api/v1/workspaces/team/costs/${EXEC}/realtime-session/reconcile`, body: { evidence: "invoice:s" } });
+  });
+
+  it("never offers Settle session to an Auditor or while a response is unknown", async () => {
+    serve(detail(attempt({ realtime_responses: [settled] })));
+    render(page(auditor));
+    await screen.findByText("Response 1");
+    expect(screen.queryByRole("button", { name: "Settle session" })).toBeNull();
+    cleanup();
+    serve(detail());
+    render(page());
+    await screen.findByText("Response 2");
+    expect(screen.queryByRole("button", { name: "Settle session" })).toBeNull();
   });
 });

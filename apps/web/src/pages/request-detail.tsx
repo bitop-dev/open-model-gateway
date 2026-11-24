@@ -23,7 +23,7 @@ import { Money } from "../components/templates/money";
 import { costText, countText, dataPolicyOf, finishReasonLabel, jobStateTone, jobText, type JobDetail, latencyText, logPaths, logsSearch, requestFilters, requestQuery, requestStatusLabel, requestStatusTone, requestTarget, servedModel, sessionTarget, timelineStatus, tokensText, tpsText, unresolvedText, workloadText, modalityText, realtimeResponseState, realtimeStatusLabel, type LogsScope, type RealtimeResponse, type RequestAttempt, type RequestDetail, type RequestPage } from "../lib/requests";
 import type { DashboardSearch } from "../lib/permissions";
 import { Button, ErrorNotice, Stack, useAction, useApi } from "../components/ui";
-import { canResolveRealtime, realtimeResolveAction } from "../lib/realtime-resolution";
+import { canResolveRealtime, canSettleRealtimeSession, realtimeResolveAction, realtimeSessionAction } from "../lib/realtime-resolution";
 import { EmptyState } from "../components/ui/empty-state/empty-state";
 import { ResourceLink, useDashboardNavigation } from "../components/navigation-link";
 import { useResourceName } from "../components/layout/breadcrumbs";
@@ -193,7 +193,7 @@ function RequestDetail({ session, scope, id }: { session: Session; scope: LogsSc
         <Timeline label="Upstream attempts" items={r!.attempts.map(a => attemptItem(a, r!.attempts, r!.workload_kind))} showDurationBars showTotal empty="No attempts are visible for this request." />
       </Card>
       {r!.job && <JobCard job={r!.job} />}
-      {served?.realtime_responses && <Card title="Realtime responses" titleAs="h2" description="One realtime session is one attempt. Each response reserved a bounded budget window and was valued from its own usage; responses without usage keep their window on hold.">
+      {served?.realtime_responses && <Card title="Realtime responses" titleAs="h2" description="One realtime session is one attempt. Each response reserved a bounded budget window and was valued from its own usage; responses without usage keep their window on hold." actions={canSettleRealtimeSession(session, served) && <Button size="sm" variant="secondary" onClick={e => ask({ ...realtimeSessionAction(r!.workspace_id, served.execution_id), returnFocus: e.currentTarget })}>Settle session</Button>}>
         <Timeline label="Realtime responses" items={served.realtime_responses.map(x => realtimeResponseItem(x, cachedSum, canResolveRealtime(session, served, x) ? (resp, opener) => ask({ ...realtimeResolveAction(r!.workspace_id, served.execution_id, resp), returnFocus: opener }) : undefined))} showDurationBars empty="No responses were created in this session." />
       </Card>}
       <p className={s.note}>Prompts and responses are never stored or shown here.</p>

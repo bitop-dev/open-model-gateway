@@ -10,7 +10,7 @@ import { api, expectAccessible, expectNoCspViolations, expectNoHorizontalScroll,
 test.use({ trace: "off", screenshot: "off", video: "off" });
 test.afterEach(expectNoCspViolations);
 
-type Seeded = { team: string; root: string };
+type Seeded = { team: string; root: string; idle: string };
 let seeded: Promise<Seeded> | undefined;
 
 async function seed(browser: Browser): Promise<Seeded> {
@@ -38,7 +38,13 @@ async function seed(browser: Browser): Promise<Seeded> {
     await db.query("INSERT INTO monetary_ledger(id,execution_id,admitted_at,kind,amount_microusd) SELECT $1,execution_id,admitted_at,'unknown',100 FROM governance_reservations WHERE execution_id=$2", [randomUUID(), root]);
     await db.query("INSERT INTO realtime_responses(execution_id,sequence,state,status,window_hold_microusd,actual_microusd,input_text_tokens,cached_text_tokens,input_audio_tokens,cached_audio_tokens,output_text_tokens,output_audio_tokens,completed_at) VALUES($1,1,'settled','completed',100,100,50,0,0,0,50,0,clock_timestamp())", [root]);
     await db.query("INSERT INTO realtime_responses(execution_id,sequence,state,status,window_hold_microusd,input_text_tokens,completed_at) VALUES($1,2,'unknown','completed',1200,40,clock_timestamp())", [root]);
-    return { team, root };
+    // A session killed while idle (lease expiry): its one response settled live, its hold that response's actual.
+    const idle = randomUUID();
+    await db.query("INSERT INTO inference_executions(id,workspace_id,api_key_id,deployment_id,public_model,provider,streamed,state,error_code,root_request_id,attempt_number,workload_kind,started_at,completed_at) VALUES($1,$2,$3,$4,'realtime-resolution/voice','openai',true,'cancelled','lease_expired',$1,1,'realtime',clock_timestamp()-interval '3 hours',clock_timestamp()-interval '179 minutes')", [idle, team, keyId, deployment.deployment_id]);
+    await db.query("INSERT INTO governance_reservations(execution_id,workspace_id,api_key_id,deployment_id,admitted_at,minute_start,month_start,lease_expires_at,state,held_microusd,unbounded_cost,price_id) SELECT id,workspace_id,api_key_id,deployment_id,started_at,date_trunc('minute',started_at,'UTC'),date_trunc('month',started_at,'UTC'),now()-interval '2 hours','unknown',100,false,$2 FROM inference_executions WHERE id=$1", [idle, price]);
+    await db.query("INSERT INTO monetary_ledger(id,execution_id,admitted_at,kind) SELECT $1,execution_id,admitted_at,'unknown' FROM governance_reservations WHERE execution_id=$2", [randomUUID(), idle]);
+    await db.query("INSERT INTO realtime_responses(execution_id,sequence,state,status,window_hold_microusd,actual_microusd,input_text_tokens,cached_text_tokens,input_audio_tokens,cached_audio_tokens,output_text_tokens,output_audio_tokens,completed_at) VALUES($1,1,'settled','completed',1200,100,50,0,0,0,50,0,clock_timestamp())", [idle]);
+    return { team, root, idle };
   } finally {
     await db.end();
     for (const session of [operator, alex]) await session.context.close();
@@ -93,3 +99,32 @@ test("Platform Admin resolves an unknown realtime response on its request page a
   } finally { await db.end(); await operator.context.close(); }
 });
 
+test("Platform Admin settles a realtime session killed while idle; an Auditor is never offered it", async ({ browser }) => {
+  const ids = await ensure(browser), auditor = await signIn(browser, "auditor");
+  try {
+    await auditor.page.goto(`/admin/logs/${ids.idle}`);
+    await expect(auditor.page.getByRole("heading", { name: "Realtime responses" })).toBeVisible();
+    await expect(auditor.page.getByRole("button", { name: "Settle session" })).toHaveCount(0);
+  } finally { await auditor.context.close(); }
+  const operator = await signIn(browser, "operator"), page = operator.page, db = new pg.Client({ connectionString: process.env.OMG_BROWSER_DATABASE_URL });
+  await db.connect();
+  try {
+    await page.goto(`/admin/logs/${ids.idle}`);
+    await expect(page.getByRole("button", { name: /^Resolve response/ })).toHaveCount(0);
+    await page.getByRole("button", { name: "Settle session" }).click();
+    const dialog = page.getByRole("dialog", { name: "Settle realtime session" });
+    await expect(dialog).toBeVisible();
+    await expectAccessible(page, "realtime session settlement dialog");
+    await dialog.getByRole("textbox", { name: /^Authoritative evidence reference/ }).fill("browser-realtime-session-1");
+    await dialog.getByRole("button", { name: "Settle session" }).click();
+    await expect(dialog).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Settle session" })).toHaveCount(0);
+    const { rows: [session] } = await db.query("SELECT state, actual_microusd::text actual FROM governance_reservations WHERE execution_id=$1", [ids.idle]);
+    expect(session).toMatchObject({ state: "settled", actual: "100" });
+    const { rows: [ledger] } = await db.query("SELECT count(*)::int n FROM monetary_ledger WHERE execution_id=$1 AND kind='reconciliation' AND evidence='browser-realtime-session-1'", [ids.idle]);
+    expect(ledger.n).toBe(1);
+    const { rows: [audit] } = await db.query("SELECT count(*)::int n FROM audit_events WHERE action='realtime_session.reconciled' AND resource_id=$1", [ids.idle]);
+    expect(audit.n).toBe(1);
+    await expectNoHorizontalScroll(page);
+  } finally { await db.end(); await operator.context.close(); }
+});

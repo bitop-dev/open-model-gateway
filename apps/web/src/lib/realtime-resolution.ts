@@ -44,3 +44,36 @@ export const realtimeResolveAction = (workspace: string, execution: string, r: R
   fields: realtimeResolutionFields(r), submitLabel: "Resolve response", successNotice: "Response resolved.",
   run: (v, signal) => api(`${wsPath(workspace)}/costs/${encodeURIComponent(execution)}/realtime-responses/${r.sequence}/reconcile`, { method: "POST", body: realtimeResolutionBody(v), signal }),
 });
+
+/*
+ * Settling a realtime session none of whose responses is unknown (#804): a session killed while idle, or one whose last
+ * responses were resolved without settling it. When the session holds a window for a request with no response row, the
+ * remainder states that request's usage from the evidence (all zero allowed); the server refuses a remainder that has no
+ * window, and asks for one when the hold has a window without a row.
+ */
+export const canSettleRealtimeSession = (session: Session, attempt: Pick<RequestAttempt, "accounting_state"> & { realtime_responses?: Pick<RealtimeResponse, "state">[] | null }) =>
+  session.capabilities.platform_write && attempt.accounting_state === "unknown" && (attempt.realtime_responses ?? []).every(r => r.state === "settled");
+
+const withRemainder = (v: Values) => v.remainder === "true";
+export function realtimeSessionFields(): Field[] {
+  const counter = ([name, label]: (typeof realtimeCounters)[number]): Field => ({
+    name, label, value: "", visibleWhen: withRemainder, requiredWhen: withRemainder, help: "The exact count from the evidence; 0 when the request used none.",
+    validate: (v, values) => !withRemainder(values) ? undefined : !/^\d{1,19}$/.test(v) || BigInt(v) > MAX ? "Enter an exact non-negative integer without exponent notation." : undefined,
+  });
+  return [
+    { name: "evidence", label: "Authoritative evidence reference", required: true, maxLength: 200, help: "No prompt, response or secret. Repeating the identical request is idempotent; other evidence for a settled session is refused." },
+    { name: "remainder", label: "A request has no response row", type: "switch", value: "false", help: "Turn on when the gateway reports that the session holds a request with no response: enter that request's usage from the evidence." },
+    ...realtimeCounters.map(counter),
+  ];
+}
+export const realtimeSessionBody = (values: Values) => ({
+  evidence: values.evidence,
+  ...(withRemainder(values) ? { remainder: Object.fromEntries(realtimeCounters.map(([name]) => [name, values[name]])) } : {}),
+});
+/** The dialog and write path (`POST …/costs/{execution}/realtime-session/reconcile`). */
+export const realtimeSessionAction = (workspace: string, execution: string): Action => ({
+  title: "Settle realtime session",
+  description: "Platform Admin action. Every response of this session is settled but its cost is still unknown (for example the process stopped). The session settles at the sum of its responses, plus a stated remainder when it holds a request with no response; the session's pinned price values it, and unknown rates are not free.",
+  fields: realtimeSessionFields(), submitLabel: "Settle session", successNotice: "Session settled.",
+  run: (v, signal) => api(`${wsPath(workspace)}/costs/${encodeURIComponent(execution)}/realtime-session/reconcile`, { method: "POST", body: realtimeSessionBody(v), signal }),
+});

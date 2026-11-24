@@ -543,7 +543,21 @@ async fn every_route_middleware_has_exact_positive_and_negative_outcomes(pool: P
         ),
         (
             "POST",
+            "/api/v1/workspaces/{ws}/costs/{execution}/realtime-session/reconcile",
+            &holder,
+            StatusCode::FORBIDDEN,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "POST",
             "/api/v1/workspaces/{ws}/costs/{execution}/realtime-responses/{sequence}/reconcile",
+            &admin,
+            StatusCode::NOT_FOUND,
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "POST",
+            "/api/v1/workspaces/{ws}/costs/{execution}/realtime-session/reconcile",
             &admin,
             StatusCode::NOT_FOUND,
             StatusCode::NOT_FOUND,

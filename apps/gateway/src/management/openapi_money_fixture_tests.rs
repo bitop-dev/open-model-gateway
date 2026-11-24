@@ -236,6 +236,31 @@ pub(super) async fn seed_realtime(pool: &PgPool, ws: Uuid, key: Uuid, deployment
     sqlx::query("INSERT INTO realtime_responses(execution_id,sequence,state,window_hold_microusd,completed_at) VALUES($1,1,'unknown',10,clock_timestamp())").bind(session).execute(pool).await.unwrap();
     session
 }
+/// A realtime session killed while idle (#804): its one response settled by
+/// `response.done` (actual 2 of window 10), and a hold of 12, so one reserved
+/// window of 10 has no response row. Returns the session id.
+pub(super) async fn seed_realtime_unrowed(
+    pool: &PgPool,
+    ws: Uuid,
+    key: Uuid,
+    deployment: Uuid,
+) -> Uuid {
+    let session = seed_realtime(pool, ws, key, deployment).await;
+    let (idle, price) = (
+        Uuid::new_v4(),
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT price_id FROM governance_reservations WHERE execution_id=$1",
+        )
+        .bind(session)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+    );
+    sqlx::query("INSERT INTO inference_executions(id,workspace_id,api_key_id,deployment_id,public_model,provider,streamed,state,error_code,root_request_id,attempt_number,workload_kind) VALUES($1,$2,$3,$4,'contract-realtime','openai',true,'cancelled','lease_expired',$1,1,'realtime')").bind(idle).bind(ws).bind(key).bind(deployment).execute(pool).await.unwrap();
+    sqlx::query("INSERT INTO governance_reservations(execution_id,workspace_id,api_key_id,deployment_id,admitted_at,minute_start,month_start,lease_expires_at,state,held_microusd,unbounded_cost,price_id) SELECT $1,$2,$3,$4,e.started_at,date_trunc('minute',e.started_at,'UTC'),date_trunc('month',e.started_at,'UTC'),now()-interval '1 day','unknown',12,false,$5 FROM inference_executions e WHERE e.id=$1").bind(idle).bind(ws).bind(key).bind(deployment).bind(price).execute(pool).await.unwrap();
+    sqlx::query("INSERT INTO realtime_responses(execution_id,sequence,state,status,window_hold_microusd,actual_microusd,input_text_tokens,cached_text_tokens,input_audio_tokens,cached_audio_tokens,output_text_tokens,output_audio_tokens,completed_at) VALUES($1,1,'settled','completed',10,2,1,0,0,0,1,0,clock_timestamp())").bind(idle).execute(pool).await.unwrap();
+    idle
+}
 const TOKEN_COMPONENTS: [&str; 6] = [
     "uncached_input_microusd",
     "cache_read_microusd",
@@ -1536,6 +1561,19 @@ async fn slice4_money_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
         .unwrap(),
         "settled",
         "the contract fixture resolved the session's last unknown response"
+    );
+    let idle = seed_realtime_unrowed(&pool, f.team, id(&team_key), deployment).await;
+    observe(&mut seen,&client,&base,&admin,"POST",&format!("{wsbase}/costs/{idle}/realtime-session/reconcile"),Some(json!({"evidence":"contract:receipt","remainder":{"input_text_tokens":"3","cached_text_tokens":"1","input_audio_tokens":"0","cached_audio_tokens":"0","output_text_tokens":"2","output_audio_tokens":"0"}}))).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM governance_reservations WHERE execution_id=$1"
+        )
+        .bind(idle)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        "settled",
+        "the contract fixture settled the idle-killed session with its remainder"
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(

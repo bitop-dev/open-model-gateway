@@ -4,7 +4,7 @@
 //! (`resolve_usage`): never zero without proof, never a second settlement,
 //! no lowering of recorded usage, nothing while the session is open, live
 //! Platform Admin authority, personal workspaces only for their owner.
-use super::realtime_resolution::{Resolved, resolve_response};
+use super::realtime_resolution::{Resolved, SessionRefusal, resolve_response, resolve_session};
 use super::tests::db::{Fixture, amounts, fixture};
 use super::*;
 use crate::inference::{
@@ -54,14 +54,17 @@ const U: RealtimeUsage = RealtimeUsage {
 const RESPONSE: i64 = 3_228;
 
 async fn realtime_model(f: &Fixture, priced: bool) -> Deployment {
+    realtime_model_priced(f, priced.then(lines)).await
+}
+async fn realtime_model_priced(f: &Fixture, price: Option<Value>) -> Deployment {
     sqlx::query("UPDATE models SET supported_protocols=ARRAY['realtime'] WHERE id=$1")
         .bind(f.model)
         .execute(&f.store.pool)
         .await
         .unwrap();
-    if priced {
+    if let Some(lines) = price {
         sqlx::query("INSERT INTO deployment_prices(id,deployment_id,input_token_limit,output_token_limit,pricing_version,price_lines,max_units) VALUES($1,$2,1000,100,3,$3,'{}')")
-            .bind(Uuid::new_v4()).bind(f.deployment).bind(lines()).execute(&f.store.pool).await.unwrap();
+            .bind(Uuid::new_v4()).bind(f.deployment).bind(lines).execute(&f.store.pool).await.unwrap();
     }
     use crate::inference::repository::InferenceRepository;
     f.store
@@ -688,5 +691,367 @@ async fn a_resolved_response_never_changes_again(pool: PgPool) {
             error.to_string().contains("realtime responses settle once"),
             "{sql}: {error}"
         );
+    }
+}
+
+// Session-level resolution (`resolve_session`): a finished session none of
+// whose responses is unknown.
+
+/// Lease expiry of `id` (its process stopped).
+async fn expire(f: &Fixture, id: Uuid) {
+    sqlx::query("UPDATE governance_reservations SET lease_expires_at=now()-interval '1 second' WHERE execution_id=$1")
+        .bind(id)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(reconcile_expired(&f.store, 10).await.unwrap(), 1);
+}
+/// A session killed while idle, reserving as `RealtimeSession` does:
+/// response 1 settled from U by `response.done`; with `armed`, request 2's
+/// window reserved (and perhaps forwarded) with no response row.
+async fn idle_session(
+    f: &Fixture,
+    principal: crate::auth::Principal,
+    d: &Deployment,
+    armed: bool,
+) -> Uuid {
+    idle_session_with(f, principal, d, U, armed).await
+}
+async fn idle_session_with(
+    f: &Fixture,
+    principal: crate::auth::Principal,
+    d: &Deployment,
+    first: RealtimeUsage,
+    armed: bool,
+) -> Uuid {
+    let id = open_session(f, principal, d).await;
+    let admission = Some(ResponseBound::admission(100));
+    realtime::reserve_window(&f.store, &principal, id, "company/smart", FULL, admission)
+        .await
+        .unwrap();
+    realtime::open_response(&f.store, id, 1, FULL)
+        .await
+        .unwrap();
+    realtime::settle_response(
+        &f.store,
+        id,
+        1,
+        Some(ResponseStatus::Completed),
+        Some(first),
+        FULL,
+    )
+    .await
+    .unwrap();
+    if armed {
+        realtime::reserve_window(&f.store, &principal, id, "company/smart", FULL, None)
+            .await
+            .unwrap();
+    }
+    expire(f, id).await;
+    id
+}
+async fn session_audits(f: &Fixture, id: Uuid) -> Vec<Value> {
+    sqlx::query_scalar("SELECT metadata FROM audit_events WHERE action='realtime_session.reconciled' AND resource_id=$1")
+        .bind(id)
+        .fetch_all(&f.store.pool)
+        .await
+        .unwrap()
+}
+const ZERO: RealtimeUsage = RealtimeUsage {
+    input_text_tokens: 0,
+    cached_text_tokens: 0,
+    input_audio_tokens: 0,
+    cached_audio_tokens: 0,
+    output_text_tokens: 0,
+    output_audio_tokens: 0,
+};
+
+#[dbtest::test]
+async fn an_idle_killed_session_settles_from_evidence_once(pool: PgPool) {
+    let f = fixture(pool).await;
+    let d = realtime_model(&f, true).await;
+    let id = idle_session(&f, f.team, &d, false).await;
+    let ws = f.team.workspace_id;
+    assert_eq!(
+        amounts(&f, id).await,
+        ("unknown".into(), Some(RESPONSE), None, false)
+    );
+    // No response is unknown: the per-response route has nothing to act on.
+    assert_eq!(
+        resolve_response(&f.store, ws, id, 1, U, "invoice", f.owner).await,
+        Err(InferenceError::InvalidRequest)
+    );
+    assert_eq!(
+        resolve_session(&f.store, ws, id, None, "invoice:s", f.owner).await,
+        Ok(Ok(Resolved::Session))
+    );
+    assert_eq!(amounts(&f, id).await.2, Some(RESPONSE));
+    assert_eq!(amounts(&f, id).await.0, "settled");
+    assert!(
+        ledger(&f, id)
+            .await
+            .contains(&("reconciliation".into(), Some(RESPONSE)))
+    );
+    assert_eq!(
+        session_audits(&f, id).await,
+        [json!({"remainder_sequence": null})]
+    );
+    // The identical request again writes nothing; anything else is refused.
+    assert_eq!(
+        resolve_session(&f.store, ws, id, None, "invoice:s", f.owner).await,
+        Ok(Ok(Resolved::Replay))
+    );
+    for (remainder, evidence) in [(None, "invoice:other"), (Some(ZERO), "invoice:s")] {
+        assert_eq!(
+            resolve_session(&f.store, ws, id, remainder, evidence, f.owner).await,
+            Err(InferenceError::InvalidRequest)
+        );
+    }
+    assert_eq!(ledger(&f, id).await.len(), 3);
+    assert_eq!(session_audits(&f, id).await.len(), 1);
+}
+
+#[dbtest::test]
+async fn an_unrowed_window_is_settled_from_its_stated_usage(pool: PgPool) {
+    let f = fixture(pool).await;
+    let d = realtime_model(&f, true).await;
+    let ws = f.team.workspace_id;
+    for (usage, value) in [(ZERO, 0), (U, RESPONSE)] {
+        let id = idle_session(&f, f.team, &d, true).await;
+        let before = amounts(&f, id).await;
+        assert_eq!(before.1, Some(RESPONSE + WINDOW));
+        // The hold holds request 2's window: its usage must be stated.
+        assert_eq!(
+            resolve_session(&f.store, ws, id, None, "invoice", f.owner).await,
+            Ok(Err(SessionRefusal::RemainderRequired))
+        );
+        assert_eq!(amounts(&f, id).await, before);
+        assert_eq!(
+            resolve_session(&f.store, ws, id, Some(usage), "invoice:rest", f.owner).await,
+            Ok(Ok(Resolved::Session))
+        );
+        assert_eq!(
+            response(&f, id, 2).await,
+            ("settled".into(), Some(value), Some("invoice:rest".into()))
+        );
+        let window: Option<i64> = sqlx::query_scalar("SELECT window_hold_microusd FROM realtime_responses WHERE execution_id=$1 AND sequence=2")
+            .bind(id).fetch_one(&f.store.pool).await.unwrap();
+        assert_eq!(window, Some(WINDOW));
+        assert_eq!(
+            amounts(&f, id).await,
+            ("settled".into(), before.1, Some(RESPONSE + value), false)
+        );
+        assert!(
+            ledger(&f, id)
+                .await
+                .contains(&("reconciliation".into(), Some(RESPONSE + value)))
+        );
+        assert_eq!(
+            session_audits(&f, id).await,
+            [json!({"remainder_sequence": 2})]
+        );
+        assert_eq!(
+            resolve_session(&f.store, ws, id, Some(usage), "invoice:rest", f.owner).await,
+            Ok(Ok(Resolved::Replay))
+        );
+    }
+}
+
+#[dbtest::test]
+async fn a_session_killed_before_its_first_response_settles_from_the_stated_request(pool: PgPool) {
+    let f = fixture(pool).await;
+    let d = realtime_model(&f, true).await;
+    let id = open_session(&f, f.team, &d).await;
+    realtime::reserve_window(
+        &f.store,
+        &f.team,
+        id,
+        "company/smart",
+        FULL,
+        Some(ResponseBound::admission(100)),
+    )
+    .await
+    .unwrap();
+    expire(&f, id).await;
+    assert_eq!(amounts(&f, id).await.1, Some(WINDOW));
+    assert_eq!(
+        resolve_session(
+            &f.store,
+            f.team.workspace_id,
+            id,
+            Some(U),
+            "invoice",
+            f.owner
+        )
+        .await,
+        Ok(Ok(Resolved::Session))
+    );
+    assert_eq!(
+        response(&f, id, 1).await,
+        ("settled".into(), Some(RESPONSE), Some("invoice".into()))
+    );
+    assert_eq!(amounts(&f, id).await.2, Some(RESPONSE));
+}
+
+#[dbtest::test]
+async fn a_session_resolution_refuses_what_it_cannot_prove(pool: PgPool) {
+    let f = fixture(pool).await;
+    let d = realtime_model(&f, true).await;
+    let ws = f.team.workspace_id;
+    // Still open.
+    let open = open_session(&f, f.team, &d).await;
+    respond(&f, &f.team, open, 1, Some(U)).await;
+    assert_eq!(
+        resolve_session(&f.store, ws, open, None, "invoice", f.owner).await,
+        Ok(Err(SessionRefusal::Open))
+    );
+    // A response still unknown is resolved first, one by one.
+    let unknown = unknown_session(&f, f.team, &d, 1).await;
+    assert_eq!(
+        resolve_session(&f.store, ws, unknown, None, "invoice", f.owner).await,
+        Ok(Err(SessionRefusal::UnknownResponses))
+    );
+    // A remainder with no window to attribute it to.
+    let idle = idle_session(&f, f.team, &d, false).await;
+    assert_eq!(
+        resolve_session(&f.store, ws, idle, Some(ZERO), "invoice", f.owner).await,
+        Err(InferenceError::InvalidRequest)
+    );
+    // Not a live Platform Admin, the wrong workspace, invalid evidence or usage.
+    for (workspace, actor, evidence, remainder) in [
+        (ws, f.other, "invoice", None),
+        (f.principal.workspace_id, f.owner, "invoice", None),
+        (ws, f.owner, "line\nbreak", None),
+        (
+            ws,
+            f.owner,
+            "invoice",
+            Some(RealtimeUsage {
+                cached_text_tokens: 11,
+                ..U
+            }),
+        ),
+    ] {
+        assert_eq!(
+            resolve_session(&f.store, workspace, idle, remainder, evidence, actor).await,
+            Err(InferenceError::InvalidRequest)
+        );
+    }
+    for id in [open, unknown, idle] {
+        assert_ne!(amounts(&f, id).await.0, "settled");
+        assert!(session_audits(&f, id).await.is_empty());
+    }
+}
+
+#[dbtest::test]
+async fn a_remainder_without_a_complete_valuation_is_refused(pool: PgPool) {
+    let f = fixture(pool).await;
+    // Audio output is not applicable on this price: audio output usage has no rate.
+    let mut price = lines();
+    for line in price.as_array_mut().unwrap() {
+        if line["meter"] == "output_audio_tokens" {
+            *line = na("output_audio_tokens");
+        }
+    }
+    let d = realtime_model_priced(&f, Some(price)).await;
+    let text_only = RealtimeUsage {
+        output_audio_tokens: 0,
+        ..U
+    };
+    let id = idle_session_with(&f, f.team, &d, text_only, true).await;
+    let ws = f.team.workspace_id;
+    assert_eq!(
+        resolve_session(&f.store, ws, id, Some(U), "invoice", f.owner).await,
+        Err(InferenceError::Configuration)
+    );
+    assert_eq!(amounts(&f, id).await.0, "unknown");
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM realtime_responses WHERE execution_id=$1")
+            .bind(id)
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, 1);
+}
+
+#[dbtest::test]
+async fn an_unpriced_session_is_never_settled_by_evidence(pool: PgPool) {
+    let f = fixture(pool).await;
+    let d = realtime_model(&f, false).await;
+    let id = open_session(&f, f.team, &d).await;
+    expire(&f, id).await;
+    for remainder in [None, Some(ZERO)] {
+        assert_eq!(
+            resolve_session(
+                &f.store,
+                f.team.workspace_id,
+                id,
+                remainder,
+                "invoice",
+                f.owner
+            )
+            .await,
+            Ok(Err(SessionRefusal::Unattributed))
+        );
+    }
+    assert_eq!(amounts(&f, id).await.0, "unknown");
+}
+
+#[dbtest::test]
+async fn an_unbounded_session_states_its_remainder_even_when_its_hold_matches(pool: PgPool) {
+    let f = fixture(pool).await;
+    let d = realtime_model(&f, true).await;
+    let id = expired_session(&f, f.team, &d, Some(U), false).await;
+    // A window the price could not bound added nothing to the hold and only
+    // marked the session unbounded: the hold no longer proves it complete.
+    sqlx::query("UPDATE governance_reservations SET unbounded_cost=true WHERE execution_id=$1")
+        .bind(id)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    let ws = f.team.workspace_id;
+    assert_eq!(
+        resolve_response(&f.store, ws, id, 2, U, "invoice:2", f.owner).await,
+        Ok(Resolved::Response)
+    );
+    assert_eq!(
+        resolve_session(&f.store, ws, id, None, "invoice:s", f.owner).await,
+        Ok(Err(SessionRefusal::RemainderRequired))
+    );
+    assert_eq!(
+        resolve_session(&f.store, ws, id, Some(ZERO), "invoice:s", f.owner).await,
+        Ok(Ok(Resolved::Session))
+    );
+    let row: (Option<i64>, Option<i64>) = sqlx::query_as("SELECT window_hold_microusd,actual_microusd FROM realtime_responses WHERE execution_id=$1 AND sequence=3")
+        .bind(id).fetch_one(&f.store.pool).await.unwrap();
+    assert_eq!(row, (Some(0), Some(0)));
+    assert_eq!(amounts(&f, id).await.2, Some(2 * RESPONSE));
+}
+
+#[dbtest::test]
+async fn concurrent_session_resolutions_settle_it_once(pool: PgPool) {
+    let f = fixture(pool).await;
+    let d = realtime_model(&f, true).await;
+    let ws = f.team.workspace_id;
+    for (a, b, other) in [
+        ("invoice", "invoice", Ok(Ok(Resolved::Replay))),
+        (
+            "invoice:a",
+            "invoice:b",
+            Err(InferenceError::InvalidRequest),
+        ),
+    ] {
+        let id = idle_session(&f, f.team, &d, true).await;
+        let (x, y) = tokio::join!(
+            resolve_session(&f.store, ws, id, Some(U), a, f.owner),
+            resolve_session(&f.store, ws, id, Some(U), b, f.owner),
+        );
+        let mut results = [x, y];
+        results.sort_by_key(|r| *r != Ok(Ok(Resolved::Session)));
+        assert_eq!(results, [Ok(Ok(Resolved::Session)), other]);
+        let counts: (i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM monetary_ledger WHERE execution_id=$1 AND kind='reconciliation'),(SELECT count(*) FROM realtime_responses WHERE execution_id=$1)")
+            .bind(id).fetch_one(&f.store.pool).await.unwrap();
+        assert_eq!(counts, (1, 2));
+        assert_eq!(amounts(&f, id).await.2, Some(2 * RESPONSE));
     }
 }
