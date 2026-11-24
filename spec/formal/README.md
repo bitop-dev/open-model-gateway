@@ -43,8 +43,8 @@ and the held amount for pending or unknown rows ([`ELSE coalesce(r.held_microusd
 | `pending` -> `settled` (usage complete; or a free pre-processing rejection on a free price) / -> `unknown` (anything else, incl. cancelled, timeout, a rejection on a priced model, a 429) | `governance::finish` -> [`fn finish_unobserved`](../../apps/gateway/src/governance/settlement.rs#L562) | Reservation row `FOR UPDATE` ([`WHERE r.execution_id=$1 FOR UPDATE OF r`](../../apps/gateway/src/governance/settlement.rs#L38)), read [`r.state != "pending"`](../../apps/gateway/src/governance/settlement.rs#L623); in the statement itself [`AND state='started' RETURNING 1`](../../apps/gateway/src/governance/settlement.rs#L657) and a row-count check [`(executions, reservations, entries) != (1, 1, 1)`](../../apps/gateway/src/governance/settlement.rs#L666); ledger UNIQUE |
 | `pending` -> `unknown` (lease expired), execution -> `cancelled` | `reconcile_expired` / [`fn reconcile_batch`](../../apps/gateway/src/governance/reconcile.rs#L29), every replica on the [`tokio::time::interval(Duration::from_secs(5))`](../../apps/gateway/src/maintenance.rs#L78) tick ([`reconcile_expired_leases(&store)`](../../apps/gateway/src/maintenance.rs#L87)) | [`WHERE state='pending' AND lease_expires_at<=clock_timestamp() ORDER BY lease_expires_at,execution_id LIMIT $1 FOR UPDATE SKIP LOCKED`](../../apps/gateway/src/governance/reconcile.rs#L33); [`SET state='unknown' WHERE execution_id=ANY($1) AND state='pending'`](../../apps/gateway/src/governance/reconcile.rs#L48); [`ids.len() != claimed.len()`](../../apps/gateway/src/governance/reconcile.rs#L53); [`WHERE id=ANY($1) AND state='started'`](../../apps/gateway/src/governance/reconcile.rs#L57) row count; [`state<>'settled' AND actual_microusd IS NULL`](../../apps/gateway/enterprise_migrations/0083_batch_envelope_resolution.sql#L10) because the UPDATE does not clear `actual`; holds are not touched |
 | `unknown` -> `settled` (operator evidence) | [`fn resolve_usage_once`](../../apps/gateway/src/governance/reconcile.rs#L140) | [`p.role='admin'`](../../apps/gateway/src/governance/reconcile.rs#L183) re-checked in the tx; [`reservation(&mut tx, execution, scoped(store))`](../../apps/gateway/src/governance/reconcile.rs#L177) or the installation row in global mode ([`lock(&mut tx).await?`](../../apps/gateway/src/governance/reconcile.rs#L163)); read [`r.state != "unknown"`](../../apps/gateway/src/governance/reconcile.rs#L230) and require a terminal execution ([`SELECT state<>'started' FROM inference_executions`](../../apps/gateway/src/governance/reconcile.rs#L204)); the UPDATE itself has no state predicate |
-| `settled` -> anything | nobody | Every writer above refuses; the database does not (section 4 assumption 2, finding 4) |
-| `held` changed | settlement raises with [`greatest(held_microusd,$20)`](../../apps/gateway/src/governance/settlement.rs#L658); the batch envelope transfer (`admit_line`, [`SET held_microusd=held_microusd-$2`](../../apps/gateway/src/governance/batch.rs#L607)) moves hold into a line's own reservation; the **realtime** paths (window growth [`SET held_microusd=held_microusd+$2,reserved_tokens=reserved_tokens+$3`](../../apps/gateway/src/governance/realtime.rs#L306) and finalization [`r.checked_add(t.actual)`](../../apps/gateway/src/governance/realtime.rs#L598)) can also change it | realtime is out of scope (section 2); `HoldNeverReleased` is stated for the request path |
+| `settled` -> anything | nobody | Every writer above refuses; since 0088 the database refuses it too, and `unknown` -> `pending` ([`CONSTRAINT='reservation_state_transition'`](../../apps/gateway/enterprise_migrations/0088_reservation_transitions.sql#L40)), before any CHECK (section 4 assumption 2, finding 4) |
+| `held` changed | settlement raises with [`greatest(held_microusd,$20)`](../../apps/gateway/src/governance/settlement.rs#L658); the batch envelope transfer (`admit_line`, [`SET held_microusd=held_microusd-$2`](../../apps/gateway/src/governance/batch.rs#L607)) moves hold into a line's own reservation; the **realtime** paths (window growth [`SET held_microusd=held_microusd+$2,reserved_tokens=reserved_tokens+$3`](../../apps/gateway/src/governance/realtime.rs#L306) and finalization [`r.checked_add(t.actual)`](../../apps/gateway/src/governance/realtime.rs#L598)) can also change it | realtime is out of scope (section 2); `HoldNeverReleased` is stated for the request path. Since 0088 the database refuses any hold change on a settled row and a decrease outside the write that ends a pending row, except the envelope transfer and a realtime response's settlement ([`e.workload_kind IN ('batches','realtime')`](../../apps/gateway/enterprise_migrations/0088_reservation_transitions.sql#L53), [`CONSTRAINT='reservation_hold_change'`](../../apps/gateway/enterprise_migrations/0088_reservation_transitions.sql#L55)) |
 | lease extended | [`fn accept_job`](../../apps/gateway/src/governance/jobs.rs#L23) for video (a batch has its final lease from admission) | [`SET lease_expires_at=greatest(lease_expires_at,$2) WHERE execution_id=$1 AND state='pending'`](../../apps/gateway/src/governance/jobs.rs#L47) |
 
 The request thread awaits admission, then runs [`let output = call_upstream(`](../../apps/gateway/src/inference/attempt.rs#L138) under the request deadline.
@@ -178,11 +178,13 @@ Assumptions of the model (some are also properties of the code):
    in the statement; the guard is the earlier read under `FOR UPDATE` in the same transaction
    (scoped mode) or the installation row (global mode). Settlement has an in-statement guard on the
    execution row (`state='started'`, `(1,1,1)` check), plus its locked read. True today.
-2. **The database does not enforce monotonic reservation state.** The runtime role may `UPDATE`
+2. **The database enforces forward-only reservation state (since 0088).** The runtime role may `UPDATE`
    `state` and `held_microusd` (`deploy/staging/runtime-grants.sql`, [`GRANT UPDATE(state,actual_microusd,`](../../deploy/staging/runtime-grants.sql#L160));
-   the state/actual CHECK and ledger UNIQUE constrain the modelled writes. No general trigger
-   enforces forward-only state transitions. The later explicit free-price and terminal batch
-   envelope resolution paths (0082/0083) are outside the model.
+   the state/actual CHECK and ledger UNIQUE constrain the modelled writes, and a row trigger on
+   every partition allows only `pending` -> `settled`/`unknown` and `unknown` -> `settled`
+   ([`IF OLD.state='pending' AND NEW.state IN ('settled','unknown') THEN`](../../apps/gateway/enterprise_migrations/0088_reservation_transitions.sql#L33)). The model
+   still does not rely on it. The later explicit free-price and terminal batch envelope
+   resolution paths (0082/0083) are outside the model; both are `unknown` -> `settled`.
 3. **A1: the lease outlives the request thread.** The model passes without it, so it only decides
    whether a slow attempt ends `settled` or `unknown`. A process stalled between admission and
    dispatch can still send the request after the reconciler took the row (tokio's `timeout` polls
@@ -278,7 +280,9 @@ money.
    refusing `settled -> *`, `unknown -> pending` and a shrinking `held_microusd` unless the new state
    is `settled` would make invariants 2 and 3 a database guarantee, one more layer in a design
    whose model needs three independent failures before `settled` can be undone. It must allow the
-   envelope transfer and realtime growth.
+   envelope transfer and realtime growth. Implemented in 0088 (#641), with one difference: a hold
+   may also change in the write that ends a pending row as `unknown`, because the realtime final
+   write sets the retained hold there.
 
 ## 6. Limits of the experiment
 

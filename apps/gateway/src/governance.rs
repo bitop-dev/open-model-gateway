@@ -544,6 +544,8 @@ pub(crate) mod tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod totals_tests;
 #[cfg(all(test, feature = "integration-tests"))]
+mod transition_tests;
+#[cfg(all(test, feature = "integration-tests"))]
 mod v3_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod workload_tests;
