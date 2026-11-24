@@ -241,7 +241,7 @@ Overnight on weekdays, at most 4 batch lines run at once. They pause while 2 or 
 | `GATEWAY_BATCH_WORKERS` | `4` | Gateway-run lines executing at once per process (`0`–`256`; `0` disables the runner). |
 | `GATEWAY_BATCH_CONCURRENCY` | `2` | Lines of one batch executing at once (`1`–`64`). |
 | `GATEWAY_JOB_POLL_INTERVAL_SECONDS` | `30` | Poller interval: native submission, status and collection (`0` disables native processing). |
-| `GATEWAY_JOB_POLL_CONCURRENCY` | `4` | Native submissions, status refreshes and collections one process runs at once (`1`–`32`); one long collection holds one of them ([poller](async-jobs.md#poller)). |
+| `GATEWAY_JOB_POLL_CONCURRENCY` | `4` | Provider job refreshes one process runs at once (`1`–`32`): native batch submissions, status refreshes and collections, video and 0016 batch status; one long collection holds one of them ([poller](async-jobs.md#poller)). |
 
 ## Storage and grants
 

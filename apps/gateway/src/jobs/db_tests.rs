@@ -1156,3 +1156,76 @@ async fn video_observations_are_fenced_and_never_go_back(pool: PgPool) {
     let row = reload(&f.store, job.id).await.unwrap();
     assert_eq!((row.progress, row.request_completed), (Some(70), Some(7)));
 }
+
+/// A video observation that is refused (a stale claim) never settles the
+/// job: the claim that recorded its terminal state settles it with its own
+/// evidence (#802).
+#[dbtest::test]
+async fn a_refused_video_observation_never_settles(pool: PgPool) {
+    use super::store::{Observation, Observer, claim_due, observe, reload};
+    let f = fixture(pool).await;
+    video_setup(&f).await;
+    let fake = Fake::default();
+    let j = jobs(&f, &fake, true);
+    fake.push_video(upstream_video(JobState::InProgress, Some(8)));
+    let job = j
+        .create_video(f.principal, video_request(), Uuid::new_v4())
+        .await
+        .unwrap();
+    let due = async || {
+        sqlx::query("UPDATE async_jobs SET next_poll_at=now(),runner_lease_until=CASE WHEN runner_lease_until IS NULL THEN NULL ELSE now()-interval '1 second' END WHERE id=$1")
+            .bind(job.id)
+            .execute(&f.store.pool)
+            .await
+            .unwrap();
+    };
+    due().await;
+    let (_, a) = claim_due(&f.store, Uuid::new_v4(), 30.0, 60.0)
+        .await
+        .unwrap()
+        .unwrap();
+    due().await;
+    let (_, b) = claim_due(&f.store, Uuid::new_v4(), 30.0, 60.0)
+        .await
+        .unwrap()
+        .unwrap();
+    // B records `completed` and has not settled yet.
+    let current = reload(&f.store, job.id).await.unwrap();
+    let completed = Observation {
+        state: JobState::Completed,
+        upstream_status: "completed",
+        progress: Some(100),
+        completed_at: None,
+        expires_at: None,
+        error: None,
+        counts: None,
+    };
+    observe(&f.store, &current, &completed, 30.0, Observer::Claim(&b))
+        .await
+        .unwrap();
+    // A's stale refresh reads `completed` without a duration: refused, it
+    // must not settle the job with that evidence.
+    fake.push_video(upstream_video(JobState::Completed, None));
+    let seen = j
+        .refresh_video(current.clone(), Observer::Claim(&a))
+        .await
+        .unwrap();
+    assert!(
+        seen.settled_at.is_none(),
+        "a refused observation settles nothing"
+    );
+    // B settles with the known duration.
+    fake.push_video(upstream_video(JobState::Completed, Some(8)));
+    let settled = j
+        .refresh_video(reload(&f.store, job.id).await.unwrap(), Observer::Claim(&b))
+        .await
+        .unwrap();
+    assert!(settled.settled_at.is_some());
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM governance_reservations WHERE execution_id=$1")
+            .bind(job.execution_id)
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "settled");
+}

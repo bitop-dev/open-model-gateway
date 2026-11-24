@@ -555,6 +555,36 @@ impl BatchFence {
         Ok((row, recorded))
     }
 
+    /// End a started submission that never recorded its provider id as
+    /// `f` (interrupted), only if the id is still absent under the finish
+    /// lock: an id that a slow submitter recorded after this claim read the
+    /// batch means the batch is submitted and is polled, not interrupted.
+    /// `None` when nothing was recorded.
+    pub(crate) async fn interrupt_submission(
+        &self,
+        store: &Store,
+        f: &Finished<'_>,
+    ) -> FenceResult<Option<JobRow>> {
+        let mut tx = self.begin(store, Hold::Update).await?;
+        let locked = lock_batch_for_finish(&mut tx, self.job)
+            .await
+            .map_err(finish_error)?;
+        if locked.upstream_id.is_some()
+            || !matches!(locked.state.as_str(), "queued" | "in_progress")
+        {
+            tx.commit().await.map_err(job_storage)?;
+            return Ok(None);
+        }
+        let row = finish_locked_batch(&mut tx, locked, f)
+            .await
+            .map_err(finish_error)?;
+        tx.commit().await.map_err(|e| {
+            job_storage(e);
+            FenceError::Unknown
+        })?;
+        Ok(Some(row))
+    }
+
     /// End the poller's claim; after a failed refresh also back off
     /// (interval × 2^failures, at most 32×). Refused once the claim ended:
     /// the next poll belongs to the claim that holds the job.

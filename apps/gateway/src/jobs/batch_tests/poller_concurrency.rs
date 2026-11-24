@@ -140,9 +140,8 @@ async fn one_stalled_collection_does_not_delay_other_jobs(pool: PgPool) {
     consistent(&w.f).await;
 }
 
-/// A pass claims all its free slots in one statement: three due jobs, four
-/// slots, one claim statement (the old serial pass made four: three claims
-/// and the empty one that ended it).
+/// A pass claims all its free slots in one statement: three due jobs and
+/// four slots take one claim statement.
 #[dbtest::test]
 async fn a_pass_claims_its_free_slots_in_one_statement(pool: PgPool) {
     let (w, rows) = three_batches(pool).await;
@@ -226,4 +225,191 @@ fn the_poll_concurrency_is_validated() {
     for bad in ["0", "33", "-1", "x"] {
         assert!(limits(Some(bad)).is_err(), "{bad}");
     }
+}
+
+/// The stalled batch of [`three_batches`], due first, its collection blocked
+/// in the results download; the others answer `in_progress`.
+fn stall_first(w: &World, rows: &[JobRow]) -> Arc<Gate> {
+    let mut s = w.openai.script.lock().unwrap();
+    s.by_id.insert(
+        rows[0].upstream_id.clone().unwrap(),
+        answer(&rows[0], BatchStatus::Completed, 1),
+    );
+    for row in &rows[1..] {
+        s.by_id.insert(
+            row.upstream_id.clone().unwrap(),
+            answer(row, BatchStatus::InProgress, 0),
+        );
+    }
+    s.results = vec![json!({"custom_id":"l0","ok":true,"input":3,"output":1})];
+    s.results_gate.insert(Arc::default()).clone()
+}
+async fn first_due(w: &World, first: &JobRow) {
+    sqlx::query("UPDATE async_jobs SET next_poll_at=now() WHERE id<>$1")
+        .bind(first.id)
+        .execute(&w.f.store.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE async_jobs SET next_poll_at=now()-interval '1 minute' WHERE id=$1")
+        .bind(first.id)
+        .execute(&w.f.store.pool)
+        .await
+        .unwrap();
+}
+async fn epoch(w: &World, job: &JobRow) -> i64 {
+    sqlx::query_scalar("SELECT runner_epoch FROM async_jobs WHERE id=$1")
+        .bind(job.id)
+        .fetch_one(&w.f.store.pool)
+        .await
+        .unwrap()
+}
+
+/// A claim statement that waits (a busy pool) does not stop the refreshes
+/// in flight: their lease renewals go on, so their claims do not lapse.
+#[dbtest::test]
+async fn a_claim_in_flight_does_not_stop_the_running_refreshes(pool: PgPool) {
+    use crate::jobs::poller::{PollLease, Renewal};
+    let (mut w, rows) = three_batches(pool).await;
+    w.jobs.poll_lease = PollLease {
+        seconds: 2.0,
+        renew: Duration::from_millis(200),
+    };
+    let held = stall_first(&w, &rows);
+    first_due(&w, &rows[0]).await;
+    let tick = Duration::from_millis(100);
+    w.jobs.limits.poll_interval = Some(tick);
+    let poller = crate::jobs::poller::start(w.jobs.clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), held.entered.notified())
+        .await
+        .expect("the stalled collection started");
+    // The same poller's next claim blocks before its statement, while its
+    // stalled refresh is still in flight.
+    w.jobs.claim_hold.arm();
+    tokio::time::timeout(Duration::from_secs(10), w.jobs.claim_hold.reached())
+        .await
+        .expect("a claim is blocked");
+    let renewed = w.jobs.renewals(Renewal::Renewed);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        w.jobs.renewals(Renewal::Renewed) > renewed,
+        "the stalled refresh keeps renewing while the claim waits"
+    );
+    w.jobs.claim_hold.release();
+    poller.abort();
+}
+
+/// A poller never claims a job it is still refreshing, even when that
+/// refresh's lease has lapsed: the job is not collected twice by one process.
+#[dbtest::test]
+async fn a_poller_never_claims_a_job_it_is_refreshing(pool: PgPool) {
+    let (mut w, rows) = three_batches(pool).await;
+    let held = stall_first(&w, &rows);
+    first_due(&w, &rows[0]).await;
+    let tick = Duration::from_millis(100);
+    w.jobs.limits.poll_interval = Some(tick);
+    let poller = crate::jobs::poller::start(w.jobs.clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), held.entered.notified())
+        .await
+        .expect("the stalled collection started");
+    let claimed = epoch(&w, &rows[0]).await;
+    // Its lease lapses (renewals are 15 s apart here) and it is due again.
+    sqlx::query("UPDATE async_jobs SET runner_lease_until=now()-interval '1 second',next_poll_at=now() WHERE id=$1")
+        .bind(rows[0].id)
+        .execute(&w.f.store.pool)
+        .await
+        .unwrap();
+    tokio::time::sleep(tick * 10).await;
+    assert_eq!(epoch(&w, &rows[0]).await, claimed, "not claimed again");
+    poller.abort();
+}
+
+/// A claim that fails while refreshes run does not abandon them: the pass
+/// lets them end their claims, then reports the failure.
+#[dbtest::test]
+async fn a_failed_claim_lets_the_running_refreshes_end_their_claims(pool: PgPool) {
+    let (mut w, rows) = three_batches(pool).await;
+    let held = {
+        let mut s = w.openai.script.lock().unwrap();
+        for _ in 0..3 {
+            s.batches.push_back(upstream(BatchStatus::InProgress));
+        }
+        s.retrieve_gate.insert(Arc::default()).clone()
+    };
+    sqlx::query("UPDATE async_jobs SET next_poll_at=now()")
+        .execute(&w.f.store.pool)
+        .await
+        .unwrap();
+    w.jobs.limits.poll_concurrency = 2;
+    // The pass's second claim statement fails.
+    let made = w
+        .jobs
+        .claim_statements
+        .load(std::sync::atomic::Ordering::SeqCst);
+    w.jobs
+        .failing_claim
+        .store(made + 2, std::sync::atomic::Ordering::SeqCst);
+    let pass = {
+        let jobs = w.jobs.clone();
+        tokio::spawn(async move { jobs.poll_once().await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), held.entered.notified())
+        .await
+        .expect("one refresh is held");
+    until("the second claim", Duration::from_secs(10), async || {
+        w.jobs
+            .claim_statements
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= made + 2
+    })
+    .await;
+    held.release.notify_one();
+    assert!(pass.await.unwrap().is_err(), "the failed claim is reported");
+    let leased: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM async_jobs WHERE id=ANY($1) AND runner_lease_until IS NOT NULL",
+    )
+    .bind(rows.iter().map(|r| r.id).collect::<Vec<_>>())
+    .fetch_one(&w.f.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(leased, 0, "every claim was ended");
+}
+
+/// A refresh that panics ends only its own work: the poller goes on with
+/// the other jobs.
+#[dbtest::test]
+async fn a_panicking_refresh_does_not_stop_the_poller(pool: PgPool) {
+    let (mut w, rows) = three_batches(pool).await;
+    {
+        let mut s = w.openai.script.lock().unwrap();
+        for row in &rows {
+            s.by_id.insert(
+                row.upstream_id.clone().unwrap(),
+                answer(row, BatchStatus::InProgress, 0),
+            );
+        }
+    }
+    sqlx::query("UPDATE async_jobs SET next_poll_at=now()")
+        .execute(&w.f.store.pool)
+        .await
+        .unwrap();
+    w.jobs
+        .panicking_refreshes
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let tick = Duration::from_millis(100);
+    w.jobs.limits.poll_interval = Some(tick);
+    let poller = crate::jobs::poller::start(w.jobs.clone()).unwrap();
+    until("the other jobs refreshed", tick * 30, async || {
+        let polled: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM async_jobs WHERE id=ANY($1) AND upstream_status='in_progress'",
+        )
+        .bind(rows.iter().map(|r| r.id).collect::<Vec<_>>())
+        .fetch_one(&w.f.store.pool)
+        .await
+        .unwrap();
+        polled >= 2
+    })
+    .await;
+    tokio::time::sleep(tick * 5).await;
+    assert!(!poller.is_finished(), "the poller is still running");
+    poller.abort();
 }

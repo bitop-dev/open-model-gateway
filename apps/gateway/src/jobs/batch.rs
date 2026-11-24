@@ -453,7 +453,7 @@ impl Jobs {
         let (target, adapter) = self.target(&job).await?;
         let upstream_id = job.upstream().ok_or(InferenceError::Storage)?;
         let upstream = call(adapter.retrieve_batch(&target, &upstream_id)).await?;
-        let job = store::observe(
+        let (job, recorded) = store::observe(
             &self.store,
             &job,
             &Observation {
@@ -474,7 +474,9 @@ impl Jobs {
         )
         .await?;
         let state = job.job_state();
-        if state.is_terminal()
+        // Only the recorded observation settles, with its own evidence.
+        if recorded
+            && state.is_terminal()
             && job.settled_at.is_none()
             && let Some(s) = settlement(state, upstream.usage)
         {

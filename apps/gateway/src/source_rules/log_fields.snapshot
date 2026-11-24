@@ -22,6 +22,7 @@ jobs/native.rs :: impl Jobs::submit_native :: warn :: job_id=%job.id
 jobs/native.rs :: stopped :: warn :: job_id=%fence.job
 jobs/plan.rs :: impl Jobs::line_candidates :: warn :: error=?other ; provider=%deployment.provider
 jobs/plan.rs :: impl ScanState::report_rejects :: warn :: error=?other
+jobs/poller.rs :: impl Jobs::guarded :: error :: job_id=%id
 jobs/poller.rs :: impl Jobs::poll_forever :: warn :: -
 jobs/poller.rs :: impl Jobs::refresh :: warn :: job_id=%fence.job
 jobs/poller.rs :: impl Jobs::renew_claim :: warn :: job_id=%fence.job

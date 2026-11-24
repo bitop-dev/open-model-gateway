@@ -632,3 +632,41 @@ async fn lease_renewals_are_counted_by_outcome(pool: PgPool) {
     a.await.unwrap().unwrap();
     assert_eq!(w.jobs.renewals(Renewal::Lost), 1);
 }
+
+/// A poller that finds a started submission past its grace does not end the
+/// batch interrupted when the provider's id landed in the meantime (under
+/// the finish lock): the batch is polled as submitted.
+#[dbtest::test]
+async fn an_upstream_id_that_lands_first_keeps_the_batch_from_being_interrupted(pool: PgPool) {
+    let (mut w, job) = unsubmitted(pool).await;
+    w.jobs.submit_grace = TimeDelta::minutes(0);
+    sqlx::query("UPDATE async_jobs SET submit_started_at=now()-interval '1 hour',next_poll_at=now() WHERE id=$1")
+        .bind(job.id)
+        .execute(&w.f.store.pool)
+        .await
+        .unwrap();
+    // B's claim reads the batch without an upstream id ...
+    let (claimed, fence) = store::claim_due(&w.f.store, Uuid::new_v4(), 30.0, 60.0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(claimed.upstream_id.is_none());
+    // ... then the slow submitter records the provider's id.
+    assert!(
+        store::set_upstream(
+            &w.f.store,
+            job.id,
+            &UpstreamId::parse("batch_late").unwrap()
+        )
+        .await
+        .unwrap()
+    );
+    w.jobs
+        .poll_native(claimed, fence, &AtomicBool::new(false))
+        .await
+        .unwrap();
+    let after = w.reload(&job).await;
+    assert_eq!(after.state, "queued", "not interrupted");
+    assert_eq!(after.upstream_id.as_deref(), Some("batch_late"));
+    assert!(after.settled_at.is_none());
+}

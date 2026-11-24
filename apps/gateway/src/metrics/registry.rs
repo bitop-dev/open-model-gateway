@@ -302,7 +302,7 @@ impl Metrics {
         );
         registry.register(
             "batches",
-            "Batches by mode (native, gateway) and event (created, submitted, or the final state)",
+            "Batches by mode (native, gateway) and event (created, submitted, the final state, or late_submission: a native batch its provider accepted after the gateway ended it)",
             self.batches.clone(),
         );
         registry.register(

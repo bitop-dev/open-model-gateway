@@ -260,6 +260,16 @@ pub struct Jobs {
     /// Test-only counts of lease renewals by outcome (`poller::Renewal`).
     #[cfg(test)]
     pub(crate) renewal_counts: Arc<[std::sync::atomic::AtomicUsize; 3]>,
+    /// Test-only pause of the next poller claim before its statement.
+    #[cfg(test)]
+    pub(crate) claim_hold: Arc<FinalizeHold>,
+    /// Test-only: the poller claim statement with this number (1-based,
+    /// counted in `claim_statements`) fails; 0 for none.
+    #[cfg(test)]
+    pub(crate) failing_claim: Arc<std::sync::atomic::AtomicUsize>,
+    /// Test-only: this many next poller refreshes panic.
+    #[cfg(test)]
+    pub(crate) panicking_refreshes: Arc<std::sync::atomic::AtomicUsize>,
 }
 /// The next finishing run waits here once armed (tests).
 #[cfg(test)]
@@ -326,6 +336,12 @@ impl Jobs {
             finish_metrics: Arc::default(),
             #[cfg(test)]
             renewal_counts: Arc::default(),
+            #[cfg(test)]
+            claim_hold: Arc::default(),
+            #[cfg(test)]
+            failing_claim: Arc::default(),
+            #[cfg(test)]
+            panicking_refreshes: Arc::default(),
         }
     }
     /// Attach the approved local endpoints (batch scheduling load signals).

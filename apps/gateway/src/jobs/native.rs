@@ -63,15 +63,16 @@ fn stopped(fence: &BatchFence) {
     tracing::warn!(job_id = %fence.job, "batch poller no longer holds its batch; it stops working on it");
 }
 
-/// Whether the poller's lease renewal found the claim ended.
 /// The batch's final state in the metrics, once: by the claim that
-/// `recorded` its finish.
+/// `recorded` its finish, right after the finish committed (a settlement that
+/// fails later does not lose it, and a retry does not count it again).
 fn count_finished(recorded: bool, state: JobState) {
     if recorded {
         crate::metrics::METRICS.observe_batch_finished("native", state.as_str());
     }
 }
 
+/// Whether the poller's lease renewal found the claim ended.
 fn lost_claim(lost: &AtomicBool) -> bool {
     lost.load(Ordering::SeqCst)
 }
@@ -265,6 +266,7 @@ impl Jobs {
                 let Some((job, recorded)) = held(&fence, finished)? else {
                     return Ok(());
                 };
+                count_finished(recorded, JobState::Failed);
                 // Partial submission may have reached the provider. Only an explicit
                 // pre-processing rejection can qualify for free-zero settlement.
                 self.settle(
@@ -277,7 +279,6 @@ impl Jobs {
                 )
                 .await?;
                 self.discard_work_file(&job).await;
-                count_finished(recorded, JobState::Failed);
                 Ok(())
             }
         }
@@ -287,7 +288,7 @@ impl Jobs {
     /// retried; the batch fails and its hold is retained as unknown.
     async fn submission_lost(&self, fence: BatchFence) -> JobResult<()> {
         let finished = fence
-            .finish_native(
+            .interrupt_submission(
                 &self.store,
                 &Finished {
                     state: JobState::Failed,
@@ -298,7 +299,7 @@ impl Jobs {
                 },
             )
             .await;
-        let Some((job, _)) = held(&fence, finished)? else {
+        let Some(Some(job)) = held(&fence, finished)? else {
             return Ok(());
         };
         self.settle(
@@ -509,6 +510,7 @@ impl Jobs {
         // finished already (its first poller's settlement did not commit)
         // counts nothing again.
         self.count_lines(recorded, &job, succeeded, counts.failed);
+        count_finished(recorded, state);
         #[cfg(test)]
         self.settle_hold.pause().await;
         // The provider's aggregate when it reports one, else the per-line sum
@@ -524,7 +526,6 @@ impl Jobs {
             tracing::warn!(job_id = %job.id, "provider batch copies not deleted");
         }
         self.discard_work_file(&job).await;
-        count_finished(recorded, state);
         Ok(())
     }
 
@@ -548,7 +549,9 @@ impl Jobs {
 
     /// Settle a batch whose finish committed and whose settlement did not
     /// from the provider's aggregate `usage`, without reading its results
-    /// again, then delete the provider's copies and the work file.
+    /// again, then delete the provider's copies and the work file. The
+    /// settlement follows the state the finish recorded, not a later
+    /// provider read: the recorded facts are the batch's.
     async fn settle_finished(
         &self,
         job: &JobRow,

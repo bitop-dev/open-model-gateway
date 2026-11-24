@@ -169,9 +169,13 @@ impl Jobs {
         observer: store::Observer<'_>,
     ) -> JobResult<JobRow> {
         let interval = self.poll_seconds();
-        let job =
+        let (job, recorded) =
             store::observe(&self.store, job, &observation(upstream), interval, observer).await?;
-        if job.job_state().is_terminal()
+        // Only the observation that was recorded settles, with its own
+        // evidence: a refused one leaves settlement to the writer that holds
+        // the job.
+        if recorded
+            && job.job_state().is_terminal()
             && job.settled_at.is_none()
             && let Some(s) = settlement(&job, upstream)
         {
