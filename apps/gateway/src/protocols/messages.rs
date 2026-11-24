@@ -125,6 +125,7 @@ pub async fn handle(
         options.beta_headers = betas;
     }
     let model = request.model.clone();
+    let show_thinking = crate::providers::messages::shows_thinking(&request);
     let id = format!("msg_{}", request_id.0.simple());
     let output = match labels
         .scope(engine.execute_protocol(principal, request, request_id.0, ApiProtocol::Messages))
@@ -133,7 +134,7 @@ pub async fn handle(
         Ok(v) => v,
         Err(e) => return error_response(e),
     };
-    render(output, id, model)
+    render_messages(output, id, model, show_thinking)
 }
 fn usage_json(usage: Usage) -> Value {
     let mut value = json!({});
@@ -189,6 +190,7 @@ pub(crate) fn batch_error_body(e: InferenceError) -> Value {
 }
 fn snapshot(id: &str, model: &str, response: &ChatResponse) -> Result<Value> {
     let size = response.content.as_ref().map_or(0, String::len)
+        + response.reasoning.as_ref().map_or(0, String::len)
         + response
             .tool_calls
             .iter()
@@ -198,7 +200,15 @@ fn snapshot(id: &str, model: &str, response: &ChatResponse) -> Result<Value> {
         return Err(InferenceError::InvalidUpstream);
     }
     let mut content = vec![];
-    if let Some(text) = &response.content {
+    // Translated reasoning has no signature, and none is invented.
+    if let Some(thinking) = &response.reasoning {
+        content.push(json!({"type":"thinking","thinking":thinking}));
+    }
+    // A translated refusal carries no output: the empty text its frames may
+    // hold is not a block (the stream renders the same terminal content).
+    if let Some(text) = &response.content
+        && !(text.is_empty() && response.finish_reason == FinishReason::Refusal)
+    {
         content.push(json!({"type":"text","text":text}));
     }
     for call in &response.tool_calls {
@@ -231,12 +241,29 @@ fn snapshot(id: &str, model: &str, response: &ChatResponse) -> Result<Value> {
         json!({"id":id,"type":"message","role":"assistant","model":model,"content":content,"stop_reason":stop,"stop_sequence":null,"usage":usage_json(response.usage)}),
     )
 }
+#[cfg(test)]
 fn render(output: ProviderOutput, id: String, model: String) -> Response {
+    render_messages(output, id, model, true)
+}
+/// `show_thinking` (`providers::messages::shows_thinking`) withholds translated
+/// reasoning the client did not ask for. It is still pushed through the
+/// accumulator first, so it stays bounded and refused after Finish.
+fn render_messages(
+    output: ProviderOutput,
+    id: String,
+    model: String,
+    show_thinking: bool,
+) -> Response {
     match output {
-        ProviderOutput::Complete(response) => match snapshot(&id, &model, &response) {
-            Ok(v) => Json(v).into_response(),
-            Err(e) => error_response(e),
-        },
+        ProviderOutput::Complete(mut response) => {
+            if !show_thinking {
+                response.reasoning = None;
+            }
+            match snapshot(&id, &model, &response) {
+                Ok(v) => Json(v).into_response(),
+                Err(e) => error_response(e),
+            }
+        }
         ProviderOutput::Stream(mut stream) => {
             let events = async_stream::stream! {
                 // Sent when the upstream stream opens, before any usage is observed (#23).
@@ -247,12 +274,19 @@ fn render(output: ProviderOutput, id: String, model: String) -> Response {
                 // turn unknown output into zero. Gateway accounting never uses these values.
                 yield Ok::<_, Infallible>(event("message_start", json!({"message":{"id":id,"type":"message","role":"assistant","model":model,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0}}})));
                 // Native Anthropic preserves validated block lifecycles. Translated
-                // streams put text in block 0 and buffer tools after it, retaining
-                // their previous behavior. Both paths wait for engine Done.
-                let mut accumulator = Accumulator::with_limit(OUTPUT_LIMIT); let mut done = false; let mut text_open = false; let mut native = false;
+                // streams open one block per run of reasoning (unsigned `thinking`)
+                // or text, in arrival order, closing each before the next opens;
+                // tools are buffered after them. Both paths wait for engine Done.
+                let mut accumulator = Accumulator::with_limit(OUTPUT_LIMIT); let mut done = false; let mut native = false;
+                // (index, is_thinking) of the open translated block; `blocks` counts opened blocks.
+                let mut open: Option<(usize, bool)> = None; let mut blocks = 0_usize; let mut text_streamed = false;
                 while let Some(next) = stream.next().await {
                     let block = match &next { Ok(ChatEvent::MessagesBlock(v)) => Some(v.clone()), _ => None };
-                    let delta = match &next { Ok(ChatEvent::Delta { text: Some(text), .. }) => Some(text.clone()), _ => None };
+                    let piece = match &next {
+                        Ok(ChatEvent::Delta { text: Some(text), .. }) => Some((false, text.clone())),
+                        Ok(ChatEvent::Reasoning(text)) => Some((true, text.clone())),
+                        _ => None,
+                    };
                     match next.and_then(|e| accumulator.push(e)) {
                         Ok(finished) => {
                             if let Some(block) = block {
@@ -262,12 +296,23 @@ fn render(output: ProviderOutput, id: String, model: String) -> Response {
                                 };
                                 yield Ok(event(kind, block.clone()));
                             }
-                            if let Some(delta) = delta.filter(|_| !native) {
-                                if !text_open {
-                                    text_open = true;
-                                    yield Ok(event("content_block_start", json!({"index":0,"content_block":{"type":"text","text":""}})));
-                                }
-                                yield Ok(event("content_block_delta", json!({"index":0,"delta":{"type":"text_delta","text":delta}})));
+                            // Empty pieces (OpenAI-wire `"content":""` beside reasoning)
+                            // never open or switch a block; see the empty text block below.
+                            if let Some((thinking, piece)) = piece.filter(|(t, p)| !native && !p.is_empty() && (show_thinking || !t)) {
+                                let index = match open {
+                                    Some((index, kind)) if kind == thinking => index,
+                                    previous => {
+                                        if let Some((index, _)) = previous {
+                                            yield Ok(event("content_block_stop", json!({"index":index})));
+                                        }
+                                        let index = blocks; blocks += 1; open = Some((index, thinking)); text_streamed |= !thinking;
+                                        let start = if thinking { json!({"type":"thinking","thinking":""}) } else { json!({"type":"text","text":""}) };
+                                        yield Ok(event("content_block_start", json!({"index":index,"content_block":start})));
+                                        index
+                                    }
+                                };
+                                let delta = if thinking { json!({"type":"thinking_delta","thinking":piece}) } else { json!({"type":"text_delta","text":piece}) };
+                                yield Ok(event("content_block_delta", json!({"index":index,"delta":delta})));
                             }
                             if finished { done = true; break; }
                         }
@@ -279,13 +324,23 @@ fn render(output: ProviderOutput, id: String, model: String) -> Response {
                 let Some(content) = terminal["content"].as_array() else {
                     yield Ok(event("error", error_body(InferenceError::InvalidUpstream))); return;
                 };
-                for (index, block) in content.iter().enumerate().filter(|_| !native) {
-                    if block["type"] != "text" {
+                if !native {
+                    if let Some((index, _)) = open {
+                        yield Ok(event("content_block_stop", json!({"index":index})));
+                    }
+                    // Text that was only ever empty still gets its (empty) block, as in JSON.
+                    if !text_streamed && content.iter().any(|b| b["type"] == "text") {
+                        let index = blocks; blocks += 1;
+                        yield Ok(event("content_block_start", json!({"index":index,"content_block":{"type":"text","text":""}})));
+                        yield Ok(event("content_block_stop", json!({"index":index})));
+                    }
+                    for block in content.iter().filter(|b| b["type"] == "tool_use") {
+                        let index = blocks; blocks += 1;
                         let mut start = block.clone(); start["input"] = json!({});
                         yield Ok(event("content_block_start", json!({"index":index,"content_block":start})));
                         yield Ok(event("content_block_delta", json!({"index":index,"delta":{"type":"input_json_delta","partial_json":block["input"].to_string()}})));
+                        yield Ok(event("content_block_stop", json!({"index":index})));
                     }
-                    yield Ok(event("content_block_stop", json!({"index":index})));
                 }
                 yield Ok(event("message_delta", json!({"delta":{"stop_reason":terminal["stop_reason"],"stop_sequence":null},"usage":terminal["usage"]})));
                 yield Ok(event("message_stop", json!({})));

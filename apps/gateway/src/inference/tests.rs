@@ -148,6 +148,7 @@ impl ProviderAdapter for Adapter {
             Mode::Complete => {
                 return Ok(ProviderOutput::Complete(ChatResponse {
                     messages_content: None,
+                    reasoning: None,
                     content: Some("hello".into()),
                     tool_calls: vec![],
                     finish_reason: FinishReason::Stop,

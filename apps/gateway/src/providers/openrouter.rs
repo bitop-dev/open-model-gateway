@@ -14,8 +14,9 @@
 //!   micro-USD (rounded up) for `provider_cost_microusd` evidence only; it is
 //!   never the gateway charge.
 //! - Chat: OpenRouter-only fields (`native_finish_reason`, reasoning traces)
-//!   are normalized away; reasoning traces are not returned to clients but
-//!   their tokens stay in `completion_tokens`. The final streaming accounting
+//!   are normalized away. The `reasoning` text reaches only Messages clients
+//!   (as unsigned thinking); `reasoning_details` is never returned. Reasoning
+//!   tokens stay in `completion_tokens`. The final streaming accounting
 //!   frame (repeated finish choice with an empty delta plus `usage`) is treated
 //!   as usage, not as a second terminal event.
 use std::{sync::Arc, time::Duration};
@@ -422,138 +423,6 @@ fn object(bytes: &[u8]) -> Result<Value> {
     Ok(value)
 }
 
-/// Remove OpenRouter-only choice fields after type-checking them, so the
-/// shared OpenAI decoder still rejects every other unknown content field.
-fn normalize_choices(value: &mut Value) -> Result<()> {
-    let Some(choices) = value.get_mut("choices").and_then(Value::as_array_mut) else {
-        return Ok(());
-    };
-    for choice in choices {
-        let Some(choice) = choice.as_object_mut() else {
-            return Err(InferenceError::InvalidUpstream);
-        };
-        if let Some(native) = choice.remove("native_finish_reason")
-            && !(native.is_null() || native.is_string())
-        {
-            return Err(InferenceError::InvalidUpstream);
-        }
-        for key in ["message", "delta"] {
-            if let Some(message) = choice.get_mut(key).and_then(Value::as_object_mut) {
-                if let Some(text) = message.remove("reasoning")
-                    && !(text.is_null() || text.is_string())
-                {
-                    return Err(InferenceError::InvalidUpstream);
-                }
-                if let Some(details) = message.remove("reasoning_details")
-                    && !(details.is_null() || details.is_array())
-                {
-                    return Err(InferenceError::InvalidUpstream);
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn decode_chat(bytes: &[u8], messages: bool) -> Result<ChatResponse> {
-    let mut value = object(bytes)?;
-    let cost = provider_cost(bytes);
-    embedded_error(
-        &value,
-        &["choices"],
-        &["usage"],
-        &cost,
-        |code| error_status(&value, messages, code),
-        || {
-            value["usage"]
-                .is_object()
-                .then(|| openai::usage(&value["usage"]))
-        },
-    )?;
-    let cost = cost?;
-    normalize_choices(&mut value)?;
-    let mut response = openai::decode_complete(&value)?;
-    response.usage.provider_cost_microusd = cost;
-    Ok(response)
-}
-
-/// Normalize one SSE data frame. `finish` is the first finish reason seen.
-fn normalize_frame(
-    data: &[u8],
-    finish: &mut Option<String>,
-    messages: bool,
-) -> Result<(Vec<u8>, Option<i64>)> {
-    if data == b"[DONE]" {
-        return Ok((data.to_vec(), None));
-    }
-    let mut value: Value =
-        serde_json::from_slice(data).map_err(|_| InferenceError::InvalidUpstream)?;
-    if !value.is_object() {
-        return Err(InferenceError::InvalidUpstream);
-    }
-    stream_embedded_error(&value, messages)?;
-    let cost = provider_cost(data)?;
-    normalize_choices(&mut value)?;
-    if let Some(previous) = finish.as_deref()
-        && !value["usage"].is_null()
-        && let Some([choice]) = value["choices"].as_array().map(Vec::as_slice)
-    {
-        let delta = &choice["delta"];
-        let accounting = delta.as_object().is_some_and(|d| {
-            d.iter().all(|(k, v)| match k.as_str() {
-                "content" | "tool_calls" => empty(v),
-                "role" => v.is_null() || v == "assistant",
-                _ => false,
-            })
-        }) && (choice["finish_reason"].is_null()
-            || choice["finish_reason"].as_str() == Some(previous))
-            && choice["index"].as_u64() == Some(0);
-        if accounting {
-            value["choices"] = json!([]);
-        }
-    }
-    if finish.is_none()
-        && let Some(reason) = value["choices"][0]["finish_reason"].as_str()
-    {
-        *finish = Some(reason.to_owned());
-    }
-    Ok((
-        serde_json::to_vec(&value).map_err(|_| InferenceError::InvalidUpstream)?,
-        cost,
-    ))
-}
-
-fn decode_chat_stream(response: reqwest::Response, messages: bool) -> EventStream {
-    Box::pin(async_stream::try_stream! {
-        let mut chunks = response.bytes_stream();
-        let mut decoder = openai::SseDecoder::new();
-        let mut state = openai::StreamState::default();
-        let mut finish = None;
-        while let Some(chunk) = chunks.next().await {
-            let chunk = chunk.map_err(transport)?;
-            for &byte in chunk.iter() {
-                if let Some(data) = decoder.push(byte)? {
-                    let (frame, cost) = normalize_frame(&data, &mut finish, messages)?;
-                    for event in state.decode(&frame)? {
-                        let event = match event {
-                            ChatEvent::Usage(mut usage) => {
-                                usage.provider_cost_microusd = cost;
-                                ChatEvent::Usage(usage)
-                            }
-                            other => other,
-                        };
-                        let done = matches!(event, ChatEvent::Done);
-                        yield event;
-                        if done { return; }
-                    }
-                }
-            }
-        }
-        // Only [DONE] proves completion.
-        Err(super::framing::TRANSPORT)?;
-    })
-}
-
 /// Embedding models with a fixed output width that rejects other `dimensions`.
 fn fixed_dimensions(model: &str) -> Option<u32> {
     let base = model.strip_suffix(":free").unwrap_or(model);
@@ -639,6 +508,7 @@ impl ProviderAdapter for OpenRouterAdapter {
         let mut body = openai::encode(&target.upstream_model, &request);
         body["provider"] = self.provider_preferences();
         body["usage"] = json!({"include": true});
+        messages_controls(&mut body, &request);
         let response = self
             .post_inner(
                 target,
@@ -647,18 +517,19 @@ impl ProviderAdapter for OpenRouterAdapter {
                 request.messages_options.is_some(),
             )
             .await?;
-        if request.stream {
+        let output = if request.stream {
             super::framing::check_sse(&response)?;
-            Ok(ProviderOutput::Stream(decode_chat_stream(
+            ProviderOutput::Stream(decode_chat_stream(
                 response,
                 request.messages_options.is_some(),
-            )))
+            ))
         } else {
-            Ok(ProviderOutput::Complete(decode_chat(
+            ProviderOutput::Complete(decode_chat(
                 &read_limit(response, request.response_limit()).await?,
                 request.messages_options.is_some(),
-            )?))
-        }
+            )?)
+        };
+        Ok(super::messages::thinking_display(&request, output))
     }
 
     async fn execute_embeddings(
@@ -778,6 +649,8 @@ impl ProviderAdapter for OpenRouterAdapter {
 }
 
 mod audio;
+mod chat;
+use chat::{decode_chat, decode_chat_stream, messages_controls};
 mod images;
 #[cfg(test)]
 mod tests;

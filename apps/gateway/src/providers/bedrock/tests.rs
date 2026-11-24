@@ -568,6 +568,7 @@ async fn tools_json_and_stream_tool_indices_usage_after_finish() {
             }
             ChatEvent::Done => order.push("done"),
             ChatEvent::MessagesBlock(_) => panic!("native Anthropic event on Converse"),
+            ChatEvent::Reasoning(_) => panic!("Converse reasoning is not mapped"),
         }
     }
     assert_eq!(starts, 1);

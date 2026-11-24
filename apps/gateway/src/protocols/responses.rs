@@ -431,7 +431,7 @@ fn render(output: ProviderOutput, id: String, model: String, created: u64) -> Re
         }
         ProviderOutput::Stream(mut stream) => {
             let events = async_stream::stream! {
-                let mut seq = 0; let mut start = snapshot(&id, &model, created, &ChatResponse { messages_content: None, content: None, tool_calls: vec![], finish_reason: FinishReason::Stop, usage: Usage::default() }); start["status"] = "in_progress".into();
+                let mut seq = 0; let mut start = snapshot(&id, &model, created, &ChatResponse { messages_content: None, reasoning: None, content: None, tool_calls: vec![], finish_reason: FinishReason::Stop, usage: Usage::default() }); start["status"] = "in_progress".into();
                 yield Ok::<_,Infallible>(numbered("response.created", json!({"response":start}), &mut seq));
                 yield Ok(numbered("response.in_progress", json!({"response":start}), &mut seq));
                 // Text is forwarded as it arrives (message item at index 0, as in the
@@ -485,6 +485,7 @@ fn render(output: ProviderOutput, id: String, model: String, created: u64) -> Re
 #[derive(Default)]
 pub(super) struct Accumulator {
     text: Option<String>,
+    reasoning: Option<String>,
     tools: std::collections::BTreeMap<u32, ToolCall>,
     reason: Option<FinishReason>,
     usage: Usage,
@@ -556,6 +557,19 @@ impl Accumulator {
                     }
                 }
             }
+            // Translated reasoning shares the output bound with text and tools.
+            ChatEvent::Reasoning(text) if self.reason.is_none() => {
+                self.bytes = self
+                    .bytes
+                    .checked_add(text.len())
+                    .ok_or(InferenceError::InvalidUpstream)?;
+                if self.bytes > self.limit.unwrap_or(OUTPUT_LIMIT) {
+                    return Err(InferenceError::InvalidUpstream);
+                }
+                self.reasoning
+                    .get_or_insert_with(String::new)
+                    .push_str(&text);
+            }
             ChatEvent::Finish(reason) if self.reason.is_none() => self.reason = Some(reason),
             ChatEvent::Usage(usage) => self.usage = usage,
             ChatEvent::Done if self.reason.is_some() => return Ok(true),
@@ -572,6 +586,7 @@ impl Accumulator {
         }
         Ok(ChatResponse {
             messages_content: None,
+            reasoning: self.reasoning,
             content: self.text,
             tool_calls: self.tools.into_values().collect(),
             finish_reason: self.reason.ok_or(InferenceError::InvalidUpstream)?,

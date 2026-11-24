@@ -218,6 +218,7 @@ impl ProviderAdapter for FixtureAdapter {
         } else {
             Ok(ProviderOutput::Complete(ChatResponse {
                 messages_content: None,
+                reasoning: None,
                 content: Some("Hello".into()),
                 tool_calls: vec![],
                 finish_reason: FinishReason::Stop,

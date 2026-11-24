@@ -220,7 +220,7 @@ pub async fn assert_text_chat_contract(
     while let Some(event) = output.next().await {
         assert!(!done, "events after Done");
         match event.unwrap() {
-            ChatEvent::Delta { .. } | ChatEvent::MessagesBlock(_) => {
+            ChatEvent::Delta { .. } | ChatEvent::MessagesBlock(_) | ChatEvent::Reasoning(_) => {
                 assert!(!finished, "delta after Finish")
             }
             ChatEvent::Finish(_) => {
@@ -310,6 +310,39 @@ pub async fn run_error_tool_sdk(
     target: Deployment,
     expect_upstream_refusal: bool,
 ) {
+    let args: &[&str] = if expect_upstream_refusal {
+        &[
+            "400",
+            crate::inference::error::InferenceError::UpstreamRejected.message(),
+        ]
+    } else {
+        &[]
+    };
+    let attempts = run_messages_sdk(
+        pool,
+        adapter,
+        target,
+        "tool-result-errors.mjs",
+        args,
+        expect_upstream_refusal,
+    )
+    .await;
+    let expected = if expect_upstream_refusal { 2 } else { 6 };
+    assert_eq!(attempts, expected, "durable attempts for SDK requests");
+}
+
+/// Runs `tests/<script>` with the official Anthropic SDK against a listening
+/// gateway whose only route is `adapter`; returns the durable attempt count.
+/// `priced` publishes a small price (input limit 100, output limit 50).
+#[cfg(feature = "integration-tests")]
+pub async fn run_messages_sdk(
+    pool: sqlx::PgPool,
+    adapter: std::sync::Arc<dyn ProviderAdapter>,
+    target: Deployment,
+    script: &str,
+    args: &[&str],
+    priced: bool,
+) -> i64 {
     use crate::{
         bootstrap,
         config::Environment,
@@ -334,7 +367,7 @@ pub async fn run_error_tool_sdk(
         .execute(&pool)
         .await
         .unwrap();
-    if expect_upstream_refusal {
+    if priced {
         sqlx::query("INSERT INTO deployment_prices(id,deployment_id,input_microusd_per_million,output_microusd_per_million,input_token_limit,output_token_limit,pricing_version) SELECT gen_random_uuid(),id,1000000,1000000,100,50,1 FROM deployments")
             .execute(&pool).await.unwrap();
     }
@@ -348,15 +381,11 @@ pub async fn run_error_tool_sdk(
             .await
             .unwrap()
     });
-    let script =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/tool-result-errors.mjs");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests")
+        .join(script);
     let mut command = tokio::process::Command::new("node");
-    command.arg(script);
-    if expect_upstream_refusal {
-        command
-            .arg("400")
-            .arg(crate::inference::error::InferenceError::UpstreamRejected.message());
-    }
+    command.arg(path).args(args);
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         command
@@ -372,13 +401,55 @@ pub async fn run_error_tool_sdk(
         .expect("node and npm ci required");
     assert!(
         output.status.success(),
-        "SDK tool-result contracts: {}",
+        "SDK contracts ({script:?}): {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let attempts: i64 = sqlx::query_scalar("SELECT count(*) FROM inference_executions")
+    sqlx::query_scalar("SELECT count(*) FROM inference_executions")
         .fetch_one(&pool)
         .await
-        .unwrap();
-    let expected = if expect_upstream_refusal { 2 } else { 6 };
-    assert_eq!(attempts, expected, "durable attempts for SDK requests");
+        .unwrap()
+}
+
+/// A Messages request parsed by the real frontend grammar (`extra` replaces
+/// top-level fields), for adapter wire tests of the Claude Code field rules.
+pub fn messages_request(extra: serde_json::Value) -> ChatRequest {
+    let mut body = serde_json::json!({"model":"public","max_tokens":4096,
+        "messages":[{"role":"user","content":"hello"}]});
+    body.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    crate::protocols::messages::openapi_normalize(body).unwrap()
+}
+
+/// The schema every structured-output wire test sends.
+pub fn output_schema() -> serde_json::Value {
+    serde_json::json!({"type":"object","properties":{"answer":{"type":"string"}},
+        "required":["answer"],"additionalProperties":false})
+}
+
+/// Reasoning text and answer text of a complete or streamed reply. A stream
+/// must deliver every reasoning event before Finish, and Done after Finish.
+pub async fn reasoning_and_text(output: ProviderOutput) -> (Option<String>, Option<String>) {
+    let mut stream = match output {
+        ProviderOutput::Complete(response) => return (response.reasoning, response.content),
+        ProviderOutput::Stream(stream) => stream,
+    };
+    let (mut reasoning, mut text, mut finished, mut done) =
+        (None::<String>, None::<String>, false, false);
+    while let Some(event) = stream.next().await {
+        match event.unwrap() {
+            ChatEvent::Reasoning(delta) => {
+                assert!(!finished, "reasoning after Finish");
+                reasoning.get_or_insert_default().push_str(&delta);
+            }
+            ChatEvent::Delta {
+                text: Some(delta), ..
+            } => text.get_or_insert_default().push_str(&delta),
+            ChatEvent::Finish(_) => finished = true,
+            ChatEvent::Done => done = true,
+            _ => {}
+        }
+    }
+    assert!(finished && done, "stream must finish");
+    (reasoning, text)
 }

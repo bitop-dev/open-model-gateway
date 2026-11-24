@@ -328,7 +328,7 @@ pub(super) fn encode_native_line(
     request: &BatchRequest,
 ) -> Result<Vec<u8>> {
     let body = match (request, endpoint.is_generation()) {
-        (BatchRequest::Chat(r), true) if !r.stream => super::encode(&target.upstream_model, r),
+        (BatchRequest::Chat(r), true) if !r.stream => super::encode_chat(&target.upstream_model, r),
         (BatchRequest::Embeddings(r), false) => {
             crate::providers::embeddings::validate(r)?;
             crate::providers::embeddings::encode(&target.upstream_model, r)
@@ -637,7 +637,13 @@ pub(super) fn decode_native_result(endpoint: BatchEndpoint, line: &[u8]) -> Resu
         let body = &response["body"];
         if status == 200 {
             NativeOutcome::Succeeded(Box::new(if endpoint.is_generation() {
-                BatchResponse::Chat(super::decode_complete(body)?)
+                // Messages lines may carry strict structured output, whose
+                // refusal is a Messages stop reason (`decode_complete_protocol`).
+                BatchResponse::Chat(super::decode_complete_protocol(
+                    body,
+                    None,
+                    matches!(endpoint, BatchEndpoint::Messages),
+                )?)
             } else {
                 // A native line's body with an `error` member, even a null
                 // one, is not a success, whatever the shared decoder makes

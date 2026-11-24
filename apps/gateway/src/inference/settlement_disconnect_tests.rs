@@ -85,6 +85,7 @@ impl ProviderAdapter for Upstream {
         Ok(match self.behaviour {
             Behaviour::Complete => ProviderOutput::Complete(ChatResponse {
                 messages_content: None,
+                reasoning: None,
                 content: Some("ok".into()),
                 tool_calls: vec![],
                 finish_reason: FinishReason::Stop,

@@ -50,9 +50,9 @@ and the held amount for pending or unknown rows ([`ELSE coalesce(r.held_microusd
 The request thread awaits admission, then runs [`let output = call_upstream(`](../../apps/gateway/src/inference/attempt.rs#L139) under the request deadline.
 It settles the outcome ([`settle_complete(&mut telemetry, &mut guard, span, response)`](../../apps/gateway/src/inference/attempt.rs#L172), [`ProviderOutput::Stream(track_stream(`](../../apps/gateway/src/inference/attempt.rs#L175)).
 `ExecutionGuard` marks settlement started ([`self.finished = true`](../../apps/gateway/src/inference/mod.rs#L460)) and calls
-[`fn settle_to_completion`](../../apps/gateway/src/inference/attempt.rs#L582) with
+[`fn settle_to_completion`](../../apps/gateway/src/inference/attempt.rs#L583) with
 [`SETTLEMENT_DEADLINE: Duration = Duration::from_secs(3)`](../../apps/gateway/src/inference/mod.rs#L374).
-The pending write uses [`HandOff::new(`](../../apps/gateway/src/inference/attempt.rs#L606), whose drop path spawns the unfinished future ([`runtime.spawn(async move`](../../apps/gateway/src/inference/hand_off.rs#L75)).
+The pending write uses [`HandOff::new(`](../../apps/gateway/src/inference/attempt.rs#L607), whose drop path spawns the unfinished future ([`runtime.spawn(async move`](../../apps/gateway/src/inference/hand_off.rs#L75)).
 [`impl Drop for ExecutionGuard`](../../apps/gateway/src/inference/mod.rs#L479) queues a detached cancellation settlement only if `finished` is false. Failover
 is decided only in the `Err(error)` arm of `Engine::attempt` (so structurally never after a
 stream was returned), only after settlement succeeds ([`let failing_over = settled.is_ok()`](../../apps/gateway/src/inference/attempt.rs#L155)), and only for
@@ -258,7 +258,7 @@ money.
    marked `finished = true` before the write, so a client disconnect while the inline settlement was
    awaited (`settle_complete`, `track_stream`) dropped the write and `Drop` did nothing. A failed or
    timed-out write still leaves `pending`, by design (test
-   [`fn diagnostic_settlement_timeout_is_not_cancellation_or_a_drop_retry`](../../apps/gateway/src/inference/tests.rs#L871) asserts no retry); the rest
+   [`fn diagnostic_settlement_timeout_is_not_cancellation_or_a_drop_retry`](../../apps/gateway/src/inference/tests.rs#L872) asserts no retry); the rest
    of this item describes that case and the original symptom. The reconciler then marks it
    `unknown`; the hold is kept (spend overstated) until an operator resolves it with evidence.
    `MoneyPathDiag` shows it (Receive usage, ClientCancel while `settling`, ExpireLease, Reconcile);

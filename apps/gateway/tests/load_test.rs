@@ -102,6 +102,7 @@ impl ProviderAdapter for MockUpstream {
             tokio::time::sleep(self.delay).await;
             Ok(ProviderOutput::Complete(ChatResponse {
                 messages_content: None,
+                reasoning: None,
                 content: Some("Load test ok".into()),
                 tool_calls: vec![],
                 finish_reason: FinishReason::Stop,

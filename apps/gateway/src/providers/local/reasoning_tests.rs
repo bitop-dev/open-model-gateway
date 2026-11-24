@@ -175,3 +175,166 @@ fn cloud_openai_decoding_still_rejects_reasoning_fields() {
     value["choices"][0]["message"]["reasoning_content"] = json!("trace");
     assert!(super::super::openai::decode_complete(&value).is_err());
 }
+
+/// Messages clients receive a local reasoning parser's trace as reasoning
+/// (rendered as unsigned `thinking`), complete and streamed, whichever of the
+/// two field names the server uses. Reasoning controls have no pinned local
+/// dialect and never reach the wire; other clients still never get the trace.
+#[tokio::test]
+async fn messages_receive_local_reasoning_text_under_either_field_name() {
+    use super::super::contract::{messages_request, reasoning_and_text};
+    let rename = |mut value: Value| {
+        let text = value.to_string().replace("reasoning_content", "reasoning");
+        value = serde_json::from_str(&text).unwrap();
+        value
+    };
+    for field in ["reasoning_content", "reasoning"] {
+        let mut complete = sglang_complete(json!(248046), json!("The user wants OK."));
+        let mut frames = sglang_frames();
+        if field == "reasoning" {
+            complete = rename(complete);
+            frames = frames.into_iter().map(rename).collect();
+        }
+        let (base, task) = serve(complete, frames).await;
+        for profile in [
+            Profile::Sglang,
+            Profile::Vllm,
+            Profile::Ollama,
+            Profile::OpenAiCompatible,
+        ] {
+            let adapter = LocalAdapter::new(
+                profile,
+                Arc::new(NoSecrets),
+                Arc::new(ApprovedEndpoints::for_test(&base)),
+            );
+            let target = target(profile, &base);
+            let controls = json!({"thinking":{"type":"enabled","budget_tokens":1024},
+                "output_config":{"effort":"high"}});
+            let messages = messages_request(controls.clone());
+            assert!(adapter.validate_chat_request(&messages).is_ok());
+            let wire = adapter.encode_chat(&target, &messages).unwrap();
+            for absent in ["reasoning_effort", "reasoning", "thinking", "output_config"] {
+                assert!(wire.get(absent).is_none(), "{absent}");
+            }
+            let output = adapter.execute(&target, messages).await.unwrap();
+            assert_eq!(
+                reasoning_and_text(output).await,
+                (Some("The user wants OK.".into()), Some("OK".into())),
+                "{field} {}",
+                profile.id()
+            );
+            let mut streamed = controls.clone();
+            streamed["stream"] = json!(true);
+            let output = adapter
+                .execute(&target, messages_request(streamed))
+                .await
+                .unwrap();
+            assert_eq!(
+                reasoning_and_text(output).await,
+                (Some("The user wants".into()), Some("OK".into()))
+            );
+            for stream in [false, true] {
+                let output = adapter.execute(&target, request(stream)).await.unwrap();
+                assert_eq!(reasoning_and_text(output).await.0, None);
+                // A Messages client that did not ask for thinking gets none:
+                // dropped here from a complete reply; a stream keeps its events
+                // for the attempt and bound checks and the codec withholds them.
+                let output = adapter
+                    .execute(&target, messages_request(json!({"stream":stream})))
+                    .await
+                    .unwrap();
+                let expected = stream.then(|| "The user wants".to_owned());
+                assert_eq!(
+                    reasoning_and_text(output).await,
+                    (expected, Some("OK".into()))
+                );
+            }
+        }
+        task.abort();
+    }
+}
+
+/// A server sending both names must agree; two different traces are invalid.
+#[tokio::test]
+async fn messages_local_reasoning_fields_must_agree() {
+    use super::super::contract::{messages_request, reasoning_and_text};
+    for (other, valid) in [
+        (json!("same"), true),
+        (Value::Null, true),
+        (json!("different"), false),
+    ] {
+        let mut complete = sglang_complete(json!(1), json!("same"));
+        complete["choices"][0]["message"]["reasoning"] = other;
+        let (base, task) = serve(complete, vec![]).await;
+        let adapter = LocalAdapter::new(
+            Profile::Vllm,
+            Arc::new(NoSecrets),
+            Arc::new(ApprovedEndpoints::for_test(&base)),
+        );
+        let result = adapter
+            .execute(
+                &target(Profile::Vllm, &base),
+                messages_request(json!({"thinking":{"type":"adaptive"}})),
+            )
+            .await;
+        if valid {
+            assert_eq!(
+                reasoning_and_text(result.unwrap()).await.0.as_deref(),
+                Some("same")
+            );
+        } else {
+            assert!(matches!(result, Err(InferenceError::InvalidUpstream)));
+        }
+        task.abort();
+    }
+}
+
+/// The same rule on a stream: a delta whose `reasoning_content` and
+/// `reasoning` disagree is refused before its text reaches the client.
+#[tokio::test]
+async fn messages_local_streamed_reasoning_fields_must_agree() {
+    use super::super::contract::messages_request;
+    for (other, valid) in [
+        (json!("The user wants"), true),
+        (Value::Null, true),
+        (json!("Something else"), false),
+    ] {
+        let mut frames = sglang_frames();
+        frames[1]["choices"][0]["delta"]["reasoning"] = other.clone();
+        let (base, task) = serve(Value::Null, frames).await;
+        let adapter = LocalAdapter::new(
+            Profile::Vllm,
+            Arc::new(NoSecrets),
+            Arc::new(ApprovedEndpoints::for_test(&base)),
+        );
+        let mut request = messages_request(json!({"thinking":{"type":"adaptive"}}));
+        request.stream = true;
+        let ProviderOutput::Stream(mut stream) = adapter
+            .execute(&target(Profile::Vllm, &base), request)
+            .await
+            .unwrap()
+        else {
+            panic!("expected stream")
+        };
+        let (mut reasoning, mut failed, mut done) = (String::new(), false, false);
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(ChatEvent::Reasoning(piece)) => reasoning.push_str(&piece),
+                Ok(ChatEvent::Done) => done = true,
+                Ok(_) => {}
+                Err(error) => {
+                    assert_eq!(error, InferenceError::InvalidUpstream);
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        assert_eq!((failed, done), (!valid, valid), "{other}");
+        assert_eq!(
+            reasoning,
+            if valid { "The user wants" } else { "" },
+            "{other}"
+        );
+        task.abort();
+    }
+}
