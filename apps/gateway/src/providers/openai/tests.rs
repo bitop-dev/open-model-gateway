@@ -1313,3 +1313,69 @@ fn streamed_refusal_text_is_bounded_by_the_messages_output_limit() {
         Some(InferenceError::InvalidUpstream)
     );
 }
+
+/// A refusal decides the finish whatever reason the provider sent with it,
+/// only on the cloud wire and only when the reply has no output at all;
+/// an absent, null or empty `refusal` is an ordinary reply.
+#[test]
+fn a_refusal_overrides_the_finish_reason_and_is_not_read_from_local_servers() {
+    let complete_with = |message: Value, reason: &str| {
+        let mut value = complete();
+        value["choices"][0]["message"] = message;
+        value["choices"][0]["finish_reason"] = json!(reason);
+        value
+    };
+    let refused = json!({"role":"assistant","content":null,"refusal":"no"});
+    for reason in ["stop", "length", "content_filter", "tool_calls"] {
+        let response =
+            decode_complete_protocol(&complete_with(refused.clone(), reason), None, true).unwrap();
+        assert_eq!(response.finish_reason, FinishReason::Refusal, "{reason}");
+        assert!(response.content.is_none(), "{reason}");
+
+        let mut state = StreamState::new(None, true);
+        let piece = serde_json::to_vec(&chunk(json!({"refusal":"no"}), Value::Null)).unwrap();
+        assert!(state.decode(&piece).unwrap().is_empty());
+        let last = serde_json::to_vec(&chunk(json!({}), json!(reason))).unwrap();
+        assert!(
+            matches!(
+                state.decode(&last).unwrap()[..],
+                [ChatEvent::Finish(FinishReason::Refusal)]
+            ),
+            "{reason}"
+        );
+    }
+
+    for profile in ["vllm", "ollama"] {
+        assert_error(
+            decode_complete_protocol(&complete_with(refused.clone(), "stop"), Some(profile), true),
+            InferenceError::InvalidUpstream,
+        );
+        let mut state = StreamState::new(Some(profile), true);
+        let piece = serde_json::to_vec(&chunk(json!({"refusal":"no"}), Value::Null)).unwrap();
+        assert_eq!(
+            state.decode(&piece).err(),
+            Some(InferenceError::InvalidUpstream),
+            "{profile}"
+        );
+    }
+
+    let blank = json!({"role":"assistant","content":" ","refusal":"no"});
+    assert_error(
+        decode_complete_protocol(&complete_with(blank, "stop"), None, true),
+        InferenceError::InvalidUpstream,
+    );
+    let mut state = StreamState::new(None, true);
+    let blank = serde_json::to_vec(&chunk(json!({"content":" ","refusal":"no"}), Value::Null));
+    assert_eq!(
+        state.decode(&blank.unwrap()).err(),
+        Some(InferenceError::InvalidUpstream)
+    );
+
+    for none in [json!(""), Value::Null] {
+        let message = json!({"role":"assistant","content":"answer","refusal":none});
+        let response = decode_complete_protocol(&complete_with(message, "length"), None, true);
+        let response = response.unwrap();
+        assert_eq!(response.finish_reason, FinishReason::Length);
+        assert_eq!(response.content.as_deref(), Some("answer"));
+    }
+}
