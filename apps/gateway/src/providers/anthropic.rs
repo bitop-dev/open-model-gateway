@@ -169,12 +169,16 @@ impl ProviderAdapter for AnthropicAdapter {
         )))
     }
 }
-/// Refuses what the Messages API cannot take: strict tools and a temperature outside 0..=1.
+/// Refuses a temperature outside 0..=1, and a strict tool from a client
+/// protocol other than Messages: only Messages tool definitions are forwarded
+/// with their `strict` field (`native_tools`); the translated tool encoding
+/// has none, so a strict Chat or Responses tool would lose its constraint.
 fn check_supported(request: &ChatRequest) -> Result<()> {
     if request
         .temperature
         .is_some_and(|t| !(0.0..=1.0).contains(&t))
-        || request.tools.iter().any(|t| t.strict == Some(true))
+        || (request.messages_options.is_none()
+            && request.tools.iter().any(|t| t.strict == Some(true)))
     {
         return Err(InferenceError::Unsupported);
     }
