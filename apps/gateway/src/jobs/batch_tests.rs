@@ -65,6 +65,12 @@ struct Script {
     calls: Vec<&'static str>,
     /// Chat calls a test holds open, by first message text.
     gates: std::collections::HashMap<String, Arc<Gate>>,
+    /// The next `retrieve_batch` takes its observation, then waits here.
+    retrieve_gate: Option<Arc<Gate>>,
+    /// The next `native_batch_results` waits here before it returns.
+    results_gate: Option<Arc<Gate>>,
+    /// The next `submit_native_batch` waits here before it reads the records.
+    submit_gate: Option<Arc<Gate>>,
 }
 /// A provider call held open by a test: `entered` is signalled when the call
 /// starts and the call returns once `release` is signalled.
@@ -347,8 +353,16 @@ impl ProviderAdapter for Fake {
         _: BatchEndpoint,
         mut records: ByteStream,
     ) -> Result<UpstreamBatch, InferenceError> {
-        if self.script.lock().unwrap().early_accept {
-            return Ok(upstream(BatchStatus::Validating));
+        let gate = {
+            let mut s = self.script.lock().unwrap();
+            if s.early_accept {
+                return Ok(upstream(BatchStatus::Validating));
+            }
+            s.submit_gate.take()
+        };
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
         }
         let mut seen = Vec::new();
         while let Some(r) = records.next().await {
@@ -372,11 +386,16 @@ impl ProviderAdapter for Fake {
         _: &Deployment,
         _: &UpstreamId,
     ) -> Result<UpstreamBatch, InferenceError> {
-        let mut s = self.script.lock().unwrap();
-        s.calls.push("retrieve");
-        s.batches
-            .pop_front()
-            .ok_or(InferenceError::UpstreamUnavailable)
+        let (batch, gate) = {
+            let mut s = self.script.lock().unwrap();
+            s.calls.push("retrieve");
+            (s.batches.pop_front(), s.retrieve_gate.take())
+        };
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+        batch.ok_or(InferenceError::UpstreamUnavailable)
     }
     async fn cancel_batch(
         &self,
@@ -391,6 +410,11 @@ impl ProviderAdapter for Fake {
         _: &Deployment,
         _: &UpstreamBatch,
     ) -> Result<ByteStream, InferenceError> {
+        let gate = self.script.lock().unwrap().results_gate.take();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
         let lines: Vec<Result<axum::body::Bytes, InferenceError>> = self
             .script
             .lock()
@@ -3171,6 +3195,7 @@ mod durable;
 mod envelope;
 mod fence;
 mod http_support;
+mod poller;
 
 /// Streaming classification must not change the non-stream classes that drive
 /// explicit line retries: OpenAI invalid output is not retryable; OpenRouter's
