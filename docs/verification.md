@@ -366,21 +366,21 @@ Neither lint constrains `egress_http.rs` itself, so the scan holds that file to 
 **Raw transports (#606).** The same `disallowed-methods` list refuses every other way to open an outbound connection that is compiled into the gateway:
 - hyper's own client (`hyper::client::conn::http1`/`http2` `handshake` and `Builder::new`/`handshake`);
 - hyper-util's legacy client and connector (`Client::builder`, `Builder::new`/`build`/`build_http`, `HttpConnector::new`/`new_with_resolver`), which reqwest and the AWS SDK link;
-- hyper-rustls's `HttpsConnectorBuilder::new`;
-- tokio-tungstenite's dialing `connect_async*` functions;
+- hyper-rustls's `HttpsConnectorBuilder::new`, `build` and `wrap_connector`, and `HttpsConnector::builder` (`HttpsConnectorBuilder::default()` cannot be named, but its builder reaches a connector only through the refused `build` or `wrap_connector`);
+- tokio-tungstenite's dialing `connect_async*` functions and tungstenite's synchronous `client::connect`/`connect_with_config`;
 - TCP and UDP sockets: `tokio::net::TcpStream::connect`, `tokio::net::TcpSocket::connect`, `std::net::TcpStream::connect`/`connect_timeout`, and both `UdpSocket::bind`s.
 
 Sockets are opened at three sanctioned statements, each under its own `#[expect(clippy::disallowed_methods)]` on a `let` whose expression the source scan pins exactly:
 - the health probe's `TcpStream::connect_timeout(&address, ..)` to the gateway's own listener (`healthcheck::probe`);
-- the audit export's connect to an address from `crate::egress::resolve` (`audit_export` `session`);
+- `crate::egress::connect_tcp`, the TCP helper for other egress (the audit export uses it), which dials only the addresses `resolve` allowed in the same function;
 - the realtime session's connect to the addresses `crate::egress::resolve` returned (`providers/openai/realtime.rs` `dial`).
 
-A changed destination, another constructor or an extra call in one of those statements is a finding. `egress_rule_probes_tests.rs` (test build only, never run) calls each of the 22 entries once under its own `#[expect]`. If an entry stops matching (a renamed path, a moved crate, a deleted line), its expectation is unfulfilled and Clippy fails. Removing all 22 entries makes all 25 sites fail: the 22 probes and the 3 production statements. The probes name `hyper-util` and `hyper-rustls` as dev-dependencies, pinned to the versions already in the graph. `entropy.rs`'s `REVIEWED_CRATES` pins the versions of every crate the list names.
+A changed destination, another constructor, an extra call in the statement, a destructuring pattern or a `let … else` block is a finding. `egress_rule_probes_tests.rs` (test build only, never run) calls each of the 27 entries once under its own `#[expect]`. If an entry stops matching (a renamed path, a moved crate, a deleted line), its expectation is unfulfilled and Clippy fails. Removing the entries makes every one of those sites fail. The probes name `hyper-util` and `hyper-rustls` as dev-dependencies, pinned to the versions already in the graph. `entropy.rs`'s `REVIEWED_CRATES` pins the versions of every crate the list names.
 
 **Path crates and the build script (#606).** Clippy applies `apps/gateway/clippy.toml` to this package, including `build.rs`: a refused call planted there fails Clippy. Code from any other crate is outside both Clippy and the scan, so `egress_coverage_tests.rs` holds it to a reviewed list:
 - every local-path package that the gateway's dependency graph reaches in `Cargo.lock` (normal, build and dev dependencies) must be one of these, each with its reason: the gateway, `crates/datetime`, `crates/dbtest` (a dev-only proc macro), and the patched `vendor/oauth2` and `vendor/openidconnect`. A new path crate linked anywhere in the graph fails, for example `tools/mock-upstream` added as a dev-dependency;
-- the dependencies of the two in-repository crates are pinned, so neither can gain a network client unnoticed;
-- `build.rs` is held to its reviewed text, and the package may declare no build dependencies and no other `package.build`.
+- the `Cargo.lock` dependencies of every path crate except the gateway are pinned (the in-repository crates and the vendored SDKs), so none can gain a network client, or have a feature turn one on, unnoticed;
+- `build.rs` is held to its reviewed text, and the package may declare no build dependencies in any spelling (a `[build-dependencies]` or `[build-dependencies.x]` table, a `[target.*]` one, `build_dependencies`, a dotted key) and no other `build` script.
 
 **Known limits.** Review must catch these:
 

@@ -107,7 +107,7 @@ tempfile = "3"
 # Named only by the egress rule probes (#606), which prove clippy.toml refuses
 # their client constructors; the same versions reqwest and the AWS SDK link.
 hyper-util = { version = "=0.1.21", default-features = false, features = ["client-legacy", "http1", "http2", "tokio"] }
-hyper-rustls = { version = "=0.27.10", default-features = false }
+hyper-rustls = { version = "=0.27.10", default-features = false, features = ["http1"] }
 # `#[dbtest::test]`: database tests that clone a pre-migrated template (docs/verification.md, "Database tests").
 dbtest = { path = "../../crates/dbtest" }
 proptest = { version = "=1.12.0", default-features = false, features = ["std"] }

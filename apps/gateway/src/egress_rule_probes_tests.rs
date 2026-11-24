@@ -5,6 +5,9 @@
 //! under `-D warnings`). Nothing here runs: the functions are never called.
 //! The three production statements that open sockets prove the TCP entries
 //! they use the same way, in the build without `test`.
+//!
+//! `dead_code` is allowed for the whole module because the probes are never
+//! called; the scan permits no other lint switch here (only these `expect`s).
 #![allow(dead_code)]
 use std::{net::SocketAddr, time::Duration};
 
@@ -133,6 +136,59 @@ fn hyper_util_http_connector_with_resolver() {
 )]
 fn hyper_rustls_connector() {
     let _ = hyper_rustls::HttpsConnectorBuilder::new();
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "probe of a refused constructor (#606)"
+)]
+fn hyper_rustls_build(
+    builder: hyper_rustls::HttpsConnectorBuilder<hyper_rustls::builderstates::WantsProtocols2>,
+) {
+    drop(builder.build());
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "probe of a refused constructor (#606)"
+)]
+fn hyper_rustls_wrap_connector(
+    builder: hyper_rustls::HttpsConnectorBuilder<hyper_rustls::builderstates::WantsProtocols2>,
+    connector: hyper_util::client::legacy::connect::HttpConnector,
+) {
+    drop(builder.wrap_connector(connector));
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "probe of a refused constructor (#606)"
+)]
+fn hyper_rustls_connector_builder() {
+    let _ =
+        hyper_rustls::HttpsConnector::<hyper_util::client::legacy::connect::HttpConnector>::builder(
+        );
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "probe of a refused constructor (#606)"
+)]
+fn tungstenite_connect() {
+    drop(tokio_tungstenite::tungstenite::client::connect(
+        "ws://127.0.0.1:1",
+    ));
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "probe of a refused constructor (#606)"
+)]
+fn tungstenite_connect_with_config() {
+    drop(tokio_tungstenite::tungstenite::client::connect_with_config(
+        "ws://127.0.0.1:1",
+        None,
+        1,
+    ));
 }
 
 #[expect(

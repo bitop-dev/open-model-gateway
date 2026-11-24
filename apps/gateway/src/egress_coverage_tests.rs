@@ -116,14 +116,61 @@ const PATH_CRATES: &[(&str, &str)] = &[
     ),
 ];
 
-/// The dependencies of the in-repository path crates, as `Cargo.lock` lists
-/// them. A network crate added to one of them fails here.
-const IN_REPOSITORY_DEPENDENCIES: &[(&str, &[&str])] = &[
+/// The dependencies of every path crate but the gateway, as `Cargo.lock`
+/// lists them. A network crate added to one of them, or a vendored SDK
+/// feature that pulls one in, fails here.
+const PATH_CRATE_DEPENDENCIES: &[(&str, &[&str])] = &[
     (
         "gateway-datetime-compat",
         &["serde", "serde_json", "sqlx", "time", "tokio"],
     ),
     ("dbtest", &["proc-macro2", "quote", "syn 3.0.10"]),
+    (
+        "oauth2",
+        &[
+            "base64 0.22.1",
+            "gateway-datetime-compat",
+            "getrandom 0.2.17",
+            "http",
+            "rand 0.8.8",
+            "reqwest",
+            "serde",
+            "serde_json",
+            "serde_path_to_error",
+            "sha2 0.10.9",
+            "thiserror 1.0.69",
+            "url",
+        ],
+    ),
+    (
+        "openidconnect",
+        &[
+            "base64 0.22.1",
+            "dyn-clone",
+            "ed25519-dalek",
+            "gateway-datetime-compat",
+            "getrandom 0.4.3",
+            "hmac 0.12.1",
+            "http",
+            "itertools",
+            "log",
+            "oauth2",
+            "p256",
+            "p384",
+            "rand 0.8.8",
+            "rsa",
+            "serde",
+            "serde-value",
+            "serde_json",
+            "serde_path_to_error",
+            "serde_plain",
+            "serde_with",
+            "sha2 0.10.9",
+            "subtle",
+            "thiserror 1.0.69",
+            "url",
+        ],
+    ),
 ];
 
 #[test]
@@ -150,7 +197,7 @@ fn the_gateways_path_dependencies_are_the_reviewed_list() {
         .filter(|p| p.local)
         .map(|p| (p.name.as_str(), p))
         .collect();
-    for (name, dependencies) in IN_REPOSITORY_DEPENDENCIES {
+    for (name, dependencies) in PATH_CRATE_DEPENDENCIES {
         assert_eq!(
             by_name[name].dependencies,
             dependencies
@@ -218,18 +265,52 @@ fn the_build_script_is_the_reviewed_one_and_has_no_dependencies() {
         "build.rs changed: it runs on the build machine outside the egress rule; review it and update BUILD_SCRIPT (#606)"
     );
     let manifest = std::fs::read_to_string(root().join("Cargo.toml")).unwrap();
-    assert!(
-        !manifest
-            .lines()
-            .any(|l| l.trim_start().starts_with("[build-dependencies]")
-                || l.trim_start().starts_with("[target.") && l.contains("build-dependencies")),
-        "the gateway has build dependencies: they run on the build machine outside the egress rule (#606)"
+    assert_eq!(
+        manifest_problems(&manifest),
+        Vec::<String>::new(),
+        "build-time code outside build.rs runs on the build machine outside the egress rule (#606)"
     );
-    // Cargo runs the file named by `package.build`, or `build.rs`.
-    assert!(
-        !manifest
-            .lines()
-            .any(|l| l.trim_start().starts_with("build =")),
-        "package.build names another build script (#606)"
-    );
+}
+
+/// Lines of a manifest that add build-time code beside `build.rs`: build
+/// dependencies in any spelling (a `[build-dependencies]` or
+/// `[build-dependencies.x]` table, a `[target.*]` one, the old
+/// `build_dependencies`, a dotted key) or a `build` key naming another
+/// script. Whitespace and comments are ignored.
+fn manifest_problems(manifest: &str) -> Vec<String> {
+    manifest
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or_default())
+        .map(|l| l.chars().filter(|c| !c.is_whitespace()).collect::<String>())
+        .filter(|l| {
+            l.replace('_', "-").contains("build-dependencies")
+                || l.starts_with("build=")
+                || l.starts_with("\"build\"=")
+        })
+        .collect()
+}
+
+#[test]
+fn every_spelling_of_build_time_code_is_refused() {
+    for line in [
+        "[build-dependencies]",
+        "[build-dependencies.cc]",
+        "[ build-dependencies ]",
+        "[build_dependencies]",
+        "[target.'cfg(unix)'.build-dependencies]",
+        "build-dependencies.cc = \"1\"",
+        "build = \"other.rs\"",
+        "build=\"other.rs\"",
+        "\"build\" = \"other.rs\"",
+    ] {
+        assert_eq!(manifest_problems(line).len(), 1, "{line}");
+    }
+    for line in [
+        "[dev-dependencies]",
+        "# build = \"x\"",
+        "builder = 1",
+        "[profile.release.build-override]",
+    ] {
+        assert!(manifest_problems(line).is_empty(), "{line}");
+    }
 }

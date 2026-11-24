@@ -527,6 +527,30 @@ pub async fn resolve(
     filter(policy, purpose, host, found)
 }
 
+/// A TCP connection to `host:port` for `purpose`, only to an address
+/// [`resolve`] allows. Each address gets `per_address` to answer, so one that
+/// never does (a dead IPv6 route) doesn't use up the caller's whole budget;
+/// the first that answers is returned.
+pub(crate) async fn connect_tcp(
+    policy: &Policy,
+    purpose: Purpose,
+    host: &str,
+    port: u16,
+    per_address: std::time::Duration,
+) -> anyhow::Result<tokio::net::TcpStream> {
+    for address in resolve(policy, purpose, host, port).await? {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "dials an address resolve() allowed (#606)"
+        )]
+        let connecting = tokio::time::timeout(per_address, tokio::net::TcpStream::connect(address));
+        if let Ok(Ok(stream)) = connecting.await {
+            return Ok(stream);
+        }
+    }
+    anyhow::bail!("could not connect to {host}")
+}
+
 /// SMTP must not retry an operator-policy refusal as a network failure.
 #[derive(Clone, Copy)]
 pub(crate) enum ResolveError {

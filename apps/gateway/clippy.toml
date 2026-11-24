@@ -75,9 +75,16 @@ disallowed-methods = [
   { path = "hyper_util::client::legacy::connect::HttpConnector::new", reason = "its connector dials any address without the egress resolver; use crate::egress::client_builder (#606)" },
   { path = "hyper_util::client::legacy::connect::HttpConnector::new_with_resolver", reason = "its connector dials any address its resolver returns; use crate::egress::client_builder (#606)" },
   { path = "hyper_rustls::HttpsConnectorBuilder::new", reason = "its connector dials any address without the egress resolver; use crate::egress::client_builder (#606)" },
+  # `HttpsConnectorBuilder::default()` cannot be named (a Default impl), so
+  # the builder's ways to a connector are refused as well.
+  { path = "hyper_rustls::HttpsConnectorBuilder::build", reason = "its connector dials any address without the egress resolver; use crate::egress::client_builder (#606)" },
+  { path = "hyper_rustls::HttpsConnectorBuilder::wrap_connector", reason = "it makes a TLS connector outside crate::egress::client_builder (#606)" },
+  { path = "hyper_rustls::HttpsConnector::builder", reason = "its connector dials any address without the egress resolver; use crate::egress::client_builder (#606)" },
   { path = "tokio_tungstenite::connect_async", reason = "it resolves and dials by itself: connect to addresses from crate::egress::resolve and hand the stream to client_async (#606)" },
   { path = "tokio_tungstenite::connect_async_with_config", reason = "it resolves and dials by itself: connect to addresses from crate::egress::resolve and hand the stream to client_async (#606)" },
   { path = "tokio_tungstenite::connect_async_tls_with_config", reason = "it resolves and dials by itself: connect to addresses from crate::egress::resolve and hand the stream to client_async (#606)" },
+  { path = "tungstenite::client::connect", reason = "it resolves and dials by itself: connect to addresses from crate::egress::resolve and hand the stream to client_async (#606)" },
+  { path = "tungstenite::client::connect_with_config", reason = "it resolves and dials by itself: connect to addresses from crate::egress::resolve and hand the stream to client_async (#606)" },
   { path = "tokio::net::TcpStream::connect", reason = "open sockets only to addresses from crate::egress::resolve, at a sanctioned statement (#606)" },
   { path = "tokio::net::TcpSocket::connect", reason = "open sockets only to addresses from crate::egress::resolve, at a sanctioned statement (#606)" },
   { path = "tokio::net::UdpSocket::bind", reason = "no outbound datagrams: the gateway's egress is crate::egress (#606)" },

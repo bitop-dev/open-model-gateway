@@ -310,10 +310,13 @@ impl<'ast> Visit<'ast> for Scan<'_> {
                 ..
             } = finding
                 && let Some(expected) = socket_site(reason)
-                && local
-                    .init
-                    .as_ref()
-                    .is_none_or(|init| text(init.expr.to_token_stream()) != expected)
+                // One plain binding of exactly the reviewed expression: no
+                // pattern that destructures and no `else` block, which the
+                // `expect` would cover too.
+                && (!matches!(&local.pat, syn::Pat::Ident(p) if p.subpat.is_none() && p.by_ref.is_none())
+                    || local.init.as_ref().is_none_or(|init| {
+                        init.diverge.is_some() || text(init.expr.to_token_stream()) != expected
+                    }))
             {
                 self.findings.push(Finding::SocketSite(on));
                 break;
@@ -444,18 +447,19 @@ impl AwsTransport {
 }
 
 const HEALTH_PROBE: &str = "the health probe dials the gateway's own listener (#606)";
-const AUDIT_SOCKET: &str = "audit export dials an address from crate::egress::resolve (#606)";
+const EGRESS_SOCKET: &str = "dials an address resolve() allowed (#606)";
 const REALTIME_SOCKET: &str =
     "the realtime session dials addresses from crate::egress::resolve (#606)";
 
 /// The three statements that open a socket (#606), pinned by expression: the
 /// `expect` covers that one call on addresses the gateway chose (the health
-/// probe's target, or `crate::egress::resolve`), and nothing else.
+/// probe's target, or `crate::egress::resolve` in `egress::connect_tcp` and
+/// the realtime `dial`), and nothing else.
 fn socket_site(reason: &str) -> Option<&'static str> {
     match reason {
         HEALTH_PROBE => Some("TcpStream : : connect_timeout ( & address , remaining ( ) ? )"),
-        AUDIT_SOCKET => Some(
-            "tokio : : time : : timeout ( CONNECT_TIMEOUT , tokio : : net : : TcpStream : : connect ( address ) )",
+        EGRESS_SOCKET => Some(
+            "tokio : : time : : timeout ( per_address , tokio : : net : : TcpStream : : connect ( address ) )",
         ),
         REALTIME_SOCKET => Some("tokio : : net : : TcpStream : : connect ( addresses )"),
         _ => None,
@@ -478,6 +482,11 @@ const PROBES: &[&str] = &[
     "hyper_util_http_connector",
     "hyper_util_http_connector_with_resolver",
     "hyper_rustls_connector",
+    "hyper_rustls_build",
+    "hyper_rustls_wrap_connector",
+    "hyper_rustls_connector_builder",
+    "tungstenite_connect",
+    "tungstenite_connect_with_config",
     "tungstenite_connect_async",
     "tungstenite_connect_async_with_config",
     "tungstenite_connect_async_tls_with_config",
@@ -582,8 +591,8 @@ fn a_sanctioned_socket_statement_must_keep_its_expression() {
         "TcpStream::connect_timeout(&address, remaining()?)"
     ));
     assert!(matches(
-        AUDIT_SOCKET,
-        "tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(address))"
+        EGRESS_SOCKET,
+        "tokio::time::timeout(per_address, tokio::net::TcpStream::connect(address))"
     ));
     assert!(matches(
         REALTIME_SOCKET,
@@ -596,12 +605,12 @@ fn a_sanctioned_socket_statement_must_keep_its_expression() {
         ),
         (HEALTH_PROBE, "TcpStream::connect(address)"),
         (
-            AUDIT_SOCKET,
-            "tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(\"203.0.113.1:514\"))",
+            EGRESS_SOCKET,
+            "tokio::time::timeout(per_address, tokio::net::TcpStream::connect(\"203.0.113.1:514\"))",
         ),
         (
-            AUDIT_SOCKET,
-            "tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(address)).and(hyper_util::client::legacy::connect::HttpConnector::new())",
+            EGRESS_SOCKET,
+            "tokio::time::timeout(per_address, tokio::net::TcpStream::connect(address)).and(hyper_util::client::legacy::connect::HttpConnector::new())",
         ),
         (
             REALTIME_SOCKET,
@@ -614,6 +623,33 @@ fn a_sanctioned_socket_statement_must_keep_its_expression() {
         (REALTIME_SOCKET, "tokio_tungstenite::connect_async(url)"),
     ] {
         assert!(!matches(reason, initializer), "{initializer}");
+    }
+    // The reviewed expression with an `else` block or a destructuring
+    // pattern: the `expect` would cover the extra code.
+    let file = src.join("fixture.rs");
+    for statement in [
+        "let Ok(connecting) = TcpStream::connect_timeout(&address, remaining()?) else { drop(TcpStream::connect(other)); return; };",
+        "let connecting = TcpStream::connect_timeout(&address, remaining()?) else { drop(TcpStream::connect(other)); return; };",
+        "let (connecting) = TcpStream::connect_timeout(&address, remaining()?);",
+        "let connecting @ _ = TcpStream::connect_timeout(&address, remaining()?);",
+    ] {
+        let source = format!(
+            "fn fixture() {{
+                #[expect(clippy::disallowed_methods, reason = {HEALTH_PROBE:?})]
+                {statement}
+            }}"
+        );
+        assert_ne!(
+            scan(src, &file, &source),
+            [level(
+                "expect",
+                false,
+                &[],
+                Some(HEALTH_PROBE),
+                "let in fixture"
+            )],
+            "{statement}"
+        );
     }
 }
 
@@ -691,12 +727,14 @@ fn sanctioned(name: &str) -> Vec<Finding> {
             Some(HEALTH_PROBE),
             "let in probe",
         )],
-        "audit_export.rs" => vec![level(
+        // The one TCP helper for other egress (the audit export): it dials
+        // only what `resolve` allowed (#606).
+        "egress.rs" => vec![level(
             "expect",
             false,
             &[],
-            Some(AUDIT_SOCKET),
-            "let in session",
+            Some(EGRESS_SOCKET),
+            "let in connect_tcp",
         )],
         // Test-only probes, never called: each proves one clippy.toml entry
         // still fires (#606).
