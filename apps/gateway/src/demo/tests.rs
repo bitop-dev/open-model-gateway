@@ -164,3 +164,11 @@ async fn failed_seed_rolls_back_entire_fixture(pool: PgPool) {
         "Enterprise"
     );
 }
+#[dbtest::test]
+async fn demo_seed_writes_only_tables_the_emptiness_check_covers(pool: PgPool) {
+    let store = Store::new(pool.clone());
+    crate::bootstrap::emptiness_tests::assert_seed_writes_only_checked_tables(&pool, async {
+        assert!(seed_data(&store).await.unwrap());
+    })
+    .await;
+}

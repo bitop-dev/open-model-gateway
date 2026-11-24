@@ -1,9 +1,11 @@
 //! Draft pricing-v3 lines from OpenRouter's public catalog (no key is sent).
 //!
 //! Server-side HTTPS fetch of a fixed origin with no redirects, ambient proxies
-//! or retries, a 5-second deadline, a 4 MiB body cap and a 10-minute cache. Units
-//! are never inferred from a bare catalog key: the workload decides the meter,
-//! and model-specific or ambiguous units are returned with `needs_review:true`.
+//! or retries, a 5-second deadline for each read (waiting for another fetch
+//! included), a 4 MiB body cap, one fetch at a time and a 10-minute cache of
+//! at most 16 MiB. Units are never inferred from a bare
+//! catalog key: the workload decides the meter, and model-specific or
+//! ambiguous units are returned with `needs_review:true`.
 //! The result is only a draft; publishing remains the immutable price POST.
 use super::*;
 use crate::{
@@ -18,10 +20,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod catalog;
 mod limits;
 mod mapping;
+pub(crate) use catalog::OpenRouterCatalog;
 mod selection;
+#[cfg(test)]
 pub(crate) use selection::map_with_endpoints;
+#[cfg(test)]
+mod catalog_shape_tests;
 #[cfg(test)]
 mod mapping_property_tests;
 #[cfg(test)]
@@ -31,132 +38,14 @@ pub(crate) use mapping::map;
 const BODY_CAP: usize = 4 * 1024 * 1024;
 const CACHE_TTL: Duration = Duration::from_secs(600);
 const CACHE_ENTRIES: usize = 64;
+const CACHE_BYTES: usize = 16 * 1024 * 1024;
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 enum CatalogError {
     Unavailable,
     Limit,
 }
 
-type Cache = HashMap<String, (Instant, Arc<Vec<u8>>)>;
-pub(crate) struct OpenRouterCatalog {
-    client: crate::egress::HttpClient,
-    base: String,
-    timeout: Duration,
-    cache: tokio::sync::Mutex<Cache>,
-}
-impl OpenRouterCatalog {
-    fn build(base: String, timeout: Duration) -> anyhow::Result<Self> {
-        Ok(Self {
-            // Every resolved address must pass the egress policy (#33).
-            client: crate::egress::client_builder(crate::egress::resolver(
-                crate::egress::Purpose::Catalog,
-            ))
-            .connect_timeout(timeout)
-            .pool_idle_timeout(crate::egress::UpstreamClient::Openrouter.pool_idle_timeout())
-            .count_connections(crate::egress::UpstreamClient::Openrouter)
-            .build()
-            .map_err(|_| anyhow::anyhow!("Unable to initialize catalog transport"))?,
-            base,
-            timeout,
-            cache: tokio::sync::Mutex::new(HashMap::new()),
-        })
-    }
-    pub(crate) fn production() -> anyhow::Result<Self> {
-        Self::build(
-            resources::OPENROUTER_BASE.to_owned(),
-            Duration::from_secs(5),
-        )
-    }
-    /// Test-only origin injection; restricted to a loopback mock server.
-    #[cfg(test)]
-    pub(crate) fn for_test(base: String, timeout: Duration) -> Self {
-        let url = reqwest::Url::parse(&base).unwrap();
-        assert_eq!(url.scheme(), "http");
-        assert_eq!(url.host_str(), Some("127.0.0.1"));
-        Self::build(base, timeout).unwrap()
-    }
-    async fn get(&self, path: &str) -> Result<Arc<Vec<u8>>, CatalogError> {
-        let url = format!("{}{path}", self.base);
-        if let Some((at, body)) = self.cache.lock().await.get(&url)
-            && at.elapsed() < CACHE_TTL
-        {
-            return Ok(body.clone());
-        }
-        let body = tokio::time::timeout(self.timeout, async {
-            let response = self
-                .client
-                .get(&url)
-                .header(reqwest::header::ACCEPT, "application/json")
-                .send()
-                .await
-                .map_err(
-                    crate::egress::UpstreamClient::Openrouter.count_then(CatalogError::Unavailable),
-                )?;
-            let json = response
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|v| v.starts_with("application/json"));
-            // Redirects are not followed: any non-200 (including 3xx) fails.
-            if response.status() != reqwest::StatusCode::OK || !json {
-                return Err(CatalogError::Unavailable);
-            }
-            if response
-                .content_length()
-                .is_some_and(|n| n > BODY_CAP as u64)
-            {
-                return Err(CatalogError::Limit);
-            }
-            let mut out = Vec::new();
-            let mut stream = response.bytes_stream();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|_| CatalogError::Unavailable)?;
-                if out.len() + chunk.len() > BODY_CAP {
-                    return Err(CatalogError::Limit);
-                }
-                out.extend_from_slice(&chunk);
-            }
-            Ok(out)
-        })
-        .await
-        .map_err(|_| CatalogError::Unavailable)??;
-        // Decode only bounded, complete JSON; a malformed 200 must not poison
-        // subsequent previews for the cache TTL.
-        limits::catalog_json(&body)?;
-        let body = Arc::new(body);
-        let images = path.starts_with("/images/");
-        if path.ends_with("/endpoints") && !limits::mapping_json(&body) {
-            // Image mapping applies its limits to the raw body. Token
-            // mapping uses a value tree, which can collapse duplicate fields.
-            return if images {
-                Ok(body)
-            } else {
-                Err(CatalogError::Limit)
-            };
-        }
-        if images {
-            let endpoints = image_endpoint_arrays(&body);
-            if endpoints.iter().all(Option::is_none) {
-                return Err(CatalogError::Unavailable);
-            }
-            if decode_image_endpoints(endpoints).is_none() {
-                // The envelope is valid, but these image prices cannot be read.
-                // Let the mapper report the missing rates and retry on next use.
-                return Ok(body);
-            }
-        } else if !catalog_shape_matches(path, &body) {
-            return Err(CatalogError::Unavailable);
-        }
-        let mut cache = self.cache.lock().await;
-        cache.retain(|_, (at, _)| at.elapsed() < CACHE_TTL);
-        if cache.len() >= CACHE_ENTRIES {
-            cache.clear();
-        }
-        cache.insert(url, (Instant::now(), body.clone()));
-        Ok(body)
-    }
-}
 #[derive(Deserialize)]
 struct CatalogEnvelope<'a> {
     #[serde(borrow)]
@@ -263,7 +152,6 @@ pub(super) async fn price_suggestion(
         .ok_or_else(unavailable)?
         .iter()
         .find(|m| m["id"] == upstream.as_str() || m["canonical_slug"] == upstream.as_str())
-        .cloned()
         .ok_or(ApiError(
             StatusCode::NOT_FOUND,
             "Model not found in the OpenRouter public catalog",
@@ -286,10 +174,10 @@ pub(super) async fn price_suggestion(
     // Token-priced workloads: price from one concrete endpoint (the one the
     // evidence matches, else the cheapest current one). If the endpoint list
     // is unavailable, fall back to the catalog's top-provider price.
-    let endpoint_body = if workload == WorkloadKind::Images {
+    let endpoints = if workload == WorkloadKind::Images {
         None
     } else {
-        Some(catalog.get(&format!("/models/{slug}/endpoints")).await)
+        Some(catalog.endpoints(&slug).await)
     };
     let evidence: Vec<Evidence> = evidence
         .into_iter()
@@ -301,17 +189,14 @@ pub(super) async fn price_suggestion(
             })
         })
         .collect();
-    let mut out = if matches!(&endpoint_body, Some(Err(CatalogError::Limit))) {
-        limits::refused(&model, workload)
+    let mut out = if matches!(&endpoints, Some(Err(CatalogError::Limit))) {
+        limits::refused(model, workload)
     } else {
-        let endpoints = endpoint_body
-            .and_then(Result::ok)
-            .and_then(|body| serde_json::from_slice::<Value>(&body).ok());
-        map_with_endpoints(
-            &model,
+        selection::map_with_endpoint_list(
+            model,
             workload,
             images.as_deref().map(Vec::as_slice),
-            endpoints.as_ref(),
+            endpoints.and_then(Result::ok).flatten(),
             &evidence,
         )
     };
@@ -467,18 +352,22 @@ impl Draft {
         self.push_line(v);
     }
 }
+/// The mapper's warnings, at most `MAPPER_WARNINGS` including the notice
+/// that more were omitted; the rest of `MAX_WARNINGS` is endpoint selection's.
 #[derive(Default)]
 struct Warnings {
     items: Vec<String>,
+    omitted: bool,
 }
 impl Warnings {
     fn push(&mut self, w: String) {
         if self.items.contains(&w) {
             return;
         }
-        if self.items.len() < limits::MAX_WARNINGS - 1 {
+        if self.items.len() < limits::MAPPER_WARNINGS - 1 {
             self.items.push(w);
-        } else if self.items.len() == limits::MAX_WARNINGS - 1 {
+        } else if !self.omitted {
+            self.omitted = true;
             self.items.push(
                 "Additional catalog warnings were omitted; review all rates before publishing."
                     .into(),
@@ -1091,11 +980,13 @@ pub(crate) mod tests {
         assert_eq!(v["needs_review"], true);
         let w = v["warnings"].to_string();
         assert!(
-            w.contains("PrimeIntellect endpoint ($0.021/M input tokens)"),
+            w.contains("PrimeIntellect endpoint ($0.021/M input tokens and $0/M output tokens)"),
             "{w}"
         );
         assert!(
-            w.contains("higher price ($0.09/M input tokens on Cloudflare)"),
+            w.contains(
+                "higher combined price ($0.09/M input tokens and $0/M output tokens on Cloudflare)"
+            ),
             "{w}"
         );
         // Evidence: 145 input tokens cost 14 µUSD → the Cloudflare endpoint.

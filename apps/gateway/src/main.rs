@@ -426,6 +426,10 @@ fn schema_version() -> Result<String> {
     }))?)
 }
 
+/// The local demo (`bootstrap-demo`, and any command run with the demo issuer)
+/// needs development mode, a loopback listener, the dedicated database and a
+/// database reached at a literal loopback address with no Unix socket (the
+/// check `bootstrap-dev` uses), all judged before any connection.
 fn ensure_demo_config(config: &Config) -> Result<()> {
     use std::str::FromStr;
     let options = sqlx::postgres::PgConnectOptions::from_str(&config.database_url)
@@ -433,7 +437,7 @@ fn ensure_demo_config(config: &Config) -> Result<()> {
     anyhow::ensure!(
         config.environment == open_model_gateway::config::Environment::Development
             && config.listen.ip().is_loopback()
-            && matches!(options.get_host(), "127.0.0.1" | "::1")
+            && open_model_gateway::bootstrap::literal_loopback_database(&options)
             && options.get_database() == Some(open_model_gateway::demo::DEMO_DATABASE),
         "local demo requires development mode, loopback binding/database, and the dedicated gateway_enterprise_demo database"
     );
@@ -682,13 +686,20 @@ mod demo {
             .unwrap(),
         };
         assert!(ensure_demo_config(&config).is_ok());
+        config.database_url =
+            "postgres://gateway:gateway@[::1]:54339/gateway_enterprise_demo".into();
+        assert!(ensure_demo_config(&config).is_ok());
         for url in [
             "postgres://gateway:gateway@127.0.0.1:54329/gateway",
             "postgres://gateway:gateway@database.example/gateway_enterprise_demo",
             "postgres://gateway:gateway@127.0.0.1:54339/gateway_enterprise_demo?host=database.example",
+            "postgres://gateway:gateway@localhost:54339/gateway_enterprise_demo",
+            // A socket keeps the URL's host but is where sqlx connects.
+            "postgres://gateway:gateway@127.0.0.1:54339/gateway_enterprise_demo?host=/some/socket/dir",
+            "postgres://gateway:gateway@127.0.0.1:54339/gateway_enterprise_demo?hostaddr=192.0.2.1",
         ] {
             config.database_url = url.into();
-            assert!(ensure_demo_config(&config).is_err());
+            assert!(ensure_demo_config(&config).is_err(), "{url}");
         }
         config.database_url =
             "postgres://gateway:gateway@127.0.0.1:54339/gateway_enterprise_demo".into();

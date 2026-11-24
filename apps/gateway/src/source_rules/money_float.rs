@@ -75,6 +75,16 @@ const MONEY_WORDS: &[&str] = &[
 ///   visitor discards numbers while checking JSON complexity before allocating
 ///   a value tree. The required callback name and its parameter type are the
 ///   two occurrences. No arithmetic, rate conversion or output uses this value.
+/// * `management/governance/suggestion/limits.rs`, `Project::visit_f64`: the
+///   endpoint projection discards a number where it reads only objects and
+///   arrays. The callback name and its parameter type are the two
+///   occurrences; the value is never read.
+/// * `management/governance/suggestion/limits.rs`, `Bounded::visit_f64`: the
+///   projection keeps a fractional number in a read endpoint field as the
+///   JSON number serde_json's own value tree would hold. The callback name and
+///   its parameter type are the two occurrences. Prices are read only from
+///   strings (`price_str` reads any other value as invalid), so this number
+///   never becomes a rate, hold or total.
 /// * `inference/types.rs`, `MessagesOptions`: the struct has a `task_budget`
 ///   (a token budget, not money, which is why the money-word rule reached it)
 ///   next to the `top_p` sampling parameter, an `f64`. Granularity is the
@@ -95,6 +105,18 @@ const ALLOWED: &[(&str, &str, &str, usize)] = &[
     (
         "management/governance/suggestion/limits.rs",
         "impl Check::visit_f64",
+        "f64",
+        2,
+    ),
+    (
+        "management/governance/suggestion/limits.rs",
+        "impl Project::visit_f64",
+        "f64",
+        2,
+    ),
+    (
+        "management/governance/suggestion/limits.rs",
+        "impl Bounded::visit_f64",
         "f64",
         2,
     ),

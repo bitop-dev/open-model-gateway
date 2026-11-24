@@ -52,20 +52,27 @@ const _: fn() = || {
     let _ = <HttpClientBuilder as AmbiguousIfDefault<_>>::some_item;
 };
 
+/// Every request constructor marks the current attempt's dispatch as started
+/// (`crate::inference::dispatch`) before it returns: an attempt whose adapter
+/// call ends without that mark built no request, so wrote nothing upstream.
 impl HttpClient {
     pub fn get<U: reqwest::IntoUrl>(&self, url: U) -> reqwest::RequestBuilder {
+        crate::inference::dispatch::started();
         self.0.get(url)
     }
 
     pub fn post<U: reqwest::IntoUrl>(&self, url: U) -> reqwest::RequestBuilder {
+        crate::inference::dispatch::started();
         self.0.post(url)
     }
 
     pub fn delete<U: reqwest::IntoUrl>(&self, url: U) -> reqwest::RequestBuilder {
+        crate::inference::dispatch::started();
         self.0.delete(url)
     }
 
     pub async fn execute(&self, request: reqwest::Request) -> reqwest::Result<reqwest::Response> {
+        crate::inference::dispatch::started();
         self.0.execute(request).await
     }
 
@@ -74,6 +81,7 @@ impl HttpClient {
         method: reqwest::Method,
         url: U,
     ) -> reqwest::RequestBuilder {
+        crate::inference::dispatch::started();
         self.0.request(method, url)
     }
 

@@ -54,6 +54,7 @@ impl ProviderAdapter for Fixture {
         _: &Deployment,
         _: ChatRequest,
     ) -> Result<ProviderOutput, InferenceError> {
+        open_model_gateway::inference::dispatch::started();
         Err(InferenceError::Unsupported)
     }
     async fn execute_images(
@@ -61,6 +62,7 @@ impl ProviderAdapter for Fixture {
         target: &Deployment,
         request: ImageRequest,
     ) -> Result<ImageResponse, InferenceError> {
+        open_model_gateway::inference::dispatch::started();
         self.calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(target.upstream_model, "private-upstream-id");
         assert_eq!(request.max_response_bytes, 20 * 1024 * 1024);

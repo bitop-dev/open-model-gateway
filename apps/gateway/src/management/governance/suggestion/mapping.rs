@@ -4,9 +4,10 @@ use super::*;
 
 /// Pure mapping from one catalog model (+ image endpoint body) to a v3 draft.
 pub(crate) fn map(model: &Value, workload: WorkloadKind, mut images: Option<&[u8]>) -> Value {
-    if !limits::mapping_value(model) {
+    let Some(read) = limits::model_fields(model) else {
         return limits::refused(model, workload);
-    }
+    };
+    let model = &read;
     if let Some(body) = images {
         if body.len() > BODY_CAP {
             return limits::refused(model, workload);
@@ -74,9 +75,8 @@ pub(crate) fn map(model: &Value, workload: WorkloadKind, mut images: Option<&[u8
         context,
         max_completion,
     } = ceilings(&mut d, model);
-    let needs_review = d.lines.iter().any(|l| l["needs_review"] == true)
-        || parsed.is_none()
-        || d.warnings.items.len() == limits::MAX_WARNINGS;
+    let needs_review =
+        d.lines.iter().any(|l| l["needs_review"] == true) || parsed.is_none() || d.warnings.omitted;
     json!({
         "source":"openrouter_public_catalog",
         "catalog_model_id":model["id"],

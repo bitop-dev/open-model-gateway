@@ -497,6 +497,25 @@ pub fn may_failover(plan: &RoutePlan, error: InferenceError) -> bool {
         }
 }
 
+/// [`may_failover`] for a failure the engine proved happened before the
+/// attempt built any upstream request (`inference::dispatch`): nothing reached
+/// the provider, so a route's own unavailability (an unresolvable credential
+/// or endpoint is `Configuration`) is not ambiguous and may fail over under
+/// the same explicit policy as `Busy`, without `allow_ambiguous_failover`.
+/// Client errors and the shared deadline (`Timeout`) still do not: another
+/// route would see the same request and the same deadline. Valid only for a
+/// failure returned before any stream, like [`may_failover`].
+pub fn may_fail_over_unsent(plan: &RoutePlan, error: InferenceError) -> bool {
+    plan.max_attempts > 1
+        && matches!(
+            error,
+            InferenceError::Busy
+                | InferenceError::Configuration
+                | InferenceError::UpstreamUnavailable
+                | InferenceError::Overloaded
+        )
+}
+
 fn affects_health(error: Option<InferenceError>) -> bool {
     matches!(
         error,

@@ -3,7 +3,7 @@
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::{PRIORITY_PROFILES, RouteSettings, WAIT_FRESH_SECONDS};
+use super::{RouteSettings, WAIT_FRESH_SECONDS};
 
 /// Admin › route: queue depth, batch lines running, the pause reason and
 /// the last server metrics reading.
@@ -43,12 +43,17 @@ pub async fn batch_waits<'e, E: sqlx::PgExecutor<'e>>(
 }
 
 /// The settings document of the management API (settings, defaults and
-/// what the route supports).
-pub fn settings_document(settings: &RouteSettings, provider: &str, status: Value) -> Value {
+/// what the route supports: `accepts_priority_hint` as for
+/// `RouteSettings::validate`).
+pub fn settings_document(
+    settings: &RouteSettings,
+    accepts_priority_hint: bool,
+    status: Value,
+) -> Value {
     json!({
         "settings": settings,
         "defaults": RouteSettings::default(),
-        "priority_supported": PRIORITY_PROFILES.contains(&provider),
+        "priority_supported": accepts_priority_hint,
         "status": status,
     })
 }

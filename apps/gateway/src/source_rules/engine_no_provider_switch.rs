@@ -13,16 +13,26 @@
 //! * a string literal that starts with a model-family or provider spelling
 //!   ([`MODEL_PREFIXES`], pinned), or that is the argument of `starts_with`,
 //!   `contains`, `ends_with`, `strip_prefix`, `strip_suffix`, `find` or
-//!   `eq_ignore_ascii_case` and contains one of [`MODEL_SPELLINGS`];
+//!   `eq_ignore_ascii_case` and contains one of [`MODEL_SPELLINGS`]. The
+//!   prefixes are model-name spellings (`claude`, `gpt-`, `gemini`, ...,
+//!   and `bedrock`) and the routing forms of provider names (`anthropic/`,
+//!   `anthropic.`, `openai/`, `openrouter/`); a provider name followed by
+//!   other text (`"openai-beta"`, `"Anthropic API"`, `"vLLM-compatible"`)
+//!   is not a model name and passes this rule, while the bare id in any
+//!   case is caught by the first;
 //! * a reference to an adapter type (`AnthropicAdapter`, `LocalAdapter`, ...)
 //!   or to a provider module (`providers::anthropic`, `providers::local`,
 //!   `providers::messages`, ...);
 //! * a variant of any provider-kind enum (`Provider::Anthropic`,
-//!   `ProviderClass::Bedrock`, `UpstreamClient::Local`), also through
-//!   `use ... as P` and by a glob import of the enum.
+//!   `ProviderClass::Bedrock`, `UpstreamClient::Local`, `Profile::Vllm`),
+//!   also through `use ... as P` and by a glob import of the enum. Every
+//!   variant of such an enum is refused, including the ones that are not
+//!   providers (`UpstreamClient::S3`, `UpstreamClient::Export`), so a
+//!   provider added to an enum is refused without a list to update.
 //!
-//! In `inference/` there is a fifth rule: the only items it may take from
-//! `providers` are `ProviderAdapter` and `ProviderRegistry`.
+//! A fifth rule: the only items the scanned files may take from `providers`
+//! are `ProviderAdapter`, `ProviderRegistry` and the items of a shared
+//! submodule (below).
 //!
 //! The provider ids, adapter types, provider modules and provider-kind enums
 //! are read from the tree: ids from `ProviderAdapter::id` bodies and the
@@ -30,20 +40,48 @@
 //! an enum is provider-kind when at least three of its variants are provider
 //! spellings (`openai`, `anthropic`, `bedrock`, `openrouter`, `local`,
 //! `compatible`, `ollama`, `vllm`, `sglang`). Each has a pinned floor, so a
-//! refactor that hides them fails instead of passing empty. Scanned: the
-//! engine, `inference/` (no exceptions allowed), and the files that admit and
-//! route its requests ([`ADJACENT`]) against the exact, counted exceptions in
-//! [`ALLOWED`].
+//! refactor that hides them fails instead of passing empty.
+//!
+//! A shared submodule is a file `providers/<module>/<name>.rs` of a provider
+//! module that is not adapter code: it implements no `ProviderAdapter`, never
+//! reaches back into its module (no `super` path, no `providers::<module>`
+//! path; `pub(super)` visibility names nothing) and has no hit of the scan
+//! above, except the egress client class of its own module,
+//! `UpstreamClient::<module>` (`UpstreamClient::Local` in `providers/local/`:
+//! the pool idle timeout and the lost-connection label of the clients it
+//! builds). Naming it (`providers::local::endpoints::ApprovedEndpoints`, the
+//! server-controlled approval of local destinations) is not a provider
+//! switch. The set is read from the tree and pinned exactly, so a new shared
+//! submodule is a reviewed change.
+//!
+//! Scanned, with no exceptions: the engine (`inference/`) and the code that
+//! admits, routes, plans and schedules its requests ([`STRICT`]). A
+//! provider-specific behaviour there is an adapter capability instead (for
+//! example `ProviderAdapter::forwards_cache_controls`). Outside the scope and
+//! outside `providers/`, the files that name a provider id or a provider-kind
+//! variant are pinned ([`OUT_OF_SCOPE`]), so a new module on the admission
+//! path cannot name one unreviewed.
 //!
 //! Cannot see: a provider named by a string built at run time or read from
-//! configuration; ids read through a `const` defined elsewhere (the literal is
-//! caught where the const is defined, if that file is scanned, not where it is
-//! used); a helper defined outside the scanned files that does the comparison
-//! (`deployment.is_anthropic()`); a comparison of two values neither of which
-//! is a literal (`a.provider == b.provider` is allowed, it is not a switch); a
-//! different spelling of the id ("open-ai"); a model family not in the pinned
-//! list; a provider type behind an alias made outside the scanned files;
-//! behaviour keyed on a capability that is really a proxy for one provider.
+//! configuration; an id read through a `const` defined elsewhere (the
+//! literal is caught where the const is defined, if that file is scanned,
+//! not where it is used); a helper defined outside the scanned files that
+//! does the comparison (`deployment.is_anthropic()`); a comparison of two
+//! values neither of which is a literal (`a.provider == b.provider`,
+//! `d.provider == name.as_str()`); a provider id inside a longer string (SQL
+//! `WHERE provider='anthropic'`, a format string), unless the string starts
+//! with a pinned prefix or is searched for; a partial literal
+//! (`starts_with("anth")`), a length (`provider.len() == 9`), a literal
+//! assembled by `concat!` or `stringify!`; an index into a table
+//! (`Provider::ALL[1]`); a variant reached through a qualified path
+//! (`<Provider>::Anthropic`, `<T as Trait>::Anthropic`); a different
+//! spelling of the id ("open-ai") or a model family not in the pinned list;
+//! a provider-kind type behind an alias made outside the scanned files, or an
+//! enum with fewer than three provider-spelled variants; behaviour keyed on a
+//! capability that is really a proxy for one provider; a shared submodule
+//! whose code is provider-specific without naming a provider, or that
+//! compares through its own module's client class
+//! (`UpstreamClient::Anthropic.as_str()` is the id `anthropic`).
 use std::collections::{BTreeMap, BTreeSet};
 
 use proc_macro2::TokenTree;
@@ -51,12 +89,10 @@ use syn::{ext::IdentExt, visit::Visit};
 
 use super::tree::{Scope, Source, flat};
 
-/// The engine proper: nothing is allowed here.
-const ENGINE: &[&str] = &["inference/"];
-
-/// Files that admit and route the engine's requests: scanned too, with
-/// [`ALLOWED`] for what exists today.
-const ADJACENT: &[&str] = &[
+/// The engine and the code that admits, routes, plans and schedules its
+/// requests: nothing is allowed here.
+const STRICT: &[&str] = &[
+    "inference/",
     "governance.rs",
     "governance/",
     "routing.rs",
@@ -64,8 +100,9 @@ const ADJACENT: &[&str] = &[
     "jobs/",
 ];
 
-/// The only items `inference/` may take from `providers`.
-const ENGINE_PROVIDER_ITEMS: &[&str] = &["ProviderAdapter", "ProviderRegistry"];
+/// The only items the scanned files may take from `providers`, besides the
+/// items of a shared submodule.
+const PROVIDER_ITEMS: &[&str] = &["ProviderAdapter", "ProviderRegistry"];
 
 /// Spellings a model name starts with (lowercase), pinned.
 const MODEL_PREFIXES: &[&str] = &[
@@ -130,86 +167,47 @@ const PROVIDER_VARIANTS: &[&str] = &[
     "sglang",
 ];
 
-/// Modules of `providers` that are not adapters but name a provider kind.
-const EXTRA_MODULES: &[&str] = &["messages"];
+/// The provider-kind enum whose variant for its own module a shared
+/// submodule may name: the egress client class of the clients it builds.
+const EGRESS_CLIENT: &str = "UpstreamClient";
 
-/// (file, item, what, count) found in [`ADJACENT`] today. The engine,
-/// `inference/`, has none. These are outside it, in admission and the batch
-/// scheduler. A second identical hit fails: the count is exact.
-///
-/// * Anthropic native cache controls are priced and held by comparing the
-///   provider name in admission (`governance.rs`, `governance/batch.rs`) and
-///   in batch line planning (`jobs/plan/scan.rs`): provider-specific
-///   behaviour that belongs behind `ProviderAdapter`. Real switches; not
-///   fixed in #591 (no behaviour change). Tracked in #624.
-/// * `jobs/schedule.rs` `PRIORITY_PROFILES` lists the local profiles that
-///   accept vLLM's `priority` request field (`vllm`, `openai_compatible`):
-///   also a provider-kind switch, read elsewhere through the const. Same
-///   follow-up.
-/// * `providers::local::endpoints::ApprovedEndpoints` in `jobs/mod.rs` and
-///   `jobs/schedule.rs` is the shared, server-controlled approval of local
-///   destinations (AGENTS.md: local HTTP endpoints). It is a type about
-///   destinations, not a branch on the provider; listed because the scan
-///   cannot tell it from an adapter module.
-/// * `jobs/schedule.rs` `fetch_reading` counts a failed scrape of a local
-///   server's metrics against `UpstreamClient::Local`, the egress client
-///   class it used: a metric label, not a branch on the provider.
-const ALLOWED: &[(&str, &str, &str, usize)] = &[
+/// Production files outside [`STRICT`] and outside `providers/` that name a
+/// provider id or a provider-spelled variant of a provider-kind enum, and
+/// why. A file on the admission path must not appear here: provider-specific
+/// behaviour there is an adapter capability.
+const OUT_OF_SCOPE: &[(&str, &str)] = &[
     (
-        "governance.rs",
-        "admit_unobserved",
-        "provider id literal \"anthropic\"",
-        2,
+        "egress_upstream.rs",
+        "defines UpstreamClient, the pooled client classes and their labels",
     ),
     (
-        "governance/batch.rs",
-        "admit_line_unobserved",
-        "provider id literal \"anthropic\"",
-        1,
+        "telemetry.rs",
+        "defines Provider, the provider ids and their telemetry spelling",
     ),
     (
-        "jobs/plan/scan.rs",
-        "impl Jobs::price_line",
-        "provider id literal \"anthropic\"",
-        1,
+        "management/governance/suggestion.rs",
+        "OpenRouter catalog price suggestions: an OpenRouter connection only",
     ),
     (
-        "jobs/schedule.rs",
-        "PRIORITY_PROFILES",
-        "provider id literal \"openai_compatible\"",
-        1,
+        "management/governance/suggestion/catalog.rs",
+        "the price-suggestion catalog transport: the OpenRouter client class of the client it builds",
     ),
     (
-        "jobs/schedule.rs",
-        "PRIORITY_PROFILES",
-        "provider id literal \"vllm\"",
-        1,
+        "management/models_ux.rs",
+        "model display: the OpenRouter free-variant feature",
     ),
     (
-        "jobs/schedule.rs",
-        "<file>",
-        "provider module providers::local",
-        1,
+        "management/requests.rs",
+        "connection display: the OpenRouter data policy",
     ),
     (
-        "jobs/schedule.rs",
-        "fetch_reading",
-        "provider-kind variant UpstreamClient::Local",
-        1,
-    ),
-    (
-        "jobs/mod.rs",
-        "<file>",
-        "provider module providers::local",
-        1,
-    ),
-    (
-        "jobs/mod.rs",
-        "impl Jobs::with_approvals",
-        "provider module providers::local",
-        1,
+        "management/resources.rs",
+        "connection validation per provider kind (endpoint, region, credentials)",
     ),
 ];
+
+/// Modules of `providers` that are not adapters but name a provider kind.
+const EXTRA_MODULES: &[&str] = &["messages"];
 
 const FLOOR_IDS: &[&str] = &[
     "openai",
@@ -236,7 +234,8 @@ const FLOOR_ADAPTERS: &[&str] = &[
     "OpenAiAdapter",
     "OpenRouterAdapter",
 ];
-const FLOOR_ENUMS: &[&str] = &["Provider", "ProviderClass", "UpstreamClient"];
+const FLOOR_ENUMS: &[&str] = &["Profile", "Provider", "ProviderClass", "UpstreamClient"];
+const FLOOR_SHARED: &[(&str, &str)] = &[("local", "endpoints")];
 
 #[derive(Default, Debug)]
 pub(super) struct Names {
@@ -245,6 +244,8 @@ pub(super) struct Names {
     adapters: BTreeSet<String>,
     /// Provider-kind enum name -> its variants.
     enums: BTreeMap<String, BTreeSet<String>>,
+    /// Shared submodules: (provider module, submodule).
+    shared: BTreeSet<(String, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -385,7 +386,122 @@ pub(super) fn names(sources: &[Source]) -> Names {
             }
         }
     }
+    // Needs every id, adapter and module first.
+    let mut shared = BTreeSet::new();
+    for source in sources {
+        if let Some((module, sub)) = submodule_of(&source.path)
+            && names.modules.contains(module)
+            && self_contained(source, module, &names)
+        {
+            shared.insert((module.to_owned(), sub.to_owned()));
+        }
+    }
+    names.shared = shared;
     names
+}
+
+/// `providers/<module>/<name>.rs` (not `mod.rs`): (module, name).
+fn submodule_of(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix("providers/")?;
+    let (module, file) = rest.split_once('/')?;
+    let sub = file.strip_suffix(".rs")?;
+    (sub != "mod" && !sub.contains('/')).then_some((module, sub))
+}
+
+/// A submodule file that is not adapter code: no `impl ProviderAdapter`, no
+/// path back into its module, and no scan hit but its own module's egress
+/// client class.
+fn self_contained(source: &Source, module: &str, names: &Names) -> bool {
+    let mut reader = IdReader::default();
+    reader.visit_file(&source.file);
+    let mut back = BackReference {
+        module,
+        found: false,
+    };
+    back.visit_file(&source.file);
+    let mut adapter = Names::default();
+    for item in &source.file.items {
+        adapters(item, module, &mut adapter);
+    }
+    adapter.adapters.is_empty()
+        && reader.ids.is_empty()
+        && !back.found
+        && scan(source, names)
+            .keys()
+            .all(|hit| own_client_class(&hit.what, module))
+}
+
+/// `provider-kind variant UpstreamClient::<module>`, the variant whose
+/// normalized name is `module`.
+fn own_client_class(what: &str, module: &str) -> bool {
+    what.strip_prefix("provider-kind variant ")
+        .and_then(|rest| rest.strip_prefix(EGRESS_CLIENT))
+        .and_then(|rest| rest.strip_prefix("::"))
+        .is_some_and(|variant| normalized(variant) == module)
+}
+
+/// A `super` path segment, or a `providers::<module>` path, anywhere.
+struct BackReference<'a> {
+    module: &'a str,
+    found: bool,
+}
+
+impl BackReference<'_> {
+    fn segments(&mut self, segments: &[String]) {
+        self.found |= segments.iter().any(|s| s == "super")
+            || segments
+                .windows(2)
+                .any(|pair| pair[0] == "providers" && pair[1] == self.module);
+    }
+    fn tree(&mut self, tree: &syn::UseTree, prefix: &mut Vec<String>) {
+        match tree {
+            syn::UseTree::Path(p) => {
+                prefix.push(p.ident.unraw().to_string());
+                self.tree(&p.tree, prefix);
+                prefix.pop();
+            }
+            syn::UseTree::Name(syn::UseName { ident })
+            | syn::UseTree::Rename(syn::UseRename { ident, .. }) => {
+                prefix.push(ident.unraw().to_string());
+                self.segments(prefix);
+                prefix.pop();
+            }
+            syn::UseTree::Glob(_) => self.segments(prefix),
+            syn::UseTree::Group(g) => {
+                for inner in &g.items {
+                    self.tree(inner, prefix);
+                }
+            }
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for BackReference<'_> {
+    /// `pub(super)` widens visibility; it names nothing in the parent.
+    fn visit_visibility(&mut self, _: &'ast syn::Visibility) {}
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        let segments: Vec<String> = path
+            .segments
+            .iter()
+            .map(|s| s.ident.unraw().to_string())
+            .collect();
+        self.segments(&segments);
+        syn::visit::visit_path(self, path);
+    }
+    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        self.tree(&item.tree, &mut Vec::new());
+    }
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        syn::visit::visit_macro(self, mac);
+        let idents: Vec<String> = flat(mac.tokens.clone())
+            .into_iter()
+            .filter_map(|t| match t {
+                TokenTree::Ident(i) => Some(i.unraw().to_string()),
+                _ => None,
+            })
+            .collect();
+        self.segments(&idents);
+    }
 }
 
 fn adapters(item: &syn::Item, module: &str, names: &mut Names) {
@@ -427,6 +543,16 @@ pub(super) fn name_problems(names: &Names) -> Vec<String> {
     need("adapter type", &names.adapters, FLOOR_ADAPTERS);
     let enums: BTreeSet<String> = names.enums.keys().cloned().collect();
     need("provider-kind enum", &enums, FLOOR_ENUMS);
+    for (module, sub) in FLOOR_SHARED {
+        if !names
+            .shared
+            .contains(&((*module).to_owned(), (*sub).to_owned()))
+        {
+            out.push(format!(
+                "discovery lost the shared submodule providers::{module}::{sub}: it would be refused"
+            ));
+        }
+    }
     out
 }
 
@@ -460,8 +586,6 @@ struct Finder<'a> {
     file: String,
     names: &'a Names,
     aliases: BTreeMap<String, String>,
-    /// `inference/`: only `ProviderAdapter` and `ProviderRegistry` from `providers`.
-    strict: bool,
     scope: Scope,
     hits: Hits,
 }
@@ -515,15 +639,20 @@ impl Finder<'_> {
                 name
             })
             .collect();
-        for pair in segments.windows(2) {
+        for (at, pair) in segments.windows(2).enumerate() {
             if pair[0] == "providers" {
-                if self.names.modules.contains(&pair[1]) {
-                    self.hit(format!("provider module providers::{}", pair[1]));
-                } else if self.strict && !ENGINE_PROVIDER_ITEMS.contains(&pair[1].as_str()) {
-                    self.hit(format!(
-                        "providers::{} (the engine may take only ProviderAdapter and ProviderRegistry)",
-                        pair[1]
-                    ));
+                let shared = segments
+                    .get(at + 2)
+                    .is_some_and(|sub| self.names.shared.contains(&(pair[1].clone(), sub.clone())));
+                if !shared {
+                    if self.names.modules.contains(&pair[1]) {
+                        self.hit(format!("provider module providers::{}", pair[1]));
+                    } else if !PROVIDER_ITEMS.contains(&pair[1].as_str()) {
+                        self.hit(format!(
+                            "providers::{} (only ProviderAdapter, ProviderRegistry and shared submodules)",
+                            pair[1]
+                        ));
+                    }
                 }
             }
             if let Some(variants) = self.names.enums.get(&pair[0])
@@ -564,9 +693,9 @@ impl Finder<'_> {
                 if let Some(last) = last {
                     if self.names.enums.contains_key(&last) {
                         self.hit(format!("glob import of the provider-kind enum {last}"));
-                    } else if self.strict && last == "providers" {
+                    } else if last == "providers" {
                         self.hit(
-                            "glob import of providers (the engine may take only ProviderAdapter and ProviderRegistry)"
+                            "glob import of providers (only ProviderAdapter, ProviderRegistry and shared submodules)"
                                 .to_owned(),
                         );
                     }
@@ -658,7 +787,6 @@ pub(super) fn scan(source: &Source, names: &Names) -> Hits {
         file: source.path.clone(),
         names,
         aliases: aliases.0,
-        strict: applies(&source.path, ENGINE),
         scope: Scope::default(),
         hits: Hits::new(),
     };
@@ -666,65 +794,18 @@ pub(super) fn scan(source: &Source, names: &Names) -> Hits {
     finder.hits
 }
 
-fn merge(into: &mut Hits, from: Hits) {
-    for (hit, n) in from {
-        *into.entry(hit).or_default() += n;
-    }
-}
-
-/// Hits in the engine, and hits in the adjacent files that differ from the
-/// counted allowlist (or allowed entries that no longer match).
-pub(super) fn problems(
-    sources: &[Source],
-    names: &Names,
-    allowed: &[(&str, &str, &str, usize)],
-) -> Vec<String> {
-    let mut engine = Hits::new();
-    let mut adjacent = Hits::new();
-    for source in sources {
-        if applies(&source.path, ENGINE) {
-            merge(&mut engine, scan(source, names));
-        } else if applies(&source.path, ADJACENT) {
-            merge(&mut adjacent, scan(source, names));
+/// Every hit in the scanned files. There are no exceptions: provider-specific
+/// behaviour there is an adapter capability.
+pub(super) fn problems(sources: &[Source], names: &Names) -> Vec<String> {
+    let mut hits = Hits::new();
+    for source in sources.iter().filter(|s| applies(&s.path, STRICT)) {
+        for (hit, n) in scan(source, names) {
+            *hits.entry(hit).or_default() += n;
         }
     }
-    let mut allowed_hits = Hits::new();
-    for (file, item, what, count) in allowed {
-        merge(
-            &mut allowed_hits,
-            Hits::from([(
-                Hit {
-                    file: (*file).to_owned(),
-                    item: (*item).to_owned(),
-                    what: (*what).to_owned(),
-                },
-                *count,
-            )]),
-        );
-    }
-    let mut out: Vec<String> = engine
-        .iter()
-        .map(|(h, n)| format!("provider switch in the engine: {} (x{n})", h.text()))
-        .collect();
-    for (hit, n) in &adjacent {
-        match allowed_hits.get(hit) {
-            Some(want) if want == n => {}
-            Some(want) => out.push(format!(
-                "provider switch in admission/routing: {} found x{n}, allowed x{want}",
-                hit.text()
-            )),
-            None => out.push(format!(
-                "provider switch in admission/routing: {} (x{n})",
-                hit.text()
-            )),
-        }
-    }
-    for (hit, want) in &allowed_hits {
-        if !adjacent.contains_key(hit) {
-            out.push(format!("stale allowlist entry: {} (x{want})", hit.text()));
-        }
-    }
-    out
+    hits.iter()
+        .map(|(h, n)| format!("provider switch outside the adapters: {} (x{n})", h.text()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -741,7 +822,7 @@ mod tests {
         let sources = real();
         let names = names(&sources);
         let mut problems = name_problems(&names);
-        problems.extend(self::problems(&sources, &names, ALLOWED));
+        problems.extend(self::problems(&sources, &names));
         assert!(
             problems.is_empty(),
             "providers are reached only through ProviderAdapter and ProviderRegistry (AGENTS.md, \
@@ -758,6 +839,12 @@ mod tests {
             "inference/mod.rs",
             "inference/attempt.rs",
             "inference/workload.rs",
+            "governance.rs",
+            "governance/batch.rs",
+            "routing.rs",
+            "jobs/mod.rs",
+            "jobs/plan/scan.rs",
+            "jobs/schedule.rs",
         ] {
             assert!(
                 sources.iter().any(|s| s.path == path),
@@ -791,7 +878,8 @@ mod tests {
         });
         let local = parse_fixture(
             "providers/local/mod.rs",
-            r#"impl ProviderAdapter for LocalAdapter { fn id(&self) -> &'static str { match 1 { _ => "vllm" } } }"#,
+            r#"pub enum Profile { OpenAiCompatible, Vllm, Sglang, Ollama }
+               impl ProviderAdapter for LocalAdapter { fn id(&self) -> &'static str { match 1 { _ => "vllm" } } }"#,
         );
         let telemetry = parse_fixture(
             "telemetry.rs",
@@ -808,7 +896,42 @@ mod tests {
         let unrelated = parse_fixture("other.rs", "pub enum Color { Red, Anthropic, Green }");
         let mut all = vec![providers, local, telemetry, class, upstream, unrelated];
         all.extend(others);
+        all.extend(submodules());
         names(&all)
+    }
+
+    /// Submodules of provider modules: one shared, five that are not (three
+    /// adapter code, two that name a provider-kind variant other than their
+    /// own module's client class).
+    fn submodules() -> [Source; 6] {
+        [
+            parse_fixture(
+                "providers/local/endpoints.rs",
+                "pub struct ApprovedEndpoints;
+                 impl ApprovedEndpoints { pub(super) fn parse() {} fn idle() { let _ = crate::egress::UpstreamClient::Local; } }",
+            ),
+            parse_fixture(
+                "providers/anthropic/batches.rs",
+                "use super::encode;
+pub fn line() {}",
+            ),
+            parse_fixture(
+                "providers/bedrock/auth.rs",
+                r#"pub fn sign(service: &str) -> bool { service == "bedrock" }"#,
+            ),
+            parse_fixture(
+                "providers/openai/jobs.rs",
+                "pub fn poll() { let _ = crate::providers::openai::client(); }",
+            ),
+            parse_fixture(
+                "providers/local/kinds.rs",
+                "pub fn special(provider: &str) -> bool { provider == crate::telemetry::Provider::Anthropic.as_str() }",
+            ),
+            parse_fixture(
+                "providers/local/pool.rs",
+                "pub fn idle() { let _ = crate::egress::UpstreamClient::Anthropic.pool_idle_timeout(); }",
+            ),
+        ]
     }
 
     fn engine(code: &str) -> Vec<String> {
@@ -818,7 +941,7 @@ mod tests {
             "{:?}",
             name_problems(&names)
         );
-        problems(&[parse_fixture("inference/attempt.rs", code)], &names, &[])
+        problems(&[parse_fixture("inference/attempt.rs", code)], &names)
     }
 
     #[test]
@@ -828,7 +951,10 @@ mod tests {
         assert!(names.adapters.contains("LocalAdapter"));
         assert!(names.modules.contains("local") && names.modules.contains("messages"));
         let enums: Vec<&String> = names.enums.keys().collect();
-        assert_eq!(enums, ["Provider", "ProviderClass", "UpstreamClient"]);
+        assert_eq!(
+            enums,
+            ["Profile", "Provider", "ProviderClass", "UpstreamClient"]
+        );
         assert!(names.enums["Provider"].contains("Sglang"));
     }
 
@@ -840,8 +966,8 @@ mod tests {
         assert_eq!(
             found,
             [
-                "provider switch in the engine: inference/attempt.rs :: f :: provider id literal \"OpenAI\" (x1)",
-                "provider switch in the engine: inference/attempt.rs :: f :: provider id literal \"anthropic\" (x1)",
+                "provider switch outside the adapters: inference/attempt.rs :: f :: provider id literal \"OpenAI\" (x1)",
+                "provider switch outside the adapters: inference/attempt.rs :: f :: provider id literal \"anthropic\" (x1)",
             ]
         );
     }
@@ -913,17 +1039,18 @@ mod tests {
         );
         assert_eq!(found.len(), 2, "{found:?}");
         assert!(found.iter().all(|p| {
-            p.contains("(the engine may take only ProviderAdapter and ProviderRegistry)")
+            p.contains("(only ProviderAdapter, ProviderRegistry and shared submodules)")
         }));
-        // Outside the engine the same imports are fine.
+        // The same in admission and jobs; files outside the scope are not scanned.
         let names = fixture_names();
+        let import = "use crate::providers::capabilities::Table;";
+        for path in ["governance.rs", "jobs/schedule.rs"] {
+            let found = problems(&[parse_fixture(path, import)], &names);
+            assert_eq!(found.len(), 1, "{path}: {found:?}");
+        }
         let other = problems(
-            &[parse_fixture(
-                "governance.rs",
-                "use crate::providers::capabilities::Table;",
-            )],
+            &[parse_fixture("management/batch_scheduling.rs", import)],
             &names,
-            &[],
         );
         assert!(other.is_empty(), "{other:?}");
     }
@@ -1017,13 +1144,14 @@ mod tests {
                 "{what} in {found:?} for {code}"
             );
         }
-        // Outside the engine a glob of `providers` is not a switch by itself.
+        // In admission too; outside the scanned scope it is not scanned.
         let names = fixture_names();
-        let other = problems(
-            &[parse_fixture("governance.rs", "use crate::providers::*;")],
-            &names,
-            &[],
+        let glob = "use crate::providers::*;";
+        assert_eq!(
+            problems(&[parse_fixture("governance.rs", glob)], &names).len(),
+            1
         );
+        let other = problems(&[parse_fixture("management/x.rs", glob)], &names);
         assert!(other.is_empty(), "{other:?}");
         // An alias of an unrelated type does not make its variants provider names.
         assert!(engine("type Hue = Color;\nfn f() { let _ = Hue::Anthropic; }").is_empty());
@@ -1045,39 +1173,113 @@ mod tests {
     }
 
     #[test]
-    fn adjacent_files_are_held_to_the_exact_counted_allowlist() {
+    fn a_provider_name_comparison_in_admission_routing_or_jobs_is_refused() {
         let names = fixture_names();
-        let source = parse_fixture(
+        for path in [
             "governance.rs",
-            r#"fn admit(d: &D) { if d.provider == "anthropic" {} }"#,
+            "governance/batch.rs",
+            "routing.rs",
+            "routing/plan.rs",
+            "jobs/plan/scan.rs",
+            "jobs/schedule.rs",
+        ] {
+            let found = problems(
+                &[parse_fixture(
+                    path,
+                    r#"fn admit(d: &D) { if d.provider == "anthropic" {} }"#,
+                )],
+                &names,
+            );
+            assert_eq!(
+                found,
+                [format!(
+                    "provider switch outside the adapters: {path} :: admit :: provider id literal \"anthropic\" (x1)"
+                )]
+            );
+        }
+        // A table of profile names, a comparison made twice and a variant:
+        // each is reported, the doubled comparison as x2.
+        let found = problems(
+            &[parse_fixture(
+                "jobs/schedule.rs",
+                r#"const P: [&str; 2] = ["vllm", "openai_compatible"];
+                   fn f(d: &D) -> bool { d.provider == "anthropic" || d.provider == "anthropic" }
+                   fn g() { let _ = crate::egress::UpstreamClient::Local; }"#,
+            )],
+            &names,
         );
-        let sources = [source];
-        let found = problems(&sources, &names, &[]);
         assert_eq!(
             found,
             [
-                "provider switch in admission/routing: governance.rs :: admit :: provider id literal \"anthropic\" (x1)"
+                "provider switch outside the adapters: jobs/schedule.rs :: P :: provider id literal \"openai_compatible\" (x1)",
+                "provider switch outside the adapters: jobs/schedule.rs :: P :: provider id literal \"vllm\" (x1)",
+                "provider switch outside the adapters: jobs/schedule.rs :: f :: provider id literal \"anthropic\" (x2)",
+                "provider switch outside the adapters: jobs/schedule.rs :: g :: provider-kind variant UpstreamClient::Local (x1)",
             ]
         );
-        let entry = (
-            "governance.rs",
-            "admit",
-            "provider id literal \"anthropic\"",
-        );
-        assert!(problems(&sources, &names, &[(entry.0, entry.1, entry.2, 1)]).is_empty());
-        let stale = [("governance.rs", "other", entry.2, 1)];
-        assert_eq!(problems(&sources, &names, &stale).len(), 2);
-        // A second identical hit exceeds the count; a lower count is stale.
-        let twice = parse_fixture(
-            "governance.rs",
-            r#"fn admit(d: &D) { if d.provider == "anthropic" && e.provider == "anthropic" {} }"#,
-        );
+    }
+
+    #[test]
+    fn a_shared_submodule_may_be_named_but_adapter_code_may_not() {
+        let names = fixture_names();
         assert_eq!(
-            problems(&[twice], &names, &[(entry.0, entry.1, entry.2, 1)]),
-            [
-                "provider switch in admission/routing: governance.rs :: admit :: provider id literal \"anthropic\" found x2, allowed x1"
-            ]
+            names.shared.iter().collect::<Vec<_>>(),
+            [&("local".to_owned(), "endpoints".to_owned())]
         );
+        let found = problems(
+            &[parse_fixture(
+                "jobs/schedule.rs",
+                "use crate::providers::local::endpoints::ApprovedEndpoints;
+                 use crate::providers::{local::endpoints, ProviderAdapter};
+                 fn f(a: Option<&crate::providers::local::endpoints::ApprovedEndpoints>) {}",
+            )],
+            &names,
+        );
+        assert!(found.is_empty(), "{found:?}");
+        for (code, what) in [
+            (
+                "use crate::providers::local;",
+                "provider module providers::local",
+            ),
+            (
+                "fn f() { crate::providers::local::adapters(); }",
+                "provider module providers::local",
+            ),
+            (
+                "use crate::providers::local::LocalAdapter;",
+                "adapter type LocalAdapter",
+            ),
+            (
+                "use crate::providers::anthropic::batches::line;",
+                "provider module providers::anthropic",
+            ),
+            (
+                "use crate::providers::bedrock::auth::sign;",
+                "provider module providers::bedrock",
+            ),
+            (
+                "use crate::providers::openai::jobs::poll;",
+                "provider module providers::openai",
+            ),
+            (
+                "use crate::providers::local::kinds::special;",
+                "provider module providers::local",
+            ),
+            (
+                "fn f() { crate::providers::local::pool::idle(); }",
+                "provider module providers::local",
+            ),
+            (
+                "fn f() { let _ = crate::providers::endpoints::X; }",
+                "providers::endpoints (only ProviderAdapter",
+            ),
+        ] {
+            let found = problems(&[parse_fixture("jobs/mod.rs", code)], &names);
+            assert!(
+                found.iter().any(|p| p.contains(what)),
+                "{what} in {found:?} for {code}"
+            );
+        }
     }
 
     #[test]
@@ -1089,7 +1291,6 @@ mod tests {
                 r#"pub const PROFILES: [&str; 2] = ["vllm", "openai_compatible"];"#,
             )],
             &names,
-            &[],
         );
         assert!(
             found.iter().all(|p| p.contains(":: PROFILES ::")),
@@ -1099,19 +1300,73 @@ mod tests {
     }
 
     #[test]
-    fn engine_hits_cannot_be_allowlisted() {
-        let names = fixture_names();
-        let source = parse_fixture(
-            "inference/mod.rs",
-            r#"fn f(p: &str) { if p == "openai" {} }"#,
+    fn the_real_shared_submodules() {
+        let names = names(&real());
+        assert_eq!(
+            names.shared,
+            BTreeSet::from([("local".to_owned(), "endpoints".to_owned())]),
+            "the shared submodules changed: the scanned code may name every item of a shared \
+             submodule, so a new one is a reviewed change (pin it here and in docs/verification.md)"
         );
-        let allowed = [("inference/mod.rs", "f", "provider id literal \"openai\"", 1)];
-        let found = problems(&[source], &names, &allowed);
+    }
+
+    #[test]
+    fn a_provider_spelling_searched_for_inside_a_longer_literal_is_refused() {
+        // None of these literals is a provider id or starts with a pinned
+        // prefix: only the search-argument rule refuses them.
+        for code in [
+            r#"fn f(m: &str) -> bool { m.contains("/gpt-") }"#,
+            r#"fn f(m: &str) -> bool { m.ends_with("-claude") }"#,
+            r#"fn f(m: &str) -> bool { m.contains("us.anthropic.") }"#,
+            r#"fn f(m: &str) -> Option<&str> { m.strip_suffix("@vllm") }"#,
+            r#"fn f(m: &[u8]) -> bool { m.ends_with(b"-ollama") }"#,
+        ] {
+            let found = engine(code);
+            assert!(
+                found.len() == 1 && found[0].contains("provider or model spelling searched for"),
+                "{code}: {found:?}"
+            );
+        }
+        // The same literals outside a search are not refused.
+        assert!(engine(r#"fn f() { let _ = ("/gpt-", "-claude", "@vllm"); }"#).is_empty());
+    }
+
+    /// A hit that names a provider: an id, a provider-spelled variant of a
+    /// provider-kind enum (not `UpstreamClient::S3` or `::Export`), or a glob
+    /// import of such an enum.
+    fn names_a_provider(what: &str) -> bool {
+        let variant = what
+            .strip_prefix("provider-kind variant ")
+            .and_then(|path| path.rsplit("::").next())
+            .is_some_and(|v| PROVIDER_VARIANTS.contains(&normalized(v).as_str()));
+        variant
+            || what.starts_with("provider id literal ")
+            || what.starts_with("glob import of the provider-kind enum ")
+    }
+
+    #[test]
+    fn the_files_outside_the_scope_that_name_a_provider_are_pinned() {
+        let lib = real();
+        let names = names(&lib);
+        let bin = production("main.rs");
         assert!(
-            found
-                .iter()
-                .any(|p| p.starts_with("provider switch in the engine")),
-            "{found:?}"
+            bin.iter().any(|s| s.path == "commands/serve.rs"),
+            "the binary's modules are scanned"
+        );
+        let found: BTreeSet<&str> = lib
+            .iter()
+            .chain(&bin)
+            .filter(|s| !applies(&s.path, STRICT) && !s.path.starts_with("providers/"))
+            .filter(|s| scan(s, &names).keys().any(|h| names_a_provider(&h.what)))
+            .map(|s| s.path.as_str())
+            .collect();
+        let pinned: BTreeSet<&str> = OUT_OF_SCOPE.iter().map(|(path, _)| *path).collect();
+        assert_eq!(
+            found, pinned,
+            "the production files outside the scanned scope and outside providers/ that name a \
+             provider changed: code on the admission, routing or scheduling path belongs in \
+             STRICT and uses adapter capabilities; anything else is listed in OUT_OF_SCOPE with \
+             its reason (and in docs/verification.md)"
         );
     }
 
@@ -1119,7 +1374,8 @@ mod tests {
     fn a_lost_discovery_fails_instead_of_passing_empty() {
         let found = name_problems(&Names::default());
         assert!(
-            found.len() >= FLOOR_IDS.len() + FLOOR_MODULES.len() + FLOOR_ENUMS.len(),
+            found.len()
+                >= FLOOR_IDS.len() + FLOOR_MODULES.len() + FLOOR_ENUMS.len() + FLOOR_SHARED.len(),
             "{found:?}"
         );
     }

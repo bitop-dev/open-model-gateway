@@ -55,6 +55,11 @@ impl ProviderAdapter for AnthropicAdapter {
     fn supports_protocol(&self, protocol: ApiProtocol) -> bool {
         super::capabilities::serves(self.id(), protocol)
     }
+    /// The native Messages encoding keeps the request's `cache_control`
+    /// hints (`set_native_overrides`).
+    fn forwards_cache_controls(&self) -> bool {
+        true
+    }
     /// Reuses the real, pure request-encoding conversion (`encode`) so
     /// pre-admission validation can never drift from what `execute` would
     /// actually reject: the model id is irrelevant to validation (it is only
