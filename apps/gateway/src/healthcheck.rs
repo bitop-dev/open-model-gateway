@@ -170,7 +170,12 @@ pub fn probe(target: &Target, timeout: Duration, allow_non_loopback: bool) -> Re
     let mut last_error = None;
     let mut stream = None;
     for address in target.addresses(allow_non_loopback)? {
-        match TcpStream::connect_timeout(&address, remaining()?) {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the health probe dials the gateway's own listener (#606)"
+        )]
+        let connecting = TcpStream::connect_timeout(&address, remaining()?);
+        match connecting {
             Ok(connected) => {
                 stream = Some(connected);
                 break;

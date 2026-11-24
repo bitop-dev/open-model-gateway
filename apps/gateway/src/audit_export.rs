@@ -708,9 +708,13 @@ impl Syslog {
         // Each address gets its own short connect limit, so one that never
         // answers (a dead IPv6 route) doesn't use up the whole run.
         for address in addresses {
-            if let Ok(Ok(stream)) =
-                tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(address)).await
-            {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "audit export dials an address from crate::egress::resolve (#606)"
+            )]
+            let connecting =
+                tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(address));
+            if let Ok(Ok(stream)) = connecting.await {
                 tcp = Some(stream);
                 break;
             }

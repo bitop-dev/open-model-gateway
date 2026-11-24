@@ -706,6 +706,14 @@ mod idle_tests;
 mod wiring_tests;
 
 #[cfg(test)]
+#[path = "egress_coverage_tests.rs"]
+mod coverage_tests;
+
+#[cfg(test)]
+#[path = "egress_rule_probes_tests.rs"]
+mod rule_probes;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

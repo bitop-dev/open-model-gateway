@@ -69,6 +69,9 @@ enum Finding {
     /// macro body that `syn` cannot parse. The scan fails closed on these.
     Unreadable(String),
     AwsTransport(String),
+    /// A sanctioned socket statement (#606) whose expression is not the
+    /// reviewed one.
+    SocketSite(String),
 }
 
 fn path_name(path: &syn::Path) -> String {
@@ -297,7 +300,22 @@ impl<'ast> Visit<'ast> for Scan<'_> {
                 && let Some(transport) = aws_transport(reason)
                 && !transport.matches(local)
             {
-                self.findings.push(Finding::AwsTransport(on));
+                self.findings.push(Finding::AwsTransport(on.clone()));
+                break;
+            }
+        }
+        for finding in &self.findings[before..] {
+            if let Finding::Level {
+                reason: Some(reason),
+                ..
+            } = finding
+                && let Some(expected) = socket_site(reason)
+                && local
+                    .init
+                    .as_ref()
+                    .is_none_or(|init| text(init.expr.to_token_stream()) != expected)
+            {
+                self.findings.push(Finding::SocketSite(on));
                 break;
             }
         }
@@ -425,6 +443,52 @@ impl AwsTransport {
     }
 }
 
+const HEALTH_PROBE: &str = "the health probe dials the gateway's own listener (#606)";
+const AUDIT_SOCKET: &str = "audit export dials an address from crate::egress::resolve (#606)";
+const REALTIME_SOCKET: &str =
+    "the realtime session dials addresses from crate::egress::resolve (#606)";
+
+/// The three statements that open a socket (#606), pinned by expression: the
+/// `expect` covers that one call on addresses the gateway chose (the health
+/// probe's target, or `crate::egress::resolve`), and nothing else.
+fn socket_site(reason: &str) -> Option<&'static str> {
+    match reason {
+        HEALTH_PROBE => Some("TcpStream : : connect_timeout ( & address , remaining ( ) ? )"),
+        AUDIT_SOCKET => Some(
+            "tokio : : time : : timeout ( CONNECT_TIMEOUT , tokio : : net : : TcpStream : : connect ( address ) )",
+        ),
+        REALTIME_SOCKET => Some("tokio : : net : : TcpStream : : connect ( addresses )"),
+        _ => None,
+    }
+}
+
+/// The functions of `egress_rule_probes_tests.rs`, one per refused
+/// connection constructor (#606).
+const PROBES: &[&str] = &[
+    "hyper_http1_handshake",
+    "hyper_http1_builder",
+    "hyper_http1_builder_handshake",
+    "hyper_http2_handshake",
+    "hyper_http2_builder",
+    "hyper_http2_builder_handshake",
+    "hyper_util_client_builder",
+    "hyper_util_builder_new",
+    "hyper_util_builder_build",
+    "hyper_util_builder_build_http",
+    "hyper_util_http_connector",
+    "hyper_util_http_connector_with_resolver",
+    "hyper_rustls_connector",
+    "tungstenite_connect_async",
+    "tungstenite_connect_async_with_config",
+    "tungstenite_connect_async_tls_with_config",
+    "tokio_tcp_stream_connect",
+    "tokio_tcp_socket_connect",
+    "tokio_udp_socket_bind",
+    "std_tcp_stream_connect",
+    "std_tcp_stream_connect_timeout",
+    "std_udp_socket_bind",
+];
+
 // Pin transport selection at the sanctioned build/override expressions. Earlier
 // builder settings can change; the final transport assignment must stay explicit.
 fn aws_transport(reason: &str) -> Option<AwsTransport> {
@@ -497,6 +561,62 @@ fn aws_transport_must_be_set_on_the_sanctioned_expression() {
     assert!(!matches(STS_EXCEPTION, "other.build()"));
 }
 
+/// A sanctioned socket statement (#606) covers its one reviewed call only:
+/// another destination, another constructor or an extra call in the same
+/// statement is a finding.
+#[test]
+fn a_sanctioned_socket_statement_must_keep_its_expression() {
+    let src = Path::new("/repo/apps/gateway/src");
+    let matches = |reason, initializer| {
+        let file = src.join("fixture.rs");
+        let source = format!(
+            "fn fixture() {{
+                #[expect(clippy::disallowed_methods, reason = {reason:?})]
+                let connecting = {initializer};
+            }}"
+        );
+        scan(src, &file, &source) == [level("expect", false, &[], Some(reason), "let in fixture")]
+    };
+    assert!(matches(
+        HEALTH_PROBE,
+        "TcpStream::connect_timeout(&address, remaining()?)"
+    ));
+    assert!(matches(
+        AUDIT_SOCKET,
+        "tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(address))"
+    ));
+    assert!(matches(
+        REALTIME_SOCKET,
+        "tokio::net::TcpStream::connect(addresses)"
+    ));
+    for (reason, initializer) in [
+        (
+            HEALTH_PROBE,
+            "TcpStream::connect_timeout(&other, remaining()?)",
+        ),
+        (HEALTH_PROBE, "TcpStream::connect(address)"),
+        (
+            AUDIT_SOCKET,
+            "tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(\"203.0.113.1:514\"))",
+        ),
+        (
+            AUDIT_SOCKET,
+            "tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(address)).and(hyper_util::client::legacy::connect::HttpConnector::new())",
+        ),
+        (
+            REALTIME_SOCKET,
+            "tokio::net::TcpStream::connect(&addresses[1..])",
+        ),
+        (
+            REALTIME_SOCKET,
+            "tokio::net::TcpStream::connect(\"203.0.113.1:443\")",
+        ),
+        (REALTIME_SOCKET, "tokio_tungstenite::connect_async(url)"),
+    ] {
+        assert!(!matches(reason, initializer), "{initializer}");
+    }
+}
+
 /// The sanctioned sites of each file under `src/`; nothing for any other.
 fn sanctioned(name: &str) -> Vec<Finding> {
     let guarded = |on: &str| {
@@ -552,13 +672,46 @@ fn sanctioned(name: &str) -> Vec<Finding> {
         "db.rs" => vec![level("allow", false, &[], None, "let in start")],
         // tungstenite fills the upstream handshake's Sec-WebSocket-Key from
         // its own generator: a protocol nonce, not a gateway secret (#511).
-        "providers/openai/realtime.rs" => vec![level(
+        // The session's socket is opened on addresses the egress resolver
+        // returned (#606).
+        "providers/openai/realtime.rs" => vec![
+            level(
+                "expect",
+                false,
+                &[],
+                Some("tungstenite's Sec-WebSocket-Key is a handshake nonce, not a secret (#511)"),
+                "fn handshake_request",
+            ),
+            level("expect", false, &[], Some(REALTIME_SOCKET), "let in dial"),
+        ],
+        "healthcheck.rs" => vec![level(
             "expect",
             false,
             &[],
-            Some("tungstenite's Sec-WebSocket-Key is a handshake nonce, not a secret (#511)"),
-            "fn handshake_request",
+            Some(HEALTH_PROBE),
+            "let in probe",
         )],
+        "audit_export.rs" => vec![level(
+            "expect",
+            false,
+            &[],
+            Some(AUDIT_SOCKET),
+            "let in session",
+        )],
+        // Test-only probes, never called: each proves one clippy.toml entry
+        // still fires (#606).
+        "egress_rule_probes_tests.rs" => PROBES
+            .iter()
+            .map(|probe| {
+                level(
+                    "expect",
+                    false,
+                    &[],
+                    Some("probe of a refused constructor (#606)"),
+                    &format!("fn {probe}"),
+                )
+            })
+            .collect(),
         "lib.rs" => vec![
             level("allow", true, &["test"], None, "crate"),
             level_of(TYPES, "allow", true, &["test"], None, "crate"),

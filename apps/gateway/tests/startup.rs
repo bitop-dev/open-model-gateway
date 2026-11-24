@@ -1070,6 +1070,10 @@ async fn bootstrap_dev_cli_refuses_unrelated_installation(pool: sqlx::PgPool) {
 
 #[cfg(feature = "integration-tests")]
 #[sqlx::test(migrations = "./enterprise_migrations")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a loopback forwarder to the test database, not gateway egress"
+)]
 async fn bootstrap_dev_cli_seeds_through_ipv6_loopback(pool: sqlx::PgPool) {
     use sqlx::ConnectOptions;
     use tokio::net::{TcpListener, TcpStream};

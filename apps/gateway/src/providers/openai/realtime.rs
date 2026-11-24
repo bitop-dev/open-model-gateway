@@ -136,6 +136,17 @@ fn handshake_request(url: String) -> Result<tungstenite::handshake::client::Requ
         .map_err(|_| InferenceError::Configuration)
 }
 
+/// Open the session's socket to the addresses `crate::egress::resolve`
+/// returned for the provider host (the first that answers).
+async fn dial(addresses: &[std::net::SocketAddr]) -> std::io::Result<tokio::net::TcpStream> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the realtime session dials addresses from crate::egress::resolve (#606)"
+    )]
+    let connecting = tokio::net::TcpStream::connect(addresses);
+    connecting.await
+}
+
 pub(super) async fn connect(
     adapter: &OpenAiAdapter,
     target: &Deployment,
@@ -167,7 +178,7 @@ pub(super) async fn connect(
     // mark it as possibly sent like one (`inference::dispatch`), although
     // realtime sessions settle from their own windows today.
     crate::inference::dispatch::started();
-    let stream = timeout_at(deadline, tokio::net::TcpStream::connect(&addresses[..]))
+    let stream = timeout_at(deadline, dial(&addresses))
         .await
         .map_err(|_| InferenceError::Timeout)?
         .map_err(|_| InferenceError::UpstreamUnavailable)?;
