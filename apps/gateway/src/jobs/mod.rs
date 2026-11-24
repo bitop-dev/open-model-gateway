@@ -91,6 +91,9 @@ pub struct JobLimits {
     /// `GATEWAY_BATCH_CONCURRENCY` (default 2, 1–64): lines of one batch
     /// executing at once.
     pub batch_concurrency: usize,
+    /// `GATEWAY_JOB_POLL_CONCURRENCY` (default 4, 1–32): provider jobs one
+    /// process refreshes at once.
+    pub poll_concurrency: usize,
 }
 const MIB: u64 = 1024 * 1024;
 impl Default for JobLimits {
@@ -102,6 +105,7 @@ impl Default for JobLimits {
             output_scan_bytes: 1024 * MIB,
             batch_workers: 4,
             batch_concurrency: 2,
+            poll_concurrency: 4,
         }
     }
 }
@@ -155,6 +159,13 @@ impl JobLimits {
                 "GATEWAY_BATCH_CONCURRENCY must be 1..=64"
             );
             limits.batch_concurrency = n as usize;
+        }
+        if let Some(n) = int("GATEWAY_JOB_POLL_CONCURRENCY")? {
+            anyhow::ensure!(
+                (1..=32).contains(&n),
+                "GATEWAY_JOB_POLL_CONCURRENCY must be 1..=32"
+            );
+            limits.poll_concurrency = n as usize;
         }
         Ok(limits)
     }
@@ -237,6 +248,12 @@ pub struct Jobs {
     /// is [`native::SUBMIT_GRACE`]).
     #[cfg(test)]
     pub(crate) submit_grace: TimeDelta,
+    /// Test-only count of poller claim statements.
+    #[cfg(test)]
+    pub(crate) claim_statements: Arc<std::sync::atomic::AtomicUsize>,
+    /// Test-only: this many next poller claims come back empty.
+    #[cfg(test)]
+    pub(crate) empty_claims: Arc<std::sync::atomic::AtomicUsize>,
 }
 /// The next finishing run waits here once armed (tests).
 #[cfg(test)]
@@ -295,6 +312,10 @@ impl Jobs {
             settle_hold: Arc::default(),
             #[cfg(test)]
             submit_grace: native::SUBMIT_GRACE,
+            #[cfg(test)]
+            claim_statements: Arc::default(),
+            #[cfg(test)]
+            empty_claims: Arc::default(),
         }
     }
     /// Attach the approved local endpoints (batch scheduling load signals).

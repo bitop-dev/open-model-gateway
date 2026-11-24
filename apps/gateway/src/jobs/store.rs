@@ -321,29 +321,52 @@ pub(crate) async fn mark_deleted(store: &Store, id: Uuid) -> Result<()> {
     Ok(())
 }
 /// Claim the next due, unsettled provider job within its poll deadline that
-/// no poller holds, for `poller`: a lease that must be renewed while the job
-/// is refreshed. Gateway-run batches belong to the batch runner, never the
-/// poller, so the two never claim the same row. The claim bumps the job's
-/// epoch in the statement that takes it, so an earlier claim of the job is
-/// fenced from then on ([`super::fence`]); it pushes the next poll forward,
-/// so one pass never claims a job twice. A job with a fenced write in flight
-/// is skipped (`SKIP LOCKED`) and taken on a later call.
+/// no poller holds, for `poller` ([`claim_due_many`] of one).
+#[cfg(test)]
 pub(crate) async fn claim_due(
     store: &Store,
     poller: Uuid,
     interval_seconds: f64,
     lease_seconds: f64,
 ) -> Result<Option<(JobRow, BatchFence)>> {
-    let claimed: Option<Claimed> = sqlx::query_as(&format!("UPDATE async_jobs SET next_poll_at=clock_timestamp()+make_interval(secs=>$2),runner_id=$1,runner_epoch=runner_epoch+1,runner_lease_until=clock_timestamp()+make_interval(secs=>$3) WHERE id=(SELECT id FROM async_jobs WHERE settled_at IS NULL AND batch_mode IS DISTINCT FROM 'gateway' AND next_poll_at<=clock_timestamp() AND poll_deadline_at>clock_timestamp() AND (runner_lease_until IS NULL OR runner_lease_until<clock_timestamp()) ORDER BY next_poll_at,id LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING {JOB_COLUMNS},runner_epoch"))
-        .bind(poller).bind(interval_seconds).bind(lease_seconds).fetch_optional(&store.pool).await.map_err(job_storage)?;
-    Ok(claimed.map(|c| {
-        let fence = BatchFence {
-            job: c.job.id,
-            runner: poller,
-            epoch: c.runner_epoch,
-        };
-        (c.job, fence)
-    }))
+    Ok(
+        claim_due_many(store, poller, interval_seconds, lease_seconds, 1)
+            .await?
+            .pop(),
+    )
+}
+/// Claim up to `limit` due, unsettled provider jobs within their poll
+/// deadline that no poller holds, for `poller`, in one statement: each a
+/// lease that must be renewed while the job is refreshed. Gateway-run
+/// batches belong to the batch runner, never the poller, so the two never
+/// claim the same row. The claim bumps each job's epoch in the statement
+/// that takes it, so an earlier claim of the job is fenced from then on
+/// ([`super::fence`]); it pushes the next poll forward, so a job is not
+/// claimed again until then. A job with a fenced write in flight is skipped
+/// (`SKIP LOCKED`) and taken on a later call. One statement reads the head
+/// of `async_jobs_due` (which also holds gateway-run batches and expired,
+/// unsettled jobs that no claim takes) once for all the slots it fills.
+pub(crate) async fn claim_due_many(
+    store: &Store,
+    poller: Uuid,
+    interval_seconds: f64,
+    lease_seconds: f64,
+    limit: usize,
+) -> Result<Vec<(JobRow, BatchFence)>> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let claimed: Vec<Claimed> = sqlx::query_as(&format!("UPDATE async_jobs SET next_poll_at=clock_timestamp()+make_interval(secs=>$2),runner_id=$1,runner_epoch=runner_epoch+1,runner_lease_until=clock_timestamp()+make_interval(secs=>$3) WHERE id IN(SELECT id FROM async_jobs WHERE settled_at IS NULL AND batch_mode IS DISTINCT FROM 'gateway' AND next_poll_at<=clock_timestamp() AND poll_deadline_at>clock_timestamp() AND (runner_lease_until IS NULL OR runner_lease_until<clock_timestamp()) ORDER BY next_poll_at,id LIMIT $4 FOR UPDATE SKIP LOCKED) RETURNING {JOB_COLUMNS},runner_epoch"))
+        .bind(poller).bind(interval_seconds).bind(lease_seconds).bind(limit).fetch_all(&store.pool).await.map_err(job_storage)?;
+    Ok(claimed
+        .into_iter()
+        .map(|c| {
+            let fence = BatchFence {
+                job: c.job.id,
+                runner: poller,
+                epoch: c.runner_epoch,
+            };
+            (c.job, fence)
+        })
+        .collect())
 }
 pub(crate) async fn reservation_pending(store: &Store, execution: Uuid) -> Result<bool> {
     sqlx::query_scalar(
