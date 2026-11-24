@@ -37,23 +37,35 @@ pub(super) fn empty(value: &Value) -> bool {
     }
 }
 
-/// Whether a usage value reports anything other than zero. Only an integer
-/// zero is zero: a float cannot tell a tiny exact cost (`1e-400`) from zero,
-/// and a string or boolean in place of a count is a malformed meter, which is
-/// no evidence that nothing was processed. The one exception is a label,
-/// exempt by its name and type (`labels`).
+/// Whether a usage member reports anything other than zero. `null` and an
+/// empty usage object report nothing. Inside it, only an integer zero and
+/// `null` (OpenAI sends `*_details: null`) are zero: a float cannot tell a
+/// tiny exact cost (`1e-400`) from zero, a string or boolean in place of a
+/// count is a malformed meter, and an empty object or array where a count
+/// or its details belong is malformed too; none of them is evidence that
+/// nothing was processed. The labels (`label`) are exempt, and only as
+/// direct members of the usage object.
+fn usage_nonzero(usage: &Value) -> bool {
+    match usage {
+        Value::Null => false,
+        Value::Object(members) => members
+            .iter()
+            .any(|(name, value)| !label(name, value) && nonzero(value)),
+        other => nonzero(other),
+    }
+}
 fn nonzero(value: &Value) -> bool {
     match value {
         Value::Null => false,
         Value::Number(n) => n.as_u64() != Some(0) && n.as_i64() != Some(0),
         Value::Bool(_) | Value::String(_) => true,
-        Value::Array(a) => a.iter().any(nonzero),
-        Value::Object(o) => o.iter().any(|(name, v)| !label(name, v) && nonzero(v)),
+        Value::Array(a) => a.is_empty() || a.iter().any(nonzero),
+        Value::Object(o) => o.is_empty() || o.values().any(nonzero),
     }
 }
-/// A usage member that names or flags the usage object rather than counting
-/// anything: OpenAI's transcription `"type":"tokens"` or `"duration"`, and
-/// OpenRouter's `"is_byok"`.
+/// A direct member of a usage object that names or flags it rather than
+/// counting anything: OpenAI's transcription `"type":"tokens"` (or
+/// `"duration"`) and OpenRouter's `"is_byok"` boolean.
 fn label(name: &str, value: &Value) -> bool {
     matches!(
         (name, value),
@@ -76,8 +88,10 @@ pub(super) fn check(
     if empty(error) {
         return Ok(());
     }
+    // Usage reported inside the error object itself is evidence too.
     if output.iter().any(|member| !empty(&body[*member]))
-        || usage.iter().any(|member| nonzero(&body[*member]))
+        || usage.iter().any(|member| usage_nonzero(&body[*member]))
+        || usage_nonzero(&error["usage"])
     {
         return Err(InferenceError::InvalidUpstream);
     }

@@ -289,7 +289,9 @@ impl Endpoint {
             Self::Transcription => Some(("text", json!("Hello"))),
             Self::Rerank => Some(("results", json!([{"index":0,"relevance_score":0.5}]))),
             Self::Systemone => Some(("answers", json!({"is_q":true}))),
-            Self::Speech => None,
+            // OpenAI's SSE speech events carry `audio`; a JSON answer that
+            // holds audio under `data` is treated the same.
+            Self::Speech => Some(("audio", json!("UklGRiQAAABXQVZF"))),
         }
     }
     /// A usage object of this endpoint on `kind` reporting 3 input tokens.
@@ -668,27 +670,99 @@ async fn a_broken_json_speech_body_is_an_invalid_response() {
 /// and `is_byok` are exempt, by name.
 #[tokio::test]
 async fn a_malformed_usage_value_is_never_read_as_zero() {
-    for usage in [
-        r#"{"prompt_tokens":"NaN"}"#,
-        r#"{"prompt_tokens":true}"#,
-        r#"{"prompt_tokens":"none"}"#,
-        r#"{"details":{"cached":"x"}}"#,
-        r#"{"type":5}"#,
-    ] {
-        let body = format!(r#"{{"error":{{"code":429}},"usage":{usage}}}"#).into_bytes();
-        for kind in [Kind::OpenAi, Kind::OpenRouter, Kind::Local] {
-            let (class, _) = complete_raw(kind, false, body.clone()).await;
-            assert_eq!(
-                class,
-                Some(InferenceError::InvalidUpstream),
-                "{kind:?} {usage}"
-            );
+    let malformed = [
+        json!({"prompt_tokens":"NaN"}),
+        json!({"prompt_tokens":true}),
+        json!({"prompt_tokens":"none"}),
+        json!({"details":{"cached":"x"}}),
+        json!({"type":5}),
+        json!({"is_byok":"false"}),
+        // A label is exempt only as a direct member of the usage object.
+        json!({"details":{"type":"x"}}),
+        json!({"details":{"is_byok":true}}),
+        // An empty container where a count or its details belong.
+        json!({"details":{}}),
+        json!({"details":[]}),
+        json!({"prompt_tokens":{}}),
+        json!([]),
+    ];
+    let mut problems = Vec::new();
+    for usage in &malformed {
+        for kind in KINDS {
+            let mut body = envelope(kind, named(kind, "rate_limit_error"));
+            body["usage"] = usage.clone();
+            let (class, _) = complete(kind, false, &body).await;
+            if class != Some(InferenceError::InvalidUpstream) {
+                problems.push(format!("{kind:?} {usage}: {class:?}"));
+            }
+        }
+        for &(kind, endpoint) in ENDPOINTS {
+            let body = json!({"error":{"code":"rate_limit_exceeded"},"usage":usage});
+            let (class, _) = call(kind, endpoint, &body).await;
+            if class != Some(InferenceError::InvalidUpstream) {
+                problems.push(format!("{kind:?} {endpoint:?} {usage}: {class:?}"));
+            }
         }
     }
-    let body =
-        br#"{"error":{"code":429},"usage":{"type":"tokens","is_byok":false,"prompt_tokens":0}}"#;
-    let (class, _) = complete_raw(Kind::OpenAi, false, body.to_vec()).await;
-    assert_eq!(class, Some(InferenceError::Busy));
+    // Clean: integer zeros, null details, the two labels as direct members,
+    // and an empty usage object, which reports nothing.
+    for usage in [
+        json!({"type":"tokens","is_byok":false,"prompt_tokens":0,"prompt_tokens_details":null}),
+        json!({}),
+        json!(null),
+    ] {
+        for kind in KINDS {
+            let mut body = envelope(kind, named(kind, "rate_limit_error"));
+            body["usage"] = usage.clone();
+            let (class, _) = complete(kind, false, &body).await;
+            if class != Some(InferenceError::Busy) {
+                problems.push(format!("{kind:?} clean {usage}: {class:?}"));
+            }
+        }
+    }
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+/// Usage reported inside the error object itself is evidence too.
+#[tokio::test]
+async fn usage_inside_the_error_object_makes_it_an_invalid_response() {
+    for kind in KINDS {
+        let mut error = named(kind, "rate_limit_error");
+        error["usage"] = json!({"total_tokens":500});
+        let (class, _) = complete(kind, false, &envelope(kind, error)).await;
+        assert_eq!(class, Some(InferenceError::InvalidUpstream), "{kind:?}");
+    }
+}
+
+/// A JSON speech answer holding audio under `data` next to an error may
+/// follow synthesis: it is not a clean envelope.
+#[tokio::test]
+async fn speech_audio_under_data_next_to_an_error_is_an_invalid_response() {
+    for kind in [Kind::OpenAi, Kind::OpenRouter] {
+        let body = json!({"error":{"code":"rate_limit_exceeded"},"data":"UklGRiQAAABXQVZF"});
+        let (class, _) = call(kind, Endpoint::Speech, &body).await;
+        assert_eq!(class, Some(InferenceError::InvalidUpstream), "{kind:?}");
+    }
+}
+
+/// A 200 body was sent: the attempt's dispatch mark is set whatever the
+/// envelope's class, so settlement never records such an attempt as
+/// "nothing sent" (`inference::dispatch`).
+#[tokio::test]
+async fn a_200_error_envelope_is_never_an_attempt_that_sent_nothing() {
+    for kind in KINDS {
+        for name in [
+            "rate_limit_error",
+            "invalid_request_error",
+            "brand_new_error",
+        ] {
+            let body = envelope(kind, named(kind, name));
+            let ((class, _), nothing_sent) =
+                crate::inference::dispatch::observe(complete(kind, false, &body)).await;
+            assert!(class.is_some(), "{kind:?} {name}");
+            assert!(!nothing_sent, "{kind:?} {name}");
+        }
+    }
 }
 
 /// A Responses body whose terminal state says generation ran (`incomplete`,

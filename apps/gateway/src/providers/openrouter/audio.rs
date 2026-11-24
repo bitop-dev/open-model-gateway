@@ -16,8 +16,8 @@ use super::{OpenRouterAdapter, embedded_error, object, provider_cost, status_err
 use crate::{
     inference::{error::InferenceError, types::*},
     providers::audio::{
-        TRANSCRIPTION_OUTPUT, TRANSCRIPTION_USAGE, decode_transcription, media_type, read_json,
-        speech_body, transcription_evidence,
+        SPEECH_OUTPUT, TRANSCRIPTION_OUTPUT, TRANSCRIPTION_USAGE, decode_transcription, media_type,
+        read_json, speech_body, transcription_evidence,
     },
 };
 
@@ -134,7 +134,14 @@ impl OpenRouterAdapter {
             let cost = provider_cost(&bytes);
             // Speech is valued from its input; a JSON answer's usage is only
             // evidence that the error may follow processing.
-            embedded_error(&value, &[], &["usage"], &cost, status_error, || None)?;
+            embedded_error(
+                &value,
+                SPEECH_OUTPUT,
+                &["usage"],
+                &cost,
+                status_error,
+                || None,
+            )?;
             return Err(InferenceError::InvalidUpstream);
         }
         speech_body(response, &request, transport).await

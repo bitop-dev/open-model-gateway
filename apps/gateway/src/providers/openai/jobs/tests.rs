@@ -645,3 +645,27 @@ fn a_native_line_with_a_duplicate_member_is_not_decoded() {
     let line = br#"{"id":"r","custom_id":"l0","response":{"status_code":200,"body":{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1]}],"usage":{"prompt_tokens":1,"total_tokens":1},"error":{"code":"x"},"error":null}},"error":null}"#;
     assert!(super::decode_native_result(BatchEndpoint::Embeddings, line).is_err());
 }
+
+/// A batch status body that names a member twice is not read (its `usage`
+/// feeds the batch's usage).
+#[tokio::test]
+async fn a_batch_status_body_with_a_duplicate_member_is_refused() {
+    let valid = batch("completed").to_string();
+    let duplicated = valid.replacen(
+        r#""usage":"#,
+        r#""usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0},"usage":"#,
+        1,
+    );
+    let t = target("gpt-x");
+    let upstream = parse_batch(&batch("in_progress")).unwrap();
+    for (body, ok) in [(valid, true), (duplicated, false)] {
+        let mock = Mock::new(vec![Reply {
+            status: 200,
+            content_type: "application/json",
+            body: body.into_bytes(),
+        }])
+        .await;
+        let result = mock.adapter().retrieve_batch(&t, &upstream.id).await;
+        assert_eq!(result.is_ok(), ok, "duplicate refused: {}", !ok);
+    }
+}

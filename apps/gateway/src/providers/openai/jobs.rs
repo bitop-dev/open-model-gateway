@@ -77,8 +77,7 @@ async fn read_object(response: reqwest::Response) -> Result<Value> {
         }
         body.extend_from_slice(&chunk);
     }
-    let value: Value =
-        serde_json::from_slice(&body).map_err(|_| InferenceError::InvalidUpstream)?;
+    let value: Value = crate::providers::framing::json(&body)?;
     if !value.is_object() {
         return Err(InferenceError::InvalidUpstream);
     }

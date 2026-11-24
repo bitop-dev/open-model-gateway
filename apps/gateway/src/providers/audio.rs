@@ -182,6 +182,10 @@ fn transcription_usage(
 /// processed the audio), and the ones that report usage (`error_envelope`).
 pub(crate) const TRANSCRIPTION_OUTPUT: &[&str] = &["text", "segments", "words", "logprobs"];
 pub(crate) const TRANSCRIPTION_USAGE: &[&str] = &["usage", "duration"];
+/// The members a JSON speech answer could carry audio in: OpenAI's speech
+/// stream events name it `audio`; `data` is the common JSON wrapper. Audio
+/// next to an error means speech may have been synthesised.
+pub(crate) const SPEECH_OUTPUT: &[&str] = &["audio", "data"];
 
 /// The usage a transcription body reports, as evidence for a failed
 /// attempt: `None` without a usage object.

@@ -15,8 +15,8 @@ use super::{BASE, OpenAiAdapter, check_status, transport_error};
 use crate::{
     inference::{error::InferenceError, types::*},
     providers::audio::{
-        Multipart, TRANSCRIPTION_OUTPUT, TRANSCRIPTION_USAGE, decode_transcription, read_json,
-        speech_body, transcription_evidence,
+        Multipart, SPEECH_OUTPUT, TRANSCRIPTION_OUTPUT, TRANSCRIPTION_USAGE, decode_transcription,
+        read_json, speech_body, transcription_evidence,
     },
 };
 
@@ -129,7 +129,7 @@ pub(super) async fn speak(
         // answer, as any non-audio answer is, not an unavailable provider.
         let bytes = read_json(response, |_| InferenceError::InvalidUpstream).await?;
         let value: Value = crate::providers::framing::json(&bytes)?;
-        envelope(&value, &[], &["usage"])?;
+        envelope(&value, SPEECH_OUTPUT, &["usage"])?;
         return Err(InferenceError::InvalidUpstream);
     }
     speech_body(response, &request, transport_error).await
