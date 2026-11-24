@@ -15,10 +15,11 @@
 //!   (402 without purchased credit), so enforcement there is unverified.
 use serde_json::{Value, json};
 
-use super::{OpenRouterAdapter, parse};
+use super::{OpenRouterAdapter, embedded_error, parse};
 use crate::{
     inference::{
         error::InferenceError,
+        evidence,
         images::{ImageRequest, ImageResponse, ImageSize, ImageTier},
         types::{Deployment, Usage},
     },
@@ -95,6 +96,14 @@ impl OpenRouterAdapter {
         let bytes = images::read_bounded(response, request.max_response_bytes).await?;
         let (value, cost) = parse(&bytes)?;
         drop(bytes);
+        if let Err(error) = embedded_error(&value, &["data"]) {
+            // A valid usage object next to the error is kept as evidence.
+            return evidence::preserve(Err(error), || {
+                value["usage"]
+                    .is_object()
+                    .then(|| usage(&value["usage"], cost))
+            });
+        }
         let usage = usage(&value["usage"], cost)?;
         images::decode(&value, &request, usage, Some(tier.variant()), Ok(None))
     }

@@ -86,7 +86,9 @@ impl OpenRouterAdapter {
         let response = self.post(target, "/audio/transcriptions", &body).await?;
         let bytes = read_json(response, transport).await?;
         let (value, cost) = parse(&bytes)?;
-        let mut decoded = decode_transcription(&bytes, &value, &request)?;
+        let mut decoded = decode_transcription(&bytes, &value, &request, |value| {
+            embedded_error(value, &["text"])
+        })?;
         decoded.usage.provider_cost_microusd = cost;
         Ok(decoded)
     }
@@ -117,7 +119,7 @@ impl OpenRouterAdapter {
             let bytes = read(response).await?;
             let value: serde_json::Value =
                 serde_json::from_slice(&bytes).map_err(|_| InferenceError::InvalidUpstream)?;
-            embedded_error(&value)?;
+            embedded_error(&value, &[])?;
             return Err(InferenceError::InvalidUpstream);
         }
         speech_body(response, &request, transport).await

@@ -259,7 +259,11 @@ impl ProviderAdapter for OpenAiAdapter {
             .await
             .map_err(transport_error)?;
         check_status(response.status())?;
-        super::embeddings::decode(&super::framing::body(response).await?, &request)
+        super::embeddings::decode(
+            &super::framing::body(response).await?,
+            &request,
+            super::framing::status_error,
+        )
     }
 
     async fn execute(&self, target: &Deployment, request: ChatRequest) -> Result<ProviderOutput> {
@@ -519,7 +523,7 @@ fn finish(value: &Value) -> Result<FinishReason> {
     }
 }
 
-fn usage(value: &Value) -> Result<Usage> {
+pub(super) fn usage(value: &Value) -> Result<Usage> {
     super::metering::inclusive(
         value,
         "prompt_tokens",
@@ -573,18 +577,13 @@ pub(super) fn decode_complete_protocol(
         })
     })
 }
-fn wire_error(value: &Value, messages: bool) -> InferenceError {
-    if messages {
-        super::framing::classified_error(value).unwrap_or(InferenceError::InvalidUpstream)
-    } else {
-        InferenceError::InvalidUpstream
-    }
-}
 fn decode_shape(value: &Value, profile: Option<&str>, messages: bool) -> Result<ChatResponse> {
     object(value)?;
-    if !empty(&value["error"]) {
-        return Err(wire_error(value, messages));
-    }
+    // A 200 error envelope (`error_envelope`); the caller's `preserve`
+    // keeps a valid usage object next to it as evidence.
+    super::error_envelope::check(value, &["choices"], &["usage"], |code| {
+        super::stream_error::openai_chat_status(value, messages, code)
+    })?;
     let choices = array(&value["choices"])?;
     if choices.len() != 1 {
         return Err(InferenceError::InvalidUpstream);

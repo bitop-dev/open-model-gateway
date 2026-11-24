@@ -178,10 +178,14 @@ fn transcription_usage(
 }
 
 /// Decode a JSON transcription body (`response_format:"json"` upstream).
+/// `envelope` checks the body's 200 error envelope (`error_envelope`) with
+/// the adapter's own status table, inside the evidence scope, so a valid
+/// usage object next to an error is kept.
 pub(crate) fn decode_transcription(
     bytes: &[u8],
     value: &Value,
     request: &TranscriptionRequest,
+    envelope: impl FnOnce(&Value) -> Result<()>,
 ) -> Result<TranscriptionResponse> {
     let probe: SecondsProbe =
         serde_json::from_slice(bytes).map_err(|_| InferenceError::InvalidUpstream)?;
@@ -189,6 +193,7 @@ pub(crate) fn decode_transcription(
     let usage = || transcription_usage(&value["usage"], seconds, request.duration_ms);
     let shape = (|| {
         let object = value.as_object().ok_or(InferenceError::InvalidUpstream)?;
+        envelope(value)?;
         // Metadata may appear; content-bearing extras (segments, words,
         // logprobs) were not requested and must not be silently dropped.
         for (key, v) in object {
@@ -263,7 +268,7 @@ mod tests {
     }
     fn decode(v: Value, duration: Option<u64>) -> Result<TranscriptionResponse> {
         let bytes = serde_json::to_vec(&v).unwrap();
-        decode_transcription(&bytes, &v, &request(duration))
+        decode_transcription(&bytes, &v, &request(duration), |_| Ok(()))
     }
 
     #[test]

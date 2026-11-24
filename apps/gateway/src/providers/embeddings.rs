@@ -74,16 +74,30 @@ fn vector(
         })
         .collect()
 }
+/// Ollama's native body; its token count is the top-level
+/// `prompt_eval_count`, and its error envelope uses the local status table.
 pub(crate) fn decode_ollama(
     value: &Value,
     request: &EmbeddingRequest,
 ) -> Result<EmbeddingResponse> {
+    if let Err(error) = super::error_envelope::check(
+        value,
+        &["embeddings"],
+        &["prompt_eval_count"],
+        super::framing::status_error,
+    ) {
+        // Only a reported count is evidence next to an error.
+        return crate::inference::evidence::preserve(Err(error), || {
+            (!value["prompt_eval_count"].is_null())
+                .then(|| super::metering::ollama_embedding(value))
+        });
+    }
     crate::inference::evidence::preserve(decode_ollama_inner(value, request), || {
         Some(super::metering::ollama_embedding(value))
     })
 }
 fn decode_ollama_inner(value: &Value, request: &EmbeddingRequest) -> Result<EmbeddingResponse> {
-    if !value.is_object() || !value["error"].is_null() {
+    if !value.is_object() {
         return Err(InferenceError::InvalidUpstream);
     }
     let data = value["embeddings"]
@@ -103,13 +117,27 @@ fn decode_ollama_inner(value: &Value, request: &EmbeddingRequest) -> Result<Embe
         usage: super::metering::ollama_embedding(value)?,
     })
 }
-pub(crate) fn decode(value: &Value, request: &EmbeddingRequest) -> Result<EmbeddingResponse> {
+/// An OpenAI-shaped embeddings body. `as_http` is the adapter's status
+/// table for a 200 error envelope (`error_envelope`).
+pub(crate) fn decode(
+    value: &Value,
+    request: &EmbeddingRequest,
+    as_http: fn(u16) -> InferenceError,
+) -> Result<EmbeddingResponse> {
+    if let Err(error) = super::error_envelope::check(value, &["data"], &["usage"], as_http) {
+        // Only a reported usage object is evidence next to an error.
+        return crate::inference::evidence::preserve(Err(error), || {
+            value["usage"]
+                .is_object()
+                .then(|| super::metering::embedding(&value["usage"]))
+        });
+    }
     crate::inference::evidence::preserve(decode_inner(value, request), || {
         Some(super::metering::embedding(&value["usage"]))
     })
 }
 fn decode_inner(value: &Value, request: &EmbeddingRequest) -> Result<EmbeddingResponse> {
-    if !value.is_object() || !value["error"].is_null() || value["object"] != "list" {
+    if !value.is_object() || value["object"] != "list" {
         return Err(InferenceError::InvalidUpstream);
     }
     let data = value["data"]
@@ -152,21 +180,21 @@ mod tests {
     #[test]
     fn indices_dimensions_and_usage_checked() {
         let good = json!({"object":"list","data":[{"object":"embedding","index":1,"embedding":[1,2]},{"object":"embedding","index":0,"embedding":[3,4]}],"usage":{"prompt_tokens":2,"total_tokens":2}});
-        let response = decode(&good, &request()).unwrap();
+        let response = decode(&good, &request(), super::super::framing::status_error).unwrap();
         assert_eq!(response.embeddings[0], vec![3., 4.]);
         assert_eq!(response.usage.output_tokens, Some(0));
         let mut bad = good.clone();
         bad["data"][0]["index"] = 0.into();
-        assert!(decode(&bad, &request()).is_err());
+        assert!(decode(&bad, &request(), super::super::framing::status_error).is_err());
         let mut bad = good.clone();
         bad["data"][0]["embedding"] = json!([1]);
-        assert!(decode(&bad, &request()).is_err());
+        assert!(decode(&bad, &request(), super::super::framing::status_error).is_err());
         let mut bad = good.clone();
         bad["usage"]["total_tokens"] = 3.into();
-        assert!(decode(&bad, &request()).is_err());
+        assert!(decode(&bad, &request(), super::super::framing::status_error).is_err());
         let mut bad = good;
         bad["data"][0]["embedding"] = json!([1e100, 2]);
-        assert!(decode(&bad, &request()).is_err());
+        assert!(decode(&bad, &request(), super::super::framing::status_error).is_err());
     }
     #[test]
     fn native_vectors_and_presence_are_not_guessed() {

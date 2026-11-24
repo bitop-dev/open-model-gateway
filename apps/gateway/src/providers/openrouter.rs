@@ -321,25 +321,21 @@ fn empty(value: &Value) -> bool {
     }
 }
 
-/// A 200 body (or stream frame) carrying `error` is a failure, mapped by code.
-fn embedded_error(value: &Value) -> Result<()> {
-    embedded_error_protocol(value, false)
-}
-fn embedded_error_protocol(value: &Value, messages: bool) -> Result<()> {
-    if empty(&value["error"]) {
-        return Ok(());
-    }
-    if let Some(code) = value["error"]["code"]
-        .as_u64()
-        .and_then(|c| u16::try_from(c).ok())
-    {
-        return Err(status_error(code));
-    }
-    Err(if messages {
-        super::framing::classified_error(value).unwrap_or(InferenceError::UpstreamUnavailable)
+/// The response path's class of HTTP `code` for the error body `value`:
+/// `status_error`, and for a Messages client a validation status refined by
+/// the body (`generation_error`), as `post_inner` applies it.
+fn error_status(value: &Value, messages: bool, code: u16) -> InferenceError {
+    if messages && matches!(code, 400 | 413 | 422) {
+        super::framing::generation_error(code, Some(value), super::framing::classified_error)
     } else {
-        InferenceError::UpstreamUnavailable
-    })
+        status_error(code)
+    }
+}
+
+/// A 200 body carrying `error` (`error_envelope`), for an endpoint whose
+/// answer is `output`; `usage` (with its `cost`) is the usage member.
+fn embedded_error(value: &Value, output: &[&str]) -> Result<()> {
+    super::error_envelope::check(value, output, &["usage"], status_error)
 }
 
 fn stream_embedded_error(value: &Value, messages: bool) -> Result<()> {
@@ -347,11 +343,7 @@ fn stream_embedded_error(value: &Value, messages: bool) -> Result<()> {
         return Ok(());
     }
     Err(super::stream_error::classify(&value["error"], |code| {
-        if messages && matches!(code, 400 | 413 | 422) {
-            super::framing::generation_error(code, Some(value), super::framing::classified_error)
-        } else {
-            status_error(code)
-        }
+        error_status(value, messages, code)
     }))
 }
 
@@ -395,17 +387,19 @@ fn provider_cost(bytes: &[u8]) -> Result<Option<i64>> {
         .transpose()
 }
 
-/// JSON object body plus exact provider cost evidence.
-fn parse(bytes: &[u8]) -> Result<(Value, Option<i64>)> {
-    parse_protocol(bytes, false)
-}
-fn parse_protocol(bytes: &[u8], messages: bool) -> Result<(Value, Option<i64>)> {
+/// A JSON object body. The caller checks its `error` (`embedded_error`)
+/// where a valid usage object next to it is kept as evidence.
+fn object(bytes: &[u8]) -> Result<Value> {
     let value: Value =
         serde_json::from_slice(bytes).map_err(|_| InferenceError::InvalidUpstream)?;
     if !value.is_object() {
         return Err(InferenceError::InvalidUpstream);
     }
-    embedded_error_protocol(&value, messages)?;
+    Ok(value)
+}
+/// JSON object body plus exact provider cost evidence.
+fn parse(bytes: &[u8]) -> Result<(Value, Option<i64>)> {
+    let value = object(bytes)?;
     Ok((value, provider_cost(bytes)?))
 }
 
@@ -443,7 +437,23 @@ fn normalize_choices(value: &mut Value) -> Result<()> {
 }
 
 fn decode_chat(bytes: &[u8], messages: bool) -> Result<ChatResponse> {
-    let (mut value, cost) = parse_protocol(bytes, messages)?;
+    let mut value = object(bytes)?;
+    let cost = provider_cost(bytes);
+    let envelope = super::error_envelope::check(&value, &["choices"], &["usage"], |code| {
+        error_status(&value, messages, code)
+    });
+    if let Err(error) = envelope {
+        // Usage and cost next to the error are kept as the attempt's evidence.
+        return evidence::preserve(Err(error), || {
+            value["usage"].is_object().then(|| {
+                openai::usage(&value["usage"]).map(|mut usage| {
+                    usage.provider_cost_microusd = cost.ok().flatten();
+                    metering::with_model(usage, &value["model"])
+                })
+            })
+        });
+    }
+    let cost = cost?;
     normalize_choices(&mut value)?;
     let mut response = openai::decode_complete(&value)?;
     response.usage.provider_cost_microusd = cost;
@@ -652,7 +662,6 @@ impl ProviderAdapter for OpenRouterAdapter {
         if !value.is_object() {
             return Err(InferenceError::InvalidUpstream);
         }
-        embedded_error(&value)?;
         let cost = provider_cost(&bytes);
         // Independent evidence: bad token metering must not erase a valid
         // reported cost, nor may bad cost erase valid token observations.
@@ -663,9 +672,15 @@ impl ProviderAdapter for OpenRouterAdapter {
         });
         observed.meters = Some(metering::text_workload_meters(Some(0)));
         observed.provider_cost_microusd = cost.as_ref().ok().copied().flatten();
+        if let Err(error) = embedded_error(&value, &["data"]) {
+            // Only a reported usage object is evidence next to an error.
+            return evidence::preserve(Err(error), || {
+                value["usage"].is_object().then_some(Ok(observed))
+            });
+        }
         evidence::preserve(
             cost.and_then(|_| {
-                let mut decoded = embeddings::decode(&value, &request)?;
+                let mut decoded = embeddings::decode(&value, &request, status_error)?;
                 decoded.usage = observed;
                 if let Some(width) = fixed_dimensions(&target.upstream_model)
                     && decoded.embeddings.iter().any(|v| v.len() != width as usize)
@@ -695,6 +710,13 @@ impl ProviderAdapter for OpenRouterAdapter {
         }
         let response = self.post(target, "/rerank", &body).await?;
         let (value, cost) = parse(&read(response).await?)?;
+        if let Err(error) = embedded_error(&value, &["results"]) {
+            return evidence::preserve(Err(error), || {
+                value["usage"]
+                    .is_object()
+                    .then(|| rerank_usage(&value["usage"], cost))
+            });
+        }
         let usage = rerank_usage(&value["usage"], cost)?;
         evidence::preserve(
             rerank_results(&value, &request).map(|results| RerankResponse { results, usage }),
@@ -712,6 +734,13 @@ impl ProviderAdapter for OpenRouterAdapter {
         body["provider"] = self.provider_preferences();
         let response = self.post(target, "/systemone", &body).await?;
         let (value, cost) = parse(&read(response).await?)?;
+        if let Err(error) = embedded_error(&value, &["answers"]) {
+            return evidence::preserve(Err(error), || {
+                value["usage"]
+                    .is_object()
+                    .then(|| systemone_usage(&value["usage"], cost))
+            });
+        }
         let usage = systemone_usage(&value["usage"], cost)?;
         evidence::preserve(
             parse_answers(&value["answers"], &request)

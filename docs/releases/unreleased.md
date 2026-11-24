@@ -9,3 +9,16 @@ Notes for changes on `main` after [v0.19.0](v0.19.0.md). They become the next re
 ## Upgrade
 
 No migration or grant change: the claim uses the `runner_id`, `runner_lease_until` and `runner_epoch` columns and grants of 0021 and 0081. The claim protects a job only once every gateway process runs this release. A process of an earlier release still polls with the old 30 s soft claim and ignores the lease, so drain older replicas rather than running them beside this one.
+
+## Provider errors inside a non-stream 200
+
+A provider error returned inside an HTTP 200 to a non-streaming request now has one classification across OpenAI chat, the local profiles, OpenAI Responses, Anthropic and OpenRouter, for chat, Messages, Responses, embeddings, images, audio, rerank and System One (#665). A clean envelope is classified like the same error inside a stream, so a recognised rate-limit or quota error (`rate_limit_error`, `rate_limit_exceeded`, `insufficient_quota`, a numeric 429) is `rate_limit_error`, as an HTTP 429 is. An unrecognised error is `upstream_unavailable`. An error next to output or nonzero usage is `invalid_upstream_response`, and valid usage next to it is recorded as the failed attempt's evidence. [Non-stream 200 errors](../provider-adapters.md#a-provider-error-inside-a-non-stream-200)
+
+**Upgrade note: failover and batch retries change.** No migration, grant or configuration change. Review routing policies and batch retry limits for these effects:
+
+- A clean 200-wrapped rate limit or quota error now **fails over** to the next route when the model's routing policy allows more than one attempt, and gateway-run **batch lines retry** it under their retry limit, exactly as for an HTTP 429. Before, OpenAI chat, local, Responses and Anthropic failed such a request as `invalid_upstream_response` with no failover or retry (Messages clients of OpenAI chat and OpenRouter already saw `rate_limit_error`).
+- An unrecognised 200 error on OpenAI chat, local, Responses and Anthropic is now `upstream_unavailable`: it counts against routing health, gateway batch lines retry it, and the engine fails over on it only with `allow_ambiguous_failover`. OpenRouter already classified it so.
+- A 200 error next to output or nonzero usage is now always `invalid_upstream_response`: never failed over or retried. OpenRouter (any client) and Messages clients of OpenAI chat used to classify it by its code, which could fail over (`Busy`) after the provider had produced something.
+- Routing health follows the new classes: 200 rate limits, quota errors and unrecognised errors now count against it on the adapters that used to report them as invalid responses (which do not count). Client-fault names (`invalid_request_error`, `authentication_error` and so on) still do not count.
+- Settlement: a clean 200 `invalid_request_error` (or another rejection name) with no usage on a fully free price now settles as a known zero on every adapter, as an HTTP 400 does (OpenRouter and the Messages context-length case already did). Every other failure keeps its hold as unknown, as before.
+- A 200 error envelope that is empty (`"error":{}` or `""`) is no error on every endpoint, as it already was for chat.

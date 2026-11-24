@@ -272,7 +272,7 @@ impl ProviderAdapter for LocalAdapter {
         if native {
             embeddings::decode_ollama(&value, &request)
         } else {
-            embeddings::decode(&value, &request)
+            embeddings::decode(&value, &request, framing::status_error)
         }
     }
     async fn execute_rerank(

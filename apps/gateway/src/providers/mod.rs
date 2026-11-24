@@ -23,6 +23,9 @@ pub mod capabilities;
 #[cfg(test)]
 pub(crate) mod contract;
 pub(crate) mod embeddings;
+#[cfg(test)]
+mod envelope_class_tests;
+mod error_envelope;
 pub(crate) mod framing;
 pub(crate) mod images;
 pub mod local;

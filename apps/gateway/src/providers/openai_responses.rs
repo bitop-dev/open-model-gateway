@@ -166,9 +166,9 @@ fn reasoning_fields(item: &Value) -> Result<()> {
     Ok(())
 }
 fn decode_shape(value: &Value) -> Result<ChatResponse> {
-    if !value["error"].is_null() {
-        return Err(InferenceError::InvalidUpstream);
-    }
+    // A failed response carries its `ResponseError` at `error`
+    // (`error_envelope`), classified as the stream's `response.failed` is.
+    super::error_envelope::check(value, &["output"], &["usage"], status_error)?;
     let reason = match value["status"].as_str() {
         Some("completed") => FinishReason::Stop,
         Some("incomplete") => match value["incomplete_details"]["reason"].as_str() {

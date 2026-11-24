@@ -146,8 +146,19 @@ pub(super) async fn execute(
     let value: Value =
         serde_json::from_slice(&bytes).map_err(|_| InferenceError::InvalidUpstream)?;
     drop(bytes);
-    if !value.is_object() || !value["error"].is_null() {
+    if !value.is_object() {
         return Err(InferenceError::InvalidUpstream);
+    }
+    if let Err(error) = crate::providers::error_envelope::check(
+        &value,
+        &["data"],
+        &["usage"],
+        crate::providers::framing::status_error,
+    ) {
+        // A valid usage object next to the error is kept as evidence.
+        return crate::inference::evidence::preserve(Err(error), || {
+            value["usage"].is_object().then(|| usage(&value["usage"]))
+        });
     }
     let usage = usage(&value["usage"])?;
     // An unknown declared format fails the attempt but keeps usage evidence.

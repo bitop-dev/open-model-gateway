@@ -6,7 +6,8 @@
 //! - `POST /audio/speech`: JSON request; the binary body is passed through
 //!   (media type checked against the requested format).
 //!
-//! Error bodies are never read.
+//! Error statuses' bodies are never read. A 200 JSON body that carries an
+//! `error` is classified (`error_envelope`); its text is never returned.
 use reqwest::header::{self, HeaderValue};
 use serde_json::{Value, json};
 
@@ -17,6 +18,16 @@ use crate::{
 };
 
 type Result<T> = std::result::Result<T, InferenceError>;
+
+/// A 200 body's error envelope, with this adapter's status table.
+fn envelope(value: &Value, output: &[&str]) -> Result<()> {
+    crate::providers::error_envelope::check(
+        value,
+        output,
+        &["usage"],
+        crate::providers::framing::status_error,
+    )
+}
 
 /// Validate the connection before resolving credentials.
 fn authorization(adapter: &OpenAiAdapter, target: &Deployment) -> Result<HeaderValue> {
@@ -76,10 +87,7 @@ pub(super) async fn transcribe(
     let bytes = read_json(response, transport_error).await?;
     let value: Value =
         serde_json::from_slice(&bytes).map_err(|_| InferenceError::InvalidUpstream)?;
-    if !(value["error"].is_null()) {
-        return Err(InferenceError::InvalidUpstream);
-    }
-    decode_transcription(&bytes, &value, &request)
+    decode_transcription(&bytes, &value, &request, |value| envelope(value, &["text"]))
 }
 
 pub(super) async fn speak(
@@ -107,6 +115,15 @@ pub(super) async fn speak(
         .await
         .map_err(transport_error)?;
     check_status(response.status())?;
+    if crate::providers::audio::media_type(&response).as_deref() == Some("application/json") {
+        // A 200 JSON body on speech is an error envelope or an unexpected
+        // envelope; never audio.
+        let bytes = read_json(response, transport_error).await?;
+        let value: Value =
+            serde_json::from_slice(&bytes).map_err(|_| InferenceError::InvalidUpstream)?;
+        envelope(&value, &[])?;
+        return Err(InferenceError::InvalidUpstream);
+    }
     speech_body(response, &request, transport_error).await
 }
 

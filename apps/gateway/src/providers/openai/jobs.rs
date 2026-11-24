@@ -646,7 +646,11 @@ pub(super) fn decode_native_result(endpoint: BatchEndpoint, line: &[u8]) -> Resu
                     input: vec![String::from("x"); n],
                     dimensions: None,
                 };
-                BatchResponse::Embeddings(crate::providers::embeddings::decode(body, &request)?)
+                BatchResponse::Embeddings(crate::providers::embeddings::decode(
+                    body,
+                    &request,
+                    crate::providers::framing::status_error,
+                )?)
             }))
         } else {
             let code = body["error"]["code"]

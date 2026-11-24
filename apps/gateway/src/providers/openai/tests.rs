@@ -189,12 +189,21 @@ async fn messages_parallel_calls_and_results_preserve_openai_turns() {
     super::super::contract::assert_parallel_chat_wire(&capture[0].body);
 }
 
+/// A clean 200 rate limit is `Busy` for every profile that shares this
+/// decoder (#665); next to output it is an invalid response.
 #[test]
-fn non_messages_error_decoding_preserves_shared_adapter_behavior() {
+fn a_200_rate_limit_is_busy_for_every_profile_unless_it_has_output() {
     let value = json!({"error":{"code":"rate_limit_exceeded","message":"prompt is too long"}});
+    let mut with_output = value.clone();
+    with_output["choices"] =
+        json!([{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}]);
     for profile in [None, Some("vllm"), Some("ollama")] {
         assert_error(
             decode_complete_profile(&value, profile),
+            InferenceError::Busy,
+        );
+        assert_error(
+            decode_complete_profile(&with_output, profile),
             InferenceError::InvalidUpstream,
         );
     }
