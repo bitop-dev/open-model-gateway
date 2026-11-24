@@ -237,8 +237,9 @@ impl Jobs {
         resolved: &Resolved,
         requested: Option<u32>,
     ) -> PricingCheck<LinePrice> {
+        // Only an adapter that forwards cache hints has them priced.
         let cache_controls = match request {
-            BatchRequest::Chat(r) if resolved.deployment.provider == "anthropic" => r
+            BatchRequest::Chat(r) if resolved.adapter.forwards_cache_controls() => r
                 .messages_options
                 .as_ref()
                 .map(|o| o.cache_controls.as_slice())

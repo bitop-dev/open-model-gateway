@@ -214,15 +214,42 @@ fn settings_validation() {
             end: "07:00".into(),
         }),
     };
-    assert_eq!(ok.validate("vllm", &approvals), Ok(()));
     assert_eq!(
-        RouteSettings::default().validate("openai", &approvals),
+        ok.validate(
+            crate::providers::capabilities::accepts_priority_hint("vllm"),
+            &approvals
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        RouteSettings::default().validate(
+            crate::providers::capabilities::accepts_priority_hint("openai"),
+            &approvals
+        ),
         Ok(())
     );
     // Priority hints only on vLLM-compatible routes, never negative.
-    assert!(ok.validate("openai", &approvals).is_err());
-    assert!(ok.validate("sglang", &approvals).is_err());
-    let bad = |s: RouteSettings| s.validate("vllm", &approvals).is_err();
+    assert!(
+        ok.validate(
+            crate::providers::capabilities::accepts_priority_hint("openai"),
+            &approvals
+        )
+        .is_err()
+    );
+    assert!(
+        ok.validate(
+            crate::providers::capabilities::accepts_priority_hint("sglang"),
+            &approvals
+        )
+        .is_err()
+    );
+    let bad = |s: RouteSettings| {
+        s.validate(
+            crate::providers::capabilities::accepts_priority_hint("vllm"),
+            &approvals,
+        )
+        .is_err()
+    };
     assert!(bad(RouteSettings {
         priority: Some(-1),
         ..ok.clone()

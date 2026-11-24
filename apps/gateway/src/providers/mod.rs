@@ -21,6 +21,8 @@ pub(crate) mod audio;
 pub mod bedrock;
 pub mod capabilities;
 #[cfg(test)]
+mod capability_tests;
+#[cfg(test)]
 pub(crate) mod contract;
 pub(crate) mod embeddings;
 pub(crate) mod framing;
@@ -47,6 +49,15 @@ pub trait ProviderAdapter: Send + Sync {
     /// Admission checks both client bounds and priced defaults before writes.
     fn generation_output_limit(&self) -> u32 {
         u32::MAX
+    }
+    /// Whether this adapter sends Messages `cache_control` hints to the
+    /// upstream, which then bills cache writes and later cache reads.
+    /// Admission and batch-line planning then require pinned cache read and
+    /// TTL write prices and a finite hold before any write; an adapter that
+    /// drops or refuses the hints returns `false` and its routes are priced
+    /// without them. A constant per adapter, read from the adapter in hand.
+    fn forwards_cache_controls(&self) -> bool {
+        false
     }
     fn supports_chat_request(&self, request: &ChatRequest) -> bool {
         self.capabilities().supports(request)

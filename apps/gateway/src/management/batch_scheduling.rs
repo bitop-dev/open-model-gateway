@@ -47,7 +47,9 @@ async fn read(
     let status = schedule::route_status(&mut *tx, id).await?;
     tx.commit().await?;
     Ok(Json(schedule::settings_document(
-        &settings, &provider, status,
+        &settings,
+        crate::providers::capabilities::accepts_priority_hint(&provider),
+        status,
     )))
 }
 
@@ -70,7 +72,10 @@ async fn write(
         )
     })?;
     settings
-        .validate(&provider, &approvals)
+        .validate(
+            crate::providers::capabilities::accepts_priority_hint(&provider),
+            &approvals,
+        )
         .map_err(|message| ApiError(StatusCode::BAD_REQUEST, message))?;
     schedule::save_settings(&mut tx, id, &settings, u.user_id()).await?;
     resources::audit(

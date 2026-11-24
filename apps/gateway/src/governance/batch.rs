@@ -425,7 +425,8 @@ pub(crate) struct LineContext {
 /// usual admission errors; `Configuration` when the batch's envelope is no
 /// longer pending (closed or reconciled), or when the runner no longer holds
 /// the batch's claim; no line may start then. A refused claim is not an
-/// admission failure and is not counted as one.
+/// admission failure and is not counted as one. `output_limit` and
+/// `forwards_cache_controls` are the line route adapter's.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn admit_line(
     store: &Store,
@@ -436,6 +437,7 @@ pub(crate) async fn admit_line(
     expected: &Deployment,
     planned_price: Option<Uuid>,
     output_limit: u32,
+    forwards_cache_controls: bool,
     generation_request: Option<&ChatRequest>,
 ) -> Result<crate::inference::repository::GenerationAdmission, InferenceError> {
     let admitted = locks::retry_deadlocks!(
@@ -449,6 +451,7 @@ pub(crate) async fn admit_line(
             expected,
             planned_price,
             output_limit,
+            forwards_cache_controls,
             generation_request
         )
         .await
@@ -477,6 +480,7 @@ async fn admit_line_unobserved(
     expected: &Deployment,
     planned_price: Option<Uuid>,
     output_limit: u32,
+    forwards_cache_controls: bool,
     generation_request: Option<&ChatRequest>,
 ) -> Result<Option<crate::inference::repository::GenerationAdmission>, InferenceError> {
     if !(1..=86_400).contains(&lease_seconds)
@@ -534,7 +538,7 @@ async fn admit_line_unobserved(
             .await?
             .ok_or(InferenceError::Configuration)?,
     };
-    if current.provider == "anthropic"
+    if forwards_cache_controls
         && let Some(options) = generation_request.and_then(|r| r.messages_options.as_deref())
     {
         require_native_cache_price(Some(&p), &options.cache_controls)?;

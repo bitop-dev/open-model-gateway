@@ -319,6 +319,11 @@ impl ProviderAdapter for Fake {
     fn native_batch(&self, _: &Deployment, endpoint: BatchEndpoint) -> bool {
         self.native && (self.id != "anthropic" || endpoint.is_generation())
     }
+    /// The fake stands in for the adapter of its id, as the real Anthropic
+    /// adapter does.
+    fn forwards_cache_controls(&self) -> bool {
+        self.id == "anthropic"
+    }
     fn encode_native_line(
         &self,
         target: &Deployment,

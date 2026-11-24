@@ -38,8 +38,6 @@ use crate::{
 
 /// Batch lines at once per route when it has no settings.
 pub const DEFAULT_MAX_CONCURRENCY: i32 = 2;
-/// Profiles whose servers accept vLLM's `priority` request field.
-pub const PRIORITY_PROFILES: [&str; 2] = ["vllm", "openai_compatible"];
 /// Demand rows older than this are ignored (their runner stopped).
 const WAIT_FRESH_SECONDS: i32 = 10;
 /// Upper bound of a metrics response.
@@ -230,11 +228,13 @@ impl TimeWindow {
 }
 
 impl RouteSettings {
-    /// Validate the settings for a route of `provider`. `approvals` checks
-    /// the metrics URL (approved local origin only). Returns a fixed message.
+    /// Validate the settings for a route whose adapter accepts a priority
+    /// hint or not (`accepts_priority_hint`, declared by the route's
+    /// provider profile). `approvals` checks the metrics URL (approved local
+    /// origin only). Returns a fixed message.
     pub fn validate(
         &self,
-        provider: &str,
+        accepts_priority_hint: bool,
         approvals: &ApprovedEndpoints,
     ) -> Result<(), &'static str> {
         if !(1..=256).contains(&self.max_concurrency) {
@@ -267,7 +267,7 @@ impl RouteSettings {
             }
         }
         if let Some(p) = self.priority {
-            if !PRIORITY_PROFILES.contains(&provider) {
+            if !accepts_priority_hint {
                 return Err("Priority hints need a vLLM-compatible route.");
             }
             if !(1..=1_000_000).contains(&p) {
@@ -483,7 +483,7 @@ async fn fetch_reading(
     )
     .await
     .map_err(|_| "timeout")?
-    .map_err(crate::egress::UpstreamClient::Local.count_then("unreachable"))?;
+    .map_err(ApprovedEndpoints::CLIENT.count_then("unreachable"))?;
     if !response.status().is_success() {
         return Err("http_status");
     }

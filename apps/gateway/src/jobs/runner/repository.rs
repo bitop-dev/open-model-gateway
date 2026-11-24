@@ -143,6 +143,7 @@ impl InferenceRepository for LineRepository {
         lease_seconds: i64,
         deployment: &Deployment,
         output_limit: u32,
+        forwards_cache_controls: bool,
     ) -> Result<crate::inference::repository::GenerationAdmission, InferenceError> {
         if !self.gated(record.id) {
             return Err(self.refuse_ungated(record, deployment));
@@ -168,6 +169,7 @@ impl InferenceRepository for LineRepository {
             deployment,
             price,
             output_limit,
+            forwards_cache_controls,
             Some(request),
         )
         .await
@@ -195,6 +197,7 @@ impl InferenceRepository for LineRepository {
             deployment,
             None,
             u32::MAX,
+            false,
             None,
         )
         .await
@@ -219,6 +222,7 @@ impl InferenceRepository for LineRepository {
             deployment,
             None,
             u32::MAX,
+            false,
             None,
         )
         .await
