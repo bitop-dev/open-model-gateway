@@ -13,28 +13,86 @@
 //!    (the provider's aggregate when it reports one) and the reservation
 //!    settles at its pinned price list. Then the provider's copies and the
 //!    private copy are deleted.
+//!
+//! Every write to the batch's row up to and including the finish runs under
+//! the poller's claim of the batch ([`BatchFence`]), checked inside the
+//! transaction that makes it. A poller whose claim ended before its finish
+//! committed writes nothing more to the row: it does not submit, record a
+//! status or counts, or finish the batch, and it deletes the result files it
+//! wrote. Once a lease renewal is refused, a collection also stops at its
+//! next safe point (before each result line, before the lines without a
+//! result, after the files are committed) and deletes what it wrote.
+//!
+//! Two things are not fenced. The upstream id of an accepted submission is
+//! recorded whatever the claim, because it is the evidence of acceptance.
+//! And everything after a committed finish: settlement (idempotent), the
+//! deletion of the provider's copies and of the private copy. A poller whose
+//! lease lapses between its finish and its settlement therefore still
+//! settles the batch and deletes the provider's copies, possibly while
+//! another poller collects it again; that collection finds the batch
+//! terminal, keeps the first collection's links and deletes its own files.
 use super::{
     batch::settlement,
+    fence::{BatchFence, FenceError, FenceResult},
     io::{LazySink, LineReader, RESULT_LINE_BYTES, Source},
     lines::{self, NotRun},
     store::Finished,
     *,
 };
 use gateway_datetime_compat::UtcInstant;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Longer than one submission may take; afterwards an unfinished submission
 /// is treated as interrupted.
-const SUBMIT_GRACE: TimeDelta = TimeDelta::minutes(40);
+pub(crate) const SUBMIT_GRACE: TimeDelta = TimeDelta::minutes(40);
+
+/// `None` when the claim ended: another poller holds the batch.
+fn held<T>(fence: &BatchFence, written: FenceResult<T>) -> JobResult<Option<T>> {
+    match written {
+        Ok(value) => Ok(Some(value)),
+        Err(FenceError::Stale) => {
+            stopped(fence);
+            Ok(None)
+        }
+        Err(_) => Err(InferenceError::Storage.into()),
+    }
+}
+
+/// The poller stops working on a batch whose claim ended.
+fn stopped(fence: &BatchFence) {
+    tracing::warn!(job_id = %fence.job, "batch poller no longer holds its batch; it stops working on it");
+}
+
+/// Whether the poller's lease renewal found the claim ended.
+fn lost_claim(lost: &AtomicBool) -> bool {
+    lost.load(Ordering::SeqCst)
+}
 
 impl Jobs {
+    #[cfg(not(test))]
+    fn submit_grace(&self) -> TimeDelta {
+        SUBMIT_GRACE
+    }
+    /// Tests may shorten the grace.
+    #[cfg(test)]
+    fn submit_grace(&self) -> TimeDelta {
+        self.submit_grace
+    }
+
     /// One poller step for a native engine batch.
-    pub(crate) async fn poll_native(&self, job: JobRow) -> JobResult<()> {
+    /// `lost` is set once a lease renewal found the claim ended.
+    pub(crate) async fn poll_native(
+        &self,
+        job: JobRow,
+        fence: BatchFence,
+        lost: &AtomicBool,
+    ) -> JobResult<()> {
         if job.upstream_id.is_none() {
             return match job.submit_started_at {
-                None if job.cancel_requested_at.is_none() => self.submit_native(job).await,
+                None if job.cancel_requested_at.is_none() => self.submit_native(job, fence).await,
                 None => Ok(()),
-                Some(at) if UtcInstant::now() - at > SUBMIT_GRACE => {
-                    self.submission_lost(job).await
+                Some(at) if UtcInstant::now() - at > self.submit_grace() => {
+                    self.submission_lost(fence).await
                 }
                 Some(_) => Ok(()),
             };
@@ -48,25 +106,27 @@ impl Jobs {
         {
             upstream = call(adapter.cancel_batch(&target, &upstream_id)).await?;
         }
-        if let Some(counts) = upstream.counts {
-            store::observe_counts(&self.store, job.id, counts).await?;
-        }
         let state = upstream.status.state();
         if !state.is_terminal() {
-            if state == JobState::InProgress {
-                store::mark_running(&self.store, job.id).await?;
-            }
-            store::set_status(&self.store, job.id, upstream.status.as_str()).await?;
-            store::poll_ok(&self.store, job.id, self.poll_seconds()).await?;
+            let observed = fence
+                .observe_native(
+                    &self.store,
+                    upstream.counts,
+                    state == JobState::InProgress,
+                    upstream.status.as_str(),
+                    self.poll_seconds(),
+                )
+                .await;
+            held(&fence, observed)?;
             return Ok(());
         }
-        self.collect_native(job, &target, adapter.as_ref(), &upstream)
+        self.collect_native(job, fence, lost, &target, adapter.as_ref(), &upstream)
             .await
     }
 
     #[cfg_attr(not(test), expect(clippy::too_many_lines, reason = "#499"))]
-    async fn submit_native(&self, job: JobRow) -> JobResult<()> {
-        if !store::claim_submit(&self.store, job.id).await? {
+    async fn submit_native(&self, job: JobRow, fence: BatchFence) -> JobResult<()> {
+        if held(&fence, fence.claim_submit(&self.store).await)? != Some(true) {
             return Ok(());
         }
         let files = self.files()?.clone();
@@ -155,26 +215,33 @@ impl Jobs {
         };
         match outcome {
             Ok(upstream) => {
-                if !upstream.status.state().is_terminal() {
-                    store::set_status(&self.store, job.id, upstream.status.as_str()).await?;
-                }
                 crate::metrics::METRICS.observe_batch_submitted(&job.provider);
+                if !upstream.status.state().is_terminal() {
+                    let status = fence.native_status(&self.store, None, upstream.status.as_str());
+                    held(&fence, status.await)?;
+                }
                 Ok(())
             }
             Err(e) => {
                 tracing::warn!(job_id = %job.id, "native batch submission failed");
-                let job = store::finish_batch(
-                    &self.store,
-                    job.id,
-                    &Finished {
-                        state: JobState::Failed,
-                        error_code: Some("submission_failed"),
-                        output_file: None,
-                        error_file: None,
-                        counts: None,
-                    },
-                )
-                .await?;
+                // A claim that ended leaves the started submission to the
+                // claim that holds the batch: it ends interrupted after the
+                // grace, with its hold retained.
+                let finished = fence
+                    .finish_native(
+                        &self.store,
+                        &Finished {
+                            state: JobState::Failed,
+                            error_code: Some("submission_failed"),
+                            output_file: None,
+                            error_file: None,
+                            counts: None,
+                        },
+                    )
+                    .await;
+                let Some(job) = held(&fence, finished)? else {
+                    return Ok(());
+                };
                 // Partial submission may have reached the provider. Only an explicit
                 // pre-processing rejection can qualify for free-zero settlement.
                 self.settle(
@@ -195,19 +262,22 @@ impl Jobs {
 
     /// A submission that never recorded its upstream id (crash): never
     /// retried; the batch fails and its hold is retained as unknown.
-    async fn submission_lost(&self, job: JobRow) -> JobResult<()> {
-        let job = store::finish_batch(
-            &self.store,
-            job.id,
-            &Finished {
-                state: JobState::Failed,
-                error_code: Some("submission_interrupted"),
-                output_file: None,
-                error_file: None,
-                counts: None,
-            },
-        )
-        .await?;
+    async fn submission_lost(&self, fence: BatchFence) -> JobResult<()> {
+        let finished = fence
+            .finish_native(
+                &self.store,
+                &Finished {
+                    state: JobState::Failed,
+                    error_code: Some("submission_interrupted"),
+                    output_file: None,
+                    error_file: None,
+                    counts: None,
+                },
+            )
+            .await;
+        let Some(job) = held(&fence, finished)? else {
+            return Ok(());
+        };
         self.settle(
             &job,
             Settlement {
@@ -239,13 +309,18 @@ impl Jobs {
     async fn collect_native(
         &self,
         job: JobRow,
+        fence: BatchFence,
+        lost: &AtomicBool,
         target: &Deployment,
         adapter: &dyn ProviderAdapter,
         upstream: &UpstreamBatch,
     ) -> JobResult<()> {
         let files = self.files()?.clone();
         let endpoint = job.endpoint().ok_or(InferenceError::Storage)?;
-        store::set_status(&self.store, job.id, "finalizing").await?;
+        let finalizing = fence.native_status(&self.store, upstream.counts, "finalizing");
+        if held(&fence, finalizing.await)?.is_none() {
+            return Ok(());
+        }
         let ids = self.custom_ids(&job).await?;
         let hex = job.id.simple();
         let mut out = LazySink::new(
@@ -269,6 +344,7 @@ impl Jobs {
             ),
         );
         let state = upstream.status.state();
+        // `Ok(None)`: the claim was lost; the sinks are aborted below.
         let written = async {
             let results = call(adapter.native_batch_results(target, upstream)).await?;
             let mut reader = LineReader::new(Source::Upstream(results), RESULT_LINE_BYTES);
@@ -276,7 +352,11 @@ impl Jobs {
             let mut usage: Option<Usage> = None;
             let mut usage_known = true;
             let mut succeeded = 0u32;
-            while let Some(raw) = reader.next_request().await? {
+            // Safe points: before each result line and before the lines
+            // without a result.
+            while !lost_claim(lost)
+                && let Some(raw) = reader.next_request().await?
+            {
                 let Ok(result) = adapter.decode_native_result(target, endpoint, &raw) else {
                     usage_known = false;
                     continue;
@@ -328,6 +408,9 @@ impl Jobs {
                     }
                 }
             }
+            if lost_claim(lost) {
+                return Ok(None);
+            }
             let missing = match state {
                 JobState::Cancelled => NotRun::Cancelled,
                 JobState::Expired => NotRun::Expired,
@@ -339,19 +422,46 @@ impl Jobs {
                     err.line(&lines::not_run_line(custom_id, missing)).await?;
                 }
             }
-            Ok::<_, InferenceError>((usage.filter(|_| usage_known), succeeded))
+            Ok::<_, InferenceError>(Some((usage.filter(|_| usage_known), succeeded)))
         }
         .await;
         let (summed, succeeded) = match written {
-            Ok(v) => v,
+            Ok(Some(v)) if !lost_claim(lost) => v,
+            Ok(_) => {
+                out.abort().await;
+                err.abort().await;
+                stopped(&fence);
+                return Ok(());
+            }
             Err(e) => {
                 out.abort().await;
                 err.abort().await;
                 return Err(e.into());
             }
         };
-        let output_file = out.finish().await?;
-        let error_file = err.finish().await?;
+        // A failed output commit must not leave the error sink to commit a
+        // file by being dropped.
+        let output_file = match out.finish().await {
+            Ok(file) => file,
+            Err(e) => {
+                err.abort().await;
+                return Err(e.into());
+            }
+        };
+        // A committed output file that no batch will link is removed with
+        // the error file's failure, as the runner does.
+        let error_file = match err.finish().await {
+            Ok(file) => file,
+            Err(e) => {
+                super::runner::remove_files(&files, &job, [output_file, None]).await;
+                return Err(e.into());
+            }
+        };
+        if lost_claim(lost) {
+            super::runner::remove_files(&files, &job, [output_file, error_file]).await;
+            stopped(&fence);
+            return Ok(());
+        }
         let total = ids.len() as u32;
         let counts = RequestCounts {
             total,
@@ -360,24 +470,26 @@ impl Jobs {
                 .counts
                 .map_or(total - succeeded.min(total), |c| c.failed),
         };
+        let finished = Finished {
+            state,
+            error_code: (state == JobState::Failed).then_some("batch_failed"),
+            output_file,
+            error_file,
+            counts: Some(counts),
+        };
+        let Some(job) = self.publish_native(&files, job, fence, &finished).await? else {
+            return Ok(());
+        };
+        // Counted once the claim recorded the lines (a lost claim records
+        // nothing and counts nothing).
         crate::metrics::METRICS.observe_batch_lines(
             "native",
             &job.provider,
             u64::from(succeeded),
             u64::from(counts.failed),
         );
-        let job = store::finish_batch(
-            &self.store,
-            job.id,
-            &Finished {
-                state,
-                error_code: (state == JobState::Failed).then_some("batch_failed"),
-                output_file,
-                error_file,
-                counts: Some(counts),
-            },
-        )
-        .await?;
+        #[cfg(test)]
+        self.settle_hold.pause().await;
         // The provider's aggregate when it reports one, else the per-line sum
         // when every succeeded line reported usage; otherwise unknown.
         let usage = upstream.usage.or(summed);
@@ -393,5 +505,39 @@ impl Jobs {
         self.discard_work_file(&job).await;
         crate::metrics::METRICS.observe_batch_finished("native", state.as_str());
         Ok(())
+    }
+
+    /// Record the collected results under the claim. `None` when the claim
+    /// ended: nothing was recorded and the result files are deleted. Files a
+    /// batch that finished earlier does not link are deleted too.
+    async fn publish_native(
+        &self,
+        files: &FileStorage,
+        job: JobRow,
+        fence: BatchFence,
+        f: &Finished<'_>,
+    ) -> JobResult<Option<JobRow>> {
+        let created = [f.output_file, f.error_file];
+        match fence.finish_native(&self.store, f).await {
+            Ok(row) => {
+                let unused = created.map(|f| {
+                    f.filter(|f| row.output_file_id != Some(*f) && row.error_file_id != Some(*f))
+                });
+                super::runner::remove_files(files, &row, unused).await;
+                Ok(Some(row))
+            }
+            Err(FenceError::Stale) => {
+                stopped(&fence);
+                super::runner::remove_files(files, &job, created).await;
+                Ok(None)
+            }
+            Err(FenceError::Storage) => {
+                super::runner::remove_files(files, &job, created).await;
+                Err(InferenceError::Storage.into())
+            }
+            // The links may have committed, or a file is locked by another
+            // operation: the sweeper reclaims what no batch links.
+            Err(FenceError::Unknown | FenceError::FileBusy) => Err(InferenceError::Storage.into()),
+        }
     }
 }
