@@ -94,6 +94,30 @@ fn the_limiter_table_is_bounded() {
 }
 
 #[test]
+fn a_key_holds_at_most_its_in_flight_slots_and_dropping_frees_them() {
+    let in_flight = InFlight::default();
+    let (key, other) = (Uuid::new_v4(), Uuid::new_v4());
+    let first = in_flight.enter(key, 2).expect("first slot");
+    let second = in_flight.enter(key, 2).expect("second slot");
+    assert!(
+        in_flight.enter(key, 2).is_none(),
+        "the key's slots are full"
+    );
+    let other_slot = in_flight
+        .enter(other, 2)
+        .expect("other keys have their own");
+    drop(first);
+    let third = in_flight
+        .enter(key, 2)
+        .expect("a dropped slot is free again");
+    drop((second, third, other_slot));
+    assert!(
+        in_flight.0.lock().unwrap().is_empty(),
+        "a key with nothing running has no entry"
+    );
+}
+
+#[test]
 fn the_source_header_says_how_the_count_was_made() {
     assert_eq!(TokenCountSource::Provider.header(), "provider");
     assert_eq!(

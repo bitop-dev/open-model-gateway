@@ -47,6 +47,8 @@ pub(super) struct Upstream {
     pub(super) reply: Arc<Mutex<Reply>>,
     pub(super) started: Arc<tokio::sync::Notify>,
     pub(super) dropped: Arc<std::sync::atomic::AtomicBool>,
+    /// Hanging counts the gateway has closed so far.
+    pub(super) drops: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl Upstream {
     fn new() -> Self {
@@ -55,17 +57,23 @@ impl Upstream {
             reply: Arc::new(Mutex::new(Reply::Count)),
             started: Arc::new(tokio::sync::Notify::new()),
             dropped: Arc::default(),
+            drops: Arc::default(),
         }
     }
     pub(super) fn answer(&self, reply: Reply) {
         *self.reply.lock().unwrap() = reply;
     }
 }
-/// Sets `dropped` when the handler future that holds it is dropped.
-struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+/// Sets `dropped` and counts in `drops` when the handler future that holds
+/// it is dropped.
+struct DropFlag(
+    Arc<std::sync::atomic::AtomicBool>,
+    Arc<std::sync::atomic::AtomicUsize>,
+);
 impl Drop for DropFlag {
     fn drop(&mut self) {
         self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -97,7 +105,7 @@ async fn anthropic_upstream(upstream: Upstream) -> (String, Server) {
                             .body(axum::body::Body::from(body))
                             .unwrap(),
                         Reply::Hang => {
-                            let _flag = DropFlag(upstream.dropped.clone());
+                            let _flag = DropFlag(upstream.dropped.clone(), upstream.drops.clone());
                             upstream.started.notify_one();
                             std::future::pending::<()>().await;
                             unreachable!()
@@ -136,6 +144,8 @@ pub(super) struct Setup {
     pub(super) minute: Option<fn() -> i64>,
     /// Serve from a replica whose versioned caches are on and never refresh.
     pub(super) stale_cache: bool,
+    /// Record count outcomes in this private registry (exact counts).
+    pub(super) metrics: Option<&'static crate::metrics::Metrics>,
 }
 
 /// `f`'s personal workspace may count with `company/smart` on Anthropic;
@@ -218,6 +228,9 @@ async fn world_with(pool: PgPool, setup: Setup) -> World {
         crate::inference::Engine::new(Arc::new(store.clone()), registry, setup.limits).unwrap();
     if let Some(minute) = setup.minute {
         engine = engine.with_count_clock(minute);
+    }
+    if let Some(metrics) = setup.metrics {
+        engine = engine.with_count_metrics(metrics);
     }
     let (base, g) = serve(crate::http::router_with_engine(store, None, engine)).await;
     World {
@@ -527,7 +540,7 @@ fn connection_minute() -> i64 {
 /// outcome is visible in `gateway_token_counts_total{outcome}`.
 #[dbtest::test]
 async fn provider_counts_share_a_per_connection_window(pool: PgPool) {
-    use crate::metrics::METRICS;
+    let metrics = crate::metrics::characterization_tests::fresh_registry();
     let limits = crate::inference::EngineLimits {
         counts_per_connection_per_minute: 2,
         ..Default::default()
@@ -545,11 +558,11 @@ async fn provider_counts_share_a_per_connection_window(pool: PgPool) {
         Setup {
             limits,
             minute: Some(connection_minute),
+            metrics: Some(metrics),
             ..Default::default()
         },
     )
     .await;
-    let before = ["provider", "estimate", "limited", "error"].map(|o| METRICS.token_count_total(o));
     assert_eq!(count(&base, &personal, &body("company/smart")).await.0, 200);
     assert_eq!(count(&base, &team, &body("company/smart")).await.0, 200);
     let (status, _, reply) = count(&base, &team, &body("company/smart")).await;
@@ -567,11 +580,162 @@ async fn provider_counts_share_a_per_connection_window(pool: PgPool) {
         count(&base, &personal, &body("company/missing")).await.0,
         404
     );
-    let after = ["provider", "estimate", "limited", "error"].map(|o| METRICS.token_count_total(o));
-    // Other tests count in parallel: each outcome moved by at least this run's.
-    for ((b, a), n) in before.iter().zip(after).zip([2, 1, 1, 1]) {
-        assert!(a - b >= n, "{before:?} -> {after:?}");
+    assert_eq!(outcomes(metrics), [2, 1, 1, 1]);
+}
+
+/// This engine's count outcomes so far: provider, estimate, limited, error.
+fn outcomes(metrics: &crate::metrics::Metrics) -> [u64; 4] {
+    ["provider", "estimate", "limited", "error"].map(|o| metrics.token_count_total(o))
+}
+
+/// Waits (at most 10 s) until `done` holds.
+async fn until(what: &str, done: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !done() {
+        assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+}
+
+/// A count that waits on the upstream, started in the background.
+fn hanging(base: &str, key: &str) -> tokio::task::JoinHandle<(u16, Option<String>, Value)> {
+    let (base, key) = (base.to_owned(), key.to_owned());
+    tokio::spawn(async move { count(&base, &key, &body("company/smart")).await })
+}
+
+/// A count that must be answered at once (never queued behind a slow one).
+async fn prompt(base: &str, key: &str, model: &str) -> (u16, Option<String>, Value) {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        count(base, key, &body(model)),
+    )
+    .await
+    .expect("answered at once")
+}
+
+/// One key cannot hold the count pool. With the default pool of 8 and an
+/// upstream that never answers, a key's counts beyond its in-flight slots
+/// are refused at once (429, counted `limited`) and never reach the
+/// upstream, while another key's count still gets a permit and reaches the
+/// provider. Cancelled counts free their slots.
+#[dbtest::test]
+async fn one_key_cannot_hold_the_count_pool(pool: PgPool) {
+    use crate::inference::count::{COUNT_CONCURRENCY, COUNTS_IN_FLIGHT_PER_KEY};
+    const { assert!(COUNTS_IN_FLIGHT_PER_KEY < COUNT_CONCURRENCY) };
+    let metrics = crate::metrics::characterization_tests::fresh_registry();
+    let World {
+        base,
+        personal,
+        team,
+        upstream,
+        _servers,
+        ..
+    } = world_with(
+        pool,
+        Setup {
+            metrics: Some(metrics),
+            ..Default::default()
+        },
+    )
+    .await;
+    upstream.answer(Reply::Hang);
+    let reached = || upstream.captured.lock().unwrap().len();
+    let mut held: Vec<_> = (0..COUNTS_IN_FLIGHT_PER_KEY)
+        .map(|_| hanging(&base, &personal))
+        .collect();
+    until("the key's counts reach the upstream", || {
+        reached() == COUNTS_IN_FLIGHT_PER_KEY
+    })
+    .await;
+    let rest = COUNT_CONCURRENCY - COUNTS_IN_FLIGHT_PER_KEY;
+    for _ in 0..rest {
+        let (status, _, reply) = prompt(&base, &personal, "company/smart").await;
+        assert_eq!(status, 429, "the key's slots are full: {reply}");
+        assert_eq!(reply["error"]["type"], "rate_limit_error");
+    }
+    assert_eq!(
+        reached(),
+        COUNTS_IN_FLIGHT_PER_KEY,
+        "refused before the upstream"
+    );
+    held.push(hanging(&base, &team));
+    until("another key's count reaches the upstream", || {
+        reached() == COUNTS_IN_FLIGHT_PER_KEY + 1
+    })
+    .await;
+    for count in &held {
+        count.abort();
+    }
+    until("every hanging count is closed", || {
+        upstream.drops.load(std::sync::atomic::Ordering::SeqCst) == held.len()
+    })
+    .await;
+    upstream.answer(Reply::Count);
+    assert_eq!(
+        prompt(&base, &personal, "company/smart").await.0,
+        200,
+        "cancelled counts freed the key's slots"
+    );
+    assert_eq!(outcomes(metrics), [1, 0, rest as u64, 0]);
+}
+
+fn fixed_minute() -> i64 {
+    42
+}
+
+/// A count refused for concurrency does not spend the key's window: a
+/// client retrying through a full pool keeps its minute. A count refused
+/// after it holds its permit (an unknown model) does spend it.
+#[dbtest::test]
+async fn concurrency_refusals_keep_the_key_window(pool: PgPool) {
+    let metrics = crate::metrics::characterization_tests::fresh_registry();
+    let limits = crate::inference::EngineLimits {
+        count_concurrency: 1,
+        counts_per_key_per_minute: 2,
+        ..Default::default()
+    };
+    let World {
+        base,
+        personal,
+        team,
+        upstream,
+        _servers,
+        ..
+    } = world_with(
+        pool,
+        Setup {
+            limits,
+            minute: Some(fixed_minute),
+            metrics: Some(metrics),
+            ..Default::default()
+        },
+    )
+    .await;
+    upstream.answer(Reply::Hang);
+    let holder = hanging(&base, &team);
+    until("the pool's only count reaches the upstream", || {
+        upstream.captured.lock().unwrap().len() == 1
+    })
+    .await;
+    for _ in 0..5 {
+        let (status, _, reply) = prompt(&base, &personal, "company/smart").await;
+        assert_eq!(status, 429, "the pool is full: {reply}");
+    }
+    holder.abort();
+    until("the hanging count is closed", || {
+        upstream.drops.load(std::sync::atomic::Ordering::SeqCst) == 1
+    })
+    .await;
+    upstream.answer(Reply::Count);
+    assert_eq!(prompt(&base, &personal, "company/missing").await.0, 404);
+    assert_eq!(
+        prompt(&base, &personal, "company/smart").await.0,
+        200,
+        "five pool refusals spent nothing; the 404 spent one"
+    );
+    let (status, _, reply) = prompt(&base, &personal, "company/smart").await;
+    assert_eq!(status, 429, "the window of two is used: {reply}");
+    assert_eq!(outcomes(metrics), [1, 0, 6, 1]);
 }
 
 /// Counts run in their own pool: with one count slot and one generation

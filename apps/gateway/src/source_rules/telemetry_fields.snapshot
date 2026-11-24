@@ -61,7 +61,7 @@ identity/login.rs :: throttled :: metrics call :: crate :: metrics :: METRICS . 
 identity/session.rs :: authenticate_admin_token_request :: metrics call :: crate :: metrics :: METRICS . auth_throttled ("admin_token" , reason)
 inference/attempt.rs :: impl ExecutionGuard::settle_to_completion :: metrics call :: crate :: metrics :: METRICS . observe_settlement (crate :: metrics :: Settlement :: Held)
 inference/attempt.rs :: report_unsettled :: event :: crate :: ops_log :: emit (crate :: ops_log :: OpsEvent :: FinalizationNeedsReconciliation { finalizer : crate :: ops_log :: Finalizer :: GenerationFinish , trace , })
-inference/count.rs :: impl Engine::count_tokens :: metrics call :: crate :: metrics :: METRICS . token_count (match & result { Ok (TokenCount { source : TokenCountSource :: Provider , .. }) => "provider" , Ok (TokenCount { source : TokenCountSource :: Estimate , .. }) => "estimate" , Err (Limited) => "limited" , Err (_) => "error" , })
+inference/count.rs :: impl Engine::count_tokens :: metrics call :: crate :: metrics :: METRICS . token_count (outcome)
 inference/mod.rs :: impl ExecutionGuard::drop :: event :: crate :: ops_log :: emit (crate :: ops_log :: OpsEvent :: FinalizationNeedsReconciliation { finalizer : crate :: ops_log :: Finalizer :: GenerationCancel , trace : None , })
 inference/mod.rs :: impl ExecutionGuard::drop :: metrics call :: crate :: metrics :: METRICS . observe_settlement (crate :: metrics :: Settlement :: Held)
 inference/realtime.rs :: impl RealtimeSession::final_write :: event :: crate :: ops_log :: emit (crate :: ops_log :: OpsEvent :: FinalizationNeedsReconciliation { finalizer , trace : None , })

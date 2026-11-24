@@ -49,11 +49,11 @@ and the held amount for pending or unknown rows ([`ELSE coalesce(r.held_microusd
 
 The request thread awaits admission, then runs [`let output = call_upstream(`](../../apps/gateway/src/inference/attempt.rs#L139) under the request deadline.
 It settles the outcome ([`settle_complete(&mut telemetry, &mut guard, span, response)`](../../apps/gateway/src/inference/attempt.rs#L172), [`ProviderOutput::Stream(track_stream(`](../../apps/gateway/src/inference/attempt.rs#L175)).
-`ExecutionGuard` marks settlement started ([`self.finished = true`](../../apps/gateway/src/inference/mod.rs#L460)) and calls
+`ExecutionGuard` marks settlement started ([`self.finished = true`](../../apps/gateway/src/inference/mod.rs#L480)) and calls
 [`fn settle_to_completion`](../../apps/gateway/src/inference/attempt.rs#L583) with
-[`SETTLEMENT_DEADLINE: Duration = Duration::from_secs(3)`](../../apps/gateway/src/inference/mod.rs#L374).
+[`SETTLEMENT_DEADLINE: Duration = Duration::from_secs(3)`](../../apps/gateway/src/inference/mod.rs#L394).
 The pending write uses [`HandOff::new(`](../../apps/gateway/src/inference/attempt.rs#L607), whose drop path spawns the unfinished future ([`runtime.spawn(async move`](../../apps/gateway/src/inference/hand_off.rs#L75)).
-[`impl Drop for ExecutionGuard`](../../apps/gateway/src/inference/mod.rs#L479) queues a detached cancellation settlement only if `finished` is false. Failover
+[`impl Drop for ExecutionGuard`](../../apps/gateway/src/inference/mod.rs#L499) queues a detached cancellation settlement only if `finished` is false. Failover
 is decided only in the `Err(error)` arm of `Engine::attempt` (so structurally never after a
 stream was returned), only after settlement succeeds ([`let failing_over = settled.is_ok()`](../../apps/gateway/src/inference/attempt.rs#L155)), and only for
 `Busy` or (with `allow_ambiguous_failover`) `UpstreamUnavailable`/`Overloaded`
@@ -70,7 +70,7 @@ Three different "leases" exist:
 * Reservation lease (`governance_reservations.lease_expires_at`): not a fencing token. It only says
   when the reconciler may take a `pending` row. Admission converts [`.request_timeout`](../../apps/gateway/src/inference/attempt.rs#L47)
   to whole seconds and adds five seconds of grace ([`+ 5,`](../../apps/gateway/src/inference/attempt.rs#L50)).
-  The request deadline uses [`started + self.limits.request_timeout`](../../apps/gateway/src/inference/mod.rs#L184).
+  The request deadline uses [`started + self.limits.request_timeout`](../../apps/gateway/src/inference/mod.rs#L204).
 * Work leases (`work_leases`, 0029, `leases.rs`): singleton background jobs. Each job transaction
   starts with `Fence::check` -> [`SELECT omg_lease_fence($1,$2,$3)`](../../apps/gateway/src/leases.rs#L107) (epoch = fencing token); the `FOR SHARE` lives in
   the 0029 SQL ([`w.expires_at>clock_timestamp() FOR SHARE`](../../apps/gateway/enterprise_migrations/0029_work_leases.sql#L72)) and is held until commit. The money
@@ -119,7 +119,7 @@ wide runs dominate).
 | + | "Failover ... never after a stream is returned" | `NoFailoverAfterStream` | checks the model's own guard; in the code [`return AttemptEnd::Failover(telemetry)`](../../apps/gateway/src/inference/attempt.rs#L162) exists only in the error arm |
 | + | Rows coherent (pending <=> execution started) | `ExecConsistent` | `reconcile_batch` aborts on [`changed != ids.len() as u64`](../../apps/gateway/src/governance/reconcile.rs#L58) |
 | + | A pending reservation always leaves `pending` (settled or unknown), under fairness | `Resolves` (liveness) | reconciler on every replica ([`crate::governance::reconcile_expired(store, 100)`](../../apps/gateway/src/maintenance.rs#L149)), restart |
-| + | Dropped future still settles or stays unknown | covered by 2, 4 and `Resolves`: the cancel path ends `unknown` (never zero) or stays `pending` until the reconciler; whether upstream work is actually cancelled is **not** modelled | [`self.record(Outcome::Cancelled, None)`](../../apps/gateway/src/inference/mod.rs#L485) in `ExecutionGuard::drop` |
+| + | Dropped future still settles or stays unknown | covered by 2, 4 and `Resolves`: the cancel path ends `unknown` (never zero) or stays `pending` until the reconciler; whether upstream work is actually cancelled is **not** modelled | [`self.record(Outcome::Cancelled, None)`](../../apps/gateway/src/inference/mod.rs#L505) in `ExecutionGuard::drop` |
 
 | Config | Result | Distinct states | Depth | Time |
 |---|---|---|---|---|
@@ -258,7 +258,7 @@ money.
    marked `finished = true` before the write, so a client disconnect while the inline settlement was
    awaited (`settle_complete`, `track_stream`) dropped the write and `Drop` did nothing. A failed or
    timed-out write still leaves `pending`, by design (test
-   [`fn diagnostic_settlement_timeout_is_not_cancellation_or_a_drop_retry`](../../apps/gateway/src/inference/tests.rs#L872) asserts no retry); the rest
+   [`fn diagnostic_settlement_timeout_is_not_cancellation_or_a_drop_retry`](../../apps/gateway/src/inference/tests.rs#L880) asserts no retry); the rest
    of this item describes that case and the original symptom. The reconciler then marks it
    `unknown`; the hold is kept (spend overstated) until an operator resolves it with evidence.
    `MoneyPathDiag` shows it (Receive usage, ClientCancel while `settling`, ExpireLease, Reconcile);

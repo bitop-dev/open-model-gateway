@@ -643,35 +643,24 @@ fn inference_limits_from_env() -> Result<crate::inference::EngineLimits> {
         })?,
         audio: crate::inference::audio::AudioLimits::from_lookup(|name| std::env::var(name).ok())?,
         counts_per_key_per_minute: count_limit(
+            |name| std::env::var(name),
             "GATEWAY_COUNT_TOKENS_PER_KEY_PER_MINUTE",
             crate::inference::count::COUNTS_PER_KEY_PER_MINUTE,
             100_000,
         )?,
         counts_per_connection_per_minute: count_limit(
+            |name| std::env::var(name),
             "GATEWAY_COUNT_TOKENS_PER_CONNECTION_PER_MINUTE",
             crate::inference::count::COUNTS_PER_CONNECTION_PER_MINUTE,
             1_000_000,
         )?,
         count_concurrency: count_limit(
+            |name| std::env::var(name),
             "GATEWAY_COUNT_TOKENS_CONCURRENCY",
             crate::inference::count::COUNT_CONCURRENCY as u32,
             1_024,
         )? as usize,
     })
-}
-
-/// One `POST /v1/messages/count_tokens` limit (`inference::count`): a whole
-/// number from 1 to `maximum`, else startup fails naming the setting.
-fn count_limit(name: &str, default: u32, maximum: u32) -> Result<u32> {
-    match std::env::var(name) {
-        Err(std::env::VarError::NotPresent) => Ok(default),
-        Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!("{name} is not valid Unicode"),
-        Ok(value) => value
-            .parse::<u32>()
-            .ok()
-            .filter(|n| (1..=maximum).contains(n))
-            .with_context(|| format!("{name} must be an integer from 1 to {maximum}")),
-    }
 }
 
 fn database_max_connections_from_env() -> Result<u32> {
@@ -792,6 +781,10 @@ mod metrics_export_config_tests;
 #[cfg(test)]
 #[path = "logs_export_config_tests.rs"]
 mod logs_export_config_tests;
+
+#[path = "config_count_limit.rs"]
+mod count_limit;
+use count_limit::count_limit;
 
 #[cfg(test)]
 mod allowlist_tests {

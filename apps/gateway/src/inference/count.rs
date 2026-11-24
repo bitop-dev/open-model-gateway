@@ -24,10 +24,14 @@
 //!   - `counts_per_connection_per_minute` provider-backed counts per provider
 //!     connection credential per UTC minute (estimates call no provider);
 //!   - `count_concurrency` counts at once, from a pool separate from
-//!     generation's, so a count never takes a generation permit.
+//!     generation's, so a count never takes a generation permit;
+//!   - [`COUNTS_IN_FLIGHT_PER_KEY`] counts at once per key, so one key's slow
+//!     counts cannot hold the whole pool.
 //!
 //!   Each refusal is the Anthropic-shaped 429 (`Busy`), before any upstream
-//!   call.
+//!   call. The key's window is spent only once the count holds its pool
+//!   permit and in-flight slot, so a count refused for concurrency does not
+//!   use up the key's minute.
 //! - **Cancellation.** The count runs inside the request future; a client
 //!   disconnect drops it, which cancels the upstream request. There is
 //!   nothing to settle.
@@ -59,6 +63,11 @@ pub const COUNTS_PER_CONNECTION_PER_MINUTE: u32 = 600;
 /// Default counts one gateway process runs at once
 /// (`GATEWAY_COUNT_TOKENS_CONCURRENCY`).
 pub const COUNT_CONCURRENCY: usize = 8;
+/// Counts one key may have running at once in one gateway process. Smaller
+/// than the default pool, so other keys keep counting while one key's
+/// counts wait on a slow provider; a pool configured this small or smaller
+/// is itself the tighter bound.
+pub const COUNTS_IN_FLIGHT_PER_KEY: usize = 2;
 /// Keys tracked at once; older minutes are dropped first, and a full table
 /// of current-minute keys refuses new keys rather than growing.
 const TRACKED_KEYS: usize = 65_536;
@@ -145,13 +154,52 @@ impl<K: Hash + Eq> Limiter<K> {
         true
     }
 }
+/// Counts running per key in this process. A key has an entry only while it
+/// holds a slot, and a slot is taken only with a pool permit, so the table
+/// never holds more keys than the pool has permits.
+#[derive(Default)]
+struct InFlight(Mutex<HashMap<Uuid, usize>>);
+impl InFlight {
+    fn enter(&self, key: Uuid, limit: usize) -> Option<Slot<'_>> {
+        let mut keys = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let running = keys.entry(key).or_insert(0);
+        if *running >= limit {
+            return None;
+        }
+        *running += 1;
+        Some(Slot { table: self, key })
+    }
+}
+/// One running count of one key. Dropping it (on every return, and when the
+/// request future is dropped by a disconnect) frees the slot.
+struct Slot<'a> {
+    table: &'a InFlight,
+    key: Uuid,
+}
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        let mut keys = self.table.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(running) = keys.get_mut(&self.key) {
+            *running -= 1;
+            if *running == 0 {
+                keys.remove(&self.key);
+            }
+        }
+    }
+}
+
 /// The count limits' state in one process: per-key and per-connection
-/// windows, the count-only concurrency pool and the window clock.
+/// windows, the count-only concurrency pool, per-key in-flight slots and the
+/// window clock.
 pub(crate) struct Counts {
     keys: Limiter<Uuid>,
     connections: Limiter<String>,
     pool: Arc<Semaphore>,
+    in_flight: InFlight,
     minute: fn() -> i64,
+    /// A private registry for a test that asserts exact outcome counts.
+    #[cfg(all(test, feature = "integration-tests"))]
+    metrics: Option<&'static crate::metrics::Metrics>,
 }
 impl Counts {
     pub(crate) fn new(concurrency: usize) -> Self {
@@ -159,15 +207,10 @@ impl Counts {
             keys: Limiter::default(),
             connections: Limiter::default(),
             pool: Arc::new(Semaphore::new(concurrency)),
+            in_flight: InFlight::default(),
             minute: current_minute,
-        }
-    }
-    /// The same limits with a fixed window clock, for deterministic tests.
-    #[cfg(all(test, feature = "integration-tests"))]
-    pub(crate) fn with_clock(concurrency: usize, minute: fn() -> i64) -> Self {
-        Self {
-            minute,
-            ..Self::new(concurrency)
+            #[cfg(all(test, feature = "integration-tests"))]
+            metrics: None,
         }
     }
 }
@@ -194,7 +237,19 @@ impl Engine {
     /// test controls the window instead of racing the UTC minute.
     #[cfg(all(test, feature = "integration-tests"))]
     pub(crate) fn with_count_clock(mut self, minute: fn() -> i64) -> Self {
-        self.counts = Arc::new(Counts::with_clock(self.limits.count_concurrency, minute));
+        Arc::get_mut(&mut self.counts)
+            .expect("set before the engine is shared")
+            .minute = minute;
+        self
+    }
+
+    /// The same engine recording count outcomes in `metrics` instead of the
+    /// process registry, so a test's counts are exact.
+    #[cfg(all(test, feature = "integration-tests"))]
+    pub(crate) fn with_count_metrics(mut self, metrics: &'static crate::metrics::Metrics) -> Self {
+        Arc::get_mut(&mut self.counts)
+            .expect("set before the engine is shared")
+            .metrics = Some(metrics);
         self
     }
 
@@ -209,7 +264,7 @@ impl Engine {
         request_id: Uuid,
     ) -> Result<TokenCount, InferenceError> {
         let result = self.count(principal, request, request_id).await;
-        crate::metrics::METRICS.token_count(match &result {
+        let outcome = match &result {
             Ok(TokenCount {
                 source: TokenCountSource::Provider,
                 ..
@@ -220,11 +275,14 @@ impl Engine {
             }) => "estimate",
             Err(Limited) => "limited",
             Err(_) => "error",
-        });
-        result.map_err(|e| match e {
-            Limited => InferenceError::Busy,
-            Failed(e) => e,
-        })
+        };
+        #[cfg(all(test, feature = "integration-tests"))]
+        if let Some(metrics) = self.counts.metrics {
+            metrics.token_count(outcome);
+            return result.map_err(CountError::into_inference);
+        }
+        crate::metrics::METRICS.token_count(outcome);
+        result.map_err(CountError::into_inference)
     }
 
     async fn count(
@@ -233,14 +291,6 @@ impl Engine {
         request: ChatRequest,
         request_id: Uuid,
     ) -> Result<TokenCount, CountError> {
-        let minute = (self.counts.minute)();
-        if !self.counts.keys.admit(
-            principal.key_id,
-            minute,
-            self.limits.counts_per_key_per_minute,
-        ) {
-            return Err(Limited);
-        }
         // Never generation's `capacity`: a slow count cannot pin a permit
         // that inference needs.
         let _permit = self
@@ -249,6 +299,21 @@ impl Engine {
             .clone()
             .try_acquire_owned()
             .map_err(|_| Limited)?;
+        let _slot = self
+            .counts
+            .in_flight
+            .enter(principal.key_id, COUNTS_IN_FLIGHT_PER_KEY)
+            .ok_or(Limited)?;
+        // Spent only now, so a count refused for concurrency (a client
+        // retrying through a full pool) keeps the key's minute.
+        let minute = (self.counts.minute)();
+        if !self.counts.keys.admit(
+            principal.key_id,
+            minute,
+            self.limits.counts_per_key_per_minute,
+        ) {
+            return Err(Limited);
+        }
         let deadline = Instant::now() + self.limits.request_timeout;
         let deployments = timeout_at(
             deadline,
@@ -325,6 +390,14 @@ enum CountError {
     Failed(InferenceError),
 }
 use CountError::{Failed, Limited};
+impl CountError {
+    fn into_inference(self) -> InferenceError {
+        match self {
+            Limited => InferenceError::Busy,
+            Failed(e) => e,
+        }
+    }
+}
 impl From<InferenceError> for CountError {
     fn from(error: InferenceError) -> Self {
         Failed(error)

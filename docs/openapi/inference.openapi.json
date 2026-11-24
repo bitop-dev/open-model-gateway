@@ -10394,7 +10394,7 @@
     },
     "/v1/messages/count_tokens": {
       "post": {
-        "description": "Counts the input tokens of a Messages request (#72). Authorized like POST /v1/messages: the workspace and key come from the validated inference key, and the model must be one the key may use now and must serve the messages protocol. Anthropic routes ask Anthropic's counting endpoint with the connection's own credential; every other route returns the gateway estimate. The route is the first one routing would choose; a count never fails over and is not an attempt. Each gateway process bounds counts by key per minute, by provider connection credential per minute (provider-backed counts only) and by its own concurrency pool, separate from generation (429 beyond any of them). A count consults no budget or rate limit and does not consume the key's request-rate allowance. Default root body cap is fixed 2097152 bytes. Unknown fields are 400 invalid_request_error.",
+        "description": "Counts the input tokens of a Messages request (#72). Authorized like POST /v1/messages: the workspace and key come from the validated inference key, and the model must be one the key may use now and must serve the messages protocol. Anthropic routes ask Anthropic's counting endpoint with the connection's own credential; every other route returns the gateway estimate. The route is the first one routing would choose; a count never fails over and is not an attempt. Each gateway process bounds counts by key per minute, by provider connection credential per minute (provider-backed counts only) and by its own concurrency pool, separate from generation, of which one key may hold at most 2 counts at once (429 beyond any of them; a count refused for concurrency does not spend the key's minute). A count consults no budget or rate limit and does not consume the key's request-rate allowance. Default root body cap is fixed 2097152 bytes. Unknown fields are 400 invalid_request_error.",
         "operationId": "post_v1_messages_count_tokens",
         "parameters": [
           {
@@ -10704,6 +10704,11 @@
             "env": "GATEWAY_COUNT_TOKENS_CONCURRENCY",
             "source": "inference/count.rs, a pool separate from GATEWAY_MAX_CONCURRENT_REQUESTS, per gateway process"
           },
+          "counts_in_flight_per_key": {
+            "default": 2,
+            "env": null,
+            "source": "Fixed COUNTS_IN_FLIGHT_PER_KEY in inference/count.rs: counts one key may have running at once, per gateway process"
+          },
           "counts_per_connection_per_minute": {
             "default": 600,
             "env": "GATEWAY_COUNT_TOKENS_PER_CONNECTION_PER_MINUTE",
@@ -10738,7 +10743,7 @@
             "code": null,
             "envelope": "AnthropicErrorEnvelope",
             "status": 429,
-            "trigger": "a count limit of this gateway process: counts per key per minute, provider-backed counts per provider connection credential per minute, or count concurrency (all configurable, per replica)"
+            "trigger": "a count limit of this gateway process: counts per key per minute, provider-backed counts per provider connection credential per minute, count concurrency (these three configurable), or 2 counts in flight per key (all per replica)"
           },
           {
             "code": null,
