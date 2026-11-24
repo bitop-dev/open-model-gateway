@@ -38,6 +38,14 @@ impl InferenceRepository for MemoryRepository {
     async fn deployments(&self, _: &Principal, _: &str) -> Result<Vec<Deployment>, InferenceError> {
         Ok(self.deployments.lock().unwrap().clone())
     }
+    /// An in-memory list: there is no cache to bypass.
+    async fn live_candidates(
+        &self,
+        principal: &Principal,
+        model: &str,
+    ) -> Result<Vec<Deployment>, InferenceError> {
+        self.deployments(principal, model).await
+    }
     async fn route_plan(
         &self,
         _: &Principal,

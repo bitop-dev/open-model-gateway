@@ -35,6 +35,14 @@ impl InferenceRepository for Repo {
             supported_protocols: vec!["realtime".into()],
         }])
     }
+    /// A fixed list: there is no cache to bypass.
+    async fn live_candidates(
+        &self,
+        principal: &Principal,
+        model: &str,
+    ) -> Result<Vec<Deployment>, InferenceError> {
+        self.deployments(principal, model).await
+    }
     async fn start(&self, _: &ExecutionStart) -> Result<(), InferenceError> {
         self.admitted.fetch_add(1, Ordering::SeqCst);
         Ok(())

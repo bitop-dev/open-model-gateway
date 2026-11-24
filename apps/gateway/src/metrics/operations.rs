@@ -170,6 +170,21 @@ impl Metrics {
             .get()
     }
 
+    /// One token count by outcome (`inference::count`).
+    pub(crate) fn token_count(&self, outcome: &'static str) {
+        self.token_counts
+            .get_or_create(&[("outcome", outcome.to_owned())])
+            .inc();
+    }
+
+    /// Token counts so far with this outcome (tests).
+    #[cfg(all(test, feature = "integration-tests"))]
+    pub(crate) fn token_count_total(&self, outcome: &str) -> u64 {
+        self.token_counts
+            .get_or_create(&[("outcome", outcome.to_owned())])
+            .get()
+    }
+
     /// One connection an outbound client's pool opened
     /// ([`crate::egress::UpstreamClient::opened_connections`]).
     pub(crate) fn upstream_connection_opened(&self, client: &'static str) {

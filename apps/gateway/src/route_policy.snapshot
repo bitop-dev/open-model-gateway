@@ -26,6 +26,7 @@ GET	/v1/models	InferenceKey	denied
 POST	/v1/chat/completions	InferenceKey	denied
 POST	/v1/responses	InferenceKey	denied
 POST	/v1/messages	InferenceKey	denied
+POST	/v1/messages/count_tokens	InferenceKey	denied
 POST	/v1/embeddings	InferenceKey	denied
 POST	/v1/realtime/client_secrets	InferenceKey	denied
 POST	/v1/realtime/calls	InferenceKey	denied

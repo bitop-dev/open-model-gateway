@@ -610,3 +610,49 @@ pub(super) fn parse_request(value: Value) -> Result<ChatRequest> {
         .map_err(|_| InferenceError::InvalidRequest)?
         .normalize()
 }
+
+/// `POST /v1/messages/count_tokens` body: Anthropic's counting fields, under
+/// the same grammar as a Messages request. Generation controls (`max_tokens`,
+/// `stream`, sampling, `stop_sequences`, `metadata`, `context_management`)
+/// are not part of a count and are refused as unknown fields, like any other
+/// field outside the grammar.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CountRequest {
+    model: String,
+    messages: Vec<WireMessage>,
+    system: Option<Value>,
+    #[serde(default)]
+    tools: Vec<Value>,
+    tool_choice: Option<Value>,
+    thinking: Option<Value>,
+    output_config: Option<Value>,
+}
+impl CountRequest {
+    /// The canonical request a count is validated, routed and counted as.
+    /// A count has no output bound: the grammar runs with the largest
+    /// maximum (so `thinking.budget_tokens` needs only its own lower bound),
+    /// and the result has none, so no adapter sends one.
+    pub(super) fn normalize(self) -> Result<ChatRequest> {
+        let mut request = Request {
+            model: self.model,
+            messages: self.messages,
+            system: self.system,
+            max_tokens: u32::MAX,
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            tools: self.tools,
+            tool_choice: self.tool_choice,
+            metadata: None,
+            thinking: self.thinking,
+            output_config: self.output_config,
+            context_management: None,
+        }
+        .normalize()?;
+        request.max_output_tokens = None;
+        Ok(request)
+    }
+}
