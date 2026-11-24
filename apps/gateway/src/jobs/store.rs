@@ -179,7 +179,7 @@ pub(crate) async fn fail_unrecorded_video(
     older_than: Option<TimeDelta>,
     writer_: Observer<'_>,
 ) -> Result<Option<JobRow>> {
-    let (runner, epoch, any) = writer_.binds(false);
+    let (runner, epoch, any) = writer_.binds();
     sqlx::query_as(&format!("UPDATE async_jobs SET state='failed',upstream_status='failed',error_code=$2,completed_at=clock_timestamp() WHERE id=$1 AND kind='video' AND upstream_id IS NULL AND state='queued' AND ($3::float8 IS NULL OR submit_started_at<=clock_timestamp()-make_interval(secs=>$3)) AND {} RETURNING {JOB_COLUMNS}", writer(4, 5, 6)))
         .bind(id).bind(code).bind(older_than.map(|d| d.whole_seconds() as f64)).bind(runner).bind(epoch).bind(any)
         .fetch_optional(&store.pool).await.map_err(job_storage)
@@ -290,50 +290,62 @@ pub(crate) enum Observer<'a> {
     /// A client read outside any claim: it writes only while no poller
     /// holds the job, whose own observation is newer.
     Client,
-    /// The request that created a video (#662). Its first observation
-    /// writes like a client read (only while no poller holds the job: a new
-    /// row is first due at the end of its create grace, so no claim exists
-    /// before then); its end of a row without a provider id
-    /// ([`fail_unrecorded_video`]) is its own compare-and-set on that row,
-    /// whatever claim exists, because only the creator knows the create's
-    /// outcome.
+    /// The request that created a video (#662). It holds the only copy of
+    /// the create's answer, so its writes are its own compare-and-sets on
+    /// the row, whatever claim exists: the first observation, written once
+    /// the provider id is recorded (a claim that read the row before the id
+    /// landed can neither end nor settle it then), and its end of a row
+    /// without a provider id ([`fail_unrecorded_video`]).
     Creator,
 }
 impl Observer<'_> {
-    /// The binds of the writer predicate ([`WRITER`]): runner, epoch, and
+    /// The binds of the writer predicate ([`writer`]): runner, epoch, and
     /// whether the writer ignores claims.
-    fn binds(self, claims_matter: bool) -> (Option<Uuid>, Option<i64>, bool) {
+    fn binds(self) -> (Option<Uuid>, Option<i64>, bool) {
         match self {
             Self::Claim(fence) => (Some(fence.runner), Some(fence.epoch), false),
             Self::Client => (None, None, false),
-            Self::Creator => (None, None, !claims_matter),
+            Self::Creator => (None, None, true),
         }
     }
 }
 /// The writer predicate over binds `$a` (runner), `$b` (epoch) and `$c`
-/// (claims do not matter): a current claim, or no live claim, or a writer
-/// for which claims do not matter.
+/// (claims do not matter): a current claim whose lease is live, or no live
+/// claim, or the creator. A claim whose lease lapsed or was released writes
+/// nothing, so it and a client read are never both writers.
 fn writer(a: u8, b: u8, c: u8) -> String {
     format!(
-        "(${c}::boolean OR CASE WHEN ${a}::uuid IS NULL THEN runner_lease_until IS NULL OR runner_lease_until<clock_timestamp() ELSE runner_id=${a} AND runner_epoch=${b} END)"
+        "(${c}::boolean OR CASE WHEN ${a}::uuid IS NULL THEN runner_lease_until IS NULL OR runner_lease_until<clock_timestamp() ELSE runner_id=${a} AND runner_epoch=${b} AND runner_lease_until>clock_timestamp() END)"
     )
 }
-/// Whether `observer` may write the job's row now (see [`Observer`]): the
-/// guard of a write that is not itself an update of the row, such as a
-/// settlement.
-pub(crate) async fn may_write(store: &Store, id: Uuid, observer: Observer<'_>) -> Result<bool> {
-    let (runner, epoch, any) = observer.binds(false);
-    sqlx::query_scalar(&format!(
-        "SELECT EXISTS(SELECT 1 FROM async_jobs WHERE id=$1 AND {})",
+/// Hold the job's row for `observer` until `tx` ends (`FOR KEY SHARE`):
+/// `false` when the observer may not write it now. A claim (`FOR UPDATE`)
+/// cannot take the row while it is held, so a settlement made under the
+/// hold is made by the writer that holds the job (the settlement's own
+/// statements run beside it and lock no job row). The job row is the first
+/// lock of the transaction, before the settlement's reservation and totals.
+pub(crate) async fn hold_writer(
+    tx: &mut Transaction<'_, Postgres>,
+    id: Uuid,
+    observer: Observer<'_>,
+) -> Result<bool> {
+    let (runner, epoch, any) = observer.binds();
+    // As a fenced transaction does (`jobs::fence`), the hold ends the session
+    // after `IDLE_IN_TRANSACTION` without a statement, so a frozen holder
+    // releases the row.
+    let held: Option<String> = sqlx::query_scalar(&format!(
+        "SELECT set_config('idle_in_transaction_session_timeout',$5,true) FROM async_jobs WHERE id=$1 AND {} FOR KEY SHARE",
         writer(2, 3, 4)
     ))
     .bind(id)
     .bind(runner)
     .bind(epoch)
     .bind(any)
-    .fetch_one(&store.pool)
+    .bind(crate::jobs::fence::IDLE_IN_TRANSACTION)
+    .fetch_optional(&mut **tx)
     .await
-    .map_err(job_storage)
+    .map_err(job_storage)?;
+    Ok(held.is_some())
 }
 /// Apply `obs` to `job` (regressions are ignored). Returns the current row
 /// and whether this observation was recorded. The write happens only for
@@ -342,7 +354,8 @@ pub(crate) async fn may_write(store: &Store, id: Uuid, observer: Observer<'_>) -
 /// request counts only ever grow, so an older observation never lowers them,
 /// and `state` moves only along the state machine. Only a recorded
 /// observation may settle the job: a refused one returns the row as the
-/// writer that holds it left it.
+/// writer that holds it left it, and so does one whose state the state
+/// machine did not take (its evidence is not the row's).
 pub(crate) async fn observe(
     store: &Store,
     job: &JobRow,
@@ -357,12 +370,12 @@ pub(crate) async fn observe(
         current
     };
     // A terminal row keeps its recorded terminal facts.
-    let (runner, epoch, any) = observer.binds(true);
+    let (runner, epoch, any) = observer.binds();
     let changed: Option<JobRow> = sqlx::query_as(&format!("UPDATE async_jobs SET state=$3,upstream_status=CASE WHEN state IN('queued','in_progress') THEN $4 ELSE upstream_status END,progress=greatest(progress,$5),completed_at=CASE WHEN $3 IN('completed','failed','cancelled','expired') THEN coalesce(completed_at,$6,clock_timestamp()) ELSE completed_at END,expires_at=coalesce($7,expires_at),error_code=coalesce(error_code,$8),request_total=greatest(request_total,$9),request_completed=greatest(request_completed,$10),request_failed=greatest(request_failed,$11),last_polled_at=clock_timestamp(),poll_failures=0,next_poll_at=clock_timestamp()+make_interval(secs=>$12) WHERE id=$1 AND state=$2 AND {} RETURNING {JOB_COLUMNS}", writer(13, 14, 15)))
         .bind(job.id).bind(current.as_str()).bind(next.as_str()).bind(obs.upstream_status).bind(obs.progress.map(i16::from)).bind(at(obs.completed_at)).bind(at(obs.expires_at)).bind(obs.error.map(|e| e.as_str())).bind(obs.counts.map(|c| c.total as i32)).bind(obs.counts.map(|c| c.completed as i32)).bind(obs.counts.map(|c| c.failed as i32)).bind(poll_interval_seconds).bind(runner).bind(epoch).bind(any)
         .fetch_optional(&store.pool).await.map_err(job_storage)?;
     match changed {
-        Some(row) => Ok((row, true)),
+        Some(row) => Ok((row, next == obs.state)),
         // A concurrent observer moved the row first, the claim ended, or a
         // poller holds the job (a client read): the row as it is.
         None => Ok((reload(store, job.id).await?, false)),
@@ -446,7 +459,10 @@ pub(crate) async fn claim_due(
 /// (`SKIP LOCKED`) and taken on a later call, and a job in `held` (one the
 /// poller still refreshes, whose lease may have lapsed) is never taken. One statement reads the head
 /// of `async_jobs_due` (which also holds gateway-run batches and expired,
-/// unsettled jobs that no claim takes) once for all the slots it fills.
+/// unsettled jobs that no claim takes) once for all the slots it fills. A
+/// video without a provider id stays claimable past its poll deadline: it is
+/// never polled upstream, and only a claim ends and settles it locally
+/// (`video::refresh_unrecorded_video`).
 pub(crate) async fn claim_due_many(
     store: &Store,
     poller: Uuid,
@@ -456,7 +472,7 @@ pub(crate) async fn claim_due_many(
     held: &[Uuid],
 ) -> Result<Vec<(JobRow, BatchFence)>> {
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-    let claimed: Vec<Claimed> = sqlx::query_as(&format!("UPDATE async_jobs SET next_poll_at=clock_timestamp()+make_interval(secs=>$2),runner_id=$1,runner_epoch=runner_epoch+1,runner_lease_until=clock_timestamp()+make_interval(secs=>$3) WHERE id IN(SELECT id FROM async_jobs WHERE settled_at IS NULL AND batch_mode IS DISTINCT FROM 'gateway' AND next_poll_at<=clock_timestamp() AND poll_deadline_at>clock_timestamp() AND (runner_lease_until IS NULL OR runner_lease_until<clock_timestamp()) AND id<>ALL($5) ORDER BY next_poll_at,id LIMIT $4 FOR UPDATE SKIP LOCKED) RETURNING {JOB_COLUMNS},runner_epoch"))
+    let claimed: Vec<Claimed> = sqlx::query_as(&format!("UPDATE async_jobs SET next_poll_at=clock_timestamp()+make_interval(secs=>$2),runner_id=$1,runner_epoch=runner_epoch+1,runner_lease_until=clock_timestamp()+make_interval(secs=>$3) WHERE id IN(SELECT id FROM async_jobs WHERE settled_at IS NULL AND batch_mode IS DISTINCT FROM 'gateway' AND next_poll_at<=clock_timestamp() AND (poll_deadline_at>clock_timestamp() OR (kind='video' AND upstream_id IS NULL)) AND (runner_lease_until IS NULL OR runner_lease_until<clock_timestamp()) AND id<>ALL($5) ORDER BY next_poll_at,id LIMIT $4 FOR UPDATE SKIP LOCKED) RETURNING {JOB_COLUMNS},runner_epoch"))
         .bind(poller).bind(interval_seconds).bind(lease_seconds).bind(limit).bind(held).fetch_all(&store.pool).await.map_err(job_storage)?;
     Ok(claimed
         .into_iter()

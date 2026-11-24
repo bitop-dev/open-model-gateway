@@ -261,7 +261,7 @@ impl Jobs {
         let job = match recorded {
             Ok(job) => job,
             Err(e) => {
-                let (error, _) = attempt.fail_unsent(e).await;
+                let (error, recorded) = attempt.fail_unsent(e).await;
                 // A COMMIT whose acknowledgement was lost may still have
                 // recorded the row: end it now rather than by the grace rule.
                 if let Ok(Some(ended)) = store::fail_unrecorded_video(
@@ -272,6 +272,7 @@ impl Jobs {
                     store::Observer::Creator,
                 )
                 .await
+                    && recorded
                 {
                     let _ = store::mark_settled(&self.store, ended.id).await;
                 }
@@ -350,8 +351,7 @@ impl Jobs {
         observer: store::Observer<'_>,
     ) -> JobResult<JobRow> {
         if job.job_state().is_terminal() {
-            if job.settled_at.is_none() && store::may_write(&self.store, job.id, observer).await? {
-                self.settle(&job, interrupted()).await?;
+            if job.settled_at.is_none() && self.settle_as(&job, interrupted(), observer).await? {
                 return Ok(store::reload(&self.store, job.id).await?);
             }
             return Ok(job);
@@ -370,8 +370,10 @@ impl Jobs {
         )
         .await?
         {
+            // Settled under the writer's hold: if the claim ended in
+            // between, the ended row is settled by the writer that holds it.
             Some(ended) => {
-                self.settle(&ended, interrupted()).await?;
+                self.settle_as(&ended, interrupted(), observer).await?;
                 Ok(store::reload(&self.store, ended.id).await?)
             }
             // Its id was recorded meanwhile, it already ended, or another
@@ -398,10 +400,31 @@ impl Jobs {
             && job.settled_at.is_none()
             && let Some(s) = settlement(&job, upstream)
         {
-            self.settle(&job, s).await?;
+            self.settle_as(&job, s, observer).await?;
             return Ok(store::reload(&self.store, job.id).await?);
         }
         Ok(job)
+    }
+
+    /// Settle `job` while `observer` holds its row (`store::hold_writer`), so
+    /// no claim can take the job between the writer check and the
+    /// settlement. `false` when the observer may not write the row now (the
+    /// writer that holds it settles it).
+    async fn settle_as(
+        &self,
+        job: &JobRow,
+        finish: Settlement,
+        observer: store::Observer<'_>,
+    ) -> JobResult<bool> {
+        let mut tx = crate::db::begin(&self.store.pool)
+            .await
+            .map_err(|_| InferenceError::Storage)?;
+        if !store::hold_writer(&mut tx, job.id, observer).await? {
+            return Ok(false);
+        }
+        self.settle(job, finish).await?;
+        tx.commit().await.map_err(|_| InferenceError::Storage)?;
+        Ok(true)
     }
 
     pub(crate) fn poll_seconds(&self) -> f64 {

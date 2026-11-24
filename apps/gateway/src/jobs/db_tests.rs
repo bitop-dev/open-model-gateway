@@ -1816,7 +1816,9 @@ async fn no_poller_holds_a_video_while_its_create_runs(pool: PgPool) {
         held_create(&f, &j, &fake, upstream_video(JobState::InProgress, Some(8))).await;
     let row = row_of(&f, execution).await;
     let (due_after_grace,): (bool,) = sqlx::query_as(
-        "SELECT next_poll_at>=submit_started_at+make_interval(secs=>$2) FROM async_jobs WHERE id=$1",
+        // `submit_started_at` and `next_poll_at` are two clock readings of
+        // one insert: allow the microseconds between them.
+        "SELECT next_poll_at>=submit_started_at+make_interval(secs=>$2)-interval '1 second' FROM async_jobs WHERE id=$1",
     )
     .bind(row.id)
     .bind(j.video_create_grace().whole_seconds() as f64)
@@ -1842,9 +1844,10 @@ async fn no_poller_holds_a_video_while_its_create_runs(pool: PgPool) {
 
 /// A create that answers after the grace while a poller holds the row: the
 /// creator records the provider id (the row is still a queued video without
-/// one) but its first observation is refused (the claim holds the row) and
-/// settles nothing; the claim's end of the row "without an id" is refused
-/// because the id landed. The next poll observes and settles the job.
+/// one) and its first observation, which ignores claims: it is the only copy
+/// of the create's answer, so it records and settles with the known
+/// duration. The claim read the row before the id landed: its end of the
+/// row "without an id" is refused, and so is the creator's own.
 #[dbtest::test]
 async fn a_late_create_and_a_live_claim_never_both_write(pool: PgPool) {
     use super::store::{Observer, claim_due};
@@ -1854,7 +1857,7 @@ async fn a_late_create_and_a_live_claim_never_both_write(pool: PgPool) {
     let mut j = jobs(&f, &fake, true);
     j.video_create_grace = TimeDelta::seconds(0);
     let (execution, hold, create) =
-        held_create(&f, &j, &fake, upstream_video(JobState::InProgress, Some(8))).await;
+        held_create(&f, &j, &fake, upstream_video(JobState::Completed, Some(8))).await;
     let row = row_of(&f, execution).await;
     make_due(&f, row.id).await;
     let (snapshot, fence) = claim_due(&f.store, Uuid::new_v4(), 30.0, 60.0)
@@ -1865,14 +1868,18 @@ async fn a_late_create_and_a_live_claim_never_both_write(pool: PgPool) {
     hold.release();
     let created = create.await.unwrap();
     assert!(created.upstream_id.is_some(), "the creator recorded the id");
-    assert_eq!(created.state, "queued", "its observation is refused");
+    assert_eq!(created.state, "completed", "its observation is recorded");
+    assert!(created.settled_at.is_some(), "and settles");
+    let settled = amounts(&f, execution).await;
+    assert_eq!(settled.0, "settled");
+    assert!(settled.2.is_some_and(|a| a > 0), "with the known duration");
     // The claim read the row before the id landed: it changes nothing.
     let seen = j
         .refresh_video(snapshot, Observer::Claim(&fence))
         .await
         .unwrap();
-    assert_eq!((seen.state.as_str(), seen.settled_at), ("queued", None));
-    assert_eq!(amounts(&f, execution).await.0, "pending");
+    assert_eq!(seen.state, "completed");
+    assert_eq!(seen.error_code, None);
     // Nor can the creator end a row whose id is recorded.
     assert!(
         super::store::fail_unrecorded_video(
@@ -1886,15 +1893,7 @@ async fn a_late_create_and_a_live_claim_never_both_write(pool: PgPool) {
         .unwrap()
         .is_none()
     );
-    // The next poll reads the provider and settles with the known duration.
-    fence.end_poll(&f.store, None).await.unwrap();
-    make_due(&f, row.id).await;
-    fake.push_video(upstream_video(JobState::Completed, Some(8)));
-    assert_eq!(j.poll_once().await.unwrap(), 1);
-    let done = row_of(&f, execution).await;
-    assert_eq!(done.state, "completed");
-    assert!(done.settled_at.is_some());
-    assert_eq!(amounts(&f, execution).await.0, "settled");
+    assert_eq!(amounts(&f, execution).await, settled);
 }
 
 /// The poller ends the row first (after the grace): the create's late answer
@@ -2061,4 +2060,174 @@ async fn a_lost_settled_mark_is_restored_only_by_the_current_writer(pool: PgPool
     let (state, held, actual, _) = amounts(&f, execution).await;
     assert_eq!((state.as_str(), actual), ("unknown", None));
     assert!(held.is_some_and(|h| h > 0), "the hold is kept");
+}
+
+/// A row without a provider id past its grace (the create's process died).
+async fn orphaned_video(f: &Fixture, j: &Jobs, fake: &Fake) -> (Uuid, JobRow) {
+    let (execution, _hold, create) =
+        held_create(f, j, fake, upstream_video(JobState::InProgress, Some(8))).await;
+    std::mem::forget(create);
+    let row = row_of(f, execution).await;
+    make_due(f, row.id).await;
+    (execution, row)
+}
+
+/// A settlement is made under the writer's hold on the job row: while a claim
+/// holds the row (`hold_writer`), no other poller can take the job, even once
+/// the lease lapsed, so the claim that checked it may write is the one that
+/// settles. After the hold ends the row is taken, and the old claim's hold is
+/// refused.
+#[dbtest::test]
+async fn a_writer_hold_keeps_a_takeover_out_until_it_ends(pool: PgPool) {
+    use super::store::{Observer, claim_due, hold_writer};
+    let f = fixture(pool).await;
+    video_setup(&f).await;
+    let fake = Fake::default();
+    let mut j = jobs(&f, &fake, true);
+    j.video_create_grace = TimeDelta::seconds(0);
+    let (_, row) = orphaned_video(&f, &j, &fake).await;
+    let (_, a) = claim_due(&f.store, Uuid::new_v4(), 30.0, 60.0)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut tx = crate::db::begin(&f.store.pool).await.unwrap();
+    assert!(
+        hold_writer(&mut tx, row.id, Observer::Claim(&a))
+            .await
+            .unwrap()
+    );
+    sqlx::query("UPDATE async_jobs SET runner_lease_until=now()-interval '1 second',next_poll_at=now() WHERE id=$1")
+        .bind(row.id)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    assert!(
+        claim_due(&f.store, Uuid::new_v4(), 30.0, 60.0)
+            .await
+            .unwrap()
+            .is_none(),
+        "no takeover while the writer holds the row"
+    );
+    tx.commit().await.unwrap();
+    let (_, b) = claim_due(&f.store, Uuid::new_v4(), 30.0, 60.0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(b.epoch > a.epoch);
+    let mut tx = crate::db::begin(&f.store.pool).await.unwrap();
+    assert!(
+        !hold_writer(&mut tx, row.id, Observer::Claim(&a))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !hold_writer(&mut tx, row.id, Observer::Client)
+            .await
+            .unwrap()
+    );
+    assert!(
+        hold_writer(&mut tx, row.id, Observer::Claim(&b))
+            .await
+            .unwrap()
+    );
+}
+
+/// A claim whose lease lapsed with no takeover writes nothing: it is not the
+/// current writer, and a client read, which may write while no claim is
+/// live, ends and settles the row. The two are never both writers.
+#[dbtest::test]
+async fn an_expired_claim_writes_nothing_and_a_read_then_may(pool: PgPool) {
+    use super::store::{Observer, claim_due};
+    let f = fixture(pool).await;
+    video_setup(&f).await;
+    let fake = Fake::default();
+    let mut j = jobs(&f, &fake, true);
+    j.video_create_grace = TimeDelta::seconds(0);
+    let (execution, row) = orphaned_video(&f, &j, &fake).await;
+    let (snapshot, a) = claim_due(&f.store, Uuid::new_v4(), 30.0, 60.0)
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query("UPDATE async_jobs SET runner_lease_until=now()-interval '1 second' WHERE id=$1")
+        .bind(row.id)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    let stale = j
+        .refresh_video(snapshot, Observer::Claim(&a))
+        .await
+        .unwrap();
+    assert_eq!((stale.state.as_str(), stale.settled_at), ("queued", None));
+    assert_eq!(amounts(&f, execution).await.0, "pending");
+    let read = j
+        .get_video(&f.principal, &client_id("video_", row.id))
+        .await
+        .unwrap();
+    assert_eq!(read.error_code.as_deref(), Some("create_interrupted"));
+    assert!(read.settled_at.is_some());
+    assert_eq!(amounts(&f, execution).await.0, "unknown");
+}
+
+/// A row without a provider id is never polled upstream, so its poll
+/// deadline does not end its claims: one past its deadline is still claimed,
+/// ended `create_interrupted` and settled with its hold kept, instead of
+/// staying queued and unsettled for good.
+#[dbtest::test]
+async fn a_video_without_an_id_past_its_poll_deadline_is_still_ended(pool: PgPool) {
+    let f = fixture(pool).await;
+    video_setup(&f).await;
+    let fake = Fake::default();
+    let mut j = jobs(&f, &fake, true);
+    j.video_create_grace = TimeDelta::seconds(0);
+    let (execution, row) = orphaned_video(&f, &j, &fake).await;
+    sqlx::query("UPDATE async_jobs SET poll_deadline_at=now()-interval '1 second' WHERE id=$1")
+        .bind(row.id)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(j.poll_once().await.unwrap(), 1);
+    let ended = row_of(&f, execution).await;
+    assert_eq!(ended.error_code.as_deref(), Some("create_interrupted"));
+    assert!(ended.settled_at.is_some());
+    let (state, held, actual, _) = amounts(&f, execution).await;
+    assert_eq!((state.as_str(), actual), ("unknown", None));
+    assert!(held.is_some_and(|h| h > 0), "the hold is kept");
+}
+
+/// An observation whose state the state machine did not take is not the
+/// row's evidence: a `failed` read of a video recorded `completed` (its
+/// settlement not yet made) settles nothing; the next `completed` read
+/// settles with its duration.
+#[dbtest::test]
+async fn an_observation_the_state_machine_did_not_take_settles_nothing(pool: PgPool) {
+    use super::store::Observer;
+    let f = fixture(pool).await;
+    video_setup(&f).await;
+    let fake = Fake::default();
+    let j = jobs(&f, &fake, true);
+    fake.push_video(upstream_video(JobState::InProgress, None));
+    let created = j
+        .create_video(f.principal, video_request(), Uuid::new_v4())
+        .await
+        .unwrap();
+    let execution = created.execution_id;
+    sqlx::query("UPDATE async_jobs SET state='completed',completed_at=now() WHERE id=$1")
+        .bind(created.id)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    let completed = super::store::reload(&f.store, created.id).await.unwrap();
+    fake.push_video(upstream_video(JobState::Failed, None));
+    let read = j
+        .refresh_video(completed.clone(), Observer::Client)
+        .await
+        .unwrap();
+    assert_eq!((read.state.as_str(), read.settled_at), ("completed", None));
+    assert_eq!(amounts(&f, execution).await.0, "pending");
+    fake.push_video(upstream_video(JobState::Completed, Some(8)));
+    let settled = j.refresh_video(read, Observer::Client).await.unwrap();
+    assert!(settled.settled_at.is_some());
+    let (state, _, actual, _) = amounts(&f, execution).await;
+    assert_eq!(state, "settled");
+    assert!(actual.is_some_and(|a| a > 0));
 }
