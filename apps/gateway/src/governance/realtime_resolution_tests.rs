@@ -469,16 +469,16 @@ async fn concurrent_resolutions_of_one_response_settle_it_once(pool: PgPool) {
     assert_eq!(amounts(&f, id).await.2, Some(2 * RESPONSE));
 }
 
-/// The response guard (0090) refuses every other change of a resolved or
-/// terminal response, whoever writes it.
 /// A session whose process died (lease expiry), reserving as
 /// `RealtimeSession` does (the first request resizes admission's window):
-/// response 1 settled from U, response 2 open; with `armed`, request 3's
-/// window reserved (and perhaps forwarded) but never opened as a response row.
+/// response 1 done with `first` (unknown without usage), response 2 open;
+/// with `armed`, request 3's window reserved (and perhaps forwarded) but never
+/// opened as a response row.
 async fn expired_session(
     f: &Fixture,
     principal: crate::auth::Principal,
     d: &Deployment,
+    first: Option<RealtimeUsage>,
     armed: bool,
 ) -> Uuid {
     let id = open_session(f, principal, d).await;
@@ -489,7 +489,7 @@ async fn expired_session(
     realtime::open_response(&f.store, id, 1, FULL)
         .await
         .unwrap();
-    realtime::settle_response(&f.store, id, 1, Some(ResponseStatus::Completed), Some(U), FULL)
+    realtime::settle_response(&f.store, id, 1, Some(ResponseStatus::Completed), first, FULL)
         .await
         .unwrap();
     realtime::reserve_window(&f.store, &principal, id, "company/smart", FULL, None)
@@ -517,7 +517,7 @@ async fn expired_session(
 async fn a_lease_expired_session_settles_once_its_rows_explain_its_hold(pool: PgPool) {
     let f = fixture(pool).await;
     let d = realtime_model(&f, true).await;
-    let id = expired_session(&f, f.team, &d, false).await;
+    let id = expired_session(&f, f.team, &d, Some(U), false).await;
     assert_eq!(amounts(&f, id).await.1, Some(RESPONSE + WINDOW));
     assert_eq!(
         resolve_response(&f.store, f.team.workspace_id, id, 2, U, "invoice:2", f.owner).await,
@@ -527,28 +527,65 @@ async fn a_lease_expired_session_settles_once_its_rows_explain_its_hold(pool: Pg
 }
 
 #[dbtest::test]
+async fn a_lease_expired_session_with_two_unknown_responses_settles_after_both(pool: PgPool) {
+    let f = fixture(pool).await;
+    let d = realtime_model(&f, true).await;
+    let id = expired_session(&f, f.team, &d, None, false).await;
+    assert_eq!(amounts(&f, id).await.1, Some(2 * WINDOW));
+    let ws = f.team.workspace_id;
+    // Each resolution values its response below the window it held; the
+    // session's hold is still exactly what its rows retained.
+    assert_eq!(
+        resolve_response(&f.store, ws, id, 1, U, "invoice:1", f.owner).await,
+        Ok(Resolved::Response)
+    );
+    assert_eq!(
+        resolve_response(&f.store, ws, id, 2, U, "invoice:2", f.owner).await,
+        Ok(Resolved::Session)
+    );
+    assert_eq!(amounts(&f, id).await.2, Some(2 * RESPONSE));
+}
+
+#[dbtest::test]
 async fn a_window_without_a_response_row_keeps_the_session_unknown(pool: PgPool) {
     let f = fixture(pool).await;
     let d = realtime_model(&f, true).await;
-    let id = expired_session(&f, f.team, &d, true).await;
+    let id = expired_session(&f, f.team, &d, None, true).await;
     let before = amounts(&f, id).await;
     // Request 3's window is held but has no row: the provider may have run it.
-    assert_eq!(before.1, Some(RESPONSE + 2 * WINDOW));
-    assert_eq!(
-        resolve_response(&f.store, f.team.workspace_id, id, 2, U, "invoice:2", f.owner).await,
-        Ok(Resolved::Response)
-    );
-    assert_eq!(response(&f, id, 2).await.0, "settled");
+    assert_eq!(before.1, Some(3 * WINDOW));
+    let ws = f.team.workspace_id;
+    // Response 1 is valued at exactly its window plus the unrowed one (5,600
+    // text output tokens at $16/M): the settled values plus the remaining
+    // window then add up to the hold, which still proves nothing.
+    let two_windows = RealtimeUsage {
+        input_text_tokens: 0,
+        cached_text_tokens: 0,
+        input_audio_tokens: 0,
+        cached_audio_tokens: 0,
+        output_text_tokens: 5_600,
+        output_audio_tokens: 0,
+    };
+    for (n, usage) in [(1, two_windows), (2, U)] {
+        assert_eq!(
+            resolve_response(&f.store, ws, id, n, usage, "invoice", f.owner).await,
+            Ok(Resolved::Response)
+        );
+        assert_eq!(response(&f, id, n).await.0, "settled");
+    }
+    assert_eq!(response(&f, id, 1).await.1, Some(2 * WINDOW));
     assert_eq!(amounts(&f, id).await, before);
     assert!(ledger(&f, id).await.iter().all(|l| l.0 != "reconciliation"));
-    let settled: bool = sqlx::query_scalar("SELECT (metadata->>'session_settled')::boolean FROM audit_events WHERE action='realtime_response.reconciled' AND resource_id=$1")
+    let settled: Vec<bool> = sqlx::query_scalar("SELECT (metadata->>'session_settled')::boolean FROM audit_events WHERE action='realtime_response.reconciled' AND resource_id=$1")
         .bind(id)
-        .fetch_one(&f.store.pool)
+        .fetch_all(&f.store.pool)
         .await
         .unwrap();
-    assert!(!settled);
+    assert_eq!(settled, [false, false]);
 }
 
+/// The response guard (0090) refuses every other change of a resolved or
+/// terminal response, whoever writes it.
 #[dbtest::test]
 async fn a_resolved_response_never_changes_again(pool: PgPool) {
     let f = fixture(pool).await;

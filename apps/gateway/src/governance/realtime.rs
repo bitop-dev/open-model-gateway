@@ -841,13 +841,20 @@ async fn resolve_response_once(
     // row. One closed by lease expiry may still hold a reserved window with
     // no row (a request forwarded before the process stopped, which the
     // provider may have run): it settles only while its hold is exactly what
-    // its rows retain (settled actuals plus unknown windows or floors), read
-    // before this response changes it. Otherwise the response settles and
-    // the session keeps its hold, unknown.
+    // its rows put into it. A row settled by `response.done` put in its
+    // actual; any other row (unknown, or settled by a resolution, which never
+    // changes the hold) its window or floor, whichever is greater. Windows
+    // and floors never change (the response guard), so this sum is the same
+    // before and after every resolution. A row without a window (an unbounded
+    // price) proves nothing. Otherwise the response settles and the session
+    // keeps its hold, unknown.
     let accounted = if expired {
-        let t = totals(&mut tx, execution).await?;
-        s.held_microusd.is_some()
-            && t.retained.and_then(|r| r.checked_add(t.actual)) == s.held_microusd
+        let rows: Option<i64> = sqlx::query_scalar("SELECT CASE WHEN bool_or(window_hold_microusd IS NULL AND NOT (state='settled' AND evidence IS NULL)) THEN NULL ELSE coalesce(sum(CASE WHEN state='settled' AND evidence IS NULL THEN actual_microusd ELSE greatest(window_hold_microusd,coalesce(floor_microusd,0)) END),0) END::bigint FROM realtime_responses WHERE execution_id=$1")
+            .bind(execution)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(storage)?;
+        rows.is_some() && rows == s.held_microusd
     } else {
         true
     };
