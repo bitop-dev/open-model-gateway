@@ -168,7 +168,18 @@ fn reasoning_fields(item: &Value) -> Result<()> {
 fn decode_shape(value: &Value) -> Result<ChatResponse> {
     // A failed response carries its `ResponseError` at `error`
     // (`error_envelope`), classified as the stream's `response.failed` is.
-    super::error_envelope::check(value, &["output"], &["usage"], status_error)?;
+    // A terminal state other than `failed` (or none) says generation ran.
+    if !super::error_envelope::empty(&value["error"])
+        && !matches!(value["status"].as_str(), None | Some("failed"))
+    {
+        return Err(InferenceError::InvalidUpstream);
+    }
+    super::error_envelope::check(
+        value,
+        &["output", "incomplete_details"],
+        &["usage"],
+        status_error,
+    )?;
     let reason = match value["status"].as_str() {
         Some("completed") => FinishReason::Stop,
         Some("incomplete") => match value["incomplete_details"]["reason"].as_str() {

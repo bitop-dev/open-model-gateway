@@ -534,25 +534,27 @@ async fn a_tiny_or_textual_usage_value_is_never_read_as_zero() {
         Some(InferenceError::InvalidUpstream),
         "unreadable cost"
     );
-    // Zeros stay clean: an integer zero everywhere, a textual zero under the
-    // generic rule (OpenRouter's exact cost is a number, so text is unreadable).
+    // Only integer zeros stay clean; a zero written as text or as a float is
+    // not read as one.
     for (kind, zero) in [
         (Kind::OpenRouter, r#"{"cost":0,"prompt_tokens":0}"#),
         (Kind::OpenAi, r#"{"prompt_tokens":0}"#),
-        (Kind::OpenAi, r#"{"cost":"0"}"#),
-        (Kind::OpenAi, r#"{"cost":"0.00"}"#),
     ] {
         let body = format!(r#"{{"error":{{"code":429}},"usage":{zero}}}"#).into_bytes();
         let (class, _) = complete_raw(kind, false, body).await;
         assert_eq!(class, Some(InferenceError::Busy), "{kind:?} {zero}");
     }
-    let body = br#"{"error":{"code":429},"usage":{"cost":"0"}}"#.to_vec();
-    let (class, _) = complete_raw(Kind::OpenRouter, false, body).await;
-    assert_eq!(
-        class,
-        Some(InferenceError::InvalidUpstream),
-        "OpenRouter text cost"
-    );
+    for kind in [Kind::OpenRouter, Kind::OpenAi] {
+        for zero in [r#"{"cost":"0"}"#, r#"{"cost":"0.00"}"#] {
+            let body = format!(r#"{{"error":{{"code":429}},"usage":{zero}}}"#).into_bytes();
+            let (class, _) = complete_raw(kind, false, body).await;
+            assert_eq!(
+                class,
+                Some(InferenceError::InvalidUpstream),
+                "{kind:?} {zero}"
+            );
+        }
+    }
 }
 
 /// A body that names a member twice is ambiguous (a JSON reader keeps one of
@@ -650,11 +652,95 @@ async fn openrouter_keeps_each_valid_meter_next_to_an_error_and_no_model() {
 /// may fail over.
 #[tokio::test]
 async fn a_broken_json_speech_body_is_an_invalid_response() {
-    let (class, _) = call_steps(
-        Kind::OpenAi,
-        Endpoint::Speech,
-        vec![Step::Bytes(br#"{"error":{"code":"#.to_vec()), Step::Reset],
+    for kind in [Kind::OpenAi, Kind::OpenRouter] {
+        let (class, _) = call_steps(
+            kind,
+            Endpoint::Speech,
+            vec![Step::Bytes(br#"{"error":{"code":"#.to_vec()), Step::Reset],
+        )
+        .await;
+        assert_eq!(class, Some(InferenceError::InvalidUpstream), "{kind:?}");
+    }
+}
+
+/// A usage value that is not an integer zero counts whatever its type (a
+/// malformed count is not evidence of no processing); only the labels `type`
+/// and `is_byok` are exempt, by name.
+#[tokio::test]
+async fn a_malformed_usage_value_is_never_read_as_zero() {
+    for usage in [
+        r#"{"prompt_tokens":"NaN"}"#,
+        r#"{"prompt_tokens":true}"#,
+        r#"{"prompt_tokens":"none"}"#,
+        r#"{"details":{"cached":"x"}}"#,
+        r#"{"type":5}"#,
+    ] {
+        let body = format!(r#"{{"error":{{"code":429}},"usage":{usage}}}"#).into_bytes();
+        for kind in [Kind::OpenAi, Kind::OpenRouter, Kind::Local] {
+            let (class, _) = complete_raw(kind, false, body.clone()).await;
+            assert_eq!(
+                class,
+                Some(InferenceError::InvalidUpstream),
+                "{kind:?} {usage}"
+            );
+        }
+    }
+    let body =
+        br#"{"error":{"code":429},"usage":{"type":"tokens","is_byok":false,"prompt_tokens":0}}"#;
+    let (class, _) = complete_raw(Kind::OpenAi, false, body.to_vec()).await;
+    assert_eq!(class, Some(InferenceError::Busy));
+}
+
+/// A Responses body whose terminal state says generation ran (`incomplete`,
+/// `completed`) is not a clean envelope, whatever its `error`.
+#[tokio::test]
+async fn a_responses_error_with_a_generated_terminal_state_is_an_invalid_response() {
+    for (status, details) in [
+        ("incomplete", json!({"reason":"max_output_tokens"})),
+        ("completed", Value::Null),
+        ("incomplete", Value::Null),
+    ] {
+        let body = json!({"id":"r","object":"response","status":status,"incomplete_details":details,
+            "error":{"code":"rate_limit_exceeded"},"output":[],"usage":null});
+        let (class, _) = complete(Kind::Responses, false, &body).await;
+        assert_eq!(
+            class,
+            Some(InferenceError::InvalidUpstream),
+            "{status} {details}"
+        );
+    }
+}
+
+/// The 16 KiB refinement read of an HTTP 400 (Messages clients) keeps its
+/// earlier reading: a duplicate member there does not drop a structured code.
+#[tokio::test]
+async fn an_http_400_refinement_still_reads_a_body_with_a_duplicate_member() {
+    let body = br#"{"error":{"code":"rate_limit_exceeded"},"x":1,"x":2}"#.to_vec();
+    for kind in [Kind::OpenAi, Kind::Local] {
+        let outcome = run(
+            kind,
+            true,
+            400,
+            "application/json",
+            vec![Step::Bytes(body.clone())],
+        )
+        .await;
+        assert_eq!(outcome.class(), Some(InferenceError::Busy), "{kind:?}");
+    }
+}
+
+/// OpenRouter embeddings keep their request meter next to an error, as on
+/// any other failed embeddings body.
+#[tokio::test]
+async fn openrouter_embeddings_keep_their_request_meter_next_to_an_error() {
+    let (class, usage) = call(
+        Kind::OpenRouter,
+        Endpoint::Embeddings,
+        &json!({"error":{"code":429},"usage":{"prompt_tokens":3,"total_tokens":3,"cost":0.01}}),
     )
     .await;
     assert_eq!(class, Some(InferenceError::InvalidUpstream));
+    let usage = usage.expect("evidence");
+    assert_eq!(usage.meters.and_then(|m| m.requests), Some(1));
+    assert_eq!(usage.provider_cost_microusd, Some(10_000));
 }

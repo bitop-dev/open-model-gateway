@@ -688,9 +688,7 @@ impl ProviderAdapter for OpenRouterAdapter {
         observed.meters = Some(metering::text_workload_meters(Some(0)));
         observed.provider_cost_microusd = cost.as_ref().ok().copied().flatten();
         embedded_error(&value, &["data"], &["usage"], &cost, status_error, || {
-            value["usage"]
-                .is_object()
-                .then(|| metering::embedding(&value["usage"]))
+            value["usage"].is_object().then_some(Ok(observed))
         })?;
         evidence::preserve(
             cost.and_then(|_| {

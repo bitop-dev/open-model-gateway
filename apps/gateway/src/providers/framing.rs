@@ -53,6 +53,9 @@ pub(super) async fn body(response: reqwest::Response) -> Result<Value> {
     body_limit(response, BODY_LIMIT).await
 }
 pub(super) async fn body_limit(response: reqwest::Response, limit: usize) -> Result<Value> {
+    json(&body_bytes(response, limit).await?)
+}
+async fn body_bytes(response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
     if response.content_length().is_some_and(|n| n > limit as u64) {
         return Err(InferenceError::InvalidUpstream);
     }
@@ -65,7 +68,7 @@ pub(super) async fn body_limit(response: reqwest::Response, limit: usize) -> Res
         }
         bytes.extend_from_slice(&chunk);
     }
-    json(&bytes)
+    Ok(bytes)
 }
 /// A complete JSON body. A member name that appears twice in one object, at
 /// any depth, makes the body ambiguous (a reader keeps one of the values, so
@@ -151,8 +154,14 @@ async fn generation_status_with(
         return Ok(response);
     }
     let code = response.status().as_u16();
+    // An HTTP error status is already a failure: its envelope only refines
+    // the class, so it is read as any JSON reader reads it (a duplicate
+    // member does not drop a structured code here).
     let body = if matches!(code, 400 | 413 | 422) {
-        body_limit(response, 16 * 1024).await.ok()
+        body_bytes(response, 16 * 1024)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
     } else {
         None
     };

@@ -622,7 +622,12 @@ fn native_messages_batch_marks_failed_tool_results_on_chat_wire() {
 /// one, is not a success.
 #[test]
 fn a_native_embeddings_line_with_an_error_member_is_not_a_success() {
-    for error in [json!({}), json!(""), json!({"code":"rate_limit_exceeded"})] {
+    for error in [
+        json!({}),
+        json!(""),
+        json!(null),
+        json!({"code":"rate_limit_exceeded"}),
+    ] {
         let line = json!({"id":"r","custom_id":"l0","response":{"status_code":200,"body":{
             "object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1]}],
             "usage":{"prompt_tokens":1,"total_tokens":1},"error":error}},"error":null});
@@ -632,4 +637,11 @@ fn a_native_embeddings_line_with_an_error_member_is_not_a_success() {
             "{error}"
         );
     }
+}
+
+/// A native line that names a member twice is not decoded at all.
+#[test]
+fn a_native_line_with_a_duplicate_member_is_not_decoded() {
+    let line = br#"{"id":"r","custom_id":"l0","response":{"status_code":200,"body":{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1]}],"usage":{"prompt_tokens":1,"total_tokens":1},"error":{"code":"x"},"error":null}},"error":null}"#;
+    assert!(super::decode_native_result(BatchEndpoint::Embeddings, line).is_err());
 }

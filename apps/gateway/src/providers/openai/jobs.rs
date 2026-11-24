@@ -622,7 +622,7 @@ pub(super) async fn native_batch_results(
 /// One output/error file line: `{custom_id, response:{status_code, body},
 /// error}`. Error messages are never read; only codes.
 pub(super) fn decode_native_result(endpoint: BatchEndpoint, line: &[u8]) -> Result<NativeResult> {
-    let value: Value = serde_json::from_slice(line).map_err(|_| InferenceError::InvalidUpstream)?;
+    let value: Value = crate::providers::framing::json(line)?;
     let custom_id = value["custom_id"]
         .as_str()
         .filter(|s| !s.is_empty() && s.len() <= 64)
@@ -640,9 +640,10 @@ pub(super) fn decode_native_result(endpoint: BatchEndpoint, line: &[u8]) -> Resu
             NativeOutcome::Succeeded(Box::new(if endpoint.is_generation() {
                 BatchResponse::Chat(super::decode_complete(body)?)
             } else {
-                // A native line's body with any `error` member is not a
-                // success, whatever the shared decoder would make of it.
-                if !body["error"].is_null() {
+                // A native line's body with an `error` member, even a null
+                // one, is not a success, whatever the shared decoder makes
+                // of it.
+                if body.get("error").is_some() {
                     return Err(InferenceError::InvalidUpstream);
                 }
                 let n = body["data"].as_array().map_or(0, Vec::len);

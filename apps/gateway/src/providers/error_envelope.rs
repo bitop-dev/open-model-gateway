@@ -37,23 +37,28 @@ pub(super) fn empty(value: &Value) -> bool {
     }
 }
 
-/// Whether a usage or cost value reports anything other than zero. Only an
-/// integer zero, or text that is a decimal zero (`"0"`, `"0.00"`), is zero:
-/// a float cannot tell a tiny exact cost (`1e-400`) from zero, so any float
-/// counts, and so does text with a digit in it that is not a zero. Text with
-/// no digit is a label or flag (`"type":"tokens"`), as are booleans.
+/// Whether a usage value reports anything other than zero. Only an integer
+/// zero is zero: a float cannot tell a tiny exact cost (`1e-400`) from zero,
+/// and a string or boolean in place of a count is a malformed meter, which is
+/// no evidence that nothing was processed. The one exception is a label,
+/// exempt by its name and type (`labels`).
 fn nonzero(value: &Value) -> bool {
     match value {
-        Value::Null | Value::Bool(_) => false,
+        Value::Null => false,
         Value::Number(n) => n.as_u64() != Some(0) && n.as_i64() != Some(0),
-        Value::String(s) => s.bytes().any(|b| b.is_ascii_digit()) && !decimal_zero(s.trim()),
+        Value::Bool(_) | Value::String(_) => true,
         Value::Array(a) => a.iter().any(nonzero),
-        Value::Object(o) => o.values().any(nonzero),
+        Value::Object(o) => o.iter().any(|(name, v)| !label(name, v) && nonzero(v)),
     }
 }
-fn decimal_zero(text: &str) -> bool {
-    let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
-    !whole.is_empty() && whole.bytes().all(|b| b == b'0') && fraction.bytes().all(|b| b == b'0')
+/// A usage member that names or flags the usage object rather than counting
+/// anything: OpenAI's transcription `"type":"tokens"` or `"duration"`, and
+/// OpenRouter's `"is_byok"`.
+fn label(name: &str, value: &Value) -> bool {
+    matches!(
+        (name, value),
+        ("type", Value::String(_)) | ("is_byok", Value::Bool(_))
+    )
 }
 
 /// `Ok` when `body` has no `error`; otherwise the class of its error. A body
@@ -128,7 +133,7 @@ mod tests {
             // Empty output and all-zero usage leave it clean.
             assert_eq!(
                 class(
-                    json!({"error":error,"choices":[],"usage":{"prompt_tokens":0,"cost":"0.00","is_byok":true,"type":"tokens"}})
+                    json!({"error":error,"choices":[],"usage":{"prompt_tokens":0,"cost":0,"is_byok":true,"type":"tokens"}})
                 ),
                 Err(expected),
                 "{error}"
@@ -150,6 +155,10 @@ mod tests {
             json!({"usage":{"cost":0.0}}),
             json!({"usage":{"cost":"1e-400"}}),
             json!({"usage":{"cost":"-0.5"}}),
+            json!({"usage":{"cost":"0"}}),
+            json!({"usage":{"prompt_tokens":"NaN"}}),
+            json!({"usage":{"prompt_tokens":false}}),
+            json!({"usage":{"type":1}}),
         ] {
             let mut body = extra.clone();
             body["error"] = error.clone();

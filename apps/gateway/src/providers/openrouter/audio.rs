@@ -12,9 +12,7 @@
 //!   gateway values it locally from the exact character count.
 use serde_json::json;
 
-use super::{
-    OpenRouterAdapter, embedded_error, object, provider_cost, read, status_error, transport,
-};
+use super::{OpenRouterAdapter, embedded_error, object, provider_cost, status_error, transport};
 use crate::{
     inference::{error::InferenceError, types::*},
     providers::audio::{
@@ -129,7 +127,9 @@ impl OpenRouterAdapter {
         if media_type(&response).as_deref() == Some("application/json") {
             // A 200 JSON body on speech is an embedded error (mapped by code)
             // or an unexpected envelope; never audio.
-            let bytes = read(response).await?;
+            // One that cannot be read whole is an invalid answer, as any
+            // non-audio answer is, not an unavailable provider.
+            let bytes = read_json(response, |_| InferenceError::InvalidUpstream).await?;
             let value = object(&bytes)?;
             let cost = provider_cost(&bytes);
             // Speech is valued from its input; a JSON answer's usage is only
