@@ -303,6 +303,7 @@ function behaviourViolations(script) {
     must("a finding in the history", prEnv(repo), { STUB_SCAN_GIT: "find" });
     must("a finding in the tree", prEnv(repo), { STUB_SCAN_DIR: "find" });
     must("a history scan with no commit count", prEnv(repo), { STUB_COUNT: "0" });
+    must("a history scan whose git log failed", prEnv(repo), { STUB_GIT_ERR: "1" });
     must("an empty base sha", prEnv(repo, { BASE_SHA: "" }));
     must("an empty head sha", prEnv(repo, { HEAD_SHA: "" }));
     must("an unknown base sha", prEnv(repo, { BASE_SHA: "1234567890abcdef1234567890abcdef12345678" }));
@@ -335,6 +336,7 @@ const BEHAVIOUR_MUTATIONS = [
   ["the canary rule check never run", t => t.replace("expect_rules dir", "true dir").replace("expect_rules git", "true git")],
   ["the canary rule list shortened", t => t.replace("omg-url-credentials generic-api-key private-key", "generic-api-key")],
   ["the range scan's status ignored", t => t.replace('[ "${status}" -eq 0 ] || exit "${status}"', "true")],
+  ["the scanner error check removed", t => t.replace(/\n\s*if grep -Eq '\(\^\| \)\(ERR\|FTL\) '[^\n]*/, "")],
   ["the commit count check removed", t => t.replace(/grep -Eq '\[0-9\]\+ commits scanned'[^\n]*\n/, "")],
   ["sha validation made a no-op", t => t.replace('[[ "$1" =~ ^[0-9a-f]{40}$ ]] && git cat-file -e "$1^{commit}" 2>/dev/null', "true")],
   ["the tree scan removed", t => t.replace(/\n\s*gitleaks dir "\$\{common\[@\]\}" --config "\$\{config\}" \.\n/, "\n")],

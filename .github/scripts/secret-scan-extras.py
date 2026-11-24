@@ -20,10 +20,14 @@ It fails (exit 2) on a git error and (exit 3) when a blob or the total would
 pass the bounds below, so a scan never quietly covers less than it says.
 """
 
+import io
 import os
 import subprocess
 import sys
+import tarfile
 import threading
+import zipfile
+import zlib
 
 ARCHIVE_SUFFIXES = (".zip", ".jar", ".tar", ".tar.gz", ".tgz", ".gz")
 def bound(name, default):
@@ -54,6 +58,34 @@ def archive_name(path):
     for suffix in ARCHIVE_SUFFIXES:
         if lower.endswith(suffix):
             return ".tar.gz" if suffix == ".tgz" else suffix
+    return None
+
+
+def unreadable(data, suffix):
+    """Why gitleaks could not open this archive, or None. It skips one it cannot
+    read without an error, so the scan checks first; expansion is bounded."""
+    limit = 4 * MAX_BLOB
+    try:
+        if suffix in (".zip", ".jar"):
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                if sum(member.file_size for member in archive.infolist()) > limit:
+                    return "expands past the bound"
+                if archive.testzip() is not None:
+                    return "has a corrupt member"
+            return None
+        raw = data
+        if suffix in (".gz", ".tar.gz"):
+            inflate = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            raw = inflate.decompress(data, limit + 1)
+            if len(raw) > limit:
+                return "expands past the bound"
+            if not inflate.eof:
+                return "is truncated"
+        if suffix in (".tar", ".tar.gz"):
+            with tarfile.open(fileobj=io.BytesIO(raw)) as archive:
+                archive.getmembers()
+    except (zipfile.BadZipFile, tarfile.TarError, zlib.error, EOFError, OSError, ValueError, NotImplementedError):
+        return "cannot be opened"
     return None
 
 
@@ -124,6 +156,14 @@ def main(argv):
     with open(os.path.join(out, "messages.txt"), "wb") as f:
         f.write(messages)
     if tag_messages:
+        # `git log --tags` follows tags to commits only: a tag on a blob or a tree would
+        # leave its content unscanned, so one fails the scan.
+        refs = git("for-each-ref", "refs/tags", "--format=%(refname)").decode().split()
+        if refs:
+            peeled = git("cat-file", "--batch-check=%(objecttype)", data="".join(f"{ref}^{{}}\n" for ref in refs).encode())
+            others = [kind for kind in peeled.decode().split() if kind != "commit"]
+            if others:
+                fail(3, f"{len(others)} tags point to a {others[0]}, not a commit; their content is not scanned")
         tags = git("for-each-ref", "refs/tags", "--format=tag %(refname:short)%0a%(contents)")
         with open(os.path.join(out, "tags.txt"), "wb") as f:
             f.write(tags)
@@ -180,6 +220,9 @@ def main(argv):
         # and the index prefix and suffix must still fit.
         base = (os.path.basename(path) or "blob")[-100:]
         if suffix is not None:
+            reason = unreadable(data, suffix)
+            if reason:
+                fail(3, f"archive blob {blob} (entry {index}) {reason}, so the scanner would skip it")
             lower = base.lower()
             cut = 4 if lower.endswith(".tgz") else len(suffix)
             stem = (base[:-cut] if len(base) > cut else "archive")[-100:]

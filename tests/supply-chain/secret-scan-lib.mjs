@@ -146,6 +146,8 @@ if path != "." and os.environ.get("STUB_NO_CANARY") != "1":
         if rule != os.environ.get("STUB_CANARY_SKIP"):
             finding(rule)
     sys.exit(1)
+if mode == "git" and os.environ.get("STUB_GIT_ERR") == "1":
+    sys.stderr.write("6:50PM ERR [git] fatal: bad object\\n")
 if mode == "git" and os.environ.get("STUB_COUNT", "1") == "1":
     sys.stderr.write("INF 3 commits scanned.\\n")
 if os.environ.get("STUB_SCAN_" + mode.upper(), "clean") == "find":

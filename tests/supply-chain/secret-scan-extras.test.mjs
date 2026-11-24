@@ -24,6 +24,27 @@ const run = (r, args, env = {}) => spawnSync("python3", ["-I", join(root, EXTRAS
 const read = (r, path) => readFileSync(join(r.out, path), "utf8");
 const list = (r, sub) => readdirSync(join(r.out, sub)).sort();
 const withRepo = fn => { const r = repo(); try { fn(r); } finally { r.cleanup(); } };
+// Real archives, built with Python's standard library: `name` gets one member holding `text`.
+const ARCHIVE = `
+import gzip, io, sys, tarfile, zipfile
+path, text = sys.argv[1], sys.argv[2].encode()
+lower = path.lower()
+def tar(mode):
+    with tarfile.open(path, mode) as t:
+        info = tarfile.TarInfo("member.txt"); info.size = len(text); t.addfile(info, io.BytesIO(text))
+if lower.endswith((".zip", ".jar")):
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z: z.writestr("member.txt", text)
+elif lower.endswith((".tar.gz", ".tgz")):
+    tar("w:gz")
+elif lower.endswith(".tar"):
+    tar("w")
+elif lower.endswith(".gz"):
+    with gzip.open(path, "wb") as g: g.write(text)
+`;
+const archive = (path, text = "x\n") => {
+  const done = spawnSync("python3", ["-I", "-c", ARCHIVE, path, text], { encoding: "utf8" });
+  assert.equal(done.status, 0, done.stderr);
+};
 
 test("messages and paths of the range only, merge commits included", () => withRepo(r => {
   git(r.dir, "checkout", "-q", "-b", "side");
@@ -53,7 +74,8 @@ test("tag messages with --tag-messages", () => withRepo(r => {
 }));
 
 test("archives are written under a name gitleaks opens; .tgz becomes .tar.gz; other blobs are not written", () => withRepo(r => {
-  for (const name of ["a.zip", "b.jar", "c.tar", "d.tar.gz", "e.gz", "f.tgz", "G.TGZ", "plain.txt", "image.png"]) writeFileSync(join(r.dir, name), `${name}\n`);
+  for (const name of ["a.zip", "b.jar", "c.tar", "d.tar.gz", "e.gz", "f.tgz", "G.TGZ"]) archive(join(r.dir, name), `${name}\n`);
+  for (const name of ["plain.txt", "image.png"]) writeFileSync(join(r.dir, name), `${name}\n`);
   const head = commitAll(r.dir, "archives");
   assert.equal(run(r, [`${r.start}..${head}`]).status, 0);
   assert.deepEqual(list(r, "archives").map(n => n.replace(/^\d+-/, "")), ["G.tar.gz", "a.zip", "b.jar", "c.tar", "d.tar.gz", "e.gz", "f.tar.gz"]);
@@ -77,7 +99,9 @@ test("UTF-16 blobs, with or without a byte order mark, are decoded; ASCII and bi
 
 test("paths with a tab, a newline or non-ASCII characters keep their names and extensions", () => withRepo(r => {
   const names = ["tab\tname.zip", "new\nline.tgz", "café.txt"];
-  for (const name of names) writeFileSync(join(r.dir, name), "x\n");
+  archive(join(r.dir, names[0]), "one\n");
+  archive(join(r.dir, names[1]), "two\n");
+  writeFileSync(join(r.dir, names[2]), "x\n");
   writeFileSync(join(r.dir, "wide\tone.txt"), Buffer.from("made up\n", "utf16le"));
   const head = commitAll(r.dir, "odd names");
   const done = run(r, [`${r.start}..${head}`]);
@@ -88,8 +112,8 @@ test("paths with a tab, a newline or non-ASCII characters keep their names and e
 }));
 
 test("the same bytes under an archive name and a text name are still opened as an archive", () => withRepo(r => {
-  writeFileSync(join(r.dir, "a.txt"), "same bytes\n");
-  writeFileSync(join(r.dir, "z.zip"), "same bytes\n");
+  archive(join(r.dir, "z.zip"), "same\n");
+  writeFileSync(join(r.dir, "a.txt"), readFileSync(join(r.dir, "z.zip")));
   const head = commitAll(r.dir, "twins");
   assert.equal(run(r, [`${r.start}..${head}`]).status, 0);
   assert.deepEqual(list(r, "archives").map(n => n.replace(/^\d+-/, "")), ["z.zip"]);
@@ -105,23 +129,61 @@ test("zero-filled binary is not taken for UTF-16 text", () => withRepo(r => {
 
 test("a long file name is shortened in the output and keeps its extension", () => withRepo(r => {
   const name = `${"n".repeat(240)}.tgz`;
-  writeFileSync(join(r.dir, name), "x\n");
+  archive(join(r.dir, name));
   const head = commitAll(r.dir, "long");
   const done = run(r, [`${r.start}..${head}`]);
   assert.equal(done.status, 0, done.stderr);
-  const [archive] = list(r, "archives");
-  assert.ok(archive.endsWith(".tar.gz") && archive.length < 120, archive);
+  const [written] = list(r, "archives");
+  assert.ok(written.endsWith(".tar.gz") && written.length < 120, written);
   assert.match(read(r, "names.txt"), new RegExp(`^${name.replace(".", "\\.")}\n$`));
 }));
 
 test("a blob that is not kept is skipped whatever its size; an error names the blob, not the path", () => withRepo(r => {
-  writeFileSync(join(r.dir, "big.txt"), "x".repeat(500));
-  writeFileSync(join(r.dir, "secret-looking-name.zip"), "y".repeat(500));
+  writeFileSync(join(r.dir, "big.txt"), "x".repeat(50000));
+  archive(join(r.dir, "secret-looking-name.tar"), "y");
   const head = commitAll(r.dir, "sizes");
-  const done = run(r, [`${r.start}..${head}`], { SECRET_SCAN_EXTRAS_MAX_BLOB: "100" });
+  const done = run(r, [`${r.start}..${head}`], { SECRET_SCAN_EXTRAS_MAX_BLOB: "1000" });
   assert.equal(done.status, 3);
-  assert.match(done.stderr, /blob [0-9a-f]{40} \(entry \d+\) is 500 bytes/);
+  assert.match(done.stderr, /blob [0-9a-f]{40} \(entry \d+\) is 10240 bytes/);
   assert.doesNotMatch(done.stderr, /secret-looking-name/);
+}));
+
+test("an archive the scanner could not open fails the scan instead of being skipped", () => withRepo(r => {
+  for (const [name, bytes] of [
+    ["not-a.zip", Buffer.from("PK\x03\x04 truncated")],
+    ["cut.gz", null],
+    ["bad.tar", Buffer.from("not a tar archive at all\n".repeat(30))],
+  ]) {
+    rmSync(r.out, { recursive: true, force: true });
+    if (bytes) writeFileSync(join(r.dir, name), bytes);
+    else { archive(join(r.dir, name), "z".repeat(5000)); writeFileSync(join(r.dir, name), readFileSync(join(r.dir, name)).subarray(0, 40)); }
+    const head = commitAll(r.dir, name);
+    const done = run(r, [`${head}~1..${head}`]);
+    assert.equal(done.status, 3, `${name}: ${done.stderr}`);
+    assert.match(done.stderr, /archive blob [0-9a-f]{40} \(entry \d+\) (cannot be opened|is truncated|has a corrupt member)/);
+  }
+}));
+
+test("an archive that expands past the bound fails", () => withRepo(r => {
+  archive(join(r.dir, "bomb.gz"), "0".repeat(100000));
+  const head = commitAll(r.dir, "bomb");
+  const done = run(r, [`${r.start}..${head}`], { SECRET_SCAN_EXTRAS_MAX_BLOB: "1000" });
+  assert.equal(done.status, 3, done.stderr);
+  assert.match(done.stderr, /expands past the bound/);
+}));
+
+test("a tag on a blob or a tree fails the scheduled scan, whose git log reads commits only", () => withRepo(r => {
+  for (const target of ["HEAD:start.txt", "HEAD^{tree}"]) {
+    git(r.dir, "tag", "-f", "odd", git(r.dir, "rev-parse", target));
+    rmSync(r.out, { recursive: true, force: true });
+    const done = run(r, ["--tag-messages", "HEAD", "--tags"]);
+    assert.equal(done.status, 3, target);
+    assert.match(done.stderr, /1 tags point to a (blob|tree), not a commit/);
+  }
+  git(r.dir, "tag", "-d", "odd");
+  git(r.dir, "tag", "-a", "fine", "-m", "on a commit");
+  rmSync(r.out, { recursive: true, force: true });
+  assert.equal(run(r, ["--tag-messages", "HEAD", "--tags"]).status, 0);
 }));
 
 test("a submodule entry (gitlink) has no blob and is skipped", () => withRepo(r => {
@@ -143,16 +205,16 @@ test("a git error, missing revisions or an existing output fail", () => withRepo
 }));
 
 test("a blob or a total over the bound fails instead of being skipped; the bounds can only be lowered", () => withRepo(r => {
-  writeFileSync(join(r.dir, "big.zip"), "x".repeat(200));
-  writeFileSync(join(r.dir, "big2.zip"), "y".repeat(200));
+  archive(join(r.dir, "big.tar"), "x".repeat(10));
+  archive(join(r.dir, "big2.tar"), "y".repeat(10));
   const head = commitAll(r.dir, "big");
-  const blob = run(r, [`${r.start}..${head}`], { SECRET_SCAN_EXTRAS_MAX_BLOB: "100" });
+  const blob = run(r, [`${r.start}..${head}`], { SECRET_SCAN_EXTRAS_MAX_BLOB: "10000" });
   assert.equal(blob.status, 3);
-  assert.match(blob.stderr, /over the 100-byte bound/);
+  assert.match(blob.stderr, /over the 10000-byte bound/);
   rmSync(r.out, { recursive: true, force: true });
-  const total = run(r, [`${r.start}..${head}`], { SECRET_SCAN_EXTRAS_MAX_TOTAL: "300" });
+  const total = run(r, [`${r.start}..${head}`], { SECRET_SCAN_EXTRAS_MAX_TOTAL: "15000" });
   assert.equal(total.status, 3);
-  assert.match(total.stderr, /pass the 300-byte bound/);
+  assert.match(total.stderr, /pass the 15000-byte bound/);
   rmSync(r.out, { recursive: true, force: true });
   assert.equal(run(r, [`${r.start}..${head}`], { SECRET_SCAN_EXTRAS_MAX_BLOB: String(10 ** 12) }).status, 0);
   const source = readFileSync(join(root, EXTRAS), "utf8");

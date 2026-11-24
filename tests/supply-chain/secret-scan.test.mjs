@@ -50,6 +50,7 @@ const CONFIG_LINES = [
   'tags=(--tag-messages)',
   'extras="${PWD}/.github/scripts/secret-scan-extras.py"',
   'python3 -I "${extras}" "${work}/extras" "${tags[@]}" "${revs[@]}"',
+  'if grep -Eq \'(^| )(ERR|FTL) \' "${work}/gitleaks.log"; then echo "gitleaks reported an error reading the history" >&2; exit 1; fi',
 ];
 
 function scriptViolations(run) {

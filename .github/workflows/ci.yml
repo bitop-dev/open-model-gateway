@@ -505,6 +505,8 @@ jobs:
               gitleaks git "${common[@]}" --config "${config}" --log-opts="-m --text ${range}" . 2>"${work}/gitleaks.log" || status=$?
               cat "${work}/gitleaks.log" >&2
               [ "${status}" -eq 0 ] || exit "${status}"
+              # gitleaks also exits 0 when its git log fails ("ERR ... fatal: bad object").
+              if grep -Eq '(^| )(ERR|FTL) ' "${work}/gitleaks.log"; then echo "gitleaks reported an error reading the history" >&2; exit 1; fi
               # gitleaks exits 0 when its git log fails; it did not get that far if it never
               # reports the number of commits it scanned. (The number is not compared with
               # rev-list: it leaves out commits without added lines, such as pure renames.)
