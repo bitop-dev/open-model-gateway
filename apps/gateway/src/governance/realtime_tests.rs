@@ -67,6 +67,7 @@ fn finished(id: Uuid, unopened: bool) -> RealtimeFinish {
         telemetry: AttemptTelemetry::default(),
         unopened_request: unopened,
         window: FULL,
+        recorded_sequence: 0,
     }
 }
 /// Unknown context: input 1000 (the ceiling) per modality, output 100 →
@@ -492,6 +493,17 @@ async fn pricing_must_be_v3_and_unpriced_sessions_stay_unknown(pool: PgPool) {
         amounts(&f, start.id).await,
         ("unknown".into(), None, None, true)
     );
+    // Without a price nothing is known about its cost, not even a floor:
+    // neither the response nor the session's unknown entry records one.
+    let floor: Option<i64> = sqlx::query_scalar(
+        "SELECT floor_microusd FROM realtime_responses WHERE execution_id=$1 AND sequence=1",
+    )
+    .bind(start.id)
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(floor, None);
+    assert_eq!(unknown_entry(&f, start.id).await, None);
     // Zero responses settle at a known zero.
     let empty = ExecutionStart {
         streamed: true,
@@ -513,6 +525,204 @@ async fn pricing_must_be_v3_and_unpriced_sessions_stay_unknown(pool: PgPool) {
     assert_eq!(
         admit_workload_for_deployment(&f.store, &v1, &admission(50), 960, &d).await,
         Err(InferenceError::Configuration)
+    );
+}
+
+/// The amount of the session's one `unknown` ledger entry.
+async fn unknown_entry(f: &Fixture, id: Uuid) -> Option<i64> {
+    sqlx::query_scalar(
+        "SELECT amount_microusd FROM monetary_ledger WHERE execution_id=$1 AND kind='unknown'",
+    )
+    .bind(id)
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap()
+}
+
+/// `(sequence, state, window)` of the session's response rows.
+async fn response_rows(f: &Fixture, id: Uuid) -> Vec<(i32, String, Option<i64>)> {
+    sqlx::query_as("SELECT sequence,state,window_hold_microusd FROM realtime_responses WHERE execution_id=$1 ORDER BY sequence")
+        .bind(id)
+        .fetch_all(&f.store.pool)
+        .await
+        .unwrap()
+}
+/// A session admitted on `d`.
+async fn session_on(f: &Fixture, d: &Deployment) -> Uuid {
+    let start = ExecutionStart {
+        streamed: true,
+        ..f.start()
+    };
+    admit_workload_for_deployment(&f.store, &start, &admission(100), 960, d)
+        .await
+        .unwrap();
+    start.id
+}
+/// A session admitted on the priced realtime model.
+async fn priced_session(f: &Fixture) -> Uuid {
+    let d = realtime_model(f, Some(lines())).await;
+    session_on(f, &d).await
+}
+fn unopened(id: Uuid, window: ResponseBound, recorded_sequence: i32) -> RealtimeFinish {
+    RealtimeFinish {
+        window,
+        recorded_sequence,
+        ..finished(id, true)
+    }
+}
+
+/// Response 1 settled, then a forwarded request that never opened: the
+/// request keeps its own window beside response 1's actual. A row that
+/// exists, but is not a pending row the session never saw, does not stand in
+/// for the request's window.
+#[dbtest::test]
+async fn a_settled_response_then_an_unopened_request(pool: PgPool) {
+    let f = fixture(pool).await;
+    let id = priced_session(&f).await;
+    let w = sized(300, 100);
+    realtime::reserve_window(
+        &f.store,
+        &f.principal,
+        id,
+        "company/smart",
+        w,
+        Some(admitted()),
+    )
+    .await
+    .unwrap();
+    realtime::open_response(&f.store, id, 1, w).await.unwrap();
+    realtime::settle_response(&f.store, id, 1, Some(ResponseStatus::Completed), Some(U), w)
+        .await
+        .unwrap();
+    realtime::reserve_window(&f.store, &f.principal, id, "company/smart", FULL, None)
+        .await
+        .unwrap();
+    realtime::finish(&f.store, &unopened(id, FULL, 1))
+        .await
+        .unwrap();
+    assert_eq!(
+        response_rows(&f, id).await,
+        vec![
+            (1, "settled".into(), Some(12_560)),
+            (2, "unknown".into(), Some(WINDOW))
+        ]
+    );
+    assert_eq!(
+        amounts(&f, id).await,
+        ("unknown".into(), Some(WINDOW + RESPONSE), None, false)
+    );
+    // The proven floor: response 1's actual.
+    assert_eq!(unknown_entry(&f, id).await, Some(RESPONSE));
+}
+
+/// A pending response the session recorded as open, and a forwarded request
+/// besides it: two windows, one each. The session refuses such a request
+/// (`RealtimeSession::reserve_window`); finishing does not rely on that.
+#[dbtest::test]
+async fn a_recorded_open_response_does_not_hold_an_unopened_request(pool: PgPool) {
+    let f = fixture(pool).await;
+    let id = priced_session(&f).await;
+    realtime::open_response(&f.store, id, 1, admitted())
+        .await
+        .unwrap();
+    realtime::finish(&f.store, &unopened(id, admitted(), 1))
+        .await
+        .unwrap();
+    assert_eq!(
+        response_rows(&f, id).await,
+        vec![
+            (1, "unknown".into(), Some(ADMISSION)),
+            (2, "unknown".into(), Some(ADMISSION))
+        ]
+    );
+    assert_eq!(
+        amounts(&f, id).await,
+        ("unknown".into(), Some(2 * ADMISSION), None, false)
+    );
+    assert_eq!(unknown_entry(&f, id).await, Some(0));
+}
+
+/// The unseen open's row and the request's window differ: the row's window
+/// (the bound its open wrote) is retained, not the request's, whichever is
+/// larger.
+#[dbtest::test]
+async fn an_unseen_open_keeps_its_own_window(pool: PgPool) {
+    let f = fixture(pool).await;
+    let d = realtime_model(&f, Some(lines())).await;
+    for (row, request, held) in [(admitted(), FULL, ADMISSION), (FULL, admitted(), WINDOW)] {
+        let id = session_on(&f, &d).await;
+        realtime::open_response(&f.store, id, 1, row).await.unwrap();
+        realtime::finish(&f.store, &unopened(id, request, 0))
+            .await
+            .unwrap();
+        assert_eq!(
+            response_rows(&f, id).await,
+            vec![(1, "unknown".into(), Some(held))]
+        );
+        assert_eq!(
+            amounts(&f, id).await,
+            ("unknown".into(), Some(held), None, false)
+        );
+    }
+}
+
+/// `response.created` was recorded in the database, but the session never
+/// learnt it (its open was cancelled or timed out as it committed), so it
+/// finishes with the request still unopened. The response row is that
+/// request's window: it is retained once, never again as an unopened one.
+#[dbtest::test]
+async fn an_open_the_session_did_not_record_is_held_once(pool: PgPool) {
+    let f = fixture(pool).await;
+    let d = realtime_model(&f, Some(lines())).await;
+    let start = ExecutionStart {
+        streamed: true,
+        ..f.start()
+    };
+    admit_workload_for_deployment(&f.store, &start, &admission(100), 960, &d)
+        .await
+        .unwrap();
+    realtime::open_response(&f.store, start.id, 1, admitted())
+        .await
+        .unwrap();
+    realtime::finish(
+        &f.store,
+        &RealtimeFinish {
+            window: admitted(),
+            ..finished(start.id, true)
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        response_rows(&f, start.id).await,
+        vec![(1, "unknown".into(), Some(ADMISSION))]
+    );
+    assert_eq!(
+        amounts(&f, start.id).await,
+        ("unknown".into(), Some(ADMISSION), None, false)
+    );
+    assert_eq!(unknown_entry(&f, start.id).await, Some(0));
+
+    // Without that row the unopened request keeps its own window.
+    let other = ExecutionStart {
+        streamed: true,
+        ..f.start()
+    };
+    admit_workload_for_deployment(&f.store, &other, &admission(100), 960, &d)
+        .await
+        .unwrap();
+    realtime::finish(
+        &f.store,
+        &RealtimeFinish {
+            window: admitted(),
+            ..finished(other.id, true)
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        amounts(&f, other.id).await,
+        ("unknown".into(), Some(ADMISSION), None, false)
     );
 }
 
