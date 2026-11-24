@@ -64,6 +64,14 @@ fn stopped(fence: &BatchFence) {
 }
 
 /// Whether the poller's lease renewal found the claim ended.
+/// The batch's final state in the metrics, once: by the claim that
+/// `recorded` its finish.
+fn count_finished(recorded: bool, state: JobState) {
+    if recorded {
+        crate::metrics::METRICS.observe_batch_finished("native", state.as_str());
+    }
+}
+
 fn lost_claim(lost: &AtomicBool) -> bool {
     lost.load(Ordering::SeqCst)
 }
@@ -119,6 +127,19 @@ impl Jobs {
                 .await;
             held(&fence, observed)?;
             return Ok(());
+        }
+        // A batch whose finish committed and whose settlement did not (its
+        // poller stopped in between): with the provider's aggregate usage it
+        // settles from that, without reading the results again. Without it
+        // the per-line sum is the only usage evidence, so the collection
+        // reads them again and removes the files it writes, because the
+        // finish keeps the first collection's links.
+        if job.job_state().is_terminal()
+            && let Some(usage) = upstream.usage
+        {
+            return self
+                .settle_finished(&job, &target, adapter.as_ref(), &upstream, usage)
+                .await;
         }
         self.collect_native(job, fence, lost, &target, adapter.as_ref(), &upstream)
             .await
@@ -207,17 +228,7 @@ impl Jobs {
             (Ok(Ok(upstream)), produced) => {
                 // An accepted response proves acceptance even if the concurrent
                 // encoder failed. Persist its id before classifying that failure.
-                if !store::set_upstream(&self.store, job.id, &upstream.id).await? {
-                    // The batch ended while the provider was accepting it
-                    // (its hold is kept as unknown cost): the provider batch
-                    // runs and is billed but is never polled. Counted and
-                    // logged with the provider's id so an operator can cancel it.
-                    crate::metrics::METRICS.observe_batch_late_submission();
-                    tracing::warn!(
-                        job_id = %job.id,
-                        upstream_id = %upstream.id.as_str(),
-                        "native batch accepted after it ended; the provider batch is not polled"
-                    );
+                if !self.record_upstream(&job, &upstream).await? {
                     return Ok(());
                 }
                 produced.map(|_| upstream)
@@ -266,10 +277,7 @@ impl Jobs {
                 )
                 .await?;
                 self.discard_work_file(&job).await;
-                if recorded {
-                    crate::metrics::METRICS
-                        .observe_batch_finished("native", JobState::Failed.as_str());
-                }
+                count_finished(recorded, JobState::Failed);
                 Ok(())
             }
         }
@@ -330,28 +338,6 @@ impl Jobs {
         adapter: &dyn ProviderAdapter,
         upstream: &UpstreamBatch,
     ) -> JobResult<()> {
-        // A batch whose finish committed and whose settlement did not (its
-        // poller stopped in between): with the provider's aggregate usage it
-        // settles from that, without reading the results again. Without it
-        // the per-line sum is the only usage evidence, so the results are
-        // read again below, and the files this second collection writes are
-        // removed because the finish keeps the first collection's links.
-        let recorded = job.job_state();
-        if recorded.is_terminal()
-            && let Some(usage) = upstream.usage
-        {
-            if let Some(s) = settlement(recorded, Some(usage)) {
-                self.settle(&job, s).await?;
-            }
-            if call(adapter.delete_native_batch(target, upstream))
-                .await
-                .is_err()
-            {
-                tracing::warn!(job_id = %job.id, "provider batch copies not deleted");
-            }
-            self.discard_work_file(&job).await;
-            return Ok(());
-        }
         let files = self.files()?.clone();
         let endpoint = job.endpoint().ok_or(InferenceError::Storage)?;
         let finalizing = fence.native_status(&self.store, upstream.counts, "finalizing");
@@ -522,17 +508,7 @@ impl Jobs {
         // records and counts nothing, and a collection of a batch that is
         // finished already (its first poller's settlement did not commit)
         // counts nothing again.
-        if recorded {
-            #[cfg(test)]
-            self.finish_metrics
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            crate::metrics::METRICS.observe_batch_lines(
-                "native",
-                &job.provider,
-                u64::from(succeeded),
-                u64::from(counts.failed),
-            );
-        }
+        self.count_lines(recorded, &job, succeeded, counts.failed);
         #[cfg(test)]
         self.settle_hold.pause().await;
         // The provider's aggregate when it reports one, else the per-line sum
@@ -548,10 +524,67 @@ impl Jobs {
             tracing::warn!(job_id = %job.id, "provider batch copies not deleted");
         }
         self.discard_work_file(&job).await;
-        if recorded {
-            crate::metrics::METRICS.observe_batch_finished("native", state.as_str());
-        }
+        count_finished(recorded, state);
         Ok(())
+    }
+
+    /// Record the provider's id of a submitted batch. `false` when the batch
+    /// ended while the provider was accepting it (its hold is kept as unknown
+    /// cost): the provider batch runs and is billed but is never polled, so
+    /// it is counted and logged with the provider's id for an operator to
+    /// cancel.
+    async fn record_upstream(&self, job: &JobRow, upstream: &UpstreamBatch) -> JobResult<bool> {
+        if store::set_upstream(&self.store, job.id, &upstream.id).await? {
+            return Ok(true);
+        }
+        crate::metrics::METRICS.observe_batch_late_submission();
+        tracing::warn!(
+            job_id = %job.id,
+            upstream_id = %upstream.id.as_str(),
+            "native batch accepted after it ended; the provider batch is not polled"
+        );
+        Ok(false)
+    }
+
+    /// Settle a batch whose finish committed and whose settlement did not
+    /// from the provider's aggregate `usage`, without reading its results
+    /// again, then delete the provider's copies and the work file.
+    async fn settle_finished(
+        &self,
+        job: &JobRow,
+        target: &Deployment,
+        adapter: &dyn ProviderAdapter,
+        upstream: &UpstreamBatch,
+        usage: Usage,
+    ) -> JobResult<()> {
+        if let Some(s) = settlement(job.job_state(), Some(usage)) {
+            self.settle(job, s).await?;
+        }
+        if call(adapter.delete_native_batch(target, upstream))
+            .await
+            .is_err()
+        {
+            tracing::warn!(job_id = %job.id, "provider batch copies not deleted");
+        }
+        self.discard_work_file(job).await;
+        Ok(())
+    }
+
+    /// The batch's lines in the metrics, once: by the claim that
+    /// `recorded` its finish.
+    fn count_lines(&self, recorded: bool, job: &JobRow, succeeded: u32, failed: u32) {
+        if !recorded {
+            return;
+        }
+        #[cfg(test)]
+        self.finish_metrics
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::metrics::METRICS.observe_batch_lines(
+            "native",
+            &job.provider,
+            u64::from(succeeded),
+            u64::from(failed),
+        );
     }
 
     /// Record the collected results under the claim. `None` when the claim

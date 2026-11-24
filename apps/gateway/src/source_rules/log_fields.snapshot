@@ -16,9 +16,9 @@ jobs/mod.rs :: impl Attempt::drop :: error :: execution_id=%record.id
 jobs/mod.rs :: impl Attempt::fail :: error :: execution_id=%self.id
 jobs/mod.rs :: impl Jobs::settle :: warn :: job_id=%job.id
 jobs/native.rs :: impl Jobs::collect_native :: warn :: job_id=%job.id
-jobs/native.rs :: impl Jobs::collect_native :: warn :: job_id=%job.id
+jobs/native.rs :: impl Jobs::record_upstream :: warn :: job_id=%job.id ; upstream_id=%upstream.id.as_str()
+jobs/native.rs :: impl Jobs::settle_finished :: warn :: job_id=%job.id
 jobs/native.rs :: impl Jobs::submit_native :: warn :: job_id=%job.id
-jobs/native.rs :: impl Jobs::submit_native :: warn :: job_id=%job.id ; upstream_id=%upstream.id.as_str()
 jobs/native.rs :: stopped :: warn :: job_id=%fence.job
 jobs/plan.rs :: impl Jobs::line_candidates :: warn :: error=?other ; provider=%deployment.provider
 jobs/plan.rs :: impl ScanState::report_rejects :: warn :: error=?other

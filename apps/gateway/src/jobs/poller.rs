@@ -110,7 +110,7 @@ impl Jobs {
         crate::metrics::METRICS.observe_job_lease_renewal(outcome.as_str());
     }
     /// Renewals of this service's claims with `outcome` so far (tests).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "integration-tests"))]
     pub(crate) fn renewals(&self, outcome: Renewal) -> usize {
         self.renewal_counts[outcome as usize].load(Ordering::SeqCst)
     }

@@ -49,7 +49,7 @@ impl Metrics {
             .inc();
     }
     /// One `batches` series so far (tests).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "integration-tests"))]
     pub(crate) fn batch_event_count(&self, mode: &str, event: &str) -> u64 {
         self.batches
             .get_or_create(&[("mode", mode.to_owned()), ("event", event.to_owned())])

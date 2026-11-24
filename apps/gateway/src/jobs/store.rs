@@ -341,7 +341,7 @@ pub(crate) async fn mark_deleted(store: &Store, id: Uuid) -> Result<()> {
 }
 /// Claim the next due, unsettled provider job within its poll deadline that
 /// no poller holds, for `poller` ([`claim_due_many`] of one).
-#[cfg(test)]
+#[cfg(all(test, feature = "integration-tests"))]
 pub(crate) async fn claim_due(
     store: &Store,
     poller: Uuid,
@@ -489,6 +489,9 @@ pub(crate) struct Finished<'a> {
 /// with the sweeper. The job lock precedes the file locks, as it does for
 /// other runner writes. A committed deletion claim makes a result unusable
 /// even while the object still exists.
+/// Lock and finish the batch in one call (tests: production finishes
+/// through its claim, `fence::BatchFence::finish_native`).
+#[cfg(all(test, feature = "integration-tests"))]
 pub(super) async fn finish_batch_tx(
     tx: &mut Transaction<'_, Postgres>,
     id: Uuid,
