@@ -38,7 +38,15 @@ async fn admit_traced(
     )));
     let result = telemetry::with_phases(
         buffer.clone(),
-        admit_generation(&f.store, start, &request(), 30, &deployment, u32::MAX),
+        admit_generation(
+            &f.store,
+            start,
+            &request(),
+            30,
+            &deployment,
+            u32::MAX,
+            false,
+        ),
     )
     .await
     .map(|_| ());

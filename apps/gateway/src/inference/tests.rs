@@ -141,6 +141,9 @@ impl ProviderAdapter for Adapter {
         _: ChatRequest,
     ) -> Result<ProviderOutput, InferenceError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        // This fake stands for an upstream call: as a real adapter's request
+        // builder would, it marks the attempt as possibly sent.
+        crate::inference::dispatch::started();
         let events = match self.mode {
             Mode::Complete => {
                 return Ok(ProviderOutput::Complete(ChatResponse {

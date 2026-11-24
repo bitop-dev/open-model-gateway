@@ -163,6 +163,10 @@ pub(super) async fn connect(
     .await
     .map_err(|_| InferenceError::Timeout)?
     .map_err(|_| InferenceError::UpstreamUnavailable)?;
+    // The one provider connection not built through `egress::HttpClient`:
+    // mark it as possibly sent like one (`inference::dispatch`), although
+    // realtime sessions settle from their own windows today.
+    crate::inference::dispatch::started();
     let stream = timeout_at(deadline, tokio::net::TcpStream::connect(&addresses[..]))
         .await
         .map_err(|_| InferenceError::Timeout)?

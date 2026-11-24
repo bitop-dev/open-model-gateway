@@ -70,6 +70,7 @@ impl ProviderAdapter for Fixture {
         _: &Deployment,
         _: ChatRequest,
     ) -> Result<ProviderOutput, InferenceError> {
+        open_model_gateway::inference::dispatch::started();
         Err(InferenceError::Unsupported)
     }
     async fn execute_audio_transcription(
@@ -77,6 +78,7 @@ impl ProviderAdapter for Fixture {
         target: &Deployment,
         request: TranscriptionRequest,
     ) -> Result<TranscriptionResponse, InferenceError> {
+        open_model_gateway::inference::dispatch::started();
         self.calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(target.upstream_model, "private-upstream-id");
         assert_eq!(request.duration_ms, Some(850));
@@ -105,6 +107,7 @@ impl ProviderAdapter for Fixture {
         target: &Deployment,
         request: SpeechRequest,
     ) -> Result<SpeechResponse, InferenceError> {
+        open_model_gateway::inference::dispatch::started();
         self.calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(target.upstream_model, "private-upstream-id");
         let signal = DropSignal(self.dropped.clone());

@@ -39,26 +39,28 @@ and the held amount for pending or unknown rows ([`ELSE coalesce(r.held_microusd
 
 | Transition | Writer | Guard that makes it safe |
 |---|---|---|
-| (none) -> `pending`, execution `started`, ledger `hold` | [`fn admit_unobserved`](../../apps/gateway/src/governance.rs#L282), one statement inserts the execution ([`WITH e AS (INSERT INTO inference_executions`](../../apps/gateway/src/governance.rs#L464)), reservation ([`INSERT INTO governance_reservations`](../../apps/gateway/src/governance.rs#L465)) and ledger hold ([`execution_id,'hold'`](../../apps/gateway/src/governance.rs#L466)); batch and line variants ([`INSERT INTO governance_reservations`](../../apps/gateway/src/governance/batch.rs#L363), [`INSERT INTO governance_reservations`](../../apps/gateway/src/governance/batch.rs#L593)) | Shared catalog and authority locks, then the totals/counter rows ([`authorize(store, &mut tx`](../../apps/gateway/src/governance.rs#L332), [`lock_wait += lock_rows(`](../../apps/gateway/src/governance.rs#L424)); a failover is a new admission with a new execution id (`Engine::attempt`, [`Uuid::now_v7()`](../../apps/gateway/src/inference/attempt.rs#L95) for attempt > 0) |
-| `pending` -> `settled` (usage complete; or a free pre-processing rejection on a free price) / -> `unknown` (anything else, incl. cancelled, timeout, a rejection on a priced model, a 429) | `governance::finish` -> [`fn finish_unobserved`](../../apps/gateway/src/governance/settlement.rs#L562) | Reservation row `FOR UPDATE` ([`WHERE r.execution_id=$1 FOR UPDATE OF r`](../../apps/gateway/src/governance/settlement.rs#L38)), read [`r.state != "pending"`](../../apps/gateway/src/governance/settlement.rs#L623); in the statement itself [`AND state='started' RETURNING 1`](../../apps/gateway/src/governance/settlement.rs#L657) and a row-count check [`(executions, reservations, entries) != (1, 1, 1)`](../../apps/gateway/src/governance/settlement.rs#L666); ledger UNIQUE |
+| (none) -> `pending`, execution `started`, ledger `hold` | [`fn admit_unobserved`](../../apps/gateway/src/governance.rs#L282), one statement inserts the execution ([`WITH e AS (INSERT INTO inference_executions`](../../apps/gateway/src/governance.rs#L467)), reservation ([`INSERT INTO governance_reservations`](../../apps/gateway/src/governance.rs#L468)) and ledger hold ([`execution_id,'hold'`](../../apps/gateway/src/governance.rs#L469)); batch and line variants ([`INSERT INTO governance_reservations`](../../apps/gateway/src/governance/batch.rs#L363), [`INSERT INTO governance_reservations`](../../apps/gateway/src/governance/batch.rs#L597)) | Shared catalog and authority locks, then the totals/counter rows ([`authorize(store, &mut tx`](../../apps/gateway/src/governance.rs#L333), [`lock_wait += lock_rows(`](../../apps/gateway/src/governance.rs#L427)); a failover is a new admission with a new execution id (`Engine::attempt`, [`Uuid::now_v7()`](../../apps/gateway/src/inference/attempt.rs#L96) for attempt > 0) |
+| `pending` -> `settled` (usage complete; a free pre-processing rejection on a free price; or, on any price, a failure whose adapter call built no upstream request, `nothing_sent`) / -> `unknown` (anything else, incl. cancelled, timeout, a rejection on a priced model, a 429) | `governance::finish` -> [`fn finish_unobserved`](../../apps/gateway/src/governance/settlement.rs#L615) | Reservation row `FOR UPDATE` ([`WHERE r.execution_id=$1 FOR UPDATE OF r`](../../apps/gateway/src/governance/settlement.rs#L38)), read [`r.state != "pending"`](../../apps/gateway/src/governance/settlement.rs#L678); in the statement itself [`AND state='started' RETURNING 1`](../../apps/gateway/src/governance/settlement.rs#L704) and a row-count check [`(executions, reservations, entries) != (1, 1, 1)`](../../apps/gateway/src/governance/settlement.rs#L713); ledger UNIQUE |
 | `pending` -> `unknown` (lease expired), execution -> `cancelled` | `reconcile_expired` / [`fn reconcile_batch`](../../apps/gateway/src/governance/reconcile.rs#L29), every replica on the [`tokio::time::interval(Duration::from_secs(5))`](../../apps/gateway/src/maintenance.rs#L78) tick ([`reconcile_expired_leases(&store)`](../../apps/gateway/src/maintenance.rs#L87)) | [`WHERE state='pending' AND lease_expires_at<=clock_timestamp() ORDER BY lease_expires_at,execution_id LIMIT $1 FOR UPDATE SKIP LOCKED`](../../apps/gateway/src/governance/reconcile.rs#L33); [`SET state='unknown' WHERE execution_id=ANY($1) AND state='pending'`](../../apps/gateway/src/governance/reconcile.rs#L48); [`ids.len() != claimed.len()`](../../apps/gateway/src/governance/reconcile.rs#L53); [`WHERE id=ANY($1) AND state='started'`](../../apps/gateway/src/governance/reconcile.rs#L57) row count; [`state<>'settled' AND actual_microusd IS NULL`](../../apps/gateway/enterprise_migrations/0083_batch_envelope_resolution.sql#L10) because the UPDATE does not clear `actual`; holds are not touched |
 | `unknown` -> `settled` (operator evidence) | [`fn resolve_usage_once`](../../apps/gateway/src/governance/reconcile.rs#L140) | [`p.role='admin'`](../../apps/gateway/src/governance/reconcile.rs#L183) re-checked in the tx; [`reservation(&mut tx, execution, scoped(store))`](../../apps/gateway/src/governance/reconcile.rs#L177) or the installation row in global mode ([`lock(&mut tx).await?`](../../apps/gateway/src/governance/reconcile.rs#L163)); read [`r.state != "unknown"`](../../apps/gateway/src/governance/reconcile.rs#L230) and require a terminal execution ([`SELECT state<>'started' FROM inference_executions`](../../apps/gateway/src/governance/reconcile.rs#L204)); the UPDATE itself has no state predicate |
-| `settled` -> anything | nobody | Every writer above refuses; the database does not (section 4 assumption 2, finding 4) |
-| `held` changed | settlement raises with [`greatest(held_microusd,$20)`](../../apps/gateway/src/governance/settlement.rs#L658); the batch envelope transfer (`admit_line`, [`SET held_microusd=held_microusd-$2`](../../apps/gateway/src/governance/batch.rs#L607)) moves hold into a line's own reservation; the **realtime** paths (window growth [`SET held_microusd=held_microusd+$2,reserved_tokens=reserved_tokens+$3`](../../apps/gateway/src/governance/realtime.rs#L306) and finalization [`r.checked_add(t.actual)`](../../apps/gateway/src/governance/realtime.rs#L609)) can also change it | realtime is out of scope (section 2); `HoldNeverReleased` is stated for the request path |
+| `settled` -> anything | nobody | Every writer above refuses; since 0088 the database refuses any change to a settled row's money and usage columns ([`CONSTRAINT='reservation_settled_change'`](../../apps/gateway/enterprise_migrations/0088_reservation_transitions.sql#L50)) and `unknown` -> `pending` ([`CONSTRAINT='reservation_state_transition'`](../../apps/gateway/enterprise_migrations/0088_reservation_transitions.sql#L57)), before any CHECK (section 4 assumption 2, finding 4) |
+| `held` changed | settlement raises with [`greatest(held_microusd,$20)`](../../apps/gateway/src/governance/settlement.rs#L705); the batch envelope transfer (`admit_line`, [`SET held_microusd=held_microusd-$2`](../../apps/gateway/src/governance/batch.rs#L611)) moves hold into a line's own reservation; the **realtime** paths (window growth [`SET held_microusd=held_microusd+$2,reserved_tokens=reserved_tokens+$3`](../../apps/gateway/src/governance/realtime.rs#L306) and finalization [`r.checked_add(t.actual)`](../../apps/gateway/src/governance/realtime.rs#L609)) can also change it | realtime is out of scope (section 2); `HoldNeverReleased` is stated for the request path. Since 0088 the database refuses a decrease except as the row settles, an unknown ending's floor of an unbounded hold, a pending realtime session ([`e.workload_kind='realtime'`](../../apps/gateway/enterprise_migrations/0088_reservation_transitions.sql#L81)) and a pending gateway-run envelope ([`j.batch_mode='gateway'`](../../apps/gateway/enterprise_migrations/0088_reservation_transitions.sql#L83)) |
 | lease extended | [`fn accept_job`](../../apps/gateway/src/governance/jobs.rs#L23) for video (a batch has its final lease from admission) | [`SET lease_expires_at=greatest(lease_expires_at,$2) WHERE execution_id=$1 AND state='pending'`](../../apps/gateway/src/governance/jobs.rs#L47) |
 
-The request thread awaits admission, then runs [`let output = call_upstream(`](../../apps/gateway/src/inference/attempt.rs#L138) under the request deadline.
-It settles the outcome ([`settle_complete(&mut telemetry, &mut guard, span, response)`](../../apps/gateway/src/inference/attempt.rs#L169), [`ProviderOutput::Stream(track_stream(`](../../apps/gateway/src/inference/attempt.rs#L172)).
-`ExecutionGuard` marks settlement started ([`self.finished = true`](../../apps/gateway/src/inference/mod.rs#L459)) and calls
-[`fn settle_to_completion`](../../apps/gateway/src/inference/attempt.rs#L569) with
-[`SETTLEMENT_DEADLINE: Duration = Duration::from_secs(3)`](../../apps/gateway/src/inference/mod.rs#L373).
-The pending write uses [`HandOff::new(`](../../apps/gateway/src/inference/attempt.rs#L593), whose drop path spawns the unfinished future ([`runtime.spawn(async move`](../../apps/gateway/src/inference/hand_off.rs#L75)).
-[`impl Drop for ExecutionGuard`](../../apps/gateway/src/inference/mod.rs#L478) queues a detached cancellation settlement only if `finished` is false. Failover
+The request thread awaits admission, then runs [`let output = call_upstream(`](../../apps/gateway/src/inference/attempt.rs#L139) under the request deadline.
+It settles the outcome ([`settle_complete(&mut telemetry, &mut guard, span, response)`](../../apps/gateway/src/inference/attempt.rs#L172), [`ProviderOutput::Stream(track_stream(`](../../apps/gateway/src/inference/attempt.rs#L175)).
+`ExecutionGuard` marks settlement started ([`self.finished = true`](../../apps/gateway/src/inference/mod.rs#L460)) and calls
+[`fn settle_to_completion`](../../apps/gateway/src/inference/attempt.rs#L582) with
+[`SETTLEMENT_DEADLINE: Duration = Duration::from_secs(3)`](../../apps/gateway/src/inference/mod.rs#L374).
+The pending write uses [`HandOff::new(`](../../apps/gateway/src/inference/attempt.rs#L606), whose drop path spawns the unfinished future ([`runtime.spawn(async move`](../../apps/gateway/src/inference/hand_off.rs#L75)).
+[`impl Drop for ExecutionGuard`](../../apps/gateway/src/inference/mod.rs#L479) queues a detached cancellation settlement only if `finished` is false. Failover
 is decided only in the `Err(error)` arm of `Engine::attempt` (so structurally never after a
-stream was returned), only after settlement succeeds ([`let failing_over = settled.is_ok()`](../../apps/gateway/src/inference/attempt.rs#L154)), and only for
+stream was returned), only after settlement succeeds ([`let failing_over = settled.is_ok()`](../../apps/gateway/src/inference/attempt.rs#L155)), and only for
 `Busy` or (with `allow_ambiguous_failover`) `UpstreamUnavailable`/`Overloaded`
-([`crate::routing::may_failover(plan, error)`](../../apps/gateway/src/inference/attempt.rs#L157)). A failed attempt with unknown usage settles `unknown` and keeps its
-hold, so a failover leaves two live holds. For a **priced** model a provider rejection (4xx) also
+([`crate::routing::may_failover(plan, error)`](../../apps/gateway/src/inference/attempt.rs#L158)), or, when the attempt built no upstream
+request (`inference::dispatch`), also `Configuration` and the others without the ambiguous flag
+(`may_fail_over_unsent`). A failed attempt with unknown usage settles `unknown` and keeps its
+hold, so a failover leaves two live holds; one that sent nothing settles at zero. For a **priced** model a provider rejection (4xx) also
 ends `unknown`: `free_rejection` settles it at zero only for `UpstreamRejected`/`ContextLength`
 with no usage, no stream returned and a pinned price that is entirely free or not applicable
 ([`l.all_free_or_not_applicable()`](../../apps/gateway/src/governance/settlement.rs#L456)).
@@ -68,7 +70,7 @@ Three different "leases" exist:
 * Reservation lease (`governance_reservations.lease_expires_at`): not a fencing token. It only says
   when the reconciler may take a `pending` row. Admission converts [`.request_timeout`](../../apps/gateway/src/inference/attempt.rs#L47)
   to whole seconds and adds five seconds of grace ([`+ 5,`](../../apps/gateway/src/inference/attempt.rs#L50)).
-  The request deadline uses [`started + self.limits.request_timeout`](../../apps/gateway/src/inference/mod.rs#L183).
+  The request deadline uses [`started + self.limits.request_timeout`](../../apps/gateway/src/inference/mod.rs#L184).
 * Work leases (`work_leases`, 0029, `leases.rs`): singleton background jobs. Each job transaction
   starts with `Fence::check` -> [`SELECT omg_lease_fence($1,$2,$3)`](../../apps/gateway/src/leases.rs#L107) (epoch = fencing token); the `FOR SHARE` lives in
   the 0029 SQL ([`w.expires_at>clock_timestamp() FOR SHARE`](../../apps/gateway/enterprise_migrations/0029_work_leases.sql#L72)) and is held until commit. The money
@@ -109,15 +111,15 @@ wide runs dominate).
 
 | # | Invariant (AGENTS.md sentence) | TLC name | Code that is meant to guarantee it |
 |---|---|---|---|
-| 1 | "Every actual upstream attempt needs its own durable reservation" | `OwnReservation` | `admit_unobserved` commits ([`tx.commit().await`](../../apps/gateway/src/governance.rs#L475)) before `call_upstream`; new execution id per attempt |
+| 1 | "Every actual upstream attempt needs its own durable reservation" | `OwnReservation` | `admit_unobserved` commits ([`tx.commit().await`](../../apps/gateway/src/governance.rs#L478)) before `call_upstream`; new execution id per attempt |
 | 2 | "Never delete unknown reservations"; a hold is never released before settlement or reconciliation (request path) | `UnknownRetainsHold`, `HoldNeverReleased` (action) | `reconcile_batch` only flips state; the settlement UPDATE keeps or raises `held`; docs/governance.md "Cancellation, reconciliation and retention" |
 | 3 | Settlement exactly once; no un-settling | `SettleOnce`, `LedgerConsistent`, `SettledTerminal` (action) | row lock + the state reads/predicates in section 1; ledger UNIQUE; `finished` flag in `ExecutionGuard` |
-| 4 | "Never treat unknown usage as zero" | `SettledMatchesTruth` | `finish_unobserved` ([`record.outcome == Outcome::Succeeded && input.is_some() && output.is_some()`](../../apps/gateway/src/governance/settlement.rs#L636)), `free_rejection` |
+| 4 | "Never treat unknown usage as zero" | `SettledMatchesTruth` | `finish_unobserved` ([`record.outcome == Outcome::Succeeded && input.is_some() && output.is_some()`](../../apps/gateway/src/governance/settlement.rs#L688)), `free_rejection` |
 | 5 | A fenced runner never writes | `NoStaleCommit`, `NoReorder` (`LeaseFence`) | `omg_lease_fence` + `FOR SHARE` (0029 SQL, `Fence::check`); the batch runner had none when this was written; since 0081 it has the claim epoch checked under [`runner_id=$2 AND runner_epoch=$3 FOR KEY SHARE`](../../apps/gateway/src/jobs/fence.rs#L138) / [`runner_id=$2 AND runner_epoch=$3 FOR NO KEY UPDATE`](../../apps/gateway/src/jobs/fence.rs#L141) of the job row (#638) |
-| + | "Failover ... never after a stream is returned" | `NoFailoverAfterStream` | checks the model's own guard; in the code [`return AttemptEnd::Failover(telemetry)`](../../apps/gateway/src/inference/attempt.rs#L159) exists only in the error arm |
+| + | "Failover ... never after a stream is returned" | `NoFailoverAfterStream` | checks the model's own guard; in the code [`return AttemptEnd::Failover(telemetry)`](../../apps/gateway/src/inference/attempt.rs#L162) exists only in the error arm |
 | + | Rows coherent (pending <=> execution started) | `ExecConsistent` | `reconcile_batch` aborts on [`changed != ids.len() as u64`](../../apps/gateway/src/governance/reconcile.rs#L58) |
 | + | A pending reservation always leaves `pending` (settled or unknown), under fairness | `Resolves` (liveness) | reconciler on every replica ([`crate::governance::reconcile_expired(store, 100)`](../../apps/gateway/src/maintenance.rs#L149)), restart |
-| + | Dropped future still settles or stays unknown | covered by 2, 4 and `Resolves`: the cancel path ends `unknown` (never zero) or stays `pending` until the reconciler; whether upstream work is actually cancelled is **not** modelled | [`self.record(Outcome::Cancelled, None)`](../../apps/gateway/src/inference/mod.rs#L484) in `ExecutionGuard::drop` |
+| + | Dropped future still settles or stays unknown | covered by 2, 4 and `Resolves`: the cancel path ends `unknown` (never zero) or stays `pending` until the reconciler; whether upstream work is actually cancelled is **not** modelled | [`self.record(Outcome::Cancelled, None)`](../../apps/gateway/src/inference/mod.rs#L485) in `ExecutionGuard::drop` |
 
 | Config | Result | Distinct states | Depth | Time |
 |---|---|---|---|---|
@@ -178,11 +180,13 @@ Assumptions of the model (some are also properties of the code):
    in the statement; the guard is the earlier read under `FOR UPDATE` in the same transaction
    (scoped mode) or the installation row (global mode). Settlement has an in-statement guard on the
    execution row (`state='started'`, `(1,1,1)` check), plus its locked read. True today.
-2. **The database does not enforce monotonic reservation state.** The runtime role may `UPDATE`
+2. **The database enforces forward-only reservation state (since 0088).** The runtime role may `UPDATE`
    `state` and `held_microusd` (`deploy/staging/runtime-grants.sql`, [`GRANT UPDATE(state,actual_microusd,`](../../deploy/staging/runtime-grants.sql#L160));
-   the state/actual CHECK and ledger UNIQUE constrain the modelled writes. No general trigger
-   enforces forward-only state transitions. The later explicit free-price and terminal batch
-   envelope resolution paths (0082/0083) are outside the model.
+   the state/actual CHECK and ledger UNIQUE constrain the modelled writes, and a row trigger on
+   every partition allows only `pending` -> `settled`/`unknown` and `unknown` -> `settled`
+   ([`CONSTRAINT='reservation_state_transition'`](../../apps/gateway/enterprise_migrations/0088_reservation_transitions.sql#L57)). The model
+   still does not rely on it. The later explicit free-price and terminal batch envelope
+   resolution paths (0082/0083) are outside the model; both are `unknown` -> `settled`.
 3. **A1: the lease outlives the request thread.** The model passes without it, so it only decides
    whether a slow attempt ends `settled` or `unknown`. A process stalled between admission and
    dispatch can still send the request after the reconciler took the row (tokio's `timeout` polls
@@ -254,7 +258,7 @@ money.
    marked `finished = true` before the write, so a client disconnect while the inline settlement was
    awaited (`settle_complete`, `track_stream`) dropped the write and `Drop` did nothing. A failed or
    timed-out write still leaves `pending`, by design (test
-   [`fn diagnostic_settlement_timeout_is_not_cancellation_or_a_drop_retry`](../../apps/gateway/src/inference/tests.rs#L868) asserts no retry); the rest
+   [`fn diagnostic_settlement_timeout_is_not_cancellation_or_a_drop_retry`](../../apps/gateway/src/inference/tests.rs#L871) asserts no retry); the rest
    of this item describes that case and the original symptom. The reconciler then marks it
    `unknown`; the hold is kept (spend overstated) until an operator resolves it with evidence.
    `MoneyPathDiag` shows it (Receive usage, ClientCancel while `settling`, ExpireLease, Reconcile);
@@ -278,7 +282,10 @@ money.
    refusing `settled -> *`, `unknown -> pending` and a shrinking `held_microusd` unless the new state
    is `settled` would make invariants 2 and 3 a database guarantee, one more layer in a design
    whose model needs three independent failures before `settled` can be undone. It must allow the
-   envelope transfer and realtime growth.
+   envelope transfer and realtime growth. Implemented in 0088 (#641): a settled row's state, hold, amount,
+   usage, price and markers are refused any change, an unbounded marker is never cleared, and a hold may decrease only as the row settles,
+   as an unknown ending records an unbounded hold's known floor, for a pending realtime session
+   (per-response settlement and its final write) and for a pending gateway-run envelope.
 
 ## 6. Limits of the experiment
 

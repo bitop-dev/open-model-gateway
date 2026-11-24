@@ -14,13 +14,8 @@ use open_model_gateway::{
     inference::Engine,
     leases::Leases,
     providers::{
-        ProviderRegistry,
-        anthropic::AnthropicAdapter,
-        bedrock::BedrockAdapter,
-        local::endpoints::ApprovedEndpoints,
-        openai::OpenAiAdapter,
-        openrouter::{OpenRouterAdapter, OpenRouterConfig},
-        secrets::EnvSecrets,
+        ProviderRegistry, local::endpoints::ApprovedEndpoints, openrouter::OpenRouterConfig,
+        secrets::EnvSecrets, served_adapters,
     },
     store::Store,
     telemetry::{self, Recorder},
@@ -118,18 +113,11 @@ async fn build_engine(
         .map(WebAssets::load)
         .transpose()?;
     let mut registry = ProviderRegistry::default();
-    let secrets = Arc::new(provider_secrets);
-    registry.register(Arc::new(OpenAiAdapter::new(secrets.clone())?))?;
-    registry.register(Arc::new(AnthropicAdapter::new(secrets.clone())?))?;
-    registry.register(Arc::new(BedrockAdapter::new()?))?;
-    registry.register(Arc::new(OpenRouterAdapter::new(
-        secrets.clone(),
-        OpenRouterConfig::from_env()?,
-    )?))?;
+    let openrouter = OpenRouterConfig::from_env()?;
     let approvals = local_approvals
         .take()
         .context("local upstream approvals are loaded before serving")?;
-    for adapter in open_model_gateway::providers::local::adapters(secrets, approvals) {
+    for adapter in served_adapters(Arc::new(provider_secrets), openrouter, approvals)? {
         registry.register(adapter)?;
     }
     let engine = Engine::new(Arc::new(store.clone()), registry, config.inference_limits)?

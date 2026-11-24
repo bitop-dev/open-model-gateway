@@ -31,6 +31,10 @@ struct Script {
     executed: Vec<String>,
     maxima: Vec<Option<u32>>,
     accept_tools: bool,
+    /// When true, the fake drops Messages `cache_control` hints as an
+    /// adapter that does not forward them (`forwards_cache_controls` is
+    /// false whatever its id).
+    drops_cache_controls: bool,
     /// #238 multi-route tests: when true, `validate_chat_request` never
     /// refuses - this provider accepts a body another provider's `Fake`
     /// (left at the default, `false`) would refuse, so a model with routes
@@ -330,6 +334,11 @@ impl ProviderAdapter for Fake {
     fn native_batch(&self, _: &Deployment, endpoint: BatchEndpoint) -> bool {
         self.native && (self.id != "anthropic" || endpoint.is_generation())
     }
+    /// The fake stands in for the adapter of its id, as the real Anthropic
+    /// adapter does, unless the script makes it drop the hints.
+    fn forwards_cache_controls(&self) -> bool {
+        self.id == "anthropic" && !self.script.lock().unwrap().drops_cache_controls
+    }
     fn encode_native_line(
         &self,
         target: &Deployment,
@@ -489,6 +498,17 @@ async fn world(
     anthropic_native: bool,
     concurrency: usize,
 ) -> World {
+    world_with(pool, openai_native, anthropic_native, concurrency, None).await
+}
+/// [`world`] with `openai` registered in place of the OpenAI fake (which
+/// stays in `World::openai`, unregistered).
+async fn world_with(
+    pool: PgPool,
+    openai_native: bool,
+    anthropic_native: bool,
+    concurrency: usize,
+    openai_adapter: Option<Arc<dyn crate::providers::ProviderAdapter>>,
+) -> World {
     let f = fixture(pool).await;
     sqlx::query("UPDATE installation_settings SET file_batch_enabled=true WHERE singleton")
         .execute(&f.store.pool)
@@ -513,7 +533,9 @@ async fn world(
     let openai = Fake::new("openai", openai_native);
     let anthropic = Fake::new("anthropic", anthropic_native);
     let mut registry = ProviderRegistry::default();
-    registry.register(Arc::new(openai.clone())).unwrap();
+    registry
+        .register(openai_adapter.unwrap_or_else(|| Arc::new(openai.clone())))
+        .unwrap();
     registry.register(Arc::new(anthropic.clone())).unwrap();
     let engine = Engine::new(
         Arc::new(f.store.clone()),
@@ -2065,6 +2087,85 @@ async fn budget_exhaustion_mid_batch_stops_and_keeps_partial_results(pool: PgPoo
     consistent(f).await;
 }
 
+/// A gateway-run line whose route's credential cannot be resolved (the real
+/// OpenAI adapter, nothing allowed to resolve) fails before any request is
+/// built: it settles at a known zero with its own ledger entry, nothing
+/// reaches the upstream, and the batch's envelope still closes.
+#[dbtest::test]
+async fn a_line_whose_credential_cannot_be_resolved_settles_as_a_known_zero(pool: PgPool) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counted = hits.clone();
+    let (upstream, _server) = crate::inference::admission_validation_tests::serve(
+        axum::Router::new().fallback(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }
+        }),
+    )
+    .await;
+    let adapter = Arc::new(crate::providers::openai::OpenAiAdapter::for_test(
+        Arc::new(crate::providers::secrets::EnvSecrets::new(Vec::new())),
+        format!("{upstream}/v1"),
+    ));
+    let w = world_with(pool, false, false, 1, Some(adapter)).await;
+    let f = &w.f;
+    let file = w
+        .upload(
+            &f.principal,
+            &[
+                chat_line("a", "company/smart", "one"),
+                chat_line("b", "company/smart", "two"),
+            ],
+        )
+        .await;
+    let job = w
+        .create(
+            f.principal,
+            &file,
+            BatchEndpoint::ChatCompletions,
+            // The real OpenAI adapter would otherwise run it natively.
+            Some(json!({"omg_mode": "gateway"})),
+        )
+        .await
+        .unwrap();
+    let _ = Runner::new(w.jobs.clone()).run_next().await;
+    let job = w.reload(&job).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    let errors = w.read(f.principal.workspace_id, job.error_file_id).await;
+    assert_eq!(errors.len(), 2, "{} {:?}", job.state, job.error_code);
+    type Line = (Uuid, String, String, Option<i64>, Option<i64>, Option<i64>);
+    let lines: Vec<Line> = sqlx::query_as(
+        "SELECT r.execution_id,e.state,r.state,r.actual_microusd,r.input_tokens,r.output_tokens FROM batch_lines b JOIN governance_reservations r ON r.execution_id=b.execution_id JOIN inference_executions e ON e.id=r.execution_id WHERE b.job_id=$1 ORDER BY b.line_no",
+    )
+    .bind(job.id)
+    .fetch_all(&f.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(lines.len(), 2);
+    for (execution, state, reservation, actual, input, output) in lines {
+        assert_eq!(
+            (state.as_str(), reservation.as_str(), actual, input, output),
+            ("failed", "settled", Some(0), Some(0), Some(0))
+        );
+        let ledger: Vec<(String, Option<i64>)> = sqlx::query_as(
+            "SELECT kind,amount_microusd FROM monetary_ledger WHERE execution_id=$1 ORDER BY kind",
+        )
+        .bind(execution)
+        .fetch_all(&f.store.pool)
+        .await
+        .unwrap();
+        assert_eq!(ledger.len(), 2, "{ledger:?}");
+        assert_eq!(ledger[1], ("settlement".into(), Some(0)));
+    }
+    let open: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM governance_reservations WHERE state<>'settled'")
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(open, 0, "the envelope and both lines are settled");
+    consistent(f).await;
+}
+
 /// A key revoked after its gateway-run batch was created: every line that
 /// runs afterwards fails exactly as the interactive endpoint refuses the key
 /// (401 `authentication_error`, never `model_not_found`), and nothing reaches
@@ -2543,6 +2644,50 @@ async fn native_anthropic_messages_batch_with_errored_lines(pool: PgPool) {
     // Standard (no batch list) at 2 µUSD/token: (10 + 2) × 2.
     assert_eq!(reservation(f, job.execution_id).await.2, Some(24));
     consistent(f).await;
+}
+
+/// Migration 0088 lets a pending reservation's hold decrease outside
+/// settlement only for a gateway-run batch envelope (its transfer into a
+/// line) and a realtime session. A native batch's reservation, also a
+/// `batches` execution, is not an envelope: the database refuses it.
+async fn lower_a_pending_batch_hold(pool: PgPool, native: bool) {
+    let w = world(pool, native, false, 1).await;
+    let f = &w.f;
+    let file = w
+        .upload(&f.principal, &[chat_line("a", "company/smart", "x")])
+        .await;
+    let metadata = (!native).then(|| json!({"omg_mode": "gateway"}));
+    let job = w
+        .create(f.principal, &file, BatchEndpoint::ChatCompletions, metadata)
+        .await
+        .unwrap();
+    let (state, held, _, _) = reservation(f, job.execution_id).await;
+    assert_eq!(state, "pending");
+    assert!(held.is_some_and(|h| h > 0));
+    let lowered = sqlx::query(
+        "UPDATE governance_reservations SET held_microusd=held_microusd-1 WHERE execution_id=$1",
+    )
+    .bind(job.execution_id)
+    .execute(&f.store.pool)
+    .await;
+    if native {
+        let error = lowered.expect_err("a native batch is not an envelope");
+        assert_eq!(
+            error.as_database_error().and_then(|e| e.constraint()),
+            Some("reservation_hold_change")
+        );
+        assert_eq!(reservation(f, job.execution_id).await.1, held);
+    } else {
+        assert_eq!(lowered.unwrap().rows_affected(), 1);
+    }
+}
+#[dbtest::test]
+async fn a_gateway_envelope_may_lower_its_pending_hold(pool: PgPool) {
+    lower_a_pending_batch_hold(pool, false).await;
+}
+#[dbtest::test]
+async fn a_native_batch_may_not_lower_its_pending_hold(pool: PgPool) {
+    lower_a_pending_batch_hold(pool, true).await;
 }
 
 #[dbtest::test]
@@ -3161,6 +3306,74 @@ async fn gateway_cache_lines_require_read_prices_and_settle_repeated_hits(pool: 
             consistent(f).await;
         }
     }
+}
+
+/// A gateway-run Messages line with a `cache_control` hint on a route whose
+/// adapter drops the hint is planned, admitted and held exactly as the same
+/// line without the hint, at the v1 price that cannot price cache tokens.
+/// The route and its provider id stay the same: with the adapter forwarding
+/// the hint again, the hinted line is refused before any write.
+#[dbtest::test]
+async fn a_cache_hint_on_a_route_that_drops_it_is_held_as_a_plain_line(pool: PgPool) {
+    let w = world(pool, false, false, 1).await;
+    let f = &w.f;
+    w.anthropic.script.lock().unwrap().drops_cache_controls = true;
+    let plain = json!({"custom_id":"line","method":"POST","url":"/v1/messages","body":{"model":"company/claude","max_tokens":10,"system":[{"type":"text","text":"cache me"}],"messages":[{"role":"user","content":"hello"}]}});
+    let mut hinted = plain.clone();
+    hinted["body"]["system"][0]["cache_control"] = json!({"type":"ephemeral","ttl":"1h"});
+    let mut runs = Vec::new();
+    for line in [plain, hinted.clone()] {
+        let file = w.upload(&f.principal, &[line]).await;
+        let job = w
+            .create(f.principal, &file, BatchEndpoint::Messages, None)
+            .await
+            .unwrap();
+        assert_eq!(job.mode(), Some(BatchMode::Gateway));
+        let envelope: (i64, i64) = sqlx::query_as(
+            "SELECT reserved_tokens,held_microusd FROM governance_reservations WHERE execution_id=$1",
+        )
+        .bind(job.execution_id)
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+        assert!(Runner::new(w.jobs.clone()).run_next().await.unwrap());
+        let job = w.reload(&job).await;
+        assert_eq!(job.state, "completed");
+        assert_eq!(
+            (job.request_completed, job.request_failed),
+            (Some(1), Some(0))
+        );
+        let lines: Vec<(Uuid, i64, i64, String, Option<i64>)> = sqlx::query_as("SELECT r.price_id,r.reserved_tokens,r.held_microusd,r.state,r.actual_microusd FROM inference_executions e JOIN governance_reservations r ON r.execution_id=e.id WHERE e.batch_job_id=$1")
+            .bind(job.id)
+            .fetch_all(&f.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(lines.len(), 1);
+        runs.push((envelope, lines));
+    }
+    assert_eq!(
+        runs[0], runs[1],
+        "the hint changes neither the envelope nor the line's hold"
+    );
+    assert_eq!(w.anthropic.executed().len(), 2);
+    // The same route with an adapter that forwards the hint.
+    w.anthropic.script.lock().unwrap().drops_cache_controls = false;
+    let file = w.upload(&f.principal, &[hinted]).await;
+    let before = admission_rowcounts(f).await;
+    let refused = w
+        .create(f.principal, &file, BatchEndpoint::Messages, None)
+        .await;
+    assert!(matches!(
+        refused,
+        Err(CreateError::Job(JobError::Inference(
+            InferenceError::InvalidField("cache_control")
+        )))
+    ));
+    assert_eq!(admission_rowcounts(f).await, before);
+    assert_eq!(w.anthropic.executed().len(), 2);
+    assert!(w.anthropic.calls().is_empty(), "no native batch calls");
+    assert!(w.openai.executed().is_empty());
+    consistent(f).await;
 }
 
 #[dbtest::test]
