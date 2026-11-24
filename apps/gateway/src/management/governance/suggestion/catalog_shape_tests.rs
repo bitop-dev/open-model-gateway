@@ -133,6 +133,12 @@ fn unread_fields_never_refuse_and_read_fields_keep_their_limits() {
     assert!(!out.to_string().contains("supported_parameters"));
 
     let mut wide = chat_model();
+    for n in 0..62 {
+        wide["pricing"][format!("extra_{n}")] = json!("1");
+    }
+    assert_eq!(wide["pricing"].as_object().unwrap().len(), 64);
+    assert!(!all_unknown(&map(&wide, WorkloadKind::Generation, None)));
+    let mut wide = chat_model();
     for n in 0..63 {
         wide["pricing"][format!("extra_{n}")] = json!("1");
     }
@@ -282,11 +288,11 @@ fn price_warnings_show_the_rates_that_were_compared() {
         .find(|w| w.starts_with("Priced from"))
         .unwrap();
     assert!(
-        priced.contains("$2/M input and $2/M output tokens"),
+        priced.contains("$2/M input tokens and $2/M output tokens"),
         "{priced}"
     );
     assert!(
-        priced.contains("one million input and one million output tokens"),
+        priced.contains("one million input tokens, one million output tokens and one request"),
         "{priced}"
     );
     let pricier = warnings
@@ -294,9 +300,79 @@ fn price_warnings_show_the_rates_that_were_compared() {
         .find(|w| w.contains("may route to another endpoint"))
         .unwrap();
     assert!(
-        pricier.contains("$1/M input and $10/M output tokens on Dear"),
+        pricier.contains("$1/M input tokens and $10/M output tokens on Dear"),
         "{pricier}"
     );
+}
+
+/// Speech and transcription endpoints are not priced per token; the
+/// comparison text names the workload's units, never tokens it does not have.
+#[test]
+fn endpoint_rates_are_stated_in_the_workload_units() {
+    let speech = speech_model(3);
+    let list = endpoints(vec![
+        endpoint("Voice", "0.00003", "0"),
+        endpoint("Dearer", "0.00004", "0"),
+    ]);
+    let out = map_with_endpoints(&speech, WorkloadKind::AudioSpeech, None, Some(&list), &[]);
+    assert_eq!(out["endpoint"]["input_rate"], "$30/M input characters");
+    let text = out["warnings"].to_string();
+    for needle in [
+        "Priced from the Voice endpoint ($30/M input characters and $0/M output units)",
+        "for one million input characters, one million output units and one request",
+        "($40/M input characters and $0/M output units on Dearer)",
+    ] {
+        assert!(text.contains(needle), "{needle}: {text}");
+    }
+    assert!(!text.contains("token"), "{text}");
+    let stt = json!({"id": "vendor/stt-1", "pricing": {"prompt": "0.00000333", "completion": "0"}});
+    let list = endpoints(vec![endpoint("Ear", "0.00000333", "0")]);
+    let out = map_with_endpoints(
+        &stt,
+        WorkloadKind::AudioTranscriptions,
+        None,
+        Some(&list),
+        &[],
+    );
+    assert_eq!(out["endpoint"]["input_rate"], "$3.33/M input units");
+    let text = out["warnings"].to_string();
+    assert!(
+        text.contains("($3.33/M input units and $0/M output tokens)"),
+        "{text}"
+    );
+}
+
+/// When every endpoint with comparable rates is left out for an unreadable
+/// status, the catalog fallback says that status was the reason.
+#[test]
+fn a_fallback_for_unreadable_statuses_says_so() {
+    let mut hidden = endpoint("Hidden", "0.00000001", "0.00000001");
+    hidden["status"] = json!("0");
+    let incomplete = json!({"provider_name": "Incomplete", "pricing": {"prompt": "0"}});
+    let out = map_with_endpoints(
+        &chat_model(),
+        WorkloadKind::Generation,
+        None,
+        Some(&endpoints(vec![hidden, incomplete.clone()])),
+        &[],
+    );
+    assert_eq!(out["endpoint"]["selection"], "catalog");
+    assert_eq!(out["needs_review"], true);
+    let text = out["warnings"].to_string();
+    assert!(text.contains("prices were unavailable"), "{text}");
+    assert!(text.contains("unreadable status"), "{text}");
+    // Without an unreadable status the generic fallback stands alone.
+    let mut down = endpoint("Down", "0.00000001", "0.00000001");
+    down["status"] = json!(-1);
+    let out = map_with_endpoints(
+        &chat_model(),
+        WorkloadKind::Generation,
+        None,
+        Some(&endpoints(vec![down, incomplete])),
+        &[],
+    );
+    assert_eq!(out["endpoint"]["selection"], "catalog");
+    assert!(!out["warnings"].to_string().contains("unreadable status"));
 }
 
 /// Hostile endpoint pricing can fill the mapper's warnings; the endpoint the
@@ -348,7 +424,7 @@ fn selection_warnings_survive_a_full_warning_list() {
 
 #[test]
 fn provider_labels_are_plain_visible_text() {
-    use selection::provider_label;
+    let provider_label = |e: &Value| selection::sanitized_label(e).0;
     for (endpoint, label) in [
         (
             json!({"provider_name": "Cloud\u{2028}flare\u{2029}"}),
@@ -382,6 +458,55 @@ fn provider_labels_are_plain_visible_text() {
     assert_eq!(
         provider_label(&json!({"provider_name": "x".repeat(500)})).len(),
         64
+    );
+}
+
+/// A label that sanitising changed, or that two endpoints share, names the
+/// endpoint's position, so the catalog cannot borrow a trusted name.
+#[test]
+fn altered_or_repeated_provider_labels_name_the_endpoint() {
+    use selection::provider_label;
+    let list = [
+        json!({"provider_name": "Cl\u{2603}oudflare"}),
+        json!({"provider_name": "Groq"}),
+        json!({"provider_name": "Cloudflare"}),
+        json!({"provider_name": "\u{200b}", "tag": "lepton"}),
+        json!({"provider_name": "Twin"}),
+        json!({"tag": "Twin"}),
+        json!({"provider_name": "", "tag": "deepinfra"}),
+    ];
+    let labels: Vec<String> = (0..list.len()).map(|i| provider_label(&list, i)).collect();
+    assert_eq!(
+        labels,
+        [
+            "Cloudflare (endpoint 1 of 7)",
+            "Groq",
+            "Cloudflare (endpoint 3 of 7)",
+            "lepton (endpoint 4 of 7)",
+            "Twin (endpoint 5 of 7)",
+            "Twin (endpoint 6 of 7)",
+            "deepinfra",
+        ]
+    );
+    // Through the mapper: the filtered name is the chosen endpoint.
+    let mut snow = endpoint("Cloudflare", "0.00000001", "0.00000001");
+    snow["provider_name"] = json!("Cl\u{2603}oudflare");
+    let out = map_with_endpoints(
+        &chat_model(),
+        WorkloadKind::Generation,
+        None,
+        Some(&endpoints(vec![
+            snow,
+            endpoint("Dear", "0.000001", "0.000001"),
+        ])),
+        &[],
+    );
+    assert_eq!(out["endpoint"]["provider"], "Cloudflare (endpoint 1 of 2)");
+    assert!(
+        out["warnings"]
+            .to_string()
+            .contains("Priced from the Cloudflare (endpoint 1 of 2) endpoint"),
+        "{out}"
     );
 }
 
@@ -507,6 +632,14 @@ fn catalog_decoding_limits_are_exact() {
             assert_eq!(limits::catalog_json(body.as_bytes()).is_ok(), ok, "{len}");
         }
     }
+    // Nesting: the outermost value is at depth 0 and depth 96 is the last
+    // accepted, so 97 nested arrays are read and 98 are refused as a limit.
+    for (levels, ok) in [(97, true), (98, false)] {
+        let body = format!("{}{}", "[".repeat(levels), "]".repeat(levels));
+        let read = limits::catalog_json(body.as_bytes());
+        assert_eq!(read.is_ok(), ok, "{levels}");
+        assert!(ok || matches!(read, Err(CatalogError::Limit)), "{levels}");
+    }
     let mut exact = b"[]".to_vec();
     exact.resize(BODY_CAP, b' ');
     assert!(limits::catalog_json(&exact).is_ok());
@@ -515,4 +648,290 @@ fn catalog_decoding_limits_are_exact() {
         limits::catalog_json(&exact),
         Err(CatalogError::Limit)
     ));
+}
+
+/// An endpoint with every field a full OpenRouter endpoint carries, its
+/// price object as large as any sampled: 16 read values.
+fn full_endpoint(n: usize) -> Value {
+    let mut e = endpoint(&format!("Provider{n}"), "0.00000002", "0.00000005");
+    e["pricing"] = json!({
+        "prompt": format!("0.000000{:02}", 10 + n % 80), "completion": "0.00000005",
+        "request": "0", "image": "0", "web_search": "0", "internal_reasoning": "0.00000005",
+        "input_cache_read": "0.00000001", "input_cache_write": "0.00000003", "discount": 0,
+    });
+    e["max_completion_tokens"] = json!(16_384);
+    e
+}
+
+/// Values the endpoint projection reads from one endpoint, itself included.
+fn endpoint_read_values(e: &Value) -> usize {
+    fn count(v: &Value) -> usize {
+        1 + match v {
+            Value::Array(a) => a.iter().map(count).sum(),
+            Value::Object(o) => o.values().map(count).sum(),
+            _ => 0,
+        }
+    }
+    1 + [
+        "pricing",
+        "status",
+        "provider_name",
+        "tag",
+        "context_length",
+        "max_completion_tokens",
+    ]
+    .iter()
+    .filter_map(|k| e.get(*k))
+    .map(count)
+    .sum::<usize>()
+}
+
+/// The value tree and the fetched bytes are projected alike.
+fn projected(doc: &Value) -> Result<limits::EndpointList, ()> {
+    let tree = limits::endpoint_list(doc).map_err(|_| ());
+    let bytes = limits::endpoint_list_json(doc.to_string().as_bytes()).map_err(|_| ());
+    assert_eq!(tree, bytes, "{doc}");
+    tree
+}
+
+#[test]
+fn full_sized_endpoint_lists_reach_the_endpoint_limit() {
+    assert_eq!(endpoint_read_values(&full_endpoint(0)), 16);
+    let list = |count: usize| endpoints((0..count).map(full_endpoint).collect());
+    let at = list(256);
+    assert_eq!(projected(&at).unwrap().unwrap().len(), 256);
+    let out = map_with_endpoints(
+        &chat_model(),
+        WorkloadKind::Generation,
+        None,
+        Some(&at),
+        &[],
+    );
+    assert_eq!(out["endpoint"]["selection"], "cheapest", "{out}");
+    assert_eq!(out["endpoint"]["endpoint_count"], 256);
+    let over = list(257);
+    assert!(projected(&over).is_err());
+    let out = map_with_endpoints(
+        &chat_model(),
+        WorkloadKind::Generation,
+        None,
+        Some(&over),
+        &[],
+    );
+    assert!(all_unknown(&out));
+    assert!(out.get("endpoint").is_none());
+}
+
+/// Each endpoint has its own budget of read values: 256 are accepted, and
+/// one more refuses the draft. A list holds at most 256 × 256.
+#[test]
+fn the_per_endpoint_value_budget_is_exact() {
+    let base =
+        json!({"provider_name": "P", "pricing": {"prompt": "0.000001", "completion": "0.000001"}});
+    let fixed = endpoint_read_values(&base);
+    for (total, priced) in [
+        (limits::ENDPOINT_VALUES, true),
+        (limits::ENDPOINT_VALUES + 1, false),
+    ] {
+        let mut e = base.clone();
+        let mut rest = total - fixed - 1; // the `padding` array
+        let mut groups = vec![];
+        while rest > 0 {
+            let nulls = (rest - 1).min(64);
+            groups.push(Value::Array(vec![Value::Null; nulls]));
+            rest -= nulls + 1;
+        }
+        e["pricing"]["padding"] = Value::Array(groups);
+        assert_eq!(endpoint_read_values(&e), total);
+        // A list of such endpoints: the budget does not run across them.
+        let doc = endpoints(vec![e; 4]);
+        assert_eq!(projected(&doc).is_ok(), priced, "{total}");
+        let out = map_with_endpoints(
+            &chat_model(),
+            WorkloadKind::Generation,
+            None,
+            Some(&doc),
+            &[],
+        );
+        assert_eq!(!all_unknown(&out), priced, "{total} values");
+    }
+}
+
+/// The read fields of one endpoint keep the mapping limits.
+#[test]
+fn one_endpoint_s_read_fields_keep_their_limits() {
+    let refuses = |e: Value| {
+        let doc = endpoints(vec![e, full_endpoint(1)]);
+        let refused = projected(&doc).is_err();
+        let out = map_with_endpoints(
+            &chat_model(),
+            WorkloadKind::Generation,
+            None,
+            Some(&doc),
+            &[],
+        );
+        assert_eq!(all_unknown(&out), refused);
+        refused
+    };
+    for (entries, refused) in [(64, false), (65, true)] {
+        let mut e = full_endpoint(0);
+        for n in e["pricing"].as_object().unwrap().len()..entries {
+            e["pricing"][format!("extra_{n}")] = json!("1");
+        }
+        assert_eq!(e["pricing"].as_object().unwrap().len(), entries);
+        assert_eq!(refuses(e), refused, "{entries} pricing entries");
+    }
+    for field in ["status", "provider_name", "tag"] {
+        for (len, refused) in [(16_384, false), (16_385, true)] {
+            let mut e = full_endpoint(0);
+            e[field] = json!("s".repeat(len));
+            assert_eq!(refuses(e), refused, "{field} of {len} bytes");
+        }
+    }
+}
+
+/// The projection reads the endpoints list as it streams: an over-long list
+/// is refused at its 257th entry, before the rest of the body is read, so no
+/// tree of the document is ever built. The tail here is not even JSON, which
+/// a decoder building the whole tree would report instead.
+#[test]
+fn endpoint_lists_are_projected_from_the_stream() {
+    let mut body = br#"{"data":{"endpoints":["#.to_vec();
+    body.extend(std::iter::repeat_n(&b"{},"[..], 257).flatten());
+    body.extend_from_slice(b"not json");
+    assert!(serde_json::from_slice::<Value>(&body).is_err());
+    assert!(matches!(
+        limits::endpoint_list_json(&body),
+        Err(CatalogError::Limit)
+    ));
+    // Unread fields are skipped, whatever they hold.
+    let tiny = vec![json!({}); 65_000];
+    let doc =
+        json!({"data": {"other": tiny.clone(), "endpoints": [full_endpoint(0)]}, "more": tiny});
+    assert_eq!(projected(&doc).unwrap().unwrap().len(), 1);
+    // A repeated key replaces the earlier value, as in a decoded tree.
+    let repeated = br#"{"endpoints":[{"provider_name":"A","pricing":{}}],"endpoints":"x"}"#;
+    assert_eq!(limits::endpoint_list_json(repeated).unwrap(), None);
+    let doc = json!({"data": {"endpoints": []}, "endpoints": [full_endpoint(0)]});
+    assert_eq!(projected(&doc).unwrap(), None, "an empty data list wins");
+}
+
+/// About 65,000 tiny endpoint objects pass the decoding preflight; they are
+/// refused before any tree of them exists, and the refusal is not cached.
+#[tokio::test]
+async fn a_list_of_many_tiny_endpoints_is_refused_and_not_cached() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let body = json!({"data": {"endpoints": vec![json!({}); 65_000]}}).to_string();
+    assert!(limits::catalog_json(body.as_bytes()).is_ok());
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    let app = axum::Router::new().route(
+        "/models/v/m/endpoints",
+        axum::routing::get(move || {
+            let (h, body) = (h.clone(), body.clone());
+            async move {
+                h.fetch_add(1, Ordering::SeqCst);
+                ([("content-type", "application/json")], body)
+            }
+        }),
+    );
+    let (url, task) = tests::mock(app).await;
+    let catalog = OpenRouterCatalog::for_test(url, Duration::from_secs(5));
+    for _ in 0..2 {
+        assert!(matches!(
+            catalog.endpoints("v/m").await,
+            Err(CatalogError::Limit)
+        ));
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert!(catalog.cache.lock().await.is_empty());
+    task.abort();
+}
+
+/// A catalog that accepts the connection and never answers: previews that
+/// queue behind the stalled fetch fail within the same deadline, and share
+/// its failure instead of each repeating it. A later preview fetches again.
+#[tokio::test]
+async fn previews_queued_behind_a_stalled_catalog_fail_together() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    let app = axum::Router::new().route(
+        "/models",
+        axum::routing::get(move || {
+            let h = h.clone();
+            async move {
+                h.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                ([("content-type", "application/json")], "{\"data\":[]}")
+            }
+        }),
+    );
+    let (url, task) = tests::mock(app).await;
+    let timeout = Duration::from_secs(1);
+    let catalog = Arc::new(OpenRouterCatalog::for_test(url, timeout));
+    let started = Instant::now();
+    let readers: Vec<_> = (0..8)
+        .map(|_| {
+            let catalog = catalog.clone();
+            tokio::spawn(async move { catalog.get("/models").await.is_err() })
+        })
+        .collect();
+    for reader in readers {
+        assert!(reader.await.unwrap());
+    }
+    // One after another they would take eight timeouts.
+    assert!(started.elapsed() < timeout * 3, "{:?}", started.elapsed());
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert!(catalog.get("/models").await.is_err());
+    assert_eq!(hits.load(Ordering::SeqCst), 2, "a failure is not cached");
+    task.abort();
+}
+
+/// A preview cancelled while it fetches leaves no outcome behind: the
+/// previews waiting for it fetch for themselves and complete.
+#[tokio::test]
+async fn waiters_complete_when_the_fetching_preview_is_cancelled() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    let app = axum::Router::new().route(
+        "/models",
+        axum::routing::get(move || {
+            let h = h.clone();
+            async move {
+                if h.fetch_add(1, Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+                ([("content-type", "application/json")], "{\"data\":[]}")
+            }
+        }),
+    );
+    let (url, task) = tests::mock(app).await;
+    let catalog = Arc::new(OpenRouterCatalog::for_test(url, Duration::from_secs(10)));
+    let leader = {
+        let catalog = catalog.clone();
+        tokio::spawn(async move { catalog.get("/models").await.is_ok() })
+    };
+    for _ in 0..500 {
+        if hits.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "the leader is fetching");
+    let waiters: Vec<_> = (0..4)
+        .map(|_| {
+            let catalog = catalog.clone();
+            tokio::spawn(async move { catalog.get("/models").await.is_ok() })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    leader.abort();
+    assert!(leader.await.unwrap_err().is_cancelled());
+    for waiter in waiters {
+        assert!(waiter.await.unwrap());
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    task.abort();
 }

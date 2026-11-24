@@ -302,7 +302,8 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
     assert_eq!(r.status(), StatusCode::OK);
     let out: Value = r.json().await.unwrap();
     assert_eq!(out["endpoint"]["selection"], "cheapest");
-    assert_eq!(out["endpoint"]["provider"], "Clean");
+    // The catalog sent "C\u{202e}lean": the filtered label names its position.
+    assert_eq!(out["endpoint"]["provider"], "Clean (endpoint 3 of 3)");
     assert_eq!(out["draft"]["output_token_limit"], 100);
     assert_eq!(out["draft"]["input_token_limit"], 4096);
     let lines = out["draft"]["price_lines"].as_array().unwrap();

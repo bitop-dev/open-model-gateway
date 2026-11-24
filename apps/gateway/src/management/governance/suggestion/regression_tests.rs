@@ -124,10 +124,10 @@ fn unreadable_status_is_unknown_and_unusable_ceilings_keep_catalog_limits() {
 
 #[test]
 fn provider_labels_remove_format_controls() {
-    let label = selection::provider_label(
+    let (label, altered) = selection::sanitized_label(
         &json!({"provider_name":"A\u{202e}B\u{2066}C\u{200b}D\u{feff}\n"}),
     );
-    assert_eq!(label, "ABCD");
+    assert_eq!((label.as_str(), altered), ("ABCD", true));
 }
 
 #[test]
