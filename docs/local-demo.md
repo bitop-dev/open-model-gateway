@@ -69,7 +69,7 @@ The tracked demo Compose file binds PostgreSQL to **127.0.0.1:54349**, separate 
 
 Example connections/deployments start **disabled**. Local HTTP approval is explicit in `.env.demo.example`; approval does not mean a server exists or a model is certified. Example prices are not vendor prices. Configure an actual local endpoint/model and enforced input bounds before enabling inference. Paid-provider tests require separate explicit approval and server-held credentials.
 
-`bootstrap-demo` is transactional and idempotent after its own successful seed marker. It preserves edits, inactive users and history; it refuses unrelated existing users or email collisions. The old organization-persona upgrade flag is unsupported. Restart issuer and gateway together: the demo signing key is ephemeral, and a new issuer key is picked up only after a JWKS refresh (rate-limited to once a minute for unknown key IDs).
+`bootstrap-demo` is transactional and idempotent after its own successful seed marker. It preserves edits, inactive users and history; on any other installation it applies the same emptiness check as `bootstrap-dev` (below) and refuses. Its database URL must name the literal loopback address `127.0.0.1` or `[::1]`, with no Unix socket (`?host=/...`); the same check applies to `serve` whenever the demo issuer is configured. The old organization-persona upgrade flag is unsupported. Restart issuer and gateway together: the demo signing key is ephemeral, and a new issuer key is picked up only after a JWKS refresh (rate-limited to once a minute for unknown key IDs).
 
 To stop without deleting data:
 
@@ -80,10 +80,29 @@ docker compose -p omg-enterprise-demo -f deploy/demo/compose.yaml stop
 Stopping the issuer/gateway is separate. Do not use `down -v` as a recovery or upgrade procedure.
 
 `bootstrap-dev` is a separate minimal development fixture. It requires
-`GATEWAY_ENV=development` and a TCP database connection to `127.0.0.1` or `::1`.
-The command rejects Unix socket overrides before connecting. On a fresh, explicitly selected migrated database it creates
-an admin and prints two inference keys once; keep that terminal output private.
-It refuses existing users, workspaces or execution history unless its own
-successful bootstrap marker and developer identity are present. Repeating a
-successful bootstrap makes no changes and never prints or rotates existing keys.
-It does not reset databases or enable upstream providers.
+`GATEWAY_ENV=development` and a TCP database connection whose host is the
+literal address `127.0.0.1` or `::1` (written `[::1]` in a URL). A host name
+such as `localhost` is refused, and so are Unix socket overrides and `PGHOST` or
+`PGHOSTADDR` values (used only when the URL names no host) that are not one of
+those addresses, all before connecting. Tests that call `bootstrap::seed` need
+the same kind of `DATABASE_URL`. On a fresh, explicitly selected migrated
+database it creates an admin and prints two inference keys once; keep that
+terminal output private.
+
+It refuses an installation that is already in use (`bootstrap.rs`
+`ensure_empty`, which `bootstrap-demo` shares): a row in any table either seed
+writes (accounts, platform role and membership grants, OIDC group mappings,
+cost centers, workspaces, service accounts, keys, provider connections, models,
+deployments and prices, catalogs and their assignments, model grants, budgets,
+audit events), any execution history, or a configuration topic that has moved
+since migration (`config_versions`; catalog, policy, key-selection and settings
+writes bump it, as do updates and deletions of accounts, grants, workspaces and
+keys, but not their inserts). The only exception is a repeat run: when the
+installation carries its own successful bootstrap marker and developer
+identity, the command makes no changes and never prints or rotates existing
+keys. It does not reset databases or enable upstream providers.
+
+What the check does not see: state only in other tables, and a loopback
+forwarder (an SSH tunnel or `kubectl port-forward`) to a freshly migrated
+remote database, which looks like a local server. Point `bootstrap-dev` only at
+a database you created for development.
