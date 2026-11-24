@@ -31,6 +31,10 @@ struct Script {
     executed: Vec<String>,
     maxima: Vec<Option<u32>>,
     accept_tools: bool,
+    /// When true, the fake drops Messages `cache_control` hints as an
+    /// adapter that does not forward them (`forwards_cache_controls` is
+    /// false whatever its id).
+    drops_cache_controls: bool,
     /// #238 multi-route tests: when true, `validate_chat_request` never
     /// refuses - this provider accepts a body another provider's `Fake`
     /// (left at the default, `false`) would refuse, so a model with routes
@@ -320,9 +324,9 @@ impl ProviderAdapter for Fake {
         self.native && (self.id != "anthropic" || endpoint.is_generation())
     }
     /// The fake stands in for the adapter of its id, as the real Anthropic
-    /// adapter does.
+    /// adapter does, unless the script makes it drop the hints.
     fn forwards_cache_controls(&self) -> bool {
-        self.id == "anthropic"
+        self.id == "anthropic" && !self.script.lock().unwrap().drops_cache_controls
     }
     fn encode_native_line(
         &self,
@@ -3136,6 +3140,74 @@ async fn gateway_cache_lines_require_read_prices_and_settle_repeated_hits(pool: 
             consistent(f).await;
         }
     }
+}
+
+/// A gateway-run Messages line with a `cache_control` hint on a route whose
+/// adapter drops the hint is planned, admitted and held exactly as the same
+/// line without the hint, at the v1 price that cannot price cache tokens.
+/// The route and its provider id stay the same: with the adapter forwarding
+/// the hint again, the hinted line is refused before any write.
+#[dbtest::test]
+async fn a_cache_hint_on_a_route_that_drops_it_is_held_as_a_plain_line(pool: PgPool) {
+    let w = world(pool, false, false, 1).await;
+    let f = &w.f;
+    w.anthropic.script.lock().unwrap().drops_cache_controls = true;
+    let plain = json!({"custom_id":"line","method":"POST","url":"/v1/messages","body":{"model":"company/claude","max_tokens":10,"system":[{"type":"text","text":"cache me"}],"messages":[{"role":"user","content":"hello"}]}});
+    let mut hinted = plain.clone();
+    hinted["body"]["system"][0]["cache_control"] = json!({"type":"ephemeral","ttl":"1h"});
+    let mut runs = Vec::new();
+    for line in [plain, hinted.clone()] {
+        let file = w.upload(&f.principal, &[line]).await;
+        let job = w
+            .create(f.principal, &file, BatchEndpoint::Messages, None)
+            .await
+            .unwrap();
+        assert_eq!(job.mode(), Some(BatchMode::Gateway));
+        let envelope: (i64, i64) = sqlx::query_as(
+            "SELECT reserved_tokens,held_microusd FROM governance_reservations WHERE execution_id=$1",
+        )
+        .bind(job.execution_id)
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+        assert!(Runner::new(w.jobs.clone()).run_next().await.unwrap());
+        let job = w.reload(&job).await;
+        assert_eq!(job.state, "completed");
+        assert_eq!(
+            (job.request_completed, job.request_failed),
+            (Some(1), Some(0))
+        );
+        let lines: Vec<(Uuid, i64, i64, String, Option<i64>)> = sqlx::query_as("SELECT r.price_id,r.reserved_tokens,r.held_microusd,r.state,r.actual_microusd FROM inference_executions e JOIN governance_reservations r ON r.execution_id=e.id WHERE e.batch_job_id=$1")
+            .bind(job.id)
+            .fetch_all(&f.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(lines.len(), 1);
+        runs.push((envelope, lines));
+    }
+    assert_eq!(
+        runs[0], runs[1],
+        "the hint changes neither the envelope nor the line's hold"
+    );
+    assert_eq!(w.anthropic.executed().len(), 2);
+    // The same route with an adapter that forwards the hint.
+    w.anthropic.script.lock().unwrap().drops_cache_controls = false;
+    let file = w.upload(&f.principal, &[hinted]).await;
+    let before = admission_rowcounts(f).await;
+    let refused = w
+        .create(f.principal, &file, BatchEndpoint::Messages, None)
+        .await;
+    assert!(matches!(
+        refused,
+        Err(CreateError::Job(JobError::Inference(
+            InferenceError::InvalidField("cache_control")
+        )))
+    ));
+    assert_eq!(admission_rowcounts(f).await, before);
+    assert_eq!(w.anthropic.executed().len(), 2);
+    assert!(w.anthropic.calls().is_empty(), "no native batch calls");
+    assert!(w.openai.executed().is_empty());
+    consistent(f).await;
 }
 
 #[dbtest::test]
