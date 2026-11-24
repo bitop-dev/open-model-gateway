@@ -84,7 +84,8 @@ impl Metrics {
             auth_throttled: Family::default(),
             key_issuance_refused: Family::default(),
             egress_denied: Family::default(),
-            upstream_connection_lost: Family::default(),
+            upstream_connection_lost: every_client(),
+            upstream_connections_opened: every_client(),
             audit_export_deliveries: Family::default(),
             audit_export_rejected_records: Counter::default(),
             trace_dropped_spans: series(&families.trace_drops, "reason", |i| {
@@ -433,6 +434,11 @@ impl Metrics {
             self.upstream_connection_lost.clone(),
         );
         registry.register(
+            "upstream_connections_opened",
+            "Connections an outbound clients pool opened (connect and any TLS handshake completed), by client (openai, openrouter, anthropic, bedrock, local, s3, export). A reused connection is not counted; the denominator for gateway_upstream_connection_lost_total and the cost of each pool idle timeout (#611)",
+            self.upstream_connections_opened.clone(),
+        );
+        registry.register(
             "auth_throttled",
             "Sign-in steps refused by abuse controls, by step (login, callback) and reason (client_rate, pending_cap)",
             self.auth_throttled.clone(),
@@ -530,6 +536,18 @@ impl Metrics {
             self.alert_oldest_pending_age.clone(),
         );
     }
+}
+
+/// A `client` family with every outbound client's series pre-created at
+/// zero, so a fresh process exports the family and, once Prometheus has
+/// scraped that zero, `rate()` and `increase()` see the first increment
+/// (#611). The labels are the fixed client set.
+fn every_client() -> Family<L1, Counter> {
+    let family = Family::default();
+    for client in crate::egress::UpstreamClient::ALL {
+        let _ = family.get_or_create(&[("client", client.as_str().to_owned())]);
+    }
+    family
 }
 
 /// The series of `family` whose `label` is `value(0)`, `value(1)`, ..., created
