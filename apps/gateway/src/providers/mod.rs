@@ -13,7 +13,7 @@ use crate::inference::{
 };
 use crate::jobs::types::{
     BatchEndpoint, BatchRequest, ByteStream, ContentStream, NativeResult, UpstreamBatch,
-    UpstreamId, UpstreamVideo, VideoAsset, VideoRequest,
+    UpstreamId, UpstreamVideo, VideoAsset, VideoCreateKey, VideoRequest,
 };
 
 pub mod anthropic;
@@ -184,6 +184,28 @@ pub trait ProviderAdapter: Send + Sync {
         _request: VideoRequest,
     ) -> Result<UpstreamVideo, InferenceError> {
         Err(InferenceError::Unsupported)
+    }
+    /// Whether this target's provider makes a create carrying the same
+    /// [`VideoCreateKey`] the same job (idempotent create). Only then may the
+    /// gateway resend a create whose outcome is unknown (`jobs::video`).
+    fn idempotent_video_create(&self, _target: &Deployment) -> bool {
+        false
+    }
+    /// The create the gateway calls: with the job's idempotency key. An
+    /// adapter whose provider supports idempotent create overrides this and
+    /// sends the key; the default creates without it. The default refuses,
+    /// before sending anything, a target this adapter declares idempotent:
+    /// a resend without the key would be a second job.
+    async fn create_video_keyed(
+        &self,
+        target: &Deployment,
+        request: VideoRequest,
+        _key: &VideoCreateKey,
+    ) -> Result<UpstreamVideo, InferenceError> {
+        if self.idempotent_video_create(target) {
+            return Err(InferenceError::Configuration);
+        }
+        self.create_video(target, request).await
     }
     async fn retrieve_video(
         &self,

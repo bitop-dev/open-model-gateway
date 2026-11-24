@@ -67,6 +67,7 @@ inference/realtime.rs :: impl RealtimeSession::final_write :: event :: crate :: 
 jobs/batch.rs :: impl Jobs::create_batch :: metrics call :: crate :: metrics :: METRICS . observe_batch_created (mode . as_str ())
 jobs/mod.rs :: impl Attempt::drop :: event :: crate :: ops_log :: emit (crate :: ops_log :: OpsEvent :: FinalizationNeedsReconciliation { finalizer : crate :: ops_log :: Finalizer :: JobCancel , trace : None , })
 jobs/mod.rs :: impl Attempt::fail :: event :: crate :: ops_log :: emit (crate :: ops_log :: OpsEvent :: FinalizationNeedsReconciliation { finalizer : crate :: ops_log :: Finalizer :: JobFail , trace : None , })
+jobs/mod.rs :: impl Attempt::fail_unsent :: event :: crate :: ops_log :: emit (crate :: ops_log :: OpsEvent :: FinalizationNeedsReconciliation { finalizer : crate :: ops_log :: Finalizer :: JobFail , trace : None , })
 jobs/native.rs :: impl Jobs::collect_native :: metrics call :: crate :: metrics :: METRICS . observe_batch_finished ("native" , state . as_str ())
 jobs/native.rs :: impl Jobs::collect_native :: metrics call :: crate :: metrics :: METRICS . observe_batch_lines ("native" , & job . provider , u64 :: from (succeeded) , u64 :: from (counts . failed) ,)
 jobs/native.rs :: impl Jobs::submit_native :: metrics call :: crate :: metrics :: METRICS . observe_batch_finished ("native" , JobState :: Failed . as_str ())
