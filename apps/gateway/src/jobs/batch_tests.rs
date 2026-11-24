@@ -248,7 +248,7 @@ impl ProviderAdapter for Fake {
     /// Simulates a real adapter's pure dry-run encoder (#228): the coarse
     /// `capabilities()`/`supports_chat_request` bool stays true (this is not
     /// a model-wide incompatibility), but this exact body is deterministically
-    /// refused, exactly like Anthropic/Bedrock reject a strict function tool.
+    /// refused, exactly like Anthropic rejects a strict Chat function tool.
     fn validate_chat_request(&self, request: &ChatRequest) -> Result<(), InferenceError> {
         let mut script = self.script.lock().unwrap();
         if script.permissive {

@@ -731,7 +731,7 @@
             "status": 400,
             "envelope": "AnthropicErrorEnvelope",
             "code": null,
-            "trigger": "strict tools or output_config.format outside OpenAI-style routes, disable_parallel_tool_use, hosted/server tools, remote image sources or denied beta prefixes"
+            "trigger": "strict tools or output_config.format on local routes, disable_parallel_tool_use, hosted/server tools, remote image sources or denied beta prefixes"
           },
           {
             "status": 400,

@@ -509,6 +509,7 @@ impl ProviderAdapter for OpenRouterAdapter {
         body["provider"] = self.provider_preferences();
         body["usage"] = json!({"include": true});
         messages_controls(&mut body, &request);
+        require_parameters(&mut body, &request);
         let response = self
             .post_inner(
                 target,
@@ -650,7 +651,7 @@ impl ProviderAdapter for OpenRouterAdapter {
 
 mod audio;
 mod chat;
-use chat::{decode_chat, decode_chat_stream, messages_controls};
+use chat::{decode_chat, decode_chat_stream, messages_controls, require_parameters};
 mod images;
 #[cfg(test)]
 mod tests;
