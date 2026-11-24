@@ -160,7 +160,7 @@ async fn messages_parallel_calls_and_results_preserve_openrouter_turns() {
 }
 
 #[tokio::test]
-async fn non_messages_named_errors_keep_legacy_adapter_behavior() {
+async fn named_200_errors_have_one_class_for_every_client() {
     let value = json!({"error":{"code":"rate_limit_exceeded","message":"prompt is too long"}});
     for messages in [false, true] {
         let mock = Mock::json(value.clone()).await;
@@ -168,11 +168,8 @@ async fn non_messages_named_errors_keep_legacy_adapter_behavior() {
         if messages {
             request.messages_options = Some(Box::default());
         }
-        let expected = if messages {
-            InferenceError::Busy
-        } else {
-            InferenceError::UpstreamUnavailable
-        };
+        // A named rate limit is `Busy` in a 200 body as in a stream (#665).
+        let expected = InferenceError::Busy;
         assert!(
             matches!(mock.adapter().execute(&target("private"), request).await, Err(error) if error == expected)
         );
