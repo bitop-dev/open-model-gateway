@@ -19,6 +19,7 @@ cache.rs :: impl VersionedCache::get :: metrics call :: crate :: metrics :: METR
 cache.rs :: impl VersionedCache::get :: metrics call :: crate :: metrics :: METRICS . observe_cache (self . name , "miss")
 egress.rs :: denied :: event :: crate :: ops_log :: emit (crate :: ops_log :: OpsEvent :: EgressRefused { purpose })
 egress.rs :: denied :: metrics call :: crate :: metrics :: METRICS . egress_denied (purpose . as_str ())
+egress_upstream.rs :: impl UpstreamClient::opened :: metrics call :: crate :: metrics :: METRICS . upstream_connection_opened (self . as_str ())
 filestore/crypto.rs :: decrypt_stream :: macro metrics call :: METRICS . observe_file_store (kind . as_str () , "read" , Some (e . code ()))
 filestore/crypto.rs :: decrypt_stream :: macro metrics call :: METRICS . observe_file_store_bytes (kind . as_str () , "get" , total)
 filestore/mod.rs :: impl Encrypted::put :: metrics call :: crate :: metrics :: METRICS . observe_file_store_bytes (kind . as_str () , "put" , done . size)
@@ -168,6 +169,8 @@ metrics/operations.rs :: impl Metrics::set_report_queue :: family :: self . repo
 metrics/operations.rs :: impl Metrics::set_report_queue :: family :: self . report_backlog_capped . get_or_create (& [])
 metrics/operations.rs :: impl Metrics::set_report_queue :: family :: self . report_oldest_due_lag . get_or_create (& [])
 metrics/operations.rs :: impl Metrics::upstream_connection_lost :: family :: self . upstream_connection_lost . get_or_create (& [("client" , client . to_owned ())])
+metrics/operations.rs :: impl Metrics::upstream_connection_opened :: family :: self . upstream_connections_opened . get_or_create (& [("client" , client . to_owned ())])
+metrics/registry.rs :: every_client :: family :: family . get_or_create (& [("client" , client . as_str () . to_owned ())]) :: client from client = crate :: egress :: UpstreamClient :: ALL
 metrics/registry.rs :: impl Metrics::register_reports_and_history :: family :: self . report_outcomes . get_or_create (& [("category" , category . as_str () . to_owned ())]) :: category from category = crate :: scheduled_reports :: Outcome :: ALL
 metrics/registry.rs :: impl Metrics::register_requests :: family :: build . get_or_create (& [("version" , env ! ("CARGO_PKG_VERSION") . to_owned ())])
 metrics/registry.rs :: impl Metrics::unregistered :: precreated labels :: series (& families . logs_drops , "reason" , | i | { crate :: ops_log :: DropReason :: ALL [i] . as_str () . to_owned () })

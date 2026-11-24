@@ -170,6 +170,22 @@ impl Metrics {
             .get()
     }
 
+    /// One connection an outbound client's pool opened
+    /// ([`crate::egress::UpstreamClient::opened_connections`]).
+    pub(crate) fn upstream_connection_opened(&self, client: &'static str) {
+        self.upstream_connections_opened
+            .get_or_create(&[("client", client.to_owned())])
+            .inc();
+    }
+
+    /// Opened connections so far for one client (tests).
+    #[cfg(test)]
+    pub(crate) fn upstream_connections_opened_count(&self, client: &str) -> u64 {
+        self.upstream_connections_opened
+            .get_or_create(&[("client", client.to_owned())])
+            .get()
+    }
+
     pub(crate) fn auth_throttled(&self, endpoint: &'static str, reason: &'static str) {
         self.auth_throttled
             .get_or_create(&[

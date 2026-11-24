@@ -6,6 +6,7 @@ use futures_util::StreamExt;
 use reqwest::{StatusCode, header};
 use serde_json::{Map, Value, json};
 
+use super::error_envelope::empty;
 use super::{ProviderAdapter, secrets::SecretResolver};
 use crate::inference::{error::InferenceError, types::*};
 use crate::jobs::types::{
@@ -36,6 +37,7 @@ impl OpenAiAdapter {
         ))
         .connect_timeout(Duration::from_secs(10))
         .pool_idle_timeout(crate::egress::UpstreamClient::Openai.pool_idle_timeout())
+        .count_connections(crate::egress::UpstreamClient::Openai)
         .build()
         .map_err(|_| anyhow::anyhow!("Unable to initialize provider transport"))?;
         Ok(Self {
@@ -259,7 +261,11 @@ impl ProviderAdapter for OpenAiAdapter {
             .await
             .map_err(transport_error)?;
         check_status(response.status())?;
-        super::embeddings::decode(&super::framing::body(response).await?, &request)
+        super::embeddings::decode(
+            &super::framing::body(response).await?,
+            &request,
+            super::framing::status_error,
+        )
     }
 
     async fn execute(&self, target: &Deployment, request: ChatRequest) -> Result<ProviderOutput> {
@@ -327,8 +333,7 @@ impl ProviderAdapter for OpenAiAdapter {
                 }
                 body.extend_from_slice(&chunk);
             }
-            let value =
-                serde_json::from_slice(&body).map_err(|_| InferenceError::InvalidUpstream)?;
+            let value = super::framing::json(&body)?;
             Ok(ProviderOutput::Complete(decode_complete_protocol(
                 &value,
                 None,
@@ -459,16 +464,6 @@ fn optional_string(value: &Value) -> Result<Option<String>> {
     }
 }
 
-fn empty(value: &Value) -> bool {
-    match value {
-        Value::Null => true,
-        Value::String(s) => s.is_empty(),
-        Value::Array(a) => a.is_empty(),
-        Value::Object(o) => o.is_empty(),
-        _ => false,
-    }
-}
-
 // Content-bearing objects must not silently lose newly introduced modalities.
 fn known_fields(value: &Value, allowed: &[&str]) -> Result<()> {
     if object(value)?
@@ -519,7 +514,7 @@ fn finish(value: &Value) -> Result<FinishReason> {
     }
 }
 
-fn usage(value: &Value) -> Result<Usage> {
+pub(super) fn usage(value: &Value) -> Result<Usage> {
     super::metering::inclusive(
         value,
         "prompt_tokens",
@@ -573,18 +568,13 @@ pub(super) fn decode_complete_protocol(
         })
     })
 }
-fn wire_error(value: &Value, messages: bool) -> InferenceError {
-    if messages {
-        super::framing::classified_error(value).unwrap_or(InferenceError::InvalidUpstream)
-    } else {
-        InferenceError::InvalidUpstream
-    }
-}
 fn decode_shape(value: &Value, profile: Option<&str>, messages: bool) -> Result<ChatResponse> {
     object(value)?;
-    if !empty(&value["error"]) {
-        return Err(wire_error(value, messages));
-    }
+    // A 200 error envelope (`error_envelope`); the caller's `preserve`
+    // keeps a valid usage object next to it as evidence.
+    super::error_envelope::check(value, &["choices"], &["usage"], |code| {
+        super::stream_error::openai_chat_status(value, messages, code)
+    })?;
     let choices = array(&value["choices"])?;
     if choices.len() != 1 {
         return Err(InferenceError::InvalidUpstream);

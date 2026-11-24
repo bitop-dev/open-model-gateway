@@ -1,11 +1,12 @@
 //! Every pooled outbound client sets its pool idle timeout and counts its
-//! lost requests under its own label (#483).
+//! lost requests (#483) and its new connections (#611) under its own label.
 //!
 //! The wiring is per call site, so a runtime test of the constants cannot
 //! see a site that dropped the call or took another client's label. This
 //! reads the production source with `syn`: each `client_builder(..)` /
 //! `pinned_client_builder(..)` chain must contain
-//! `.pool_idle_timeout(UpstreamClient::X.pool_idle_timeout())` with the `X`
+//! `.pool_idle_timeout(UpstreamClient::X.pool_idle_timeout())` and
+//! `.count_connections(UpstreamClient::X)` with the `X`
 //! listed for its file, and each file that maps a send error must count it
 //! under the listed client, as many times as it has sites.
 use std::{
@@ -56,6 +57,7 @@ const COUNTED: &[(&str, &str, usize)] = &[
 #[derive(Default)]
 struct Chain {
     idle: Option<String>,
+    opened: Option<String>,
     single_connection: bool,
 }
 
@@ -63,6 +65,19 @@ struct Chain {
 struct Found {
     chains: HashMap<usize, Chain>,
     counted: Vec<String>,
+    /// `use ... client_builder as X` and the like: a renamed constructor
+    /// would hide a builder chain from this scan, so none may exist.
+    renamed: Vec<String>,
+}
+
+/// A chain setting the same thing twice (two counters would count each
+/// connection under two labels) records `duplicate`, which no client is.
+fn record(slot: &mut Option<String>, client: String) {
+    *slot = Some(if slot.is_some() {
+        "duplicate".into()
+    } else {
+        client
+    });
 }
 
 fn is_cfg_test(attributes: &[syn::Attribute]) -> bool {
@@ -131,6 +146,17 @@ impl<'ast> Visit<'ast> for Found {
         }
     }
 
+    fn visit_use_rename(&mut self, node: &'ast syn::UseRename) {
+        if matches!(
+            node.ident.to_string().as_str(),
+            "client_builder" | "pinned_client_builder"
+        ) {
+            self.renamed
+                .push(format!("{} as {}", node.ident, node.rename));
+        }
+        syn::visit::visit_use_rename(self, node);
+    }
+
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
         if is_builder(node) {
             self.chains.entry(node as *const _ as usize).or_default();
@@ -159,14 +185,23 @@ impl<'ast> Visit<'ast> for Found {
             let chain = self.chains.entry(root as *const _ as usize).or_default();
             match method.as_str() {
                 "pool_idle_timeout" => {
-                    chain.idle = Some(match node.args.first() {
+                    let client = match node.args.first() {
                         Some(Expr::MethodCall(arg))
                             if arg.method == "pool_idle_timeout" && arg.args.is_empty() =>
                         {
                             client_of(&arg.receiver).unwrap_or_else(|| "?".into())
                         }
                         _ => "?".into(),
-                    });
+                    };
+                    record(&mut chain.idle, client);
+                }
+                "count_connections" => {
+                    let client = node
+                        .args
+                        .first()
+                        .and_then(client_of)
+                        .unwrap_or_else(|| "?".into());
+                    record(&mut chain.opened, client);
                 }
                 "pool_max_idle_per_host" => {
                     chain.single_connection = matches!(
@@ -225,13 +260,13 @@ fn scan() -> Vec<(String, Found)> {
 }
 
 #[test]
-fn every_client_builder_sets_the_pool_idle_timeout_of_its_client() {
+fn every_client_builder_sets_the_pool_idle_timeout_and_counter_of_its_client() {
     let mut seen = Vec::new();
     for (file, found) in scan() {
         for chain in found.chains.values() {
             if file == SINGLE_CONNECTION {
                 assert!(
-                    chain.single_connection && chain.idle.is_none(),
+                    chain.single_connection && chain.idle.is_none() && chain.opened.is_none(),
                     "{file}: identity keeps one connection per request (#417)"
                 );
                 seen.push(file.clone());
@@ -247,6 +282,12 @@ fn every_client_builder_sets_the_pool_idle_timeout_of_its_client() {
                 Some(expected),
                 "{file}: the builder chain must call \
                  .pool_idle_timeout(UpstreamClient::{expected}.pool_idle_timeout())"
+            );
+            assert_eq!(
+                chain.opened.as_deref(),
+                Some(expected),
+                "{file}: the builder chain must call \
+                 .count_connections(UpstreamClient::{expected})"
             );
             seen.push(file.clone());
         }
@@ -271,4 +312,48 @@ fn every_send_error_mapper_counts_under_its_client() {
             "{file}: counting sites must match COUNTED (client labels and number of sites)"
         );
     }
+}
+
+#[test]
+fn no_file_renames_a_client_builder_constructor() {
+    for (file, found) in scan() {
+        assert!(
+            found.renamed.is_empty(),
+            "{file}: {:?} would hide a builder chain from the wiring scan",
+            found.renamed
+        );
+    }
+}
+
+/// The scan itself: a chain with two counters, or a counter under another
+/// client, or a renamed constructor, is not accepted.
+#[test]
+fn the_scan_refuses_duplicate_counters_and_renamed_constructors() {
+    let found = |source: &str| {
+        let mut found = Found::default();
+        found.visit_file(&syn::parse_file(source).unwrap());
+        found
+    };
+    let chain = |source: &str| {
+        let found = found(source);
+        let chains: Vec<_> = found.chains.into_values().collect();
+        assert_eq!(chains.len(), 1, "{source}");
+        (chains[0].idle.clone(), chains[0].opened.clone())
+    };
+    assert_eq!(
+        chain(
+            "fn f() { client_builder(r).pool_idle_timeout(UpstreamClient::S3.pool_idle_timeout()).count_connections(UpstreamClient::S3).build(); }"
+        ),
+        (Some("S3".into()), Some("S3".into()))
+    );
+    assert_eq!(
+        chain(
+            "fn f() { client_builder(r).pool_idle_timeout(UpstreamClient::S3.pool_idle_timeout()).count_connections(UpstreamClient::S3).count_connections(UpstreamClient::Export).build(); }"
+        ),
+        (Some("S3".into()), Some("duplicate".into()))
+    );
+    assert_eq!(
+        found("use crate::egress::client_builder as cb; fn f() { cb(r).build(); }").renamed,
+        ["client_builder as cb"]
+    );
 }

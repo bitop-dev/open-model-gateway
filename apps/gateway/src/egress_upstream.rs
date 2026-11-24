@@ -1,4 +1,5 @@
-//! Per-client pool idle timeouts and the lost-connection counter (#483).
+//! Per-client pool idle timeouts, the lost-connection counter (#483) and the
+//! new-connection counter (#611).
 //!
 //! An upstream (or a load balancer in front of it) closes an idle keep-alive
 //! connection on its own timeout. A request written at that moment is lost,
@@ -8,7 +9,10 @@
 //!   upstream's, so the pool drops a connection before the upstream does
 //!   ([`UpstreamClient::pool_idle_timeout`]);
 //! - [`UpstreamClient::lost_before_response`] counts the failure class that
-//!   remains, in `gateway_upstream_connection_lost_total{client}`.
+//!   remains, in `gateway_upstream_connection_lost_total{client}`;
+//! - [`UpstreamClient::opened_connections`] counts every connection the pool
+//!   opens, in `gateway_upstream_connections_opened_total{client}`: the
+//!   denominator for the loss counter, and the cost of each idle timeout.
 //!
 //! Neither resends anything. `reqwest::retry::never()` governs only
 //! reqwest's own retry policy; the connection pool below it can re-dispatch
@@ -39,7 +43,7 @@ pub(crate) enum UpstreamClient {
 }
 
 impl UpstreamClient {
-    #[cfg(test)]
+    /// Every client, for the series pre-created at zero.
     pub(crate) const ALL: [Self; 7] = [
         Self::Openai,
         Self::Openrouter,
@@ -98,6 +102,30 @@ impl UpstreamClient {
         })
     }
 
+    /// The connector layer of [`super::HttpClientBuilder::count_connections`]: it counts each
+    /// connection the pool opens (TCP, and TLS where used, completed) once
+    /// under this client's label. A reused connection never reaches the
+    /// connector, and a connect that fails or is refused by the egress policy
+    /// opens nothing, so neither is counted. The layer only observes: it
+    /// returns the connection and every error unchanged.
+    pub(super) fn opened_connections<C>(
+        self,
+    ) -> tower::util::MapResponseLayer<impl Fn(C) -> C + Clone + Send + Sync + 'static> {
+        tower::util::MapResponseLayer::new(move |connection| {
+            self.opened();
+            connection
+        })
+    }
+
+    fn opened(self) {
+        #[cfg(test)]
+        if let Some(sink) = SINK.with(std::cell::Cell::get) {
+            sink.upstream_connection_opened(self.as_str());
+            return;
+        }
+        crate::metrics::METRICS.upstream_connection_opened(self.as_str());
+    }
+
     /// Counts `error` if it is a connection lost before a complete response
     /// head. Call it where a send error is mapped; it changes nothing about
     /// the error the caller returns.
@@ -133,7 +161,8 @@ thread_local! {
     static SINK: std::cell::Cell<Option<&'static Metrics>> = const { std::cell::Cell::new(None) };
 }
 
-/// Test only: counts on this thread go to `metrics` until the guard drops,
+/// Test only: counts (lost requests and opened connections) on this thread
+/// go to `metrics` until the guard drops,
 /// so a test asserts an exact count that no parallel test can change.
 #[cfg(test)]
 pub(crate) fn count_here(metrics: &'static Metrics) -> impl Drop {
