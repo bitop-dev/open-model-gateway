@@ -71,9 +71,14 @@ pub struct ApprovedEndpoints {
     endpoints: BTreeMap<String, Endpoint>,
 }
 impl ApprovedEndpoints {
-    /// The egress client class of every client built for an approval: its
-    /// pool settings and the label its lost connections are counted under.
-    pub(crate) const CLIENT: crate::egress::UpstreamClient = crate::egress::UpstreamClient::Local;
+    /// A `map_err` function for a send through an approval's client: counts
+    /// a connection lost before the response head under the approvals'
+    /// client label (`client="local"`, the class whose pool idle timeout
+    /// every approval's client has), then returns `value`. Code outside
+    /// this file gets the counting, never an `UpstreamClient` value.
+    pub(crate) fn count_lost_then<T>(value: T) -> impl FnOnce(reqwest::Error) -> T {
+        crate::egress::UpstreamClient::Local.count_then(value)
+    }
     pub fn from_env(environment: &str) -> anyhow::Result<Self> {
         let value = match std::env::var("GATEWAY_LOCAL_UPSTREAMS") {
             Ok(value) => value,
@@ -170,7 +175,7 @@ impl ApprovedEndpoints {
             };
             let client = crate::egress::pinned_client_builder(&approved)
                 .connect_timeout(Duration::from_secs(10))
-                .pool_idle_timeout(Self::CLIENT.pool_idle_timeout())
+                .pool_idle_timeout(crate::egress::UpstreamClient::Local.pool_idle_timeout())
                 .build()
                 .map_err(|_| Rejected::Invalid)?;
             endpoints.insert(base.clone(), Endpoint { client, base });

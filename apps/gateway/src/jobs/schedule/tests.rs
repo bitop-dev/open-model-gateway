@@ -304,3 +304,47 @@ fn pause_codes_round_trip() {
     assert!(!Pause::MetricsUnavailable.legitimate());
     assert!(Pause::OutsideWindow.legitimate());
 }
+
+/// Reads one request head, then closes with an RST (SO_LINGER 0 is the one
+/// way to make the kernel send one): a connection lost before the response.
+#[expect(
+    deprecated,
+    reason = "a test needs a real RST, which only SO_LINGER 0 gives"
+)]
+async fn reset_after_request(mut stream: tokio::net::TcpStream) {
+    use tokio::io::AsyncReadExt;
+    let mut head = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => head.extend_from_slice(&buf[..n]),
+        }
+    }
+    stream.set_linger(Some(Duration::ZERO)).unwrap();
+}
+
+/// A metrics scrape whose connection is lost reads as `unreachable` and is
+/// counted under the approvals' client label, `client="local"`.
+#[tokio::test]
+async fn a_lost_metrics_scrape_is_counted_under_the_local_client() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(reset_after_request(stream));
+        }
+    });
+    let approvals = ApprovedEndpoints::for_test(&format!("http://fixture.invalid:{port}/v1"));
+    let metrics = crate::metrics::characterization_tests::fresh_registry();
+    let _sink = crate::egress::count_here(metrics);
+    let reading = fetch_reading(
+        Some(&approvals),
+        &format!("http://fixture.invalid:{port}/metrics"),
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(reading.err(), Some("unreachable"));
+    assert_eq!(metrics.upstream_connection_lost_count("local"), 1);
+    assert_eq!(metrics.upstream_connection_lost_count("openai"), 0);
+}

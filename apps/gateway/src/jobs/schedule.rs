@@ -483,7 +483,7 @@ async fn fetch_reading(
     )
     .await
     .map_err(|_| "timeout")?
-    .map_err(ApprovedEndpoints::CLIENT.count_then("unreachable"))?;
+    .map_err(ApprovedEndpoints::count_lost_then("unreachable"))?;
     if !response.status().is_success() {
         return Err("http_status");
     }
