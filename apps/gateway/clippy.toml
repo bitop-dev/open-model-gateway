@@ -55,6 +55,53 @@ disallowed-methods = [
   { path = "reqwest::RequestBuilder::build_split", reason = "it returns a raw reqwest client; send requests through crate::egress::HttpClient (#569)" },
   { path = "reqwest::RequestBuilder::from_parts", reason = "it takes a raw reqwest client; send requests through crate::egress::HttpClient (#569)" },
   { path = "reqwest::get", reason = "send requests with a client from crate::egress::client_builder (#509)" },
+  # Raw transports (#606): hyper's and hyper-util's own clients and
+  # connectors, hyper-rustls's connector, tokio-tungstenite's dialing
+  # connects, and TCP/UDP sockets bypass crate::egress::client_builder and
+  # the egress resolver. Sockets are opened only at three sanctioned
+  # statements, each on addresses chosen by the gateway (see
+  # egress_source_scan_tests.rs); egress_rule_probes_tests.rs proves every
+  # entry still fires.
+  { path = "hyper::client::conn::http1::handshake", reason = "build outbound HTTP clients with crate::egress::client_builder, not hyper's own client (#606)" },
+  { path = "hyper::client::conn::http1::Builder::new", reason = "build outbound HTTP clients with crate::egress::client_builder, not hyper's own client (#606)" },
+  { path = "hyper::client::conn::http1::Builder::handshake", reason = "build outbound HTTP clients with crate::egress::client_builder, not hyper's own client (#606)" },
+  { path = "hyper::client::conn::http2::handshake", reason = "build outbound HTTP clients with crate::egress::client_builder, not hyper's own client (#606)" },
+  { path = "hyper::client::conn::http2::Builder::new", reason = "build outbound HTTP clients with crate::egress::client_builder, not hyper's own client (#606)" },
+  { path = "hyper::client::conn::http2::Builder::handshake", reason = "build outbound HTTP clients with crate::egress::client_builder, not hyper's own client (#606)" },
+  { path = "hyper_util::client::legacy::Client::builder", reason = "build outbound HTTP clients with crate::egress::client_builder, not hyper-util's client (#606)" },
+  { path = "hyper_util::client::legacy::Builder::new", reason = "build outbound HTTP clients with crate::egress::client_builder, not hyper-util's client (#606)" },
+  { path = "hyper_util::client::legacy::Builder::build", reason = "build outbound HTTP clients with crate::egress::client_builder, not hyper-util's client (#606)" },
+  { path = "hyper_util::client::legacy::Builder::build_http", reason = "build outbound HTTP clients with crate::egress::client_builder, not hyper-util's client (#606)" },
+  { path = "hyper_util::client::legacy::connect::HttpConnector::new", reason = "its connector dials any address without the egress resolver; use crate::egress::client_builder (#606)" },
+  { path = "hyper_util::client::legacy::connect::HttpConnector::new_with_resolver", reason = "its connector dials any address its resolver returns; use crate::egress::client_builder (#606)" },
+  { path = "hyper_rustls::HttpsConnectorBuilder::new", reason = "its connector dials any address without the egress resolver; use crate::egress::client_builder (#606)" },
+  # `HttpsConnectorBuilder::default()` cannot be named (a Default impl), so
+  # the builder's ways to a connector are refused as well.
+  { path = "hyper_rustls::HttpsConnectorBuilder::build", reason = "its connector dials any address without the egress resolver; use crate::egress::client_builder (#606)" },
+  { path = "hyper_rustls::HttpsConnectorBuilder::wrap_connector", reason = "it makes a TLS connector outside crate::egress::client_builder (#606)" },
+  { path = "hyper_rustls::HttpsConnector::builder", reason = "its connector dials any address without the egress resolver; use crate::egress::client_builder (#606)" },
+  { path = "tokio_tungstenite::connect_async", reason = "it resolves and dials by itself: connect to addresses from crate::egress::resolve and hand the stream to client_async (#606)" },
+  { path = "tokio_tungstenite::connect_async_with_config", reason = "it resolves and dials by itself: connect to addresses from crate::egress::resolve and hand the stream to client_async (#606)" },
+  { path = "tokio_tungstenite::connect_async_tls_with_config", reason = "it resolves and dials by itself: connect to addresses from crate::egress::resolve and hand the stream to client_async (#606)" },
+  { path = "tungstenite::client::connect", reason = "it resolves and dials by itself: connect to addresses from crate::egress::resolve and hand the stream to client_async (#606)" },
+  { path = "tungstenite::client::connect_with_config", reason = "it resolves and dials by itself: connect to addresses from crate::egress::resolve and hand the stream to client_async (#606)" },
+  { path = "tokio::net::TcpStream::connect", reason = "open sockets only to addresses from crate::egress::resolve, at a sanctioned statement (#606)" },
+  { path = "tokio::net::TcpSocket::connect", reason = "open sockets only to addresses from crate::egress::resolve, at a sanctioned statement (#606)" },
+  { path = "tokio::net::UdpSocket::bind", reason = "no outbound datagrams: the gateway's egress is crate::egress (#606)" },
+  { path = "std::net::TcpStream::connect", reason = "open sockets only to addresses from crate::egress::resolve, at a sanctioned statement (#606)" },
+  { path = "std::net::TcpStream::connect_timeout", reason = "open sockets only to addresses from crate::egress::resolve, at a sanctioned statement (#606)" },
+  { path = "std::net::UdpSocket::bind", reason = "no outbound datagrams: the gateway's egress is crate::egress (#606)" },
+  { path = "aws_config::imds::client::Builder::build", reason = "AWS credentials come only from the reviewed chain in providers/bedrock/auth.rs, whose transports are the documented exception; this provider dials an endpoint of its own (#606)" },
+  { path = "aws_config::imds::credentials::Builder::build", reason = "AWS credentials come only from the reviewed chain in providers/bedrock/auth.rs, whose transports are the documented exception; this provider dials an endpoint of its own (#606)" },
+  { path = "aws_config::ecs::Builder::build", reason = "AWS credentials come only from the reviewed chain in providers/bedrock/auth.rs, whose transports are the documented exception; this provider dials an endpoint of its own (#606)" },
+  { path = "aws_config::web_identity_token::Builder::build", reason = "AWS credentials come only from the reviewed chain in providers/bedrock/auth.rs, whose transports are the documented exception; this provider dials an endpoint of its own (#606)" },
+  { path = "aws_config::sso::credentials::Builder::build", reason = "AWS credentials come only from the reviewed chain in providers/bedrock/auth.rs, whose transports are the documented exception; this provider dials an endpoint of its own (#606)" },
+  { path = "aws_config::sso::token::Builder::build", reason = "AWS credentials come only from the reviewed chain in providers/bedrock/auth.rs, whose transports are the documented exception; this provider dials an endpoint of its own (#606)" },
+  { path = "aws_config::credential_process::CredentialProcessProvider::new", reason = "AWS credentials come only from the reviewed chain in providers/bedrock/auth.rs; this provider runs a command of its own (#606)" },
+  { path = "libc::socket", reason = "no raw sockets: outbound connections go through crate::egress (#606)" },
+  { path = "libc::connect", reason = "no raw sockets: outbound connections go through crate::egress (#606)" },
+  { path = "libc::sendto", reason = "no raw sockets: outbound connections go through crate::egress (#606)" },
+  { path = "libc::sendmsg", reason = "no raw sockets: outbound connections go through crate::egress (#606)" },
   { path = "reqwest::ClientBuilder::redirect", reason = "crate::egress::client_builder disables redirects (#509)" },
   { path = "reqwest::ClientBuilder::retry", reason = "crate::egress::client_builder disables implicit retries (#509)" },
   { path = "reqwest::ClientBuilder::proxy", reason = "crate::egress::client_builder disables proxies (#509)" },
