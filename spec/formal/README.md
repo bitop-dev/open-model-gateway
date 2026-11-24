@@ -50,9 +50,9 @@ and the held amount for pending or unknown rows ([`ELSE coalesce(r.held_microusd
 The request thread awaits admission, then runs [`let output = call_upstream(`](../../apps/gateway/src/inference/attempt.rs#L138) under the request deadline.
 It settles the outcome ([`settle_complete(&mut telemetry, &mut guard, span, response)`](../../apps/gateway/src/inference/attempt.rs#L171), [`ProviderOutput::Stream(track_stream(`](../../apps/gateway/src/inference/attempt.rs#L174)).
 `ExecutionGuard` marks settlement started ([`self.finished = true`](../../apps/gateway/src/inference/mod.rs#L453)) and calls
-[`fn settle_to_completion`](../../apps/gateway/src/inference/attempt.rs#L577) with
+[`fn settle_to_completion`](../../apps/gateway/src/inference/attempt.rs#L581) with
 [`SETTLEMENT_DEADLINE: Duration = Duration::from_secs(3)`](../../apps/gateway/src/inference/mod.rs#L367).
-The pending write uses [`HandOff::new(`](../../apps/gateway/src/inference/attempt.rs#L601), whose drop path spawns the unfinished future ([`runtime.spawn(async move`](../../apps/gateway/src/inference/hand_off.rs#L75)).
+The pending write uses [`HandOff::new(`](../../apps/gateway/src/inference/attempt.rs#L605), whose drop path spawns the unfinished future ([`runtime.spawn(async move`](../../apps/gateway/src/inference/hand_off.rs#L75)).
 [`impl Drop for ExecutionGuard`](../../apps/gateway/src/inference/mod.rs#L472) queues a detached cancellation settlement only if `finished` is false. Failover
 is decided only in the `Err(error)` arm of `Engine::attempt` (so structurally never after a
 stream was returned), only after settlement succeeds ([`let failing_over = settled.is_ok()`](../../apps/gateway/src/inference/attempt.rs#L154)), and only for
