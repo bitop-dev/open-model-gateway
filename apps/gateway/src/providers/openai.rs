@@ -6,6 +6,7 @@ use futures_util::StreamExt;
 use reqwest::{StatusCode, header};
 use serde_json::{Map, Value, json};
 
+use super::error_envelope::empty;
 use super::{ProviderAdapter, secrets::SecretResolver};
 use crate::inference::{error::InferenceError, types::*};
 use crate::jobs::types::{
@@ -331,8 +332,7 @@ impl ProviderAdapter for OpenAiAdapter {
                 }
                 body.extend_from_slice(&chunk);
             }
-            let value =
-                serde_json::from_slice(&body).map_err(|_| InferenceError::InvalidUpstream)?;
+            let value = super::framing::json(&body)?;
             Ok(ProviderOutput::Complete(decode_complete_protocol(
                 &value,
                 None,
@@ -460,16 +460,6 @@ fn optional_string(value: &Value) -> Result<Option<String>> {
         Ok(None)
     } else {
         Ok(Some(string(value)?.to_owned()))
-    }
-}
-
-fn empty(value: &Value) -> bool {
-    match value {
-        Value::Null => true,
-        Value::String(s) => s.is_empty(),
-        Value::Array(a) => a.is_empty(),
-        Value::Object(o) => o.is_empty(),
-        _ => false,
     }
 }
 

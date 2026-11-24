@@ -177,15 +177,40 @@ fn transcription_usage(
     Ok(usage)
 }
 
+/// The members of a transcription body that carry what the provider
+/// transcribed (any of them non-empty next to an error means it may have
+/// processed the audio), and the ones that report usage (`error_envelope`).
+pub(crate) const TRANSCRIPTION_OUTPUT: &[&str] = &["text", "segments", "words", "logprobs"];
+pub(crate) const TRANSCRIPTION_USAGE: &[&str] = &["usage", "duration"];
+
+/// The usage a transcription body reports, as evidence for a failed
+/// attempt: `None` without a usage object.
+pub(crate) fn transcription_evidence(
+    bytes: &[u8],
+    value: &Value,
+    request: &TranscriptionRequest,
+) -> Option<Result<Usage>> {
+    if !value["usage"].is_object() {
+        return None;
+    }
+    let probe: SecondsProbe = match serde_json::from_slice(bytes) {
+        Ok(probe) => probe,
+        Err(_) => return Some(Err(InferenceError::InvalidUpstream)),
+    };
+    let seconds = probe.usage.and_then(|u| u.seconds).map(RawValue::get);
+    Some(transcription_usage(
+        &value["usage"],
+        seconds,
+        request.duration_ms,
+    ))
+}
+
 /// Decode a JSON transcription body (`response_format:"json"` upstream).
-/// `envelope` checks the body's 200 error envelope (`error_envelope`) with
-/// the adapter's own status table, inside the evidence scope, so a valid
-/// usage object next to an error is kept.
+/// The caller has checked its error envelope (`error_envelope`) first.
 pub(crate) fn decode_transcription(
     bytes: &[u8],
     value: &Value,
     request: &TranscriptionRequest,
-    envelope: impl FnOnce(&Value) -> Result<()>,
 ) -> Result<TranscriptionResponse> {
     let probe: SecondsProbe =
         serde_json::from_slice(bytes).map_err(|_| InferenceError::InvalidUpstream)?;
@@ -193,7 +218,6 @@ pub(crate) fn decode_transcription(
     let usage = || transcription_usage(&value["usage"], seconds, request.duration_ms);
     let shape = (|| {
         let object = value.as_object().ok_or(InferenceError::InvalidUpstream)?;
-        envelope(value)?;
         // Metadata may appear; content-bearing extras (segments, words,
         // logprobs) were not requested and must not be silently dropped.
         for (key, v) in object {
@@ -268,7 +292,7 @@ mod tests {
     }
     fn decode(v: Value, duration: Option<u64>) -> Result<TranscriptionResponse> {
         let bytes = serde_json::to_vec(&v).unwrap();
-        decode_transcription(&bytes, &v, &request(duration), |_| Ok(()))
+        decode_transcription(&bytes, &v, &request(duration))
     }
 
     #[test]

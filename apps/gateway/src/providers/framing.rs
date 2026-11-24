@@ -65,7 +65,72 @@ pub(super) async fn body_limit(response: reqwest::Response, limit: usize) -> Res
         }
         bytes.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&bytes).map_err(|_| InferenceError::InvalidUpstream)
+    json(&bytes)
+}
+/// A complete JSON body. A member name that appears twice in one object, at
+/// any depth, makes the body ambiguous (a reader keeps one of the values, so
+/// output or usage could hide behind an empty duplicate): it is invalid.
+pub(super) fn json(bytes: &[u8]) -> Result<Value> {
+    serde_json::from_slice::<Strict>(bytes)
+        .map(|strict| strict.0)
+        .map_err(|_| InferenceError::InvalidUpstream)
+}
+struct Strict(Value);
+impl<'de> serde::Deserialize<'de> for Strict {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        d.deserialize_any(StrictVisitor).map(Strict)
+    }
+}
+struct StrictVisitor;
+impl<'de> serde::de::Visitor<'de> for StrictVisitor {
+    type Value = Value;
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("JSON without duplicate member names")
+    }
+    fn visit_bool<E>(self, v: bool) -> std::result::Result<Value, E> {
+        Ok(Value::Bool(v))
+    }
+    fn visit_i64<E>(self, v: i64) -> std::result::Result<Value, E> {
+        Ok(Value::from(v))
+    }
+    fn visit_u64<E>(self, v: u64) -> std::result::Result<Value, E> {
+        Ok(Value::from(v))
+    }
+    fn visit_f64<E>(self, v: f64) -> std::result::Result<Value, E> {
+        Ok(Value::from(v))
+    }
+    fn visit_str<E>(self, v: &str) -> std::result::Result<Value, E> {
+        Ok(Value::String(v.to_owned()))
+    }
+    fn visit_string<E>(self, v: String) -> std::result::Result<Value, E> {
+        Ok(Value::String(v))
+    }
+    fn visit_unit<E>(self) -> std::result::Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+        self,
+        mut seq: A,
+    ) -> std::result::Result<Value, A::Error> {
+        let mut items = Vec::new();
+        while let Some(Strict(item)) = seq.next_element()? {
+            items.push(item);
+        }
+        Ok(Value::Array(items))
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> std::result::Result<Value, A::Error> {
+        let mut object = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let Strict(value) = map.next_value()?;
+            if object.insert(key, value).is_some() {
+                return Err(serde::de::Error::custom("duplicate member"));
+            }
+        }
+        Ok(Value::Object(object))
+    }
 }
 /// Read only a small bounded error envelope to classify context overflow.
 /// Never return, log or retain upstream text; all public messages are constants.

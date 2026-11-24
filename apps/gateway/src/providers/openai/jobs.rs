@@ -640,6 +640,11 @@ pub(super) fn decode_native_result(endpoint: BatchEndpoint, line: &[u8]) -> Resu
             NativeOutcome::Succeeded(Box::new(if endpoint.is_generation() {
                 BatchResponse::Chat(super::decode_complete(body)?)
             } else {
+                // A native line's body with any `error` member is not a
+                // success, whatever the shared decoder would make of it.
+                if !body["error"].is_null() {
+                    return Err(InferenceError::InvalidUpstream);
+                }
                 let n = body["data"].as_array().map_or(0, Vec::len);
                 let request = crate::inference::types::EmbeddingRequest {
                     model: String::new(),

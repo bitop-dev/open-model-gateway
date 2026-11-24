@@ -14,17 +14,20 @@ use serde_json::{Value, json};
 use super::{BASE, OpenAiAdapter, check_status, transport_error};
 use crate::{
     inference::{error::InferenceError, types::*},
-    providers::audio::{Multipart, decode_transcription, read_json, speech_body},
+    providers::audio::{
+        Multipart, TRANSCRIPTION_OUTPUT, TRANSCRIPTION_USAGE, decode_transcription, read_json,
+        speech_body, transcription_evidence,
+    },
 };
 
 type Result<T> = std::result::Result<T, InferenceError>;
 
 /// A 200 body's error envelope, with this adapter's status table.
-fn envelope(value: &Value, output: &[&str]) -> Result<()> {
+fn envelope(value: &Value, output: &[&str], usage: &[&str]) -> Result<()> {
     crate::providers::error_envelope::check(
         value,
         output,
-        &["usage"],
+        usage,
         crate::providers::framing::status_error,
     )
 }
@@ -85,9 +88,14 @@ pub(super) async fn transcribe(
         .map_err(transport_error)?;
     check_status(response.status())?;
     let bytes = read_json(response, transport_error).await?;
-    let value: Value =
-        serde_json::from_slice(&bytes).map_err(|_| InferenceError::InvalidUpstream)?;
-    decode_transcription(&bytes, &value, &request, |value| envelope(value, &["text"]))
+    let value: Value = crate::providers::framing::json(&bytes)?;
+    if let Err(error) = envelope(&value, TRANSCRIPTION_OUTPUT, TRANSCRIPTION_USAGE) {
+        // A valid usage object next to the error is kept as evidence.
+        return crate::inference::evidence::preserve(Err(error), || {
+            transcription_evidence(&bytes, &value, &request)
+        });
+    }
+    decode_transcription(&bytes, &value, &request)
 }
 
 pub(super) async fn speak(
@@ -117,11 +125,11 @@ pub(super) async fn speak(
     check_status(response.status())?;
     if crate::providers::audio::media_type(&response).as_deref() == Some("application/json") {
         // A 200 JSON body on speech is an error envelope or an unexpected
-        // envelope; never audio.
-        let bytes = read_json(response, transport_error).await?;
-        let value: Value =
-            serde_json::from_slice(&bytes).map_err(|_| InferenceError::InvalidUpstream)?;
-        envelope(&value, &[])?;
+        // envelope; never audio. One that cannot be read whole is an invalid
+        // answer, as any non-audio answer is, not an unavailable provider.
+        let bytes = read_json(response, |_| InferenceError::InvalidUpstream).await?;
+        let value: Value = crate::providers::framing::json(&bytes)?;
+        envelope(&value, &[], &["usage"])?;
         return Err(InferenceError::InvalidUpstream);
     }
     speech_body(response, &request, transport_error).await

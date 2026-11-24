@@ -143,8 +143,7 @@ pub(super) async fn execute(
         .map_err(transport_error)?;
     check_status(response.status())?;
     let bytes = images::read_bounded(response, request.max_response_bytes).await?;
-    let value: Value =
-        serde_json::from_slice(&bytes).map_err(|_| InferenceError::InvalidUpstream)?;
+    let value: Value = crate::providers::framing::json(&bytes)?;
     drop(bytes);
     if !value.is_object() {
         return Err(InferenceError::InvalidUpstream);

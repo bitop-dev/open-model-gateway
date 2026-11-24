@@ -71,12 +71,15 @@ pub(crate) async fn complete(
     messages: bool,
     body: &Value,
 ) -> (Option<InferenceError>, Option<Usage>) {
-    let (base, _server) = serve(upstream(
-        200,
-        "application/json",
-        vec![Step::Bytes(body.to_string().into_bytes())],
-    ))
-    .await;
+    complete_raw(kind, messages, body.to_string().into_bytes()).await
+}
+/// [`complete`] for a body given as its exact bytes.
+pub(crate) async fn complete_raw(
+    kind: Kind,
+    messages: bool,
+    body: Vec<u8>,
+) -> (Option<InferenceError>, Option<Usage>) {
+    let (base, _server) = serve(upstream(200, "application/json", vec![Step::Bytes(body)])).await;
     let adapter = kind.adapter(&base);
     let mut chat = request(messages);
     chat.stream = false;
@@ -131,9 +134,8 @@ async fn a_clean_200_error_envelope_has_the_class_of_the_same_http_error() {
     assert!(problems.is_empty(), "{problems:#?}");
 }
 
-/// The owner's 2026-11-23 decision in one place: a recognised rate-limit or
-/// quota error in a clean 200 is `Busy`, as an HTTP 429 is, on every adapter
-/// and client protocol.
+/// A recognised rate-limit or quota error in a clean 200 is `Busy`, as an
+/// HTTP 429 is, on every adapter and client protocol.
 #[tokio::test]
 async fn a_rate_limit_or_quota_error_in_a_clean_200_is_busy() {
     for kind in KINDS {
@@ -310,13 +312,21 @@ async fn call(
     endpoint: Endpoint,
     body: &Value,
 ) -> (Option<InferenceError>, Option<Usage>) {
-    use crate::inference::{audio::*, images::*};
-    let (base, _server) = serve(upstream(
-        200,
-        "application/json",
+    call_steps(
+        kind,
+        endpoint,
         vec![Step::Bytes(body.to_string().into_bytes())],
-    ))
-    .await;
+    )
+    .await
+}
+/// [`call`] for an upstream body made of `steps`.
+async fn call_steps(
+    kind: Kind,
+    endpoint: Endpoint,
+    steps: Vec<Step>,
+) -> (Option<InferenceError>, Option<Usage>) {
+    use crate::inference::{audio::*, images::*};
+    let (base, _server) = serve(upstream(200, "application/json", steps)).await;
     let adapter = kind.adapter(&base);
     let mut target = kind.target(&base);
     if endpoint == Endpoint::Images && kind == Kind::OpenAi {
@@ -468,4 +478,183 @@ async fn every_endpoint_classifies_a_200_error_envelope_like_chat() {
         }
     }
     assert!(problems.is_empty(), "{problems:#?}");
+}
+
+/// Output the shared transcription decoder knows (segments, words, log
+/// probabilities, a duration) counts next to an error even when `text` is
+/// empty: the provider transcribed something.
+#[tokio::test]
+async fn transcription_output_beyond_text_makes_an_error_an_invalid_response() {
+    for kind in [Kind::OpenAi, Kind::OpenRouter] {
+        for (member, value) in [
+            ("segments", json!([{"text":"hello"}])),
+            ("words", json!([{"word":"hello"}])),
+            ("logprobs", json!([{"token":"hello"}])),
+            ("duration", json!(3)),
+        ] {
+            let mut body = json!({"error":{"code":429},"text":""});
+            body[member] = value;
+            let (class, _) = call(kind, Endpoint::Transcription, &body).await;
+            assert_eq!(
+                class,
+                Some(InferenceError::InvalidUpstream),
+                "{kind:?} {member}"
+            );
+        }
+    }
+}
+
+/// A cost or count too small for a float to tell from zero, a float zero and
+/// a cost written as text all count as usage: only an integer zero or a
+/// textual zero is no usage.
+#[tokio::test]
+async fn a_tiny_or_textual_usage_value_is_never_read_as_zero() {
+    for usage in [
+        r#"{"cost":1e-400}"#,
+        r#"{"cost":0.0}"#,
+        r#"{"cost":"0.0000001"}"#,
+        r#"{"cost":"1e-400"}"#,
+        r#"{"prompt_tokens":1e-400}"#,
+    ] {
+        let body = format!(r#"{{"error":{{"code":429}},"usage":{usage}}}"#).into_bytes();
+        for kind in [Kind::OpenRouter, Kind::OpenAi] {
+            let (class, _) = complete_raw(kind, false, body.clone()).await;
+            assert_eq!(
+                class,
+                Some(InferenceError::InvalidUpstream),
+                "{kind:?} {usage}"
+            );
+        }
+    }
+    // OpenRouter reads its exact cost: one it cannot read is not a zero.
+    let body = br#"{"error":{"code":429},"usage":{"cost":"abc"}}"#.to_vec();
+    let (class, _) = complete_raw(Kind::OpenRouter, false, body).await;
+    assert_eq!(
+        class,
+        Some(InferenceError::InvalidUpstream),
+        "unreadable cost"
+    );
+    // Zeros stay clean: an integer zero everywhere, a textual zero under the
+    // generic rule (OpenRouter's exact cost is a number, so text is unreadable).
+    for (kind, zero) in [
+        (Kind::OpenRouter, r#"{"cost":0,"prompt_tokens":0}"#),
+        (Kind::OpenAi, r#"{"prompt_tokens":0}"#),
+        (Kind::OpenAi, r#"{"cost":"0"}"#),
+        (Kind::OpenAi, r#"{"cost":"0.00"}"#),
+    ] {
+        let body = format!(r#"{{"error":{{"code":429}},"usage":{zero}}}"#).into_bytes();
+        let (class, _) = complete_raw(kind, false, body).await;
+        assert_eq!(class, Some(InferenceError::Busy), "{kind:?} {zero}");
+    }
+    let body = br#"{"error":{"code":429},"usage":{"cost":"0"}}"#.to_vec();
+    let (class, _) = complete_raw(Kind::OpenRouter, false, body).await;
+    assert_eq!(
+        class,
+        Some(InferenceError::InvalidUpstream),
+        "OpenRouter text cost"
+    );
+}
+
+/// A body that names a member twice is ambiguous (a JSON reader keeps one of
+/// them): it is an invalid response, never a clean envelope.
+#[tokio::test]
+async fn a_body_with_a_duplicate_member_is_an_invalid_response() {
+    let bodies: [&[u8]; 4] = [
+        br#"{"error":{"code":400},"choices":[{"index":0,"message":{"role":"assistant","content":"answered"},"finish_reason":"stop"}],"choices":[]}"#,
+        br#"{"error":{"code":429},"usage":{"prompt_tokens":3,"prompt_tokens":0}}"#,
+        br#"{"error":{"code":429},"error":{"code":400}}"#,
+        br#"{"error":{"code":429,"code":400}}"#,
+    ];
+    for kind in [Kind::OpenAi, Kind::OpenRouter, Kind::Local] {
+        for body in bodies {
+            let (class, _) = complete_raw(kind, false, body.to_vec()).await;
+            assert_eq!(
+                class,
+                Some(InferenceError::InvalidUpstream),
+                "{kind:?} {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+    for kind in [Kind::Anthropic, Kind::Responses] {
+        let body = envelope(kind, named(kind, "rate_limit_error")).to_string();
+        let duplicated = body.replacen('{', r#"{"usage":null,"usage":null,"#, 1);
+        let (class, _) = complete_raw(kind, false, duplicated.into_bytes()).await;
+        assert_eq!(class, Some(InferenceError::InvalidUpstream), "{kind:?}");
+    }
+}
+
+/// OpenRouter's token counts, duration and exact cost are independent
+/// evidence next to an error: one being malformed does not drop the other,
+/// and the body's `model` string is not recorded from an error body.
+#[tokio::test]
+async fn openrouter_keeps_each_valid_meter_next_to_an_error_and_no_model() {
+    let (class, usage) = complete(
+        Kind::OpenRouter,
+        false,
+        &json!({"error":{"code":429},"model":"user_2xPrivateAccountIdentifier",
+            "usage":{"prompt_tokens":"bad","cost":0.01}}),
+    )
+    .await;
+    assert_eq!(class, Some(InferenceError::InvalidUpstream));
+    let usage = usage.expect("the cost is evidence");
+    assert_eq!(usage.provider_cost_microusd, Some(10_000));
+    assert_eq!(usage.reported_model, None);
+    let (_, usage) = complete(
+        Kind::OpenRouter,
+        false,
+        &json!({"error":{"code":429},"model":"user_2xPrivateAccountIdentifier",
+            "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5,"cost":0.01}}),
+    )
+    .await;
+    let usage = usage.expect("tokens and cost are evidence");
+    assert_eq!(
+        (usage.input_tokens, usage.output_tokens),
+        (Some(3), Some(2))
+    );
+    assert_eq!(usage.provider_cost_microusd, Some(10_000));
+    assert_eq!(usage.reported_model, None);
+    let (class, usage) = call(
+        Kind::OpenRouter,
+        Endpoint::Transcription,
+        &json!({"error":{"code":429},"usage":{"type":"duration","seconds":3,"cost":0.01}}),
+    )
+    .await;
+    assert_eq!(class, Some(InferenceError::InvalidUpstream));
+    assert_eq!(
+        usage.expect("duration and cost").provider_cost_microusd,
+        Some(10_000)
+    );
+    for (endpoint, body) in [
+        (
+            Endpoint::Rerank,
+            json!({"error":{"code":429},"usage":{"total_tokens":3,"cost":"bad"}}),
+        ),
+        (
+            Endpoint::Images,
+            json!({"error":{"code":429},"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5,"cost":"bad"}}),
+        ),
+    ] {
+        let (class, usage) = call(Kind::OpenRouter, endpoint, &body).await;
+        assert_eq!(class, Some(InferenceError::InvalidUpstream), "{endpoint:?}");
+        assert_eq!(
+            usage.and_then(|u| u.input_tokens),
+            Some(3),
+            "{endpoint:?}: tokens kept"
+        );
+    }
+}
+
+/// A JSON speech answer whose body breaks before it is complete is an invalid
+/// response, as any non-audio answer was: not an unavailable provider that
+/// may fail over.
+#[tokio::test]
+async fn a_broken_json_speech_body_is_an_invalid_response() {
+    let (class, _) = call_steps(
+        Kind::OpenAi,
+        Endpoint::Speech,
+        vec![Step::Bytes(br#"{"error":{"code":"#.to_vec()), Step::Reset],
+    )
+    .await;
+    assert_eq!(class, Some(InferenceError::InvalidUpstream));
 }

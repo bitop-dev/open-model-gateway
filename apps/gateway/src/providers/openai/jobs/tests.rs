@@ -617,3 +617,19 @@ fn native_messages_batch_marks_failed_tool_results_on_chat_wire() {
         assert_error_tool_chat_wire(&line["body"], failed, &text);
     }
 }
+
+/// A native embeddings line's 200 body with any `error` member, even an empty
+/// one, is not a success.
+#[test]
+fn a_native_embeddings_line_with_an_error_member_is_not_a_success() {
+    for error in [json!({}), json!(""), json!({"code":"rate_limit_exceeded"})] {
+        let line = json!({"id":"r","custom_id":"l0","response":{"status_code":200,"body":{
+            "object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1]}],
+            "usage":{"prompt_tokens":1,"total_tokens":1},"error":error}},"error":null});
+        assert!(
+            super::decode_native_result(BatchEndpoint::Embeddings, line.to_string().as_bytes())
+                .is_err(),
+            "{error}"
+        );
+    }
+}

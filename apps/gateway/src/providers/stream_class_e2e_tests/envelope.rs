@@ -149,7 +149,7 @@ async fn first_route_answers(
     }
     if fails_over {
         let want: Vec<Attempt> = vec![
-            ("failed".into(), Some("rate_limit_error".into()), None, None),
+            ("failed".into(), Some(class.code().into()), None, None),
             ("succeeded".into(), None, Some(3), Some(2)),
         ];
         if reply.status != 200 || models != ["model-first", "model-second"] || recorded != want {
@@ -325,65 +325,115 @@ async fn single(pool: PgPool, kind: Kind, free: bool) -> Single {
 /// replaced by zeros.
 async fn settlement(pool: PgPool, kind: Kind, free: bool) {
     let mut problems = Vec::new();
-    {
-        {
-            let s = single(pool, kind, free).await;
-            for client in clients(kind) {
-                let messages = client == Client::Messages;
-                let rejected = envelope(kind, named(kind, "invalid_request_error"));
-                let cases = [
-                    (
-                        "a clean rejection",
-                        rejected.clone(),
-                        http_class(kind, messages, "invalid_request_error", 400),
-                        None,
-                    ),
-                    (
-                        "a clean rate limit",
-                        envelope(kind, named(kind, "rate_limit_exceeded")),
-                        InferenceError::Busy,
-                        None,
-                    ),
-                    (
-                        "a rejection next to usage",
-                        with_usage(kind, rejected, false),
-                        InferenceError::InvalidUpstream,
-                        Some((3, 2)),
-                    ),
-                ];
-                for (label, body, class, tokens) in cases {
-                    *s.body.lock().unwrap() = body.to_string().into_bytes();
-                    sqlx::query("DELETE FROM deployment_health")
-                        .execute(&s.f.store.pool)
-                        .await
-                        .unwrap();
-                    let reply = ask(&s.base, &s.token, client).await;
-                    let at = format!("{kind:?} {client:?} free={free} {label}");
-                    let got = recorded(&s.f.store.pool, s.deployment, reply.id).await;
-                    let known_zero = free && class == InferenceError::UpstreamRejected;
-                    let want = if known_zero {
-                        Recorded {
-                            state: "failed".into(),
-                            error_code: Some(class.code().into()),
-                            input: Some(0),
-                            output: Some(0),
-                            reservation: "settled".into(),
-                            actual: Some(0),
-                            ledger: vec!["hold".into(), "settlement".into()],
-                            health_failures: 0,
-                        }
-                    } else {
-                        failed_with(class, tokens)
-                    };
-                    if got != want {
-                        problems.push(format!("{at}: recorded {got:?}, want {want:?}"));
-                    }
-                    if !reply.body.contains(shown(client, class)) || reply.body.contains("secret") {
-                        problems.push(format!("{at}: told {}", reply.body));
-                    }
+    let s = single(pool, kind, free).await;
+    for client in clients(kind) {
+        let messages = client == Client::Messages;
+        let rejected = envelope(kind, named(kind, "invalid_request_error"));
+        let cases = [
+            (
+                "a clean rejection",
+                rejected.clone(),
+                http_class(kind, messages, "invalid_request_error", 400),
+                None,
+            ),
+            (
+                "a clean rate limit",
+                envelope(kind, named(kind, "rate_limit_exceeded")),
+                InferenceError::Busy,
+                None,
+            ),
+            (
+                "a rejection next to usage",
+                with_usage(kind, rejected, false),
+                InferenceError::InvalidUpstream,
+                Some((3, 2)),
+            ),
+        ];
+        for (label, body, class, tokens) in cases {
+            *s.body.lock().unwrap() = body.to_string().into_bytes();
+            sqlx::query("DELETE FROM deployment_health")
+                .execute(&s.f.store.pool)
+                .await
+                .unwrap();
+            let reply = ask(&s.base, &s.token, client).await;
+            let at = format!("{kind:?} {client:?} free={free} {label}");
+            let got = recorded(&s.f.store.pool, s.deployment, reply.id).await;
+            let known_zero = free && class == InferenceError::UpstreamRejected;
+            let want = if known_zero {
+                Recorded {
+                    state: "failed".into(),
+                    error_code: Some(class.code().into()),
+                    input: Some(0),
+                    output: Some(0),
+                    reservation: "settled".into(),
+                    actual: Some(0),
+                    ledger: vec!["hold".into(), "settlement".into()],
+                    health_failures: 0,
                 }
+            } else {
+                failed_with(class, tokens)
+            };
+            if got != want {
+                problems.push(format!("{at}: recorded {got:?}, want {want:?}"));
+            }
+            if !reply.body.contains(shown(client, class)) || reply.body.contains("secret") {
+                problems.push(format!("{at}: told {}", reply.body));
             }
         }
+    }
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+/// With the ambiguous-failure opt-in, an unrecognised 200 error (an
+/// unavailable provider) fails over as an HTTP 5xx does; the same error next
+/// to output or usage still never does.
+async fn ambiguous_failover(pool: PgPool, kind: Kind) {
+    let mut problems = Vec::new();
+    let mut f = fixture(pool).await;
+    let token = issue_key(&mut f).await;
+    two_routes(&f, kind, true).await;
+    for client in clients(kind) {
+        let clean = envelope(kind, named(kind, "brand_new_error"));
+        let at = format!("{kind:?} {client:?} ambiguous with the opt-in");
+        first_route_answers(
+            &f,
+            &token,
+            kind,
+            client,
+            clean.clone(),
+            true,
+            InferenceError::UpstreamUnavailable,
+            None,
+            &format!("{at} clean"),
+            &mut problems,
+        )
+        .await;
+        first_route_answers(
+            &f,
+            &token,
+            kind,
+            client,
+            with_content(kind, clean.clone()),
+            false,
+            InferenceError::InvalidUpstream,
+            None,
+            &format!("{at} with output"),
+            &mut problems,
+        )
+        .await;
+        first_route_answers(
+            &f,
+            &token,
+            kind,
+            client,
+            with_usage(kind, clean, false),
+            false,
+            InferenceError::InvalidUpstream,
+            Some((3, 2)),
+            &format!("{at} with usage"),
+            &mut problems,
+        )
+        .await;
     }
     assert!(problems.is_empty(), "{problems:#?}");
 }
@@ -395,6 +445,10 @@ macro_rules! per_kind {
             #[dbtest::test]
             async fn a_clean_200_rate_limit_fails_over_and_nothing_else_does(pool: PgPool) {
                 failover(pool, $kind).await;
+            }
+            #[dbtest::test]
+            async fn an_ambiguous_200_error_fails_over_only_under_the_opt_in(pool: PgPool) {
+                ambiguous_failover(pool, $kind).await;
             }
             #[dbtest::test]
             async fn settlement_on_a_free_price_follows_the_class_of_a_200_error(pool: PgPool) {

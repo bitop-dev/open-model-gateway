@@ -37,18 +37,23 @@ pub(super) fn empty(value: &Value) -> bool {
     }
 }
 
-/// Whether a usage or cost value reports anything other than zero. A number
-/// counts unless it is zero, a string counts when it is a nonzero number (a
-/// cost written as text), and labels and flags (`"type":"tokens"`,
-/// `"is_byok":false`) do not count.
+/// Whether a usage or cost value reports anything other than zero. Only an
+/// integer zero, or text that is a decimal zero (`"0"`, `"0.00"`), is zero:
+/// a float cannot tell a tiny exact cost (`1e-400`) from zero, so any float
+/// counts, and so does text with a digit in it that is not a zero. Text with
+/// no digit is a label or flag (`"type":"tokens"`), as are booleans.
 fn nonzero(value: &Value) -> bool {
     match value {
         Value::Null | Value::Bool(_) => false,
-        Value::Number(n) => n.as_f64().is_none_or(|n| n != 0.0),
-        Value::String(s) => s.trim().parse::<f64>().is_ok_and(|n| n != 0.0),
+        Value::Number(n) => n.as_u64() != Some(0) && n.as_i64() != Some(0),
+        Value::String(s) => s.bytes().any(|b| b.is_ascii_digit()) && !decimal_zero(s.trim()),
         Value::Array(a) => a.iter().any(nonzero),
         Value::Object(o) => o.values().any(nonzero),
     }
+}
+fn decimal_zero(text: &str) -> bool {
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+    !whole.is_empty() && whole.bytes().all(|b| b == b'0') && fraction.bytes().all(|b| b == b'0')
 }
 
 /// `Ok` when `body` has no `error`; otherwise the class of its error. A body
@@ -123,7 +128,7 @@ mod tests {
             // Empty output and all-zero usage leave it clean.
             assert_eq!(
                 class(
-                    json!({"error":error,"choices":[],"usage":{"prompt_tokens":0,"cost":"0","is_byok":true,"type":"tokens"}})
+                    json!({"error":error,"choices":[],"usage":{"prompt_tokens":0,"cost":"0.00","is_byok":true,"type":"tokens"}})
                 ),
                 Err(expected),
                 "{error}"
@@ -142,6 +147,9 @@ mod tests {
             json!({"usage":{"cost":"0.0001"}}),
             json!({"usage":{"cost":0.5}}),
             json!({"usage":7}),
+            json!({"usage":{"cost":0.0}}),
+            json!({"usage":{"cost":"1e-400"}}),
+            json!({"usage":{"cost":"-0.5"}}),
         ] {
             let mut body = extra.clone();
             body["error"] = error.clone();
