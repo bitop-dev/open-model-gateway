@@ -212,10 +212,30 @@ def git(*args):
 
 
 def changed_files(base):
+    """Returns (every changed path, the untracked ones among them).
+
+    Untracked, unignored files count: a new source file selects its tests
+    before it is added. They are reported separately, because a checkout with
+    a large untracked tree would otherwise look like a large change.
+    """
     merge_base = git("merge-base", base, "HEAD").strip()
-    names = set(git("diff", "--name-only", merge_base).splitlines())
-    names |= set(git("ls-files", "--others", "--exclude-standard").splitlines())
-    return sorted(name for name in names if name)
+    tracked = {name for name in git("diff", "--name-only", merge_base).splitlines() if name}
+    untracked = {name for name in git("ls-files", "--others", "--exclude-standard").splitlines() if name}
+    return sorted(tracked | untracked), sorted(untracked - tracked)
+
+
+def describe_changes(changed, untracked, base):
+    """The header lines: what changed against the base, and where untracked files are."""
+    lines = [f"{len(changed) - len(untracked)} changed files against {base}"
+             + (f", {len(untracked)} untracked" if untracked else "")]
+    if len(untracked) > 10:
+        roots = {}
+        for name in untracked:
+            root = name.split("/", 1)[0] + ("/" if "/" in name else "")
+            roots[root] = roots.get(root, 0) + 1
+        for root, count in sorted(roots.items(), key=lambda item: (-item[1], item[0]))[:8]:
+            lines.append(f"  untracked: {count} under {root}")
+    return lines
 
 
 def cargo_test(jobs, extra):
@@ -250,13 +270,14 @@ def main(argv=None):
     parser.add_argument("--test-threads", type=int, default=0, help="libtest threads (default: libtest's)")
     args = parser.parse_args(argv)
 
-    changed = changed_files(args.base)
+    changed, untracked = changed_files(args.base)
     touches_rust = args.all or any(
         path.startswith((GATEWAY_SRC,) + CROSS_CUTTING + CONTRACT_SURFACE) for path in changed)
     tests = list_tests(args.jobs) if touches_rust else []
     selected, reasons, targets, scripts = select(changed, tests, everything=args.all, contract=args.contract)
 
-    print(f"{len(changed)} changed files against {args.base}")
+    for line in describe_changes(changed, untracked, args.base):
+        print(line)
     for reason in reasons:
         print("  " + reason)
     print(f"selected: {len(selected)} of {len(tests)} lib tests"
