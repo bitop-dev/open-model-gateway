@@ -50,6 +50,7 @@ impl Engine {
                     + 5,
                 deployment,
                 adapter.generation_output_limit(),
+                adapter.forwards_cache_controls(),
             ),
         );
         let admission_result = match admission_group.as_ref().map(|(b, _, _)| b.clone()) {

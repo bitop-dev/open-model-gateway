@@ -80,6 +80,16 @@ pub fn protocols(profile: &str) -> Option<&'static [P]> {
         .map(|(_, protocols)| *protocols)
 }
 
+/// Whether routes on `profile` accept a batch priority hint: its adapter is
+/// a local profile whose servers take vLLM's `priority` request field
+/// (`local::Profile::accepts_priority_hint`). Read by the route scheduling
+/// settings, which know the stored profile but have no adapter instance.
+pub fn accepts_priority_hint(profile: &str) -> bool {
+    super::local::Profile::ALL
+        .into_iter()
+        .any(|p| p.id() == profile && p.accepts_priority_hint())
+}
+
 /// Whether `profile`'s adapter can carry `protocol` at all.
 pub fn serves(profile: &str, protocol: P) -> bool {
     protocols(profile).is_some_and(|p| p.contains(&protocol))

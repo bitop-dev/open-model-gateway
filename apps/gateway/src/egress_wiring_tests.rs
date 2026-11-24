@@ -44,7 +44,9 @@ const COUNTED: &[(&str, &str, usize)] = &[
     ("providers/anthropic.rs", "Anthropic", 1),
     ("providers/anthropic/batches.rs", "Anthropic", 2),
     ("providers/local/mod.rs", "Local", 3),
-    ("jobs/schedule.rs", "Local", 1),
+    // The batch scheduler's metrics scrape (`jobs/schedule.rs`) counts
+    // through `ApprovedEndpoints::count_lost_then`.
+    ("providers/local/endpoints.rs", "Local", 1),
     ("providers/bedrock/transport.rs", "Bedrock", 1),
     ("filestore/s3/transport.rs", "S3", 1),
     ("otlp.rs", "Export", 2),
