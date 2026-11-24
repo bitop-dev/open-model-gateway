@@ -80,6 +80,7 @@ impl ProviderAdapter for MockUpstream {
         _target: &Deployment,
         request: ChatRequest,
     ) -> Result<ProviderOutput, InferenceError> {
+        open_model_gateway::inference::dispatch::started();
         self.calls.fetch_add(1, Ordering::SeqCst);
         let usage = Usage {
             input_tokens: Some(7),
@@ -101,6 +102,7 @@ impl ProviderAdapter for MockUpstream {
             tokio::time::sleep(self.delay).await;
             Ok(ProviderOutput::Complete(ChatResponse {
                 messages_content: None,
+                reasoning: None,
                 content: Some("Load test ok".into()),
                 tool_calls: vec![],
                 finish_reason: FinishReason::Stop,

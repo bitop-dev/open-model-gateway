@@ -267,7 +267,7 @@ pub(super) fn decode_native_result(endpoint: BatchEndpoint, line: &[u8]) -> Resu
     if !endpoint.is_generation() {
         return Err(InferenceError::Unsupported);
     }
-    let value: Value = serde_json::from_slice(line).map_err(|_| InferenceError::InvalidUpstream)?;
+    let value: Value = crate::providers::framing::json(line)?;
     let custom_id = value["custom_id"]
         .as_str()
         .filter(|s| !s.is_empty() && s.len() <= 64)

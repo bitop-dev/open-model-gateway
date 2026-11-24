@@ -224,11 +224,14 @@ pub async fn handle(
         Err(error) => return super::workload_error(error, StatusCode::BAD_REQUEST),
     };
     let limits = session.limits();
+    // The upgraded connection runs on its own task: it keeps the upgrade
+    // request's log span, and so do the writes a dropped session detaches.
+    let span = tracing::Span::current();
     upgrade
         .protocols(["realtime"])
         .max_message_size(limits.max_message_bytes)
         .max_frame_size(limits.max_message_bytes)
-        .on_upgrade(move |socket| proxy(socket, session))
+        .on_upgrade(move |socket| tracing::Instrument::instrument(proxy(socket, session), span))
 }
 
 // ------------------------------------------------------- Client events ----

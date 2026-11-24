@@ -33,6 +33,62 @@ impl BedrockAdapter {
         http: aws_smithy_runtime_api::client::http::SharedHttpClient,
         streaming_http: aws_smithy_runtime_api::client::http::SharedHttpClient,
     ) -> Self {
+        Self::for_test_identity(
+            base,
+            timeouts,
+            http,
+            streaming_http,
+            aws_sdk_bedrockruntime::config::SharedCredentialsProvider::new(
+                aws_sdk_bedrockruntime::config::Credentials::new(
+                    "AKIDLOCALTEST",
+                    "local-not-a-secret",
+                    Some("local-session-token".into()),
+                    None,
+                    "local-test",
+                ),
+            ),
+        )
+    }
+
+    /// A real adapter against a local mock whose SDK credential provider
+    /// fails: a named profile (`auth::profile_provider`, the production
+    /// profile path) missing from an explicit credentials file, so the SDK
+    /// never gets an identity and never calls its connector.
+    #[cfg(feature = "integration-tests")]
+    #[allow(deprecated)]
+    pub(crate) fn for_test_without_credentials(base: &str) -> Self {
+        use aws_config::profile::profile_file::{ProfileFileKind, ProfileFiles};
+        // Same content for every caller, so concurrent tests may share it.
+        let path = std::env::temp_dir().join("omg-bedrock-without-absent-profile.ini");
+        std::fs::write(
+            &path,
+            "[default]\naws_access_key_id = AKIDDEFAULT\naws_secret_access_key = default-not-a-secret\n",
+        )
+        .unwrap();
+        let files = ProfileFiles::builder()
+            .with_file(ProfileFileKind::Credentials, &path)
+            .build();
+        let timeouts = transport::Timeouts::default();
+        Self::for_test_identity(
+            base,
+            timeouts,
+            transport::client(timeouts, false).unwrap(),
+            transport::client(timeouts, true).unwrap(),
+            aws_sdk_bedrockruntime::config::SharedCredentialsProvider::new(auth::profile_provider(
+                "absent",
+                "us-east-1",
+                Some(files),
+            )),
+        )
+    }
+
+    fn for_test_identity(
+        base: &str,
+        timeouts: transport::Timeouts,
+        http: aws_smithy_runtime_api::client::http::SharedHttpClient,
+        streaming_http: aws_smithy_runtime_api::client::http::SharedHttpClient,
+        credentials: aws_sdk_bedrockruntime::config::SharedCredentialsProvider,
+    ) -> Self {
         let mut adapter = Self::new().unwrap();
         adapter.timeouts = timeouts;
         adapter.http = http;
@@ -40,13 +96,7 @@ impl BedrockAdapter {
         let config = aws_sdk_bedrockruntime::Config::builder()
             .behavior_version(auth::sdk_behavior_version())
             .region(Region::new("us-east-1"))
-            .credentials_provider(aws_sdk_bedrockruntime::config::Credentials::new(
-                "AKIDLOCALTEST",
-                "local-not-a-secret",
-                Some("local-session-token".into()),
-                None,
-                "local-test",
-            ))
+            .credentials_provider(credentials)
             .endpoint_url(base)
             .http_client(adapter.http.clone())
             .timeout_config(adapter.operation_timeouts())
@@ -518,6 +568,7 @@ async fn tools_json_and_stream_tool_indices_usage_after_finish() {
             }
             ChatEvent::Done => order.push("done"),
             ChatEvent::MessagesBlock(_) => panic!("native Anthropic event on Converse"),
+            ChatEvent::Reasoning(_) => panic!("Converse reasoning is not mapped"),
         }
     }
     assert_eq!(starts, 1);

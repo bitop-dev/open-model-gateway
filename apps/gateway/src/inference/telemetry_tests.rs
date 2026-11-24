@@ -77,6 +77,7 @@ impl InferenceRepository for TelemetryRepository {
         _lease_seconds: i64,
         _deployment: &Deployment,
         _output_limit: u32,
+        _forwards_cache_controls: bool,
     ) -> Result<GenerationAdmission, InferenceError> {
         use telemetry::SpanName::*;
         for phase in [
@@ -168,6 +169,7 @@ impl ProviderAdapter for Adapter {
         match mode.unwrap_or(Mode::Error(InferenceError::Storage)) {
             Mode::Complete(usage) => Ok(ProviderOutput::Complete(ChatResponse {
                 messages_content: None,
+                reasoning: None,
                 content: Some("hello".into()),
                 tool_calls: vec![],
                 finish_reason: FinishReason::Stop,

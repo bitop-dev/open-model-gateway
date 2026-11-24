@@ -222,6 +222,7 @@ impl ProviderAdapter for Recording {
         } else {
             ProviderOutput::Complete(ChatResponse {
                 messages_content: None,
+                reasoning: None,
                 content: Some("ok".into()),
                 tool_calls: vec![],
                 finish_reason: FinishReason::Stop,
@@ -362,6 +363,7 @@ impl ProviderAdapter for CeilingSensitive {
         self.seen.lock().unwrap().push(request.max_output_tokens);
         Ok(ProviderOutput::Complete(ChatResponse {
             messages_content: None,
+            reasoning: None,
             content: Some("ok".into()),
             tool_calls: vec![],
             finish_reason: FinishReason::Stop,
@@ -636,7 +638,7 @@ async fn publication_barrier(pool: sqlx::PgPool, mode: locks::AdmissionMode) {
         .fetch_one(&mut *blocker)
         .await
         .unwrap();
-    let admitted = admit_generation(&f.store, &s, &r, 30, &d, u32::MAX);
+    let admitted = admit_generation(&f.store, &s, &r, 30, &d, u32::MAX, false);
     tokio::pin!(admitted);
     // Drive admission until its backend is observed holding the shared catalog
     // lock while blocked by the authority lock; it must not complete meanwhile.
@@ -684,7 +686,7 @@ async fn publication_barrier(pool: sqlx::PgPool, mode: locks::AdmissionMode) {
     assert_eq!(pin, (old, 150, 150));
     let next = f.start();
     assert_eq!(
-        admit_generation(&f.store, &next, &r, 30, &d, u32::MAX)
+        admit_generation(&f.store, &next, &r, 30, &d, u32::MAX, false)
             .await
             .unwrap()
             .max_output_tokens,
@@ -734,7 +736,7 @@ async fn generation_defaults_unknown_price_keeps_unknown_hold_and_budget_refusal
     r.max_output_tokens = None;
     let s = f.start();
     assert_eq!(
-        admit_generation(&f.store, &s, &r, 30, &d, u32::MAX)
+        admit_generation(&f.store, &s, &r, 30, &d, u32::MAX, false)
             .await
             .unwrap()
             .max_output_tokens,
@@ -746,7 +748,7 @@ async fn generation_defaults_unknown_price_keeps_unknown_hold_and_budget_refusal
         .await;
     let before = counts(&f).await;
     assert_eq!(
-        admit_generation(&f.store, &f.start(), &r, 30, &d, u32::MAX).await,
+        admit_generation(&f.store, &f.start(), &r, 30, &d, u32::MAX, false).await,
         Err(InferenceError::PriceUnbounded)
     );
     assert_eq!(counts(&f).await, before);
@@ -788,7 +790,7 @@ async fn generation_defaults_cancellation_and_expired_lease_keep_exact_holds(poo
         .unwrap()
         .remove(0);
     let lease = f.start();
-    admit_generation(&f.store, &lease, &r, 1, &d, u32::MAX)
+    admit_generation(&f.store, &lease, &r, 1, &d, u32::MAX, false)
         .await
         .unwrap();
     sqlx::query("UPDATE governance_reservations SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE execution_id=$1").bind(lease.id).execute(&f.store.pool).await.unwrap();

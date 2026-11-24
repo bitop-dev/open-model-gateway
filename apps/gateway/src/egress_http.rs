@@ -33,8 +33,8 @@ pub struct HttpClient(reqwest::Client);
 
 /// A builder from [`client_builder`] or [`pinned_client_builder`]. It
 /// exposes only settings that cannot change the safeguards: timeouts, the
-/// idle pool, HTTPS-only and (through [`add_root_certificates`]) extra trust
-/// anchors.
+/// idle pool, the connection counter, HTTPS-only and (through
+/// [`add_root_certificates`]) extra trust anchors.
 #[derive(Debug)]
 #[must_use]
 pub(crate) struct HttpClientBuilder(reqwest::ClientBuilder);
@@ -52,20 +52,27 @@ const _: fn() = || {
     let _ = <HttpClientBuilder as AmbiguousIfDefault<_>>::some_item;
 };
 
+/// Every request constructor marks the current attempt's dispatch as started
+/// (`crate::inference::dispatch`) before it returns: an attempt whose adapter
+/// call ends without that mark built no request, so wrote nothing upstream.
 impl HttpClient {
     pub fn get<U: reqwest::IntoUrl>(&self, url: U) -> reqwest::RequestBuilder {
+        crate::inference::dispatch::started();
         self.0.get(url)
     }
 
     pub fn post<U: reqwest::IntoUrl>(&self, url: U) -> reqwest::RequestBuilder {
+        crate::inference::dispatch::started();
         self.0.post(url)
     }
 
     pub fn delete<U: reqwest::IntoUrl>(&self, url: U) -> reqwest::RequestBuilder {
+        crate::inference::dispatch::started();
         self.0.delete(url)
     }
 
     pub async fn execute(&self, request: reqwest::Request) -> reqwest::Result<reqwest::Response> {
+        crate::inference::dispatch::started();
         self.0.execute(request).await
     }
 
@@ -74,6 +81,7 @@ impl HttpClient {
         method: reqwest::Method,
         url: U,
     ) -> reqwest::RequestBuilder {
+        crate::inference::dispatch::started();
         self.0.request(method, url)
     }
 
@@ -108,6 +116,18 @@ impl HttpClientBuilder {
     /// redirect, retry, proxy or resolver safeguard.
     pub fn pool_idle_timeout(self, timeout: Duration) -> Self {
         Self(self.0.pool_idle_timeout(timeout))
+    }
+
+    /// Counts each connection the pool opens under `client`'s label
+    /// (#611). The layer only observes a completed connection and returns it
+    /// unchanged: it changes no destination, resolver, TLS, proxy, redirect
+    /// or retry safeguard, and it is the only connector layer a client gets.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the one connector layer, which only counts (#611)"
+    )]
+    pub fn count_connections(self, client: super::UpstreamClient) -> Self {
+        Self(self.0.connector_layer(client.opened_connections()))
     }
 
     pub fn https_only(self, enabled: bool) -> Self {

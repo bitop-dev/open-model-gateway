@@ -3,6 +3,7 @@ pub mod audio;
 pub mod client;
 pub mod count;
 mod deadline_stream;
+pub mod dispatch;
 mod embeddings;
 pub mod error;
 pub(crate) mod evidence;
@@ -124,6 +125,13 @@ impl Engine {
             recorder: None,
             counts: Arc::default(),
         })
+    }
+
+    /// Concurrency permits not held by a request, a session or a detached
+    /// write that still carries one.
+    #[cfg(all(test, feature = "integration-tests"))]
+    pub(crate) fn available_capacity(&self) -> usize {
+        self.capacity.available_permits()
     }
 
     /// Attaches the bounded trace recorder (#98). None disables tracing for
@@ -535,3 +543,5 @@ mod steering_tests;
 mod telemetry_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, feature = "integration-tests"))]
+mod unsent_tests;

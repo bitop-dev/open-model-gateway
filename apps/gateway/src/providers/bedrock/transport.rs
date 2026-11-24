@@ -158,7 +158,8 @@ pub(super) fn client(timeouts: Timeouts, streaming: bool) -> anyhow::Result<Shar
     let builder =
         crate::egress::client_builder(crate::egress::resolver(crate::egress::Purpose::Provider))
             .connect_timeout(Duration::from_secs(10))
-            .pool_idle_timeout(crate::egress::UpstreamClient::Bedrock.pool_idle_timeout());
+            .pool_idle_timeout(crate::egress::UpstreamClient::Bedrock.pool_idle_timeout())
+            .count_connections(crate::egress::UpstreamClient::Bedrock);
     // ConverseStream's lifetime belongs to the engine watchdog. A reqwest total
     // timer also runs while the consumer is idle and would falsely fail a healthy
     // stream at this fixed boundary. Keep the total cap for non-stream Converse.

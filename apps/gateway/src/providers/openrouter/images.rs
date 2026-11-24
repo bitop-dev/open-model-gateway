@@ -15,7 +15,7 @@
 //!   (402 without purchased credit), so enforcement there is unverified.
 use serde_json::{Value, json};
 
-use super::{OpenRouterAdapter, parse};
+use super::{OpenRouterAdapter, embedded_error, object, provider_cost, status_error};
 use crate::{
     inference::{
         error::InferenceError,
@@ -93,9 +93,15 @@ impl OpenRouterAdapter {
         }
         let response = self.post(target, "/images", &body).await?;
         let bytes = images::read_bounded(response, request.max_response_bytes).await?;
-        let (value, cost) = parse(&bytes)?;
+        let value = object(&bytes)?;
+        let cost = provider_cost(&bytes);
         drop(bytes);
-        let usage = usage(&value["usage"], cost)?;
+        embedded_error(&value, &["data"], &["usage"], &cost, status_error, || {
+            value["usage"]
+                .is_object()
+                .then(|| usage(&value["usage"], None))
+        })?;
+        let usage = usage(&value["usage"], cost?)?;
         images::decode(&value, &request, usage, Some(tier.variant()), Ok(None))
     }
 }

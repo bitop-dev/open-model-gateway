@@ -769,6 +769,7 @@ impl ProviderAdapter for GenerationAdapter {
             ]);
             return Ok(ProviderOutput::Complete(ChatResponse {
                 messages_content,
+                reasoning: None,
                 content,
                 tool_calls: calls,
                 finish_reason,

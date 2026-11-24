@@ -31,6 +31,10 @@ struct Script {
     executed: Vec<String>,
     maxima: Vec<Option<u32>>,
     accept_tools: bool,
+    /// When true, the fake drops Messages `cache_control` hints as an
+    /// adapter that does not forward them (`forwards_cache_controls` is
+    /// false whatever its id).
+    drops_cache_controls: bool,
     /// #238 multi-route tests: when true, `validate_chat_request` never
     /// refuses - this provider accepts a body another provider's `Fake`
     /// (left at the default, `false`) would refuse, so a model with routes
@@ -259,6 +263,7 @@ impl ProviderAdapter for Fake {
                 billing.cache_read_input_tokens = Some(5);
                 Ok(ProviderOutput::Complete(ChatResponse {
                     messages_content: None,
+                    reasoning: None,
                     content: Some("cached answer".into()),
                     tool_calls: vec![],
                     finish_reason: FinishReason::Stop,
@@ -267,6 +272,7 @@ impl ProviderAdapter for Fake {
             }
             "oversized-result" => Ok(ProviderOutput::Complete(ChatResponse {
                 messages_content: None,
+                reasoning: None,
                 content: Some("\0".repeat(super::io::RESULT_LINE_BYTES / 6)),
                 tool_calls: vec![],
                 finish_reason: FinishReason::Stop,
@@ -278,6 +284,7 @@ impl ProviderAdapter for Fake {
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 Ok(ProviderOutput::Complete(ChatResponse {
                     messages_content: None,
+                    reasoning: None,
                     content: Some("ok".into()),
                     tool_calls: vec![],
                     finish_reason: FinishReason::Stop,
@@ -286,6 +293,7 @@ impl ProviderAdapter for Fake {
             }
             "huge" => Ok(ProviderOutput::Complete(ChatResponse {
                 messages_content: None,
+                reasoning: None,
                 content: Some("ok".into()),
                 tool_calls: vec![],
                 finish_reason: FinishReason::Stop,
@@ -293,6 +301,7 @@ impl ProviderAdapter for Fake {
             })),
             _ => Ok(ProviderOutput::Complete(ChatResponse {
                 messages_content: None,
+                reasoning: None,
                 content: Some(format!("answer to {text}")),
                 tool_calls: vec![],
                 finish_reason: FinishReason::Stop,
@@ -324,6 +333,11 @@ impl ProviderAdapter for Fake {
     }
     fn native_batch(&self, _: &Deployment, endpoint: BatchEndpoint) -> bool {
         self.native && (self.id != "anthropic" || endpoint.is_generation())
+    }
+    /// The fake stands in for the adapter of its id, as the real Anthropic
+    /// adapter does, unless the script makes it drop the hints.
+    fn forwards_cache_controls(&self) -> bool {
+        self.id == "anthropic" && !self.script.lock().unwrap().drops_cache_controls
     }
     fn encode_native_line(
         &self,
@@ -440,6 +454,7 @@ impl ProviderAdapter for Fake {
         let outcome = if v["ok"] == json!(true) {
             NativeOutcome::Succeeded(Box::new(BatchResponse::Chat(ChatResponse {
                 messages_content: None,
+                reasoning: None,
                 content: Some("native answer".into()),
                 tool_calls: vec![],
                 finish_reason: FinishReason::Stop,
@@ -483,6 +498,17 @@ async fn world(
     anthropic_native: bool,
     concurrency: usize,
 ) -> World {
+    world_with(pool, openai_native, anthropic_native, concurrency, None).await
+}
+/// [`world`] with `openai` registered in place of the OpenAI fake (which
+/// stays in `World::openai`, unregistered).
+async fn world_with(
+    pool: PgPool,
+    openai_native: bool,
+    anthropic_native: bool,
+    concurrency: usize,
+    openai_adapter: Option<Arc<dyn crate::providers::ProviderAdapter>>,
+) -> World {
     let f = fixture(pool).await;
     sqlx::query("UPDATE installation_settings SET file_batch_enabled=true WHERE singleton")
         .execute(&f.store.pool)
@@ -507,7 +533,9 @@ async fn world(
     let openai = Fake::new("openai", openai_native);
     let anthropic = Fake::new("anthropic", anthropic_native);
     let mut registry = ProviderRegistry::default();
-    registry.register(Arc::new(openai.clone())).unwrap();
+    registry
+        .register(openai_adapter.unwrap_or_else(|| Arc::new(openai.clone())))
+        .unwrap();
     registry.register(Arc::new(anthropic.clone())).unwrap();
     let engine = Engine::new(
         Arc::new(f.store.clone()),
@@ -2059,6 +2087,85 @@ async fn budget_exhaustion_mid_batch_stops_and_keeps_partial_results(pool: PgPoo
     consistent(f).await;
 }
 
+/// A gateway-run line whose route's credential cannot be resolved (the real
+/// OpenAI adapter, nothing allowed to resolve) fails before any request is
+/// built: it settles at a known zero with its own ledger entry, nothing
+/// reaches the upstream, and the batch's envelope still closes.
+#[dbtest::test]
+async fn a_line_whose_credential_cannot_be_resolved_settles_as_a_known_zero(pool: PgPool) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counted = hits.clone();
+    let (upstream, _server) = crate::inference::admission_validation_tests::serve(
+        axum::Router::new().fallback(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }
+        }),
+    )
+    .await;
+    let adapter = Arc::new(crate::providers::openai::OpenAiAdapter::for_test(
+        Arc::new(crate::providers::secrets::EnvSecrets::new(Vec::new())),
+        format!("{upstream}/v1"),
+    ));
+    let w = world_with(pool, false, false, 1, Some(adapter)).await;
+    let f = &w.f;
+    let file = w
+        .upload(
+            &f.principal,
+            &[
+                chat_line("a", "company/smart", "one"),
+                chat_line("b", "company/smart", "two"),
+            ],
+        )
+        .await;
+    let job = w
+        .create(
+            f.principal,
+            &file,
+            BatchEndpoint::ChatCompletions,
+            // The real OpenAI adapter would otherwise run it natively.
+            Some(json!({"omg_mode": "gateway"})),
+        )
+        .await
+        .unwrap();
+    let _ = Runner::new(w.jobs.clone()).run_next().await;
+    let job = w.reload(&job).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    let errors = w.read(f.principal.workspace_id, job.error_file_id).await;
+    assert_eq!(errors.len(), 2, "{} {:?}", job.state, job.error_code);
+    type Line = (Uuid, String, String, Option<i64>, Option<i64>, Option<i64>);
+    let lines: Vec<Line> = sqlx::query_as(
+        "SELECT r.execution_id,e.state,r.state,r.actual_microusd,r.input_tokens,r.output_tokens FROM batch_lines b JOIN governance_reservations r ON r.execution_id=b.execution_id JOIN inference_executions e ON e.id=r.execution_id WHERE b.job_id=$1 ORDER BY b.line_no",
+    )
+    .bind(job.id)
+    .fetch_all(&f.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(lines.len(), 2);
+    for (execution, state, reservation, actual, input, output) in lines {
+        assert_eq!(
+            (state.as_str(), reservation.as_str(), actual, input, output),
+            ("failed", "settled", Some(0), Some(0), Some(0))
+        );
+        let ledger: Vec<(String, Option<i64>)> = sqlx::query_as(
+            "SELECT kind,amount_microusd FROM monetary_ledger WHERE execution_id=$1 ORDER BY kind",
+        )
+        .bind(execution)
+        .fetch_all(&f.store.pool)
+        .await
+        .unwrap();
+        assert_eq!(ledger.len(), 2, "{ledger:?}");
+        assert_eq!(ledger[1], ("settlement".into(), Some(0)));
+    }
+    let open: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM governance_reservations WHERE state<>'settled'")
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(open, 0, "the envelope and both lines are settled");
+    consistent(f).await;
+}
+
 /// A key revoked after its gateway-run batch was created: every line that
 /// runs afterwards fails exactly as the interactive endpoint refuses the key
 /// (401 `authentication_error`, never `model_not_found`), and nothing reaches
@@ -2537,6 +2644,50 @@ async fn native_anthropic_messages_batch_with_errored_lines(pool: PgPool) {
     // Standard (no batch list) at 2 µUSD/token: (10 + 2) × 2.
     assert_eq!(reservation(f, job.execution_id).await.2, Some(24));
     consistent(f).await;
+}
+
+/// Migration 0088 lets a pending reservation's hold decrease outside
+/// settlement only for a gateway-run batch envelope (its transfer into a
+/// line) and a realtime session. A native batch's reservation, also a
+/// `batches` execution, is not an envelope: the database refuses it.
+async fn lower_a_pending_batch_hold(pool: PgPool, native: bool) {
+    let w = world(pool, native, false, 1).await;
+    let f = &w.f;
+    let file = w
+        .upload(&f.principal, &[chat_line("a", "company/smart", "x")])
+        .await;
+    let metadata = (!native).then(|| json!({"omg_mode": "gateway"}));
+    let job = w
+        .create(f.principal, &file, BatchEndpoint::ChatCompletions, metadata)
+        .await
+        .unwrap();
+    let (state, held, _, _) = reservation(f, job.execution_id).await;
+    assert_eq!(state, "pending");
+    assert!(held.is_some_and(|h| h > 0));
+    let lowered = sqlx::query(
+        "UPDATE governance_reservations SET held_microusd=held_microusd-1 WHERE execution_id=$1",
+    )
+    .bind(job.execution_id)
+    .execute(&f.store.pool)
+    .await;
+    if native {
+        let error = lowered.expect_err("a native batch is not an envelope");
+        assert_eq!(
+            error.as_database_error().and_then(|e| e.constraint()),
+            Some("reservation_hold_change")
+        );
+        assert_eq!(reservation(f, job.execution_id).await.1, held);
+    } else {
+        assert_eq!(lowered.unwrap().rows_affected(), 1);
+    }
+}
+#[dbtest::test]
+async fn a_gateway_envelope_may_lower_its_pending_hold(pool: PgPool) {
+    lower_a_pending_batch_hold(pool, false).await;
+}
+#[dbtest::test]
+async fn a_native_batch_may_not_lower_its_pending_hold(pool: PgPool) {
+    lower_a_pending_batch_hold(pool, true).await;
 }
 
 #[dbtest::test]
@@ -3157,6 +3308,74 @@ async fn gateway_cache_lines_require_read_prices_and_settle_repeated_hits(pool: 
     }
 }
 
+/// A gateway-run Messages line with a `cache_control` hint on a route whose
+/// adapter drops the hint is planned, admitted and held exactly as the same
+/// line without the hint, at the v1 price that cannot price cache tokens.
+/// The route and its provider id stay the same: with the adapter forwarding
+/// the hint again, the hinted line is refused before any write.
+#[dbtest::test]
+async fn a_cache_hint_on_a_route_that_drops_it_is_held_as_a_plain_line(pool: PgPool) {
+    let w = world(pool, false, false, 1).await;
+    let f = &w.f;
+    w.anthropic.script.lock().unwrap().drops_cache_controls = true;
+    let plain = json!({"custom_id":"line","method":"POST","url":"/v1/messages","body":{"model":"company/claude","max_tokens":10,"system":[{"type":"text","text":"cache me"}],"messages":[{"role":"user","content":"hello"}]}});
+    let mut hinted = plain.clone();
+    hinted["body"]["system"][0]["cache_control"] = json!({"type":"ephemeral","ttl":"1h"});
+    let mut runs = Vec::new();
+    for line in [plain, hinted.clone()] {
+        let file = w.upload(&f.principal, &[line]).await;
+        let job = w
+            .create(f.principal, &file, BatchEndpoint::Messages, None)
+            .await
+            .unwrap();
+        assert_eq!(job.mode(), Some(BatchMode::Gateway));
+        let envelope: (i64, i64) = sqlx::query_as(
+            "SELECT reserved_tokens,held_microusd FROM governance_reservations WHERE execution_id=$1",
+        )
+        .bind(job.execution_id)
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+        assert!(Runner::new(w.jobs.clone()).run_next().await.unwrap());
+        let job = w.reload(&job).await;
+        assert_eq!(job.state, "completed");
+        assert_eq!(
+            (job.request_completed, job.request_failed),
+            (Some(1), Some(0))
+        );
+        let lines: Vec<(Uuid, i64, i64, String, Option<i64>)> = sqlx::query_as("SELECT r.price_id,r.reserved_tokens,r.held_microusd,r.state,r.actual_microusd FROM inference_executions e JOIN governance_reservations r ON r.execution_id=e.id WHERE e.batch_job_id=$1")
+            .bind(job.id)
+            .fetch_all(&f.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(lines.len(), 1);
+        runs.push((envelope, lines));
+    }
+    assert_eq!(
+        runs[0], runs[1],
+        "the hint changes neither the envelope nor the line's hold"
+    );
+    assert_eq!(w.anthropic.executed().len(), 2);
+    // The same route with an adapter that forwards the hint.
+    w.anthropic.script.lock().unwrap().drops_cache_controls = false;
+    let file = w.upload(&f.principal, &[hinted]).await;
+    let before = admission_rowcounts(f).await;
+    let refused = w
+        .create(f.principal, &file, BatchEndpoint::Messages, None)
+        .await;
+    assert!(matches!(
+        refused,
+        Err(CreateError::Job(JobError::Inference(
+            InferenceError::InvalidField("cache_control")
+        )))
+    ));
+    assert_eq!(admission_rowcounts(f).await, before);
+    assert_eq!(w.anthropic.executed().len(), 2);
+    assert!(w.anthropic.calls().is_empty(), "no native batch calls");
+    assert!(w.openai.executed().is_empty());
+    consistent(f).await;
+}
+
 #[dbtest::test]
 async fn memoized_refusal_classification_stays_per_line(pool: PgPool) {
     // Cached candidate lookups preserve each line's own refusal kind.
@@ -3197,16 +3416,16 @@ mod fence;
 mod http_support;
 mod poller;
 
-/// Streaming classification must not change the non-stream classes that drive
-/// explicit line retries: OpenAI invalid output is not retryable; OpenRouter's
-/// pre-existing unavailable class is. Neither becomes Busy.
-#[dbtest::test]
-async fn openai_non_stream_200_errors_preserve_batch_retry_semantics(pool: PgPool) {
+/// A gateway-run batch line retries a clean 200-wrapped rate limit under its
+/// retry policy, as it retries an HTTP 429 (#665), and never retries the same
+/// error next to output: the provider may have processed that line.
+#[sqlx::test(migrations = "./enterprise_migrations")]
+async fn openai_non_stream_200_rate_limits_retry_only_when_clean(pool: PgPool) {
     non_stream_200_batch_error(pool, crate::providers::stream_class_tests::Kind::OpenAi).await;
 }
 
-#[dbtest::test]
-async fn openrouter_non_stream_200_errors_preserve_batch_retry_semantics(pool: PgPool) {
+#[sqlx::test(migrations = "./enterprise_migrations")]
+async fn openrouter_non_stream_200_rate_limits_retry_only_when_clean(pool: PgPool) {
     non_stream_200_batch_error(pool, crate::providers::stream_class_tests::Kind::OpenRouter).await;
 }
 
@@ -3214,7 +3433,7 @@ async fn non_stream_200_batch_error(
     pool: PgPool,
     kind: crate::providers::stream_class_tests::Kind,
 ) {
-    use crate::providers::stream_class_tests::{Kind, Step, response, serve};
+    use crate::providers::stream_class_tests::{Step, response, serve};
     use std::sync::atomic::Ordering;
     let mut w = world(pool.clone(), false, false, 1).await;
     sqlx::query("UPDATE provider_connections SET provider=$1,credential_ref=$2 WHERE id=(SELECT provider_connection_id FROM deployments WHERE id=$3)")
@@ -3222,16 +3441,17 @@ async fn non_stream_200_batch_error(
             .execute(&w.f.store.pool).await.unwrap();
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let seen = calls.clone();
-    let app = axum::Router::new().fallback(move || {
+    // The first line's body is a clean rate limit; the second's carries output.
+    let app = axum::Router::new().fallback(move |body: axum::body::Bytes| {
         seen.fetch_add(1, Ordering::SeqCst);
-        async {
-            response(
-                200,
-                "application/json",
-                vec![Step::Bytes(
-                    br#"{"error":{"code":"rate_limit_exceeded"}}"#.to_vec(),
-                )],
-            )
+        let partial = String::from_utf8_lossy(&body).contains("partial please");
+        async move {
+            let answer = if partial {
+                br#"{"error":{"code":"rate_limit_exceeded"},"choices":[{"index":0,"message":{"role":"assistant","content":"partial"},"finish_reason":"stop"}]}"#.to_vec()
+            } else {
+                br#"{"error":{"code":"rate_limit_exceeded"}}"#.to_vec()
+            };
+            response(200, "application/json", vec![Step::Bytes(answer)])
         }
     });
     let (base, _mock) = serve(app).await;
@@ -3249,7 +3469,13 @@ async fn non_stream_200_batch_error(
         .with_files(Some(runtime))
         .with_engine(engine);
     let file = w
-        .upload(&w.f.principal, &[chat_line("a", "company/smart", "hi")])
+        .upload(
+            &w.f.principal,
+            &[
+                chat_line("a", "company/smart", "hi"),
+                chat_line("b", "company/smart", "partial please"),
+            ],
+        )
         .await;
     let job = w
         .create(
@@ -3261,32 +3487,42 @@ async fn non_stream_200_batch_error(
         .await
         .unwrap();
     Runner::new(w.jobs.clone()).run_next().await.unwrap();
-    let attempts: Vec<(i16, String, Option<String>)> =
-        sqlx::query_as("SELECT attempts,state,error_code FROM batch_lines WHERE job_id=$1")
-            .bind(job.id)
-            .fetch_all(&w.f.store.pool)
-            .await
-            .unwrap();
-    let (n, code) = if kind == Kind::OpenAi {
-        (1, "invalid_upstream_response")
-    } else {
-        (2, "upstream_unavailable")
-    };
-    assert_eq!(
-        attempts,
-        [(n, "failed".into(), Some(code.into()))],
-        "{kind:?}"
-    );
-    assert_eq!(calls.load(Ordering::SeqCst), n as usize, "{kind:?}");
-    let executions: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM inference_executions WHERE batch_job_id=$1 AND error_code=$2",
+    let lines: Vec<(i32, i16, String, Option<String>)> = sqlx::query_as(
+        "SELECT line_no,attempts,state,error_code FROM batch_lines WHERE job_id=$1 ORDER BY line_no",
     )
     .bind(job.id)
-    .bind(code)
-    .fetch_one(&w.f.store.pool)
+    .fetch_all(&w.f.store.pool)
     .await
     .unwrap();
-    assert_eq!(executions, i64::from(n));
+    assert_eq!(
+        lines,
+        [
+            (0, 2, "failed".into(), Some("rate_limit_error".into())),
+            (
+                1,
+                1,
+                "failed".into(),
+                Some("invalid_upstream_response".into())
+            ),
+        ],
+        "{kind:?}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 3, "{kind:?}");
+    let executions: Vec<(Option<String>, i64)> = sqlx::query_as(
+        "SELECT error_code,count(*) FROM inference_executions WHERE batch_job_id=$1 GROUP BY error_code ORDER BY error_code",
+    )
+    .bind(job.id)
+    .fetch_all(&w.f.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        executions,
+        [
+            (Some("invalid_upstream_response".into()), 1),
+            (Some("rate_limit_error".into()), 2),
+        ],
+        "{kind:?}: one execution per attempt"
+    );
 }
 
 mod accepted_failure_tests;

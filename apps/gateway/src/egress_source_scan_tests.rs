@@ -55,6 +55,7 @@ enum Finding {
         cfg: Vec<String>,
         reason: Option<String>,
         /// What the attribute is attached to: `crate`, `fn <path>`,
+        /// `method <path>` (a method of an inherent or trait impl),
         /// `let in <fn path>`, or `other in <path>` (never sanctioned).
         on: String,
     },
@@ -272,6 +273,8 @@ impl<'ast> Visit<'ast> for Scan<'_> {
 
     fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
         self.path.push(item.sig.ident.unraw().to_string());
+        let on = format!("method {}", self.here());
+        self.own(&item.attrs, &on);
         syn::visit::visit_impl_item_fn(self, item);
         self.path.pop();
     }
@@ -524,7 +527,8 @@ fn sanctioned(name: &str) -> Vec<Finding> {
         "providers/bedrock/auth.rs" => vec![aws_config("sts_config", STS_EXCEPTION)],
         // The one module that holds or builds a raw reqwest client (#569):
         // the whole file may name the types; only the three constructors
-        // may call the disallowed methods.
+        // and the connection counter (one fixed, observe-only connector
+        // layer, #611) may call the disallowed methods.
         "egress_http.rs" => vec![
             level_of(
                 TYPES,
@@ -533,6 +537,13 @@ fn sanctioned(name: &str) -> Vec<Finding> {
                 &[],
                 Some("the egress client newtype is the one place a reqwest client is held (#569)"),
                 "crate",
+            ),
+            level(
+                "expect",
+                false,
+                &[],
+                Some("the one connector layer, which only counts (#611)"),
+                "method count_connections",
             ),
             guarded("fn client_builder"),
             guarded("fn pinned_client_builder"),
@@ -792,11 +803,11 @@ const CLIENT_MODULE: &[&str] = &[
     "impl < T : Default > AmbiguousIfDefault < u8 > for T { }",
     "const _ : fn ( ) = | | { let _ = < HttpClient as AmbiguousIfDefault < _ > > : : some_item ; let _ = < HttpClientBuilder as AmbiguousIfDefault < _ > > : : some_item ; } ;",
     "impl HttpClient { }",
-    "HttpClient :: pub fn get < U : reqwest : : IntoUrl > ( & self , url : U ) - > reqwest : : RequestBuilder { self . 0 . get ( url ) }",
-    "HttpClient :: pub fn post < U : reqwest : : IntoUrl > ( & self , url : U ) - > reqwest : : RequestBuilder { self . 0 . post ( url ) }",
-    "HttpClient :: pub fn delete < U : reqwest : : IntoUrl > ( & self , url : U ) - > reqwest : : RequestBuilder { self . 0 . delete ( url ) }",
-    "HttpClient :: pub async fn execute ( & self , request : reqwest : : Request ) - > reqwest : : Result < reqwest : : Response > { self . 0 . execute ( request ) . await }",
-    "HttpClient :: pub fn request < U : reqwest : : IntoUrl > ( & self , method : reqwest : : Method , url : U , ) - > reqwest : : RequestBuilder { self . 0 . request ( method , url ) }",
+    "HttpClient :: pub fn get < U : reqwest : : IntoUrl > ( & self , url : U ) - > reqwest : : RequestBuilder { crate : : inference : : dispatch : : started ( ) ; self . 0 . get ( url ) }",
+    "HttpClient :: pub fn post < U : reqwest : : IntoUrl > ( & self , url : U ) - > reqwest : : RequestBuilder { crate : : inference : : dispatch : : started ( ) ; self . 0 . post ( url ) }",
+    "HttpClient :: pub fn delete < U : reqwest : : IntoUrl > ( & self , url : U ) - > reqwest : : RequestBuilder { crate : : inference : : dispatch : : started ( ) ; self . 0 . delete ( url ) }",
+    "HttpClient :: pub async fn execute ( & self , request : reqwest : : Request ) - > reqwest : : Result < reqwest : : Response > { crate : : inference : : dispatch : : started ( ) ; self . 0 . execute ( request ) . await }",
+    "HttpClient :: pub fn request < U : reqwest : : IntoUrl > ( & self , method : reqwest : : Method , url : U , ) - > reqwest : : RequestBuilder { crate : : inference : : dispatch : : started ( ) ; self . 0 . request ( method , url ) }",
     "HttpClient :: # [ cfg ( test ) ] pub ( crate ) fn from_test_client ( client : reqwest : : Client ) - > Self { Self ( client ) }",
     "impl HttpClientBuilder { }",
     "HttpClientBuilder :: pub fn timeout ( self , timeout : Duration ) - > Self { Self ( self . 0 . timeout ( timeout ) ) }",
@@ -804,6 +815,7 @@ const CLIENT_MODULE: &[&str] = &[
     "HttpClientBuilder :: pub fn read_timeout ( self , timeout : Duration ) - > Self { Self ( self . 0 . read_timeout ( timeout ) ) }",
     "HttpClientBuilder :: pub fn pool_max_idle_per_host ( self , max : usize ) - > Self { Self ( self . 0 . pool_max_idle_per_host ( max ) ) }",
     "HttpClientBuilder :: pub fn pool_idle_timeout ( self , timeout : Duration ) - > Self { Self ( self . 0 . pool_idle_timeout ( timeout ) ) }",
+    "HttpClientBuilder :: # [ expect ( clippy : : disallowed_methods , reason = \"the one connector layer, which only counts (#611)\" ) ] pub fn count_connections ( self , client : super : : UpstreamClient ) - > Self { Self ( self . 0 . connector_layer ( client . opened_connections ( ) ) ) }",
     "HttpClientBuilder :: pub fn https_only ( self , enabled : bool ) - > Self { Self ( self . 0 . https_only ( enabled ) ) }",
     "HttpClientBuilder :: pub fn build ( self ) - > reqwest : : Result < HttpClient > { self . 0 . build ( ) . map ( HttpClient ) }",
     "# [ expect ( clippy : : disallowed_methods , reason = \"the egress-guarded constructor (#509)\" ) ] pub ( crate ) fn client_builder ( resolver : Arc < Resolver > ) - > HttpClientBuilder { HttpClientBuilder ( reqwest : : Client : : builder ( ) . no_proxy ( ) . dns_resolver ( resolver ) . redirect ( reqwest : : redirect : : Policy : : none ( ) ) . retry ( reqwest : : retry : : never ( ) ) , ) }",
@@ -1479,9 +1491,11 @@ fn sanctioned_attributes_count_only_on_their_own_items() {
     let expect =
         "#[expect(clippy::disallowed_methods, reason = \"the egress-guarded constructor (#509)\")]";
     let types = "#![expect(clippy::disallowed_types, reason = \"the egress client newtype is the one place a reqwest client is held (#569)\")]";
+    let counter = "#[expect(clippy::disallowed_methods, reason = \"the one connector layer, which only counts (#611)\")]";
     let egress = |rogue: &str| {
         format!(
-            "{types} {expect} fn client_builder() {{}} {expect} fn pinned_client_builder() {{}} {rogue}"
+            "{types} impl B {{ {counter} fn count_connections() {{}} }} \
+             {expect} fn client_builder() {{}} {expect} fn pinned_client_builder() {{}} {rogue}"
         )
     };
     let finds = |name: &str, source: &str| scan(src, &src.join(name), source) == sanctioned(name);
@@ -1496,6 +1510,14 @@ fn sanctioned_attributes_count_only_on_their_own_items() {
         format!("mod m {{ {expect} fn add_root_certificates() {{}} }}"),
         format!("fn add_root_certificates() {{ {expect} let x = 1; }}"),
         format!("{expect} fn add_root_certificates() {{}} mod m {{ {types} }}"),
+        // The counter's switch belongs to its own method, not another one
+        // or a statement inside it.
+        format!("{expect} fn add_root_certificates() {{}} impl B {{ {counter} fn rogue() {{}} }}"),
+        format!(
+            "{expect} fn add_root_certificates() {{}} \
+             impl B {{ fn count_connections() {{ {counter} let x = 1; }} }}"
+        ),
+        format!("{expect} fn add_root_certificates() {{}} {counter} fn count_connections() {{}}"),
         format!(
             "{expect} fn add_root_certificates() {{}} \
              #[expect(clippy::disallowed_types, reason = \"x\")] struct S;"

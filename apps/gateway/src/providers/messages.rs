@@ -1,5 +1,8 @@
 //! Explicit Messages provider policy. Native fidelity is opt-in, never passthrough.
-use crate::inference::{error::InferenceError, types::ChatRequest};
+use crate::inference::{
+    error::InferenceError,
+    types::{ChatRequest, ProviderOutput},
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderClass {
@@ -74,6 +77,17 @@ pub(crate) fn validate_beta_headers<'a>(
     }
 }
 
+/// A `thinking` history block carries a signature only when it has a
+/// nonblank one: SDK accumulators replay a translated (unsigned) block with
+/// `"signature": ""`, which Anthropic would reject after admission. Translated
+/// routes remove thinking history whatever its signature.
+fn signed(block: &serde_json::Value) -> bool {
+    block
+        .get("signature")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty())
+}
+
 pub(crate) fn validate(request: &ChatRequest, class: ProviderClass) -> Result<(), InferenceError> {
     let Some(options) = &request.messages_options else {
         return Ok(());
@@ -82,15 +96,29 @@ pub(crate) fn validate(request: &ChatRequest, class: ProviderClass) -> Result<()
     if class != ProviderClass::Anthropic && !options.images.is_empty() {
         return refuse("image");
     }
-    if options
-        .output_config
-        .as_ref()
-        .is_some_and(|v| v.get("format").is_some())
-    {
-        return refuse("output_config.format");
+    // OpenAI-style adapters map structured output and strict tools to their
+    // JSON-schema controls; no other route has a faithful mapping yet.
+    if class != ProviderClass::OpenAi {
+        if options
+            .output_config
+            .as_ref()
+            .is_some_and(|v| v.get("format").is_some())
+        {
+            return refuse("output_config.format");
+        }
+        if options.strict_tools {
+            return refuse("strict");
+        }
     }
-    if options.strict_tools {
-        return refuse("strict");
+    // A native route forwards history with its signature; an unsigned block
+    // (a translated reply replayed) cannot be forwarded and is refused.
+    if class == ProviderClass::Anthropic
+        && options
+            .history_thinking
+            .iter()
+            .any(|b| b["type"] == "thinking" && !signed(b))
+    {
+        return refuse("thinking");
     }
     if class == ProviderClass::Bedrock {
         // The Converse mapping cannot carry these Messages controls.
@@ -125,4 +153,31 @@ pub(crate) fn validate(request: &ChatRequest, class: ProviderClass) -> Result<()
     }
     validate_beta_headers(options.beta_headers.iter().map(String::as_str))
         .map_err(|_| InferenceError::InvalidField("anthropic-beta"))
+}
+
+/// Translated reasoning text follows Anthropic's rule for thinking text: it is
+/// returned only when the client asked for thinking (`enabled` or `adaptive`)
+/// without `display:"omitted"`. Otherwise it is withheld, as a native route
+/// would never return it; its tokens stay in the reported output count.
+pub(crate) fn shows_thinking(request: &ChatRequest) -> bool {
+    request
+        .messages_options
+        .as_ref()
+        .and_then(|o| o.thinking.as_ref())
+        .is_some_and(|t| t["type"] != "disabled" && t["display"] != "omitted")
+}
+
+/// Withholds unrequested reasoning from a complete reply (gateway-run batch
+/// lines have no other place to apply it). The whole body was already read
+/// within the response bound. Streams keep their reasoning events so the
+/// attempt and output-bound checks see them; the Messages codec withholds
+/// them after those checks.
+pub(crate) fn thinking_display(request: &ChatRequest, output: ProviderOutput) -> ProviderOutput {
+    match output {
+        ProviderOutput::Complete(mut response) if !shows_thinking(request) => {
+            response.reasoning = None;
+            ProviderOutput::Complete(response)
+        }
+        output => output,
+    }
 }

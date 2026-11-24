@@ -617,3 +617,107 @@ fn native_messages_batch_marks_failed_tool_results_on_chat_wire() {
         assert_error_tool_chat_wire(&line["body"], failed, &text);
     }
 }
+
+/// A Messages batch line carries the same OpenAI controls as an interactive
+/// request: effort and structured output are never silently dropped.
+#[test]
+fn native_messages_lines_map_reasoning_and_structured_output() {
+    use crate::providers::contract::{messages_request, output_schema};
+    let request = messages_request(json!({"output_config":{"effort":"high",
+        "format":{"type":"json_schema","schema":output_schema()}},
+        "tools":[{"name":"lookup","input_schema":{"type":"object"},"strict":true}]}));
+    let line: Value = serde_json::from_slice(
+        &encode_native_line(
+            &target("gpt-fixture"),
+            BatchEndpoint::Messages,
+            "l0",
+            &BatchRequest::Chat(request),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(line["body"]["reasoning_effort"], "high");
+    assert_eq!(line["body"]["tools"][0]["function"]["strict"], true);
+    assert_eq!(
+        line["body"]["response_format"],
+        json!({"type":"json_schema","json_schema":{"name":"output","schema":output_schema(),"strict":true}})
+    );
+}
+
+/// A native batch line for `/v1/messages` that the model declined under
+/// strict structured output is a Messages refusal; the same body on a Chat
+/// Completions batch stays an invalid upstream line.
+#[test]
+fn native_messages_lines_accept_a_structured_output_refusal() {
+    let line = json!({"custom_id":"l0","response":{"status_code":200,"body":{"id":"x","model":"m",
+        "choices":[{"index":0,"message":{"role":"assistant","content":null,"refusal":"no"},"finish_reason":"stop"}],
+        "usage":{"prompt_tokens":3,"completion_tokens":1}}},"error":null})
+    .to_string();
+    let outcome = decode_native_result(BatchEndpoint::Messages, line.as_bytes())
+        .unwrap()
+        .outcome;
+    let NativeOutcome::Succeeded(response) = outcome else {
+        panic!("expected a success")
+    };
+    let BatchResponse::Chat(r) = *response else {
+        panic!("expected a chat result")
+    };
+    assert_eq!(
+        r.finish_reason,
+        crate::inference::types::FinishReason::Refusal
+    );
+    assert!(r.content.is_none());
+    assert!(decode_native_result(BatchEndpoint::ChatCompletions, line.as_bytes()).is_err());
+}
+
+/// A native embeddings line's 200 body with any `error` member, even an empty
+/// one, is not a success.
+#[test]
+fn a_native_embeddings_line_with_an_error_member_is_not_a_success() {
+    for error in [
+        json!({}),
+        json!(""),
+        json!(null),
+        json!({"code":"rate_limit_exceeded"}),
+    ] {
+        let line = json!({"id":"r","custom_id":"l0","response":{"status_code":200,"body":{
+            "object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1]}],
+            "usage":{"prompt_tokens":1,"total_tokens":1},"error":error}},"error":null});
+        assert!(
+            super::decode_native_result(BatchEndpoint::Embeddings, line.to_string().as_bytes())
+                .is_err(),
+            "{error}"
+        );
+    }
+}
+
+/// A native line that names a member twice is not decoded at all.
+#[test]
+fn a_native_line_with_a_duplicate_member_is_not_decoded() {
+    let line = br#"{"id":"r","custom_id":"l0","response":{"status_code":200,"body":{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1]}],"usage":{"prompt_tokens":1,"total_tokens":1},"error":{"code":"x"},"error":null}},"error":null}"#;
+    assert!(super::decode_native_result(BatchEndpoint::Embeddings, line).is_err());
+}
+
+/// A batch status body that names a member twice is not read (its `usage`
+/// feeds the batch's usage).
+#[tokio::test]
+async fn a_batch_status_body_with_a_duplicate_member_is_refused() {
+    let valid = batch("completed").to_string();
+    let duplicated = valid.replacen(
+        r#""usage":"#,
+        r#""usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0},"usage":"#,
+        1,
+    );
+    let t = target("gpt-x");
+    let upstream = parse_batch(&batch("in_progress")).unwrap();
+    for (body, ok) in [(valid, true), (duplicated, false)] {
+        let mock = Mock::new(vec![Reply {
+            status: 200,
+            content_type: "application/json",
+            body: body.into_bytes(),
+        }])
+        .await;
+        let result = mock.adapter().retrieve_batch(&t, &upstream.id).await;
+        assert_eq!(result.is_ok(), ok, "duplicate refused: {}", !ok);
+    }
+}

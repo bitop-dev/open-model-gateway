@@ -1,6 +1,6 @@
 # Claude Code through the gateway, with any model (#70, #71)
 
-Status: approved 2026-10-12; implementation deferred until the phase 2 (scale) work is done. Nothing here is implemented yet.
+Status: approved 2026-10-12. Deliveries 1–2 shipped in v0.9.0; delivery 3 (OpenAI-style reasoning and structured output) is described in `docs/protocol-matrix.md` and `docs/claude-code.md`. Still pending for #70: structured output and strict tools on native Anthropic and Bedrock routes (refused with 400 for now) and returned reasoning content on Bedrock. Deliveries 4–6 remain open (#71, #72, #73).
 
 ## Goal
 

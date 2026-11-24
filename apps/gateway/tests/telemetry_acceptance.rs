@@ -63,9 +63,11 @@ impl ProviderAdapter for FixtureAdapter {
         target: &Deployment,
         _request: ChatRequest,
     ) -> Result<ProviderOutput, InferenceError> {
+        open_model_gateway::inference::dispatch::started();
         assert_eq!(target.upstream_model, "fixture-upstream-id");
         Ok(ProviderOutput::Complete(ChatResponse {
             messages_content: None,
+            reasoning: None,
             content: Some("hello".into()),
             tool_calls: vec![],
             finish_reason: FinishReason::Stop,

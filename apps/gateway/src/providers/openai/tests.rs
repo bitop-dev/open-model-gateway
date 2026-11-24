@@ -189,12 +189,21 @@ async fn messages_parallel_calls_and_results_preserve_openai_turns() {
     super::super::contract::assert_parallel_chat_wire(&capture[0].body);
 }
 
+/// A clean 200 rate limit is `Busy` for every profile that shares this
+/// decoder (#665); next to output it is an invalid response.
 #[test]
-fn non_messages_error_decoding_preserves_shared_adapter_behavior() {
+fn a_200_rate_limit_is_busy_for_every_profile_unless_it_has_output() {
     let value = json!({"error":{"code":"rate_limit_exceeded","message":"prompt is too long"}});
+    let mut with_output = value.clone();
+    with_output["choices"] =
+        json!([{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}]);
     for profile in [None, Some("vllm"), Some("ollama")] {
         assert_error(
             decode_complete_profile(&value, profile),
+            InferenceError::Busy,
+        );
+        assert_error(
+            decode_complete_profile(&with_output, profile),
             InferenceError::InvalidUpstream,
         );
     }
@@ -295,10 +304,7 @@ fn error_decoding_is_classified_like_the_same_http_error() {
         let value = json!({"error": error});
         let bytes = serde_json::to_vec(&value).unwrap();
         assert_error(StreamState::default().decode(&bytes), chat);
-        let mut state = StreamState {
-            messages: true,
-            ..StreamState::default()
-        };
+        let mut state = StreamState::new(None, true);
         assert_error(state.decode(&bytes), messages);
     }
     // An empty `error` is no error at all.
@@ -1097,5 +1103,288 @@ async fn error_tool_sdk_openai(pool: sqlx::PgPool) {
         .zip(super::super::contract::error_tool_result_requests())
     {
         super::super::contract::assert_error_tool_chat_wire(&captured.body, error, &text);
+    }
+}
+
+/// Messages effort/format/strict reach OpenAI Chat's own controls. Thinking has
+/// no Chat control (no budget or on/off switch), so it never reaches the wire.
+#[tokio::test]
+async fn messages_reasoning_and_structured_output_use_openai_chat_controls() {
+    use super::super::contract::{messages_request, output_schema};
+    let mock = Mock::json(complete()).await;
+    let format = json!({"type":"json_schema","json_schema":{"name":"output","schema":output_schema(),"strict":true}});
+    for (extra, effort, structured, strict) in [
+        (
+            json!({"thinking":{"type":"enabled","budget_tokens":2048},
+                "output_config":{"effort":"max","format":{"type":"json_schema","schema":output_schema()}},
+                "tools":[{"name":"lookup","input_schema":{"type":"object"},"strict":true}]}),
+            Some("max"),
+            true,
+            Some(true),
+        ),
+        (
+            json!({"tools":[{"name":"lookup","input_schema":{"type":"object"},"strict":false}]}),
+            None,
+            false,
+            Some(false),
+        ),
+        (json!({"thinking":{"type":"adaptive"}}), None, false, None),
+        (
+            json!({"thinking":{"type":"disabled"},"output_config":{"effort":"low"}}),
+            Some("low"),
+            false,
+            None,
+        ),
+        (
+            json!({"output_config":{"effort":"xhigh"}}),
+            Some("xhigh"),
+            false,
+            None,
+        ),
+    ] {
+        let request = messages_request(extra.clone());
+        mock.adapter().validate_chat_request(&request).unwrap();
+        mock.adapter().execute(&target(), request).await.unwrap();
+        let capture = mock.requests.lock().unwrap();
+        let body = &capture.last().unwrap().body;
+        assert_eq!(
+            body.get("reasoning_effort"),
+            effort.map(|e| json!(e)).as_ref(),
+            "{extra}"
+        );
+        assert_eq!(
+            body.get("response_format"),
+            structured.then_some(&format),
+            "{extra}"
+        );
+        assert_eq!(
+            body["tools"][0]["function"].get("strict"),
+            strict.map(|s| json!(s)).as_ref()
+        );
+        for absent in ["reasoning", "thinking", "output_config", "budget_tokens"] {
+            assert!(body.get(absent).is_none(), "{absent}");
+        }
+    }
+    // Chat Completions requests never carry these controls upstream.
+    mock.adapter()
+        .execute(&target(), request(false))
+        .await
+        .unwrap();
+    let capture = mock.requests.lock().unwrap();
+    let body = &capture.last().unwrap().body;
+    assert!(body.get("reasoning_effort").is_none() && body.get("response_format").is_none());
+}
+
+fn structured_messages(stream: bool) -> ChatRequest {
+    use super::super::contract::{messages_request, output_schema};
+    let mut request = messages_request(
+        json!({"output_config":{"format":{"type":"json_schema","schema":output_schema()}}}),
+    );
+    request.stream = stream;
+    request
+}
+fn refusal_frames(pieces: &[Value]) -> Vec<u8> {
+    let mut frames = vec![event(chunk(
+        json!({"role":"assistant","content":null,"refusal":""}),
+        Value::Null,
+    ))];
+    frames.extend(pieces.iter().map(|d| event(chunk(d.clone(), Value::Null))));
+    frames.push(finished());
+    frames.push(event(
+        json!({"id":"private-id","model":"private-model","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2}}),
+    ));
+    frames.push("data: [DONE]\n\n".into());
+    frames.concat().into_bytes()
+}
+async fn collect_events(mock: &Mock, request: ChatRequest) -> Vec<Result<ChatEvent>> {
+    let ProviderOutput::Stream(stream) = mock.adapter().execute(&target(), request).await.unwrap()
+    else {
+        panic!("expected stream")
+    };
+    stream.collect().await
+}
+
+/// Strict structured output lets a model decline with `refusal` and no
+/// content. A Messages client gets `stop_reason: "refusal"`; the refusal
+/// text is never returned (it is not content) and usage settles as reported.
+/// Chat Completions and Responses clients still refuse it as lossy.
+#[tokio::test]
+async fn messages_refusal_ends_the_reply_without_its_text() {
+    let mut value = complete();
+    value["choices"][0]["message"] =
+        json!({"role":"assistant","content":null,"refusal":"I can't help with that."});
+    value["usage"] = json!({"prompt_tokens":3,"completion_tokens":2});
+    let mock = Mock::json(value).await;
+    let ProviderOutput::Complete(response) = mock
+        .adapter()
+        .execute(&target(), structured_messages(false))
+        .await
+        .unwrap()
+    else {
+        panic!("expected complete")
+    };
+    assert_eq!(response.finish_reason, FinishReason::Refusal);
+    assert!(response.content.is_none() && response.tool_calls.is_empty());
+    assert!(response.reasoning.is_none());
+    assert_eq!(
+        (response.usage.input_tokens, response.usage.output_tokens),
+        (Some(3), Some(2))
+    );
+    assert_error(
+        mock.adapter().execute(&target(), request(false)).await,
+        InferenceError::InvalidUpstream,
+    );
+
+    let mock = Mock::sse(
+        refusal_frames(&[json!({"refusal":"I can't "}), json!({"refusal":"help."})]),
+        7,
+    )
+    .await;
+    let events = collect_events(&mock, structured_messages(true)).await;
+    let (mut finish, mut usage, mut done) = (None, 0, false);
+    for event in events {
+        match event.unwrap() {
+            ChatEvent::Delta { text, tool_calls } => {
+                assert!(text.is_none_or(|t| t.is_empty()) && tool_calls.is_empty())
+            }
+            ChatEvent::Reasoning(_) => panic!("a refusal is never reasoning"),
+            ChatEvent::Finish(reason) => finish = Some(reason),
+            ChatEvent::Usage(_) => usage += 1,
+            ChatEvent::Done => done = true,
+            ChatEvent::MessagesBlock(_) => panic!("translated stream"),
+        }
+    }
+    assert_eq!(
+        (finish, usage, done),
+        (Some(FinishReason::Refusal), 1, true)
+    );
+    let results = collect_events(&mock, request(true)).await;
+    assert!(
+        results
+            .iter()
+            .any(|e| matches!(e, Err(InferenceError::InvalidUpstream))),
+        "Chat Completions streams still refuse a refusal"
+    );
+}
+
+/// A refusal is the whole reply: with content or tool calls, or as anything
+/// but a string, it is an invalid upstream response on every protocol.
+#[tokio::test]
+async fn messages_refusal_with_output_or_of_the_wrong_kind_is_invalid() {
+    let call = json!([{"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}]);
+    for message in [
+        json!({"role":"assistant","content":"partial","refusal":"no"}),
+        json!({"role":"assistant","content":null,"refusal":"no","tool_calls":call}),
+        json!({"role":"assistant","content":null,"refusal":7}),
+        json!({"role":"assistant","content":null,"refusal":{"text":"no"}}),
+    ] {
+        let mut value = complete();
+        value["choices"][0]["message"] = message.clone();
+        let mock = Mock::json(value).await;
+        assert_error(
+            mock.adapter()
+                .execute(&target(), structured_messages(false))
+                .await,
+            InferenceError::InvalidUpstream,
+        );
+    }
+    for pieces in [
+        vec![json!({"content":"partial"}), json!({"refusal":"no"})],
+        vec![json!({"refusal":"no"}), json!({"content":"partial"})],
+        vec![
+            json!({"refusal":"no"}),
+            json!({"tool_calls":[{"index":0,"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}]}),
+        ],
+        vec![json!({"refusal":7})],
+    ] {
+        let mock = Mock::sse(refusal_frames(&pieces), 64).await;
+        let events = collect_events(&mock, structured_messages(true)).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Err(InferenceError::InvalidUpstream))),
+            "{pieces:?}"
+        );
+        assert!(!events.iter().any(|e| matches!(e, Ok(ChatEvent::Done))));
+    }
+}
+
+/// Streamed refusal text is never emitted, so it is bounded where it is
+/// received: at the Messages output limit, like returned output.
+#[test]
+fn streamed_refusal_text_is_bounded_by_the_messages_output_limit() {
+    let frame = serde_json::to_vec(&chunk(json!({"refusal":"x"}), Value::Null)).unwrap();
+    let mut state = StreamState::new(None, true);
+    state.refusal_bytes = crate::protocols::messages::OUTPUT_LIMIT - 1;
+    assert!(state.decode(&frame).is_ok());
+    assert_eq!(
+        state.decode(&frame).err(),
+        Some(InferenceError::InvalidUpstream)
+    );
+}
+
+/// A refusal decides the finish whatever reason the provider sent with it,
+/// only on the cloud wire and only when the reply has no output at all;
+/// an absent, null or empty `refusal` is an ordinary reply.
+#[test]
+fn a_refusal_overrides_the_finish_reason_and_is_not_read_from_local_servers() {
+    let complete_with = |message: Value, reason: &str| {
+        let mut value = complete();
+        value["choices"][0]["message"] = message;
+        value["choices"][0]["finish_reason"] = json!(reason);
+        value
+    };
+    let refused = json!({"role":"assistant","content":null,"refusal":"no"});
+    for reason in ["stop", "length", "content_filter", "tool_calls"] {
+        let response =
+            decode_complete_protocol(&complete_with(refused.clone(), reason), None, true).unwrap();
+        assert_eq!(response.finish_reason, FinishReason::Refusal, "{reason}");
+        assert!(response.content.is_none(), "{reason}");
+
+        let mut state = StreamState::new(None, true);
+        let piece = serde_json::to_vec(&chunk(json!({"refusal":"no"}), Value::Null)).unwrap();
+        assert!(state.decode(&piece).unwrap().is_empty());
+        let last = serde_json::to_vec(&chunk(json!({}), json!(reason))).unwrap();
+        assert!(
+            matches!(
+                state.decode(&last).unwrap()[..],
+                [ChatEvent::Finish(FinishReason::Refusal)]
+            ),
+            "{reason}"
+        );
+    }
+
+    for profile in ["vllm", "ollama"] {
+        assert_error(
+            decode_complete_protocol(&complete_with(refused.clone(), "stop"), Some(profile), true),
+            InferenceError::InvalidUpstream,
+        );
+        let mut state = StreamState::new(Some(profile), true);
+        let piece = serde_json::to_vec(&chunk(json!({"refusal":"no"}), Value::Null)).unwrap();
+        assert_eq!(
+            state.decode(&piece).err(),
+            Some(InferenceError::InvalidUpstream),
+            "{profile}"
+        );
+    }
+
+    let blank = json!({"role":"assistant","content":" ","refusal":"no"});
+    assert_error(
+        decode_complete_protocol(&complete_with(blank, "stop"), None, true),
+        InferenceError::InvalidUpstream,
+    );
+    let mut state = StreamState::new(None, true);
+    let blank = serde_json::to_vec(&chunk(json!({"content":" ","refusal":"no"}), Value::Null));
+    assert_eq!(
+        state.decode(&blank.unwrap()).err(),
+        Some(InferenceError::InvalidUpstream)
+    );
+
+    for none in [json!(""), Value::Null] {
+        let message = json!({"role":"assistant","content":"answer","refusal":none});
+        let response = decode_complete_protocol(&complete_with(message, "length"), None, true);
+        let response = response.unwrap();
+        assert_eq!(response.finish_reason, FinishReason::Length);
+        assert_eq!(response.content.as_deref(), Some("answer"));
     }
 }

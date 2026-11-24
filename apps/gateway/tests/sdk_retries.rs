@@ -48,6 +48,7 @@ impl ProviderAdapter for RetryFixture {
         _: &Deployment,
         request: ChatRequest,
     ) -> Result<ProviderOutput, InferenceError> {
+        open_model_gateway::inference::dispatch::started();
         assert!(!request.stream);
         let attempt = self.dispatches.fetch_add(1, Ordering::SeqCst) + 1;
         // OpenAI callers omit optional maxima; native Messages requires 7.
@@ -72,6 +73,7 @@ impl ProviderAdapter for RetryFixture {
         }
         Ok(ProviderOutput::Complete(ChatResponse {
             messages_content: None,
+            reasoning: None,
             content: Some("recovered".into()),
             tool_calls: vec![],
             finish_reason: FinishReason::Stop,

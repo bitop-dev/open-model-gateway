@@ -286,6 +286,7 @@ async fn admit_unobserved(
     lease_seconds: i64,
     expected: Option<&Deployment>,
     output_limit: u32,
+    forwards_cache_controls: bool,
     generation_request: Option<&ChatRequest>,
     timer: &mut crate::metrics::PhaseTimer,
 ) -> Result<crate::inference::repository::GenerationAdmission, InferenceError> {
@@ -378,10 +379,12 @@ async fn admit_unobserved(
     {
         return Err(InferenceError::Configuration);
     }
-    // Only the live, validated native deployment forwards these hints. Check
-    // its immutable pinned price under the catalog lock, before any execution,
-    // reservation, counters or totals are written. Translated routes drop hints.
-    if current.provider == "anthropic"
+    // Only an adapter that forwards these hints to the live, validated
+    // deployment (`current.provider == record.provider`, the adapter's id)
+    // gets them priced: check its immutable pinned price under the catalog
+    // lock, before any execution, reservation, counters or totals are
+    // written. Other adapters drop or refuse the hints.
+    if forwards_cache_controls
         && let Some(options) = generation_request.and_then(|r| r.messages_options.as_deref())
     {
         require_native_cache_price(price.as_ref(), &options.cache_controls)?;
@@ -398,7 +401,7 @@ async fn admit_unobserved(
     }
     let (tokens, held) = reservation_bounds(price.as_ref(), &workload)?;
     if held.is_none()
-        && current.provider == "anthropic"
+        && forwards_cache_controls
         && generation_request.is_some_and(|r| {
             r.messages_options
                 .as_ref()
@@ -502,6 +505,8 @@ mod anthropic_cache_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod audio_tests;
 #[cfg(all(test, feature = "integration-tests"))]
+mod cache_capability_tests;
+#[cfg(all(test, feature = "integration-tests"))]
 mod generation_defaults_tests;
 /// Test helper: replace one scope's whole budget set with `amount` for `period` (or none).
 #[cfg(all(test, feature = "integration-tests"))]
@@ -543,6 +548,8 @@ mod telemetry_tests;
 pub(crate) mod tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod totals_tests;
+#[cfg(all(test, feature = "integration-tests"))]
+mod transition_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod v3_tests;
 #[cfg(all(test, feature = "integration-tests"))]

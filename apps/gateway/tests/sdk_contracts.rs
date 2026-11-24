@@ -31,6 +31,7 @@ impl ProviderAdapter for Fixture {
         _: &Deployment,
         request: ChatRequest,
     ) -> Result<ProviderOutput, InferenceError> {
+        open_model_gateway::inference::dispatch::started();
         // Omitted optional client maxima must arrive bounded at the adapter.
         assert!(request.max_output_tokens.is_some());
         let mut text = match request.max_output_tokens {
@@ -96,6 +97,7 @@ impl ProviderAdapter for Fixture {
         } else {
             Ok(ProviderOutput::Complete(ChatResponse {
                 messages_content: None,
+                reasoning: None,
                 content: Some(text.into()),
                 tool_calls: calls,
                 finish_reason,

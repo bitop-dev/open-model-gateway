@@ -6,13 +6,13 @@
 use super::*;
 use gateway_datetime_compat::UtcInstant;
 
-/// Record an accepted job: extend the lease of its still-pending reservation
-/// to `until` (never shortens) and run `insert` (the job row), in one
-/// transaction, so the job never exists without a reservation that lives as
-/// long as the job. The reservation not being pending any more (reconciled
-/// while the provider call ran) does not stop the job from being recorded:
-/// the provider has it, and its hold stays with reconciliation. Either
-/// statement failing rolls both back.
+/// Record a job before its provider create (#662): extend the lease of its
+/// still-pending reservation to `until` (never shortens) and run `insert`
+/// (the job row, without a provider id yet), in one transaction, so the job
+/// never exists without a reservation that lives as long as the job, and the
+/// provider is never called for a job that is not recorded. Either statement
+/// failing rolls both back; nothing has been sent then, so the caller settles
+/// the attempt as a known zero.
 ///
 /// Lock order: the reservation row first (the lease statement), then the
 /// counter rows the job row's trigger changes (`insert`). Global mode:
@@ -29,40 +29,43 @@ pub(crate) async fn accept_job<T>(
     let _queued = gate(&store.lock_gates.settlement).await;
     let mut tx = crate::db::begin(&store.pool)
         .await
-        .map_err(accepted_storage)?;
+        .map_err(record_storage)?;
     if !scoped(store) {
-        // The same global settlement prefix, reported as an accepted-job
-        // failure: the provider already has the work at this boundary.
+        // The same global settlement prefix as every change to live leases.
         sqlx::query("SELECT pg_advisory_xact_lock_shared(72419502)")
             .execute(&mut *tx)
             .await
-            .map_err(accepted_storage)?;
+            .map_err(record_storage)?;
         sqlx::query_scalar::<_, Uuid>(
             "SELECT id FROM installation WHERE singleton FOR NO KEY UPDATE",
         )
         .fetch_one(&mut *tx)
         .await
-        .map_err(accepted_storage)?;
+        .map_err(record_storage)?;
     }
     let extended = sqlx::query("UPDATE governance_reservations SET lease_expires_at=greatest(lease_expires_at,$2) WHERE execution_id=$1 AND state='pending'")
         .bind(execution)
         .bind(until)
         .execute(&mut *tx)
         .await
-        .map_err(accepted_storage)?
+        .map_err(record_storage)?
         .rows_affected();
     if extended != 1 {
-        tracing::warn!(execution_id = %execution, "job reservation no longer pending; its hold is left to reconciliation");
+        // Its admission lease ran out before the job could be recorded (and
+        // reconciliation took it): the provider is not called for it.
+        tracing::warn!(execution_id = %execution, "job reservation no longer pending before its record; nothing is sent");
+        return Err(InferenceError::Storage);
     }
     let recorded = insert(&mut *tx).await?;
-    tx.commit().await.map_err(accepted_storage)?;
+    tx.commit().await.map_err(record_storage)?;
     Ok(recorded)
 }
 
-/// Every failed SQL step after upstream acceptance leaves a hold requiring
-/// reconciliation, including a failed begin or commit acknowledgement.
-fn accepted_storage(error: sqlx::Error) -> InferenceError {
-    crate::db::accounting_failure::job_settlement(error);
+/// A failed step of the record, before anything was sent: counted at
+/// `job_storage`. A failed COMMIT acknowledgement may still have committed
+/// the row; it then ends by the video create-grace rule.
+fn record_storage(error: sqlx::Error) -> InferenceError {
+    crate::db::accounting_failure::job_storage(error);
     InferenceError::Storage
 }
 
