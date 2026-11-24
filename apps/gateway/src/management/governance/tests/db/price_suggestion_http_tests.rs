@@ -58,7 +58,10 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
                     {"id":"v/endpoint-large","context_length":4096,"top_provider":{"max_completion_tokens":100},"pricing":{"prompt":"1","completion":"2"}},
                     {"id":"v/endpoint-deep","context_length":4096,"top_provider":{"max_completion_tokens":100},"pricing":{"prompt":"1","completion":"2"}},
                     {"id":"v/endpoint-wide","context_length":4096,"top_provider":{"max_completion_tokens":100},"pricing":{"prompt":"1","completion":"2"}},
-                    {"id":"v/tiers","context_length":4096,"top_provider":{"max_completion_tokens":100},"pricing":{"prompt":"1","overrides":&tiers[..64]}}
+                    {"id":"v/tiers","context_length":4096,"top_provider":{"max_completion_tokens":100},"pricing":{"prompt":"1","overrides":&tiers[..64]}},
+                    // Live entries carry long lists the mapper never reads.
+                    {"id":"v/live","context_length":4096,"top_provider":{"max_completion_tokens":100,"is_moderated":false},"pricing":{"prompt":"0.000001","completion":"0.000002"},
+                        "supported_voices":(0..97).map(|n| format!("voice-{n}")).collect::<Vec<_>>(),"supported_parameters":vec!["seed"; 80]}
                 ]}).to_string())
             }
         }))
@@ -68,6 +71,14 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
                 {"provider_name":"Unknown","status":null,"pricing":{"prompt":"0","completion":"0","request":"0"}},
                 {"provider_name":"C\u{202e}lean","status":0,"context_length":0,"max_completion_tokens":0,"pricing":{"prompt":"3","completion":"3","request":"0","input_cache_write":"1e400"}}
             ]}))
+        }))
+        .route("/models/v/live/endpoints", axum::routing::get(|| async {
+            let list: Vec<_> = (0..90).map(|n| json!({
+                "provider_name":format!("Provider {n}"),"status":0,"max_completion_tokens":null,
+                "supported_parameters":vec!["seed"; 20],"uptime_last_30m":100,
+                "pricing":{"prompt":format!("0.000000{:02}", 90 - n),"completion":"0.000002","discount":0}
+            })).collect();
+            axum::Json(json!({"data":{"id":"v/live","endpoints":list}}))
         }))
         .route("/models/v/endpoint-large/endpoints", axum::routing::get(|| async {
             axum::Json(json!({"endpoints":[
@@ -82,8 +93,13 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
             let wide_hits = wide_hits.clone();
             async move {
                 let body = if wide_hits.fetch_add(1, Ordering::SeqCst) == 0 {
-                    let valid = json!({"endpoints":[{"provider_name":"Example","status":0,"pricing":{"prompt":"1","completion":"2"}}]}).to_string();
-                    format!(r#"{{{}{}"#, r#""metadata":0,"#.repeat(64), &valid[1..])
+                    // Fields the mapper never reads are not limited; a read
+                    // price object with more than 64 entries refuses.
+                    let mut pricing = json!({"prompt":"1","completion":"2"});
+                    for n in 0..63 {
+                        pricing[format!("extra_{n}")] = json!("1");
+                    }
+                    json!({"metadata":vec![0; 500],"endpoints":[{"provider_name":"Example","status":0,"supported_parameters":vec!["seed"; 100],"pricing":pricing}]}).to_string()
                 } else {
                     json!({"endpoints":[{"provider_name":"Recovered","status":0,"pricing":{"prompt":"3","completion":"3"}}]}).to_string()
                 };
@@ -141,6 +157,9 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
     let endpoint_wide = Uuid::new_v4();
     sqlx::query("INSERT INTO deployments(id,model_id,provider_connection_id,upstream_model) VALUES($1,$2,$3,'v/endpoint-wide')")
         .bind(endpoint_wide).bind(model).bind(connection).execute(&f.store.pool).await.unwrap();
+    let live = Uuid::new_v4();
+    sqlx::query("INSERT INTO deployments(id,model_id,provider_connection_id,upstream_model) VALUES($1,$2,$3,'v/live')")
+        .bind(live).bind(model).bind(connection).execute(&f.store.pool).await.unwrap();
     let image_model = Uuid::new_v4();
     let image_deployment = Uuid::new_v4();
     sqlx::query("INSERT INTO models(id,public_name,supported_protocols) VALUES($1,'preview-image',ARRAY['images'])")
@@ -283,7 +302,8 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
     assert_eq!(r.status(), StatusCode::OK);
     let out: Value = r.json().await.unwrap();
     assert_eq!(out["endpoint"]["selection"], "cheapest");
-    assert_eq!(out["endpoint"]["provider"], "Clean");
+    // The catalog sent "C\u{202e}lean": the filtered label names its position.
+    assert_eq!(out["endpoint"]["provider"], "Clean (endpoint 3 of 3)");
     assert_eq!(out["draft"]["output_token_limit"], 100);
     assert_eq!(out["draft"]["input_token_limit"], 4096);
     let lines = out["draft"]["price_lines"].as_array().unwrap();
@@ -340,6 +360,26 @@ async fn operator_preview_is_bounded_fail_closed_and_preserves_prices(pool: PgPo
         assert!(out.get("endpoint").is_none());
         assert!(!out["warnings"].to_string().contains("price was used"));
     }
+    let r = client
+        .get(format!(
+            "{gateway_url}/api/v1/platform/deployments/{live}/price-suggestion"
+        ))
+        .header("cookie", &admin_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let out: Value = r.json().await.unwrap();
+    assert_eq!(out["endpoint"]["selection"], "cheapest", "{out}");
+    assert_eq!(out["endpoint"]["provider"], "Provider 89");
+    assert_eq!(out["endpoint"]["endpoint_count"], 90);
+    let input = out["draft"]["price_lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["meter"] == "input_tokens")
+        .unwrap();
+    assert_eq!(input["microusd_per_batch"], "10000");
     let corrected_url =
         format!("{gateway_url}/api/v1/platform/deployments/{endpoint_wide}/price-suggestion");
     for _ in 0..2 {

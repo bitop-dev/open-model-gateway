@@ -2385,6 +2385,7 @@ mod jobs_fake {
             _: &Deployment,
             _: ChatRequest,
         ) -> Result<ProviderOutput, InferenceError> {
+            open_model_gateway::inference::dispatch::started();
             self.0.lock().unwrap().push("line");
             Ok(ProviderOutput::Complete(answer()))
         }
@@ -2888,6 +2889,7 @@ async fn realtime_accounting_runs_as_runtime(pool: &PgPool) {
             telemetry: AttemptTelemetry::default(),
             unopened_request: false,
             window: ResponseBound::unknown(100),
+            recorded_sequence: 1,
         })
         .await
         .unwrap();
