@@ -186,7 +186,11 @@ const OUT_OF_SCOPE: &[(&str, &str)] = &[
     ),
     (
         "management/governance/suggestion.rs",
-        "OpenRouter catalog price suggestions: an OpenRouter connection only, its client class",
+        "OpenRouter catalog price suggestions: an OpenRouter connection only",
+    ),
+    (
+        "management/governance/suggestion/catalog.rs",
+        "the price-suggestion catalog transport: the OpenRouter client class of the client it builds",
     ),
     (
         "management/models_ux.rs",
