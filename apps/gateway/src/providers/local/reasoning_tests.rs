@@ -288,3 +288,53 @@ async fn messages_local_reasoning_fields_must_agree() {
         task.abort();
     }
 }
+
+/// The same rule on a stream: a delta whose `reasoning_content` and
+/// `reasoning` disagree is refused before its text reaches the client.
+#[tokio::test]
+async fn messages_local_streamed_reasoning_fields_must_agree() {
+    use super::super::contract::messages_request;
+    for (other, valid) in [
+        (json!("The user wants"), true),
+        (Value::Null, true),
+        (json!("Something else"), false),
+    ] {
+        let mut frames = sglang_frames();
+        frames[1]["choices"][0]["delta"]["reasoning"] = other.clone();
+        let (base, task) = serve(Value::Null, frames).await;
+        let adapter = LocalAdapter::new(
+            Profile::Vllm,
+            Arc::new(NoSecrets),
+            Arc::new(ApprovedEndpoints::for_test(&base)),
+        );
+        let mut request = messages_request(json!({"thinking":{"type":"adaptive"}}));
+        request.stream = true;
+        let ProviderOutput::Stream(mut stream) = adapter
+            .execute(&target(Profile::Vllm, &base), request)
+            .await
+            .unwrap()
+        else {
+            panic!("expected stream")
+        };
+        let (mut reasoning, mut failed, mut done) = (String::new(), false, false);
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(ChatEvent::Reasoning(piece)) => reasoning.push_str(&piece),
+                Ok(ChatEvent::Done) => done = true,
+                Ok(_) => {}
+                Err(error) => {
+                    assert_eq!(error, InferenceError::InvalidUpstream);
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        assert_eq!((failed, done), (!valid, valid), "{other}");
+        assert_eq!(
+            reasoning,
+            if valid { "The user wants" } else { "" },
+            "{other}"
+        );
+        task.abort();
+    }
+}

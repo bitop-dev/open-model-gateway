@@ -525,10 +525,12 @@ pub(super) fn local_usage(value: &Value, profile: &str) -> Result<Usage> {
     Ok(usage)
 }
 
+#[cfg(test)]
 pub(super) fn decode_complete(value: &Value) -> Result<ChatResponse> {
     decode_complete_profile(value, None)
 }
 /// Structural failure still fails, but a valid usage object is kept as evidence.
+#[cfg(test)]
 pub(super) fn decode_complete_profile(
     value: &Value,
     profile: Option<&str>,
@@ -557,6 +559,26 @@ fn wire_error(value: &Value, messages: bool) -> InferenceError {
         InferenceError::InvalidUpstream
     }
 }
+/// Whether an OpenAI Chat wire `refusal` is accepted: only for Messages
+/// requests on the cloud wire (OpenAI and OpenRouter), where strict
+/// structured output lets a model decline. Messages has a refusal stop reason
+/// for it; Chat Completions and Responses clients keep refusing it as lossy,
+/// and local profiles never send structured output.
+fn accepts_refusal(profile: Option<&str>, messages: bool) -> bool {
+    messages && profile.is_none()
+}
+/// A nonempty string `refusal`. Null and `""` are no refusal; anything else
+/// is not a refusal this wire defines.
+fn refusal(value: &Value) -> Result<Option<&str>> {
+    match value {
+        Value::Null => Ok(None),
+        Value::String(text) => Ok((!text.is_empty()).then_some(text.as_str())),
+        _ => Err(InferenceError::InvalidUpstream),
+    }
+}
+const MESSAGE_FIELDS: &[&str] = &["role", "content", "tool_calls"];
+const REFUSAL_MESSAGE_FIELDS: &[&str] = &["role", "content", "tool_calls", "refusal"];
+
 fn decode_shape(value: &Value, profile: Option<&str>, messages: bool) -> Result<ChatResponse> {
     object(value)?;
     if !empty(&value["error"]) {
@@ -577,9 +599,14 @@ fn decode_shape(value: &Value, profile: Option<&str>, messages: bool) -> Result<
         LOCAL_STOP_FIELDS,
     )?;
     let message = &choice["message"];
+    let accepts_refusal = accepts_refusal(profile, messages);
     known_profile_fields(
         message,
-        &["role", "content", "tool_calls"],
+        if accepts_refusal {
+            REFUSAL_MESSAGE_FIELDS
+        } else {
+            MESSAGE_FIELDS
+        },
         profile,
         LOCAL_REASONING_FIELDS,
     )?;
@@ -616,12 +643,22 @@ fn decode_shape(value: &Value, profile: Option<&str>, messages: bool) -> Result<
         Some(_) if messages => local_reasoning(message)?,
         _ => None,
     };
+    let mut finish_reason = finish(&choice["finish_reason"])?;
+    // A refusal is the whole reply. Its text is the provider's explanation,
+    // not output: it is not returned as content and never logged; the body
+    // that held it was already read within the response bound.
+    if accepts_refusal && refusal(&message["refusal"])?.is_some() {
+        if content.as_deref().is_some_and(|c| !c.is_empty()) || !tool_calls.is_empty() {
+            return Err(InferenceError::InvalidUpstream);
+        }
+        finish_reason = FinishReason::Refusal;
+    }
     Ok(ChatResponse {
         messages_content: None,
         reasoning,
-        content,
+        content: content.filter(|c| finish_reason != FinishReason::Refusal || !c.is_empty()),
         tool_calls,
-        finish_reason: finish(&choice["finish_reason"])?,
+        finish_reason,
         usage: super::metering::with_model(
             match profile {
                 Some(profile) => local_usage(&value["usage"], profile)?,
@@ -630,119 +667,6 @@ fn decode_shape(value: &Value, profile: Option<&str>, messages: bool) -> Result<
             &value["model"],
         ),
     })
-}
-
-#[derive(Default)]
-pub(super) struct StreamState {
-    profile: Option<&'static str>,
-    messages: bool,
-    finished: bool,
-    used: bool,
-    /// First valid `model` any chunk reported; carried on the usage event.
-    model: Option<ReportedModel>,
-}
-
-impl StreamState {
-    pub(super) fn decode(&mut self, data: &[u8]) -> Result<Vec<ChatEvent>> {
-        if data == b"[DONE]" {
-            if !self.finished {
-                return Err(InferenceError::InvalidUpstream);
-            }
-            return Ok(vec![ChatEvent::Done]);
-        }
-        let value: Value =
-            serde_json::from_slice(data).map_err(|_| InferenceError::InvalidUpstream)?;
-        object(&value)?;
-        if !empty(&value["error"]) {
-            return Err(super::stream_error::openai_chat(&value, self.messages));
-        }
-        if self.model.is_none() {
-            self.model = ReportedModel::from_json(&value["model"]);
-        }
-        let choices = array(&value["choices"])?;
-        if choices.len() > 1 {
-            return Err(InferenceError::InvalidUpstream);
-        }
-        let mut events = Vec::new();
-        if let Some(choice) = choices.first() {
-            if self.finished || choice["index"].as_u64() != Some(0) {
-                return Err(InferenceError::InvalidUpstream);
-            }
-            known_profile_fields(
-                choice,
-                &["index", "delta", "finish_reason", "logprobs"],
-                self.profile,
-                LOCAL_STOP_FIELDS,
-            )?;
-            let delta = &choice["delta"];
-            known_profile_fields(
-                delta,
-                &["role", "content", "tool_calls"],
-                self.profile,
-                LOCAL_REASONING_FIELDS,
-            )?;
-            if !delta["role"].is_null() && delta["role"].as_str() != Some("assistant") {
-                return Err(InferenceError::InvalidUpstream);
-            }
-            let text = optional_string(&delta["content"])?;
-            let mut tool_calls = Vec::new();
-            if !delta["tool_calls"].is_null() {
-                for tool in array(&delta["tool_calls"])? {
-                    known_fields(tool, &["index", "id", "type", "function"])?;
-                    if !tool["type"].is_null() && tool["type"].as_str() != Some("function") {
-                        return Err(InferenceError::InvalidUpstream);
-                    }
-                    let index = tool["index"]
-                        .as_u64()
-                        .and_then(|v| u32::try_from(v).ok())
-                        .ok_or(InferenceError::InvalidUpstream)?;
-                    if index as usize >= MAX_TOOL_CALLS
-                        || tool_calls.iter().any(|t: &ToolCallDelta| t.index == index)
-                    {
-                        return Err(InferenceError::InvalidUpstream);
-                    }
-                    let function = &tool["function"];
-                    if !function.is_null() {
-                        known_fields(function, &["name", "arguments"])?;
-                    }
-                    tool_calls.push(ToolCallDelta {
-                        index,
-                        id: optional_string(&tool["id"])?,
-                        name: optional_string(&function["name"])?,
-                        arguments: optional_string(&function["arguments"])?,
-                    });
-                }
-            }
-            if self.messages
-                && self.profile.is_some()
-                && let Some(reasoning) = local_reasoning(delta)?
-            {
-                events.push(ChatEvent::Reasoning(reasoning));
-            }
-            if text.is_some() || !tool_calls.is_empty() {
-                events.push(ChatEvent::Delta { text, tool_calls });
-            }
-            if !choice["finish_reason"].is_null() {
-                events.push(ChatEvent::Finish(finish(&choice["finish_reason"])?));
-                self.finished = true;
-            }
-        } else if value["usage"].is_null() {
-            return Err(InferenceError::InvalidUpstream);
-        }
-        if !value["usage"].is_null() {
-            if self.used || !self.finished {
-                return Err(InferenceError::InvalidUpstream);
-            }
-            let mut usage = match self.profile {
-                Some(profile) => local_usage(&value["usage"], profile)?,
-                None => usage(&value["usage"])?,
-            };
-            usage.reported_model = self.model;
-            events.push(ChatEvent::Usage(usage));
-            self.used = true;
-        }
-        Ok(events)
-    }
 }
 
 /// Incremental byte framing: UTF-8 is decoded only after a complete line, so a
@@ -827,7 +751,7 @@ pub(super) fn decode_stream_profile(
     Box::pin(async_stream::try_stream! {
         let mut chunks = response.bytes_stream();
         let mut decoder = SseDecoder::new();
-        let mut state = StreamState { profile, messages, ..StreamState::default() };
+        let mut state = StreamState::new(profile, messages);
         while let Some(chunk) = chunks.next().await {
             let chunk = chunk.map_err(transport_error)?;
             for &byte in chunk.iter() {
@@ -847,6 +771,9 @@ pub(super) fn decode_stream_profile(
 
 mod audio;
 mod chat_controls;
+#[path = "openai/chat_stream.rs"]
+mod chat_stream;
+pub(super) use chat_stream::StreamState;
 mod images;
 mod jobs;
 mod local_fields;

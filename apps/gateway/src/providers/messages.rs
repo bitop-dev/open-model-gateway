@@ -77,6 +77,17 @@ pub(crate) fn validate_beta_headers<'a>(
     }
 }
 
+/// A `thinking` history block carries a signature only when it has a
+/// nonblank one: SDK accumulators replay a translated (unsigned) block with
+/// `"signature": ""`, which Anthropic would reject after admission. Translated
+/// routes remove thinking history whatever its signature.
+fn signed(block: &serde_json::Value) -> bool {
+    block
+        .get("signature")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty())
+}
+
 pub(crate) fn validate(request: &ChatRequest, class: ProviderClass) -> Result<(), InferenceError> {
     let Some(options) = &request.messages_options else {
         return Ok(());
@@ -105,7 +116,7 @@ pub(crate) fn validate(request: &ChatRequest, class: ProviderClass) -> Result<()
         && options
             .history_thinking
             .iter()
-            .any(|b| b["type"] == "thinking" && b.get("signature").is_none())
+            .any(|b| b["type"] == "thinking" && !signed(b))
     {
         return refuse("thinking");
     }

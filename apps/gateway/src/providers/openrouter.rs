@@ -495,7 +495,7 @@ fn messages_controls(body: &mut Value, request: &ChatRequest) {
 fn decode_chat(bytes: &[u8], messages: bool) -> Result<ChatResponse> {
     let (mut value, cost) = parse_protocol(bytes, messages)?;
     let reasoning = normalize_choices(&mut value)?;
-    let mut response = openai::decode_complete(&value)?;
+    let mut response = openai::decode_complete_protocol(&value, None, messages)?;
     response.usage.provider_cost_microusd = cost;
     // Only Messages clients receive the trace.
     response.reasoning = reasoning.filter(|_| messages);
@@ -557,7 +557,7 @@ fn decode_chat_stream(response: reqwest::Response, messages: bool) -> EventStrea
     Box::pin(async_stream::try_stream! {
         let mut chunks = response.bytes_stream();
         let mut decoder = openai::SseDecoder::new();
-        let mut state = openai::StreamState::default();
+        let mut state = openai::StreamState::new(None, messages);
         let mut finish = None;
         while let Some(chunk) = chunks.next().await {
             let chunk = chunk.map_err(transport)?;

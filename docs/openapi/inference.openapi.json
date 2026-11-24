@@ -2939,10 +2939,11 @@
         ]
       },
       "GenThinkingBlock": {
-        "$comment": "Assistant history only. This is the native Anthropic form: a native route refuses a thinking block without signature (400 thinking). Translated routes return thinking without a signature, also accept it back without one, and remove all thinking history before dispatch.",
+        "$comment": "Assistant history only. This is the native Anthropic form: a native route refuses a thinking block without a nonblank signature (400 thinking), so an empty signature is outside this schema and a whitespace-only one is refused by the native route's field rules. Translated routes return thinking without a signature, also accept it back without one or with an empty or blank one, and remove all thinking history before dispatch.",
         "additionalProperties": false,
         "properties": {
           "signature": {
+            "minLength": 1,
             "type": "string"
           },
           "thinking": {

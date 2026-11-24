@@ -623,3 +623,80 @@ async fn api_version_2023_06_01_maps_and_nulls_sampling_on_every_route() {
         }
     }
 }
+
+/// The withheld-reasoning path composed end to end: the real OpenRouter
+/// adapter stream, the engine's attempt wrapper and the Messages codec. With
+/// no `thinking` in the request no thinking block reaches the client, even
+/// though the upstream streamed reasoning; with `thinking` it does.
+#[tokio::test]
+async fn unrequested_streamed_reasoning_never_reaches_the_messages_client() {
+    let frame = |delta: Value, finish: Value, usage: Value| {
+        format!(
+            "data: {}\n\n",
+            json!({"id":"g","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":delta,"finish_reason":finish}],"usage":usage})
+        )
+    };
+    let body = [
+        frame(
+            json!({"role":"assistant","content":"","reasoning":"SECRET-PLAN"}),
+            Value::Null,
+            Value::Null,
+        ),
+        frame(json!({"content":"answer"}), Value::Null, Value::Null),
+        frame(json!({"content":""}), json!("stop"), Value::Null),
+        frame(
+            json!({"content":""}),
+            json!("stop"),
+            json!({"prompt_tokens":3,"completion_tokens":5}),
+        ),
+        "data: [DONE]\n\n".to_owned(),
+    ]
+    .concat();
+    let app = Router::new().fallback(move || {
+        let body = body.clone();
+        async move {
+            axum::response::Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(Body::from(body))
+                .unwrap()
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/api/v1", listener.local_addr().unwrap());
+    let _mock = Mock {
+        url: url.clone(),
+        task: tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }),
+    };
+    let adapter = crate::providers::openrouter::OpenRouterAdapter::for_test(
+        Arc::new(Resolver),
+        crate::providers::openrouter::OpenRouterConfig::default(),
+        url,
+    );
+    let (app, _repository) = frontend_adapter(Arc::new(adapter));
+    for (thinking, shown) in [
+        (None, false),
+        (Some(json!({"type":"adaptive","display":"omitted"})), false),
+        (Some(json!({"type":"adaptive"})), true),
+    ] {
+        let mut wire_body = json!({"model":"m","max_tokens":64,"stream":true,
+            "messages":[{"role":"user","content":"hi"}]});
+        if let Some(thinking) = &thinking {
+            wire_body["thinking"] = thinking.clone();
+        }
+        let mut request = wire(wire_body);
+        request.headers_mut().remove("anthropic-beta");
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(text.contains("event: message_stop"), "{text}");
+        assert!(text.contains("\"answer\""), "{text}");
+        assert_eq!(text.contains("SECRET-PLAN"), shown, "{thinking:?}: {text}");
+        assert_eq!(text.contains("\"thinking\""), shown, "{thinking:?}: {text}");
+    }
+}

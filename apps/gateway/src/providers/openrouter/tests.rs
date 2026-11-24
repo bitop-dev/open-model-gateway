@@ -1406,3 +1406,197 @@ async fn translated_reasoning_sdk_openrouter(pool: sqlx::PgPool) {
     assert_eq!(structured["tools"][0]["function"]["strict"], true);
     assert_eq!(structured["provider"]["require_parameters"], true);
 }
+
+fn structured_messages(stream: bool) -> ChatRequest {
+    let mut request = super::super::contract::messages_request(
+        json!({"output_config":{"format":{"type":"json_schema","schema":super::super::contract::output_schema()}}}),
+    );
+    request.stream = stream;
+    request
+}
+fn refusal_complete() -> Value {
+    let mut value = glm_complete();
+    value["choices"][0]["finish_reason"] = json!("stop");
+    value["choices"][0]["native_finish_reason"] = json!("stop");
+    value["choices"][0]["message"] = json!({"role":"assistant","content":null,"refusal":"I can't help with that.","reasoning":null});
+    value
+}
+fn refusal_stream() -> String {
+    [
+        chunk(
+            json!({"role":"assistant","content":"","refusal":"I can't "}),
+            None,
+            None,
+        ),
+        chunk(json!({"refusal":"help."}), None, None),
+        chunk(json!({"content":""}), Some("stop"), None),
+        chunk(
+            json!({"content":"","role":"assistant"}),
+            Some("stop"),
+            Some(glm_usage()),
+        ),
+        "data: [DONE]\n\n".to_owned(),
+    ]
+    .concat()
+}
+
+/// OpenRouter uses the OpenAI Chat wire: a Messages request under strict
+/// structured output may be declined with `refusal`. It ends the reply with
+/// `stop_reason: "refusal"`, the text is never returned, and the accounting
+/// repeat settles once. Chat Completions clients still refuse it as lossy.
+#[tokio::test]
+async fn messages_refusal_on_openrouter_ends_the_reply_without_its_text() {
+    let mock = Mock::json(refusal_complete()).await;
+    let ProviderOutput::Complete(response) = mock
+        .adapter()
+        .execute(&target("private"), structured_messages(false))
+        .await
+        .unwrap()
+    else {
+        panic!("expected complete")
+    };
+    assert_eq!(response.finish_reason, FinishReason::Refusal);
+    assert!(response.content.is_none() && response.tool_calls.is_empty());
+    assert_eq!(response.usage.output_tokens, Some(16));
+    assert!(matches!(
+        mock.adapter()
+            .execute(&target("private"), chat(false))
+            .await,
+        Err(InferenceError::InvalidUpstream)
+    ));
+
+    let mock = Mock::sse(refusal_stream(), 9).await;
+    let events = collect(&mock.adapter(), structured_messages(true)).await;
+    let (mut finish, mut usage, mut done) = (vec![], 0, false);
+    for event in events {
+        match event.unwrap() {
+            ChatEvent::Delta { text, tool_calls } => {
+                assert!(text.is_none_or(|t| t.is_empty()) && tool_calls.is_empty())
+            }
+            ChatEvent::Finish(reason) => finish.push(reason),
+            ChatEvent::Usage(_) => usage += 1,
+            ChatEvent::Done => done = true,
+            _ => panic!("no reasoning or native block in a refusal"),
+        }
+    }
+    assert_eq!(
+        (finish, usage, done),
+        (vec![FinishReason::Refusal], 1, true)
+    );
+    let events = collect(&mock.adapter(), chat(true)).await;
+    assert!(matches!(
+        events.last(),
+        Some(Err(InferenceError::InvalidUpstream))
+    ));
+}
+
+/// A Chat Completions request with a strict tool is sent as the shared
+/// OpenAI encoding plus only OpenRouter's fixed provider preferences and
+/// usage accounting: no `require_parameters`, no `reasoning`.
+#[tokio::test]
+async fn chat_strict_tools_are_sent_unchanged() {
+    let mock = Mock::json(glm_complete()).await;
+    let mut request = chat(false);
+    request.tools = vec![FunctionTool {
+        name: "lookup".into(),
+        description: Some("Look it up".into()),
+        parameters: json!({"type":"object","properties":{"q":{"type":"string"}},"required":["q"],"additionalProperties":false}),
+        strict: Some(true),
+    }];
+    mock.adapter()
+        .execute(&target("private"), request.clone())
+        .await
+        .unwrap();
+    let (_, _, body) = mock.last();
+    let mut expected = super::super::openai::encode("private", &request);
+    expected["provider"] = json!({"data_collection":"deny"});
+    expected["usage"] = json!({"include":true});
+    assert_eq!(body, expected);
+    assert_eq!(body["tools"][0]["function"]["strict"], true);
+    assert!(body.get("reasoning").is_none());
+    assert!(body["provider"].get("require_parameters").is_none());
+}
+
+/// For Messages, a frame that carries reasoning is content, never the
+/// accounting repeat, so reasoning after the finish frame is refused.
+/// Reasoning before the finish and a plain accounting repeat settle once.
+#[tokio::test]
+async fn messages_reasoning_frames_and_the_accounting_repeat() {
+    let thinking = || {
+        let mut r = super::super::contract::messages_request(
+            json!({"thinking":{"type":"enabled","budget_tokens":1024}}),
+        );
+        r.stream = true;
+        r
+    };
+    let late = [
+        chunk(json!({"role":"assistant","content":"answer"}), None, None),
+        chunk(json!({"content":""}), Some("stop"), None),
+        chunk(
+            json!({"content":"","reasoning":"late"}),
+            Some("stop"),
+            Some(glm_usage()),
+        ),
+        "data: [DONE]\n\n".to_owned(),
+    ]
+    .concat();
+    let mock = Mock::sse(late, 11).await;
+    let events = collect(&mock.adapter(), thinking()).await;
+    assert!(matches!(
+        events.last(),
+        Some(Err(InferenceError::InvalidUpstream))
+    ));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Ok(ChatEvent::Reasoning(_))))
+    );
+
+    let mock = Mock::sse(glm_stream(), 11).await;
+    let events = collect(&mock.adapter(), thinking()).await;
+    let count =
+        |f: fn(&ChatEvent) -> bool| events.iter().filter(|e| e.as_ref().is_ok_and(f)).count();
+    assert_eq!(count(|e| matches!(e, ChatEvent::Reasoning(_))), 1);
+    assert_eq!(count(|e| matches!(e, ChatEvent::Finish(_))), 1);
+    assert_eq!(count(|e| matches!(e, ChatEvent::Usage(_))), 1);
+    assert_eq!(count(|e| matches!(e, ChatEvent::Done)), 1);
+}
+
+/// Official Anthropic SDK -> listening gateway (PostgreSQL admission and
+/// settlement) -> OpenRouter adapter -> mock that declines structured output.
+#[cfg(feature = "integration-tests")]
+#[dbtest::test]
+async fn refusal_sdk_openrouter(pool: sqlx::PgPool) {
+    let mut complete = refusal_complete();
+    complete["choices"][0]["message"]["refusal"] = json!("SECRET-REFUSAL");
+    let complete = serde_json::to_vec(&complete).unwrap();
+    let stream = refusal_stream()
+        .replace("help.", "SECRET-REFUSAL")
+        .into_bytes();
+    let mock = Mock::reply(move |body| {
+        if body["stream"] == true {
+            (200, "text/event-stream", vec![stream.clone()], None)
+        } else {
+            (200, "application/json", vec![complete.clone()], None)
+        }
+    })
+    .await;
+    let attempts = super::super::contract::run_messages_sdk(
+        pool,
+        Arc::new(mock.adapter()),
+        target("private"),
+        "thinking-refusal.mjs",
+        &["refusal"],
+        false,
+    )
+    .await;
+    assert_eq!(attempts, 2, "one attempt per SDK request");
+    let capture = mock.requests.lock().unwrap();
+    assert_eq!(capture.len(), 2);
+    for request in capture.iter() {
+        assert_eq!(
+            request.body["response_format"]["json_schema"]["strict"],
+            true
+        );
+    }
+}

@@ -204,7 +204,11 @@ fn snapshot(id: &str, model: &str, response: &ChatResponse) -> Result<Value> {
     if let Some(thinking) = &response.reasoning {
         content.push(json!({"type":"thinking","thinking":thinking}));
     }
-    if let Some(text) = &response.content {
+    // A translated refusal carries no output: the empty text its frames may
+    // hold is not a block (the stream renders the same terminal content).
+    if let Some(text) = &response.content
+        && !(text.is_empty() && response.finish_reason == FinishReason::Refusal)
+    {
         content.push(json!({"type":"text","text":text}));
     }
     for call in &response.tool_calls {

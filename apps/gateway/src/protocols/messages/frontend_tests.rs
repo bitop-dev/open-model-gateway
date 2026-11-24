@@ -575,6 +575,33 @@ fn unsigned_thinking_history_is_removed_or_refused_by_route() {
     }
 }
 
+/// SDK accumulators replay a translated (unsigned) thinking block with
+/// `"signature": ""` after the client switches back to a Claude model. An
+/// empty or whitespace-only signature is no signature: the native route
+/// refuses it before admission, and translated routes remove it.
+#[test]
+fn empty_or_blank_signatures_are_unsigned_thinking() {
+    for signature in ["", " ", "\t \n"] {
+        let parsed = request(json!({"messages":[{"role":"user","content":"hello"},
+            {"role":"assistant","content":[{"type":"thinking","thinking":"plan","signature":signature},{"type":"text","text":"answer"}]},
+            {"role":"user","content":"continue"}]}))
+        .unwrap();
+        assert!(
+            matches!(
+                crate::providers::messages::validate(&parsed, ProviderClass::Anthropic),
+                Err(InferenceError::InvalidField("thinking"))
+            ),
+            "{signature:?}"
+        );
+        for class in [ProviderClass::OpenAi, ProviderClass::Local] {
+            assert!(
+                crate::providers::messages::validate(&parsed, class).is_ok(),
+                "{signature:?}"
+            );
+        }
+    }
+}
+
 fn sse_values(text: &str) -> Vec<Value> {
     text.lines()
         .filter_map(|line| line.strip_prefix("data: "))
@@ -900,4 +927,35 @@ fn thinking_is_shown_only_when_requested() {
             "{thinking:?}"
         );
     }
+}
+
+/// A translated refusal has no content: the empty text that refusal frames
+/// carry (`"content":""`) renders as no block, in JSON as in SSE, as when the
+/// complete reply's content is null.
+#[test]
+fn a_translated_refusal_renders_without_an_empty_text_block() {
+    for content in [None, Some(String::new())] {
+        let response = ChatResponse {
+            messages_content: None,
+            reasoning: None,
+            content,
+            tool_calls: vec![],
+            finish_reason: FinishReason::Refusal,
+            usage: Usage::default(),
+        };
+        let value = super::batch_response("msg_x", "m", &response).unwrap();
+        assert_eq!(value["stop_reason"], "refusal");
+        assert_eq!(value["content"], json!([]));
+    }
+    // An empty text block of an ordinary stop is unchanged.
+    let response = ChatResponse {
+        messages_content: None,
+        reasoning: None,
+        content: Some(String::new()),
+        tool_calls: vec![],
+        finish_reason: FinishReason::Stop,
+        usage: Usage::default(),
+    };
+    let value = super::batch_response("msg_x", "m", &response).unwrap();
+    assert_eq!(value["content"], json!([{"type":"text","text":""}]));
 }

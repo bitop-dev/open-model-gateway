@@ -638,7 +638,13 @@ pub(super) fn decode_native_result(endpoint: BatchEndpoint, line: &[u8]) -> Resu
         let body = &response["body"];
         if status == 200 {
             NativeOutcome::Succeeded(Box::new(if endpoint.is_generation() {
-                BatchResponse::Chat(super::decode_complete(body)?)
+                // Messages lines may carry strict structured output, whose
+                // refusal is a Messages stop reason (`decode_complete_protocol`).
+                BatchResponse::Chat(super::decode_complete_protocol(
+                    body,
+                    None,
+                    matches!(endpoint, BatchEndpoint::Messages),
+                )?)
             } else {
                 let n = body["data"].as_array().map_or(0, Vec::len);
                 let request = crate::inference::types::EmbeddingRequest {
