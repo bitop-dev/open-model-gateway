@@ -741,11 +741,14 @@ pub(super) async fn reconcile_realtime_response(
 ) -> ApiResult {
     let (mut tx, _) = resources::workspace_tx(&s, &u, ws).await?;
     resources::platform_write(&mut tx, &u).await?;
+    // A realtime session of this workspace with that response; anything else
+    // is not found (a foreign personal workspace already was, above).
     sqlx::query_scalar::<_, Uuid>(
-        "SELECT id FROM inference_executions WHERE workspace_id=$1 AND id=$2 AND workload_kind='realtime'",
+        "SELECT e.id FROM inference_executions e JOIN realtime_responses x ON x.execution_id=e.id AND x.sequence=$3 WHERE e.workspace_id=$1 AND e.id=$2 AND e.workload_kind='realtime'",
     )
     .bind(ws)
     .bind(execution)
+    .bind(sequence)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(missing)?;

@@ -302,6 +302,28 @@ async fn evidence_never_lowers_what_a_response_recorded(pool: PgPool) {
         Err(InferenceError::InvalidRequest)
     );
     assert_eq!(response(&f, id, 3).await.0, "unknown");
+    // Raising a recorded cached count lowers the recorded uncached input.
+    sqlx::query("INSERT INTO realtime_responses(execution_id,sequence,state,window_hold_microusd,input_text_tokens,cached_text_tokens,completed_at) VALUES($1,4,'unknown',0,10,4,clock_timestamp())")
+        .bind(id)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        resolve_response(
+            &f.store,
+            ws,
+            id,
+            4,
+            RealtimeUsage {
+                cached_text_tokens: 5,
+                ..U
+            },
+            "invoice",
+            f.owner
+        )
+        .await,
+        Err(InferenceError::InvalidRequest)
+    );
     // Equal or higher counts settle it (response 2 is still unknown).
     assert_eq!(
         resolve_response(&f.store, ws, id, 3, U, "invoice", f.owner).await,
@@ -449,12 +471,95 @@ async fn concurrent_resolutions_of_one_response_settle_it_once(pool: PgPool) {
 
 /// The response guard (0090) refuses every other change of a resolved or
 /// terminal response, whoever writes it.
+/// A session whose process died (lease expiry), reserving as
+/// `RealtimeSession` does (the first request resizes admission's window):
+/// response 1 settled from U, response 2 open; with `armed`, request 3's
+/// window reserved (and perhaps forwarded) but never opened as a response row.
+async fn expired_session(
+    f: &Fixture,
+    principal: crate::auth::Principal,
+    d: &Deployment,
+    armed: bool,
+) -> Uuid {
+    let id = open_session(f, principal, d).await;
+    let admission = Some(ResponseBound::admission(100));
+    realtime::reserve_window(&f.store, &principal, id, "company/smart", FULL, admission)
+        .await
+        .unwrap();
+    realtime::open_response(&f.store, id, 1, FULL)
+        .await
+        .unwrap();
+    realtime::settle_response(&f.store, id, 1, Some(ResponseStatus::Completed), Some(U), FULL)
+        .await
+        .unwrap();
+    realtime::reserve_window(&f.store, &principal, id, "company/smart", FULL, None)
+        .await
+        .unwrap();
+    realtime::open_response(&f.store, id, 2, FULL)
+        .await
+        .unwrap();
+    if armed {
+        realtime::reserve_window(&f.store, &principal, id, "company/smart", FULL, None)
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE governance_reservations SET lease_expires_at=now()-interval '1 second' WHERE execution_id=$1")
+        .bind(id)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(reconcile_expired(&f.store, 10).await.unwrap(), 1);
+    assert_eq!(response(&f, id, 2).await.0, "unknown");
+    id
+}
+
+#[dbtest::test]
+async fn a_lease_expired_session_settles_once_its_rows_explain_its_hold(pool: PgPool) {
+    let f = fixture(pool).await;
+    let d = realtime_model(&f, true).await;
+    let id = expired_session(&f, f.team, &d, false).await;
+    assert_eq!(amounts(&f, id).await.1, Some(RESPONSE + WINDOW));
+    assert_eq!(
+        resolve_response(&f.store, f.team.workspace_id, id, 2, U, "invoice:2", f.owner).await,
+        Ok(Resolved::Session)
+    );
+    assert_eq!(amounts(&f, id).await.2, Some(2 * RESPONSE));
+}
+
+#[dbtest::test]
+async fn a_window_without_a_response_row_keeps_the_session_unknown(pool: PgPool) {
+    let f = fixture(pool).await;
+    let d = realtime_model(&f, true).await;
+    let id = expired_session(&f, f.team, &d, true).await;
+    let before = amounts(&f, id).await;
+    // Request 3's window is held but has no row: the provider may have run it.
+    assert_eq!(before.1, Some(RESPONSE + 2 * WINDOW));
+    assert_eq!(
+        resolve_response(&f.store, f.team.workspace_id, id, 2, U, "invoice:2", f.owner).await,
+        Ok(Resolved::Response)
+    );
+    assert_eq!(response(&f, id, 2).await.0, "settled");
+    assert_eq!(amounts(&f, id).await, before);
+    assert!(ledger(&f, id).await.iter().all(|l| l.0 != "reconciliation"));
+    let settled: bool = sqlx::query_scalar("SELECT (metadata->>'session_settled')::boolean FROM audit_events WHERE action='realtime_response.reconciled' AND resource_id=$1")
+        .bind(id)
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    assert!(!settled);
+}
+
 #[dbtest::test]
 async fn a_resolved_response_never_changes_again(pool: PgPool) {
     let f = fixture(pool).await;
     let d = realtime_model(&f, true).await;
     let id = unknown_session(&f, f.team, &d, 2).await;
     resolve_response(&f.store, f.team.workspace_id, id, 2, U, "invoice", f.owner)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO realtime_responses(execution_id,sequence,state,window_hold_microusd,floor_microusd,unbounded_cost,input_text_tokens,cached_text_tokens,input_audio_tokens,cached_audio_tokens,output_text_tokens,output_audio_tokens,completed_at) VALUES($1,4,'unknown',0,5000,true,10,4,0,0,0,0,clock_timestamp())")
+        .bind(id)
+        .execute(&f.store.pool)
         .await
         .unwrap();
     for (n, sql) in [
@@ -473,6 +578,25 @@ async fn a_resolved_response_never_changes_again(pool: PgPool) {
         (
             3,
             "UPDATE realtime_responses SET state='settled',actual_microusd=0,input_text_tokens=0,cached_text_tokens=0,input_audio_tokens=0,cached_audio_tokens=0,output_text_tokens=0,output_audio_tokens=0 WHERE execution_id=$1 AND sequence=$2",
+        ),
+        // Response 4 (below): unbounded, with a known floor and recorded
+        // text input. A resolution keeps the unbounded mark, never values it
+        // below its floor and never lowers its uncached input.
+        (
+            4,
+            "UPDATE realtime_responses SET state='settled',actual_microusd=6000,unbounded_cost=false,evidence='e',resolved_at=now() WHERE execution_id=$1 AND sequence=$2",
+        ),
+        (
+            4,
+            "UPDATE realtime_responses SET state='settled',actual_microusd=100,evidence='e',resolved_at=now() WHERE execution_id=$1 AND sequence=$2",
+        ),
+        (
+            4,
+            "UPDATE realtime_responses SET state='settled',actual_microusd=6000,cached_text_tokens=8,evidence='e',resolved_at=now() WHERE execution_id=$1 AND sequence=$2",
+        ),
+        (
+            4,
+            "UPDATE realtime_responses SET state='settled',actual_microusd=6000,input_text_tokens=NULL,evidence='e',resolved_at=now() WHERE execution_id=$1 AND sequence=$2",
         ),
     ] {
         let error = sqlx::query(sql)

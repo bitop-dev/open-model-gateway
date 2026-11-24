@@ -765,8 +765,8 @@ async fn resolve_response_once(
     }
     super::reconcile::operator_authorized(store, &mut tx, actor, workspace).await?;
     let s = session(&mut tx, execution).await?;
-    let open: bool = sqlx::query_scalar(
-        "SELECT state='started' FROM inference_executions WHERE id=$1 AND started_at=$2",
+    let (open, expired): (bool, bool) = sqlx::query_as(
+        "SELECT state='started',error_code IS NOT DISTINCT FROM 'lease_expired' FROM inference_executions WHERE id=$1 AND started_at=$2",
     )
     .bind(execution)
     .bind(r.admitted_at)
@@ -776,15 +776,15 @@ async fn resolve_response_once(
     if r.state == "pending" || open {
         return Err(InferenceError::Busy);
     }
-    let row: Option<(String, Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<String>)> = sqlx::query_as(
-        "SELECT state,input_text_tokens,cached_text_tokens,input_audio_tokens,cached_audio_tokens,output_text_tokens,output_audio_tokens,evidence FROM realtime_responses WHERE execution_id=$1 AND sequence=$2 FOR UPDATE",
+    let row: Option<(String, Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<String>, Option<i64>)> = sqlx::query_as(
+        "SELECT state,input_text_tokens,cached_text_tokens,input_audio_tokens,cached_audio_tokens,output_text_tokens,output_audio_tokens,evidence,floor_microusd FROM realtime_responses WHERE execution_id=$1 AND sequence=$2 FOR UPDATE",
     )
     .bind(execution)
     .bind(sequence)
     .fetch_optional(&mut *tx)
     .await
     .map_err(storage)?;
-    let Some((state, a, b, c, d, e, f, recorded_evidence)) = row else {
+    let Some((state, a, b, c, d, e, f, recorded_evidence, floor)) = row else {
         return Err(InferenceError::InvalidRequest);
     };
     let row: ResponseRow = (state, [a, b, c, d, e, f], recorded_evidence);
@@ -804,12 +804,20 @@ async fn resolve_response_once(
         "pending" => return Err(InferenceError::Busy),
         _ => {}
     }
-    // Evidence never lowers what the response recorded.
+    // Evidence never lowers what the response recorded: no counter, and no
+    // uncached input (input minus cached) where both were recorded.
+    let [it, ct, ia, ca, ..] = row.1;
+    let [nit, nct, nia, nca, ..] = wanted.map(Option::unwrap_or_default);
+    let uncached_lowered = |input: Option<i64>, cached: Option<i64>, n_input: i64, n_cached: i64| {
+        input.zip(cached).is_some_and(|(i, c)| n_input - n_cached < i - c)
+    };
     if row
         .1
         .iter()
         .zip(wanted.iter())
         .any(|(recorded, new)| recorded.is_some_and(|old| new.is_some_and(|n| n < old)))
+        || uncached_lowered(it, ct, nit, nct)
+        || uncached_lowered(ia, ca, nia, nca)
     {
         return Err(InferenceError::InvalidRequest);
     }
@@ -824,7 +832,25 @@ async fn resolve_response_once(
     let bound = ResponseBound::unknown(u32::try_from(usage.output_tokens()).unwrap_or(u32::MAX));
     let (actual, _, _, components) = value_response(&price, usage, bound)?;
     let actual = actual.ok_or(InferenceError::Configuration)?;
+    // The floor the response's own usage proved is never undercut.
+    if floor.is_some_and(|f| actual < f) {
+        return Err(InferenceError::InvalidRequest);
+    }
     let components = components.map(|c| c.to_value());
+    // A session closed by `finish` gave every forwarded request a response
+    // row. One closed by lease expiry may still hold a reserved window with
+    // no row (a request forwarded before the process stopped, which the
+    // provider may have run): it settles only while its hold is exactly what
+    // its rows retain (settled actuals plus unknown windows or floors), read
+    // before this response changes it. Otherwise the response settles and
+    // the session keeps its hold, unknown.
+    let accounted = if expired {
+        let t = totals(&mut tx, execution).await?;
+        s.held_microusd.is_some()
+            && t.retained.and_then(|r| r.checked_add(t.actual)) == s.held_microusd
+    } else {
+        true
+    };
     let [it, ct, ia, ca, ot, oa] = wanted.map(Option::unwrap_or_default);
     let changed = sqlx::query("UPDATE realtime_responses SET state='settled',actual_microusd=$3,cost_components=$4,input_text_tokens=$5,cached_text_tokens=$6,input_audio_tokens=$7,cached_audio_tokens=$8,output_text_tokens=$9,output_audio_tokens=$10,evidence=$11,resolved_at=clock_timestamp() WHERE execution_id=$1 AND sequence=$2 AND state='unknown'")
         .bind(execution).bind(sequence).bind(actual).bind(&components)
@@ -834,7 +860,7 @@ async fn resolve_response_once(
         return Err(InferenceError::Storage);
     }
     let t = totals(&mut tx, execution).await?;
-    let settles = t.responses == t.settled;
+    let settles = accounted && t.responses == t.settled;
     if settles {
         // The session's last unknown response: it settles once, with the
         // responses' sum (`finish` would have written the same).
