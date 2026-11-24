@@ -190,13 +190,18 @@ pub trait ProviderAdapter: Send + Sync {
     }
     /// The create the gateway calls: with the job's idempotency key. An
     /// adapter whose provider supports idempotent create overrides this and
-    /// sends the key; the default creates without it.
+    /// sends the key; the default creates without it. The default refuses,
+    /// before sending anything, a target this adapter declares idempotent:
+    /// a resend without the key would be a second job.
     async fn create_video_keyed(
         &self,
         target: &Deployment,
         request: VideoRequest,
         _key: &VideoCreateKey,
     ) -> Result<UpstreamVideo, InferenceError> {
+        if self.idempotent_video_create(target) {
+            return Err(InferenceError::Configuration);
+        }
         self.create_video(target, request).await
     }
     async fn retrieve_video(

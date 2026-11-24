@@ -1450,3 +1450,154 @@ async fn a_process_that_dies_during_the_create_leaves_a_job_that_ends_interrupte
     assert!(held.is_some_and(|h| h > 0));
     assert_eq!(fake.calls(), ["create_video"]);
 }
+
+/// The failed create's attempt is recorded before its row ends, and the row
+/// is marked settled only when that record succeeded: here it fails (the
+/// ledger refuses it), the row ends `create_unconfirmed` unsettled, and a
+/// later read settles it, conservatively (unknown, hold kept).
+#[dbtest::test]
+async fn a_failed_create_whose_record_fails_is_settled_by_a_later_read(pool: PgPool) {
+    let f = fixture(pool).await;
+    video_setup(&f).await;
+    let fake = Fake::default();
+    let j = jobs(&f, &fake, false);
+    fake.0
+        .lock()
+        .unwrap()
+        .create_failures
+        .push_back((false, InferenceError::Timeout));
+    sqlx::raw_sql(
+        r#"CREATE FUNCTION refuse_ledger_662() RETURNS trigger LANGUAGE plpgsql AS
+             $$ BEGIN IF NEW.kind<>'hold' THEN RAISE EXCEPTION 'ledger refused'; END IF; RETURN NEW; END $$;
+           CREATE TRIGGER refuse_ledger_662 BEFORE INSERT ON monetary_ledger
+             FOR EACH ROW EXECUTE FUNCTION refuse_ledger_662();"#,
+    )
+    .execute(&f.store.pool)
+    .await
+    .unwrap();
+    let id = Uuid::new_v4();
+    assert_eq!(
+        j.create_video(f.principal, video_request(), id).await.err(),
+        Some(JobError::Inference(InferenceError::Timeout))
+    );
+    assert_eq!(
+        video_row(&f, id).await,
+        Some((
+            "failed".into(),
+            None,
+            Some("create_unconfirmed".into()),
+            false
+        ))
+    );
+    assert_eq!(amounts(&f, id).await.0, "pending");
+    sqlx::raw_sql("DROP TRIGGER refuse_ledger_662 ON monetary_ledger")
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    let job_id: Uuid = sqlx::query_scalar("SELECT id FROM async_jobs WHERE execution_id=$1")
+        .bind(id)
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    j.get_video(&f.principal, &client_id("video_", job_id))
+        .await
+        .unwrap();
+    assert!(video_row(&f, id).await.unwrap().3, "settled");
+    let (state, held, actual, _) = amounts(&f, id).await;
+    assert_eq!((state.as_str(), actual), ("unknown", None));
+    assert!(held.is_some_and(|h| h > 0));
+    assert_eq!(fake.calls(), ["create_video"]);
+}
+
+/// Once the first outcome was unknown, a resend that the provider refuses
+/// does not turn the job into "answered without a job": it stays
+/// `create_unconfirmed` and its hold is kept, while the client sees the
+/// resend's answer.
+#[dbtest::test]
+async fn a_refused_resend_after_an_unknown_outcome_stays_unconfirmed(pool: PgPool) {
+    let f = fixture(pool).await;
+    video_setup(&f).await;
+    let fake = Fake::default();
+    {
+        let mut script = fake.0.lock().unwrap();
+        script.idempotent = true;
+        script
+            .create_failures
+            .push_back((false, InferenceError::Timeout));
+        script
+            .create_failures
+            .push_back((false, InferenceError::UpstreamRejected));
+    }
+    let j = jobs(&f, &fake, false);
+    let id = Uuid::new_v4();
+    assert_eq!(
+        j.create_video(f.principal, video_request(), id).await.err(),
+        Some(JobError::Inference(InferenceError::UpstreamRejected))
+    );
+    assert_eq!(fake.calls(), ["create_video", "create_video"]);
+    assert_eq!(
+        video_row(&f, id).await,
+        Some((
+            "failed".into(),
+            None,
+            Some("create_unconfirmed".into()),
+            true
+        ))
+    );
+    assert_eq!(amounts(&f, id).await.0, "unknown");
+}
+
+/// An adapter that declares idempotent create but does not send the key
+/// (the default keyed create) is refused before anything is sent: a resend
+/// without the key would be a second job.
+#[tokio::test]
+async fn the_default_keyed_create_refuses_an_idempotent_declaration() {
+    struct Declares;
+    #[async_trait]
+    impl ProviderAdapter for Declares {
+        fn id(&self) -> &'static str {
+            "openai"
+        }
+        fn capabilities(&self) -> crate::inference::types::Capabilities {
+            crate::inference::types::Capabilities {
+                text_chat: false,
+                streaming: false,
+                tools: false,
+            }
+        }
+        fn idempotent_video_create(&self, _: &Deployment) -> bool {
+            true
+        }
+        async fn create_video(
+            &self,
+            _: &Deployment,
+            _: VideoRequest,
+        ) -> Result<UpstreamVideo, InferenceError> {
+            panic!("never called without the key");
+        }
+        async fn execute(
+            &self,
+            _: &Deployment,
+            _: crate::inference::types::ChatRequest,
+        ) -> Result<crate::inference::types::ProviderOutput, InferenceError> {
+            Err(InferenceError::Unsupported)
+        }
+    }
+    let target = Deployment {
+        id: Uuid::new_v4(),
+        provider: "openai".into(),
+        upstream_model: "m".into(),
+        credential_ref: "none".into(),
+        endpoint: None,
+        region: None,
+        supported_protocols: vec!["videos".into()],
+    };
+    let (created, nothing_sent) = crate::inference::dispatch::observe(Declares.create_video_keyed(
+        &target,
+        video_request(),
+        &VideoCreateKey::for_job(Uuid::new_v4()),
+    ))
+    .await;
+    assert_eq!(created.err(), Some(InferenceError::Configuration));
+    assert!(nothing_sent);
+}
