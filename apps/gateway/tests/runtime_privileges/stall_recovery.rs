@@ -105,6 +105,7 @@ impl ProviderAdapter for MockAdapter {
             }
             Ok(ProviderOutput::Complete(ChatResponse {
                 messages_content: None,
+                reasoning: None,
                 content: Some("controlled fixture".into()),
                 tool_calls: vec![],
                 finish_reason: FinishReason::Stop,

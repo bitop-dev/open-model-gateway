@@ -643,3 +643,26 @@ async fn error_tool_sdk_anthropic_preserves_boolean_presence(pool: sqlx::PgPool)
         );
     }
 }
+
+/// Official Anthropic SDK -> listening gateway -> native Anthropic route: an
+/// unsigned thinking block replayed with an empty or blank signature is
+/// refused before admission, so nothing reaches Anthropic and no attempt exists.
+#[cfg(feature = "integration-tests")]
+#[dbtest::test]
+async fn empty_signature_sdk_anthropic_is_refused_before_admission(pool: sqlx::PgPool) {
+    let mock = Mock::new(200, None).await;
+    let adapter = AnthropicAdapter::for_test(Arc::new(Resolver), mock.adapter.base.clone());
+    let mut deployment = target();
+    deployment.credential_ref = "env:FIXTURE_ONLY".into();
+    let attempts = super::super::contract::run_messages_sdk(
+        pool,
+        Arc::new(adapter),
+        deployment,
+        "thinking-refusal.mjs",
+        &["signature"],
+        false,
+    )
+    .await;
+    assert_eq!(attempts, 0);
+    assert!(mock.capture.lock().unwrap().is_empty());
+}

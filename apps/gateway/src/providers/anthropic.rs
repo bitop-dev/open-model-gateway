@@ -328,6 +328,11 @@ fn decode_for(value: &Value, messages: bool) -> Result<ChatResponse> {
     })
 }
 fn decode_shape(value: &Value, messages: bool) -> Result<ChatResponse> {
+    // `{"type":"error","error":{...}}` in a 200 (`error_envelope`), classified
+    // as the same `error` event in a stream is.
+    super::error_envelope::check(value, &["content"], &["usage"], |code| {
+        error_status(value, messages, code)
+    })?;
     fields(
         value,
         &[
@@ -387,6 +392,7 @@ fn decode_shape(value: &Value, messages: bool) -> Result<ChatResponse> {
     }
     Ok(ChatResponse {
         messages_content: messages.then(|| blocks.clone()),
+        reasoning: None,
         content: if text.is_empty() { None } else { Some(text) },
         tool_calls: calls,
         finish_reason: finish(&value["stop_reason"])?,
@@ -420,13 +426,15 @@ enum BlockKind {
 /// for a Messages client `generation_error` with the `prompt is too long`
 /// refinement (`anthropic_error`), exactly as `anthropic_generation_status`.
 fn stream_error(event: &Value, messages: bool) -> InferenceError {
-    super::stream_error::classify(&event["error"], |code| {
-        if messages {
-            generation_error(code, Some(event), anthropic_error)
-        } else {
-            status_error(code)
-        }
-    })
+    super::stream_error::classify(&event["error"], |code| error_status(event, messages, code))
+}
+/// The response path's class of HTTP `code` for the error body `event`.
+fn error_status(event: &Value, messages: bool, code: u16) -> InferenceError {
+    if messages {
+        generation_error(code, Some(event), anthropic_error)
+    } else {
+        status_error(code)
+    }
 }
 impl State {
     fn push(&mut self, value: Value) -> Result<Vec<ChatEvent>> {

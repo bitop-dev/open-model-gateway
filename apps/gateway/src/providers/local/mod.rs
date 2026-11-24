@@ -232,22 +232,22 @@ impl ProviderAdapter for LocalAdapter {
             framing::status(response.status())?;
             response
         };
-        if request.stream {
+        let output = if request.stream {
             framing::check_sse(&response)?;
-            Ok(ProviderOutput::Stream(openai::decode_stream_profile(
+            ProviderOutput::Stream(openai::decode_stream_profile(
                 response,
                 Some(self.id()),
                 request.messages_options.is_some(),
-            )))
+            ))
         } else {
             let value = framing::body_limit(response, request.response_limit()).await?;
-            let response = openai::decode_complete_protocol(
+            ProviderOutput::Complete(openai::decode_complete_protocol(
                 &value,
                 Some(self.id()),
                 request.messages_options.is_some(),
-            )?;
-            Ok(ProviderOutput::Complete(response))
-        }
+            )?)
+        };
+        Ok(super::messages::thinking_display(&request, output))
     }
     async fn execute_embeddings(
         &self,
@@ -286,7 +286,7 @@ impl ProviderAdapter for LocalAdapter {
         if native {
             embeddings::decode_ollama(&value, &request)
         } else {
-            embeddings::decode(&value, &request)
+            embeddings::decode(&value, &request, framing::status_error)
         }
     }
     async fn execute_rerank(

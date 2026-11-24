@@ -112,12 +112,18 @@ pub(super) fn classify(
 /// client `generation_error` as `generation_status` applies it.
 pub(super) fn openai_chat(value: &Value, messages: bool) -> InferenceError {
     classify(&value["error"], |code| {
-        if messages {
-            super::framing::generation_error(code, Some(value), super::framing::classified_error)
-        } else {
-            super::framing::status_error(code)
-        }
+        openai_chat_status(value, messages, code)
     })
+}
+/// The response path's class of HTTP `code` for an OpenAI-shaped chat body
+/// `value` (OpenAI and the local profiles): `framing::status_error`, and for
+/// a Messages client `generation_error` as `generation_status` applies it.
+pub(super) fn openai_chat_status(value: &Value, messages: bool, code: u16) -> InferenceError {
+    if messages {
+        super::framing::generation_error(code, Some(value), super::framing::classified_error)
+    } else {
+        super::framing::status_error(code)
+    }
 }
 
 #[cfg(test)]

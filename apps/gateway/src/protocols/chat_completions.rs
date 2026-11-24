@@ -347,7 +347,8 @@ pub async fn handle(
                             }
                             chunk(delta, Value::Null)
                         }
-                        Ok(ChatEvent::MessagesBlock(_)) => continue,
+                        // Messages-only events; adapters emit them only for Messages requests.
+                        Ok(ChatEvent::MessagesBlock(_) | ChatEvent::Reasoning(_)) => continue,
                         Ok(ChatEvent::Finish(reason)) => chunk(json!({}), json!(finish_reason(reason))),
                         Ok(ChatEvent::Usage(usage)) => {
                             if !include_usage { continue; }

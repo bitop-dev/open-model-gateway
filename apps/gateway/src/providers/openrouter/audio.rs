@@ -12,10 +12,13 @@
 //!   gateway values it locally from the exact character count.
 use serde_json::json;
 
-use super::{OpenRouterAdapter, embedded_error, parse, read, transport};
+use super::{OpenRouterAdapter, embedded_error, object, provider_cost, status_error, transport};
 use crate::{
     inference::{error::InferenceError, types::*},
-    providers::audio::{decode_transcription, media_type, read_json, speech_body},
+    providers::audio::{
+        SPEECH_OUTPUT, TRANSCRIPTION_OUTPUT, TRANSCRIPTION_USAGE, decode_transcription, media_type,
+        read_json, speech_body, transcription_evidence,
+    },
 };
 
 type Result<T> = std::result::Result<T, InferenceError>;
@@ -85,7 +88,17 @@ impl OpenRouterAdapter {
         }
         let response = self.post(target, "/audio/transcriptions", &body).await?;
         let bytes = read_json(response, transport).await?;
-        let (value, cost) = parse(&bytes)?;
+        let value = object(&bytes)?;
+        let cost = provider_cost(&bytes);
+        embedded_error(
+            &value,
+            TRANSCRIPTION_OUTPUT,
+            TRANSCRIPTION_USAGE,
+            &cost,
+            status_error,
+            || transcription_evidence(&bytes, &value, &request),
+        )?;
+        let cost = cost?;
         let mut decoded = decode_transcription(&bytes, &value, &request)?;
         decoded.usage.provider_cost_microusd = cost;
         Ok(decoded)
@@ -114,10 +127,21 @@ impl OpenRouterAdapter {
         if media_type(&response).as_deref() == Some("application/json") {
             // A 200 JSON body on speech is an embedded error (mapped by code)
             // or an unexpected envelope; never audio.
-            let bytes = read(response).await?;
-            let value: serde_json::Value =
-                serde_json::from_slice(&bytes).map_err(|_| InferenceError::InvalidUpstream)?;
-            embedded_error(&value)?;
+            // One that cannot be read whole is an invalid answer, as any
+            // non-audio answer is, not an unavailable provider.
+            let bytes = read_json(response, |_| InferenceError::InvalidUpstream).await?;
+            let value = object(&bytes)?;
+            let cost = provider_cost(&bytes);
+            // Speech is valued from its input; a JSON answer's usage is only
+            // evidence that the error may follow processing.
+            embedded_error(
+                &value,
+                SPEECH_OUTPUT,
+                &["usage"],
+                &cost,
+                status_error,
+                || None,
+            )?;
             return Err(InferenceError::InvalidUpstream);
         }
         speech_body(response, &request, transport).await

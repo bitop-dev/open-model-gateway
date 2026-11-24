@@ -451,6 +451,7 @@ pub(crate) enum Ev {
         args: String,
     },
     Block(Value),
+    Reasoning(String),
     Finish(FinishReason),
     Usage(Usage),
     Done,
@@ -459,6 +460,7 @@ pub(crate) enum Ev {
 pub(crate) fn flatten(event: ChatEvent) -> Vec<Ev> {
     match event {
         ChatEvent::MessagesBlock(v) => vec![Ev::Block(v)],
+        ChatEvent::Reasoning(v) => vec![Ev::Reasoning(v)],
         ChatEvent::Delta { text, tool_calls } => {
             let mut out = vec![];
             if let Some(t) = text {

@@ -718,6 +718,7 @@ fn decode_complete_limit(
         invoked_model(output.trace.as_ref().and_then(|t| t.prompt_router.as_ref()));
     Ok(ChatResponse {
         messages_content: None,
+        reasoning: None,
         content: (!text.is_empty()).then_some(text),
         tool_calls: calls,
         finish_reason: reason,

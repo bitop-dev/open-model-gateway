@@ -20,9 +20,9 @@ fn unlisted_row_table_and_installation_locks() {
 
 const GLOBAL: &str = r#"if !scoped(store) {
     sqlx::query("SELECT pg_advisory_xact_lock_shared(72419502)")
-        .execute(&mut *tx).await.map_err(accepted_storage)?;
+        .execute(&mut *tx).await.map_err(record_storage)?;
     sqlx::query_scalar::<_, Uuid>("SELECT id FROM installation WHERE singleton FOR NO KEY UPDATE",)
-        .fetch_one(&mut *tx).await.map_err(accepted_storage)?;
+        .fetch_one(&mut *tx).await.map_err(record_storage)?;
 }"#;
 
 #[test]

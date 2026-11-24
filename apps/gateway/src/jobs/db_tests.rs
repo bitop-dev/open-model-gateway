@@ -15,6 +15,14 @@ use std::sync::Mutex;
 #[derive(Default)]
 struct Script {
     video_hold: Option<Arc<FinalizeHold>>,
+    /// The provider makes a create with the same key the same job.
+    idempotent: bool,
+    /// The idempotency key of every create call, in order.
+    keys: Vec<String>,
+    /// Scripted create outcomes, before `videos` is consulted: `Some(true)`
+    /// fails before any request is built (nothing sent), `Some(false)` fails
+    /// after it was sent, each with the paired error.
+    create_failures: std::collections::VecDeque<(bool, InferenceError)>,
     videos: std::collections::VecDeque<UpstreamVideo>,
     batches: std::collections::VecDeque<UpstreamBatch>,
     calls: Vec<&'static str>,
@@ -73,6 +81,34 @@ impl ProviderAdapter for Fake {
     ) -> Result<crate::inference::types::ProviderOutput, InferenceError> {
         Err(InferenceError::Unsupported)
     }
+    fn idempotent_video_create(&self, _: &Deployment) -> bool {
+        self.0.lock().unwrap().idempotent
+    }
+    async fn create_video_keyed(
+        &self,
+        target: &Deployment,
+        request: VideoRequest,
+        key: &VideoCreateKey,
+    ) -> Result<UpstreamVideo, InferenceError> {
+        let failure = {
+            let mut script = self.0.lock().unwrap();
+            script.keys.push(key.as_str().to_owned());
+            script.create_failures.pop_front()
+        };
+        match failure {
+            Some((true, e)) => {
+                self.call("create_video");
+                Err(e)
+            }
+            Some((false, e)) => {
+                // Stands for a request that was built and sent.
+                crate::inference::dispatch::started();
+                self.call("create_video");
+                Err(e)
+            }
+            None => self.create_video(target, request).await,
+        }
+    }
     async fn create_video(
         &self,
         target: &Deployment,
@@ -80,6 +116,8 @@ impl ProviderAdapter for Fake {
     ) -> Result<UpstreamVideo, InferenceError> {
         assert_eq!(target.upstream_model, "mock-model");
         assert_eq!(request.prompt, "a calm lake");
+        // Stands for an upstream call: marked like a real request builder.
+        crate::inference::dispatch::started();
         self.call("create_video");
         let hold = self.0.lock().unwrap().video_hold.clone();
         if let Some(hold) = hold {
@@ -315,7 +353,8 @@ async fn unknown_or_failed_video_keeps_the_hold(pool: PgPool) {
     );
     assert_eq!(amounts(&f, b).await.0, "unknown");
     assert_eq!(amounts(&f, b).await.1, Some(4_000_000));
-    // The upstream create failing records a failed attempt (hold kept).
+    // The upstream create failing after its request was sent records a
+    // failed attempt (hold kept) and ends its job row `create_unconfirmed`.
     let c = Uuid::new_v4();
     assert_eq!(
         j.create_video(f.principal, video_request(), c).await.err(),
@@ -326,7 +365,14 @@ async fn unknown_or_failed_video_keeps_the_hold(pool: PgPool) {
         .fetch_one(&f.store.pool)
         .await
         .unwrap();
-    assert_eq!(jobs, 2);
+    assert_eq!(jobs, 3);
+    let ended: (String, Option<String>) =
+        sqlx::query_as("SELECT state,error_code FROM async_jobs WHERE execution_id=$1")
+            .bind(c)
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(ended, ("failed".into(), Some("create_unconfirmed".into())));
 }
 
 #[dbtest::test]
@@ -834,11 +880,12 @@ async fn a_failed_job_claim_names_its_cause(pool: PgPool) {
     assert_eq!(signals, [("job_storage", "lock_timeout")]);
 }
 
-/// #497: a job record that fails after admission and the provider's
-/// acceptance leaves the reservation pending with no job to settle it (only
-/// reconciliation does): counted at `job_settlement`, not `job_storage`.
+/// #497, #662: the job record is written before the provider call, so a
+/// record that fails sends nothing: no provider call, no job row, and the
+/// attempt settles as a known zero. Counted at `job_storage` (no hold is left
+/// to reconciliation).
 #[dbtest::test]
-async fn a_job_record_failing_after_acceptance_is_a_settlement_failure(pool: PgPool) {
+async fn a_job_record_failing_before_the_provider_call_sends_nothing(pool: PgPool) {
     use crate::db::{
         accounting_failure::tests::labels,
         diagnostics::{self, Handle},
@@ -868,23 +915,20 @@ async fn a_job_record_failing_after_acceptance_is_a_settlement_failure(pool: PgP
         created,
         Err(JobError::Inference(InferenceError::Storage))
     ));
-    assert_eq!(fake.calls(), ["create_video"], "the provider accepted it");
-    assert_eq!(
-        amounts(&f, request_id).await.0,
-        "pending",
-        "the hold stays until reconciliation"
-    );
+    assert!(fake.calls().is_empty(), "nothing was sent");
+    assert_eq!(video_row(&f, request_id).await, None);
+    let (state, _, actual, _) = amounts(&f, request_id).await;
+    assert_eq!((state.as_str(), actual), ("settled", Some(0)));
     assert_eq!(
         labels(&handle.signals()),
-        [("job_settlement", "other_database")]
+        [("job_storage", "other_database")]
     );
 }
 
-/// #640: the video job row and the extension of its reservation's lease are
-/// one transaction. When the lease cannot be extended, no job row is left
-/// behind whose reservation a short lease would turn `unknown` while the
-/// provider's video is polled: the create fails and the reservation keeps the
-/// hold it was admitted with, for reconciliation.
+/// #640, #662: the video job row and the extension of its reservation's
+/// lease are one transaction, written before the provider call. When the
+/// lease cannot be extended, no job row is left and the provider is never
+/// called: the attempt settles as a known zero.
 #[dbtest::test]
 async fn a_video_lease_that_cannot_be_extended_leaves_no_job_row(pool: PgPool) {
     let f = fixture(pool).await;
@@ -902,19 +946,20 @@ async fn a_video_lease_that_cannot_be_extended_leaves_no_job_row(pool: PgPool) {
     .await;
     assert_eq!(
         crate::db::accounting_failure::tests::labels(&handle.signals()),
-        [("job_settlement", "other_database")]
+        [("job_storage", "other_database")]
     );
     assert!(matches!(
         created,
         Err(JobError::Inference(InferenceError::Storage))
     ));
-    assert_eq!(fake.calls(), ["create_video"], "the provider accepted it");
+    assert!(fake.calls().is_empty(), "nothing was sent");
     let jobs_left: i64 = sqlx::query_scalar("SELECT count(*) FROM async_jobs")
         .fetch_one(&f.store.pool)
         .await
         .unwrap();
     assert_eq!(jobs_left, 0);
-    assert_eq!(amounts(&f, request_id).await.0, "pending");
+    assert_eq!(amounts(&f, request_id).await.0, "settled");
+    assert_eq!(amounts(&f, request_id).await.2, Some(0));
 }
 
 /// Reject later lease-extension UPDATEs; initial final-lease INSERTs remain valid.
@@ -936,7 +981,7 @@ pub(super) async fn refuse_lease_extensions(pool: &PgPool) {
 }
 
 #[dbtest::test]
-async fn a_failed_video_commit_is_a_settlement_failure_and_leaves_no_job(pool: PgPool) {
+async fn a_failed_video_record_commit_sends_nothing_and_leaves_no_job(pool: PgPool) {
     let f = fixture(pool).await;
     video_setup(&f).await;
     sqlx::raw_sql("CREATE FUNCTION refuse_job_commit_640() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'commit refused'; END $$; CREATE CONSTRAINT TRIGGER refuse_job_commit_640 AFTER INSERT ON async_jobs DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION refuse_job_commit_640()")
@@ -957,22 +1002,20 @@ async fn a_failed_video_commit_is_a_settlement_failure_and_leaves_no_job(pool: P
     ));
     assert_eq!(
         crate::db::accounting_failure::tests::labels(&handle.signals()),
-        [("job_settlement", "other_database")]
+        [("job_storage", "other_database")]
     );
-    assert_eq!(fake.calls(), ["create_video"]);
+    assert!(fake.calls().is_empty(), "nothing was sent");
     let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM async_jobs")
         .fetch_one(&f.store.pool)
         .await
         .unwrap();
     assert_eq!(jobs, 0);
-    let (state, held, actual, _) = amounts(&f, request_id).await;
-    assert_eq!(state, "pending");
-    assert!(held.is_some_and(|h| h > 0));
-    assert_eq!(actual, None);
+    let (state, _, actual, _) = amounts(&f, request_id).await;
+    assert_eq!((state.as_str(), actual), ("settled", Some(0)));
 }
 
 #[dbtest::test]
-async fn an_accepted_video_transaction_that_cannot_begin_is_a_settlement_failure(pool: PgPool) {
+async fn a_video_record_transaction_that_cannot_begin_is_a_storage_failure(pool: PgPool) {
     let f = fixture(pool).await;
     f.store.pool.close().await;
     let handle = crate::db::diagnostics::Handle::new();
@@ -989,7 +1032,7 @@ async fn an_accepted_video_transaction_that_cannot_begin_is_a_settlement_failure
     assert_eq!(result, Err(InferenceError::Storage));
     assert_eq!(
         crate::db::accounting_failure::tests::labels(&handle.signals()),
-        [("job_settlement", "pool_closed")]
+        [("job_storage", "pool_closed")]
     );
 }
 
@@ -1035,7 +1078,7 @@ async fn a_video_reconciled_during_the_provider_call_is_recorded_and_finishes(po
 }
 
 #[dbtest::test]
-async fn an_accepted_video_global_prefix_failure_is_a_settlement_failure(pool: PgPool) {
+async fn a_video_record_global_prefix_failure_is_a_storage_failure(pool: PgPool) {
     let f = fixture(pool).await;
     let limited = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
@@ -1072,7 +1115,7 @@ async fn an_accepted_video_global_prefix_failure_is_a_settlement_failure(pool: P
     assert_eq!(result, Err(InferenceError::Storage));
     assert_eq!(
         crate::db::accounting_failure::tests::labels(&handle.signals()),
-        [("job_settlement", "lock_timeout")]
+        [("job_storage", "lock_timeout")]
     );
     store.pool.close().await;
 }
@@ -1228,4 +1271,794 @@ async fn a_refused_video_observation_never_settles(pool: PgPool) {
             .await
             .unwrap();
     assert_eq!(state, "settled");
+}
+
+/// The job row of an execution: (state, upstream id, error code, settled).
+async fn video_row(
+    f: &Fixture,
+    execution: Uuid,
+) -> Option<(String, Option<String>, Option<String>, bool)> {
+    sqlx::query_as("SELECT state,upstream_id,error_code,settled_at IS NOT NULL FROM async_jobs WHERE execution_id=$1")
+        .bind(execution)
+        .fetch_optional(&f.store.pool)
+        .await
+        .unwrap()
+}
+/// The ledger of an execution: (kind, amount), by kind.
+async fn ledger(f: &Fixture, execution: Uuid) -> Vec<(String, Option<i64>)> {
+    sqlx::query_as(
+        "SELECT kind,amount_microusd FROM monetary_ledger WHERE execution_id=$1 ORDER BY kind",
+    )
+    .bind(execution)
+    .fetch_all(&f.store.pool)
+    .await
+    .unwrap()
+}
+
+/// #662: the provider accepts the video, then the database refuses the write
+/// that carries its id. The job stays tracked: a row exists, clients see it
+/// queued (never running, no provider call), and once the create grace has
+/// passed the poller ends it `create_interrupted` with its hold kept.
+#[dbtest::test]
+async fn a_record_failure_after_the_provider_accepts_leaves_a_tracked_job(pool: PgPool) {
+    let f = fixture(pool).await;
+    video_setup(&f).await;
+    sqlx::raw_sql(
+        r#"CREATE FUNCTION refuse_video_id_662() RETURNS trigger LANGUAGE plpgsql AS
+             $$ BEGIN RAISE EXCEPTION 'video id write refused'; END $$;
+           CREATE TRIGGER refuse_video_id_662 BEFORE INSERT OR UPDATE ON async_jobs
+             FOR EACH ROW WHEN (NEW.upstream_id IS NOT NULL) EXECUTE FUNCTION refuse_video_id_662();"#,
+    )
+    .execute(&f.store.pool)
+    .await
+    .unwrap();
+    let fake = Fake::default();
+    let j = jobs(&f, &fake, true);
+    fake.push_video(upstream_video(JobState::Queued, Some(8)));
+    let request_id = Uuid::new_v4();
+    let created = j
+        .create_video(f.principal, video_request(), request_id)
+        .await;
+    assert!(matches!(
+        created,
+        Err(JobError::Inference(InferenceError::Storage))
+    ));
+    assert_eq!(fake.calls(), ["create_video"], "the provider accepted it");
+    assert_eq!(
+        video_row(&f, request_id).await,
+        Some(("queued".into(), None, None, false)),
+        "the job is tracked"
+    );
+    let (state, held, actual, _) = amounts(&f, request_id).await;
+    assert_eq!(state, "pending");
+    assert!(held.is_some_and(|h| h > 0));
+    assert_eq!(actual, None);
+    // Clients see it queued with no progress, and no provider call is made.
+    let listed = j.list_videos(&f.principal, None, 10, false).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    let id = client_id("video_", listed[0].id);
+    let read = j.get_video(&f.principal, &id).await.unwrap();
+    let shown = video::render(&read);
+    assert_eq!(
+        (shown["status"].as_str(), shown["progress"].as_i64()),
+        (Some("queued"), Some(0))
+    );
+    assert!(shown["error"].is_null());
+    assert!(matches!(
+        j.video_content(&f.principal, &id, VideoAsset::Video).await,
+        Err(JobError::Conflict("video_not_ready", _))
+    ));
+    assert!(matches!(
+        j.delete_video(&f.principal, &id).await,
+        Err(JobError::Conflict("video_in_progress", _))
+    ));
+    // Within the grace the poller leaves it alone.
+    sqlx::query("UPDATE async_jobs SET next_poll_at=now()")
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(j.poll_once().await.unwrap(), 1);
+    assert_eq!(video_row(&f, request_id).await.unwrap().0, "queued");
+    // Past the grace: failed, settled as cancelled with unknown usage.
+    let mut later = j.clone();
+    later.video_create_grace = TimeDelta::seconds(0);
+    sqlx::query("UPDATE async_jobs SET next_poll_at=now()")
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(later.poll_once().await.unwrap(), 1);
+    assert_eq!(
+        video_row(&f, request_id).await,
+        Some((
+            "failed".into(),
+            None,
+            Some("create_interrupted".into()),
+            true
+        ))
+    );
+    let (state, after, actual, _) = amounts(&f, request_id).await;
+    assert_eq!((state.as_str(), after, actual), ("unknown", held, None));
+    assert_eq!(
+        ledger(&f, request_id).await,
+        [("hold".into(), held), ("unknown".into(), Some(0))]
+    );
+    assert_eq!(
+        fake.calls(),
+        ["create_video"],
+        "never polled with an empty id"
+    );
+    // A finished video without a provider id has no provider assets.
+    let failed = video::render(&j.get_video(&f.principal, &id).await.unwrap());
+    assert_eq!(failed["error"]["code"], "create_interrupted");
+    j.delete_video(&f.principal, &id).await.unwrap();
+    assert_eq!(fake.calls(), ["create_video"]);
+}
+
+/// A create that built no request: the row ends `create_failed`, settled,
+/// and the attempt is a known zero (#814). A record that cannot be written
+/// before the call sends nothing either: no row, a known zero.
+#[dbtest::test]
+async fn a_video_create_that_sent_nothing_settles_as_a_known_zero(pool: PgPool) {
+    let f = fixture(pool).await;
+    video_setup(&f).await;
+    let fake = Fake::default();
+    let j = jobs(&f, &fake, false);
+    fake.0
+        .lock()
+        .unwrap()
+        .create_failures
+        .push_back((true, InferenceError::Configuration));
+    let a = Uuid::new_v4();
+    assert_eq!(
+        j.create_video(f.principal, video_request(), a).await.err(),
+        Some(JobError::Inference(InferenceError::Configuration))
+    );
+    assert_eq!(
+        video_row(&f, a).await,
+        Some(("failed".into(), None, Some("create_failed".into()), true))
+    );
+    let (state, held, actual, _) = amounts(&f, a).await;
+    assert_eq!((state.as_str(), actual), ("settled", Some(0)));
+    assert_eq!(
+        ledger(&f, a).await,
+        [("hold".into(), held), ("settlement".into(), Some(0))]
+    );
+    // The record refused: the provider is never called.
+    sqlx::raw_sql(
+        r#"CREATE FUNCTION refuse_video_record_662() RETURNS trigger LANGUAGE plpgsql AS
+             $$ BEGIN RAISE EXCEPTION 'video record refused'; END $$;
+           CREATE TRIGGER refuse_video_record_662 BEFORE INSERT ON async_jobs
+             FOR EACH ROW EXECUTE FUNCTION refuse_video_record_662();"#,
+    )
+    .execute(&f.store.pool)
+    .await
+    .unwrap();
+    let b = Uuid::new_v4();
+    let handle = crate::db::diagnostics::Handle::new();
+    let created = crate::db::diagnostics::scope(
+        handle.clone(),
+        j.create_video(f.principal, video_request(), b),
+    )
+    .await;
+    assert_eq!(
+        created.err(),
+        Some(JobError::Inference(InferenceError::Storage))
+    );
+    assert_eq!(
+        crate::db::accounting_failure::tests::labels(&handle.signals()),
+        [("job_storage", "other_database")]
+    );
+    assert_eq!(
+        fake.calls(),
+        ["create_video"],
+        "only the first create was called"
+    );
+    assert_eq!(video_row(&f, b).await, None);
+    assert_eq!(amounts(&f, b).await.0, "settled");
+    assert_eq!(amounts(&f, b).await.2, Some(0));
+}
+
+/// A create that times out after its request was sent, on a provider without
+/// idempotent create: one call only, the row ends `create_unconfirmed` and
+/// the hold is kept (the provider may have the video).
+#[dbtest::test]
+async fn a_video_create_with_an_unknown_outcome_keeps_its_hold(pool: PgPool) {
+    let f = fixture(pool).await;
+    video_setup(&f).await;
+    let fake = Fake::default();
+    let j = jobs(&f, &fake, false);
+    fake.0
+        .lock()
+        .unwrap()
+        .create_failures
+        .push_back((false, InferenceError::Timeout));
+    fake.push_video(upstream_video(JobState::Queued, Some(8)));
+    let id = Uuid::new_v4();
+    assert_eq!(
+        j.create_video(f.principal, video_request(), id).await.err(),
+        Some(JobError::Inference(InferenceError::Timeout))
+    );
+    assert_eq!(
+        fake.calls(),
+        ["create_video"],
+        "no resend without idempotency"
+    );
+    assert_eq!(
+        video_row(&f, id).await,
+        Some((
+            "failed".into(),
+            None,
+            Some("create_unconfirmed".into()),
+            true
+        ))
+    );
+    let (state, held, actual, _) = amounts(&f, id).await;
+    assert_eq!((state.as_str(), actual), ("unknown", None));
+    assert!(held.is_some_and(|h| h > 0));
+}
+
+/// Where the provider makes a create with the same key the same job, a
+/// create whose outcome is unknown is resent once with that key, and the job
+/// is tracked with the provider's id.
+#[dbtest::test]
+async fn an_idempotent_provider_gets_one_keyed_resend(pool: PgPool) {
+    let f = fixture(pool).await;
+    video_setup(&f).await;
+    let fake = Fake::default();
+    {
+        let mut script = fake.0.lock().unwrap();
+        script.idempotent = true;
+        script
+            .create_failures
+            .push_back((false, InferenceError::UpstreamUnavailable));
+    }
+    let j = jobs(&f, &fake, false);
+    fake.push_video(upstream_video(JobState::Queued, Some(8)));
+    let id = Uuid::new_v4();
+    let job = j
+        .create_video(f.principal, video_request(), id)
+        .await
+        .unwrap();
+    assert_eq!(fake.calls(), ["create_video", "create_video"]);
+    let keys = fake.0.lock().unwrap().keys.clone();
+    assert_eq!(
+        keys,
+        [
+            format!("omg-video-{}", job.id),
+            format!("omg-video-{}", job.id)
+        ]
+    );
+    assert!(job.upstream_id.is_some());
+    assert_eq!(job.state, "queued");
+    assert_eq!(amounts(&f, id).await.0, "pending");
+    // A second failure of the resend is not resent again.
+    {
+        let mut script = fake.0.lock().unwrap();
+        script
+            .create_failures
+            .push_back((false, InferenceError::Timeout));
+        script
+            .create_failures
+            .push_back((false, InferenceError::Timeout));
+    }
+    let other = Uuid::new_v4();
+    assert_eq!(
+        j.create_video(f.principal, video_request(), other)
+            .await
+            .err(),
+        Some(JobError::Inference(InferenceError::Timeout))
+    );
+    assert_eq!(fake.calls().len(), 4);
+    assert_eq!(
+        video_row(&f, other).await.unwrap().2.as_deref(),
+        Some("create_unconfirmed")
+    );
+}
+
+/// The process dies after the record, while the provider create runs (the
+/// create future is never finished nor dropped). Lease reconciliation finds
+/// nothing (the lease covers the job), and the first poll after the create
+/// grace ends the job `create_interrupted` with its hold kept, without a
+/// provider call.
+#[dbtest::test]
+async fn a_process_that_dies_during_the_create_leaves_a_job_that_ends_interrupted(pool: PgPool) {
+    let f = fixture(pool).await;
+    video_setup(&f).await;
+    let fake = Fake::default();
+    let hold = Arc::new(FinalizeHold::default());
+    hold.arm();
+    fake.0.lock().unwrap().video_hold = Some(hold.clone());
+    let j = jobs(&f, &fake, true);
+    fake.push_video(upstream_video(JobState::Queued, Some(8)));
+    let id = Uuid::new_v4();
+    let mut create = Box::pin(j.create_video(f.principal, video_request(), id));
+    tokio::select! {
+        _ = &mut create => panic!("the create is held at the provider"),
+        () = hold.reached() => {}
+    }
+    // Death: nothing after this point of the create ever runs.
+    std::mem::forget(create);
+    assert_eq!(
+        video_row(&f, id).await,
+        Some(("queued".into(), None, None, false))
+    );
+    assert_eq!(
+        crate::governance::reconcile_expired(&f.store, 100)
+            .await
+            .unwrap(),
+        0
+    );
+    let mut later = j.clone();
+    later.video_create_grace = TimeDelta::seconds(0);
+    sqlx::query("UPDATE async_jobs SET next_poll_at=now()")
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(later.poll_once().await.unwrap(), 1);
+    assert_eq!(
+        video_row(&f, id).await,
+        Some((
+            "failed".into(),
+            None,
+            Some("create_interrupted".into()),
+            true
+        ))
+    );
+    let (state, held, actual, _) = amounts(&f, id).await;
+    assert_eq!((state.as_str(), actual), ("unknown", None));
+    assert!(held.is_some_and(|h| h > 0));
+    assert_eq!(fake.calls(), ["create_video"]);
+}
+
+/// The failed create's attempt is recorded before its row ends, and the row
+/// is marked settled only when that record succeeded: here it fails (the
+/// ledger refuses it), the row ends `create_unconfirmed` unsettled, and a
+/// later read settles it, conservatively (unknown, hold kept).
+#[dbtest::test]
+async fn a_failed_create_whose_record_fails_is_settled_by_a_later_read(pool: PgPool) {
+    let f = fixture(pool).await;
+    video_setup(&f).await;
+    let fake = Fake::default();
+    let j = jobs(&f, &fake, false);
+    fake.0
+        .lock()
+        .unwrap()
+        .create_failures
+        .push_back((false, InferenceError::Timeout));
+    sqlx::raw_sql(
+        r#"CREATE FUNCTION refuse_ledger_662() RETURNS trigger LANGUAGE plpgsql AS
+             $$ BEGIN IF NEW.kind<>'hold' THEN RAISE EXCEPTION 'ledger refused'; END IF; RETURN NEW; END $$;
+           CREATE TRIGGER refuse_ledger_662 BEFORE INSERT ON monetary_ledger
+             FOR EACH ROW EXECUTE FUNCTION refuse_ledger_662();"#,
+    )
+    .execute(&f.store.pool)
+    .await
+    .unwrap();
+    let id = Uuid::new_v4();
+    assert_eq!(
+        j.create_video(f.principal, video_request(), id).await.err(),
+        Some(JobError::Inference(InferenceError::Timeout))
+    );
+    assert_eq!(
+        video_row(&f, id).await,
+        Some((
+            "failed".into(),
+            None,
+            Some("create_unconfirmed".into()),
+            false
+        ))
+    );
+    assert_eq!(amounts(&f, id).await.0, "pending");
+    sqlx::raw_sql("DROP TRIGGER refuse_ledger_662 ON monetary_ledger")
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    let job_id: Uuid = sqlx::query_scalar("SELECT id FROM async_jobs WHERE execution_id=$1")
+        .bind(id)
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    j.get_video(&f.principal, &client_id("video_", job_id))
+        .await
+        .unwrap();
+    assert!(video_row(&f, id).await.unwrap().3, "settled");
+    let (state, held, actual, _) = amounts(&f, id).await;
+    assert_eq!((state.as_str(), actual), ("unknown", None));
+    assert!(held.is_some_and(|h| h > 0));
+    assert_eq!(fake.calls(), ["create_video"]);
+}
+
+/// Once the first outcome was unknown, a resend that the provider refuses
+/// does not turn the job into "answered without a job": it stays
+/// `create_unconfirmed` and its hold is kept, while the client sees the
+/// resend's answer.
+#[dbtest::test]
+async fn a_refused_resend_after_an_unknown_outcome_stays_unconfirmed(pool: PgPool) {
+    let f = fixture(pool).await;
+    video_setup(&f).await;
+    let fake = Fake::default();
+    {
+        let mut script = fake.0.lock().unwrap();
+        script.idempotent = true;
+        script
+            .create_failures
+            .push_back((false, InferenceError::Timeout));
+        script
+            .create_failures
+            .push_back((false, InferenceError::UpstreamRejected));
+    }
+    let j = jobs(&f, &fake, false);
+    let id = Uuid::new_v4();
+    assert_eq!(
+        j.create_video(f.principal, video_request(), id).await.err(),
+        Some(JobError::Inference(InferenceError::UpstreamRejected))
+    );
+    assert_eq!(fake.calls(), ["create_video", "create_video"]);
+    assert_eq!(
+        video_row(&f, id).await,
+        Some((
+            "failed".into(),
+            None,
+            Some("create_unconfirmed".into()),
+            true
+        ))
+    );
+    assert_eq!(amounts(&f, id).await.0, "unknown");
+}
+
+/// An adapter that declares idempotent create but does not send the key
+/// (the default keyed create) is refused before anything is sent: a resend
+/// without the key would be a second job.
+#[tokio::test]
+async fn the_default_keyed_create_refuses_an_idempotent_declaration() {
+    struct Declares;
+    #[async_trait]
+    impl ProviderAdapter for Declares {
+        fn id(&self) -> &'static str {
+            "openai"
+        }
+        fn capabilities(&self) -> crate::inference::types::Capabilities {
+            crate::inference::types::Capabilities {
+                text_chat: false,
+                streaming: false,
+                tools: false,
+            }
+        }
+        fn idempotent_video_create(&self, _: &Deployment) -> bool {
+            true
+        }
+        async fn create_video(
+            &self,
+            _: &Deployment,
+            _: VideoRequest,
+        ) -> Result<UpstreamVideo, InferenceError> {
+            panic!("never called without the key");
+        }
+        async fn execute(
+            &self,
+            _: &Deployment,
+            _: crate::inference::types::ChatRequest,
+        ) -> Result<crate::inference::types::ProviderOutput, InferenceError> {
+            Err(InferenceError::Unsupported)
+        }
+    }
+    let target = Deployment {
+        id: Uuid::new_v4(),
+        provider: "openai".into(),
+        upstream_model: "m".into(),
+        credential_ref: "none".into(),
+        endpoint: None,
+        region: None,
+        supported_protocols: vec!["videos".into()],
+    };
+    let (created, nothing_sent) = crate::inference::dispatch::observe(Declares.create_video_keyed(
+        &target,
+        video_request(),
+        &VideoCreateKey::for_job(Uuid::new_v4()),
+    ))
+    .await;
+    assert_eq!(created.err(), Some(InferenceError::Configuration));
+    assert!(nothing_sent);
+}
+
+/// #802 with #662: a video held at its provider create, recorded without a
+/// provider id. The create future is returned so the test decides whether it
+/// answers or dies.
+async fn held_create<'a>(
+    f: &'a Fixture,
+    j: &'a Jobs,
+    fake: &Fake,
+    answer: UpstreamVideo,
+) -> (
+    Uuid,
+    Arc<FinalizeHold>,
+    std::pin::Pin<Box<impl std::future::Future<Output = JobResult<JobRow>> + 'a>>,
+) {
+    let hold = Arc::new(FinalizeHold::default());
+    hold.arm();
+    fake.0.lock().unwrap().video_hold = Some(hold.clone());
+    fake.push_video(answer);
+    let id = Uuid::new_v4();
+    let mut create = Box::pin(j.create_video(f.principal, video_request(), id));
+    tokio::select! {
+        _ = &mut create => panic!("the create is held at the provider"),
+        () = hold.reached() => {}
+    }
+    (id, hold, create)
+}
+async fn row_of(f: &Fixture, execution: Uuid) -> JobRow {
+    let id: Uuid = sqlx::query_scalar("SELECT id FROM async_jobs WHERE execution_id=$1")
+        .bind(execution)
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    super::store::reload(&f.store, id).await.unwrap()
+}
+async fn make_due(f: &Fixture, job: Uuid) {
+    sqlx::query("UPDATE async_jobs SET next_poll_at=now() WHERE id=$1")
+        .bind(job)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+}
+
+/// The creator's first observation is written with no poller able to hold
+/// the row: a recorded video is first due at the end of its create grace, so
+/// no claim takes it while the create runs; the create's answer is recorded.
+#[dbtest::test]
+async fn no_poller_holds_a_video_while_its_create_runs(pool: PgPool) {
+    use super::store::claim_due;
+    let f = fixture(pool).await;
+    video_setup(&f).await;
+    let fake = Fake::default();
+    let j = jobs(&f, &fake, true);
+    let (execution, hold, create) =
+        held_create(&f, &j, &fake, upstream_video(JobState::InProgress, Some(8))).await;
+    let row = row_of(&f, execution).await;
+    let (due_after_grace,): (bool,) = sqlx::query_as(
+        "SELECT next_poll_at>=submit_started_at+make_interval(secs=>$2) FROM async_jobs WHERE id=$1",
+    )
+    .bind(row.id)
+    .bind(j.video_create_grace().whole_seconds() as f64)
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    assert!(due_after_grace, "first due at the end of the grace");
+    assert!(
+        claim_due(&f.store, Uuid::new_v4(), 30.0, 60.0)
+            .await
+            .unwrap()
+            .is_none(),
+        "no claim inside the grace"
+    );
+    hold.release();
+    let created = create.await.unwrap();
+    assert_eq!(
+        created.state, "in_progress",
+        "the creator's observation is recorded"
+    );
+    assert!(created.upstream_id.is_some());
+}
+
+/// A create that answers after the grace while a poller holds the row: the
+/// creator records the provider id (the row is still a queued video without
+/// one) but its first observation is refused (the claim holds the row) and
+/// settles nothing; the claim's end of the row "without an id" is refused
+/// because the id landed. The next poll observes and settles the job.
+#[dbtest::test]
+async fn a_late_create_and_a_live_claim_never_both_write(pool: PgPool) {
+    use super::store::{Observer, claim_due};
+    let f = fixture(pool).await;
+    video_setup(&f).await;
+    let fake = Fake::default();
+    let mut j = jobs(&f, &fake, true);
+    j.video_create_grace = TimeDelta::seconds(0);
+    let (execution, hold, create) =
+        held_create(&f, &j, &fake, upstream_video(JobState::InProgress, Some(8))).await;
+    let row = row_of(&f, execution).await;
+    make_due(&f, row.id).await;
+    let (snapshot, fence) = claim_due(&f.store, Uuid::new_v4(), 30.0, 60.0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(snapshot.upstream_id.is_none());
+    hold.release();
+    let created = create.await.unwrap();
+    assert!(created.upstream_id.is_some(), "the creator recorded the id");
+    assert_eq!(created.state, "queued", "its observation is refused");
+    // The claim read the row before the id landed: it changes nothing.
+    let seen = j
+        .refresh_video(snapshot, Observer::Claim(&fence))
+        .await
+        .unwrap();
+    assert_eq!((seen.state.as_str(), seen.settled_at), ("queued", None));
+    assert_eq!(amounts(&f, execution).await.0, "pending");
+    // Nor can the creator end a row whose id is recorded.
+    assert!(
+        super::store::fail_unrecorded_video(
+            &f.store,
+            row.id,
+            "create_failed",
+            None,
+            Observer::Creator
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    // The next poll reads the provider and settles with the known duration.
+    fence.end_poll(&f.store, None).await.unwrap();
+    make_due(&f, row.id).await;
+    fake.push_video(upstream_video(JobState::Completed, Some(8)));
+    assert_eq!(j.poll_once().await.unwrap(), 1);
+    let done = row_of(&f, execution).await;
+    assert_eq!(done.state, "completed");
+    assert!(done.settled_at.is_some());
+    assert_eq!(amounts(&f, execution).await.0, "settled");
+}
+
+/// The poller ends the row first (after the grace): the create's late answer
+/// cannot record its id on the ended row, and the row keeps its
+/// `create_interrupted` end and its retained hold.
+#[dbtest::test]
+async fn a_create_answering_after_the_poller_ended_the_row_changes_nothing(pool: PgPool) {
+    use super::store::{Observer, claim_due};
+    let f = fixture(pool).await;
+    video_setup(&f).await;
+    let fake = Fake::default();
+    let mut j = jobs(&f, &fake, true);
+    j.video_create_grace = TimeDelta::seconds(0);
+    let (execution, hold, create) =
+        held_create(&f, &j, &fake, upstream_video(JobState::InProgress, Some(8))).await;
+    let row = row_of(&f, execution).await;
+    make_due(&f, row.id).await;
+    let (snapshot, fence) = claim_due(&f.store, Uuid::new_v4(), 30.0, 60.0)
+        .await
+        .unwrap()
+        .unwrap();
+    let ended = j
+        .refresh_video(snapshot, Observer::Claim(&fence))
+        .await
+        .unwrap();
+    assert_eq!(
+        (ended.state.as_str(), ended.error_code.as_deref()),
+        ("failed", Some("create_interrupted"))
+    );
+    assert!(ended.settled_at.is_some());
+    let settled = amounts(&f, execution).await;
+    assert_eq!(settled.0, "unknown");
+    hold.release();
+    assert!(create.await.is_err(), "the id arrived after the job ended");
+    let after = row_of(&f, execution).await;
+    assert_eq!(after.upstream_id, None);
+    assert_eq!(after.error_code.as_deref(), Some("create_interrupted"));
+    assert_eq!(amounts(&f, execution).await, settled);
+}
+
+/// A row without a provider id past its grace: a client read while a poller
+/// holds the row, and a stale claim, end and settle nothing; the current
+/// claim ends it `create_interrupted`.
+#[dbtest::test]
+async fn only_the_current_writer_ends_a_row_without_an_id(pool: PgPool) {
+    use super::store::{Observer, claim_due};
+    let f = fixture(pool).await;
+    video_setup(&f).await;
+    let fake = Fake::default();
+    let mut j = jobs(&f, &fake, true);
+    j.video_create_grace = TimeDelta::seconds(0);
+    let (execution, _hold, create) =
+        held_create(&f, &j, &fake, upstream_video(JobState::InProgress, Some(8))).await;
+    std::mem::forget(create);
+    let row = row_of(&f, execution).await;
+    let lapse = async || {
+        sqlx::query("UPDATE async_jobs SET runner_lease_until=CASE WHEN runner_lease_until IS NULL THEN NULL ELSE now()-interval '1 second' END,next_poll_at=now() WHERE id=$1")
+            .bind(row.id)
+            .execute(&f.store.pool)
+            .await
+            .unwrap();
+    };
+    lapse().await;
+    let (stale_snapshot, a) = claim_due(&f.store, Uuid::new_v4(), 30.0, 60.0)
+        .await
+        .unwrap()
+        .unwrap();
+    lapse().await;
+    let (snapshot, b) = claim_due(&f.store, Uuid::new_v4(), 30.0, 60.0)
+        .await
+        .unwrap()
+        .unwrap();
+    let id = client_id("video_", row.id);
+    let read = j.get_video(&f.principal, &id).await.unwrap();
+    assert_eq!(
+        (read.state.as_str(), read.settled_at),
+        ("queued", None),
+        "a read during a claim"
+    );
+    let stale = j
+        .refresh_video(stale_snapshot, Observer::Claim(&a))
+        .await
+        .unwrap();
+    assert_eq!(
+        (stale.state.as_str(), stale.settled_at),
+        ("queued", None),
+        "a stale claim"
+    );
+    assert_eq!(amounts(&f, execution).await.0, "pending");
+    let ended = j
+        .refresh_video(snapshot, Observer::Claim(&b))
+        .await
+        .unwrap();
+    assert_eq!(ended.error_code.as_deref(), Some("create_interrupted"));
+    assert!(ended.settled_at.is_some());
+    assert_eq!(amounts(&f, execution).await.0, "unknown");
+}
+
+/// A terminal row without an id whose settled mark was lost (its create
+/// failed): settling it is not an observation, so it is made only by the
+/// writer that may write the row now (the current claim, or a read while no
+/// claim is live), never by a stale claim or a read during a live one.
+#[dbtest::test]
+async fn a_lost_settled_mark_is_restored_only_by_the_current_writer(pool: PgPool) {
+    use super::store::{Observer, claim_due, fail_unrecorded_video};
+    let f = fixture(pool).await;
+    video_setup(&f).await;
+    let fake = Fake::default();
+    let j = jobs(&f, &fake, true);
+    let (execution, _hold, create) =
+        held_create(&f, &j, &fake, upstream_video(JobState::InProgress, Some(8))).await;
+    std::mem::forget(create);
+    let row = row_of(&f, execution).await;
+    // The create failed and its settled mark was lost.
+    let failed = fail_unrecorded_video(
+        &f.store,
+        row.id,
+        "create_unconfirmed",
+        None,
+        Observer::Creator,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(failed.settled_at.is_none());
+    let lapse = async || {
+        sqlx::query("UPDATE async_jobs SET runner_lease_until=CASE WHEN runner_lease_until IS NULL THEN NULL ELSE now()-interval '1 second' END,next_poll_at=now() WHERE id=$1")
+            .bind(row.id)
+            .execute(&f.store.pool)
+            .await
+            .unwrap();
+    };
+    lapse().await;
+    let (stale_snapshot, a) = claim_due(&f.store, Uuid::new_v4(), 30.0, 60.0)
+        .await
+        .unwrap()
+        .unwrap();
+    lapse().await;
+    let (snapshot, b) = claim_due(&f.store, Uuid::new_v4(), 30.0, 60.0)
+        .await
+        .unwrap()
+        .unwrap();
+    let id = client_id("video_", row.id);
+    assert!(
+        j.get_video(&f.principal, &id)
+            .await
+            .unwrap()
+            .settled_at
+            .is_none()
+    );
+    assert!(
+        j.refresh_video(stale_snapshot, Observer::Claim(&a))
+            .await
+            .unwrap()
+            .settled_at
+            .is_none()
+    );
+    assert_eq!(amounts(&f, execution).await.0, "pending");
+    let settled = j
+        .refresh_video(snapshot, Observer::Claim(&b))
+        .await
+        .unwrap();
+    assert!(settled.settled_at.is_some());
+    let (state, held, actual, _) = amounts(&f, execution).await;
+    assert_eq!((state.as_str(), actual), ("unknown", None));
+    assert!(held.is_some_and(|h| h > 0), "the hold is kept");
 }
