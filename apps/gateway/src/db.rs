@@ -21,6 +21,7 @@ use sqlx::{PgPool, Postgres, Transaction};
 pub(crate) mod accounting_failure;
 #[cfg(test)]
 pub(crate) mod diagnostics;
+pub(crate) mod startup;
 #[cfg(all(test, feature = "integration-tests"))]
 mod tests;
 

@@ -1,4 +1,8 @@
 {{- if and .Values.cnpg.cluster.enabled .Values.cnpg.pooler.enabled }}
+{{- $image := required "cnpg.pooler.image is required" .Values.cnpg.pooler.image }}
+{{- if not (regexMatch "^[^@\\s]+@sha256:[0-9a-f]{64}$" $image) }}
+{{- fail "cnpg.pooler.image must be pinned by digest: <name>[:tag]@sha256:<64 hex digits>" }}
+{{- end }}
 apiVersion: postgresql.cnpg.io/v1
 kind: Pooler
 metadata:
@@ -26,8 +30,18 @@ spec:
         {{- include "omg.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: pooler
     spec:
+      # CloudNativePG keeps an init container's resources that the template
+      # sets (it fills the image, command and mounts itself), and the
+      # pgbouncer container's image ahead of its own default (operator
+      # v1.30.1, pkg/specs/pgbouncer/deployments.go and
+      # internal/controller/pooler_image.go).
+      initContainers:
+        - name: bootstrap-controller
+          resources:
+            {{- toYaml .Values.cnpg.pooler.resources | nindent 12 }}
       containers:
         - name: pgbouncer
+          image: {{ $image | quote }}
           resources:
             {{- toYaml .Values.cnpg.pooler.resources | nindent 12 }}
 {{- end }}

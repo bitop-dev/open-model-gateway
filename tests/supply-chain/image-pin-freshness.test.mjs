@@ -75,7 +75,9 @@ console.log(JSON.stringify({digest: current, manifests}));
     }
   }
   const chart = "deploy/helm/open-model-gateway/values.yaml";
-  expectPin(toData(parseStrict(readLocalFromRepo(chart), chart)).cnpg.cluster.image);
+  const { cnpg } = toData(parseStrict(readLocalFromRepo(chart), chart));
+  expectPin(cnpg.cluster.image);
+  expectPin(cnpg.pooler.image);
   for (const tag of [
     "mirror.gcr.io/moby/buildkit:buildx-stable-1",
     "mirror.gcr.io/docker/buildkit-syft-scanner:stable-1",
