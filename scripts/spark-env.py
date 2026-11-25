@@ -90,6 +90,14 @@ FIXED_ENVIRONMENT = {"KUBECTL_KUBERC": "false"}
 _REGISTERED_SECRETS = []
 
 
+def write_private(path, text):
+    """Write a file only its owner can read (0600, also when it existed), never through a symbolic link."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    with os.fdopen(os.open(path, flags, 0o600), "w") as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        handle.write(text)
+
+
 class SparkError(RuntimeError):
     pass
 
@@ -645,7 +653,7 @@ class Spark:
         result["sha"] = self.kubectl(["get", "configmap", "omg-spark-env", "-o", "jsonpath={.data.sha}"], namespace=namespace, capture=True).strip()
         result["quota_used"] = module.quota(self, namespace)
         if summary:
-            Path(summary).write_text(redact(json.dumps(result, indent=2)) + "\n")
+            write_private(summary, redact(json.dumps(result, indent=2)) + "\n")
         print(f"{'passed' if result['passed'] else 'FAILED'} in {result['seconds']} s")
         if not result["passed"]:
             raise SystemExit(1)

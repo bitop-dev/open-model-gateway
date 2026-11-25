@@ -46,6 +46,7 @@ UNENTITLED_EMAIL = "unentitled@spark.invalid"
 GATEWAY_PORT = 3000
 ISSUER_PORT = 18443
 POD_PORTS = (3101, 3102)
+METRICS_PORTS = (3201, 3202, 3203)
 MODEL = "spark/mock"
 FIRST_ADMIN_JOB = "omg-first-admin"
 
@@ -466,7 +467,7 @@ class Check:
         signed = self.expect(1, "admin-signs-in", outcome[0] == "signed-in", f"{outcome[0]} {outcome[1]}")
         if signed:
             status, me = admin.api("GET", "/api/v1/me")
-            self.expect(1, "admin-is-platform-admin", status == 200 and (me or {}).get("user", {}).get("platform_admin") is True, f"GET /api/v1/me {status}")
+            self.expect(1, "admin-is-platform-admin", status == 200 and (me or {}).get("user", {}).get("platform_role") == "admin", f"GET /api/v1/me {status}")
         wrong = Browser(gateway, issuer, self.namespace).sign_in("admin", users["admin"] + "-wrong")
         self.expect(1, "wrong-password-refused", wrong[0] == "issuer-refused", f"stopped at {wrong[0]}")
         unentitled = Browser(gateway, issuer, self.namespace).sign_in("unentitled", users["unentitled"])
@@ -523,7 +524,7 @@ class Check:
             self.record(3, "rolling-restart-under-load", "fail", "no key: an earlier step failed")
             return
         self.kubectl(["create", "-f", "-"], stdin=json.dumps(secret("omg-check-key", {"key": key})), capture=True)
-        seconds = 120
+        seconds = 900
         self.kubectl(["apply", "-f", "-"], stdin=fill((DEPLOY / "load-pod.yaml").read_text(), {"MODEL": MODEL, "SECONDS": str(seconds)}), capture=True)
         self.kubectl(["wait", "--for=condition=Ready", "pod/omg-check-load", "--timeout=120s"], capture=True)
         time.sleep(10)
@@ -541,17 +542,33 @@ class Check:
         watcher.start()
         restart = time.monotonic()
         self.kubectl(["rollout", "restart", "deployment/omg"], capture=True)
-        self.kubectl(["rollout", "status", "deployment/omg", "--timeout=600s"], capture=True)
+        try:
+            self.kubectl(["rollout", "status", "deployment/omg", "--timeout=420s"], capture=True)
+        except self.env.SparkError:
+            stop.set()
+            self.record(3, "rolling-restart-no-failed-request", "fail", f"the rollout did not finish: {self.replica_failure()}")
+            return
         rolled = round(time.monotonic() - restart)
         stop.set()
         watcher.join()
-        self.kubectl(["wait", "--for=jsonpath={.status.phase}=Succeeded", "pod/omg-check-load", f"--timeout={seconds + 120}s"], capture=True)
+        # Load covers the whole rollout and ten seconds after it, then stops.
+        time.sleep(10)
+        self.kubectl(["exec", "omg-check-load", "--", "node", "-e", "require('fs').writeFileSync('/tmp/stop', '')"], capture=True)
+        self.kubectl(["wait", "--for=jsonpath={.status.phase}=Succeeded", "pod/omg-check-load", "--timeout=120s"], capture=True)
         counts = json.loads(self.kubectl(["logs", "pod/omg-check-load"], capture=True).strip().splitlines()[-1])
         failures = sum(counts["failures"].values()) + sum(v for k, v in counts["statuses"].items() if k != "200")
         self.expect(3, "rolling-restart-no-failed-request", failures == 0 and counts["statuses"].get("200", 0) > 0,
-                    f"{counts['statuses'].get('200', 0)} ok, {failures} failed of {counts['sent']}; rollout {rolled}s")
+                    f"{counts['statuses'].get('200', 0)} ok, {failures} failed of {counts['sent']}, sent from 10 s before the restart until 10 s after its {rolled} s rollout")
         self.expect(3, "rolling-restart-kept-a-ready-replica", minimum[0] >= 1, f"fewest ready replicas {minimum[0]}")
         self.pdb_check()
+
+    def replica_failure(self):
+        """Why the Deployment cannot create a pod (for example the quota), if it says."""
+        status = json.loads(self.kubectl(["get", "deployment/omg", "-o", "json"], capture=True)).get("status", {})
+        for condition in status.get("conditions", []):
+            if condition.get("type") == "ReplicaFailure" and condition.get("status") == "True":
+                return re.sub(r"\s+", " ", condition.get("message", ""))[:300]
+        return "no ReplicaFailure condition"
 
     def evict(self, pod):
         body = json.dumps({"apiVersion": "policy/v1", "kind": "Eviction", "metadata": {"name": pod, "namespace": self.namespace}})
@@ -559,14 +576,26 @@ class Check:
             self.kubectl(["create", "--raw", f"/api/v1/namespaces/{self.namespace}/pods/{pod}/eviction", "-f", "-"], stdin=body, capture=True)
             return "evicted"
         except self.env.SparkError as error:
-            return "refused" if "disruption budget" in str(error).lower() or "429" in str(error) else "error"
+            text = str(error).lower()
+            if "forbidden" in text and "pods/eviction" in text:
+                return "forbidden"
+            return "refused" if "disruption budget" in text or "429" in text else "error"
 
     def pdb_check(self):
+        """The budget covers the gateway pods (one may be disrupted of two), and
+        an eviction of a second pod while one is being replaced is refused."""
+        status = json.loads(self.kubectl(["get", "pdb", "omg", "-o", "json"], capture=True))["status"]
+        self.expect(3, "pdb-covers-the-replicas", (status.get("expectedPods"), status.get("desiredHealthy"), status.get("disruptionsAllowed")) == (2, 1, 1),
+                    f"expected {status.get('expectedPods')}, desired healthy {status.get('desiredHealthy')}, disruptions allowed {status.get('disruptionsAllowed')}")
         pods = [p["metadata"]["name"] for p in self.gateway_pods()]
         if len(pods) < 2:
             self.record(3, "pdb-refuses-a-second-eviction", "fail", f"{len(pods)} running replicas")
             return
-        first, second = self.evict(pods[0]), self.evict(pods[1])
+        first = self.evict(pods[0])
+        if first == "forbidden":
+            self.record(3, "pdb-refuses-a-second-eviction", "skip", "the platform refuses pods/eviction in this namespace (can-i answers yes)")
+            return
+        second = self.evict(pods[1])
         self.expect(3, "pdb-refuses-a-second-eviction", (first, second) == ("evicted", "refused"), f"{first}, then {second}")
         self.kubectl(["rollout", "status", "deployment/omg", "--timeout=600s"], capture=True)
         for _ in range(120):
@@ -577,19 +606,29 @@ class Check:
     def lease_step(self, lease="metrics"):
         """Delete the pod holding a lease; another replica takes it within the
         documented time (TTL 30 s + renewal 10 s) and the old term is fenced."""
-        current = self.sql(f"SELECT holder||' '||epoch FROM work_leases WHERE name='{lease}' AND expires_at>clock_timestamp()").split()
+        # Just after the rollout of step 3 the lease can be between holders
+        # (the old pod's term runs out, then a replica takes it): wait for a
+        # current holder, at most the documented takeover time and a margin.
+        current = []
+        for _ in range(60):
+            current = self.sql(f"SELECT holder||' '||epoch FROM work_leases WHERE name='{lease}' AND expires_at>clock_timestamp()").split()
+            if len(current) == 2:
+                break
+            time.sleep(1)
         if len(current) != 2:
             self.record(4, "lease-takeover", "fail", f"no replica holds the {lease} lease")
             return
         holder, epoch = current
-        pods = self.gateway_pods()
+        # The holder is the replica whose own metrics say it holds the lease.
         owner = None
-        for pod in pods:
-            log = self.kubectl(["logs", pod["metadata"]["name"], "-c", "gateway"], capture=True)
-            if re.search(rf'"lease":"{lease}".*"epoch":{epoch}\b|"epoch":{epoch}\b.*"lease":"{lease}"', log):
+        for pod, port in zip(self.gateway_pods(), METRICS_PORTS):
+            child = self.forward(f"pod/{pod['metadata']['name']}", [f"{port}:9464"])
+            status, _, _, body = Http(port).request("GET", "/metrics")
+            self.stop(child)
+            if status == 200 and re.search(rf'^gateway_work_leases_held\{{lease="{lease}"\}} 1$', body.decode(), re.M):
                 owner = pod["metadata"]["name"]
         if owner is None:
-            self.record(4, "lease-takeover", "fail", "no replica logged the current term")
+            self.record(4, "lease-takeover", "fail", f"no replica's metrics show the {lease} lease held")
             return
         deleted = time.monotonic()
         self.kubectl(["delete", "pod", owner, "--wait=false"], capture=True)

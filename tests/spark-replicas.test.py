@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -220,6 +221,36 @@ class Pieces(unittest.TestCase):
         env.mode = lambda namespace: "demo"
         with self.assertRaisesRegex(spark.SparkError, "demo environment"):
             env.check("d599")
+
+    def test_the_check_summary_is_private_and_redacted(self):
+        cluster = Cluster()
+        env = spark.Spark(CONFIG, cluster)
+        env._base = "coder-03"
+        env.environment = lambda name: f"coder-03-omg-{name}"
+        env.mode = lambda namespace: "replicas"
+        env.kubectl = lambda *args, **kwargs: "abc123"
+        planted = "omg_sk_" + "x" * 24
+
+        class Check:
+            def __init__(self, *args):
+                pass
+
+            def run(self):
+                spark._REGISTERED_SECRETS.append(planted)
+                return {"seconds": 1, "steps": [{"step": 1, "detail": planted}], "passed": True}
+
+        module = mock.Mock(Check=Check, quota=lambda *args: {"pods": "7"})
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(spark, "replicas_module", return_value=module), \
+                mock.patch.dict(sys.modules, {spark.__name__: spark}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            path = Path(directory) / "summary.json"
+            path.write_text("old")
+            path.chmod(0o644)
+            env.check("r601", str(path))
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            text = path.read_text()
+        self.assertNotIn(planted, text)
+        self.assertEqual(json.loads(text)["quota_used"], {"pods": "7"})
 
     def test_the_mode_is_validated_before_anything_runs(self):
         cluster = Cluster()

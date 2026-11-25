@@ -1,5 +1,5 @@
 # The load pod of `spark-env.py check` (load.mjs): requests to the gateway
-# Service during the rolling restart. The key comes from the Secret the check
+# Service from before the rolling restart until after it has finished. The key comes from the Secret the check
 # creates (omg-check-key) and is deleted with it. __MODEL__ and __SECONDS__
 # are set by the check.
 apiVersion: v1
@@ -27,12 +27,17 @@ spec:
         - {name: OMG_KEY, valueFrom: {secretKeyRef: {name: omg-check-key, key: key}}}
       resources:
         requests: {cpu: 50m, memory: 64Mi}
-        limits: {cpu: 500m, memory: 128Mi}
+        limits: {cpu: 250m, memory: 128Mi}
       securityContext:
         allowPrivilegeEscalation: false
         readOnlyRootFilesystem: true
         capabilities: {drop: [ALL]}
-      volumeMounts: [{name: scripts, mountPath: /scripts, readOnly: true}]
+      volumeMounts:
+        - {name: scripts, mountPath: /scripts, readOnly: true}
+        # The check's stop marker.
+        - {name: tmp, mountPath: /tmp}
   volumes:
     - name: scripts
       configMap: {name: omg-replicas-scripts}
+    - name: tmp
+      emptyDir: {sizeLimit: 1Mi}

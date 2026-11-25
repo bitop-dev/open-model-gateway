@@ -5,8 +5,9 @@
 # Keycloak issuer in the namespace (issuer.yaml) whose certificate a CA
 # generated for this environment signs (GATEWAY_OIDC_CA_FILE, #826). The
 # script sets the image, the issuer and mock-upstream addresses, and whether
-# the chart's NetworkPolicy can be created. Sized so one environment fits the
-# shared quota beside one spark-test.py slot.
+# the chart's NetworkPolicy can be created. Sized against the shared quota's
+# CPU limit (8): a rolling update adds one gateway pod (maxSurge 1) while the
+# check's load pod runs, and that must still fit.
 fullnameOverride: omg
 replicaCount: 2
 pdb:
@@ -26,7 +27,7 @@ gateway:
     GATEWAY_CONFIG_CACHE: "on"
   resources:
     requests: {cpu: 150m, memory: 192Mi}
-    limits: {cpu: "1", memory: 512Mi}
+    limits: {cpu: 500m, memory: 512Mi}
   # The pods spread over nodes when there are several; the Spark has one.
   topologySpreadConstraints: []
 secrets:
@@ -52,7 +53,7 @@ cnpg:
     image: ghcr.io/cloudnative-pg/postgresql:17.6@sha256:30b304a2e300ed80b6d1b740e4369e9b0f25599fb518de78c01fd9f25531791b
     resources:
       requests: {cpu: 200m, memory: 512Mi}
-      limits: {cpu: "1", memory: 1Gi}
+      limits: {cpu: 500m, memory: 1Gi}
     roles:
       migrator: {existingSecret: omg-migrator-role}
       runtime: {existingSecret: omg-runtime-role}
