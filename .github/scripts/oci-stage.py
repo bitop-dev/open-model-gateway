@@ -65,7 +65,7 @@ LOGIN_TIMEOUT = 120
 TERMINAL = re.compile(
     rb"(?:^|[:;] )(?:unauthorized|denied|blob unknown|blob upload invalid|blob upload unknown|"
     rb"digest invalid|manifest blob unknown|manifest invalid|manifest unknown|name invalid|"
-    rb"name unknown|size invalid|unsupported): |failed to verify certificate|"
+    rb"name unknown|size invalid|unsupported)(?:: |; |$)|failed to verify certificate|"
     rb'": response status code 4(?!29)[0-9]{2}\b',
     re.MULTILINE,
 )
@@ -74,10 +74,13 @@ TRANSIENT = {"registry-server", "registry-rate-limit", "registry-readback", "tra
 # pushed from the destination, to list the manifest's children; a 404 there is
 # returned unwrapped and printed with the registry prefix as `<digest>: not
 # found` (ORAS v1.3.6 status/text.go PostCopy; oras-go v2.7.0 copy.go and
-# manifestStore.Fetch, which reads no body on a 404, so no registry text can
-# be part of it). The push had succeeded; the registry did not serve it yet.
-# Copying the same verified archive by digest again publishes nothing else.
-READBACK = re.compile(rb"sha256:[0-9a-f]{64}: not found")
+# manifestStore.Fetch, which reads no body on a 404). The push had succeeded;
+# the registry did not serve it yet. Copying the same verified archive by
+# digest again publishes nothing else. A registry's own error entries print
+# as `code: message` with the status dropped, so a registry could still spell
+# this line for another answer: the digest must be one of the manifests this
+# copy pushes, and the worst case is the bounded retry of the same copy.
+READBACK = re.compile(rb"(sha256:[0-9a-f]{64}): not found")
 # The diagnostic of a failed copy is built only from these fixed words, numbers
 # and the match of a fixed alternation: never URL paths, queries, headers, tokens
 # or registry message text.
@@ -85,12 +88,17 @@ READBACK = re.compile(rb"sha256:[0-9a-f]{64}: not found")
 # a code or a request record at the start of the text after the prefix, a
 # status right after the request record, transport words only after a
 # request record without a status (Go's own error text, not a registry's).
+# A code prints bare when its message is empty, and entries join with "; ".
 OCI_CODE = re.compile(
     rb"(blob unknown|blob upload invalid|blob upload unknown|digest invalid|manifest blob unknown|"
     rb"manifest invalid|manifest unknown|name invalid|name unknown|size invalid|unauthorized|denied|"
-    rb"unsupported|toomanyrequests|unknown): "
+    rb"unsupported|toomanyrequests|unknown)(?:: |; |\Z)"
 )
 REQUEST = re.compile(rb'(GET|HEAD|POST|PATCH|PUT|DELETE) "https?://([^/"\s?]+)(/[^"\s?]*)?(?:\?[^"\s]*)?": ', re.IGNORECASE)
+# Go's net/http and net error text after a request record. oras-go also puts
+# its own response checks there (`invalid response Content-Type: ...`, with
+# header values): those are not a transport error.
+GO_TRANSPORT = re.compile(rb"(?:EOF\Z|unexpected EOF\Z|dial tcp|read tcp|write tcp|net/http: |context deadline exceeded|http2: |tls: )")
 STATUS = re.compile(rb"response status code ([1-5][0-9]{2}): ")
 TRANSPORT_MARKERS = (
     ("unexpected-eof", b"unexpected EOF"),
@@ -275,8 +283,8 @@ def error_line(report, image=None):
     registry warnings, the one remaining line through EOF, with its prefix
     `Error response from registry: ` ("registry") or `Error from destination
     registry for "<image>": ` ("destination"; any quoted reference when
-    `image` is None). (kind, the text after the prefix, whether it is the
-    last line), or None."""
+    `image` is None). (kind, the text after the prefix, whether nothing
+    follows it), or None."""
     if len(report) > DIAGNOSTIC_BYTES:
         return None
     offset = 0
@@ -300,15 +308,17 @@ def error_line(report, image=None):
     return ("destination", line[prefix.end():], not trailing) if prefix else None
 
 
-def copy_failure_category(stderr, image):
+def copy_failure_category(stderr, image, manifests=frozenset()):
     stderr.seek(0)
     found = error_line(stderr.read(DIAGNOSTIC_BYTES + 1), image)
     if found is None:
         return "unknown"
     kind, detail, alone = found
-    # The whole text after ORAS's registry prefix, on the report's only line
-    # (the error carries no usage text): the read-back of a pushed manifest.
-    if kind == "registry" and alone and READBACK.fullmatch(detail):
+    # The whole text after ORAS's registry prefix, on the last line with
+    # nothing after it (the error carries no usage text): the read-back of a
+    # manifest this copy pushed.
+    readback = READBACK.fullmatch(detail)
+    if kind == "registry" and alone and readback and readback[1].decode() in manifests:
         return "registry-readback"
 
     request = GHCR_REQUEST.match(detail)
@@ -375,7 +385,7 @@ def copy_signals(stderr):
         if request:
             rest = detail[request.end():]
             status = STATUS.match(rest)
-            if status is None:
+            if status is None and GO_TRANSPORT.match(rest):
                 # Go's transport error text; the separator ORAS prints is kept.
                 markers = [name for name, needle in TRANSPORT_MARKERS if needle in b": " + rest]
         else:
@@ -450,7 +460,7 @@ def skeleton(stderr):
     return text + SKELETON_OMITTED if cut else text
 
 
-def attempt_copy(tool, args, env, work, image, timeout):
+def attempt_copy(tool, args, env, work, image, timeout, manifests=frozenset()):
     """None on success, else (category, signals, retryable) of one copy attempt."""
     signals = "status none; oci-code none; request none; host none; transport none; stderr 0 lines"
     try:
@@ -466,7 +476,7 @@ def attempt_copy(tool, args, env, work, image, timeout):
             if result.returncode < 0:
                 return "signal", signals, False
             if result.returncode == 1:
-                category = copy_failure_category(err, image)
+                category = copy_failure_category(err, image, manifests)
                 return category, signals, category in TRANSIENT and not terminal(err)
             return "unknown", signals, False
     except (OSError, subprocess.SubprocessError):
@@ -477,11 +487,11 @@ def wait(seconds):
     time.sleep(seconds)
 
 
-def copy(tool, args, env, work, image):
+def copy(tool, args, env, work, image, manifests):
     """Copy, retrying only a transient failure, within COPY_BUDGET seconds in all."""
     deadline = time.monotonic() + COPY_BUDGET
     for attempt in range(1, COPY_ATTEMPTS + 1):
-        outcome = attempt_copy(tool, args, env, work, image, deadline - time.monotonic())
+        outcome = attempt_copy(tool, args, env, work, image, deadline - time.monotonic(), manifests)
         if outcome is None:
             return
         category, signals, retryable = outcome
@@ -523,7 +533,9 @@ def stage(args):
         tool.chmod(0o500)
         snapshot(args.archive, archive, layout.MAX_TOTAL_BYTES)
         archive.chmod(0o400)
-        layout.inspect_archive(archive, args.root, args.platform)
+        graph = layout.inspect_archive(archive, args.root, args.platform)
+        # The manifests this copy pushes: the root index and its manifests.
+        manifests = frozenset([args.root, *(m["digest"] for m in json.loads(graph["root_json"])["manifests"])])
         home, work = private / "home", private / "work"
         home.mkdir(mode=0o700)
         work.mkdir(mode=0o700)
@@ -543,7 +555,7 @@ def stage(args):
         copy(tool, ["cp", "--force", "--no-tty", "--from-oci-layout",
                     "--to-registry-config", str(auth), "--to-distribution-spec",
                     "v1.1-referrers-api", str(archive) + "@" + args.root, args.image],
-             env, work, args.image)
+             env, work, args.image, manifests)
 
 
 def main(argv=None):
