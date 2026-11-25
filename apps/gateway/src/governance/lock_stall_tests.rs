@@ -150,43 +150,31 @@ async fn on_multi_thread(scenario: impl Future<Output = ()> + Send + 'static) {
     }
 }
 
-/// `n`, or 0 for a measurement of cold pools (`OMG_LOCK_STALL_COLD_POOLS`).
-fn cold_or(n: u32) -> u32 {
-    if std::env::var("OMG_LOCK_STALL_COLD_POOLS").as_deref() == Ok("1") {
-        0
-    } else {
-        n
-    }
-}
-/// A runtime pool of 10 as `serve` opens one (all connections open before
-/// any load).
+/// A runtime pool of 10 as `serve` opens one: all connections open before
+/// any load (`db::startup::connect`), unless the measurement asks for the
+/// pool before #132, which opens connections on demand
+/// (`OMG_LOCK_STALL_COLD_POOLS`).
 async fn runtime_pool(options: &sqlx::postgres::PgConnectOptions) -> PgPool {
     let pool = PgPoolOptions::new()
         .max_connections(POOL_SIZE)
-        .min_connections(cold_or(POOL_SIZE))
         .acquire_timeout(crate::config::ACQUIRE_TIMEOUT)
         .after_connect(|c, _| {
             Box::pin(async move {
                 sqlx::Executor::execute(c, "SET ROLE gateway_runtime").await?;
                 Ok(())
             })
-        })
-        .connect_with(
-            options
-                .clone()
-                .application_name(APP)
-                .disable_statement_logging(),
-        )
-        .await
-        .unwrap();
-    // As `serve` opens it (`Config::connect_serving`), unless the measurement
-    // asks for today's pool before #132, which opens connections on demand.
-    if std::env::var("OMG_LOCK_STALL_COLD_POOLS").as_deref() != Ok("1") {
-        crate::config::open_pool(&pool, POOL_SIZE, crate::config::OPEN_POOL_TIMEOUT)
+        });
+    let options = options
+        .clone()
+        .application_name(APP)
+        .disable_statement_logging();
+    if std::env::var("OMG_LOCK_STALL_COLD_POOLS").as_deref() == Ok("1") {
+        pool.connect_with(options).await.unwrap()
+    } else {
+        crate::db::startup::connect(pool, options, std::time::Duration::ZERO)
             .await
-            .unwrap();
+            .unwrap()
     }
-    pool
 }
 
 /// On the scenario's runtime: an owner pool, the runtime pool of 10, an
@@ -610,10 +598,6 @@ const AFTER: Duration = Duration::from_secs(20);
 const WINDOW: Duration = Duration::from_millis(500);
 /// How soon after the stall ends the load must be back to its baseline.
 const RECOVERY: Duration = Duration::from_secs(10);
-/// How long past `RECOVERY` the recovery is judged, and how many windows of
-/// it may fall short (single slow commits of a shared disk).
-const HORIZON: Duration = Duration::from_secs(5);
-const SHORT: usize = 2;
 
 #[dbtest::test]
 #[ignore = "dedicated PostgreSQL runtime-role lock-stall measurement (#132)"]
@@ -895,9 +879,9 @@ async fn summarize(h: &Harness, run: &Run) {
 
 /// The requests sent into the stall were shed before admission; the
 /// baseline is within capacity; and from some point within `RECOVERY` of
-/// the release until `RECOVERY + HORIZON` after it, at most `SHORT` windows fall short
-/// (fewer than 95% succeeded, or a p99 above the bound): a slow commit after
-/// recovery is noise, not a collapse. Windows with no request are skipped.
+/// the release to the end of the run, at most one window falls short (fewer
+/// than 95% succeeded, or a p99 above the bound). Windows with no request
+/// are skipped.
 fn assess(rows: &[Row], run: &Run, knobs: &Knobs) {
     let stall = run.released - run.stalled;
     // Requests sent into the stall (and not in its last bound, which the
@@ -957,16 +941,14 @@ fn assess(rows: &[Row], run: &Run, knobs: &Knobs) {
         "the load is within capacity before the stall",
     );
     let p99_bound = base_p99 * 3 + Duration::from_millis(100);
-    // Judged up to `HORIZON` past the bound: a later hiccup (a slow WAL fsync
-    // on a shared runner) is not this stall's.
     let after: Vec<&Row> = rows
         .iter()
-        .filter(|r| r.1 > 0 && r.0 >= run.released && r.0 < run.released + RECOVERY + HORIZON)
+        .filter(|r| r.1 > 0 && r.0 >= run.released)
         .collect();
     let bad = |r: &Row| (r.2 as f64) < 0.95 * r.1 as f64 || r.3 > p99_bound;
-    // The earliest good window from which at most `SHORT` windows fall short.
+    // The earliest good window from which at most one window falls short.
     let recovered = (0..after.len())
-        .find(|&i| !bad(after[i]) && after[i..].iter().filter(|r| bad(r)).count() <= SHORT)
+        .find(|&i| !bad(after[i]) && after[i..].iter().filter(|r| bad(r)).count() <= 1)
         .map(|i| after[i].0.saturating_sub(run.released));
     eprintln!(
         "lock_stall recovery recovered_after_ms={} bound_ms={} p99_bound_ms={}",
@@ -976,6 +958,9 @@ fn assess(rows: &[Row], run: &Run, knobs: &Knobs) {
     );
     check(
         recovered.is_some_and(|r| r <= RECOVERY),
-        "throughput and latency did not return to the pre-stall level within the bound",
+        &format!(
+            "throughput and latency did not return to the pre-stall level within {}ms of the release",
+            ms(RECOVERY)
+        ),
     );
 }

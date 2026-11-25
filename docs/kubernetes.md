@@ -187,6 +187,17 @@ pods have a `wait-for-schema` init container (`wait-for-database --schema`, with
 credential), so they wait for the schema instead of crash-looping, and `--wait` completes once they
 pass `/health/ready`. Verified on kind with CloudNativePG 1.30.1: about two minutes, no restarts.
 
+The Pooler's instances start before PostgreSQL accepts connections, and each that tried by then
+answers its first client afterwards with PgBouncer's cached error ("server login has been
+failing, cached error: … (server_login_retry)"). The init container can pass through one instance
+while another still answers that way, so `serve` waits that error out instead of exiting: it tries
+again once a second while the next attempt would start within 30 s, keeping the connections of its
+pool already open, and logs the cached cause each time (#836). PgBouncer gives the same answer when PostgreSQL refuses the pooler's own login (a
+revoked CONNECT, a `pg_hba` rule), so such a refusal stops `serve` after those 30 s, with that
+error, instead of at once. Any other connection error (a wrong password included) still stops it at
+once. Later connections can still reach such an instance for a few seconds; they fail like any
+database error, without stopping the process.
+
 Every later migrating upgrade is `helm upgrade ... --set migrations.run=true --wait`; there the Job
 is a `pre-upgrade` hook, so the schema changes before any new gateway pod starts.
 
@@ -346,6 +357,15 @@ durability safeguard; use the [explicit policy](#production-durability-policy-39
 
 ## PgBouncer caveats (read before enabling the Pooler)
 
+- **Image:** `cnpg.pooler.image` pins PgBouncer by digest (the multi-arch index), PgBouncer 1.25.2,
+  CloudNativePG 1.30.1's own default. Without a pin the Pooler would run whatever image the installed
+  operator defaults to. The chart refuses a value without a `@sha256:` digest; set another
+  digest-pinned PgBouncer (1.21 or newer, for `max_prepared_statements`) to move.
+- **Resources:** `cnpg.pooler.resources` applies to the `pgbouncer` container and to the operator's
+  `bootstrap-controller` init container, which CloudNativePG keeps when the Pooler template sets it.
+  A pod counts the larger of its init and main containers against a quota, and an init container
+  without resources takes the namespace's LimitRange defaults (1 CPU and 1 Gi on the Spark test
+  platform), so without this each Pooler pod would count that much whatever the pooler's own limits.
 - **Prepared statements:** `max_prepared_statements: 200` is required in `cnpg.pooler.parameters`
   for sqlx's named prepared statement cache under transaction-mode pooling (PgBouncer ≥ 1.21,
   which CNPG 1.30's bundled image satisfies). Without it, every admission/settlement query fails.
@@ -366,8 +386,21 @@ durability safeguard; use the [explicit policy](#production-durability-policy-39
   `hpa.behavior.scaleDown.stabilizationWindowSeconds: 600` avoids cutting long-lived streams.
 - `pdb.maxUnavailable: 1` and `gateway.topologySpreadConstraints` keep replicas spread across nodes
   during voluntary disruption and rollout.
+- **In a namespace with a resource quota, size CPU and memory limits for `maxSurge`.** The chart's
+  rolling update (`maxSurge: 1`, `maxUnavailable: 0`) starts a new gateway pod before an old one
+  goes, so the quota must hold every pod's limits plus one more gateway pod's. If it does not, the
+  surge pod is refused (`exceeded quota`), the Deployment reports `ReplicaFailure`, and the rollout
+  waits until its deadline with the old pods still serving. With the chart's default limits (each
+  gateway at 2 CPU, the database instance at 2 CPU) two replicas and their surge pod did not fit an
+  8-CPU limits quota in the multi-replica rehearsal on Spark (#601), whose values lower them.
+- **A rollout needs database connections for its new pods while the old ones hold theirs.** Each
+  new pod opens its whole pool (`GATEWAY_DATABASE_MAX_CONNECTIONS`) before it is ready (#132), so
+  size PostgreSQL's `max_connections` (direct) or the Pooler's `max_client_conn` for
+  `(replicas + 1 surge pod) × GATEWAY_DATABASE_MAX_CONNECTIONS` plus the pods still draining and
+  the other sessions ([connection sizing](postgresql-ha.md#connection-sizing)). A pod that cannot
+  open its pool fails startup naming that setting and the rollout stops with the old pods serving.
 - `cnpg.pooler.instances` and `cnpg.pooler.parameters.default_pool_size` size the PgBouncer tier;
-  size `max_client_conn` for `replicaCount × GATEWAY_DATABASE_MAX_CONNECTIONS` plus headroom
+  size `max_client_conn` for `(replicaCount + 1) × GATEWAY_DATABASE_MAX_CONNECTIONS` plus headroom
   ([connection sizing](postgresql-ha.md#connection-sizing)).
 - Scale the gateway with `kubectl scale` or the HPA; scale CNPG with `cnpg.cluster.instances`
   (requires a migrating upgrade is not pending) — see `docs/operations.md` for connection sizing.

@@ -523,6 +523,32 @@ impl Config {
             .context("could not connect to PostgreSQL")
     }
 
+    /// `serve`'s primary pool: all `GATEWAY_DATABASE_MAX_CONNECTIONS`
+    /// connections opened before the gateway listens (so before it is
+    /// ready) and kept open, with a pooler's cached failed server login from
+    /// before PostgreSQL accepted connections waited out
+    /// ([`crate::db::startup`]). Any other failure to open them stops
+    /// startup, naming the setting. One-shot commands keep the pool that
+    /// opens connections when needed ([`Self::connect`]).
+    pub async fn connect_serve(&self) -> Result<sqlx::PgPool> {
+        let options =
+            <sqlx::postgres::PgConnectOptions as std::str::FromStr>::from_str(&self.database_url)
+                .context("could not connect to PostgreSQL")?;
+        crate::db::startup::connect(
+            self.primary_pool_options(),
+            options,
+            crate::db::startup::WINDOW,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "could not open the database pool's {} connections (GATEWAY_DATABASE_MAX_CONNECTIONS)",
+                self.database_max_connections
+            )
+        })
+        .context("could not connect to PostgreSQL")
+    }
+
     pub async fn connect_bootstrap_dev(&self) -> Result<sqlx::PgPool> {
         let options = crate::bootstrap::dev_connect_options(self.environment, &self.database_url)?;
         self.primary_pool_options()
@@ -781,11 +807,6 @@ mod metrics_export_config_tests;
 #[cfg(test)]
 #[path = "logs_export_config_tests.rs"]
 mod logs_export_config_tests;
-
-#[path = "config_open_pool.rs"]
-mod open_pool;
-#[cfg(all(test, feature = "integration-tests"))]
-pub(crate) use open_pool::{OPEN_POOL_TIMEOUT, open_pool};
 
 #[path = "config_count_limit.rs"]
 mod count_limit;

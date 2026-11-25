@@ -383,13 +383,13 @@ async fn run(cli: Cli, process_start_unix_nano: u64) -> Result<()> {
             )
         })
         .transpose()?;
-    let pool = if matches!(cli.command, Some(Command::BootstrapDev)) {
-        config.connect_bootstrap_dev().await?
-    } else if matches!(cli.command, None | Some(Command::Serve)) {
-        // Every connection open before the listener binds (`connect_serving`).
-        config.connect_serving().await?
-    } else {
-        config.connect().await?
+    let pool = match cli.command {
+        Some(Command::BootstrapDev) => config.connect_bootstrap_dev().await?,
+        // Only `serve` opens its whole pool before it listens and waits out
+        // a pooler's cached failed server login (a first install); every
+        // other command connects once, as before.
+        None | Some(Command::Serve) => config.connect_serve().await?,
+        _ => config.connect().await?,
     };
     // Reports, usage and logs only (never admission, settlement or writes).
     let provider_secrets = EnvSecrets::new(config.secret_env_allowlist.clone());

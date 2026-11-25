@@ -464,6 +464,33 @@ test("CNPG Pooler runs transaction mode with prepared statements enabled", () =>
   assert.match(pooler, /max_prepared_statements: "200"/);
 });
 
+// #836: the PgBouncer image is the chart's digest-pinned value, never the
+// operator's default; and the operator's bootstrap-controller init container
+// carries the Pooler's resources, so a Pooler pod's effective limits are
+// cnpg.pooler.resources (not a namespace's LimitRange defaults).
+test("CNPG Pooler pins its image and sizes its init container like the pooler", () => {
+  const values = readFileSync(join(chart, "values.yaml"), "utf8");
+  const image = /^    image: (ghcr\.io\/cloudnative-pg\/pgbouncer:1\.\d+\.\d+@sha256:[0-9a-f]{64})$/m.exec(values)?.[1];
+  assert.ok(image, "cnpg.pooler.image is a digest-pinned PgBouncer");
+  for (const extra of [[], ["--set", "cnpg.pooler.resources.limits.cpu=250m", "--set", "cnpg.pooler.resources.requests.cpu=50m"]]) {
+    const rendered = helmTemplate(["-f", join(chart, "ci/cnpg-values.yaml"), ...extra]);
+    const [pooler] = docsOfKind(rendered, "Pooler");
+    const spec = /^    spec:\n((?:      .*\n)+)/m.exec(`${pooler}\n`)?.[1] ?? "";
+    const init = /^      initContainers:\n        - name: bootstrap-controller\n          resources:\n((?:            .*\n)+)/m.exec(spec)?.[1];
+    const main = /^        - name: pgbouncer\n          image: "(.+)"\n          resources:\n((?:            .*\n)+)/m.exec(spec);
+    assert.ok(init && main, spec);
+    assert.equal(main[1], image);
+    assert.equal(init, main[2], "the init container's resources are the pooler's");
+    assert.match(init, extra.length ? /cpu: 250m/ : /cpu: 500m/);
+  }
+  assertHelmRefuses(["-f", join(chart, "ci/cnpg-values.yaml"), "--set", "cnpg.pooler.image="], /cnpg\.pooler\.image is required/);
+  for (const unpinned of ["ghcr.io/cloudnative-pg/pgbouncer:1.25.2", "pgbouncer:latest", `pgbouncer@sha256:${"a".repeat(63)}`, `pgbouncer@sha256:${"A".repeat(64)}`]) {
+    assertHelmRefuses(["-f", join(chart, "ci/cnpg-values.yaml"), "--set", `cnpg.pooler.image=${unpinned}`], /cnpg\.pooler\.image must be pinned by digest/);
+  }
+  // The Pooler disabled: nothing is required of the value.
+  assert.doesNotMatch(helmTemplate(["-f", join(chart, "ci/cnpg-values.yaml"), "--set", "cnpg.pooler.enabled=false", "--set", "cnpg.pooler.image=pgbouncer:latest"]), /kind: Pooler/);
+});
+
 test("migration Job applies runtime grants with the gateway image itself, from no copied SQL", () => {
   const rendered = helmTemplate(["-f", join(chart, "ci/external-db-values.yaml"), "--set", "migrations.run=true"]);
   const [job] = docsOfKind(rendered, "Job");

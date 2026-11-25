@@ -461,16 +461,28 @@ cnpg:
     enabled: true
     type: rw
     instances: 2
+    # The PgBouncer image, pinned by digest (the multi-arch index): without
+    # it the Pooler runs whatever the installed operator defaults to.
+    # PgBouncer 1.25.2 is CloudNativePG 1.30.1's own default
+    # (pkg/versions/versions.go DefaultPgbouncerImage); max_prepared_statements
+    # below needs PgBouncer 1.21 or newer.
+    image: ghcr.io/cloudnative-pg/pgbouncer:1.25.2@sha256:b15c428057d1ffbc19fb70496911a5f1a47066dcc1315bf794f4e85ade29e2e5
     poolMode: transaction
     parameters:
       # Every replica opens its whole pool at startup (#132); idle client
       # connections cost PgBouncer no server connection in transaction mode.
-      # 500 holds hpa.maxReplicas (10) plus a rolling update's surge (3) x
-      # GATEWAY_DATABASE_MAX_CONNECTIONS (32) = 416 on one instance, however
-      # unevenly the Service spreads them.
+      # 500 holds hpa.maxReplicas (10) plus a rolling update's surge pod (1)
+      # x GATEWAY_DATABASE_MAX_CONNECTIONS (32) = 352 on one instance, however
+      # unevenly the Service spreads them, with room for four old pods that
+      # are still draining (they keep their connections until they exit).
       max_client_conn: "500"
       default_pool_size: "25"
       max_prepared_statements: "200"
+    # For the pgbouncer container and the operator's bootstrap-controller
+    # init container alike, so a Pooler pod's effective requests and limits
+    # are these (an init container without its own would take the
+    # namespace's LimitRange defaults, and a pod counts the larger of its
+    # init and main containers against a quota).
     resources:
       requests:
         cpu: 100m
