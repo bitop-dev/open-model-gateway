@@ -87,6 +87,67 @@ fn every_other_file_is_refused_naming_the_setting_only() {
     }
 }
 
+/// `GATEWAY_S3_CA_FILE` keeps the rules it has always had (whatever
+/// `reqwest::Certificate::from_pem_bundle` accepts), so no installation stops
+/// at upgrade; `GATEWAY_OIDC_CA_FILE` refuses the very same files. The two
+/// differ on purpose: do not make one follow the other without deciding to.
+/// The S3 path is proven over TLS in `filestore/s3/tests.rs`.
+#[test]
+fn s3_keeps_its_rules_where_the_oidc_setting_refuses() {
+    let server = crate::identity::test_pki::self_signed(&Spec {
+        common_name: "minio.internal",
+        from: 2020,
+        until: 2120,
+        sans: &[San::Dns("minio.internal")],
+    });
+    let key = section(&["PRIVATE", "KEY"], &base64_of(&server.key_pkcs8));
+    let expired = Ca::from_spec(&Spec {
+        common_name: "OMG expired CA",
+        from: 2000,
+        until: 2010,
+        sans: &[],
+    });
+    let cases: [(&str, Vec<u8>, usize, &str); 4] = [
+        (
+            "a self-signed server certificate",
+            server.pem().into_bytes(),
+            1,
+            "must contain only CA certificates, not a server certificate",
+        ),
+        (
+            "a certificate and its key in one file",
+            format!("{}{key}", server.pem()).into_bytes(),
+            1,
+            "must contain only PEM certificates",
+        ),
+        (
+            "an expired CA",
+            expired.certificate.pem().into_bytes(),
+            1,
+            "contains a certificate outside its validity period",
+        ),
+        ("an empty file", Vec::new(), 0, "contains no certificate"),
+    ];
+    for (what, pem, roots, oidc) in cases {
+        let s3 = CaBundle::pem_bundle("GATEWAY_S3_CA_FILE", &pem).unwrap();
+        assert_eq!(s3.certificates().len(), roots, "S3 accepts {what}");
+        assert_eq!(
+            refusal(&pem),
+            format!("{SETTING} {oidc}"),
+            "OIDC refuses {what}"
+        );
+    }
+    // S3 still refuses what is not PEM at all, in the words it has always used.
+    let broken = b"-----BEGIN CERTIFICATE-----\n!invalid-base64!\n-----END CERTIFICATE-----\n";
+    assert_eq!(
+        CaBundle::pem_bundle("GATEWAY_S3_CA_FILE", broken)
+            .err()
+            .unwrap()
+            .to_string(),
+        "GATEWAY_S3_CA_FILE is not a PEM certificate bundle"
+    );
+}
+
 fn base64_of(bytes: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(bytes)
