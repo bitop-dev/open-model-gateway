@@ -45287,7 +45287,8 @@
                         {
                           "enum": [
                             "egress_not_allowed",
-                            "tightened_rule_missing"
+                            "tightened_rule_missing",
+                            "not_runnable"
                           ]
                         }
                       ]
@@ -45455,7 +45456,7 @@
             "type": "object"
           },
           "enforced": {
-            "const": false
+            "const": true
           },
           "kind": {
             "enum": [
@@ -49308,7 +49309,8 @@
                         {
                           "enum": [
                             "egress_not_allowed",
-                            "tightened_rule_missing"
+                            "tightened_rule_missing",
+                            "not_runnable"
                           ]
                         }
                       ]
@@ -49476,7 +49478,7 @@
             "type": "object"
           },
           "enforced": {
-            "const": false
+            "const": true
           },
           "kind": {
             "enum": [
@@ -50823,7 +50825,8 @@
                     {
                       "enum": [
                         "egress_not_allowed",
-                        "tightened_rule_missing"
+                        "tightened_rule_missing",
+                        "not_runnable"
                       ]
                     }
                   ]
@@ -50989,7 +50992,7 @@
             "type": "object"
           },
           "enforced": {
-            "const": false
+            "const": true
           },
           "kind": {
             "enum": [
@@ -57834,7 +57837,8 @@
                         {
                           "enum": [
                             "egress_not_allowed",
-                            "tightened_rule_missing"
+                            "tightened_rule_missing",
+                            "not_runnable"
                           ]
                         }
                       ]
@@ -58002,7 +58006,7 @@
             "type": "object"
           },
           "enforced": {
-            "const": false
+            "const": true
           },
           "kind": {
             "enum": [
@@ -59414,7 +59418,8 @@
                     {
                       "enum": [
                         "egress_not_allowed",
-                        "tightened_rule_missing"
+                        "tightened_rule_missing",
+                        "not_runnable"
                       ],
                       "x-omg-unobserved-branch": "A local PUT validates every tightening entry against the current platform layer and phase 1 refuses every detector that sends text out, so no entry it returns is inactive."
                     }
@@ -59581,7 +59586,7 @@
             "type": "object"
           },
           "enforced": {
-            "const": false
+            "const": true
           },
           "kind": {
             "enum": [
@@ -80110,7 +80115,7 @@
     },
     "/api/v1/platform/workspace-types/{kind}/guardrails": {
       "get": {
-        "description": "#840: the workspace-type default guardrail layer, with custom pattern text (Platform Admins and Auditors). rule_set is null until written. Phase 1 (#840) stores and composes policies only: nothing inspects request text yet (enforced is false).",
+        "description": "#840: the workspace-type default guardrail layer, with custom pattern text (Platform Admins and Auditors). rule_set is null until written. Input rules are enforced by the engine for generation and embeddings (enforced is true); output is not inspected in this release.",
         "operationId": "get_api_v1_platform_workspace_types_by_kind_guardrails",
         "parameters": [
           {
@@ -80190,7 +80195,7 @@
         "x-omg-token-policy": "Scope"
       },
       "put": {
-        "description": "#840: replace the type default's rules (full set) and local_only (required); moves its revision forward by one; audited as guardrail_policy.updated with ids, actions and a pattern count. An entry keeps its id when it names one of this layer's rules; new entries get new ids. Tightening entries belong to local layers (400 here). Phase 1 (#840) stores and composes policies only: nothing inspects request text yet (enforced is false).",
+        "description": "#840: replace the type default's rules (full set) and local_only (required); moves its revision forward by one; audited as guardrail_policy.updated with ids, actions and a pattern count. An entry keeps its id when it names one of this layer's rules; new entries get new ids. Tightening entries belong to local layers (400 here). Input rules are enforced by the engine for generation and embeddings (enforced is true); output is not inspected in this release.",
         "operationId": "put_api_v1_platform_workspace_types_by_kind_guardrails",
         "parameters": [
           {
@@ -81486,7 +81491,7 @@
         "x-omg-token-policy": "Scope"
       },
       "get": {
-        "description": "#840: a workspace's platform layers (type default, override) and, for a Team or Project, its local layer and effective rules. A personal workspace's local layer is the owner's own choice: platform staff get local null, local_visible false and effective null. Phase 1 (#840) stores and composes policies only: nothing inspects request text yet (enforced is false).",
+        "description": "#840: a workspace's platform layers (type default, override) and, for a Team or Project, its local layer and effective rules. A personal workspace's local layer is the owner's own choice: platform staff get local null, local_visible false and effective null. Input rules are enforced by the engine for generation and embeddings (enforced is true); output is not inspected in this release.",
         "operationId": "get_api_v1_platform_workspaces_by_ws_guardrails",
         "parameters": [
           {
@@ -81557,7 +81562,7 @@
         "x-omg-token-policy": "Scope"
       },
       "put": {
-        "description": "#840: replace the workspace's override (full set) and local_only (required); the override replaces the type default. Personal workspaces are addressable (platform-managed configuration). Phase 1 (#840) stores and composes policies only: nothing inspects request text yet (enforced is false).",
+        "description": "#840: replace the workspace's override (full set) and local_only (required); the override replaces the type default. Personal workspaces are addressable (platform-managed configuration). Input rules are enforced by the engine for generation and embeddings (enforced is true); output is not inspected in this release.",
         "operationId": "put_api_v1_platform_workspaces_by_ws_guardrails",
         "parameters": [
           {
@@ -86278,7 +86283,7 @@
     },
     "/api/v1/workspaces/{ws}/guardrails": {
       "get": {
-        "description": "#840: the workspace's effective guardrail rules with provenance: its platform layer (override or type default), its local layer and each effective entry's source, revision, tightening entries and active/inactive_reason (egress_not_allowed under local_only, tightened_rule_missing for an entry whose platform rule is gone). Custom pattern text is shown to the layer's writers and, for platform layers and a shared workspace's local layer, to platform staff; everyone else sees pattern_count. Members and, on a Team or Project, platform staff read; a personal workspace is its owner's only. Phase 1 (#840) stores and composes policies only: nothing inspects request text yet (enforced is false).",
+        "description": "#840: the workspace's effective guardrail rules with provenance: its platform layer (override or type default), its local layer and each effective entry's source, revision, tightening entries and active/inactive_reason (egress_not_allowed under local_only, tightened_rule_missing for an entry whose platform rule is gone). Custom pattern text is shown to the layer's writers and, for platform layers and a shared workspace's local layer, to platform staff; everyone else sees pattern_count. Members and, on a Team or Project, platform staff read; a personal workspace is its owner's only. Input rules are enforced by the engine for generation and embeddings (enforced is true); output is not inspected in this release.",
         "operationId": "get_api_v1_workspaces_by_ws_guardrails",
         "parameters": [
           {
@@ -86342,7 +86347,7 @@
         "x-omg-token-policy": "Scope"
       },
       "put": {
-        "description": "#840: replace the workspace's local layer (full set): rules of its own, and tightening entries ({tightens: <platform rule id>} with only input.action, output.mode, on_error or threshold) that make a platform rule stricter. Composition takes the stricter value of each field, so an entry never weakens the current platform rule. Shared owners/admins and a personal workspace's owner; browser only. local_only is a platform field (400). Phase 1 (#840) stores and composes policies only: nothing inspects request text yet (enforced is false).",
+        "description": "#840: replace the workspace's local layer (full set): rules of its own, and tightening entries ({tightens: <platform rule id>} with only input.action, output.mode, on_error or threshold) that make a platform rule stricter. Composition takes the stricter value of each field, so an entry never weakens the current platform rule. Shared owners/admins and a personal workspace's owner; browser only. local_only is a platform field (400). Input rules are enforced by the engine for generation and embeddings (enforced is true); output is not inspected in this release.",
         "operationId": "put_api_v1_workspaces_by_ws_guardrails",
         "parameters": [
           {

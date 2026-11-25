@@ -231,6 +231,7 @@ pub const PARTITIONED_RELATIONS: &[&str] = &[
     "monetary_ledger",
     "audit_events",
     "storage_usage_hours",
+    "guardrail_events",
 ];
 /// Relations that a later migration drops: accepted only before an explicit
 /// upgrade (`migrate`), never by readiness or serve on a current schema.

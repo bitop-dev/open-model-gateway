@@ -157,6 +157,14 @@ impl WorkloadLimits {
 pub trait Workload: Clone + Send + Sync + 'static {
     type Response: Send + 'static;
     const PROTOCOL: ApiProtocol;
+    /// The guardrail workload rules name (no default: every workload says
+    /// which one it is, so a rule that names it is never skipped).
+    const GUARDRAIL: crate::guardrails::policy::Workload;
+    /// The text a guardrail detector can read. `None` (the default): the
+    /// request cannot be inspected, and an enforcing rule refuses it.
+    fn inspection(&self) -> Option<crate::guardrails::detector::Inspection<'_>> {
+        None
+    }
     fn model(&self) -> &str;
     /// Pure bounds, evaluated before any storage or network work.
     fn validate(&self) -> Result<(), InferenceError>;
@@ -240,6 +248,10 @@ pub(super) fn within_ceilings(usage: Usage, ceilings: MeterUsage) -> bool {
 impl Workload for EmbeddingRequest {
     type Response = EmbeddingResponse;
     const PROTOCOL: ApiProtocol = ApiProtocol::Embeddings;
+    const GUARDRAIL: crate::guardrails::policy::Workload = crate::guardrails::policy::Workload::Embeddings;
+    fn inspection(&self) -> Option<crate::guardrails::detector::Inspection<'_>> {
+        Some(crate::guardrails::enforce::texts_inspection(&self.input))
+    }
     fn model(&self) -> &str {
         &self.model
     }
@@ -277,6 +289,7 @@ impl Workload for EmbeddingRequest {
 impl Workload for RerankRequest {
     type Response = RerankResponse;
     const PROTOCOL: ApiProtocol = ApiProtocol::Rerank;
+    const GUARDRAIL: crate::guardrails::policy::Workload = crate::guardrails::policy::Workload::Rerank;
     fn model(&self) -> &str {
         &self.model
     }
@@ -311,6 +324,7 @@ impl Workload for RerankRequest {
 impl Workload for SystemoneRequest {
     type Response = SystemoneResponse;
     const PROTOCOL: ApiProtocol = ApiProtocol::Systemone;
+    const GUARDRAIL: crate::guardrails::policy::Workload = crate::guardrails::policy::Workload::Systemone;
     fn model(&self) -> &str {
         &self.model
     }
@@ -395,6 +409,21 @@ impl Engine {
         if candidates.is_empty() {
             return Err(InferenceError::Unsupported);
         }
+        // Guardrails, before the route plan and any admission (as for
+        // generation): a refused input reserves nothing.
+        timeout_at(
+            deadline,
+            self.guard_input(
+                &principal,
+                request_id,
+                W::GUARDRAIL.as_str(),
+                request.model(),
+                W::GUARDRAIL,
+                || request.inspection(),
+            ),
+        )
+        .await
+        .map_err(|_| InferenceError::Timeout)??;
         let plan = timeout_at(
             deadline,
             self.repository

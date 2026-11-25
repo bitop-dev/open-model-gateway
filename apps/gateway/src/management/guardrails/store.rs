@@ -5,149 +5,16 @@
 use std::collections::HashSet;
 
 use super::super::*;
-use crate::guardrails::policy::{self, Entry, Layer, RuleSet, StoredRule};
+use crate::guardrails::policy::{Entry, RuleSet, StoredRule};
+pub(super) use crate::guardrails::stored::Scope;
+use crate::guardrails::stored::{self, Unreadable};
 
-type RuleRow = (
-    Uuid,
-    Option<Uuid>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<Vec<String>>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<i32>,
-    Option<String>,
-    Option<i32>,
-    Option<Vec<String>>,
-    Option<String>,
-    Vec<String>,
-);
-const RULE_COLUMNS: &str = "id,tightens_rule_id,name,protection,detector_kind,detector_ref,categories,input_action,redact_scope,output_mode,(threshold*1000)::int,on_error,timeout_ms,workloads,uninspectable,patterns";
-
-fn names<T: Copy + Ord>(
-    parse: fn(&str) -> Option<T>,
-    v: &[String],
-) -> Option<std::collections::BTreeSet<T>> {
-    v.iter().map(|s| parse(s)).collect()
-}
-/// A stored row as an entry. Values come from the table's CHECK constraints;
-/// anything unknown is a storage error (never a silently skipped rule).
-fn decode(row: RuleRow) -> std::result::Result<StoredRule, ApiError> {
-    use policy::*;
-    let bad = || {
+impl From<Unreadable> for ApiError {
+    fn from(_: Unreadable) -> Self {
         ApiError(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Stored guardrail rule is not readable",
         )
-    };
-    let (
-        id,
-        tightens,
-        name,
-        protection,
-        kind,
-        reference,
-        categories,
-        input,
-        scope,
-        output,
-        threshold,
-        on_error,
-        timeout,
-        workloads,
-        uninspectable,
-        pats,
-    ) = row;
-    let threshold = threshold
-        .map(|t| u16::try_from(t).map_err(|_| bad()))
-        .transpose()?;
-    let entry = match tightens {
-        Some(target) => Entry::Tightens(
-            target,
-            Tightening {
-                input_action: input
-                    .as_deref()
-                    .map(|v| InputAction::parse(v).ok_or_else(bad))
-                    .transpose()?,
-                output_mode: output
-                    .as_deref()
-                    .map(|v| OutputMode::parse(v).ok_or_else(bad))
-                    .transpose()?,
-                on_error: on_error
-                    .as_deref()
-                    .map(|v| OnError::parse(v).ok_or_else(bad))
-                    .transpose()?,
-                threshold,
-            },
-        ),
-        None => Entry::Rule(Box::new(Rule {
-            name: name.ok_or_else(bad)?,
-            protection: protection
-                .as_deref()
-                .and_then(Protection::parse)
-                .ok_or_else(bad)?,
-            detector: Detector {
-                kind: kind
-                    .as_deref()
-                    .and_then(DetectorKind::parse)
-                    .ok_or_else(bad)?,
-                categories: categories
-                    .as_deref()
-                    .and_then(|c| names(Category::parse, c))
-                    .ok_or_else(bad)?,
-                patterns: pats,
-                reference,
-            },
-            input_action: input
-                .as_deref()
-                .and_then(InputAction::parse)
-                .ok_or_else(bad)?,
-            redact_scope: scope
-                .as_deref()
-                .and_then(RedactScope::parse)
-                .ok_or_else(bad)?,
-            output_mode: output
-                .as_deref()
-                .and_then(OutputMode::parse)
-                .ok_or_else(bad)?,
-            threshold,
-            on_error: on_error
-                .as_deref()
-                .and_then(OnError::parse)
-                .ok_or_else(bad)?,
-            timeout_ms: timeout
-                .map(|t| u32::try_from(t).map_err(|_| bad()))
-                .transpose()?,
-            workloads: workloads
-                .as_deref()
-                .and_then(|w| names(Workload::parse, w))
-                .ok_or_else(bad)?,
-            uninspectable: uninspectable
-                .as_deref()
-                .and_then(Uninspectable::parse)
-                .ok_or_else(bad)?,
-        })),
-    };
-    Ok(StoredRule { id, entry })
-}
-
-/// Where a rule set lives.
-#[derive(Clone, Copy)]
-pub(super) enum Scope<'a> {
-    Type(&'a str),
-    Override(Uuid),
-    Local(Uuid),
-}
-impl Scope<'_> {
-    pub(super) fn layer(self) -> Layer {
-        match self {
-            Self::Type(_) => Layer::TypeDefault,
-            Self::Override(_) => Layer::WorkspaceOverride,
-            Self::Local(_) => Layer::WorkspaceLocal,
-        }
     }
 }
 
@@ -155,37 +22,7 @@ pub(super) async fn load(
     tx: &mut Transaction<'_, Postgres>,
     scope: Scope<'_>,
 ) -> std::result::Result<Option<RuleSet>, ApiError> {
-    let (kind, ws) = match scope {
-        Scope::Type(k) => (Some(k), None),
-        Scope::Override(w) | Scope::Local(w) => (None, Some(w)),
-    };
-    let head: Option<(Uuid, i64, Option<bool>)> = sqlx::query_as(
-        "SELECT id,revision,local_only FROM guardrail_rule_sets WHERE layer=$1 AND kind IS NOT DISTINCT FROM $2 AND workspace_id IS NOT DISTINCT FROM $3",
-    )
-    .bind(scope.layer().as_str())
-    .bind(kind)
-    .bind(ws)
-    .fetch_optional(&mut **tx)
-    .await?;
-    let Some((id, revision, local_only)) = head else {
-        return Ok(None);
-    };
-    let rows: Vec<RuleRow> = sqlx::query_as(&format!(
-        "SELECT {RULE_COLUMNS} FROM guardrail_rules WHERE rule_set_id=$1 ORDER BY position"
-    ))
-    .bind(id)
-    .fetch_all(&mut **tx)
-    .await?;
-    Ok(Some(RuleSet {
-        id,
-        layer: scope.layer(),
-        revision,
-        local_only,
-        rules: rows
-            .into_iter()
-            .map(decode)
-            .collect::<std::result::Result<_, _>>()?,
-    }))
+    Ok(stored::load(&mut **tx, scope).await??)
 }
 
 /// A workspace's kind and its platform layer: the override if one exists,

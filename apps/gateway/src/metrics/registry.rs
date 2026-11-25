@@ -85,6 +85,8 @@ impl Metrics {
             token_counts: Family::default(),
             key_issuance_refused: Family::default(),
             egress_denied: Family::default(),
+            guardrail_decisions: Family::default(),
+            guardrail_detector: Family::new_with_constructor(phase_buckets),
             upstream_connection_lost: every_client(),
             upstream_connections_opened: every_client(),
             job_lease_renewals: renewal_outcomes(),
@@ -349,7 +351,7 @@ impl Metrics {
         );
         registry.register(
             "config_changes",
-            "Configuration version changes this replica observed, by topic (access, catalog, keys, policy, settings)",
+            "Configuration version changes this replica observed, by topic (access, catalog, guardrails, keys, policy, settings)",
             self.config_changes.clone(),
         );
     }
@@ -434,6 +436,16 @@ impl Metrics {
             "egress_denied",
             "Outbound connections refused by the egress policy, by purpose (provider, oidc, storage, catalog, smtp, audit)",
             self.egress_denied.clone(),
+        );
+        registry.register(
+            "guardrail_decisions",
+            "Guardrail decisions by stage (input), detector kind, category family and action (monitored, blocked, detector_failed, skipped)",
+            self.guardrail_decisions.clone(),
+        );
+        registry.register(
+            "guardrail_detector_seconds",
+            "Time a request's guardrail detectors took, by detector kind",
+            self.guardrail_detector.clone(),
         );
         registry.register(
             "upstream_connection_lost",

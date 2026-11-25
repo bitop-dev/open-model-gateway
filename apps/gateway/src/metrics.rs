@@ -44,6 +44,7 @@ type L0 = [(&'static str, String); 0];
 type L1 = [(&'static str, String); 1];
 type L2 = [(&'static str, String); 2];
 type L3 = [(&'static str, String); 3];
+type L4 = [(&'static str, String); 4];
 type Histograms<L> = Family<L, Histogram, fn() -> Histogram>;
 
 /// Distinct values admitted per dynamic label before folding into `other`.
@@ -242,6 +243,10 @@ pub struct Metrics {
     token_counts: Family<L1, Counter>,
     key_issuance_refused: Family<L2, Counter>,
     egress_denied: Family<L1, Counter>,
+    /// Guardrail decisions by stage, detector kind, category family and
+    /// action (fixed sets; custom rules count as `custom`).
+    guardrail_decisions: Family<L4, Counter>,
+    guardrail_detector: Histograms<L1>,
     upstream_connection_lost: Family<L1, Counter>,
     upstream_connections_opened: Family<L1, Counter>,
     job_lease_renewals: Family<L1, Counter>,

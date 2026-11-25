@@ -38,7 +38,7 @@ def guardrails(t):
     t.undo("remove guardrail override", lambda: operator.delete(platform))
     target = first(written.get("override", "rules")).get("id")
     t.ok("guardrails.override-replaces-type-default", written.get("platform", "source") == "workspace_override")
-    t.ok("guardrails.not-enforced-yet", written.get("enforced") is False)
+    t.ok("guardrails.enforced", written.get("enforced") is True)
     t.expect("guardrails.override-auditor-read", auditor.get(platform), 200)
 
     # The local layer tightens, never loosens, and adds a custom pattern.

@@ -19,6 +19,10 @@ use serde_json::{Map, Value, json};
 use syn::visit::Visit;
 
 use crate::{
+    guardrails::{
+        enforce::{Refusal, RefusalKind},
+        policy::{Category, DetectorKind},
+    },
     inference::error::{FieldName, InferenceError, LimitScope},
     protocols::batch_line_error,
 };
@@ -48,6 +52,19 @@ pub(super) fn all() -> Vec<InferenceError> {
         InferenceError::InvalidUpstream,
         InferenceError::Storage,
     ];
+    for kind in [
+        RefusalKind::InputBlocked,
+        RefusalKind::DetectorFailed,
+        RefusalKind::NotSupported,
+    ] {
+        all.push(InferenceError::Guardrail(Refusal {
+            kind,
+            rule_set_id: uuid::Uuid::nil(),
+            rule_id: uuid::Uuid::nil(),
+            category: Category::Secret,
+            detector: DetectorKind::Pattern,
+        }));
+    }
     for scope in [LimitScope::Workspace, LimitScope::ApiKey] {
         all.extend([
             InferenceError::BudgetExceeded(scope),
@@ -82,6 +99,7 @@ pub(super) const fn guard(error: InferenceError) -> usize {
         InferenceError::InvalidUpstream => 19,
         InferenceError::Storage => 20,
         InferenceError::ScopeBusy => 21,
+        InferenceError::Guardrail(_) => 22,
     }
 }
 const _: fn(InferenceError) -> usize = guard;

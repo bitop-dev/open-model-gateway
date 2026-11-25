@@ -141,6 +141,35 @@ impl Metrics {
         self.audit_export_oldest.set(oldest_seconds);
     }
 
+    /// One guardrail decision. Every value comes from a fixed set.
+    pub(crate) fn guardrail_decision(
+        &self,
+        stage: &'static str,
+        detector: &'static str,
+        family: &'static str,
+        action: &'static str,
+    ) {
+        self.guardrail_decisions
+            .get_or_create(&[
+                ("stage", stage.to_owned()),
+                ("detector", detector.to_owned()),
+                ("family", family.to_owned()),
+                ("action", action.to_owned()),
+            ])
+            .inc();
+    }
+
+    /// How long a request's guardrail detectors of one kind took.
+    pub(crate) fn guardrail_detector_seconds(
+        &self,
+        detector: &'static str,
+        elapsed: std::time::Duration,
+    ) {
+        self.guardrail_detector
+            .get_or_create(&[("detector", detector.to_owned())])
+            .observe(elapsed.as_secs_f64());
+    }
+
     pub(crate) fn egress_denied(&self, purpose: &'static str) {
         self.egress_denied
             .get_or_create(&[("purpose", purpose.to_owned())])

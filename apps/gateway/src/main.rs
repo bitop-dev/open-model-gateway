@@ -190,7 +190,7 @@ enum PartitionsCommand {
 
 #[derive(Subcommand)]
 enum ArchiveCommand {
-    /// Export one closed month of a group (history, audit or storage) with a
+    /// Export one closed month of a group (history, audit, storage or guardrails) with a
     /// checksummed manifest, then detach it (kept in schema omg_archive, or
     /// dropped with --drop). Refuses months with pending/unknown cost or
     /// within retention. Requires the schema owner.

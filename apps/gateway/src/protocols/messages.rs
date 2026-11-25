@@ -452,6 +452,11 @@ fn error_body(e: InferenceError) -> Value {
         | InferenceError::ContextLength
         | InferenceError::UpstreamRejected
         | InferenceError::Unsupported => "invalid_request_error",
+        InferenceError::Guardrail(r)
+            if r.kind != crate::guardrails::enforce::RefusalKind::DetectorFailed =>
+        {
+            "invalid_request_error"
+        }
         InferenceError::ModelUnavailable => "not_found_error",
         InferenceError::Unauthenticated => "authentication_error",
         // Anthropic has no budget type for HTTP 429; the message distinguishes it.
@@ -471,7 +476,11 @@ fn error_body(e: InferenceError) -> Value {
         InferenceError::InvalidField(field) => format!("Unsupported or invalid field: {field}"),
         _ => e.message().to_owned(),
     };
-    json!({"type":"error","error":{"type":kind,"message":message}})
+    let mut body = json!({"type":"error","error":{"type":kind,"message":message}});
+    if let InferenceError::Guardrail(r) = e {
+        body["error"]["guardrail"] = r.json();
+    }
+    body
 }
 pub(super) fn status(e: InferenceError) -> StatusCode {
     match e {

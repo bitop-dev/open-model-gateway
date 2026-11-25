@@ -102,6 +102,8 @@ classes! {
     "gateway_db_pool_connections" => (System, Gauge, "1", ["state"]),
     "gateway_db_pool_max_connections" => (System, Gauge, "1", []),
     "gateway_egress_denied" => (System, Counter, "1", ["purpose"]),
+    "gateway_guardrail_decisions" => (Traffic, Counter, "1", ["action", "detector", "family", "stage"]),
+    "gateway_guardrail_detector_seconds" => (Traffic, Histogram, "s", ["detector"]),
     "gateway_file_store_bytes" => (Traffic, Counter, "By", ["backend", "op"]),
     "gateway_file_store_operations" => (Traffic, Counter, "1", ["backend", "op", "outcome"]),
     "gateway_history_partition_months_ahead" => (System, Gauge, "mo", ["table"]),

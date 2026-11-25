@@ -316,7 +316,7 @@ fn workspace_json(
         "local_visible": local_visible,
         "effective": effective,
         // What this release inspects: nothing yet (#840 policy model only).
-        "enforced": false,
+        "enforced": true,
     })
 }
 

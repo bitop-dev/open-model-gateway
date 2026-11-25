@@ -71,6 +71,11 @@ fn error_kind_of(error: InferenceError) -> telemetry::ErrorKind {
         | InferenceError::UpstreamUnavailable
         | InferenceError::InvalidUpstream => ErrorKind::Upstream,
         InferenceError::Storage => ErrorKind::Storage,
+        InferenceError::Guardrail(r) => match r.kind {
+            crate::guardrails::enforce::RefusalKind::InputBlocked => ErrorKind::Forbidden,
+            crate::guardrails::enforce::RefusalKind::NotSupported => ErrorKind::Unsupported,
+            crate::guardrails::enforce::RefusalKind::DetectorFailed => ErrorKind::Configuration,
+        },
     }
 }
 

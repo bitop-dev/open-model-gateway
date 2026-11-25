@@ -6,6 +6,7 @@ mod deadline_stream;
 pub mod dispatch;
 mod embeddings;
 pub mod error;
+pub mod guardrails;
 pub(crate) mod evidence;
 mod hand_off;
 pub mod images;
@@ -231,6 +232,26 @@ impl Engine {
             return self
                 .refuse(&principal, &request, &refused, request_id, deadline)
                 .await;
+        }
+        // Guardrails, once per root request, before the route plan and any
+        // admission: a refused input reserves nothing and reaches no provider.
+        let guarded = timeout_at(
+            deadline,
+            self.guard_input(
+                &principal,
+                request_id,
+                guardrails::operation(protocol),
+                &request.model,
+                crate::guardrails::policy::Workload::Generation,
+                || Some(crate::guardrails::enforce::chat_inspection(&request)),
+            ),
+        )
+        .await
+        .map_err(|_| InferenceError::Timeout)
+        .and_then(|result| result);
+        if let Err(error) = guarded {
+            telemetry.finish(telemetry::Outcome::Error, Some(error));
+            return Err(error);
         }
         let plan = timeout_at(
             deadline,
@@ -546,6 +567,8 @@ impl Drop for ExecutionGuard {
 pub(crate) mod admission_validation_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod count_db_tests;
+#[cfg(all(test, feature = "integration-tests"))]
+mod guardrail_db_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod settlement_disconnect_tests;
 #[cfg(all(test, feature = "integration-tests"))]

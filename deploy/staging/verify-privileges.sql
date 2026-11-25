@@ -19,7 +19,7 @@ DO $$ DECLARE r record; t text; BEGIN
  IF EXISTS(SELECT FROM pg_database WHERE datname=current_database() AND datdba=r.oid) OR EXISTS(SELECT FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relowner=r.oid) THEN RAISE EXCEPTION 'runtime owns objects'; END IF;
  IF has_database_privilege('gateway_runtime','postgres','CONNECT') OR has_database_privilege('gateway_runtime','template1','CONNECT') THEN RAISE EXCEPTION 'maintenance database access'; END IF;
  IF has_schema_privilege('gateway_runtime','public','CREATE') OR has_database_privilege('gateway_runtime',current_database(),'CREATE') OR has_database_privilege('gateway_runtime',current_database(),'TEMP') THEN RAISE EXCEPTION 'runtime can create objects'; END IF;
- FOREACH t IN ARRAY ARRAY['_sqlx_migrations','deployment_prices','monetary_ledger','audit_events','provider_cost_imports','provider_cost_lines','provider_cost_mappings','provider_cost_bindings','provider_reconciliations','configuration_changes'] LOOP
+ FOREACH t IN ARRAY ARRAY['_sqlx_migrations','deployment_prices','monetary_ledger','audit_events','guardrail_events','provider_cost_imports','provider_cost_lines','provider_cost_mappings','provider_cost_bindings','provider_reconciliations','configuration_changes'] LOOP
   IF has_table_privilege('gateway_runtime','public.'||t,'UPDATE,DELETE,TRUNCATE') OR has_any_column_privilege('gateway_runtime','public.'||t,'UPDATE') THEN RAISE EXCEPTION 'mutable immutable history: %',t; END IF;
  END LOOP;
  IF has_table_privilege('gateway_runtime','public._sqlx_migrations','INSERT') OR has_table_privilege('gateway_runtime','public.installation','INSERT,DELETE,TRUNCATE') OR has_column_privilege('gateway_runtime','public.installation','schema_family','UPDATE') OR has_column_privilege('gateway_runtime','public.installation','id','UPDATE') THEN RAISE EXCEPTION 'runtime can rewrite lineage'; END IF;
@@ -224,7 +224,7 @@ DO $$ DECLARE r record; t text; BEGIN
  IF EXISTS(SELECT FROM history_partitions h JOIN pg_class p ON p.relname=h.parent AND p.relnamespace='public'::regnamespace
   JOIN pg_inherits i ON i.inhparent=p.oid
   WHERE NOT EXISTS(SELECT FROM pg_trigger t WHERE t.tgrelid=i.inhrelid AND t.tgtype&32=32 AND t.tgenabled='O' AND t.tgfoid='public.immutable_history'::regproc)) THEN RAISE EXCEPTION 'history partition without a TRUNCATE guard'; END IF;
- IF (SELECT count(*) FROM pg_partitioned_table pt JOIN pg_class c ON c.oid=pt.partrelid WHERE c.relnamespace='public'::regnamespace)<>5
+ IF (SELECT count(*) FROM pg_partitioned_table pt JOIN pg_class c ON c.oid=pt.partrelid WHERE c.relnamespace='public'::regnamespace)<>6
   OR EXISTS(SELECT FROM pg_partitioned_table WHERE partdefid<>0) THEN RAISE EXCEPTION 'unexpected partitioned tables or a default partition'; END IF;
  IF (SELECT count(*) FROM pg_trigger WHERE tgname LIKE '%\_stay\_in\_partition' AND tgenabled='O' AND tgparentid=0)<>2 THEN RAISE EXCEPTION 'partition key guards missing or disabled'; END IF;
  IF has_table_privilege('gateway_runtime','public.history_partitions','INSERT,UPDATE,DELETE,TRUNCATE') OR NOT has_table_privilege('gateway_runtime','public.history_partitions','SELECT') THEN RAISE EXCEPTION 'partition registry writable or unreadable'; END IF;
@@ -1208,6 +1208,18 @@ BEGIN
   DELETE FROM guardrail_rules WHERE rule_set_id=go;
   DELETE FROM guardrail_rule_sets WHERE id=go;
  END;
+ -- Guardrail decisions (0093): appended as runtime, never changed, removed or
+ -- back-dated, and scoped to the key's own workspace.
+ INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count)
+  VALUES(gen_random_uuid(),gen_random_uuid(),ws,k,'chat_completions','probe-model','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','secret','blocked',1);
+ BEGIN UPDATE guardrail_events SET count=2 WHERE workspace_id=ws; RAISE EXCEPTION 'guardrail event changed'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+ BEGIN DELETE FROM guardrail_events WHERE workspace_id=ws; RAISE EXCEPTION 'guardrail event removed'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+ BEGIN INSERT INTO guardrail_events(id,created_at,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count)
+  VALUES(gen_random_uuid(),now()-interval '400 days',gen_random_uuid(),ws,k,'chat_completions','probe-model','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','secret','blocked',1);
+  RAISE EXCEPTION 'guardrail event back-dated'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+ BEGIN INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count)
+  VALUES(gen_random_uuid(),gen_random_uuid(),personal,k,'chat_completions','probe-model','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','secret','blocked',1);
+  RAISE EXCEPTION 'guardrail event names another workspace''s key'; EXCEPTION WHEN foreign_key_violation THEN NULL; END;
  SET CONSTRAINTS ALL IMMEDIATE;
  IF (SELECT bool_or((versions_before->>topic)::bigint+1<>version) FROM config_versions) THEN RAISE EXCEPTION 'configuration versions not bumped once per transaction'; END IF;
  BEGIN UPDATE config_versions SET version=0 WHERE topic='keys'; RAISE EXCEPTION 'configuration version rollback allowed'; EXCEPTION WHEN check_violation THEN NULL; END;

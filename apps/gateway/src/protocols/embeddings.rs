@@ -56,6 +56,10 @@ struct PreparedResponse {
 impl Workload for ClientRequest {
     type Response = PreparedResponse;
     const PROTOCOL: ApiProtocol = ApiProtocol::Embeddings;
+    const GUARDRAIL: crate::guardrails::policy::Workload = crate::guardrails::policy::Workload::Embeddings;
+    fn inspection(&self) -> Option<crate::guardrails::detector::Inspection<'_>> {
+        self.request.inspection()
+    }
     fn model(&self) -> &str {
         &self.request.model
     }

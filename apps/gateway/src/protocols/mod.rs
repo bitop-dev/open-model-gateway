@@ -81,6 +81,12 @@ fn http_status(error: InferenceError) -> StatusCode {
         | InferenceError::Storage
         | InferenceError::ScopeBusy
         | InferenceError::RouteCoolingDown(_) => StatusCode::SERVICE_UNAVAILABLE,
+        InferenceError::Guardrail(r) => match r.kind {
+            crate::guardrails::enforce::RefusalKind::DetectorFailed => StatusCode::SERVICE_UNAVAILABLE,
+            crate::guardrails::enforce::RefusalKind::InputBlocked | crate::guardrails::enforce::RefusalKind::NotSupported => {
+                StatusCode::BAD_REQUEST
+            }
+        },
     }
 }
 
@@ -138,10 +144,19 @@ fn openai_error_body(error: InferenceError) -> serde_json::Value {
     ) {
         // OpenAI's type for transient server-side unavailability (HTTP 5xx).
         "server_error"
+    } else if let InferenceError::Guardrail(r) = error {
+        match r.kind {
+            crate::guardrails::enforce::RefusalKind::DetectorFailed => "server_error",
+            _ => "invalid_request_error",
+        }
     } else {
         error.code()
     };
-    serde_json::json!({"error":{"message":error.message(),"type":kind,"code":error.code(),"param":null}})
+    let mut body = serde_json::json!({"error":{"message":error.message(),"type":kind,"code":error.code(),"param":null}});
+    if let InferenceError::Guardrail(r) = error {
+        body["error"]["guardrail"] = r.json();
+    }
+    body
 }
 
 #[cfg(test)]

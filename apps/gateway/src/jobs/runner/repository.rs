@@ -91,6 +91,20 @@ impl LineRepository {
 }
 #[async_trait]
 impl InferenceRepository for LineRepository {
+    // A batch line runs under its workspace's guardrails like an
+    // interactive request (blocked lines get the interactive error body).
+    async fn guardrails(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<std::sync::Arc<crate::guardrails::enforce::Policy>, InferenceError> {
+        self.store.guardrails(workspace_id).await
+    }
+    async fn record_guardrails(
+        &self,
+        record: &crate::inference::guardrails::GuardrailRecord<'_>,
+    ) -> Result<(), InferenceError> {
+        self.store.record_guardrails(record).await
+    }
     async fn deployments(
         &self,
         principal: &Principal,

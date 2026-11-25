@@ -104,6 +104,9 @@ pub enum InferenceError {
     UpstreamUnavailable,
     InvalidUpstream,
     Storage,
+    /// A guardrail refused the request before admission (nothing was
+    /// reserved or sent): ids and fixed codes only, never matched text.
+    Guardrail(crate::guardrails::enforce::Refusal),
 }
 
 impl InferenceError {
@@ -131,6 +134,11 @@ impl InferenceError {
             Self::UpstreamUnavailable => "upstream_unavailable",
             Self::InvalidUpstream => "invalid_upstream_response",
             Self::Storage => "accounting_unavailable",
+            Self::Guardrail(r) => match r.kind {
+                crate::guardrails::enforce::RefusalKind::InputBlocked => "guardrail_input_blocked",
+                crate::guardrails::enforce::RefusalKind::DetectorFailed => "guardrail_detector_failed",
+                crate::guardrails::enforce::RefusalKind::NotSupported => "guardrail_not_supported",
+            },
         }
     }
     /// Budget/accounting denials are not transient; SDKs must not auto-retry them.
@@ -148,6 +156,9 @@ impl InferenceError {
                     | Self::ContextLength
                     | Self::TokenReservationExceedsLimit(_)
                     | Self::PriceUnbounded
+                    // A guardrail decision does not change on retry, and a
+                    // retry would run the detectors again.
+                    | Self::Guardrail(_)
             )
     }
     /// Seconds a client should wait before retrying (`Retry-After`), if known.
@@ -209,6 +220,17 @@ impl InferenceError {
             Self::UpstreamUnavailable => "The provider is unavailable",
             Self::InvalidUpstream => "The provider returned an invalid or incomplete response",
             Self::Storage => "Inference accounting is unavailable",
+            Self::Guardrail(r) => match r.kind {
+                crate::guardrails::enforce::RefusalKind::InputBlocked => {
+                    "Blocked by a guardrail policy; error.guardrail names the rule and the category"
+                }
+                crate::guardrails::enforce::RefusalKind::DetectorFailed => {
+                    "A guardrail detector could not run and its rule fails closed; error.guardrail names the rule"
+                }
+                crate::guardrails::enforce::RefusalKind::NotSupported => {
+                    "A guardrail policy enforces on this request, but part of it (an image, audio or an encoded document) cannot be inspected"
+                }
+            },
         }
     }
 }
