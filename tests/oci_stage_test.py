@@ -496,7 +496,7 @@ if kind == 'login':
             (b'Error: failed to resolve "sha256:2f1c" in OCI layout: not found',
              "error: failed to resolve <x> in oci layout: not found"),
             # Letter case carries nothing; words outside the list are placeholders.
-            (b"ERROR: Failed To Open hunter2Secret", "none"),
+            (b"ERROR: Failed To Open hunter2Secret", "unrecognised: error: failed to open <x>"),
             (b"Error: FAILED To Open hunter2Secret", "error: failed to open <x>"),
             # A number survives only as the status of a status code.
             (b"Error: response status code 503: 5000 12 0x1f", "error: response status code 503: <x>"),
@@ -507,16 +507,24 @@ if kind == 'login':
             # Brackets, quotes and semicolons never show: the skeleton cannot
             # imitate the fields printed around it.
             (b'Error: copy"]; status 418; [read', "error: <x>"),
-            # Only ORAS's own error line is shown.
-            (b"[2026-11-22T08:12:08.123Z][WARNING]: copy read", "none"),
-            (b"\nError: failed", "none"),
-            (b"", "none"),
+            # Every first line is shown under the name of its form (below).
+            (b"[2026-11-22T08:12:08.123Z][WARNING]: copy read", "warning: <x> read"),
+            (b"\nError: failed", "blank"),
+            (b"", "blank"),
         )
         for text, expected in cases:
             with self.subTest(expected=expected):
                 got = sk(line(text))
                 self.assertEqual(got, expected)
                 self.assertNotIn(TOKEN, got)
+        self.assertEqual(sk(b""), "none")
+        # A first line longer than the report is still named, its cut token
+        # dropped (a cut token may read as a listed word) and the cut marked.
+        # (4096 bytes end inside "opened", at "open".)
+        for long in (b"Error: failed " + b"x" * 5000, b"Error: " + b"x" * 4084 + b" opened" + b"x" * 100):
+            got = sk(long + b"\n")
+            self.assertTrue(got.startswith("error: ") and got.endswith(" \u2026"), got)
+            self.assertNotIn("open", got)
         # Bounded in tokens and characters, the omission marker included.
         for text in (b"Error: " + b"error " * 200, b"Error: " + b" ".join([b"failed"] * 30 + [b"x" * 50] * 30),
                      b"Error: " + b":" * 100):
@@ -533,6 +541,86 @@ if kind == 'login':
         self.assertIn('first-line "error: failed to push <x>: <x>"', outcome[1])
         self.assertNotIn(TOKEN, outcome[1])
         self.assertNotIn("bitop", outcome[1])
+
+    # Every form ORAS v1.3.6 (with cobra v1.10.2 and oras-go v2.7.0) or the Go
+    # runtime prints as the first line of a failed `cp`, with its fixed name.
+    FORMS = (
+        (b"Error: ", "error:"),
+        (b"Error response from registry: ", "error response from registry:"),
+        (b'Error from source registry for "ghcr.io/bitop-dev/x:v1": ', "error from source registry for <x>:"),
+        (b'Error from source oci-layout for "/tmp/oci-stage-x/image.tar@sha256:aa": ',
+         "error from source oci-layout for <x>:"),
+        (b'Error from destination registry for "ghcr.io/bitop-dev/open-model-gateway": ',
+         "error from destination registry for <x>:"),
+        (b'Error from destination oci-layout for "dir:v1": ', "error from destination oci-layout for <x>:"),
+        (b"[2026-11-25T16:33:08.123456789Z][WARNING]: ", "warning:"),
+        (b"[2026-11-25T16:33:08+01:00][WARNING]: ", "warning:"),
+        (b"panic: ", "panic:"),
+        (b"fatal error: ", "fatal error:"),
+        (b"runtime: ", "runtime:"),
+    )
+
+    def test_every_first_line_form_is_named_and_masked_as_before(self):
+        def sk(stderr):
+            return self.api.skeleton(io.BytesIO(stderr))
+        for prefix, name in self.FORMS:
+            with self.subTest(form=name):
+                self.assertEqual(sk(prefix + b"failed to open /tmp/x: no such file or directory\n"),
+                                 name + " failed to open <x>: no such file or directory")
+                self.assertEqual(sk(prefix + b"\n"), name)
+        # The reference ORAS quotes (Go %q) is one placeholder, escapes included.
+        self.assertEqual(sk(b'Error from destination registry for "a\\" copy read": denied\n'),
+                         "error from destination registry for <x>: denied")
+        # A prefix that is not exactly one of the forms is shown as unrecognised.
+        for line, expected in (
+            (b"Error from destination copy for \"x\": denied", "unrecognised: error from destination <x> for <x>: denied"),
+            (b"Error response from registry:denied", "unrecognised: error response from registry: denied"),
+            (b"[2026-11-25][WARNING]: read", "unrecognised: <x>: read"),
+            (b"error: failed", "unrecognised: error: failed"),
+            (b"  Error: failed", "unrecognised: error: failed"),
+            (b"Run 'oras cp --help' for usage.", "unrecognised: <x> for <x>"),
+            (b"   ", "blank"),
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(sk(line + b"\n"), expected)
+
+    # The leak fixtures of the `Error: ` form, under every other form too.
+    LEAKS = (
+        b"Bearer " + TOKEN.encode() + b" rejected; token=" + TOKEN.encode(),
+        b'GET "https://ghcr.io/token?scope=repository%3Abitop-dev%3Apush&access_token=' + TOKEN.encode() + b'": unexpected EOF',
+        b'password "COPY"; host "cache"; file "config"; repository "bitop-dev/backup"',
+        b'"https://registry.fixture.invalid/v2?fixture=opaque:copy"',
+        b"Failed To Open hunter2Secret " + TOKEN.encode(),
+        "\x1b[31mrouge élève\x07 ".encode() + TOKEN.encode(),
+        b"read\r" + TOKEN.encode() + b" copy",
+        b'copy"]; status 418; [read ' + TOKEN.encode(),
+        b"unauthorized: " + TOKEN.encode() + b": " + b"x" * 4000,
+        b'"' + TOKEN.encode() + b'\\" ' + TOKEN.encode() + b' "',
+    )
+
+    def test_no_form_lets_a_secret_or_a_value_through(self):
+        allowed = re.compile(r"[a-z0-9' :,<>\-…]{1,160}")
+        for prefix, name in self.FORMS + ((b"", "unrecognised:"), (b"Error from destination copy for ", "unrecognised:")):
+            for leak in self.LEAKS:
+                with self.subTest(form=name, leak=leak[:24]):
+                    got = self.api.skeleton(io.BytesIO(prefix + leak + b"\nsecond " + TOKEN.encode() + b"\n"))
+                    self.assertTrue(got.startswith(name), got)
+                    self.assertRegex(got, allowed)
+                    for secret in (TOKEN, "bitop", "hunter2", "fixture", "opaque", "cache", "418", "rouge"):
+                        self.assertNotIn(secret, got)
+
+    def test_the_line_of_the_first_unknown_failure_is_named(self):
+        # #711: one stderr line that was not ORAS's `Error: ` form, reported as
+        # `first-line "none"`. The same report now names the form.
+        line = (b'Error from destination registry for "ghcr.io/bitop-dev/open-model-gateway": '
+                b"service unavailable: " + TOKEN.encode())
+        self.install_tool(fail="cp", diagnostic=line + b"\n")
+        code, out, err = self.invoke()
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(err.strip(), (
+            "oci-stage: copy failed (unknown) [attempt 1 of 3; status none; oci-code none; request none; "
+            'host none; transport none; stderr 1 lines; first-line "error from destination registry for <x>: <x>: <x>"]'))
+        self.assertEqual(sum(1 for r in self.records() if r["argv"][0] == "cp"), 1)
 
     def test_signals_come_from_request_records_only(self):
         cases = (
