@@ -31,6 +31,10 @@ impl InferenceRepository for Repo {
     async fn deployments(&self, _: &Principal, _: &str) -> Result<Vec<Deployment>> {
         Ok(self.deployments.lock().unwrap().clone())
     }
+    /// An in-memory list: there is no cache to bypass.
+    async fn live_candidates(&self, principal: &Principal, model: &str) -> Result<Vec<Deployment>> {
+        self.deployments(principal, model).await
+    }
     async fn start(&self, _: &ExecutionStart) -> Result<()> {
         panic!("images must use admit_workload")
     }

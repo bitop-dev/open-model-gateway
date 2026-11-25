@@ -50,7 +50,7 @@ Claude Code sends whatever name it is configured with (`ANTHROPIC_MODEL`, `ANTHR
 2. Anthropic route fidelity: preserved system/cache blocks, `thinking` with signatures, beta headers forwarded, thinking streamed back.
 3. Reasoning and structured-output mapping for OpenAI-style providers.
 4. Accounting checks for thinking and cache on PostgreSQL 17 (#71).
-5. `/v1/messages/count_tokens` (see the open question).
+5. `/v1/messages/count_tokens` (#72): implemented as described in `docs/protocol-matrix.md` (Token counting).
 6. #73: real Claude Code acceptance with paid calls, under your spending cap.
 
 ## Decisions

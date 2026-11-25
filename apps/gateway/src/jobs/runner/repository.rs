@@ -98,6 +98,14 @@ impl InferenceRepository for LineRepository {
     ) -> Result<Vec<Deployment>, InferenceError> {
         self.store.deployments(principal, model).await
     }
+    /// Batch lines never count tokens; the store's live read, never its cache.
+    async fn live_candidates(
+        &self,
+        principal: &Principal,
+        model: &str,
+    ) -> Result<Vec<Deployment>, InferenceError> {
+        self.store.live_candidates(principal, model).await
+    }
     /// Every deployment of the model, unless this attempt is pinned to one
     /// route (an omitted-maximum line pinned at plan time, or an explicit-
     /// maximum line the scheduler already claimed capacity on): then only

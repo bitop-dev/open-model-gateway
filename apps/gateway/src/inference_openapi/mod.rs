@@ -207,7 +207,7 @@ mod tests {
         );
         // Intentionally not acceptance of #82: later PRs must reduce this to zero.
         assert_eq!(
-            operations, 27,
+            operations, 28,
             "review route additions and update this baseline"
         );
         assert_eq!(

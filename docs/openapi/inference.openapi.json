@@ -6414,6 +6414,335 @@
         ],
         "type": "object"
       },
+      "post_v1_messages_count_tokensRequest": {
+        "description": "The Messages input fields under the Messages grammar (same block, tool, thinking, output_config and image rules). Generation controls (max_tokens, stream, temperature, top_p, top_k, stop_sequences, metadata, context_management) are not part of a count and are refused as unknown fields. The 2 MiB serialized JSON body cap applies.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "messages": {
+                "items": {
+                  "$ref": "#/components/schemas/GenMessagesTurn"
+                },
+                "maxItems": 4096,
+                "minItems": 1,
+                "type": "array",
+                "x-omg-unsendable-boundary": "The shared automatic vector planner is capped at 1000 array items; generation accepts 4096. inference_openapi_generation_large_message_boundaries executes the real 4096/4097 HTTP straddle separately with compact text messages, without raising the planner memory bound."
+              },
+              "model": {
+                "description": "Nonempty after Rust str::trim(), enforced by generation-normalization; ECMA regex whitespace differs (notably U+FEFF). UTF-8 byte limit remains enforced.",
+                "minLength": 1,
+                "type": "string",
+                "x-omg-max-bytes": 200
+              },
+              "output_config": {
+                "oneOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "effort": {
+                        "enum": [
+                          "low",
+                          "medium",
+                          "high",
+                          "xhigh",
+                          "max"
+                        ],
+                        "type": "string"
+                      },
+                      "task_budget": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "remaining": {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "total": {
+                            "minimum": 1,
+                            "type": "integer"
+                          },
+                          "type": {
+                            "const": "tokens"
+                          }
+                        },
+                        "required": [
+                          "type",
+                          "total"
+                        ],
+                        "type": "object"
+                      }
+                    },
+                    "required": [],
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "system": {
+                "oneOf": [
+                  {
+                    "oneOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "items": {
+                          "$ref": "#/components/schemas/GenTextBlock"
+                        },
+                        "maxItems": 256,
+                        "minItems": 0,
+                        "type": "array"
+                      }
+                    ]
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "thinking": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/GenThinking"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "tool_choice": {
+                "oneOf": [
+                  {
+                    "oneOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "type": {
+                            "enum": [
+                              "auto",
+                              "none",
+                              "any"
+                            ],
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "type"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "name": {
+                            "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                            "type": "string"
+                          },
+                          "type": {
+                            "const": "tool"
+                          }
+                        },
+                        "required": [
+                          "type",
+                          "name"
+                        ],
+                        "type": "object"
+                      }
+                    ]
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "tools": {
+                "items": {
+                  "$ref": "#/components/schemas/GenMessagesTool"
+                },
+                "maxItems": 128,
+                "minItems": 0,
+                "type": "array"
+              }
+            },
+            "required": [
+              "model",
+              "messages"
+            ],
+            "type": "object"
+          },
+          {
+            "items": false,
+            "maxItems": 7,
+            "minItems": 7,
+            "prefixItems": [
+              {
+                "description": "Nonempty after Rust str::trim(), enforced by generation-normalization; ECMA regex whitespace differs (notably U+FEFF). UTF-8 byte limit remains enforced.",
+                "minLength": 1,
+                "type": "string",
+                "x-omg-max-bytes": 200
+              },
+              {
+                "items": {
+                  "$ref": "#/components/schemas/GenMessagesTurn"
+                },
+                "maxItems": 4096,
+                "minItems": 1,
+                "type": "array",
+                "x-omg-unsendable-boundary": "The shared automatic vector planner is capped at 1000 array items; generation accepts 4096. inference_openapi_generation_large_message_boundaries executes the real 4096/4097 HTTP straddle separately with compact text messages, without raising the planner memory bound."
+              },
+              {
+                "oneOf": [
+                  {
+                    "oneOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "items": {
+                          "$ref": "#/components/schemas/GenTextBlock"
+                        },
+                        "maxItems": 256,
+                        "minItems": 0,
+                        "type": "array"
+                      }
+                    ]
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              {
+                "items": {
+                  "$ref": "#/components/schemas/GenMessagesTool"
+                },
+                "maxItems": 128,
+                "minItems": 0,
+                "type": "array"
+              },
+              {
+                "oneOf": [
+                  {
+                    "oneOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "type": {
+                            "enum": [
+                              "auto",
+                              "none",
+                              "any"
+                            ],
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "type"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "name": {
+                            "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                            "type": "string"
+                          },
+                          "type": {
+                            "const": "tool"
+                          }
+                        },
+                        "required": [
+                          "type",
+                          "name"
+                        ],
+                        "type": "object"
+                      }
+                    ]
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/GenThinking"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              {
+                "oneOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "effort": {
+                        "enum": [
+                          "low",
+                          "medium",
+                          "high",
+                          "xhigh",
+                          "max"
+                        ],
+                        "type": "string"
+                      },
+                      "task_budget": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "remaining": {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "total": {
+                            "minimum": 1,
+                            "type": "integer"
+                          },
+                          "type": {
+                            "const": "tokens"
+                          }
+                        },
+                        "required": [
+                          "type",
+                          "total"
+                        ],
+                        "type": "object"
+                      }
+                    },
+                    "required": [],
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            ],
+            "type": "array"
+          }
+        ],
+        "x-omg-request-constraints": "generation-normalization"
+      },
+      "post_v1_messages_count_tokensResponse": {
+        "additionalProperties": false,
+        "description": "The input-token count only. x-omg-token-count says whether the provider counted it or the gateway estimated it.",
+        "properties": {
+          "input_tokens": {
+            "maximum": 9223372036854775807,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "input_tokens"
+        ],
+        "type": "object"
+      },
       "post_v1_realtime_callsRequest": false,
       "post_v1_realtime_callsResponse": {
         "$ref": "#/components/schemas/RealtimeUnsupportedRefusal"
@@ -10059,6 +10388,376 @@
         },
         "x-omg-response-schema": {
           "$ref": "#/components/schemas/post_v1_messagesResponse"
+        },
+        "x-omg-token-policy": "Denied"
+      }
+    },
+    "/v1/messages/count_tokens": {
+      "post": {
+        "description": "Counts the input tokens of a Messages request (#72). Authorized like POST /v1/messages: the workspace and key come from the validated inference key, and the model must be one the key may use now and must serve the messages protocol. Anthropic routes ask Anthropic's counting endpoint with the connection's own credential; every other route returns the gateway estimate. The route is the first one routing would choose; a count never fails over and is not an attempt. Each gateway process bounds counts by key per minute, by provider connection credential per minute (provider-backed counts only) and by its own concurrency pool, separate from generation, of which one key may hold at most 2 counts at once (429 beyond any of them; a count refused for concurrency does not spend the key's minute). A count consults no budget or rate limit and does not consume the key's request-rate allowance. Default root body cap is fixed 2097152 bytes. Unknown fields are 400 invalid_request_error.",
+        "operationId": "post_v1_messages_count_tokens",
+        "parameters": [
+          {
+            "description": "Exactly one occurrence with the literal version 2023-06-01 or 2026-10-21. The count body has no sampling fields and no version-dependent rules, so both versions validate the same body; native Anthropic routes send 2023-06-01 upstream.",
+            "in": "header",
+            "name": "anthropic-version",
+            "required": true,
+            "schema": {
+              "enum": [
+                "2023-06-01",
+                "2026-10-21"
+              ],
+              "type": "string"
+            },
+            "x-omg-max-occurrences": 1
+          },
+          {
+            "description": "Open comma-separated list, not an allowlist. At most 16 header occurrences, 32 total nonempty tokens; ASCII graphical characters plus space/tab. Tokens are trimmed for case-insensitive deny-prefix checks.",
+            "in": "header",
+            "name": "anthropic-beta",
+            "required": false,
+            "schema": {
+              "maxLength": 1024,
+              "minLength": 1,
+              "pattern": "^[\\x09\\x20-\\x7E]+$",
+              "type": "string"
+            },
+            "x-omg-denied-prefixes": [
+              "context-1m-",
+              "code-execution-",
+              "web-search-",
+              "web-fetch-",
+              "files-api-",
+              "mcp-client-",
+              "computer-use-"
+            ],
+            "x-omg-max-occurrences": 16,
+            "x-omg-max-tokens": 32
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/post_v1_messages_count_tokensRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "input_tokens": 11
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/post_v1_messages_count_tokensResponse"
+                }
+              }
+            },
+            "description": "The count. Never billed, never an admission bound; no execution, reservation or ledger entry is written.",
+            "headers": {
+              "cache-control": {
+                "$ref": "#/components/headers/NoStore"
+              },
+              "x-omg-token-count": {
+                "description": "provider: the route's provider counted the request (Anthropic routes). estimate; method=utf8-bytes-div-4: every other route; the gateway's approximation, the UTF-8 bytes of the system and message text, tool calls and results, and tool names, descriptions and schemas, divided by four and rounded up. It is not the model's tokenizer and can differ from the provider's count in either direction.",
+                "required": true,
+                "schema": {
+                  "enum": [
+                    "provider",
+                    "estimate; method=utf8-bytes-div-4"
+                  ],
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnthropicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Anthropic-shaped error without gateway machine code; status 400",
+            "headers": {
+              "cache-control": {
+                "$ref": "#/components/headers/NoStore"
+              },
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "x-should-retry": {
+                "$ref": "#/components/headers/ShouldRetryFalse"
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnthropicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Anthropic-shaped error without gateway machine code; status 401",
+            "headers": {
+              "cache-control": {
+                "$ref": "#/components/headers/NoStore"
+              },
+              "www-authenticate": {
+                "$ref": "#/components/headers/WwwAuthenticate"
+              },
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnthropicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Anthropic-shaped error without gateway machine code; status 404",
+            "headers": {
+              "cache-control": {
+                "$ref": "#/components/headers/NoStore"
+              },
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnthropicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Method not allowed",
+            "headers": {
+              "allow": {
+                "required": true,
+                "schema": {
+                  "const": "POST"
+                }
+              },
+              "cache-control": {
+                "$ref": "#/components/headers/NoStore"
+              },
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnthropicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Anthropic-shaped error without gateway machine code; status 413",
+            "headers": {
+              "cache-control": {
+                "$ref": "#/components/headers/NoStore"
+              },
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnthropicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Anthropic-shaped error without gateway machine code; status 429",
+            "headers": {
+              "cache-control": {
+                "$ref": "#/components/headers/NoStore"
+              },
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "x-should-retry": {
+                "$ref": "#/components/headers/ShouldRetryFalse"
+              }
+            }
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnthropicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Anthropic-shaped error without gateway machine code; status 501",
+            "headers": {
+              "cache-control": {
+                "$ref": "#/components/headers/NoStore"
+              },
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "x-should-retry": {
+                "$ref": "#/components/headers/ShouldRetryFalse"
+              }
+            }
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnthropicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Anthropic-shaped error without gateway machine code; status 502",
+            "headers": {
+              "cache-control": {
+                "$ref": "#/components/headers/NoStore"
+              },
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnthropicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Anthropic-shaped error without gateway machine code; status 503",
+            "headers": {
+              "cache-control": {
+                "$ref": "#/components/headers/NoStore"
+              },
+              "retry-after": {
+                "$ref": "#/components/headers/RetryAfter"
+              },
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "x-should-retry": {
+                "$ref": "#/components/headers/ShouldRetryFalse"
+              }
+            }
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnthropicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Anthropic-shaped error without gateway machine code; status 504",
+            "headers": {
+              "cache-control": {
+                "$ref": "#/components/headers/NoStore"
+              },
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "inferenceKey": []
+          },
+          {
+            "anthropicApiKey": []
+          }
+        ],
+        "summary": "Count message tokens",
+        "x-omg-access": "InferenceKey",
+        "x-omg-limits": {
+          "body_bytes": {
+            "default": 2097152,
+            "env": null,
+            "source": "Fixed root RequestBodyLimitLayer in apps/gateway/src/http.rs"
+          },
+          "count_concurrency": {
+            "default": 8,
+            "env": "GATEWAY_COUNT_TOKENS_CONCURRENCY",
+            "source": "inference/count.rs, a pool separate from GATEWAY_MAX_CONCURRENT_REQUESTS, per gateway process"
+          },
+          "counts_in_flight_per_key": {
+            "default": 2,
+            "env": null,
+            "source": "Fixed COUNTS_IN_FLIGHT_PER_KEY in inference/count.rs: counts one key may have running at once, per gateway process"
+          },
+          "counts_per_connection_per_minute": {
+            "default": 600,
+            "env": "GATEWAY_COUNT_TOKENS_PER_CONNECTION_PER_MINUTE",
+            "source": "inference/count.rs, provider-backed counts per provider connection credential, per gateway process"
+          },
+          "counts_per_key_per_minute": {
+            "default": 60,
+            "env": "GATEWAY_COUNT_TOKENS_PER_KEY_PER_MINUTE",
+            "source": "inference/count.rs, per gateway process"
+          }
+        },
+        "x-omg-refusals": [
+          {
+            "code": null,
+            "envelope": "AnthropicErrorEnvelope",
+            "status": 400,
+            "trigger": "unknown fields (including max_tokens, stream, sampling, metadata and context_management), invalid types, bounds or malformed JSON"
+          },
+          {
+            "code": null,
+            "envelope": "AnthropicErrorEnvelope",
+            "status": 400,
+            "trigger": "a field the selected route refuses for generation (for example images on translated routes, structured output on local routes), hosted/server tools, remote image sources or denied beta prefixes"
+          },
+          {
+            "code": null,
+            "envelope": "AnthropicErrorEnvelope",
+            "status": 404,
+            "trigger": "the model is unknown, not granted to the key's workspace, or excluded by the key's restriction"
+          },
+          {
+            "code": null,
+            "envelope": "AnthropicErrorEnvelope",
+            "status": 429,
+            "trigger": "a count limit of this gateway process: counts per key per minute, provider-backed counts per provider connection credential per minute, count concurrency (these three configurable), or 2 counts in flight per key (all per replica)"
+          },
+          {
+            "code": null,
+            "envelope": "AnthropicErrorEnvelope",
+            "status": 501,
+            "trigger": "the model is available to the key but no enabled deployment serves the messages protocol, or none supports the requested capability"
+          }
+        ],
+        "x-omg-request-constraints": "generation-normalization",
+        "x-omg-request-schema": {
+          "$ref": "#/components/schemas/post_v1_messages_count_tokensRequest"
+        },
+        "x-omg-response-schema": {
+          "$ref": "#/components/schemas/post_v1_messages_count_tokensResponse"
         },
         "x-omg-token-policy": "Denied"
       }

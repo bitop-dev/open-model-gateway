@@ -45,7 +45,10 @@ async fn start(
 ) -> sqlx::Result<Transaction<'static, Postgres>> {
     let pool = pool.clone();
     let start = async move {
-        #[allow(clippy::disallowed_methods)] // the one sanctioned call site
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the one sanctioned pool begin (cancellation-safe wrapper)"
+        )]
         let begin = pool.begin_with("BEGIN ISOLATION LEVEL READ COMMITTED");
         #[cfg(test)]
         let begin = diagnostics::sql(diagnostics::Stage::PoolAcquireAndBegin, begin);

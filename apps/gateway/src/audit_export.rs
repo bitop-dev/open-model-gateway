@@ -695,27 +695,17 @@ impl Syslog {
     }
 
     async fn session(&self, frames: &[u8]) -> Result<(), &'static str> {
-        // The egress policy picks the addresses (#33); TLS still verifies `host`.
-        let addresses = crate::egress::resolve(
+        // The egress policy picks the addresses (#33), each with its own short
+        // connect limit; TLS still verifies `host`.
+        let tcp = crate::egress::connect_tcp(
             &self.policy,
             crate::egress::Purpose::Audit,
             &self.host,
             self.port,
+            CONNECT_TIMEOUT,
         )
         .await
         .map_err(|_| "connection")?;
-        let mut tcp = None;
-        // Each address gets its own short connect limit, so one that never
-        // answers (a dead IPv6 route) doesn't use up the whole run.
-        for address in addresses {
-            if let Ok(Ok(stream)) =
-                tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(address)).await
-            {
-                tcp = Some(stream);
-                break;
-            }
-        }
-        let tcp = tcp.ok_or("connection")?;
         let mut tls = tokio_rustls::TlsConnector::from(self.tls.clone())
             .connect(self.server_name.clone(), tcp)
             .await

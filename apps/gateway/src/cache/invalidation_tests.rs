@@ -18,7 +18,7 @@ use sqlx::PgPool;
 
 const MODEL: &str = "company/smart";
 
-pub(super) async fn replica(pool: &PgPool) -> Store {
+pub(crate) async fn replica(pool: &PgPool) -> Store {
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(4)
         .connect_with((*pool.connect_options()).clone())
@@ -33,7 +33,7 @@ pub(super) async fn replica(pool: &PgPool) -> Store {
 /// every cache is bypassed, so a slow (loaded) machine would turn the stale
 /// replica into one that reads live. Tests that exercise expiry call
 /// `backdate_sync` themselves.
-pub(super) async fn stale_replica(pool: &PgPool) -> Store {
+pub(crate) async fn stale_replica(pool: &PgPool) -> Store {
     let store = replica(pool).await;
     store.caches.versions.enable();
     notify::poll_once(&store.pool, &store.caches.versions)

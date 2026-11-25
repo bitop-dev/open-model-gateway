@@ -16,9 +16,9 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::{convert::Infallible, time::Duration};
 mod request;
-pub use request::Request;
 #[cfg(test)]
 use request::parse_request;
+pub use request::{CountRequest, Request};
 pub(crate) const OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
 /// The two Anthropic API versions the gateway accepts (#430). Requests are
 /// always sent upstream as `2023-06-01`: under `2026-10-21` the gateway refuses
@@ -79,6 +79,80 @@ fn beta_error_response(tokens: &[String]) -> Response {
         json!({"type":"error","error":{"type":"invalid_request_error","message":message}}),
     )
 }
+/// The validated `anthropic-beta` values and `anthropic-version` of a
+/// Messages or count request, or the Anthropic-shaped refusal (boxed: a
+/// response is large and the success path is the common one).
+fn protocol_headers(
+    headers: &HeaderMap,
+) -> std::result::Result<(Vec<String>, ApiVersion), Box<Response>> {
+    let betas = match beta_headers(headers) {
+        Ok(v) => v,
+        Err(BetaHeaderError::Denied(tokens)) => {
+            return Err(Box::new(beta_error_response(&tokens)));
+        }
+        Err(BetaHeaderError::Invalid) => {
+            return Err(Box::new(error_response(InferenceError::InvalidField(
+                "anthropic-beta",
+            ))));
+        }
+    };
+    let Some(version) = version(headers) else {
+        return Err(Box::new(error_response(InferenceError::InvalidRequest)));
+    };
+    Ok((betas, version))
+}
+/// The decoded body, or the Anthropic-shaped refusal (413 for a streamed
+/// body over the cap, the unknown field's name, else the generic 400).
+fn body<T>(
+    input: std::result::Result<Json<T>, JsonRejection>,
+) -> std::result::Result<T, Box<Response>> {
+    match input {
+        Ok(Json(v)) => Ok(v),
+        Err(e) if e.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            Err(Box::new(http_error(StatusCode::PAYLOAD_TOO_LARGE)))
+        }
+        Err(e) => Err(Box::new(rejection(e))),
+    }
+}
+/// `POST /v1/messages/count_tokens` (#72): the headers, grammar and live
+/// key/workspace/model authorization of `handle`, answered by
+/// `Engine::count_tokens`. The reply is `{"input_tokens":N}`; the
+/// `x-omg-token-count` header says whether the provider counted it or the
+/// gateway estimated it. Nothing is billed or admitted.
+pub async fn count_tokens(
+    Extension(engine): Extension<Engine>,
+    Extension(principal): Extension<Principal>,
+    Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
+    input: std::result::Result<Json<CountRequest>, JsonRejection>,
+) -> Response {
+    let (betas, _version) = match protocol_headers(&headers) {
+        Ok(v) => v,
+        Err(response) => return *response,
+    };
+    let wire = match body(input) {
+        Ok(v) => v,
+        Err(response) => return *response,
+    };
+    let mut request = match wire.normalize() {
+        Ok(v) => v,
+        Err(e) => return error_response(e),
+    };
+    if let Some(options) = &mut request.messages_options {
+        options.beta_headers = betas;
+    }
+    match engine.count_tokens(principal, request, request_id.0).await {
+        Ok(count) => {
+            let mut response = Json(json!({"input_tokens":count.input_tokens})).into_response();
+            response.headers_mut().insert(
+                "x-omg-token-count",
+                axum::http::HeaderValue::from_static(count.source.header()),
+            );
+            response
+        }
+        Err(e) => error_response(e),
+    }
+}
 pub async fn handle(
     Extension(engine): Extension<Engine>,
     Extension(principal): Extension<Principal>,
@@ -86,22 +160,13 @@ pub async fn handle(
     headers: HeaderMap,
     input: std::result::Result<Json<Request>, JsonRejection>,
 ) -> Response {
-    let betas = match beta_headers(&headers) {
+    let (betas, version) = match protocol_headers(&headers) {
         Ok(v) => v,
-        Err(BetaHeaderError::Denied(tokens)) => return beta_error_response(&tokens),
-        Err(BetaHeaderError::Invalid) => {
-            return error_response(InferenceError::InvalidField("anthropic-beta"));
-        }
+        Err(response) => return *response,
     };
-    let Some(version) = version(&headers) else {
-        return error_response(InferenceError::InvalidRequest);
-    };
-    let wire = match input {
-        Ok(Json(v)) => v,
-        Err(e) if e.status() == StatusCode::PAYLOAD_TOO_LARGE => {
-            return http_error(StatusCode::PAYLOAD_TOO_LARGE);
-        }
-        Err(e) => return rejection(e),
+    let wire = match body(input) {
+        Ok(v) => v,
+        Err(response) => return *response,
     };
     if let Err(field) = wire.check_version(version) {
         return version_error_response(field);
@@ -429,4 +494,11 @@ mod tests;
 #[cfg(test)]
 pub(crate) fn openapi_normalize(value: Value) -> Result<ChatRequest> {
     request::parse_request(value)
+}
+/// The count route's normalization, for the contract's semantic constraint.
+#[cfg(test)]
+pub(crate) fn openapi_count_normalize(value: Value) -> Result<ChatRequest> {
+    serde_json::from_value::<CountRequest>(value)
+        .map_err(|_| InferenceError::InvalidRequest)?
+        .normalize()
 }

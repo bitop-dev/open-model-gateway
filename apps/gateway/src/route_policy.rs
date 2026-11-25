@@ -135,6 +135,8 @@ pub(crate) const ROUTES: &[Route] = routes! {
     "POST"                 "/v1/responses" => InferenceKey, DENIED;
     // Also /v1/messages?beta=true: queries never widen this exact POST template.
     "POST"                 "/v1/messages" => InferenceKey, DENIED;
+    // Token counting (#72): the same key, workspace and model authority.
+    "POST"                 "/v1/messages/count_tokens" => InferenceKey, DENIED;
     "POST"                 "/v1/embeddings" => InferenceKey, DENIED;
     "POST"                 "/v1/realtime/client_secrets" => InferenceKey, DENIED;
     "POST"                 "/v1/realtime/calls" => InferenceKey, DENIED;

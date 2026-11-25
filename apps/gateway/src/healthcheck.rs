@@ -157,6 +157,32 @@ pub fn parse_timeout(value: &str) -> Result<Duration> {
     Ok(duration)
 }
 
+/// The first of the target's addresses (loopback unless allowed) that accepts
+/// within the time `remaining` leaves.
+fn connect(
+    target: &Target,
+    allow_non_loopback: bool,
+    remaining: &dyn Fn() -> Result<Duration>,
+) -> Result<TcpStream> {
+    let mut last_error = None;
+    for address in target.addresses(allow_non_loopback)? {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the health probe dials the gateway's own listener (#606)"
+        )]
+        let connecting = TcpStream::connect_timeout(&address, remaining()?);
+        match connecting {
+            Ok(connected) => return Ok(connected),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(anyhow!(
+        "could not connect to {}: {}",
+        target.host_header(),
+        last_error.map_or_else(|| "no address".to_owned(), |e| e.to_string())
+    ))
+}
+
 /// Probe once. Returns the `2xx` status, or an error describing why the
 /// gateway is not healthy.
 pub fn probe(target: &Target, timeout: Duration, allow_non_loopback: bool) -> Result<u16> {
@@ -167,24 +193,7 @@ pub fn probe(target: &Target, timeout: Duration, allow_non_loopback: bool) -> Re
             .filter(|d| !d.is_zero())
             .ok_or_else(|| anyhow!("timed out after {timeout:?}"))
     };
-    let mut last_error = None;
-    let mut stream = None;
-    for address in target.addresses(allow_non_loopback)? {
-        match TcpStream::connect_timeout(&address, remaining()?) {
-            Ok(connected) => {
-                stream = Some(connected);
-                break;
-            }
-            Err(error) => last_error = Some(error),
-        }
-    }
-    let mut stream = stream.ok_or_else(|| {
-        anyhow!(
-            "could not connect to {}: {}",
-            target.host_header(),
-            last_error.map_or_else(|| "no address".to_owned(), |e| e.to_string())
-        )
-    })?;
+    let mut stream = connect(target, allow_non_loopback, &remaining)?;
     let request = format!(
         "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: open-model-gateway-healthcheck\r\nAccept: */*\r\nConnection: close\r\n\r\n",
         target.path,

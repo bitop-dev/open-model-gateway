@@ -239,6 +239,7 @@ pub struct Metrics {
     config_changes: Family<L1, Counter>,
     config_poll_failures: Counter,
     auth_throttled: Family<L2, Counter>,
+    token_counts: Family<L1, Counter>,
     key_issuance_refused: Family<L2, Counter>,
     egress_denied: Family<L1, Counter>,
     upstream_connection_lost: Family<L1, Counter>,

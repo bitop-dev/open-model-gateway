@@ -42,6 +42,7 @@ pub(super) fn load_fragments() -> Result<Fragments> {
 /// (`http::credential` for Messages, `protocols::realtime::credential`).
 const EXTRA_CREDENTIALS: &[(&str, &str)] = &[
     ("/v1/messages", "anthropicApiKey"),
+    ("/v1/messages/count_tokens", "anthropicApiKey"),
     ("/v1/realtime", "realtimeSubprotocol"),
 ];
 /// Non-path parameters a route reads (`protocols/realtime.rs` `model_param`).
@@ -49,6 +50,8 @@ const EXTRA_CREDENTIALS: &[(&str, &str)] = &[
 pub(super) const HEADER_PARAMETERS: &[(&str, &str, &str)] = &[
     ("POST", "/v1/messages", "anthropic-version"),
     ("POST", "/v1/messages", "anthropic-beta"),
+    ("POST", "/v1/messages/count_tokens", "anthropic-version"),
+    ("POST", "/v1/messages/count_tokens", "anthropic-beta"),
 ];
 
 pub(super) const QUERY_PARAMETERS: &[(&str, &str, &str)] = &[
@@ -340,7 +343,19 @@ pub(super) fn verify(document: &Value) -> Result<()> {
     }
     ensure!(actual.iter().eq(inventory.keys()), "omitted operations");
     super::errors::verify_components(document)?;
-    let parameters = document["paths"]["/v1/messages"]["post"]["parameters"]
+    for path in ANTHROPIC_PATHS {
+        verify_anthropic_headers(document, path)?;
+    }
+    verify_transport_exceptions(document)?;
+    Ok(())
+}
+
+/// The Anthropic-protocol routes (`http.rs` `anthropic_path`): Anthropic
+/// errors, the `x-api-key` credential and the protocol headers.
+pub(super) const ANTHROPIC_PATHS: &[&str] = &["/v1/messages", "/v1/messages/count_tokens"];
+
+fn verify_anthropic_headers(document: &Value, path: &str) -> Result<()> {
+    let parameters = document["paths"][path]["post"]["parameters"]
         .as_array()
         .context("Messages protocol headers")?;
     let version = parameters
@@ -369,7 +384,6 @@ pub(super) fn verify(document: &Value) -> Result<()> {
                 == json!(crate::providers::messages::DENIED_BETA_PREFIXES),
         "Messages open beta list declaration drift"
     );
-    verify_transport_exceptions(document)?;
     Ok(())
 }
 
@@ -378,8 +392,10 @@ pub(super) fn verify(document: &Value) -> Result<()> {
 /// Anthropic's shape in the outer layer (`http.rs` request_context,
 /// `protocols/messages.rs` http_error), unlike every other route. They must be
 /// IN the document, with the Anthropic envelope.
-const TRANSPORT_EXCEPTIONS: &[(&str, &str, &[&str])] =
-    &[("/v1/messages", "post", &["401", "405", "413"])];
+const TRANSPORT_EXCEPTIONS: &[(&str, &str, &[&str])] = &[
+    ("/v1/messages", "post", &["401", "405", "413"]),
+    ("/v1/messages/count_tokens", "post", &["401", "405", "413"]),
+];
 
 fn verify_transport_exceptions(document: &Value) -> Result<()> {
     for (path, method, statuses) in TRANSPORT_EXCEPTIONS {
@@ -392,11 +408,13 @@ fn verify_transport_exceptions(document: &Value) -> Result<()> {
             );
         }
     }
-    ensure!(
-        document["paths"]["/v1/messages"]["post"]["responses"]["405"]["headers"]["allow"]["schema"]
-            == json!({"const":"POST"}),
-        "the /v1/messages 405 must keep its Allow header"
-    );
+    for path in ANTHROPIC_PATHS {
+        ensure!(
+            document["paths"][*path]["post"]["responses"]["405"]["headers"]["allow"]["schema"]
+                == json!({"const":"POST"}),
+            "the {path} 405 must keep its Allow header"
+        );
+    }
     Ok(())
 }
 
