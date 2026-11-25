@@ -166,7 +166,7 @@ jobs:
           RUST_TEST_NOCAPTURE: "1"
         run: node deploy/spark/test-integration.mjs key-contention
       - name: Measure admission lock stalls (#132) on dedicated runtime-role PostgreSQL
-        # Load measurements on the shared rows of one scope: run alone, after the other probes.
+        # Load measurements on the shared rows of one scope: each runs alone (--exact, one thread).
         env:
           RUST_TEST_NOCAPTURE: "1"
         run: node deploy/spark/test-integration.mjs lock-stall
