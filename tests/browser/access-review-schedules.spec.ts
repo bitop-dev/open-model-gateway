@@ -24,7 +24,13 @@ test("a schedule is created, paused, resumed, read by the auditor and deleted", 
     await create.getByRole("combobox", { name: /^Repeats/ }).selectOption("yearly");
     await create.getByRole("combobox", { name: /^Start month/ }).selectOption("2");
     await create.getByRole("spinbutton", { name: /^Start day/ }).fill("29");
+    // The id comes from the create response, before any assertion that could fail and leave it behind.
+    const posted = page.waitForResponse(r => r.request().method() === "POST" && new URL(r.url()).pathname === "/api/v1/platform/access-review-schedules");
     await create.getByRole("button", { name: "Create schedule" }).click();
+    const response = await posted;
+    expect(response.status()).toBe(200);
+    const created = await response.json();
+    id = created.id as string;
     await expect(create).toBeHidden();
 
     const schedules = page.getByRole("table", { name: "Review schedules" });
@@ -32,9 +38,6 @@ test("a schedule is created, paused, resumed, read by the auditor and deleted", 
     await expect(row).toContainText("Yearly on 29 February (or the month's last day)");
     await expect(row).toContainText("UTC");
     await expect(row).toContainText("Not run yet");
-    const listed = await (await api(page, "GET", "/platform/access-review-schedules?limit=200")).json();
-    const created = listed.data.find((x: { name: string }) => x.name === name);
-    id = created.id as string;
     // The next start is the next 29 February (28 February in a common year), at 00:00 UTC.
     expect(created.next_run_at).toMatch(/-02-2[89]T00:00:00/);
     await expectAccessible(page, "access review schedules");
@@ -66,7 +69,8 @@ test("a schedule is created, paused, resumed, read by the auditor and deleted", 
     expect((await api(page, "GET", `/platform/access-review-schedules/${id}`)).status()).toBe(404);
     id = undefined;
   } finally {
-    if (id) await api(page, "DELETE", `/platform/access-review-schedules/${id}`);
-    await operator.context.close();
+    try {
+      if (id) expect((await api(page, "DELETE", `/platform/access-review-schedules/${id}`)).status()).toBe(200);
+    } finally { await operator.context.close(); }
   }
 });

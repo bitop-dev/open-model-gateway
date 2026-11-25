@@ -8,7 +8,7 @@ import { ActionProvider } from "./ui";
 import { DashboardNavigationProvider } from "./navigation-link";
 import { AccessReviewDetail, PlatformAccessReviewsPage } from "../pages/access-reviews";
 import { reviewItemsPath, reviewPath, reviewsPath, type ReviewCampaignDetail } from "../lib/access-reviews";
-import { cadenceText, calendarBody, lastRunText, schedulePath, schedulesPath, utcDate, type ReviewSchedule } from "../lib/access-review-schedules";
+import { cadenceText, calendarBody, lastRunText, scheduleNameError, schedulePath, schedulesPath, utcDate, type ReviewSchedule } from "../lib/access-review-schedules";
 import { admin, auditor, testClient } from "../lib/test-fixtures";
 
 beforeEach(() => {
@@ -55,12 +55,23 @@ describe("Review schedules: wording (#481)", () => {
     expect(cadenceText(schedule)).toBe("Monthly on day 1");
     expect(cadenceText(skipped)).toBe("Quarterly on day 31 of Feb, May, Aug, Nov (or the month's last day)");
     expect(cadenceText(paused)).toBe("Yearly on 15 November");
-    expect(utcDate("2026-12-01T00:00:00Z")).toMatch(/2026.*UTC$/);
+    // A UTC midnight is that UTC day whatever the viewer's zone (it is the
+    // previous day west of Greenwich), and a late run keeps its UTC day.
+    expect(utcDate("2026-12-01T00:00:00Z")).toBe("1 Dec 2026 UTC");
+    expect(utcDate("2028-02-29T23:59:59Z")).toBe("29 Feb 2028 UTC");
   });
   it("says what the last run did, with the reason of a skip", () => {
     expect(lastRunText(null)).toBe("Not run yet");
     expect(lastRunText(schedule.last_run)).toBe("Started a review");
     expect(lastRunText(skipped.last_run)).toBe("Skipped: the previous review was still open");
+  });
+  it("checks a name as the server does: code points, no control characters", () => {
+    expect(scheduleNameError("Quarterly review")).toBeUndefined();
+    expect(scheduleNameError("\u{1F600}".repeat(100))).toBeUndefined();
+    expect(scheduleNameError("\u{1F600}".repeat(101))).toBe("Use at most 100 characters.");
+    expect(scheduleNameError("Review\u0085")).toBe("Remove control characters from the name.");
+    expect(scheduleNameError("Tab\there")).toBe("Remove control characters from the name.");
+    expect(scheduleNameError("   ")).toBe("Enter a name.");
   });
   it("sends no start month for a monthly calendar", () => {
     expect(calendarBody({ cadence: "monthly", start_day: "5", start_month: "3" })).toEqual({ cadence: "monthly", start_day: 5, start_month: null });
@@ -70,18 +81,23 @@ describe("Review schedules: wording (#481)", () => {
 
 describe("Admin › Access reviews › Schedules (#481)", () => {
   it("lists each schedule with its next start, last run (and a skip's reason) and last review", async () => {
-    serve({ [reviewsPath]: () => ({ data: [] }), [schedulesPath]: () => ({ data: [schedule, skipped, paused] }) });
+    const fetch = serve({ [reviewsPath]: () => ({ data: [] }), [schedulesPath]: () => ({ data: [schedule, skipped, paused] }) });
     mount(<PlatformAccessReviewsPage session={admin} />);
     const table = await screen.findByRole("table", { name: "Review schedules" });
     const row = (name: string) => within(table).getByRole("rowheader", { name: new RegExp(name) }).closest("tr")!;
     await within(table).findByText("Monthly team review");
     expect(row("Monthly team review").textContent).toContain("Monthly on day 1");
-    expect(row("Monthly team review").textContent).toContain(utcDate("2026-12-01T00:00:00Z"));
+    expect(row("Monthly team review").textContent).toContain("1 Dec 2026 UTC");
+    expect(row("Monthly team review").textContent).toContain("Ran 1 Nov 2026 UTC");
     expect(within(row("Monthly team review")).getByRole("link", { name: "Monthly team review (2026-11-01)" })).toBeTruthy();
     expect(row("Quarterly roles").textContent).toContain("Skipped: the previous review was still open");
     expect(row("Paused yearly").textContent).toContain("Paused");
     expect(row("Paused yearly").textContent).toContain("Not run yet");
     expect(row("Paused yearly").textContent).toContain("None yet");
+    // Loaded whole (at most 50 exist), never with the reviews table's paging.
+    const requested = fetch.mock.calls.map(([path]) => String(path)).filter(p => p.startsWith(`${schedulesPath}?`));
+    expect(requested).toEqual([`${schedulesPath}?limit=200&offset=0`]);
+    expect(screen.getByRole("heading", { level: 2, name: "Schedules" })).toBeTruthy();
   });
   it("creates a quarterly schedule with what the admin chose", async () => {
     const fetch = serve({ [reviewsPath]: () => ({ data: [] }), [schedulesPath]: init => init?.method === "POST" ? { ...schedule, cadence: "quarterly" } : { data: [] } });

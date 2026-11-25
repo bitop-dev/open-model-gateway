@@ -17,11 +17,11 @@
 import { CalendarClock, ClipboardCheck, Plus } from "lucide-react";
 import { api, platformPath, type Session } from "../lib/api";
 import { accessText, decisionText, isKey, keyIdentity, keyHolderText, keyText, keyUseText, subjectsText, itemLabel, removalTarget, campaignState, campaignStateLabels, campaignStateTone, decisionPath, decisionTone, inboxPath, personText, removalConsequence, reviewClosePath, reviewExportPath, reviewerPath, reviewItemsPath, reviewPath, reviewsPath, sourceLabels, subjectLabels, type ReviewSubject, type InboxItem, type ReviewCampaign, type ReviewCampaignDetail, type ReviewItem } from "../lib/access-reviews";
-import { cadenceLabels, cadenceText, calendarBody, lastRunText, monthNames, schedulePath, schedulesPath, scheduleState, utcDate, type ReviewSchedule } from "../lib/access-review-schedules";
+import { cadenceLabels, cadenceText, calendarBody, lastRunText, monthNames, scheduleNameError, schedulePath, schedulesPath, scheduleState, utcDate, type ReviewSchedule } from "../lib/access-review-schedules";
 import { nameField, type Field, type Values } from "../lib/forms";
 import type { DirectoryUser, DirectoryWorkspace } from "../lib/people";
-import { Button, ErrorNotice, Heading, Inline, Stack, useAction, useApi } from "../components/ui";
-import { DirectoryTable } from "../components/people";
+import { Button, ErrorNotice, Heading, Inline, SectionHeadings, Stack, useAction, useApi } from "../components/ui";
+import { DirectoryTable, LocalTable } from "../components/people";
 import { ResourceLink } from "../components/navigation-link";
 import { useResourceName } from "../components/layout/breadcrumbs";
 import { StatusBadge } from "../components/ui/badge/badge";
@@ -126,6 +126,8 @@ function calendarFields(current?: ReviewSchedule): Field[] {
       visibleWhen: (v: Values) => v.cadence !== "monthly", requiredWhen: (v: Values) => v.cadence !== "monthly", help: "Quarterly: a month of the cycle (every third month from it). Yearly: the month." },
   ];
 }
+/** The server's name rule, checked by code points (a native maxLength counts UTF-16 units). */
+const scheduleNameField = (value?: string): Field => ({ name: "name", label: "Name", required: true, value, validate: v => scheduleNameError(v), help: "Each review is named after it, with the date it starts." });
 const openDaysField = (value = "14"): Field => ({ name: "open_days", label: "Each review is due after (days)", type: "number", value, required: true, min: 1, max: 90 });
 
 /**
@@ -136,8 +138,8 @@ const openDaysField = (value = "14"): Field => ({ name: "open_days", label: "Eac
 function AccessReviewSchedules({ session }: { session: Session }) {
   const ask = useAction(), writable = session.capabilities.platform_write;
   const create = () => ask({
-    title: "New review schedule", description: "Starts a review like the one below each period. The first one starts at the next start day, never today.",
-    fields: [{ ...nameField, maxLength: 100, help: "Each review is named after it, with the date it starts." },
+    title: "New review schedule", description: "Starts a review like the one below each period, at 00:00 UTC on its start day. The first one starts at the next scheduled start, never at once.",
+    fields: [scheduleNameField(),
       { name: "subjects", label: "What to review", type: "checkboxes", required: true, value: JSON.stringify(["workspace_memberships"]), options: Object.entries(subjectLabels).map(([value, label]) => ({ value, label })) },
       workspaceField, openDaysField(), ...calendarFields()],
     submitLabel: "Create schedule", successNotice: "Review schedule created.",
@@ -148,7 +150,7 @@ function AccessReviewSchedules({ session }: { session: Session }) {
   });
   const change = (x: ReviewSchedule) => ask({
     title: `Change ${x.name}`, description: "Applies to reviews it starts from now on; reviews already started are unchanged. A new calendar starts at its next start day.",
-    fields: [{ ...nameField, maxLength: 100, value: x.name }, openDaysField(String(x.open_days)), ...calendarFields(x)],
+    fields: [scheduleNameField(x.name), openDaysField(String(x.open_days)), ...calendarFields(x)],
     submitLabel: "Save", successNotice: "Review schedule changed.",
     run: (v, signal) => api<ReviewSchedule>(schedulePath(x.id), { method: "PATCH", body: { name: v.name, open_days: Number(v.open_days), ...calendarBody(v) }, signal }),
   });
@@ -167,12 +169,14 @@ function AccessReviewSchedules({ session }: { session: Session }) {
     { id: "name", header: "Schedule", accessor: x => x.name, rowHeader: true, hideable: false, cell: x => <CellText primary={x.name} secondary={`${subjectsText(x.subjects)}${x.workspace_ids.length ? ` · ${x.workspace_ids.length} selected workspaces` : ""}`} /> },
     { id: "repeats", header: "Repeats", accessor: x => x.cadence, cell: x => <CellText primary={cadenceText(x)} secondary={`Due after ${x.open_days} days`} /> },
     { id: "next", header: "Next start", accessor: x => x.next_run_at ?? "", cell: x => x.next_run_at ? <span className={s.secondary}>{utcDate(x.next_run_at)}</span> : <StatusBadge tone="neutral">Paused</StatusBadge> },
-    { id: "last", header: "Last run", accessor: x => x.last_run?.period_at ?? "", cell: x => <CellText primary={lastRunText(x.last_run)} secondary={x.last_run ? utcDate(x.last_run.period_at) : undefined} /> },
+    { id: "last", header: "Last run", accessor: x => x.last_run?.ran_at ?? "", cell: x => <CellText primary={lastRunText(x.last_run)} secondary={x.last_run ? `Ran ${utcDate(x.last_run.ran_at)}` : undefined} /> },
     { id: "review", header: "Last review", accessor: x => x.last_campaign?.created_at ?? "", cell: x => x.last_campaign ? <ResourceLink search={{ page: "access-review-detail", record: x.last_campaign.id }}>{x.last_campaign.name}</ResourceLink> : <span className={s.muted}>None yet</span> },
   ];
-  return <>
+  // At most 50 schedules exist (the server's limit), so they load whole and
+  // page in memory, independent of the reviews table's paging.
+  return <SectionHeadings>
     <Heading title="Schedules" description="Reviews that start on their own each month, quarter or year, in UTC. A review is skipped (Platform Admins are alerted) while the schedule's previous one is still open." actions={writable && <Button variant="secondary" onClick={create}><Plus aria-hidden />New schedule</Button>} />
-    <DirectoryTable<ReviewSchedule> path={schedulesPath} label="Review schedules" storageKey="access-review-schedules" columns={columns} rowKey={x => x.id} rowLabel={x => x.name}
+    <LocalTable<ReviewSchedule> path={schedulesPath} label="Review schedules" storageKey="access-review-schedules" columns={columns} rowKey={x => x.id} rowLabel={x => x.name}
       rowActions={x => !writable ? [] : [
         { label: "Change…", onSelect: () => change(x) },
         { label: "Pause…", hidden: scheduleState(x) === "paused", onSelect: () => pause(x, true) },
@@ -180,7 +184,7 @@ function AccessReviewSchedules({ session }: { session: Session }) {
         { label: "Delete…", danger: true, onSelect: () => remove(x) },
       ]}
       empty={{ icon: <CalendarClock />, title: "No review schedules.", description: writable ? "Create one to start a review every month, quarter or year." : "Platform Admins create review schedules." }} />
-  </>;
+  </SectionHeadings>;
 }
 
 /** One campaign: counts, items with their decision and reviewer. */

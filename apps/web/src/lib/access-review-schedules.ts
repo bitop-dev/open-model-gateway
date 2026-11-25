@@ -49,8 +49,19 @@ export function lastRunText(run: ScheduleRun | null): string {
   return run.outcome === "started" ? "Started a review" : `Skipped: ${skipReasonLabels[run.reason ?? "empty"]}`;
 }
 
-/** A period start or run time, as a UTC date (periods are defined in UTC). */
-export const utcDate = (iso: string) => `${new Date(iso).toLocaleDateString(undefined, { timeZone: "UTC", year: "numeric", month: "short", day: "numeric" })} UTC`;
+/** A period start or run time as its UTC date ("1 Dec 2026 UTC"): periods are defined in UTC, so the viewer's time zone never moves the day. */
+export function utcDate(iso: string): string {
+  const d = new Date(iso);
+  return `${d.getUTCDate()} ${monthNames[d.getUTCMonth()]!.slice(0, 3)} ${d.getUTCFullYear()} UTC`;
+}
+
+/** At most 100 characters (Unicode code points, as the server counts), not blank, no control characters (C0, DEL or C1), as the server checks. */
+export function scheduleNameError(value: string): string | undefined {
+  if (!value.trim()) return "Enter a name.";
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(value)) return "Remove control characters from the name.";
+  if (Array.from(value).length > 100) return "Use at most 100 characters.";
+  return undefined;
+}
 
 /** The schedule's state for its badge. */
 export const scheduleState = (s: ReviewSchedule) => s.paused_at ? "paused" as const : "active" as const;
