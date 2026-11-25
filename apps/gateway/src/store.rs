@@ -426,7 +426,7 @@ impl Store {
 
     /// A longer admission wait bound, for a test of another property whose
     /// bursts on one scope exceed what the production bound admits.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "integration-tests"))]
     pub(crate) fn with_admission_lock_wait(mut self, wait: std::time::Duration) -> Self {
         self.admission_lock_wait = wait;
         self
