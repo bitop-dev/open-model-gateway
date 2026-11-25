@@ -1067,6 +1067,12 @@ async fn transport_failures(pool: PgPool, kind: Kind) {
     assert!(problems.is_empty(), "{problems:#?}");
 }
 
+/// A connection of its own to the test database, outside the test pool.
+async fn connect(pool: &PgPool) -> sqlx::postgres::PgConnection {
+    <sqlx::postgres::PgConnection as sqlx::Connection>::connect_with(&pool.connect_options())
+        .await
+        .unwrap()
+}
 /// A health observation that outlives its 250 ms advisory timeout
 /// (`ExecutionGuard::finish`) is abandoned by its request, but its single
 /// statement is already on the server and commits after the reply ended. Each
@@ -1074,12 +1080,6 @@ async fn transport_failures(pool: PgPool, kind: Kind) {
 /// held by an advisory lock until its reply has ended (so the race is really
 /// taken), then released, and must count for the first case, never for the
 /// second.
-/// A connection of its own to the test database, outside the test pool.
-async fn connect(pool: &PgPool) -> sqlx::postgres::PgConnection {
-    <sqlx::postgres::PgConnection as sqlx::Connection>::connect_with(&pool.connect_options())
-        .await
-        .unwrap()
-}
 #[dbtest::test]
 async fn a_health_write_that_outlives_its_timeout_counts_for_its_own_case(pool: PgPool) {
     const HOLD: i64 = 828_828;
