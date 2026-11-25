@@ -1311,9 +1311,12 @@ async fn a_committed_result_survives_takeover_with_another_line_in_flight(pool: 
     sqlx::query("INSERT INTO deployment_batch_scheduling(deployment_id,max_concurrency,updated_by) VALUES($1,1,$2)")
         .bind(w.f.deployment).bind(w.f.owner).execute(&w.f.store.pool).await.unwrap();
     let held = w.openai.gate("hold-b");
-    // Line `a`'s segment stays open while `b` is planned (at most `REACH`) and
-    // the state below is read, then flushes on its age.
-    let age = REACH + Duration::from_secs(5);
+    // Line `a`'s segment is opened after the runner starts and stays open
+    // while `b` is planned (at most `REACH`) and the state below is read (at
+    // most `reads`), then flushes on its age. (A failed lease renewal would
+    // flush it early; none is expected here.)
+    let reads = Duration::from_secs(5);
+    let age = REACH + reads + Duration::from_secs(2);
     let old = start_with(flushing_after(&w, age));
     tokio::time::timeout(REACH, held.entered.notified())
         .await
@@ -1325,15 +1328,19 @@ async fn a_committed_result_survives_takeover_with_another_line_in_flight(pool: 
         .bind(job.id)
         .fetch_one(&w.f.store.pool)
     };
-    assert_eq!(line().await.unwrap(), ("running".into(), None, true));
-    assert_eq!(w.reload(&job).await.request_completed, Some(0));
-    assert_eq!(
-        crate::jobs::schedule::Scheduler::new(w.f.store.clone(), None)
-            .running_lines(w.f.deployment)
-            .await
-            .unwrap(),
-        1
-    );
+    tokio::time::timeout(reads, async {
+        assert_eq!(line().await.unwrap(), ("running".into(), None, true));
+        assert_eq!(w.reload(&job).await.request_completed, Some(0));
+        assert_eq!(
+            crate::jobs::schedule::Scheduler::new(w.f.store.clone(), None)
+                .running_lines(w.f.deployment)
+                .await
+                .unwrap(),
+            1
+        );
+    })
+    .await
+    .expect("the unflushed state is read before the segment's age");
     tokio::time::timeout(age + Duration::from_secs(3), async {
         loop {
             if line().await.unwrap() == ("succeeded".into(), Some(0), false) {
@@ -1709,16 +1716,18 @@ async fn unacknowledged_finish_leaves_actual_results_for_sweep(pool: PgPool) {
 async fn cancelling_flushes_queued_and_in_flight_answers_without_running_the_tail(pool: PgPool) {
     let (w, job) = batch(pool, &[("a", "plain"), ("b", "hold-b"), ("c", "never")]).await;
     let held = w.openai.gate("hold-b");
-    // The answers reach the result only through the cancel: no segment
-    // flushes on its age while `b` is planned (at most `REACH`), the runner
-    // observes the cancel and the run finishes.
+    // No segment flushes on its age before the run ends: the age outlasts
+    // every bounded wait below, from the runner's start (before `a`'s
+    // segment opens) to the run's end, so the answers are flushed by the
+    // cancel ending the run. (A failed lease renewal would flush them
+    // early; none is expected here.)
+    let cancel = Duration::from_secs(5);
     let (observe, finish) = (Duration::from_secs(20), Duration::from_secs(5));
-    let age = REACH + observe + finish + Duration::from_secs(5);
+    let age = REACH + cancel + observe + finish + Duration::from_secs(2);
     let running = start_with(flushing_after(&w, age));
     tokio::time::timeout(REACH, held.entered.notified())
         .await
         .unwrap();
-    assert_eq!(w.reload(&job).await.request_completed, Some(0));
     let lease = || {
         sqlx::query_scalar::<_, gateway_datetime_compat::UtcInstant>(
             "SELECT runner_lease_until FROM async_jobs WHERE id=$1",
@@ -1726,11 +1735,17 @@ async fn cancelling_flushes_queued_and_in_flight_answers_without_running_the_tai
         .bind(job.id)
         .fetch_one(&w.f.store.pool)
     };
-    let initial = lease().await.unwrap();
-    w.jobs
-        .cancel_batch(&w.f.principal, &client_id("batch_", job.id))
-        .await
-        .unwrap();
+    let initial = tokio::time::timeout(cancel, async {
+        assert_eq!(w.reload(&job).await.request_completed, Some(0));
+        let initial = lease().await.unwrap();
+        w.jobs
+            .cancel_batch(&w.f.principal, &client_id("batch_", job.id))
+            .await
+            .unwrap();
+        initial
+    })
+    .await
+    .expect("the batch is cancelled before the segment's age");
     // Let the active runner observe cancel before its current provider call returns.
     tokio::time::timeout(observe, async {
         while lease().await.unwrap() == initial {
