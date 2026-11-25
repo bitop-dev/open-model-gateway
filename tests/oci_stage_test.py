@@ -558,6 +558,7 @@ if kind == 'login':
         (b"panic: ", "panic:"),
         (b"fatal error: ", "fatal error:"),
         (b"runtime: ", "runtime:"),
+        (b"unexpected fault address ", "unexpected fault address"),
     )
 
     def test_every_first_line_form_is_named_and_masked_as_before(self):
@@ -600,14 +601,46 @@ if kind == 'login':
 
     def test_no_form_lets_a_secret_or_a_value_through(self):
         allowed = re.compile(r"[a-z0-9' :,<>\-…]{1,160}")
+        words = self.api.SKELETON_TOKENS + 1  # the omission marker
         for prefix, name in self.FORMS + ((b"", "unrecognised:"), (b"Error from destination copy for ", "unrecognised:")):
             for leak in self.LEAKS:
                 with self.subTest(form=name, leak=leak[:24]):
                     got = self.api.skeleton(io.BytesIO(prefix + leak + b"\nsecond " + TOKEN.encode() + b"\n"))
                     self.assertTrue(got.startswith(name), got)
-                    self.assertRegex(got, allowed)
+                    self.assertIsNotNone(allowed.fullmatch(got), got)
+                    self.assertLessEqual(len(got.split(" ")), words, got)
                     for secret in (TOKEN, "bitop", "hunter2", "fixture", "opaque", "cache", "418", "rouge"):
                         self.assertNotIn(secret, got)
+
+    def test_quotes_cuts_and_bounds_hold_under_every_form(self):
+        def sk(stderr):
+            return self.api.skeleton(io.BytesIO(stderr))
+        # A single-quoted segment is one placeholder; an apostrophe inside a
+        # word keeps the word.
+        self.assertEqual(sk(b"Error response from registry: denied: 'private read denied value'\n"),
+                         "error response from registry: denied: <x>")
+        self.assertEqual(sk(b"Error: it doesn't exist 'unterminated read\n"), "error: it doesn't exist <x>")
+        # What masking cannot do: a value that is itself a listed word shows,
+        # on every form. Secrets here (tokens, paths, digests) never are.
+        self.assertEqual(sk(b"Authorization: Bearer read\n"), "unrecognised: <x>: bearer read")
+        # A line longer than the report: the token the cut ends is a
+        # placeholder, whatever separates it, and the cut is marked.
+        for line, expected in (
+            (b"x" * 4097, "unrecognised: <x> \u2026"),
+            (b"Error: " + b"x" * 4083 + b"\topened", "error: <x> \u2026"),
+            (b"Error: " + b"x" * 4084 + b" opened" + b"x" * 100, "error: <x> \u2026"),
+        ):
+            with self.subTest(line=line[-12:]):
+                self.assertEqual(sk(line + b"\n"), expected)
+        # A line of exactly the report's size, ended by its newline, is whole.
+        whole = b"Error: " + b"x" * (4096 - 7 - 7) + b"\tdenied"
+        self.assertEqual(len(whole), 4096)
+        for end in (b"\n", b"\r"):
+            self.assertEqual(sk(whole + end + b"more\n"), "error: <x> denied")
+        # The name's words count against the bound.
+        got = sk(b'Error from destination registry for "repo": ' + b"a " * 60 + b"\n")
+        self.assertLessEqual(len(got.split(" ")), self.api.SKELETON_TOKENS + 1, got)
+        self.assertTrue(got.endswith(" \u2026"), got)
 
     def test_the_line_of_the_first_unknown_failure_is_named(self):
         # #711: one stderr line that was not ORAS's `Error: ` form, reported as
