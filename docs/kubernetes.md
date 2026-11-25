@@ -401,8 +401,9 @@ durability safeguard; use the [explicit policy](#production-durability-policy-39
 - **A rollout needs database connections for its new pods while the old ones hold theirs.** Each
   new pod opens its whole pool (`GATEWAY_DATABASE_MAX_CONNECTIONS`) before it is ready (#132), so
   size PostgreSQL's `max_connections` (direct) or the Pooler's `max_client_conn` for
-  `(replicas + 1 surge pod) × GATEWAY_DATABASE_MAX_CONNECTIONS` plus the pods still draining and
-  the other sessions ([connection sizing](postgresql-ha.md#connection-sizing)). A pod that cannot
+  `(replicas + 1 surge pod) × GATEWAY_DATABASE_MAX_CONNECTIONS` plus the pods still draining (a
+  Deployment does not count terminating pods against the surge,
+  [Updating a Deployment](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#updating-a-deployment)) and the other sessions ([connection sizing](postgresql-ha.md#connection-sizing)). A pod that cannot
   open its pool fails startup naming that setting and the rollout stops with the old pods serving.
 - `cnpg.pooler.instances` and `cnpg.pooler.parameters.default_pool_size` size the PgBouncer tier;
   size `max_client_conn` for `(replicaCount + 1) × GATEWAY_DATABASE_MAX_CONNECTIONS` plus headroom
