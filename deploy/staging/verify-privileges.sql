@@ -63,7 +63,7 @@ DO $$ DECLARE r record; t text; BEGIN
  FOREACH t IN ARRAY ARRAY['execution_id','sequence','window_hold_microusd','created_at'] LOOP
   IF has_column_privilege('gateway_runtime','public.realtime_responses',t,'UPDATE') THEN RAISE EXCEPTION 'mutable realtime response identity: %',t; END IF;
  END LOOP;
- IF (SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'realtime_responses_%' AND tgenabled='O' AND NOT tgisinternal)<>4 THEN RAISE EXCEPTION 'realtime response guards missing or disabled'; END IF;
+ IF (SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'realtime_responses_%' AND tgenabled='O' AND NOT tgisinternal)<>5 THEN RAISE EXCEPTION 'realtime response guards missing or disabled'; END IF;
  -- Async jobs (0016): no removal; identity, ownership and reservation link fixed.
  -- upstream_id is written once (0021: native batches are submitted after creation; trigger).
  FOREACH t IN ARRAY ARRAY['async_jobs','async_job_files'] LOOP
@@ -706,6 +706,13 @@ BEGIN
  UPDATE realtime_responses SET state='settled',status='completed',actual_microusd=0,input_text_tokens=0,cached_text_tokens=0,input_audio_tokens=0,cached_audio_tokens=0,output_text_tokens=0,output_audio_tokens=0,completed_at=clock_timestamp() WHERE execution_id=e AND sequence=1;
  BEGIN UPDATE realtime_responses SET status='failed' WHERE execution_id=e; RAISE EXCEPTION 'settled realtime response rewritten'; EXCEPTION WHEN raise_exception THEN IF SQLERRM<>'realtime responses settle once' THEN RAISE; END IF; END;
  BEGIN DELETE FROM realtime_responses WHERE execution_id=e; RAISE EXCEPTION 'realtime response removal allowed'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+ -- Resolution (0090): an unknown response settles once with evidence; a count is never lowered.
+ INSERT INTO realtime_responses(execution_id,sequence,window_hold_microusd) VALUES(e,2,1);
+ UPDATE realtime_responses SET state='unknown',input_text_tokens=5,completed_at=clock_timestamp() WHERE execution_id=e AND sequence=2;
+ BEGIN UPDATE realtime_responses SET state='settled',actual_microusd=0,input_text_tokens=4,cached_text_tokens=0,input_audio_tokens=0,cached_audio_tokens=0,output_text_tokens=0,output_audio_tokens=0,evidence='probe',resolved_at=clock_timestamp() WHERE execution_id=e AND sequence=2; RAISE EXCEPTION 'realtime resolution lowered a count'; EXCEPTION WHEN raise_exception THEN IF SQLERRM<>'realtime responses settle once' THEN RAISE; END IF; END;
+ UPDATE realtime_responses SET state='settled',actual_microusd=0,input_text_tokens=5,cached_text_tokens=0,input_audio_tokens=0,cached_audio_tokens=0,output_text_tokens=0,output_audio_tokens=0,evidence='probe',resolved_at=clock_timestamp() WHERE execution_id=e AND sequence=2;
+ BEGIN UPDATE realtime_responses SET evidence='other' WHERE execution_id=e AND sequence=2; RAISE EXCEPTION 'resolved realtime response rewritten'; EXCEPTION WHEN raise_exception THEN IF SQLERRM<>'realtime responses settle once' THEN RAISE; END IF; END;
+ BEGIN INSERT INTO realtime_responses(execution_id,sequence,state,window_hold_microusd,evidence,resolved_at,completed_at) VALUES(e,3,'unknown',1,'probe',clock_timestamp(),clock_timestamp()); RAISE EXCEPTION 'unsettled realtime response inserted with evidence'; EXCEPTION WHEN raise_exception THEN IF SQLERRM<>'realtime responses settle once' THEN RAISE; END IF; END;
  IF NOT valid_model_protocols(ARRAY['realtime']) OR valid_model_protocols(ARRAY['realtime','chat_completions'])
   OR NOT valid_price_lines('[{"meter":"input_tokens","not_applicable":true},{"meter":"output_audio_tokens","microusd_per_batch":"64000000","batch":1000000,"unit_label":"/M tokens","sku_label":"Audio output"}]'::jsonb)
   OR valid_price_lines('[{"meter":"output_audio_tokens","not_applicable":true}]'::jsonb) THEN RAISE EXCEPTION 'realtime validators'; END IF;

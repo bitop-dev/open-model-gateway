@@ -2880,6 +2880,101 @@
       "scope": "governance:write",
       "token_policy": "Scope"
     },
+    "POST /api/v1/workspaces/{ws}/costs/{execution}/realtime-responses/{sequence}/reconcile": {
+      "access": "WorkspacePlatformWrite",
+      "operation": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/post_api_v1_workspaces_by_ws_costs_by_execution_realtime_responses_by_sequence_reconcileRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Representation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/post_api_v1_workspaces_by_ws_costs_by_execution_realtime_responses_by_sequence_reconcileResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request parameters, JSON syntax, or handler validation. Framework extraction may return text.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Absent or hidden resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflicting revision, state or configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Unsupported request media type",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid request fields or bounded export/history refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "description": "Resolves one unknown response of a finished realtime session from operator evidence (#804). Requires live Platform Admin write authority AND workspace access; foreign personal executions, executions that are not realtime sessions of the workspace and responses that do not exist are hidden (404); and a Platform Admin resolves personal-workspace sessions only in their own personal workspace. The six counters are canonical decimal strings. Rules the schemas cannot express (400): cached tokens may not exceed their modality's input; each input and output counter is at most 2305843009213693951 (i64::MAX / 4, so the session's sums fit); no counter may be lower than one the response already recorded, nor the uncached input (input minus cached) where both were recorded, and the value may not fall below the response's recorded floor. The response is valued with the session's pinned v3 price exactly as response.done would have been; without a pinned price, or with a missing rate for a reported meter, the request is 409 and nothing is written (missing rates stay unknown, never zero). The session must be finished (its reservation unknown and its execution terminal) and the response unknown; an open session or response is 409. A response that is already settled is refused with 400, except that the identical evidence and counters again answer 200 and write nothing. When this was the session's last unknown response, the session settles in the same transaction: the sum of its responses' actuals and per-key cost components, its token totals, and one reconciliation ledger entry. A session closed by lease expiry settles only while its hold equals what its response rows put into it and it is not marked unbounded; otherwise the response settles and the session keeps its hold, unknown, for POST /api/v1/workspaces/{ws}/costs/{execution}/realtime-session/reconcile. The answer carries no usage or evidence."
+      },
+      "scope": "governance:write",
+      "token_policy": "Scope"
+    },
     "GET /api/v1/workspaces/{ws}/usage": {
       "access": "WorkspaceMember",
       "operation": {
@@ -4263,6 +4358,101 @@
       },
       "scope": null,
       "token_policy": "Denied"
+    },
+    "POST /api/v1/workspaces/{ws}/costs/{execution}/realtime-session/reconcile": {
+      "access": "WorkspacePlatformWrite",
+      "operation": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/post_api_v1_workspaces_by_ws_costs_by_execution_realtime_session_reconcileRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Representation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/post_api_v1_workspaces_by_ws_costs_by_execution_realtime_session_reconcileResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request parameters, JSON syntax, or handler validation. Framework extraction may return text.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Absent or hidden resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflicting revision, state or configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Unsupported request media type",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid request fields or bounded export/history refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "description": "Settles a finished realtime session none of whose responses is unknown, from operator evidence (#804): a session killed while idle (every response settled by response.done, the reservation left unknown by lease expiry), or one whose last responses were resolved without settling it. Requires live Platform Admin write authority AND workspace access; foreign personal executions and executions that are not realtime sessions of the workspace are hidden (404); a Platform Admin settles personal-workspace sessions only in their own personal workspace. When the session's hold is exactly what its response rows put into it, remainder must be omitted (or null) and the session settles at the sum of its responses. A session closed by lease expiry may hold one reserved window with no response row (a request that may have been forwarded), or be marked unbounded (a response exceeded its window, or a window the price could not bound added nothing to the hold): then remainder states that request's six counters (all zero is allowed, with evidence: a request never served, which counts no request and costs nothing), valued with the session's pinned v3 price like any response and recorded as a resolved response row holding that window, and the session settles. Either way the session gets one reconciliation ledger entry with this evidence. Rules the schemas cannot express (400): cached tokens may not exceed their modality's input; each input and output counter is at most 2305843009213693951 (i64::MAX / 4); a remainder when the session holds no window without a row; an actor who is no longer a live Platform Admin; a session already settled other than by this identical request (the same evidence and the same remainder or none again answers 200 and writes nothing). 409: the session is still open; a response is still unknown (resolve it first with the realtime-responses route); the session holds a window without a row and no remainder was stated; the hold cannot be attributed to its responses (no pinned price, or a hold below them); the remainder has no complete pinned valuation (missing rates stay unknown, never zero). Nothing is written on any refusal. The answer carries no usage or evidence."
+      },
+      "scope": "governance:write",
+      "token_policy": "Scope"
     }
   },
   "schemas": {}

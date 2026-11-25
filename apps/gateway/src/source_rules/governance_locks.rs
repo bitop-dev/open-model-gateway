@@ -173,6 +173,11 @@ const ROW_LOCKS: &[(&str, &str)] = &[
         "governance::realtime::settle_response_once",
         "SELECT state,window_hold_microusd FROM realtime_responses WHERE execution_id=$1 AND sequence=$2 FOR UPDATE",
     ),
+    // #804: after the session's reservation row (canonical order).
+    (
+        "governance::realtime_resolution::load_response",
+        "SELECT state,input_text_tokens,cached_text_tokens,input_audio_tokens,cached_audio_tokens,output_text_tokens,output_audio_tokens,evidence,floor_microusd FROM realtime_responses WHERE execution_id=$1 AND sequence=$2 FOR UPDATE",
+    ),
     (
         "governance::reconcile::reconcile_batch",
         "SELECT execution_id,workspace_id,api_key_id,admitted_at FROM governance_reservations WHERE state='pending' AND lease_expires_at<=clock_timestamp() ORDER BY lease_expires_at,execution_id LIMIT $1 FOR UPDATE SKIP LOCKED",
@@ -316,7 +321,7 @@ impl<'ast> Visit<'ast> for Scan<'_> {
         let suffixes = [
             ("governance::catalog_share", " FOR SHARE OF d,p,m"),
             (
-                "governance::reconcile::resolve_usage_once",
+                "governance::reconcile::operator_authorized",
                 " FOR SHARE OF u,w",
             ),
         ];
@@ -641,7 +646,7 @@ fn macros_helpers_and_global_branches() {
         ),
         (
             "governance/reconcile.rs",
-            r#"fn resolve_usage_once() { format!("{}", if scoped(store) { "" } else { " FOR SHARE OF u,w" }); q!(" FOR SHARE OF u,w"); }"#,
+            r#"fn operator_authorized() { format!("{}", if scoped(store) { "" } else { " FOR SHARE OF u,w" }); q!(" FOR SHARE OF u,w"); }"#,
             1,
         ),
         (

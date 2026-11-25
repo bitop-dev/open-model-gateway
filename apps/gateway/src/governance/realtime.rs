@@ -103,7 +103,7 @@ pub async fn window_output(
 }
 
 #[derive(sqlx::FromRow)]
-struct Session {
+pub(super) struct Session {
     workspace_id: Uuid,
     api_key_id: Uuid,
     deployment_id: Uuid,
@@ -111,12 +111,12 @@ struct Session {
     state: String,
     admitted_at: UtcInstant,
     minute_start: UtcInstant,
-    held_microusd: Option<i64>,
-    unbounded_cost: bool,
+    pub(super) held_microusd: Option<i64>,
+    pub(super) unbounded_cost: bool,
     workload_kind: String,
     public_model: String,
 }
-async fn session(tx: &mut Tx<'_>, id: Uuid) -> Result<Session, InferenceError> {
+pub(super) async fn session(tx: &mut Tx<'_>, id: Uuid) -> Result<Session, InferenceError> {
     let s: Session = sqlx::query_as("SELECT r.workspace_id,r.api_key_id,r.deployment_id,r.price_id,r.state,r.admitted_at,r.minute_start,r.held_microusd,r.unbounded_cost,e.workload_kind,e.public_model FROM governance_reservations r JOIN inference_executions e ON e.id=r.execution_id WHERE r.execution_id=$1 FOR UPDATE OF r")
         .bind(id)
         .fetch_optional(&mut **tx)
@@ -128,7 +128,7 @@ async fn session(tx: &mut Tx<'_>, id: Uuid) -> Result<Session, InferenceError> {
     }
     Ok(s)
 }
-async fn pinned(tx: &mut Tx<'_>, s: &Session) -> Result<Option<Price>, InferenceError> {
+pub(super) async fn pinned(tx: &mut Tx<'_>, s: &Session) -> Result<Option<Price>, InferenceError> {
     let Some(id) = s.price_id else {
         return Ok(None);
     };
@@ -339,10 +339,20 @@ pub async fn open_response(
 
 /// Pinned-price value of one response: `(actual, known floor, violated,
 /// components)`. Only v3 prices value realtime audio tokens.
-fn value_response(
+pub(super) fn value_response(
     p: &Price,
     u: RealtimeUsage,
     window: ResponseBound,
+) -> Result<(Option<i64>, i64, bool, Option<CostBreakdown>), InferenceError> {
+    value_requests(p, u, window, 1)
+}
+/// [`value_response`] metering `requests` requests (0 for a request stated
+/// never to have been served).
+pub(super) fn value_requests(
+    p: &Price,
+    u: RealtimeUsage,
+    window: ResponseBound,
+    requests: u64,
 ) -> Result<(Option<i64>, i64, bool, Option<CostBreakdown>), InferenceError> {
     if p.pricing_version != 3 || !u.valid() {
         return Ok((None, 0, true, None));
@@ -366,7 +376,7 @@ fn value_response(
         input_audio_seconds_ms: Some(0),
         output_audio_seconds_ms: Some(0),
         search_units: Some(0),
-        requests: Some(1),
+        requests: Some(requests),
         ..MeterUsage::default()
     };
     let priced = billing::v3::value(
@@ -497,17 +507,38 @@ async fn settle_response_once(
 }
 
 #[derive(sqlx::FromRow)]
-struct Totals {
-    responses: i64,
-    settled: i64,
-    actual: i64,
+pub(super) struct Totals {
+    pub(super) responses: i64,
+    pub(super) settled: i64,
+    pub(super) actual: i64,
     retained: Option<i64>,
     known_floor: i64,
     unbounded: bool,
     measured: i64,
-    input: i64,
-    output: i64,
-    components: Option<serde_json::Value>,
+    pub(super) input: i64,
+    pub(super) output: i64,
+    pub(super) components: Option<serde_json::Value>,
+}
+
+/// The session's response rows summed: counts, settled actuals and their
+/// per-key components (each response's components total its actual, so their
+/// key-wise sum totals the session's: nothing is counted twice), retained
+/// windows and measured tokens.
+pub(super) async fn totals(tx: &mut Tx<'_>, id: Uuid) -> Result<Totals, InferenceError> {
+    sqlx::query_as(r#"SELECT count(*) responses,count(*) FILTER(WHERE state='settled') settled,
+        coalesce(sum(actual_microusd) FILTER(WHERE state='settled'),0)::bigint actual,
+        CASE WHEN bool_or(state='unknown' AND window_hold_microusd IS NULL) THEN NULL ELSE coalesce(sum(greatest(window_hold_microusd,coalesce(floor_microusd,0))) FILTER(WHERE state='unknown'),0) END::bigint retained,
+        coalesce(sum(floor_microusd) FILTER(WHERE state='unknown'),0)::bigint known_floor,
+        coalesce(bool_or(unbounded_cost),false) unbounded,
+        count(*) FILTER(WHERE input_text_tokens IS NOT NULL) measured,
+        coalesce(sum(input_text_tokens+input_audio_tokens),0)::bigint input,
+        coalesce(sum(output_text_tokens+output_audio_tokens),0)::bigint output,
+        (SELECT jsonb_object_agg(k,v::text) FROM (SELECT c.key k,sum((c.value#>>'{}')::numeric) v FROM realtime_responses x,jsonb_each(x.cost_components) c WHERE x.execution_id=$1 AND x.state='settled' GROUP BY c.key) a) components
+        FROM realtime_responses WHERE execution_id=$1"#)
+        .bind(id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(storage)
 }
 
 /// Finish the session attempt from its response rows (see module docs).
@@ -584,17 +615,7 @@ async fn finish_once(store: &Store, record: &RealtimeFinish) -> Result<Finished,
     // Responses still open at the end never reported usage.
     sqlx::query("UPDATE realtime_responses SET state='unknown',completed_at=clock_timestamp() WHERE execution_id=$1 AND state='pending'")
         .bind(record.id).execute(&mut *tx).await.map_err(storage)?;
-    let t: Totals = sqlx::query_as(r#"SELECT count(*) responses,count(*) FILTER(WHERE state='settled') settled,
-        coalesce(sum(actual_microusd) FILTER(WHERE state='settled'),0)::bigint actual,
-        CASE WHEN bool_or(state='unknown' AND window_hold_microusd IS NULL) THEN NULL ELSE coalesce(sum(greatest(window_hold_microusd,coalesce(floor_microusd,0))) FILTER(WHERE state='unknown'),0) END::bigint retained,
-        coalesce(sum(floor_microusd) FILTER(WHERE state='unknown'),0)::bigint known_floor,
-        coalesce(bool_or(unbounded_cost),false) unbounded,
-        count(*) FILTER(WHERE input_text_tokens IS NOT NULL) measured,
-        coalesce(sum(input_text_tokens+input_audio_tokens),0)::bigint input,
-        coalesce(sum(output_text_tokens+output_audio_tokens),0)::bigint output,
-        (SELECT jsonb_object_agg(k,v::text) FROM (SELECT c.key k,sum((c.value#>>'{}')::numeric) v FROM realtime_responses x,jsonb_each(x.cost_components) c WHERE x.execution_id=$1 AND x.state='settled' GROUP BY c.key) a) components
-        FROM realtime_responses WHERE execution_id=$1"#)
-        .bind(record.id).fetch_one(&mut *tx).await.map_err(storage)?;
+    let t = totals(&mut tx, record.id).await?;
     let all_settled = t.responses == t.settled;
     let actual = all_settled.then_some(t.actual);
     let components = t.components.filter(|_| all_settled && t.settled > 0);

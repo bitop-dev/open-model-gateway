@@ -233,6 +233,7 @@ impl Targets {
             .replace("{user}", &f.member.user_id.to_string())
             .replace("{kind}", "team")
             .replace("{role}", "user")
+            .replace("{sequence}", "1")
             .replace("{*rest}", "unknown");
         for name in [
             "key",

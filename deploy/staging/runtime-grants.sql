@@ -338,6 +338,9 @@ GRANT SELECT,INSERT ON public.realtime_responses TO gateway_runtime;
 GRANT UPDATE(state,status,actual_microusd,floor_microusd,unbounded_cost,input_text_tokens,
  cached_text_tokens,input_audio_tokens,cached_audio_tokens,output_text_tokens,output_audio_tokens,
  cost_components,completed_at) ON public.realtime_responses TO gateway_runtime;
+-- 0090: a Platform Admin resolves an unknown response once, with evidence
+-- (the guard trigger allows only unknown -> settled, never lowering a count).
+GRANT UPDATE(evidence,resolved_at) ON public.realtime_responses TO gateway_runtime;
 GRANT EXECUTE ON FUNCTION public.valid_model_protocols_base(text[]),
  public.valid_cost_components_base(jsonb),public.valid_price_lines_base(jsonb) TO gateway_runtime;
 -- File store (0019): metadata only (objects are encrypted in the configured store).

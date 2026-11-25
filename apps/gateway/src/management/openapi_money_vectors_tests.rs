@@ -669,6 +669,93 @@ impl Vx<'_> {
             plain,
         )
         .await;
+        // #804: every request gets a fresh finished realtime session with one
+        // unknown response. Cached tokens above their input and a counter above
+        // i64::MAX / 4 are handler refusals a schema cannot state; they are
+        // decided only when the original body actually has them.
+        let realtime = json!({"input_text_tokens":"3","cached_text_tokens":"1","input_audio_tokens":"2","cached_audio_tokens":"1","output_text_tokens":"2","output_audio_tokens":"1","evidence":"vector:receipt"});
+        self.forms(
+            seen,
+            self.admin,
+            "POST",
+            "/api/v1/workspaces/{ws}/costs/{execution}/realtime-responses/{sequence}/reconcile",
+            vec![realtime.clone(), seq(&realtime, REALTIME_RECONCILE)],
+            async || {
+                let session =
+                    super::openapi_money_fixture_tests::seed_realtime(self.pool, self.team, self.key, self.deployment).await;
+                format!("{wsbase}/costs/{session}/realtime-responses/1/reconcile")
+            },
+            async |captured, input| {
+                let object = view(&input, REALTIME_RECONCILE);
+                let count = |key: &str| object[key].as_str().and_then(|v| v.parse::<u64>().ok());
+                let above = |cached: &str, input: &str| matches!((count(cached), count(input)), (Some(c), Some(i)) if c > i);
+                // RealtimeUsage::valid: each input and output counter is at
+                // most i64::MAX / 4, so a session's sums fit.
+                let too_large = ["input_text_tokens", "input_audio_tokens", "output_text_tokens", "output_audio_tokens"]
+                    .iter()
+                    .any(|k| count(k).is_some_and(|n| n > i64::MAX as u64 / 4));
+                if captured.status == StatusCode::BAD_REQUEST
+                    && (too_large || above("cached_text_tokens", "input_text_tokens") || above("cached_audio_tokens", "input_audio_tokens"))
+                    && self.schema_body(
+                        "POST",
+                        "/api/v1/workspaces/{ws}/costs/{execution}/realtime-responses/{sequence}/reconcile",
+                        &input,
+                    )
+                {
+                    return Probe::decided(captured, true);
+                }
+                Probe::from(captured)
+            },
+        )
+        .await;
+        // #804: every request gets a fresh idle-killed realtime session holding
+        // one window without a response row, so a body without a remainder is
+        // a domain refusal (409). Cached tokens above their input and a
+        // counter above i64::MAX / 4 are handler refusals a schema cannot
+        // state; they are decided only when the original body has them.
+        let counters = json!({"input_text_tokens":"3","cached_text_tokens":"1","input_audio_tokens":"2","cached_audio_tokens":"1","output_text_tokens":"2","output_audio_tokens":"1"});
+        let session = json!({"evidence":"vector:receipt","remainder":counters});
+        let positional = json!(["vector:receipt", seq(&counters, &REALTIME_RECONCILE[..6])]);
+        self.forms(
+            seen,
+            self.admin,
+            "POST",
+            "/api/v1/workspaces/{ws}/costs/{execution}/realtime-session/reconcile",
+            vec![
+                session,
+                positional,
+                json!({"evidence":"vector:receipt","remainder":null}),
+                json!(["vector:receipt", null]),
+            ],
+            async || {
+                let session = super::openapi_money_fixture_tests::seed_realtime_unrowed(self.pool, self.team, self.key, self.deployment).await;
+                format!("{wsbase}/costs/{session}/realtime-session/reconcile")
+            },
+            async |captured, input| {
+                let body = view(&input, &["evidence", "remainder"]);
+                let remainder = match &body["remainder"] {
+                    Value::Array(_) => view(&body["remainder"], &REALTIME_RECONCILE[..6]),
+                    other => other.clone(),
+                };
+                let count = |key: &str| remainder[key].as_str().and_then(|v| v.parse::<u64>().ok());
+                let above = |cached: &str, input: &str| matches!((count(cached), count(input)), (Some(c), Some(i)) if c > i);
+                let too_large = ["input_text_tokens", "input_audio_tokens", "output_text_tokens", "output_audio_tokens"]
+                    .iter()
+                    .any(|k| count(k).is_some_and(|n| n > i64::MAX as u64 / 4));
+                if captured.status == StatusCode::BAD_REQUEST
+                    && (too_large || above("cached_text_tokens", "input_text_tokens") || above("cached_audio_tokens", "input_audio_tokens"))
+                    && self.schema_body(
+                        "POST",
+                        "/api/v1/workspaces/{ws}/costs/{execution}/realtime-session/reconcile",
+                        &input,
+                    )
+                {
+                    return Probe::decided(captured, true);
+                }
+                Probe::from(captured)
+            },
+        )
+        .await;
         // Every request gets a fresh hold. Walk billing and meter evidence in
         // both wire forms, including null; cross-field 400 refusals are decided
         // only when the original body actually violates token coherence (#408).
@@ -916,6 +1003,16 @@ const METER: &[&str] = &[
 
 /// The serde positional (sequence) wire form of an object: its values in
 /// field order.
+/// Field order of the realtime response reconcile body (#804).
+const REALTIME_RECONCILE: &[&str] = &[
+    "input_text_tokens",
+    "cached_text_tokens",
+    "input_audio_tokens",
+    "cached_audio_tokens",
+    "output_text_tokens",
+    "output_audio_tokens",
+    "evidence",
+];
 fn seq(object: &Value, keys: &[&str]) -> Value {
     Value::Array(keys.iter().map(|key| object[*key].clone()).collect())
 }
