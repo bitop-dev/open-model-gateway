@@ -1,4 +1,5 @@
-"""Access reviews: start a small campaign on a throwaway Team, decide, export, close."""
+"""Access reviews: start a small campaign on a throwaway Team, decide, export, close; then a schedule on the
+same Team: create, read, pause, resume and delete (it is never due during the run)."""
 from ..client import uuid_of
 from ..registry import journey
 from .common import rows
@@ -91,3 +92,33 @@ def access_reviews(t):
     inbox_after = rows(alex.get("/api/v1/me/access-reviews?limit=200"))
     t.ok("review.closed-campaign-leaves-inbox", inbox_after is not None and not any(i.get("id") == blair_item for i in inbox_after))
     t.ok("review.detail-shows-closed", auditor.get(f"{base}/{cid}").get("closed_at") is not None)
+
+    # Schedules (#481). The first run is the first period start after now, so this schedule never runs here.
+    sched = "/api/v1/platform/access-review-schedules"
+    schedule_body = {"name": t.label("schedule"), "subjects": ["workspace_memberships"], "workspace_ids": [ws], "cadence": "monthly", "start_day": 1}
+    t.expect("schedule.anonymous-list-refused", anon.get(sched), 401)
+    t.expect("schedule.member-list-refused", alex.get(sched), 403)
+    t.expect("schedule.member-cannot-create", alex.post(sched, schedule_body), 403)
+    t.expect("schedule.auditor-cannot-create", auditor.post(sched, schedule_body), 403)
+    t.expect("schedule.monthly-start-month-refused", operator.post(sched, {**schedule_body, "start_month": 1}), 400)
+    created = operator.post(sched, schedule_body)
+    t.expect("schedule.create", created, 200)
+    sid = created.id()
+    if not sid:
+        t.rec.fail("schedule.created-schedule-missing", "setup_failed")
+        return
+    # Deleting twice is refused (404), which the undo accepts: it only has to leave the schedule deleted.
+    t.undo("delete schedule", lambda: operator.delete(f"{sched}/{sid}"), gone=(404,))
+    t.ok("schedule.next-run-is-future", bool(created.get("next_run_at")) and created.get("last_run") is None)
+    t.ok("schedule.listed", any(s.get("id") == sid for s in rows(auditor.get(f"{sched}?limit=200")) or []))
+    t.expect("schedule.detail-auditor", auditor.get(f"{sched}/{sid}"), 200)
+    t.expect("schedule.auditor-cannot-pause", auditor.patch(f"{sched}/{sid}", {"paused": True}), 403)
+    paused = operator.patch(f"{sched}/{sid}", {"paused": True})
+    t.expect("schedule.pause", paused, 200)
+    t.ok("schedule.paused-has-no-next-run", paused.get("paused_at") is not None and paused.get("next_run_at") is None)
+    resumed = operator.patch(f"{sched}/{sid}", {"paused": False})
+    t.expect("schedule.resume", resumed, 200)
+    t.ok("schedule.resumed-has-next-run", resumed.get("paused_at") is None and bool(resumed.get("next_run_at")))
+    t.expect("schedule.member-cannot-delete", alex.delete(f"{sched}/{sid}"), 403)
+    t.expect("schedule.delete", operator.delete(f"{sched}/{sid}"), 200)
+    t.expect("schedule.deleted-detail-gone", operator.get(f"{sched}/{sid}"), 404)

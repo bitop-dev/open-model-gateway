@@ -1,10 +1,16 @@
 //! Operator-configured extra trust anchors for one outbound client: the file
 //! store's S3 endpoint (`GATEWAY_S3_CA_FILE`) and the OIDC issuer
-//! (`GATEWAY_OIDC_CA_FILE`). A bundle is read and checked once, at startup,
-//! and given to the one client its setting names
-//! ([`super::add_root_certificates`]); the roots are added to the public
-//! webpki roots, never instead of them, and no other client sees them.
-//! Rotating the CA therefore needs a restart.
+//! (`GATEWAY_OIDC_CA_FILE`). A bundle is given to the one client its setting
+//! names ([`super::add_root_certificates`]); the roots are added to the public
+//! webpki roots, never instead of them, and no other client sees them. It is
+//! read once, at startup, so rotating the CA needs a restart.
+//!
+//! The two settings accept different files, deliberately: the OIDC bundle
+//! goes through [`CaBundle::read`]'s checks (CA certificates only), while S3
+//! keeps exactly the rules it has always had ([`CaBundle::pem_bundle`]), so an
+//! existing installation is never stopped at upgrade (for example one whose
+//! endpoint has a single self-signed server certificate, named as its own
+//! trust anchor, or a combined file that also holds the key).
 
 /// Certificates of one setting's PEM file. Holds no secret (certificates are
 /// public), but is never printed: errors name the setting, not the contents.
@@ -90,6 +96,16 @@ impl CaBundle {
             "{setting} contains no certificate"
         );
         anyhow::ensure!(certificates.len() == sections, invalid());
+        Ok(Self { certificates })
+    }
+
+    /// What `reqwest::Certificate::from_pem_bundle` accepts and nothing more,
+    /// for `GATEWAY_S3_CA_FILE`: its `CERTIFICATE` sections, other sections
+    /// ignored, no CA-flag, validity or size check. Never use it for a new
+    /// setting; `read` is the rule for those.
+    pub(crate) fn pem_bundle(setting: &'static str, pem: &[u8]) -> anyhow::Result<Self> {
+        let certificates = reqwest::Certificate::from_pem_bundle(pem)
+            .map_err(|_| anyhow::anyhow!("{setting} is not a PEM certificate bundle"))?;
         Ok(Self { certificates })
     }
 

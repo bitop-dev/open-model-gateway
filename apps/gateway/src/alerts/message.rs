@@ -196,6 +196,9 @@ pub(super) fn email_message_with_link(
                     Some(SCIM_LAST_ADMIN) => Some("Built-in SCIM safeguard".to_owned()),
                     Some(PARTITIONS_MISSING) => Some("Built-in partition check".to_owned()),
                     Some(HISTORY_ORPHANS) => Some("Built-in history check".to_owned()),
+                    Some(ACCESS_REVIEW_SKIPPED) => {
+                        Some("Built-in access review schedule".to_owned())
+                    }
                     _ => None,
                 }
             }),

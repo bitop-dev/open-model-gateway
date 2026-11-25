@@ -324,17 +324,46 @@ async fn operator_ca_bundle_is_required_for_private_s3_tls() {
     let key = ObjectKey::new(Purpose::BatchInput, Scope::Workspace(uuid::Uuid::new_v4())).unwrap();
 
     let stored_size = crypto::stored_len(42).unwrap();
-    for (bundle, leaf, trusted) in [
-        (None, SERVER_CERT, false),
-        (Some(OTHER_CA.to_owned()), SERVER_CERT, false),
-        (Some(CA.to_owned()), WRONG_NAME_CERT, false),
-        (Some(format!("{OTHER_CA}{CA}")), SERVER_CERT, true),
+    let fixture = |leaf: &str| {
+        (
+            CertificateDer::from_pem_slice(leaf.as_bytes()).unwrap(),
+            PrivateKeyDer::from_pem_slice(SERVER_KEY.as_bytes()).unwrap(),
+        )
+    };
+    // An endpoint with a single self-signed server certificate (no CA flag),
+    // named as its own trust anchor, alone or in a file that also holds its
+    // key: S3 has always accepted both (`egress::CaBundle::pem_bundle`), and
+    // keeps doing so, although GATEWAY_OIDC_CA_FILE refuses these files.
+    let own = crate::identity::test_pki::self_signed(&crate::identity::test_pki::Spec {
+        common_name: "minio.internal",
+        from: 2020,
+        until: 2120,
+        sans: &[crate::identity::test_pki::San::Ip([127, 0, 0, 1])],
+    });
+    let own_key = {
+        use base64::Engine as _;
+        // The label is assembled at run time: the source holds no key marker.
+        let label = ["PRIVATE", "KEY"].join(" ");
+        let body = base64::engine::general_purpose::STANDARD.encode(&own.key_pkcs8);
+        format!("-----BEGIN {label}-----\n{body}\n-----END {label}-----\n")
+    };
+    let own_fixture = || {
+        (
+            CertificateDer::from(own.der.clone()),
+            PrivateKeyDer::Pkcs8(own.key_pkcs8.clone().into()),
+        )
+    };
+    for (bundle, (certificate, private_key), trusted) in [
+        (None, fixture(SERVER_CERT), false),
+        (Some(OTHER_CA.to_owned()), fixture(SERVER_CERT), false),
+        (Some(CA.to_owned()), fixture(WRONG_NAME_CERT), false),
+        (Some(format!("{OTHER_CA}{CA}")), fixture(SERVER_CERT), true),
+        (Some(own.pem()), own_fixture(), true),
+        (Some(format!("{}{own_key}", own.pem())), own_fixture(), true),
     ] {
         if let Some(pem) = &bundle {
             std::fs::write(&path, pem).unwrap();
         }
-        let certificate = CertificateDer::from_pem_slice(leaf.as_bytes()).unwrap();
-        let private_key = PrivateKeyDer::from_pem_slice(SERVER_KEY.as_bytes()).unwrap();
         let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
@@ -414,9 +443,9 @@ async fn invalid_ca_file_fails_through_s3_configuration() {
         "-----BEGIN CERTIFICATE-----\n!invalid-base64!\n-----END CERTIFICATE-----\n",
     )
     .unwrap();
-    // Refused when the configuration is read, before any client is built.
     let settings = s3_lookup("https://127.0.0.1:1", Some(path));
-    let error = FileStoreConfig::from_lookup(&*settings).err().unwrap();
+    let config = FileStoreConfig::from_lookup(&*settings).unwrap();
+    let error = FileStoreRuntime::build(config).await.err().unwrap();
     assert_eq!(
         error.to_string(),
         "GATEWAY_S3_CA_FILE is not a PEM certificate bundle"

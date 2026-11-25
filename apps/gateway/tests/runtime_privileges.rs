@@ -139,6 +139,8 @@ async fn enterprise_runtime_allowlist_and_rollback_probes(pool: PgPool) {
         "access_review_assignments",
         "access_review_decisions",
         "access_review_notification_reads",
+        "access_review_schedules",
+        "access_review_schedule_runs",
         "budget_totals",
         "rate_minute_counters",
         "inflight_counters",
@@ -196,6 +198,7 @@ async fn enterprise_runtime_allowlist_and_rollback_probes(pool: PgPool) {
     report_probe_releases_lease(&pool).await;
     change_notifications_and_leases_run_as_runtime(&pool).await;
     alert_evaluation_runs_as_runtime(&pool).await;
+    scheduled_access_reviews_run_as_runtime(&pool).await;
     realtime_accounting_runs_as_runtime(&pool).await;
     scim_provisioning_runs_as_runtime(&pool).await;
     budget_totals_maintained_as_runtime(&pool).await;
@@ -1089,6 +1092,49 @@ async fn scim_provisioning_runs_as_runtime(pool: &PgPool) {
 
 /// The alert evaluator and email delivery need nothing beyond the reviewed
 /// grants: seed as owner, then evaluate through a pool that runs as runtime.
+/// #481: the lifecycle job's scheduler runs with runtime grants: it starts a
+/// due schedule's campaign through the definer, snapshots its items, records
+/// a skipped run with its alert, audits both, and moves each schedule to its
+/// next period.
+async fn scheduled_access_reviews_run_as_runtime(pool: &PgPool) {
+    // The admin the alert probe seeded: the SCIM probe after this one
+    // expects exactly one.
+    sqlx::raw_sql(r#"DO $$ DECLARE u uuid:=(SELECT user_id FROM effective_platform_roles WHERE role='admin' ORDER BY user_id LIMIT 1); ws uuid:=gen_random_uuid(); empty uuid:=gen_random_uuid(); BEGIN
+ INSERT INTO workspaces(id,name,kind) VALUES(ws,'Scheduled review team','team'),(empty,'Scheduled review empty','project');
+ INSERT INTO workspace_membership_grants(workspace_id,user_id,role,source) VALUES(ws,u,'owner','manual');
+ INSERT INTO access_review_schedules(id,name,subjects,workspace_ids,open_days,cadence,start_day,created_by,next_run_at) VALUES
+  (gen_random_uuid(),'Runtime scheduled','{workspace_memberships}',ARRAY[ws],7,'monthly',1,u,date_trunc('month',now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'),
+  (gen_random_uuid(),'Runtime empty','{workspace_memberships}',ARRAY[empty],7,'monthly',1,u,date_trunc('month',now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC');
+ END $$"#)
+        .execute(pool)
+        .await
+        .unwrap();
+    let runtime = runtime_pool(pool).await;
+    let store = open_model_gateway::store::Store::new(runtime.clone());
+    assert_eq!(
+        open_model_gateway::lifecycle::start_scheduled_access_reviews_fenced(&store, None)
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        open_model_gateway::lifecycle::start_scheduled_access_reviews_fenced(&store, None)
+            .await
+            .unwrap(),
+        0,
+        "a schedule runs once per period"
+    );
+    runtime.close().await;
+    let (campaigns, items, started, skipped, alerts, audited, future): (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM access_review_campaigns WHERE schedule_id IS NOT NULL),(SELECT count(*) FROM access_review_items i JOIN access_review_campaigns c ON c.id=i.campaign_id WHERE c.schedule_id IS NOT NULL),(SELECT count(*) FROM access_review_schedule_runs WHERE outcome='started'),(SELECT count(*) FROM access_review_schedule_runs WHERE outcome='skipped' AND reason='empty'),(SELECT count(*) FROM alert_events WHERE builtin='access_review_skipped'),(SELECT count(*) FROM audit_events WHERE action IN ('access_review.started_by_schedule','access_review_schedule.run_skipped') AND actor_user_id IS NULL),(SELECT count(*) FROM access_review_schedules WHERE next_run_at=(date_trunc('month',now() AT TIME ZONE 'UTC') + interval '1 month') AT TIME ZONE 'UTC')")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        (campaigns, items, started, skipped, alerts, audited, future),
+        (1, 1, 1, 1, 1, 2, 2)
+    );
+}
+
 async fn alert_evaluation_runs_as_runtime(pool: &PgPool) {
     sqlx::raw_sql(r#"DO $$ DECLARE u uuid:=gen_random_uuid(); ws uuid:=gen_random_uuid(); personal uuid:=gen_random_uuid(); k uuid:=gen_random_uuid(); pk uuid:=gen_random_uuid(); m uuid:=gen_random_uuid(); pc uuid:=gen_random_uuid(); d uuid:=gen_random_uuid(); e uuid; i integer; BEGIN
  INSERT INTO users(id,email) VALUES(u,'alerts-'||u||'@example.invalid');

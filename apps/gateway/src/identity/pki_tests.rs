@@ -245,6 +245,22 @@ impl Ca {
     }
 }
 
+/// A self-signed server certificate (no CA flag), as an endpoint with a
+/// single certificate has.
+pub(crate) fn self_signed(spec: &Spec<'_>) -> Issued {
+    let (key, pkcs8) = generate();
+    Issued {
+        der: signed(
+            &key,
+            spec.common_name,
+            spec,
+            key.public_key().as_ref(),
+            false,
+        ),
+        key_pkcs8: pkcs8,
+    }
+}
+
 /// A rustls server configuration presenting `leaf`.
 #[cfg(feature = "integration-tests")]
 pub(crate) fn server(leaf: &Issued) -> std::sync::Arc<rustls::ServerConfig> {

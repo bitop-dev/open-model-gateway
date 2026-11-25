@@ -73,6 +73,17 @@ impl S3Auth {
     }
 }
 
+/// The bytes of `GATEWAY_S3_CA_FILE`, held privately by `S3Settings`: read
+/// when the configuration is, parsed when the client is built, with the rules
+/// S3 has always had ([`crate::egress::CaBundle::pem_bundle`]).
+pub(crate) struct S3CaBundle(Vec<u8>);
+
+impl S3CaBundle {
+    pub(crate) fn bundle(&self) -> anyhow::Result<crate::egress::CaBundle> {
+        crate::egress::CaBundle::pem_bundle(CA_FILE_ENV, &self.0)
+    }
+}
+
 /// Validated S3 configuration. No Debug.
 pub struct S3Settings {
     pub(crate) bucket: String,
@@ -81,7 +92,7 @@ pub struct S3Settings {
     pub(crate) endpoint: Option<String>,
     pub(crate) path_style: bool,
     pub(crate) auth: S3Auth,
-    ca_bundle: Option<crate::egress::CaBundle>,
+    ca_bundle: Option<S3CaBundle>,
 }
 
 fn charset(value: &str, extra: &[u8]) -> bool {
@@ -254,9 +265,14 @@ impl S3Settings {
             );
             S3Auth::Aws(auth)
         };
-        let ca_bundle = get(CA_FILE_ENV)
-            .map(|path| crate::egress::CaBundle::read(CA_FILE_ENV, &path))
-            .transpose()?;
+        let ca_bundle = match get(CA_FILE_ENV) {
+            None => None,
+            Some(path) => {
+                let pem = std::fs::read(path)
+                    .map_err(|_| anyhow::anyhow!("{CA_FILE_ENV} could not be read"))?;
+                Some(S3CaBundle(pem))
+            }
+        };
         Ok(Self {
             bucket,
             prefix,
