@@ -692,6 +692,7 @@ pub(crate) async fn audit(
                 || v.as_str().is_some_and(|s| {
                     s.len() <= 32 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
                 }))
+                || super::guardrails::audit_field(action, k, v)
             {
                 safe.insert(k.clone(), v.clone());
             }
@@ -847,14 +848,6 @@ pub(super) const PRICED_ROUTE: &str =
     "EXISTS(SELECT 1 FROM deployment_prices dp WHERE dp.deployment_id=d.id)";
 /// Active workspaces holding an independent direct assignment for model `m`.
 pub(super) const DIRECT_WORKSPACES: &str = "(SELECT count(*) FROM workspace_model_grants g JOIN workspaces w ON w.id=g.workspace_id WHERE g.model_id=m.id AND g.source='direct' AND w.disabled_at IS NULL)";
-/// Server-side mirror of the documented UI readiness derivation, used only for aggregate counts.
-/// Video models are never ready: OpenAI shut down its Videos API on 2026-09-24 and no adapter offers video.
-pub(super) fn ready_model() -> String {
-    let serving = &*SERVING_ROUTE;
-    format!(
-        "(m.enabled AND NOT ('videos'=ANY(m.supported_protocols)) AND EXISTS(SELECT 1 FROM deployments d WHERE d.model_id=m.id AND {serving}) AND (EXISTS(SELECT 1 FROM catalog_models cm WHERE cm.model_id=m.id) OR {DIRECT_WORKSPACES}>0))"
-    )
-}
 /// Configuration check (best effort): the smallest tokens-per-minute limit
 /// among the workspace-type defaults that offer
 /// model `m` through their default catalogs (every type when none does).
