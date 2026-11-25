@@ -1,7 +1,7 @@
 //! A provider answer is charged once across either side of the result commit.
 use super::*;
 use super::{
-    fence::{lapse, start},
+    fence::{REACH, lapse, start},
     http_support::{Resolver, Server, client},
 };
 use crate::jobs::schedule::claims::RetryCommitFault;
@@ -102,7 +102,10 @@ async fn crash_worker() {
     let dir = std::env::var("BATCH_TEST_DIR").unwrap();
     let store = crate::store::Store::new(pool);
     let engine = loopback_engine(&store, &std::env::var("BATCH_TEST_UPSTREAM").unwrap());
-    let jobs = loopback_jobs(store, engine, local_files(dir.as_ref()).await, 1);
+    let mut jobs = loopback_jobs(store, engine, local_files(dir.as_ref()).await, 1);
+    jobs.segment_age = std::env::var("BATCH_TEST_SEGMENT_AGE_MS")
+        .ok()
+        .map(|ms| Duration::from_millis(ms.parse().unwrap()));
     jobs.finalize_hold.arm();
     assert!(Runner::new(jobs).run_next().await.unwrap());
 }
@@ -140,6 +143,12 @@ fn start_process(w: &World, dir: &std::path::Path, upstream: &Server) -> tokio::
         )
         .env("BATCH_TEST_DIR", dir)
         .env("BATCH_TEST_UPSTREAM", &upstream.base)
+        // The worker flushes on the parent's segment age (`run_case`).
+        .envs(
+            w.jobs
+                .segment_age
+                .map(|age| ("BATCH_TEST_SEGMENT_AGE_MS", age.as_millis().to_string())),
+        )
         // The parent shard's libtest output must contain just its own summary.
         .stdout(std::process::Stdio::null())
         .kill_on_drop(true)
@@ -305,6 +314,15 @@ async fn run_case(pool: PgPool, case: Case) {
     .await
     .unwrap();
     w.jobs = loopback_jobs(store, engine, files, concurrency);
+    // A fault case runs its lines one at a time and asserts where all their
+    // answers are (none written before the held commit, or all in segment 0).
+    // Each line reaches the provider within `REACH` (a planning failure costs
+    // a REPLAN), so `dispatch` bounds them all, and their segment is flushed
+    // when the lines end, never on its age first.
+    let dispatch = REACH * size as u32;
+    if fault.is_some() {
+        w.jobs.segment_age = Some(dispatch + Duration::from_secs(5));
+    }
     if let Case::CapacityTakeover(loss) = case {
         let process = matches!(loss, Loss::Crash).then(|| start_process(&w, dir.path(), &upstream));
         check_takeover_capacity(&w, &job, &calls, &release_provider, process).await;
@@ -434,7 +452,7 @@ async fn run_case(pool: PgPool, case: Case) {
         assert!(!Runner::new(w.jobs.clone()).run_next().await.unwrap());
     } else if let Some((_, loss)) = fault {
         if before {
-            tokio::time::timeout(Duration::from_secs(20),async {
+            tokio::time::timeout(dispatch, async {
                 loop {
                     let waiting:bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE relation='stored_files'::regclass AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND NOT granted)").fetch_one(&w.f.store.pool).await.unwrap();
                     if waiting {break}
@@ -447,7 +465,7 @@ async fn run_case(pool: PgPool, case: Case) {
                 "the one-slot route drains before the first grouped write"
             );
         } else if crash {
-            tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::time::timeout(dispatch, async {
                 while w.reload(&job).await.finalizing_at.is_none() {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
@@ -455,7 +473,7 @@ async fn run_case(pool: PgPool, case: Case) {
             .await
             .unwrap();
         } else {
-            tokio::time::timeout(Duration::from_secs(20), w.jobs.finalize_hold.reached())
+            tokio::time::timeout(dispatch, w.jobs.finalize_hold.reached())
                 .await
                 .unwrap();
         }

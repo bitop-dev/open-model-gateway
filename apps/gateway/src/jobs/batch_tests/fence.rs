@@ -9,7 +9,7 @@ use crate::jobs::schedule::{Scheduler, claims::RetryClaim};
 /// cooldown: the line is planned again only after one `jobs::runner::REPLAN`,
 /// so a wait of exactly `REPLAN` can expire before the next plan reaches the
 /// provider. Two `REPLAN`s and a margin still bound a stuck runner.
-const REACH: Duration = crate::jobs::runner::REPLAN
+pub(super) const REACH: Duration = crate::jobs::runner::REPLAN
     .saturating_mul(2)
     .saturating_add(Duration::from_secs(10));
 
@@ -1794,9 +1794,12 @@ async fn a_segment_commit_error_keeps_the_file_and_recovery_does_not_replay(pool
     .execute(db)
     .await
     .unwrap();
-    // The whole run, provider calls included: a planning failure costs one REPLAN.
+    // The whole run, provider calls included: a planning failure costs one
+    // REPLAN. Its segment flushes when the run's lines end, never on its age
+    // first (which would stop the run at the refused commit before `two`).
+    let age = REACH + Duration::from_secs(5);
     assert!(
-        tokio::time::timeout(REACH, start(&w))
+        tokio::time::timeout(REACH, start_with(flushing_after(&w, age)))
             .await
             .unwrap()
             .unwrap()
