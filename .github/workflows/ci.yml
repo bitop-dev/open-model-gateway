@@ -613,15 +613,17 @@ jobs:
       # operating-system packages come from the arm64 child of the same runtime
       # base, so that child is scanned from the registry too (v0.14.0 failed on
       # arm64 first). Run from an empty directory so no Trivy configuration or
-      # ignore file in the checkout applies, and by full path.
+      # ignore file in the checkout applies, and by full path. The only
+      # exceptions are the dated, package-scoped entries of
+      # .github/trivy-exceptions.yaml, passed by name (docs/verification.md).
       - name: Scan the candidate image and the arm64 runtime base
         env:
           APPROVED_RUNTIME: gcr.io/distroless/cc-debian13:nonroot@sha256:cb87acc574abe719b6e5c547384defa2f7b1f24af9605d3f618cf852495d8be2
         run: |
           set -euo pipefail
           cd "$(mktemp -d)"
-          "${RUNNER_TEMP}/trivy-bin/trivy" image --image-src docker --severity CRITICAL,HIGH --exit-code 1 --ignore-unfixed open-model-gateway:staging
-          "${RUNNER_TEMP}/trivy-bin/trivy" image --image-src remote --platform linux/arm64 --severity CRITICAL,HIGH --exit-code 1 --ignore-unfixed "${APPROVED_RUNTIME}"
+          "${RUNNER_TEMP}/trivy-bin/trivy" image --image-src docker --severity CRITICAL,HIGH --exit-code 1 --ignore-unfixed --ignorefile "${GITHUB_WORKSPACE}/.github/trivy-exceptions.yaml" open-model-gateway:staging
+          "${RUNNER_TEMP}/trivy-bin/trivy" image --image-src remote --platform linux/arm64 --severity CRITICAL,HIGH --exit-code 1 --ignore-unfixed --ignorefile "${GITHUB_WORKSPACE}/.github/trivy-exceptions.yaml" "${APPROVED_RUNTIME}"
       - name: Migrate and verify isolated runtime authority over HTTPS
         run: |
           python3 -I scripts/staging.py init
