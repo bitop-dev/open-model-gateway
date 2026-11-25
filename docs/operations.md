@@ -545,7 +545,22 @@ How to respond:
 
 - **Held settlements:** these are database or finalization failures. Holds are retained and never refunded as zero. The maintenance loop moves expired leases to `unknown`. Fix database health first, then review unknown usage in the dashboard and resolve it deliberately.
 - **Unknown reservations:** they keep budget holds and can block budgeted admission (`unresolved_usage`). Resolve them; never delete reservations.
+- **Bursts shed with `scope_busy`:** see [below](#bursts-shed-with-scope_busy).
 - **Pool saturation or rising latency:** read the [load test](#load-test-baseline) section before raising pool sizes. Compare `histogram_quantile(0.99, sum by (le, phase) (rate(gateway_admission_seconds_bucket{outcome="admitted"}[5m])))` across phases: a large `lock_rows` share means one workspace is hot (its admissions serialize on its totals rows; split the traffic over workspaces; `gateway_scope_lock_wait_seconds{lock="rows"}` shows the same wait and an [`admission_ceiling`](alerts.md#rule-kinds) rule names the scope); a large `locks` share means a management change of a scope (or, in the global mode, the installation lock) is held; a large `queue` share means the per-replica admission slots (half the pool) are busy; a large `limits` share means per-minute rate accounting or budget reads are slow (see [pg_stat_statements](#finding-slow-queries-and-lock-waits)).
+
+### Bursts shed with `scope_busy`
+
+An admission waits at most 1.5 s for the replica's admission gate and its scope's rows ([governance](governance.md#scoped-admission-lock-order)); past that it is shed with HTTP 503 `scope_busy` and `Retry-After: 2`, before anything is written or sent. A stall sheds this way, and so does a burst at a scope's ceiling: admissions on one scope (one workspace, and within it one key lineage) serialize on its totals rows, so N simultaneous admissions on one scope wait about N times the time one of them holds those rows, its commit included.
+
+- **What you see:** `gateway_admission_denials_total{code="scope_busy",scope="scope_lock"}` rising during bursts on a busy workspace, and `gateway_scope_lock_wait_seconds{lock="rows",path="admission"}` (the row-lock wait, sheds included) near the bound; the `queue` phase of admitted requests in `gateway_admission_seconds` grows too (a request shed at the gate records no phase). Settlements keep their latency and there is no `accounting_unavailable`: that is what tells a burst from a stall, which also holds settlements up.
+- **Measured (#859):** in bursts of 40 simultaneous requests on one scope, the slowest request took 0.34–1.1 s on GitHub's hosted runners (30 runs) and 0.6–0.95 s on a 4-core machine with commits of under 1 ms. The first burst a newly started gateway serves (a rollout, a restart, a scale-out) is slower. Locally it took 1.7 s, on a fresh database and on one already in use, with up to about half of its requests past 1.5 s (their whole latency, an upper bound on what the bound sheds). On CI it was printed only when it failed: in 2 of 30 runs one of its requests was shed. Why a new gateway's first burst is slower has not been established.
+- **Slow storage (an estimate):** a request on one scope costs about 10–20 ms of serialized time with fast commits (the numbers above), and each millisecond of commit latency adds about 6 ms per request (#831, from the capacity measured with 5 and 10 ms commit delays; a request commits twice). With 10 ms commits that is about 70 ms per request when the burst's own settlements interleave with its admissions (a fast upstream), so a burst of about 20 on one scope reaches the bound, or about 40 when they come later.
+- **What to do:**
+  - Let clients honour `Retry-After`: nothing was charged or sent. The official OpenAI and Anthropic SDKs retry a 503 twice by default, with backoff; other clients may not.
+  - Spread one workspace's bulk work over time, or send it through the Batches API: batch lines retry a shed admission with their backoff.
+  - Keep commit latency low: the WAL device's flush time, and for a synchronous standby its network round trip (`pg_stat_wal`, `pg_stat_io`).
+  - Scale out before a known burst rather than during it.
+  - Do not raise `GATEWAY_DATABASE_MAX_CONNECTIONS` for this: one scope's admissions serialize on its rows whatever the pool size.
 
 ## Backups and restore
 
