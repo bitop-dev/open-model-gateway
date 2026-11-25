@@ -517,22 +517,20 @@ mod database {
         // lock skip protects the second one.
         let mut other = f.store.clone();
         other.caches = std::sync::Arc::new(crate::cache::Caches::new());
-        let started = std::time::Instant::now();
-        let results = futures::future::join_all((0..40).map(|i| {
-            let store = if i % 2 == 0 { &f.store } else { &other };
-            tokio::time::timeout(
-                std::time::Duration::from_millis(500),
-                record_result(store, deployment.id, None),
-            )
-        }))
-        .await;
-        let waited = results.iter().filter(|r| r.is_err()).count();
-        assert_eq!(
-            waited, 0,
-            "{waited} of 40 healthy results queued on the busy health row"
-        );
-        assert!(results.iter().flatten().all(Result::is_ok));
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        // A result that queued behind the held row could finish only after
+        // the rollback below: every result finishing first, however slow
+        // the machine, shows that none queued. The bound only stops a test
+        // that would otherwise hang.
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            futures::future::join_all((0..40).map(|i| {
+                let store = if i % 2 == 0 { &f.store } else { &other };
+                record_result(store, deployment.id, None)
+            })),
+        )
+        .await
+        .expect("a healthy result queued on the busy health row");
+        assert!(results.iter().all(Result::is_ok));
         assert_eq!(
             observed().await,
             before,
