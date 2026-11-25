@@ -100,29 +100,37 @@ pub(super) struct OidcHttp {
     allow_loopback_http: bool,
 }
 impl OidcHttp {
-    pub(super) fn new(allow_loopback_http: bool) -> anyhow::Result<Self> {
+    /// The OIDC client: built once per provider and used for discovery,
+    /// JWKS (and its refreshes) and the token exchange; `ca` adds an
+    /// operator's private roots to the public ones for this client only.
+    pub(super) fn new(
+        allow_loopback_http: bool,
+        ca: Option<&crate::egress::CaBundle>,
+    ) -> anyhow::Result<Self> {
+        // No ambient HTTP(S)_PROXY/ALL_PROXY and no implicit retries, like
+        // every provider client (#144): identity traffic goes straight to the
+        // issuer, once. Discovery, token and JWKS addresses pass the egress
+        // policy (#33). `allow_loopback_http` is GATEWAY_ENV=development, as
+        // in the global policy; passing it keeps tests (strict global
+        // default) and production identical.
+        let mut builder = crate::egress::client_builder(crate::egress::resolver_with(
+            crate::egress::Purpose::Oidc,
+            crate::egress::policy().permit_loopback(allow_loopback_http),
+        ))
+        .timeout(Duration::from_secs(15))
+        .connect_timeout(Duration::from_secs(5))
+        // No idle connections (#417): a provider closes them on its own
+        // schedule, and a request written to one it is closing is lost. With
+        // no retry that fails the sign-in after its one-time attempt is
+        // consumed. Sign-in is rare; each request pays for its own connection.
+        .pool_max_idle_per_host(0);
+        if let Some(ca) = ca {
+            builder = crate::egress::add_root_certificates(builder, ca);
+        }
         Ok(Self {
-            // No ambient HTTP(S)_PROXY/ALL_PROXY and no implicit retries,
-            // like every provider client (#144): identity traffic goes
-            // straight to the issuer, once.
-            // Discovery, token and JWKS addresses pass the egress policy
-            // (#33). `allow_loopback_http` is GATEWAY_ENV=development, as
-            // in the global policy; passing it keeps tests (strict global
-            // default) and production identical.
-            client: crate::egress::client_builder(crate::egress::resolver_with(
-                crate::egress::Purpose::Oidc,
-                crate::egress::policy().permit_loopback(allow_loopback_http),
-            ))
-            .timeout(Duration::from_secs(15))
-            .connect_timeout(Duration::from_secs(5))
-            // No idle connections (#417): a provider closes them on
-            // its own schedule, and a request written to one it is closing
-            // is lost. With no retry that fails the sign-in after its
-            // one-time attempt is consumed. Sign-in is rare; each request
-            // pays for its own connection.
-            .pool_max_idle_per_host(0)
-            .build()
-            .map_err(|_| anyhow::anyhow!("Cannot initialize OIDC HTTP client"))?,
+            client: builder
+                .build()
+                .map_err(|_| anyhow::anyhow!("Cannot initialize OIDC HTTP client"))?,
             allow_loopback_http,
         })
     }

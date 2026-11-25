@@ -46,6 +46,9 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 mod client;
 pub use client::HttpClient;
 pub(crate) use client::{add_root_certificates, client_builder, pinned_client_builder};
+#[path = "egress_ca.rs"]
+mod ca;
+pub(crate) use ca::CaBundle;
 #[path = "egress_upstream.rs"]
 mod upstream;
 pub(crate) use upstream::UpstreamClient;

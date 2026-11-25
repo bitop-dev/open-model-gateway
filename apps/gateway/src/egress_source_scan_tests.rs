@@ -1146,7 +1146,7 @@ const CLIENT_MODULE: &[&str] = &[
     "HttpClientBuilder :: pub fn build ( self ) - > reqwest : : Result < HttpClient > { self . 0 . build ( ) . map ( HttpClient ) }",
     "# [ expect ( clippy : : disallowed_methods , reason = \"the egress-guarded constructor (#509)\" ) ] pub ( crate ) fn client_builder ( resolver : Arc < Resolver > ) - > HttpClientBuilder { HttpClientBuilder ( reqwest : : Client : : builder ( ) . no_proxy ( ) . dns_resolver ( resolver ) . redirect ( reqwest : : redirect : : Policy : : none ( ) ) . retry ( reqwest : : retry : : never ( ) ) , ) }",
     "# [ expect ( clippy : : disallowed_methods , reason = \"the egress-guarded constructor (#509)\" ) ] pub ( crate ) fn pinned_client_builder ( approved : & crate : : providers : : local : : endpoints : : ApprovedDestinations , ) - > HttpClientBuilder { HttpClientBuilder ( reqwest : : Client : : builder ( ) . no_proxy ( ) . redirect ( reqwest : : redirect : : Policy : : none ( ) ) . retry ( reqwest : : retry : : never ( ) ) . resolve_to_addrs ( approved . host ( ) , approved . addresses ( ) ) , ) }",
-    "# [ expect ( clippy : : disallowed_methods , reason = \"the egress-guarded constructor (#509)\" ) ] pub ( crate ) fn add_root_certificates ( builder : HttpClientBuilder , bundle : & crate : : filestore : : s3 : : S3CaBundle , ) - > anyhow : : Result < HttpClientBuilder > { let mut builder = builder . 0 ; for certificate in bundle . certificates ( ) ? { builder = builder . add_root_certificate ( certificate ) ; } Ok ( HttpClientBuilder ( builder ) ) }",
+    "# [ expect ( clippy : : disallowed_methods , reason = \"the egress-guarded constructor (#509)\" ) ] pub ( crate ) fn add_root_certificates ( builder : HttpClientBuilder , bundle : & super : : CaBundle , ) - > HttpClientBuilder { let mut builder = builder . 0 ; for certificate in bundle . certificates ( ) { builder = builder . add_root_certificate ( certificate . clone ( ) ) ; } HttpClientBuilder ( builder ) }",
 ];
 
 fn client_module_source() -> String {
@@ -1502,8 +1502,8 @@ fn planted(source: &str) -> Vec<(String, &'static str)> {
         (
             edited(
                 source,
-                "builder = builder.add_root_certificate(certificate);",
-                "builder = builder.add_root_certificate(certificate).danger_accept_invalid_hostnames(true);",
+                "builder = builder.add_root_certificate(certificate.clone());",
+                "builder = builder.add_root_certificate(certificate.clone()).danger_accept_invalid_hostnames(true);",
             ),
             "changed: pub(crate) fn add_root_certificates",
         ),

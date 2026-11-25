@@ -291,6 +291,16 @@ secrets:
     clientIdKey: GATEWAY_OIDC_CLIENT_ID
     issuerKey: GATEWAY_OIDC_ISSUER
     clientSecretKey: GATEWAY_OIDC_CLIENT_SECRET
+    # The issuer's private CA (GATEWAY_OIDC_CA_FILE, #826): a PEM bundle of
+    # extra root certificates for the OIDC client only (added to the public
+    # roots; no other client trusts them). Name exactly one of a Secret or a
+    # ConfigMap holding it under `key`. Read at startup: roll the pods after
+    # changing it. Whoever can change it can impersonate the issuer.
+    ca:
+      enabled: false
+      secretName: ""
+      configMapName: ""
+      key: ca.crt
   # Provider API keys use the binary's `_FILE` import for the four built-in
   # names, or `extraEnvFrom`/`secretEnvAllowlist` above for anything else.
   providers:

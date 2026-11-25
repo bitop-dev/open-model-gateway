@@ -182,18 +182,20 @@ pub(crate) fn pinned_client_builder(
     )
 }
 
-/// Adds the trust anchors carried by S3's operator configuration.
+/// Adds an operator-configured bundle's trust anchors (S3's or the OIDC
+/// issuer's, checked when the setting was read) to the public roots of the
+/// one client that setting names.
 #[expect(
     clippy::disallowed_methods,
     reason = "the egress-guarded constructor (#509)"
 )]
 pub(crate) fn add_root_certificates(
     builder: HttpClientBuilder,
-    bundle: &crate::filestore::s3::S3CaBundle,
-) -> anyhow::Result<HttpClientBuilder> {
+    bundle: &super::CaBundle,
+) -> HttpClientBuilder {
     let mut builder = builder.0;
-    for certificate in bundle.certificates()? {
-        builder = builder.add_root_certificate(certificate);
+    for certificate in bundle.certificates() {
+        builder = builder.add_root_certificate(certificate.clone());
     }
-    Ok(HttpClientBuilder(builder))
+    HttpClientBuilder(builder)
 }
