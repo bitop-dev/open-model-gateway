@@ -1,0 +1,32 @@
+# A probe pod of `spark-env.py check` step 6 (probe.mjs): one connection to
+# the gateway Service. __NAME__ is the pod; __LABEL__ its name label, which
+# the chart's NetworkPolicy admits (omg-check-load) or not (omg-check-probe).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: __NAME__
+  labels: {app.kubernetes.io/name: __LABEL__}
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    seccompProfile: {type: RuntimeDefault}
+  containers:
+    - name: probe
+      image: mirror.gcr.io/library/node:22.23.4-bookworm-slim@sha256:5ec23b7c622b00547753bc6ffd78085dd868a68aeb41c8e0a1418f033e13d96d
+      command: [node, /scripts/probe.mjs]
+      resources:
+        requests: {cpu: 20m, memory: 48Mi}
+        limits: {cpu: 200m, memory: 128Mi}
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: {drop: [ALL]}
+      volumeMounts:
+        - {name: scripts, mountPath: /scripts, readOnly: true}
+  volumes:
+    - name: scripts
+      configMap: {name: omg-replicas-scripts}

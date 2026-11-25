@@ -1,0 +1,53 @@
+# The free in-namespace model server of `spark-env.py up --mode replicas`
+# (mock-upstream.mjs). The gateway reaches it only through its approved
+# local upstream (GATEWAY_LOCAL_UPSTREAMS pins this Service's ClusterIP).
+apiVersion: v1
+kind: Service
+metadata:
+  name: omg-mock-upstream
+  labels: {app.kubernetes.io/name: omg-mock-upstream}
+spec:
+  type: ClusterIP
+  selector: {app.kubernetes.io/name: omg-mock-upstream}
+  ports:
+    - {name: http, port: 8000, targetPort: http}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: omg-mock-upstream
+  labels: {app.kubernetes.io/name: omg-mock-upstream}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: omg-mock-upstream}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: omg-mock-upstream}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: mock
+          image: mirror.gcr.io/library/node:22.23.4-bookworm-slim@sha256:5ec23b7c622b00547753bc6ffd78085dd868a68aeb41c8e0a1418f033e13d96d
+          command: [node, --preserve-symlinks-main, --preserve-symlinks, /scripts/mock-upstream.mjs]
+          ports:
+            - {name: http, containerPort: 8000}
+          readinessProbe:
+            tcpSocket: {port: http}
+            periodSeconds: 2
+          resources:
+            requests: {cpu: 20m, memory: 48Mi}
+            limits: {cpu: 200m, memory: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts: [{name: scripts, mountPath: /scripts, readOnly: true}]
+      volumes:
+        - name: scripts
+          configMap: {name: omg-replicas-scripts}
