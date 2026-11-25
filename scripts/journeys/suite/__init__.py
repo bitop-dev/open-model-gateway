@@ -6,6 +6,7 @@ from . import (  # noqa: F401
     catalogs,
     credentials,
     csrf_origin,
+    guardrails,
     health_spa,
     inference,
     keys,

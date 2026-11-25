@@ -70,6 +70,8 @@ mod files_tests;
 mod filter_scale_tests;
 #[path = "group_mapping_preview_tests.rs"]
 mod group_mapping_preview_tests;
+#[path = "guardrails_tests.rs"]
+mod guardrails_tests;
 #[path = "keys/issuance_tests.rs"]
 mod key_issuance_tests;
 #[path = "key_safety_tests.rs"]

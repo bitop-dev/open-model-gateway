@@ -121,6 +121,8 @@ DELETE	/api/v1/workspaces/{ws}/models/{model}	WorkspaceAdmin	denied
 GET	/api/v1/workspaces/{ws}/models/compare	WorkspaceMember	denied
 GET	/api/v1/workspaces/{ws}/policy	WorkspaceMetadata	scope:platform:read
 PUT	/api/v1/workspaces/{ws}/policy	WorkspaceAdmin	denied
+GET	/api/v1/workspaces/{ws}/guardrails	WorkspaceMetadata	scope:platform:read
+PUT	/api/v1/workspaces/{ws}/guardrails	WorkspaceAdmin	denied
 GET	/api/v1/workspaces/{ws}/members	WorkspaceAdminOrReader	scope:platform:read
 POST	/api/v1/workspaces/{ws}/members	WorkspaceAdmin	denied
 DELETE	/api/v1/workspaces/{ws}/members/{user}	WorkspaceAdmin	denied
@@ -285,6 +287,11 @@ GET	/api/v1/platform/workspace-types/{kind}/policy	PlatformRead	scope:platform:r
 PUT	/api/v1/platform/workspace-types/{kind}/policy	PlatformWrite	scope:governance:write
 GET	/api/v1/platform/workspaces/{ws}/policy	PlatformRead	scope:platform:read
 PUT DELETE	/api/v1/platform/workspaces/{ws}/policy	PlatformWrite	scope:governance:write
+GET	/api/v1/platform/guardrails/detectors	PlatformRead	scope:platform:read
+GET	/api/v1/platform/workspace-types/{kind}/guardrails	PlatformRead	scope:platform:read
+PUT	/api/v1/platform/workspace-types/{kind}/guardrails	PlatformWrite	scope:governance:write
+GET	/api/v1/platform/workspaces/{ws}/guardrails	PlatformRead	scope:platform:read
+PUT DELETE	/api/v1/platform/workspaces/{ws}/guardrails	PlatformWrite	scope:governance:write
 GET	/api/v1/platform/deployments/{deployment}/prices	PlatformRead	scope:platform:read
 POST	/api/v1/platform/deployments/{deployment}/prices	PlatformWrite	scope:catalog:write
 GET	/api/v1/platform/deployments/{deployment}/price-suggestion	PlatformRead	scope:platform:read

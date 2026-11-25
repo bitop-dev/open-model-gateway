@@ -11,7 +11,8 @@ use super::*;
 use crate::governance::totals::Scope;
 use futures::FutureExt;
 use openapi::http_vectors::{
-    Probe, body_vectors_http, query_vectors, query_vectors_extended, query_vectors_fixed,
+    Probe, body_vectors_http, body_vectors_seeded, query_vectors, query_vectors_extended,
+    query_vectors_fixed,
 };
 use openapi::responses::{Captured, PositiveFixtures, SLICE2_AREAS, capture_http};
 use sha2::{Digest, Sha256};
@@ -141,7 +142,8 @@ impl Client {
         assert_eq!(
             r.status.as_u16(),
             expected.as_u16(),
-            "{method}: unexpected status"
+            "{method} {path}: unexpected status: {}",
+            String::from_utf8_lossy(&r.bytes)
         );
         self.observed.lock().await.observe(&r);
         serde_json::from_slice(&r.bytes).unwrap_or(Value::Null)
@@ -1532,6 +1534,11 @@ async fn slice2_fixtures(pool: PgPool, shard: usize) -> (Vec<String>, PositiveFi
     Box::pin(access_review_fixtures(c, &admin, &f, &pool)).await;
     // #481: access review schedules and the campaigns they start.
     Box::pin(access_review_schedule_fixtures(c, &admin, &f, &pool)).await;
+    // #840: guardrail layers.
+    Box::pin(guardrail_fixtures(
+        c, &admin, &auditor, &owner, &regular, &f, &pool,
+    ))
+    .await;
 
     // Catalog and policy layers: populated replacement/default lists, never a union.
     let catalog = Uuid::new_v4();
@@ -4064,6 +4071,264 @@ async fn access_review_fixtures(c: &Client, admin: &Browser, f: &Fixture, pool: 
         )
         .await;
     }
+}
+
+/// #840: guardrail policy layers. Body vectors for the three PUTs first (each
+/// replaces its layer), then the states every response branch is seen in: type
+/// defaults and overrides with custom patterns, a local layer that tightens a
+/// platform rule and adds a pattern, tightening entries left inactive by an
+/// override and by a removed rule, the member view (pattern count only), an
+/// Auditor who also administers a Team (platform pattern text), personal
+/// workspaces with no rules and as platform staff see them (local hidden), an
+/// override reset, and the detectors.
+async fn guardrail_fixtures(
+    c: &Client,
+    admin: &Browser,
+    auditor: &Browser,
+    owner: &Browser,
+    regular: &Browser,
+    f: &Fixture,
+    pool: &PgPool,
+) {
+    type Platform = std::collections::HashMap<String, (String, String)>;
+    const TEAM_TYPE: &str = "/api/v1/platform/workspace-types/team/guardrails";
+    const PROJECT_TYPE: &str = "/api/v1/platform/workspace-types/project/guardrails";
+    let secrets = |action: &str| json!({"name":"Secrets","protection":"secrets","detector":{"kind":"pattern","categories":["secret"]},"input":{"action":action}});
+    let custom = |pattern: &str| json!({"name":"Code names","protection":"custom","detector":{"kind":"pattern","categories":["custom"],"patterns":[pattern]},"input":{"action":"block","redact_scope":"user_text"},"output":{"mode":"off"},"threshold":null,"on_error":"fail_open","timeout_ms":null,"workloads":["generation"],"uninspectable":"deny"});
+    let local_team = format!("/api/v1/workspaces/{}/guardrails", f.team);
+    let local_project = format!("/api/v1/workspaces/{}/guardrails", f.project);
+    let local_personal = format!("/api/v1/workspaces/{}/guardrails", f.personal);
+    let platform_team = format!("/api/v1/platform/workspaces/{}/guardrails", f.team);
+    let platform_project = format!("/api/v1/platform/workspaces/{}/guardrails", f.project);
+    let platform_personal = format!("/api/v1/platform/workspaces/{}/guardrails", f.personal);
+    // Rules the schema cannot state, which the handler refuses for a body the
+    // schema accepts: the documented refusals, not mismatches.
+    let described = |body: &Value, platform: &Platform| -> bool {
+        let Some(rules) = body.get("rules").and_then(Value::as_array) else {
+            return false;
+        };
+        let mut patterns = 0usize;
+        let mut targets = std::collections::HashSet::new();
+        for rule in rules {
+            if rule.get("id").is_some() {
+                return true; // An id names one of the layer's rules; vectors invent them.
+            }
+            if let Some(target) = rule.get("tightens") {
+                let Some((action, on_error)) = target.as_str().and_then(|t| platform.get(t)) else {
+                    return true;
+                };
+                if !targets.insert(target.to_string()) {
+                    return true;
+                }
+                let tightened = rule.pointer("/input/action").and_then(Value::as_str);
+                let mode = rule.pointer("/output/mode");
+                let failure = rule.get("on_error").and_then(Value::as_str);
+                if tightened.is_none() && mode.is_none() && failure.is_none() {
+                    return true;
+                }
+                let rank = |a: &str| {
+                    ["off", "monitor", "redact", "block"]
+                        .iter()
+                        .position(|x| *x == a)
+                };
+                if tightened.is_some_and(|a| rank(a) < rank(action))
+                    || (failure == Some("fail_open") && on_error == "fail_closed")
+                {
+                    return true;
+                }
+                continue;
+            }
+            let custom = rule
+                .pointer("/detector/categories")
+                .and_then(Value::as_array)
+                .is_some_and(|c| c.iter().any(|v| v == "custom"));
+            let list: Vec<&str> = rule
+                .pointer("/detector/patterns")
+                .and_then(Value::as_array)
+                .map(|p| p.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            if custom == list.is_empty() {
+                return true;
+            }
+            patterns += list.len();
+            if list
+                .iter()
+                .any(|p| p.len() > 512 || !crate::guardrails::patterns::valid(p))
+            {
+                return true;
+            }
+        }
+        patterns > 50
+    };
+    let platform_rules = |set: &Value| -> Platform {
+        set["rules"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|r| {
+                Some((
+                    r["id"].as_str()?.to_owned(),
+                    (
+                        r.pointer("/input/action")?.as_str()?.to_owned(),
+                        r["on_error"].as_str()?.to_owned(),
+                    ),
+                ))
+            })
+            .collect()
+    };
+    let probe = async |who: &Browser, path: &str, body: Value, platform: &Platform| {
+        let refused = crate::management::openapi_semantic::check_request("PUT", path, &body)
+            .is_ok()
+            && described(&body, platform);
+        let captured = c.raw(who, "PUT", path, Some(body), &[]).await;
+        if refused && matches!(captured.status.as_u16(), 400 | 403) {
+            Probe::decided(captured, true)
+        } else {
+            Probe::from(captured)
+        }
+    };
+    let none = Platform::new();
+    // Seeds walk the optional ids: an id names one of the layer's own rules
+    // (each vector replaces the layer, so a seeded id is a described refusal).
+    let seeded = Uuid::now_v7().to_string();
+    {
+        let mut o = c.observed.lock().await;
+        c.guarded(
+            "PUT /platform/workspace-types/{kind}/guardrails",
+            body_vectors_seeded(&mut o, "PUT", "/api/v1/platform/workspace-types/{kind}/guardrails", json!({"local_only":false,"rules":[secrets("monitor"), custom("PROJECT-[0-9]{4}")]}), &[("/rules/0/id", json!(seeded))], async |body| probe(admin, TEAM_TYPE, body, &none).await),
+        )
+        .await;
+        c.guarded(
+            "PUT /platform/workspaces/{ws}/guardrails",
+            body_vectors_seeded(
+                &mut o,
+                "PUT",
+                "/api/v1/platform/workspaces/{ws}/guardrails",
+                json!({"local_only":true,"rules":[secrets("block"), custom("acme-[a-z]+")]}),
+                &[("/rules/0/id", json!(seeded))],
+                async |body| probe(admin, &platform_project, body, &none).await,
+            ),
+        )
+        .await;
+    }
+    // The Team's platform layer for the local vectors: its type default, whose
+    // first rule is off and fails open, so every action and failure mode a
+    // vector picks tightens it (a loosening is a 403, never an input verdict).
+    let team_type = c
+        .setup(
+            admin,
+            "PUT",
+            TEAM_TYPE,
+            Some(json!({"rules":[{"name":"Secrets","protection":"secrets","detector":{"kind":"pattern","categories":["secret"]},"input":{"action":"off"},"on_error":"fail_open"}, custom("PROJECT-[0-9]{4}")]})),
+        )
+        .await;
+    let rules = platform_rules(&team_type["rule_set"]);
+    let target = team_type["rule_set"]["rules"][0]["id"].clone();
+    let custom_rule = team_type["rule_set"]["rules"][1]["id"].clone();
+    {
+        let mut o = c.observed.lock().await;
+        c.guarded(
+            "PUT /workspaces/{ws}/guardrails",
+            body_vectors_seeded(&mut o, "PUT", "/api/v1/workspaces/{ws}/guardrails", json!({"rules":[{"tightens":target,"input":{"action":"block"},"output":{"mode":"off"},"on_error":"fail_closed","threshold":null}, custom("internal-[0-9]+")]}), &[("/rules/0/id", json!(seeded)), ("/rules/1/id", json!(seeded))], async |body| probe(owner, &local_team, body, &rules).await),
+        )
+        .await;
+    }
+    let keep = |id: &Value, rule: Value| {
+        let mut rule = rule;
+        rule["id"] = id.clone();
+        rule
+    };
+    // Type defaults with custom patterns (the personal one stays unwritten).
+    c.ok(admin, "PUT", TEAM_TYPE, Some(json!({"rules":[keep(&target, secrets("monitor")), keep(&custom_rule, custom("PROJECT-[0-9]{4}"))]}))).await;
+    c.ok(
+        admin,
+        "PUT",
+        PROJECT_TYPE,
+        Some(json!({"rules":[secrets("monitor"), custom("PROJECT-[0-9]{4}")]})),
+    )
+    .await;
+    c.ok(auditor, "GET", TEAM_TYPE, None).await;
+    c.ok(
+        auditor,
+        "GET",
+        "/api/v1/platform/workspace-types/personal/guardrails",
+        None,
+    )
+    .await;
+    // The Team's local layer tightens both type-default rules and adds a pattern.
+    c.ok(owner, "PUT", &local_team, Some(json!({"rules":[{"tightens":target,"input":{"action":"block"}}, {"tightens":custom_rule,"on_error":"fail_closed"}, custom("internal-[0-9]+")]}))).await;
+    c.ok(regular, "GET", &local_team, None).await;
+    // A personal workspace with no rules in any layer.
+    c.ok(owner, "GET", &local_personal, None).await;
+    // The Project's override: its local layer tightens the override's rule,
+    // which a second override write keeps (by its id).
+    let first = c
+        .ok(
+            admin,
+            "PUT",
+            &platform_project,
+            Some(json!({"local_only":false,"rules":[secrets("monitor"), custom("acme-[a-z]+")]})),
+        )
+        .await;
+    let overridden = first["override"]["rules"][0]["id"].clone();
+    c.ok(owner, "PUT", &local_project, Some(json!({"rules":[{"tightens":overridden,"input":{"action":"block"}}, custom("internal-[0-9]+")]}))).await;
+    c.ok(admin, "PUT", &platform_project, Some(json!({"local_only":false,"rules":[keep(&overridden, secrets("monitor")), custom("acme-[a-z]+")]}))).await;
+    c.ok(auditor, "GET", &platform_project, None).await;
+    c.ok(owner, "GET", &local_project, None).await;
+    // An Auditor who administers a Team reads and writes its local layer with
+    // the platform's (type default's) pattern text.
+    let staff = user(pool, "guardrail-staff", "auditor").await;
+    let staffed = workspace(pool, "Guardrail staffed team", "team", f.owner.user_id).await;
+    member(pool, staffed, staff.user_id, "admin").await;
+    let staff = browser(pool, &staff).await;
+    let staffed = format!("/api/v1/workspaces/{staffed}/guardrails");
+    c.ok(&staff, "PUT", &staffed, Some(json!({"rules":[{"tightens":target,"input":{"action":"block"}}, custom("internal-[0-9]+")]}))).await;
+    c.ok(&staff, "GET", &staffed, None).await;
+    // The Team's override leaves both local entries inactive; the type default
+    // then drops its custom rule, so removing the override restores one
+    // tightening and leaves the other inactive.
+    c.ok(
+        admin,
+        "PUT",
+        &platform_team,
+        Some(json!({"local_only":true,"rules":[secrets("block"), custom("acme-[a-z]+")]})),
+    )
+    .await;
+    c.ok(owner, "GET", &local_team, None).await;
+    c.ok(auditor, "GET", &platform_team, None).await;
+    c.ok(
+        admin,
+        "PUT",
+        TEAM_TYPE,
+        Some(json!({"rules":[keep(&target, secrets("monitor")), custom("OTHER-[0-9]{4}")]})),
+    )
+    .await;
+    c.ok(admin, "DELETE", &platform_team, None).await;
+    // A personal workspace: its owner's local layer, which platform staff never
+    // see; its override (platform-managed) and that override's removal.
+    c.ok(
+        owner,
+        "PUT",
+        &local_personal,
+        Some(json!({"rules":[secrets("block")]})),
+    )
+    .await;
+    c.ok(admin, "GET", &platform_personal, None).await;
+    c.ok(
+        admin,
+        "PUT",
+        &platform_personal,
+        Some(json!({"rules":[secrets("block")]})),
+    )
+    .await;
+    c.ok(admin, "DELETE", &platform_personal, None).await;
+    c.ok(
+        auditor,
+        "GET",
+        "/api/v1/platform/guardrails/detectors",
+        None,
+    )
+    .await;
 }
 
 /// #481: access review schedules. Positives cover a schedule that never ran,

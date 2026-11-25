@@ -34,6 +34,7 @@ pub mod email;
 pub mod entropy;
 pub mod filestore;
 pub mod governance;
+pub mod guardrails;
 pub mod healthcheck;
 pub mod history;
 pub mod http;

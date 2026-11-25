@@ -543,7 +543,7 @@ fn quote_cfg_test(attr: &syn::Attribute) -> bool {
 fn error_schema() -> Result<Value> {
     Ok(
         json!({"type":"object","required":["error"],"additionalProperties":false,
-            "description":"Shared management handler envelope, not a universal framework response. code equals the HTTP status string. Selected reasons add period, limit, missing_meters or retry details. Detail keys are closed over the inventoried handler vocabulary (policy period/limit, price missing_meters, access/key-issuance retry details, and a template slot name).",
+            "description":"Shared management handler envelope, not a universal framework response. code equals the HTTP status string. Selected reasons add period, limit, missing_meters, rule or retry details. Detail keys are closed over the inventoried handler vocabulary (policy period/limit, price missing_meters, access/key-issuance retry details, a template slot name, and the platform guardrail rule a workspace may not loosen).",
             "properties":{"error":{"type":"object","required":["code","message"],"additionalProperties":false,
                 "properties":{
                     "code":{"type":"string","pattern":"^[1-5][0-9]{2}$"},
@@ -553,7 +553,8 @@ fn error_schema() -> Result<Value> {
                     "retry_after_seconds":{"type":"integer","minimum":0},
                     "scope":{"type":"string"},"operation":{"type":"string"},
                     "window_seconds":{"type":"integer","minimum":0},
-                    "slot":{"type":"string"}
+                    "slot":{"type":"string"},
+                    "rule":{"type":"string","format":"uuid"}
                 }}}
         }),
     )

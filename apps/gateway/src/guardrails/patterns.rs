@@ -1,0 +1,59 @@
+//! Custom patterns: compiled with fixed limits, at save and again when the
+//! detector loads them, so an administrator's pattern cannot exhaust memory or
+//! time. The `regex` crate matches in time linear in the input (no
+//! backtracking), and these limits bound what a compiled pattern may hold.
+use regex::{Regex, RegexBuilder};
+
+/// The compiled program of one pattern (the crate's default is 10 MiB).
+pub const COMPILED_LIMIT: usize = 1 << 20;
+/// The lazy DFA cache of one pattern (the crate's default is 2 MiB).
+pub const DFA_LIMIT: usize = 1 << 20;
+/// How deeply a pattern may nest (the crate's default is 250).
+pub const NEST_LIMIT: u32 = 64;
+
+/// Compile one custom pattern within the limits.
+pub fn compile(pattern: &str) -> Option<Regex> {
+    if pattern.is_empty() || pattern.len() > super::policy::MAX_PATTERN_BYTES {
+        return None;
+    }
+    RegexBuilder::new(pattern)
+        .size_limit(COMPILED_LIMIT)
+        .dfa_size_limit(DFA_LIMIT)
+        .nest_limit(NEST_LIMIT)
+        .build()
+        .ok()
+}
+
+/// Whether a pattern compiles within the limits (the save-time check).
+pub fn valid(pattern: &str) -> bool {
+    compile(pattern).is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_patterns_compile() {
+        for p in [
+            r"\bPROJECT-[A-Z]{4}-\d{3}\b",
+            r"(?i)internal\.example\.com",
+            "codename (alpha|beta)",
+        ] {
+            assert!(valid(p), "{p}");
+        }
+    }
+
+    #[test]
+    fn invalid_and_oversized_patterns_are_refused() {
+        assert!(!valid(""));
+        assert!(!valid("(unclosed"));
+        assert!(!valid(&"a".repeat(513)));
+        // Small to write, enormous to compile: the size limit refuses it.
+        assert!(!valid(r"\w{1000}\w{1000}"));
+        assert!(
+            !valid(&format!("{}a{}", "(".repeat(70), ")".repeat(70))),
+            "nesting"
+        );
+    }
+}

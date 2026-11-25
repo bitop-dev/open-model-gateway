@@ -51,6 +51,7 @@ pub(crate) const SLICE2_AREAS: &[&str] = &[
     "platform/access-requests",
     "platform/access-review-schedules",
     "platform/access-reviews",
+    "platform/guardrails",
     "platform/oidc",
     "platform/users",
     "platform/workspace-templates",
@@ -59,6 +60,7 @@ pub(crate) const SLICE2_AREAS: &[&str] = &[
     "workspaces/{ws}",
     "workspaces/{ws}/access",
     "workspaces/{ws}/access-requests",
+    "workspaces/{ws}/guardrails",
     "workspaces/{ws}/invitations",
     "workspaces/{ws}/member-candidates",
     "workspaces/{ws}/members",
@@ -1445,7 +1447,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(count, 281);
+        assert_eq!(count, 289);
     }
     #[test]
     fn management_openapi_response_rejects_incomplete_completed_slot() {

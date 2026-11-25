@@ -640,6 +640,54 @@ pub(crate) async fn audit(
             {
                 safe.insert(k.clone(), v.clone());
             }
+            // #840: a guardrail layer change lists each entry's id, the platform
+            // rule a tightening entry names, and its closed action and output
+            // mode codes; never a rule's name or a custom pattern.
+            if action == "guardrail_policy.updated" {
+                let closed = |v: Option<&Value>, allowed: &[&str]| {
+                    v.is_none_or(|v| {
+                        v.is_null() || v.as_str().is_some_and(|s| allowed.contains(&s))
+                    })
+                };
+                let id = |v: Option<&Value>| {
+                    v.and_then(Value::as_str)
+                        .is_some_and(|id| Uuid::parse_str(id).is_ok())
+                };
+                let ok = match k.as_str() {
+                    "layer" => v.as_str().is_some_and(|s| {
+                        matches!(s, "type_default" | "workspace_override" | "workspace_local")
+                    }),
+                    "revision" => v.is_null() || v.is_u64(),
+                    "custom_patterns" => v.is_u64(),
+                    "local_only" | "reset" => v.is_boolean(),
+                    "rules" => v.as_array().is_some_and(|rules| {
+                        rules.len() <= crate::guardrails::policy::MAX_RULES
+                            && rules.iter().all(|r| {
+                                r.as_object().is_some_and(|o| {
+                                    o.keys().all(|k| {
+                                        matches!(
+                                            k.as_str(),
+                                            "id" | "tightens" | "action" | "output_mode"
+                                        )
+                                    }) && id(o.get("id"))
+                                        && (o.get("tightens").is_none() || id(o.get("tightens")))
+                                        && closed(
+                                            o.get("action"),
+                                            &["off", "monitor", "redact", "block"],
+                                        )
+                                        && closed(
+                                            o.get("output_mode"),
+                                            &["off", "monitor", "stop", "block"],
+                                        )
+                                })
+                            })
+                    }),
+                    _ => false,
+                };
+                if ok {
+                    safe.insert(k.clone(), v.clone());
+                }
+            }
             // #88: the bulk outcome event lists each target's id and closed
             // outcome code, nothing else.
             if k == "items"

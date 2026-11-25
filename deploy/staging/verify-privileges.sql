@@ -204,13 +204,13 @@ DO $$ DECLARE r record; t text; BEGIN
   IF has_column_privilege('gateway_runtime','public.batch_route_waits',t,'UPDATE') THEN RAISE EXCEPTION 'mutable batch demand identity: %',t; END IF;
  END LOOP;
  IF has_table_privilege('gateway_runtime','public.batch_route_waits','TRUNCATE') THEN RAISE EXCEPTION 'batch demand truncatable'; END IF;
- IF EXISTS(SELECT FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public' AND has_function_privilege('gateway_runtime',p.oid,'EXECUTE') AND p.proname NOT IN ('lock_installation','workspace_model_allowed','valid_model_protocols','valid_i64_string','valid_cache_pricing','valid_billing_usage','valid_cost_components','components_total','valid_meter_usage','valid_meter_variant','valid_price_lines','valid_max_units','valid_model_protocols_base','valid_cost_components_base','valid_price_lines_base','valid_upstream_job_id','rate_reserved_tokens','rate_contribution','omg_scope_key','omg_type_key','omg_scope_lock_audit_order','omg_lock_scopes','omg_admission_locks','omg_lock_scope_rows','omg_catalog_lock_mode','omg_scope_lock_exclusive','omg_config_bump','omg_lease_acquire','omg_lease_fence','omg_lease_complete','omg_lease_release','omg_ensure_partitions','omg_partition_coverage','omg_partition_bounds','omg_month_start','omg_next_month','omg_usage_aggregate','omg_usage_rows','omg_admin_tokens_revoke_owner','omg_admin_tokens_require_read_committed','omg_admin_tokens_require_owner_lock','valid_admin_token_scopes','valid_admin_token_allowlist','alert_webhook_summary','alert_webhook_payload','omg_report_prune_snapshots','omg_report_set_cursor','alert_delivery_lock_buckets','alert_delivery_recent_count','scrub_access_request_reasons','access_review_item_active','access_review_candidate','access_review_may_decide','omg_access_review_start_scheduled')) THEN RAISE EXCEPTION 'unexpected executable function'; END IF;
+ IF EXISTS(SELECT FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public' AND has_function_privilege('gateway_runtime',p.oid,'EXECUTE') AND p.proname NOT IN ('lock_installation','workspace_model_allowed','valid_model_protocols','valid_i64_string','valid_cache_pricing','valid_billing_usage','valid_cost_components','components_total','valid_meter_usage','valid_meter_variant','valid_price_lines','valid_max_units','valid_model_protocols_base','valid_cost_components_base','valid_price_lines_base','valid_upstream_job_id','rate_reserved_tokens','rate_contribution','omg_scope_key','omg_type_key','omg_scope_lock_audit_order','omg_lock_scopes','omg_admission_locks','omg_lock_scope_rows','omg_catalog_lock_mode','omg_scope_lock_exclusive','omg_config_bump','omg_lease_acquire','omg_lease_fence','omg_lease_complete','omg_lease_release','omg_ensure_partitions','omg_partition_coverage','omg_partition_bounds','omg_month_start','omg_next_month','omg_usage_aggregate','omg_usage_rows','omg_admin_tokens_revoke_owner','omg_admin_tokens_require_read_committed','omg_admin_tokens_require_owner_lock','valid_admin_token_scopes','valid_admin_token_allowlist','alert_webhook_summary','alert_webhook_payload','omg_report_prune_snapshots','omg_report_set_cursor','alert_delivery_lock_buckets','alert_delivery_recent_count','scrub_access_request_reasons','access_review_item_active','access_review_candidate','access_review_may_decide','omg_access_review_start_scheduled','guardrail_patterns_valid')) THEN RAISE EXCEPTION 'unexpected executable function'; END IF;
  -- Change notifications (0028): seeded topics, forward-only versions, triggers present.
  IF has_table_privilege('gateway_runtime','public.config_versions','INSERT,DELETE,TRUNCATE') OR has_column_privilege('gateway_runtime','public.config_versions','topic','UPDATE') THEN RAISE EXCEPTION 'configuration topics mutable'; END IF;
  IF NOT has_table_privilege('gateway_runtime','public.config_versions','SELECT') OR NOT has_column_privilege('gateway_runtime','public.config_versions','version','UPDATE') THEN RAISE EXCEPTION 'configuration versions not maintainable by runtime'; END IF;
- IF (SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'omg\_config\_%' AND tgenabled='O' AND NOT tgisinternal)<>30
+ IF (SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'omg\_config\_%' AND tgenabled='O' AND NOT tgisinternal)<>32
   OR (SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'config\_versions\_%' AND tgenabled='O' AND NOT tgisinternal)<>2 THEN RAISE EXCEPTION 'change notification triggers missing or disabled'; END IF;
- IF (SELECT array_agg(topic ORDER BY topic) FROM config_versions)<>ARRAY['access','catalog','keys','policy','settings'] THEN RAISE EXCEPTION 'configuration topics changed'; END IF;
+ IF (SELECT array_agg(topic ORDER BY topic) FROM config_versions)<>ARRAY['access','catalog','guardrails','keys','policy','settings'] THEN RAISE EXCEPTION 'configuration topics changed'; END IF;
  -- Work leases (0029): seeded names, forward-only epochs, guards present.
  IF has_table_privilege('gateway_runtime','public.work_leases','INSERT,DELETE,TRUNCATE') OR has_column_privilege('gateway_runtime','public.work_leases','name','UPDATE') THEN RAISE EXCEPTION 'work leases creatable, removable or re-keyable'; END IF;
  IF NOT has_table_privilege('gateway_runtime','public.work_leases','SELECT') OR NOT has_column_privilege('gateway_runtime','public.work_leases','epoch','UPDATE') THEN RAISE EXCEPTION 'work leases not usable by runtime'; END IF;
@@ -1473,6 +1473,35 @@ BEGIN
    UPDATE access_review_schedules SET deleted_at=now(),deleted_by=t_reviewer WHERE id=sch;
    BEGIN UPDATE access_review_schedules SET name='revived' WHERE id=sch; RAISE EXCEPTION 'deleted schedule changed'; EXCEPTION WHEN check_violation THEN NULL; END;
    IF NOT EXISTS (SELECT FROM access_review_campaigns WHERE id=sc AND schedule_id=sch AND closed_at IS NULL) THEN RAISE EXCEPTION 'deleting a schedule touched its campaign'; END IF;
+  END;
+  -- Guardrail policies (0092): platform layers written by a Platform Admin and
+  -- a local layer by an owner or admin of its workspace; each set keeps its
+  -- scope and moves forward one revision; rules are replaced, never edited; a
+  -- tightening entry names a rule of its workspace's platform layer; only an
+  -- override is removed; nothing is truncated.
+  DECLARE gws uuid:=gen_random_uuid(); gother uuid:=gen_random_uuid(); go uuid:=gen_random_uuid(); gl uuid:=gen_random_uuid(); gr uuid:=gen_random_uuid(); gor uuid:=gen_random_uuid(); BEGIN
+   INSERT INTO workspaces(id,name,kind) VALUES(gws,'Guardrail probe '||gws,'team'),(gother,'Guardrail other '||gother,'team');
+   INSERT INTO workspace_membership_grants(workspace_id,user_id,role,source) VALUES(gws,t_author,'owner','manual');
+   BEGIN INSERT INTO guardrail_rule_sets(id,layer,kind,local_only,updated_by) VALUES(gen_random_uuid(),'type_default','team',false,t_author); RAISE EXCEPTION 'platform guardrail layer written by a non-admin'; EXCEPTION WHEN check_violation THEN NULL; END;
+   BEGIN INSERT INTO guardrail_rule_sets(id,layer,workspace_id,updated_by) VALUES(gen_random_uuid(),'workspace_local',gws,t_reviewer); RAISE EXCEPTION 'local guardrail layer written by a non-member'; EXCEPTION WHEN check_violation THEN NULL; END;
+   INSERT INTO guardrail_rule_sets(id,layer,workspace_id,local_only,updated_by) VALUES(go,'workspace_override',gws,false,t_reviewer),(gen_random_uuid(),'workspace_override',gother,false,t_reviewer);
+   INSERT INTO guardrail_rule_sets(id,layer,workspace_id,updated_by) VALUES(gl,'workspace_local',gws,t_author);
+   INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable) VALUES(gr,go,0,'Secrets','secrets','pattern','{secret}','monitor','user_text','off','fail_open','{generation}','deny');
+   INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable)
+    SELECT gor,id,0,'Secrets','secrets','pattern','{secret}','monitor','user_text','off','fail_open','{generation}','deny' FROM guardrail_rule_sets WHERE workspace_id=gother;
+   INSERT INTO guardrail_rules(id,rule_set_id,position,tightens_rule_id,input_action) VALUES(gen_random_uuid(),gl,0,gr,'block');
+   BEGIN INSERT INTO guardrail_rules(id,rule_set_id,position,tightens_rule_id,input_action) VALUES(gen_random_uuid(),gl,1,gor,'block'); RAISE EXCEPTION 'tightening entry named another workspace''s rule'; EXCEPTION WHEN check_violation THEN NULL; END;
+   BEGIN INSERT INTO guardrail_rules(id,rule_set_id,position,tightens_rule_id,input_action) VALUES(gen_random_uuid(),go,1,gr,'block'); RAISE EXCEPTION 'tightening entry in a platform layer'; EXCEPTION WHEN check_violation THEN NULL; END;
+   BEGIN INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable,patterns) VALUES(gen_random_uuid(),gl,2,'Custom','custom','pattern','{custom}','block','user_text','off','fail_closed','{generation}','deny',ARRAY[repeat('a',513)]); RAISE EXCEPTION 'oversized custom pattern stored'; EXCEPTION WHEN check_violation THEN NULL; END;
+   BEGIN UPDATE guardrail_rules SET input_action='off' WHERE id=gr; RAISE EXCEPTION 'guardrail rule edited in place'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+   BEGIN UPDATE guardrail_rule_sets SET workspace_id=gother WHERE id=gl; RAISE EXCEPTION 'guardrail layer moved'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+   BEGIN UPDATE guardrail_rule_sets SET revision=revision+2,updated_by=t_author WHERE id=gl; RAISE EXCEPTION 'guardrail revision skipped'; EXCEPTION WHEN check_violation THEN NULL; END;
+   UPDATE guardrail_rule_sets SET revision=revision+1,updated_by=t_author WHERE id=gl;
+   BEGIN UPDATE guardrail_rule_sets SET revision=revision+1,local_only=true,updated_by=t_author WHERE id=go; RAISE EXCEPTION 'override changed by a non-admin'; EXCEPTION WHEN check_violation THEN NULL; END;
+   BEGIN DELETE FROM guardrail_rule_sets WHERE id=gl; RAISE EXCEPTION 'local guardrail layer removed'; EXCEPTION WHEN check_violation THEN NULL; END;
+   BEGIN TRUNCATE guardrail_rules; RAISE EXCEPTION 'guardrail rules truncatable'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+   DELETE FROM guardrail_rules WHERE rule_set_id=go;
+   DELETE FROM guardrail_rule_sets WHERE id=go;
   END;
  END;
  -- Work leases (0029): election, renewal, fencing, release and takeover as runtime.
