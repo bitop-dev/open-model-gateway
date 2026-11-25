@@ -30,8 +30,22 @@ async fn batch(pool: PgPool, lines: &[(&str, &str)]) -> (World, JobRow) {
 
 /// Run the next claimable batch on a new runner (a process of its own).
 pub(super) fn start(w: &World) -> tokio::task::JoinHandle<JobResult<bool>> {
-    let runner = Runner::new(w.jobs.clone());
+    start_with(w.jobs.clone())
+}
+
+/// [`start`] with `jobs`, for a test that changes its settings.
+fn start_with(jobs: Jobs) -> tokio::task::JoinHandle<JobResult<bool>> {
+    let runner = Runner::new(jobs);
     tokio::spawn(async move { runner.run_next().await })
+}
+
+/// `w.jobs` flushing result segments only after `age`: a test asserting that
+/// a finished line is still unflushed while a later line is planned sets an
+/// age that the plan's own wait (up to [`REACH`]) cannot reach.
+fn flushing_after(w: &World, age: Duration) -> Jobs {
+    let mut jobs = w.jobs.clone();
+    jobs.segment_age = Some(age);
+    jobs
 }
 
 /// A replacement runner taking `job` over, as the runner's loop runs it. The
@@ -1297,8 +1311,11 @@ async fn a_committed_result_survives_takeover_with_another_line_in_flight(pool: 
     sqlx::query("INSERT INTO deployment_batch_scheduling(deployment_id,max_concurrency,updated_by) VALUES($1,1,$2)")
         .bind(w.f.deployment).bind(w.f.owner).execute(&w.f.store.pool).await.unwrap();
     let held = w.openai.gate("hold-b");
-    let old = start(&w);
-    tokio::time::timeout(Duration::from_secs(5), held.entered.notified())
+    // Line `a`'s segment stays open while `b` is planned (at most `REACH`) and
+    // the state below is read, then flushes on its age.
+    let age = REACH + Duration::from_secs(5);
+    let old = start_with(flushing_after(&w, age));
+    tokio::time::timeout(REACH, held.entered.notified())
         .await
         .expect("the second provider call needs no segment flush to start");
     let line = || {
@@ -1317,7 +1334,7 @@ async fn a_committed_result_survives_takeover_with_another_line_in_flight(pool: 
             .unwrap(),
         1
     );
-    tokio::time::timeout(Duration::from_secs(13), async {
+    tokio::time::timeout(age + Duration::from_secs(3), async {
         loop {
             if line().await.unwrap() == ("succeeded".into(), Some(0), false) {
                 break;
@@ -1692,8 +1709,13 @@ async fn unacknowledged_finish_leaves_actual_results_for_sweep(pool: PgPool) {
 async fn cancelling_flushes_queued_and_in_flight_answers_without_running_the_tail(pool: PgPool) {
     let (w, job) = batch(pool, &[("a", "plain"), ("b", "hold-b"), ("c", "never")]).await;
     let held = w.openai.gate("hold-b");
-    let running = start(&w);
-    tokio::time::timeout(Duration::from_secs(5), held.entered.notified())
+    // The answers reach the result only through the cancel: no segment
+    // flushes on its age while `b` is planned (at most `REACH`), the runner
+    // observes the cancel and the run finishes.
+    let (observe, finish) = (Duration::from_secs(20), Duration::from_secs(5));
+    let age = REACH + observe + finish + Duration::from_secs(5);
+    let running = start_with(flushing_after(&w, age));
+    tokio::time::timeout(REACH, held.entered.notified())
         .await
         .unwrap();
     assert_eq!(w.reload(&job).await.request_completed, Some(0));
@@ -1710,7 +1732,7 @@ async fn cancelling_flushes_queued_and_in_flight_answers_without_running_the_tai
         .await
         .unwrap();
     // Let the active runner observe cancel before its current provider call returns.
-    tokio::time::timeout(Duration::from_secs(20), async {
+    tokio::time::timeout(observe, async {
         while lease().await.unwrap() == initial {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -1719,7 +1741,7 @@ async fn cancelling_flushes_queued_and_in_flight_answers_without_running_the_tai
     .unwrap();
     held.release.notify_one();
     assert!(
-        tokio::time::timeout(Duration::from_secs(5), running)
+        tokio::time::timeout(finish, running)
             .await
             .unwrap()
             .unwrap()

@@ -164,10 +164,20 @@ struct Segment {
     deadline: Option<Instant>,
 }
 
+/// How long a run buffers results before flushing them as a segment.
+#[cfg(not(test))]
+fn segment_age(_: &RunState) -> Duration {
+    SEGMENT_AGE
+}
+/// [`SEGMENT_AGE`], or the run's test-only age (`Jobs::segment_age`).
+#[cfg(test)]
+fn segment_age(state: &RunState) -> Duration {
+    state.segment_age.unwrap_or(SEGMENT_AGE)
+}
+
 impl Segment {
-    fn push(&mut self, record: Record) -> bool {
-        self.deadline
-            .get_or_insert_with(|| Instant::now() + SEGMENT_AGE);
+    fn push(&mut self, record: Record, age: Duration) -> bool {
+        self.deadline.get_or_insert_with(|| Instant::now() + age);
         if self.body.is_empty() {
             self.body = record.encoded;
         } else {
@@ -333,7 +343,9 @@ pub(super) async fn write_segments(
                 {
                     break;
                 }
-                if segment.push(record) && !writer.flush(&mut segment).await {
+                if segment.push(record, segment_age(&writer.state))
+                    && !writer.flush(&mut segment).await
+                {
                     break;
                 }
             }
@@ -463,7 +475,7 @@ mod tests {
         assert!(record.encoded.len() > SEGMENT_BYTES);
         assert!(record.encoded.len() <= RESULT_LINE_BYTES);
         let mut segment = Segment::default();
-        assert!(segment.push(record));
+        assert!(segment.push(record, SEGMENT_AGE));
         assert_eq!(segment.succeeded.len(), 1);
         assert_eq!(segment.body.iter().filter(|&&b| b == b'\n').count(), 1);
     }
@@ -477,10 +489,10 @@ mod tests {
         });
         let record = |line| Record::encode(line, Uuid::nil(), true, &Value::Null).unwrap();
         let mut segment = Segment::default();
-        assert!(!segment.push(record(0)));
+        assert!(!segment.push(record(0), SEGMENT_AGE));
         let (tx, mut rx) = mpsc::channel(1);
         tokio::time::advance(SEGMENT_AGE - Duration::from_millis(1)).await;
-        assert!(!segment.push(record(1)));
+        assert!(!segment.push(record(1), SEGMENT_AGE));
         tx.try_send(record(2)).unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(matches!(
