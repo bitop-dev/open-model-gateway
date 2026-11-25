@@ -409,7 +409,9 @@ async fn concurrent_admissions_lock_no_parent_rows(pool: PgPool) {
         .connect_with((*pool.connect_options()).clone())
         .await
         .unwrap();
-    let store = Store::new(wide);
+    // 64 admissions at once on one scope test parent locking, not the
+    // admission wait bound.
+    let store = Store::new(wide).with_admission_lock_wait(std::time::Duration::from_secs(120));
     let mut tasks = Vec::new();
     for i in 0..64 {
         let principal = if i % 2 == 0 { f.principal } else { f.team };

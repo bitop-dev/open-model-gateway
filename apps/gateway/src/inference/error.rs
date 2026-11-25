@@ -46,6 +46,10 @@ impl FieldName {
     }
 }
 
+/// `Retry-After` of [`InferenceError::ScopeBusy`]: about the time a scope's
+/// queue behind a short stall takes to drain once it ends.
+pub const SCOPE_BUSY_RETRY_SECONDS: u32 = 2;
+
 /// Safe errors only. Never embed upstream bodies, URLs, credentials or prompts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InferenceError {
@@ -66,6 +70,14 @@ pub enum InferenceError {
     Unsupported,
     Configuration,
     Busy,
+    /// Admission waited longer than its bound (`governance::ADMISSION_LOCK_WAIT`)
+    /// for the scope rows (or, in the global mode, the installation row) it
+    /// must lock, so it ended before anything existed: no reservation, no
+    /// counter or hold, no upstream call. Transient: an HTTP 503 with
+    /// `Retry-After` ([`SCOPE_BUSY_RETRY_SECONDS`]); gateway-run batch lines
+    /// retry it with their backoff. Never failed over: every route of the
+    /// scope locks the same rows.
+    ScopeBusy,
     /// Admission would exceed a budget (in its current day/week/month window) at this scope.
     BudgetExceeded(LimitScope),
     /// Unresolved unbounded-cost usage blocks budgeted admission at this scope.
@@ -108,6 +120,7 @@ impl InferenceError {
             Self::Configuration => "provider_configuration_error",
             Self::PriceUnbounded => "price_unbounded",
             Self::Busy => "rate_limit_error",
+            Self::ScopeBusy => "scope_busy",
             Self::BudgetExceeded(_) => "budget_exceeded",
             Self::UnresolvedUsage(_) => "unresolved_usage",
             Self::TokenReservationExceedsLimit(_) => "token_reservation_exceeds_limit",
@@ -141,6 +154,7 @@ impl InferenceError {
     pub fn retry_after_seconds(self) -> Option<u32> {
         match self {
             Self::RouteCoolingDown(seconds) => Some(seconds.max(1)),
+            Self::ScopeBusy => Some(SCOPE_BUSY_RETRY_SECONDS),
             _ => None,
         }
     }
@@ -160,6 +174,9 @@ impl InferenceError {
                 "The model's price cannot bound this request's cost (a meter it may use is unknown or has no per-request maximum), so budgeted keys cannot use it until a Platform Admin publishes a complete price"
             }
             Self::Busy => "Gateway or provider concurrency/rate limit reached",
+            Self::ScopeBusy => {
+                "This workspace's or API key's accounting is busy; nothing was admitted or sent. Retry after the indicated delay"
+            }
             Self::BudgetExceeded(LimitScope::ApiKey) => {
                 "Budget for this API key would be exceeded in its current period"
             }

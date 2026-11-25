@@ -40,6 +40,9 @@ pub(super) struct RunState {
     /// Test-only: turns the next finished line into a soft loss.
     #[cfg(test)]
     pub(super) soft_loss: Arc<AtomicBool>,
+    /// Test-only flush age of the run's result segments (`Jobs::segment_age`).
+    #[cfg(test)]
+    pub(super) segment_age: Option<std::time::Duration>,
 }
 impl RunState {
     pub(super) fn new(fence: BatchFence) -> Self {
@@ -57,6 +60,8 @@ impl RunState {
             pauses: Arc::default(),
             #[cfg(test)]
             soft_loss: Arc::default(),
+            #[cfg(test)]
+            segment_age: None,
         }
     }
     /// The batch belongs to another claim: the run writes nothing more to it.
@@ -246,6 +251,7 @@ impl LineRun {
                     let retryable = matches!(
                         e,
                         InferenceError::Busy
+                            | InferenceError::ScopeBusy
                             | InferenceError::UpstreamUnavailable
                             | InferenceError::Timeout
                     );
