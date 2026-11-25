@@ -19,8 +19,17 @@ use catalogs::{Membership, replace_membership};
 use governance::prices::{Price, insert_price, validate_price};
 use resources::{
     DeploymentInput, ENABLED_ROUTE, ModelInput, PRICED_ROUTE, insert_deployment, insert_model,
-    ready_model,
 };
+
+/// Server-side mirror of the documented UI readiness derivation, used only for aggregate counts.
+/// Video models are never ready: OpenAI shut down its Videos API on 2026-09-24 and no adapter offers video.
+fn ready_model() -> String {
+    let serving = &*resources::SERVING_ROUTE;
+    format!(
+        "(m.enabled AND NOT ('videos'=ANY(m.supported_protocols)) AND EXISTS(SELECT 1 FROM deployments d WHERE d.model_id=m.id AND {serving}) AND (EXISTS(SELECT 1 FROM catalog_models cm WHERE cm.model_id=m.id) OR {}>0))",
+        resources::DIRECT_WORKSPACES
+    )
+}
 
 pub(super) fn routes() -> Router<Store> {
     Router::new()

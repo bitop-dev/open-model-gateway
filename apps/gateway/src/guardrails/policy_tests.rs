@@ -1,5 +1,6 @@
 //! Write validation and tighten-only composition of guardrail layers.
 use super::*;
+use serde_json::{Value, json};
 
 fn compile(p: &str) -> bool {
     crate::guardrails::patterns::valid(p)

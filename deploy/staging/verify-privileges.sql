@@ -1173,6 +1173,37 @@ BEGIN
   INSERT INTO monetary_ledger(id,execution_id,admitted_at,kind,amount_microusd,input_tokens,output_tokens,billing_usage,cost_components,meter_usage,output_image_variant,provider_cost_microusd,evidence) SELECT gen_random_uuid(),execution_id,admitted_at,'reconciliation',0,input_tokens,output_tokens,billing_usage,cost_components,meter_usage,output_image_variant,provider_cost_microusd,'batch-lines=0;rollback probe' FROM governance_reservations WHERE execution_id=envelope;
   INSERT INTO audit_events(id,workspace_id,actor_user_id,action,resource_type,resource_id,metadata) VALUES(gen_random_uuid(),ws,u,'usage.batch_envelope_resolved','workspace',ws,'{"reason":"rollback probe","resolved_count":"1","envelope_held_microusd":"100","line_settled_microusd":"0","line_held_microusd":"0","line_pending_count":"0","line_unknown_count":"0","line_unbounded_count":"0"}');
  END;
+ -- Guardrail policies (0092): platform layers written by a Platform Admin and
+ -- a local layer by an owner or admin of its workspace; each set keeps its
+ -- scope and moves forward one revision; rules are replaced, never edited; a
+ -- tightening entry names a rule of its workspace's platform layer; only an
+ -- override is removed; nothing is truncated.
+ DECLARE t_author uuid:=gen_random_uuid(); t_reviewer uuid:=gen_random_uuid(); gws uuid:=gen_random_uuid(); gother uuid:=gen_random_uuid(); go uuid:=gen_random_uuid(); gl uuid:=gen_random_uuid(); gr uuid:=gen_random_uuid(); gor uuid:=gen_random_uuid(); BEGIN
+  INSERT INTO users(id,email) VALUES(t_author,'guardrail-owner-'||t_author||'@example.invalid'),(t_reviewer,'guardrail-admin-'||t_reviewer||'@example.invalid');
+  INSERT INTO platform_role_grants(user_id,role,source) VALUES(t_author,'user','manual'),(t_reviewer,'admin','manual');
+  INSERT INTO workspaces(id,name,kind) VALUES(gws,'Guardrail probe '||gws,'team'),(gother,'Guardrail other '||gother,'team');
+  INSERT INTO workspace_membership_grants(workspace_id,user_id,role,source) VALUES(gws,t_author,'owner','manual');
+  BEGIN INSERT INTO guardrail_rule_sets(id,layer,kind,local_only,updated_by) VALUES(gen_random_uuid(),'type_default','team',false,t_author); RAISE EXCEPTION 'platform guardrail layer written by a non-admin'; EXCEPTION WHEN check_violation THEN NULL; END;
+  BEGIN INSERT INTO guardrail_rule_sets(id,layer,workspace_id,updated_by) VALUES(gen_random_uuid(),'workspace_local',gws,t_reviewer); RAISE EXCEPTION 'local guardrail layer written by a non-member'; EXCEPTION WHEN check_violation THEN NULL; END;
+  INSERT INTO guardrail_rule_sets(id,layer,workspace_id,local_only,updated_by) VALUES(go,'workspace_override',gws,false,t_reviewer),(gen_random_uuid(),'workspace_override',gother,false,t_reviewer);
+  INSERT INTO guardrail_rule_sets(id,layer,workspace_id,updated_by) VALUES(gl,'workspace_local',gws,t_author);
+  INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable) VALUES(gr,go,0,'Secrets','secrets','pattern','{secret}','monitor','user_text','off','fail_open','{generation}','deny');
+  INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable)
+   SELECT gor,id,0,'Secrets','secrets','pattern','{secret}','monitor','user_text','off','fail_open','{generation}','deny' FROM guardrail_rule_sets WHERE workspace_id=gother;
+  INSERT INTO guardrail_rules(id,rule_set_id,position,tightens_rule_id,input_action) VALUES(gen_random_uuid(),gl,0,gr,'block');
+  BEGIN INSERT INTO guardrail_rules(id,rule_set_id,position,tightens_rule_id,input_action) VALUES(gen_random_uuid(),gl,1,gor,'block'); RAISE EXCEPTION 'tightening entry named another workspace''s rule'; EXCEPTION WHEN check_violation THEN NULL; END;
+  BEGIN INSERT INTO guardrail_rules(id,rule_set_id,position,tightens_rule_id,input_action) VALUES(gen_random_uuid(),go,1,gr,'block'); RAISE EXCEPTION 'tightening entry in a platform layer'; EXCEPTION WHEN check_violation THEN NULL; END;
+  BEGIN INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable,patterns) VALUES(gen_random_uuid(),gl,2,'Custom','custom','pattern','{custom}','block','user_text','off','fail_closed','{generation}','deny',ARRAY[repeat('a',513)]); RAISE EXCEPTION 'oversized custom pattern stored'; EXCEPTION WHEN check_violation THEN NULL; END;
+  BEGIN UPDATE guardrail_rules SET input_action='off' WHERE id=gr; RAISE EXCEPTION 'guardrail rule edited in place'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+  BEGIN UPDATE guardrail_rule_sets SET workspace_id=gother WHERE id=gl; RAISE EXCEPTION 'guardrail layer moved'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+  BEGIN UPDATE guardrail_rule_sets SET revision=revision+2,updated_by=t_author WHERE id=gl; RAISE EXCEPTION 'guardrail revision skipped'; EXCEPTION WHEN check_violation THEN NULL; END;
+  UPDATE guardrail_rule_sets SET revision=revision+1,updated_by=t_author WHERE id=gl;
+  BEGIN UPDATE guardrail_rule_sets SET revision=revision+1,local_only=true,updated_by=t_author WHERE id=go; RAISE EXCEPTION 'override changed by a non-admin'; EXCEPTION WHEN check_violation THEN NULL; END;
+  BEGIN DELETE FROM guardrail_rule_sets WHERE id=gl; RAISE EXCEPTION 'local guardrail layer removed'; EXCEPTION WHEN check_violation THEN NULL; END;
+  BEGIN TRUNCATE guardrail_rules; RAISE EXCEPTION 'guardrail rules truncatable'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+  DELETE FROM guardrail_rules WHERE rule_set_id=go;
+  DELETE FROM guardrail_rule_sets WHERE id=go;
+ END;
  SET CONSTRAINTS ALL IMMEDIATE;
  IF (SELECT bool_or((versions_before->>topic)::bigint+1<>version) FROM config_versions) THEN RAISE EXCEPTION 'configuration versions not bumped once per transaction'; END IF;
  BEGIN UPDATE config_versions SET version=0 WHERE topic='keys'; RAISE EXCEPTION 'configuration version rollback allowed'; EXCEPTION WHEN check_violation THEN NULL; END;
@@ -1473,35 +1504,6 @@ BEGIN
    UPDATE access_review_schedules SET deleted_at=now(),deleted_by=t_reviewer WHERE id=sch;
    BEGIN UPDATE access_review_schedules SET name='revived' WHERE id=sch; RAISE EXCEPTION 'deleted schedule changed'; EXCEPTION WHEN check_violation THEN NULL; END;
    IF NOT EXISTS (SELECT FROM access_review_campaigns WHERE id=sc AND schedule_id=sch AND closed_at IS NULL) THEN RAISE EXCEPTION 'deleting a schedule touched its campaign'; END IF;
-  END;
-  -- Guardrail policies (0092): platform layers written by a Platform Admin and
-  -- a local layer by an owner or admin of its workspace; each set keeps its
-  -- scope and moves forward one revision; rules are replaced, never edited; a
-  -- tightening entry names a rule of its workspace's platform layer; only an
-  -- override is removed; nothing is truncated.
-  DECLARE gws uuid:=gen_random_uuid(); gother uuid:=gen_random_uuid(); go uuid:=gen_random_uuid(); gl uuid:=gen_random_uuid(); gr uuid:=gen_random_uuid(); gor uuid:=gen_random_uuid(); BEGIN
-   INSERT INTO workspaces(id,name,kind) VALUES(gws,'Guardrail probe '||gws,'team'),(gother,'Guardrail other '||gother,'team');
-   INSERT INTO workspace_membership_grants(workspace_id,user_id,role,source) VALUES(gws,t_author,'owner','manual');
-   BEGIN INSERT INTO guardrail_rule_sets(id,layer,kind,local_only,updated_by) VALUES(gen_random_uuid(),'type_default','team',false,t_author); RAISE EXCEPTION 'platform guardrail layer written by a non-admin'; EXCEPTION WHEN check_violation THEN NULL; END;
-   BEGIN INSERT INTO guardrail_rule_sets(id,layer,workspace_id,updated_by) VALUES(gen_random_uuid(),'workspace_local',gws,t_reviewer); RAISE EXCEPTION 'local guardrail layer written by a non-member'; EXCEPTION WHEN check_violation THEN NULL; END;
-   INSERT INTO guardrail_rule_sets(id,layer,workspace_id,local_only,updated_by) VALUES(go,'workspace_override',gws,false,t_reviewer),(gen_random_uuid(),'workspace_override',gother,false,t_reviewer);
-   INSERT INTO guardrail_rule_sets(id,layer,workspace_id,updated_by) VALUES(gl,'workspace_local',gws,t_author);
-   INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable) VALUES(gr,go,0,'Secrets','secrets','pattern','{secret}','monitor','user_text','off','fail_open','{generation}','deny');
-   INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable)
-    SELECT gor,id,0,'Secrets','secrets','pattern','{secret}','monitor','user_text','off','fail_open','{generation}','deny' FROM guardrail_rule_sets WHERE workspace_id=gother;
-   INSERT INTO guardrail_rules(id,rule_set_id,position,tightens_rule_id,input_action) VALUES(gen_random_uuid(),gl,0,gr,'block');
-   BEGIN INSERT INTO guardrail_rules(id,rule_set_id,position,tightens_rule_id,input_action) VALUES(gen_random_uuid(),gl,1,gor,'block'); RAISE EXCEPTION 'tightening entry named another workspace''s rule'; EXCEPTION WHEN check_violation THEN NULL; END;
-   BEGIN INSERT INTO guardrail_rules(id,rule_set_id,position,tightens_rule_id,input_action) VALUES(gen_random_uuid(),go,1,gr,'block'); RAISE EXCEPTION 'tightening entry in a platform layer'; EXCEPTION WHEN check_violation THEN NULL; END;
-   BEGIN INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable,patterns) VALUES(gen_random_uuid(),gl,2,'Custom','custom','pattern','{custom}','block','user_text','off','fail_closed','{generation}','deny',ARRAY[repeat('a',513)]); RAISE EXCEPTION 'oversized custom pattern stored'; EXCEPTION WHEN check_violation THEN NULL; END;
-   BEGIN UPDATE guardrail_rules SET input_action='off' WHERE id=gr; RAISE EXCEPTION 'guardrail rule edited in place'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
-   BEGIN UPDATE guardrail_rule_sets SET workspace_id=gother WHERE id=gl; RAISE EXCEPTION 'guardrail layer moved'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
-   BEGIN UPDATE guardrail_rule_sets SET revision=revision+2,updated_by=t_author WHERE id=gl; RAISE EXCEPTION 'guardrail revision skipped'; EXCEPTION WHEN check_violation THEN NULL; END;
-   UPDATE guardrail_rule_sets SET revision=revision+1,updated_by=t_author WHERE id=gl;
-   BEGIN UPDATE guardrail_rule_sets SET revision=revision+1,local_only=true,updated_by=t_author WHERE id=go; RAISE EXCEPTION 'override changed by a non-admin'; EXCEPTION WHEN check_violation THEN NULL; END;
-   BEGIN DELETE FROM guardrail_rule_sets WHERE id=gl; RAISE EXCEPTION 'local guardrail layer removed'; EXCEPTION WHEN check_violation THEN NULL; END;
-   BEGIN TRUNCATE guardrail_rules; RAISE EXCEPTION 'guardrail rules truncatable'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
-   DELETE FROM guardrail_rules WHERE rule_set_id=go;
-   DELETE FROM guardrail_rule_sets WHERE id=go;
   END;
  END;
  -- Work leases (0029): election, renewal, fencing, release and takeover as runtime.

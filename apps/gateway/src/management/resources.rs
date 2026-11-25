@@ -640,54 +640,6 @@ pub(crate) async fn audit(
             {
                 safe.insert(k.clone(), v.clone());
             }
-            // #840: a guardrail layer change lists each entry's id, the platform
-            // rule a tightening entry names, and its closed action and output
-            // mode codes; never a rule's name or a custom pattern.
-            if action == "guardrail_policy.updated" {
-                let closed = |v: Option<&Value>, allowed: &[&str]| {
-                    v.is_none_or(|v| {
-                        v.is_null() || v.as_str().is_some_and(|s| allowed.contains(&s))
-                    })
-                };
-                let id = |v: Option<&Value>| {
-                    v.and_then(Value::as_str)
-                        .is_some_and(|id| Uuid::parse_str(id).is_ok())
-                };
-                let ok = match k.as_str() {
-                    "layer" => v.as_str().is_some_and(|s| {
-                        matches!(s, "type_default" | "workspace_override" | "workspace_local")
-                    }),
-                    "revision" => v.is_null() || v.is_u64(),
-                    "custom_patterns" => v.is_u64(),
-                    "local_only" | "reset" => v.is_boolean(),
-                    "rules" => v.as_array().is_some_and(|rules| {
-                        rules.len() <= crate::guardrails::policy::MAX_RULES
-                            && rules.iter().all(|r| {
-                                r.as_object().is_some_and(|o| {
-                                    o.keys().all(|k| {
-                                        matches!(
-                                            k.as_str(),
-                                            "id" | "tightens" | "action" | "output_mode"
-                                        )
-                                    }) && id(o.get("id"))
-                                        && (o.get("tightens").is_none() || id(o.get("tightens")))
-                                        && closed(
-                                            o.get("action"),
-                                            &["off", "monitor", "redact", "block"],
-                                        )
-                                        && closed(
-                                            o.get("output_mode"),
-                                            &["off", "monitor", "stop", "block"],
-                                        )
-                                })
-                            })
-                    }),
-                    _ => false,
-                };
-                if ok {
-                    safe.insert(k.clone(), v.clone());
-                }
-            }
             // #88: the bulk outcome event lists each target's id and closed
             // outcome code, nothing else.
             if k == "items"
@@ -740,6 +692,7 @@ pub(crate) async fn audit(
                 || v.as_str().is_some_and(|s| {
                     s.len() <= 32 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
                 }))
+                || super::guardrails::audit_field(action, k, v)
             {
                 safe.insert(k.clone(), v.clone());
             }
@@ -895,14 +848,6 @@ pub(super) const PRICED_ROUTE: &str =
     "EXISTS(SELECT 1 FROM deployment_prices dp WHERE dp.deployment_id=d.id)";
 /// Active workspaces holding an independent direct assignment for model `m`.
 pub(super) const DIRECT_WORKSPACES: &str = "(SELECT count(*) FROM workspace_model_grants g JOIN workspaces w ON w.id=g.workspace_id WHERE g.model_id=m.id AND g.source='direct' AND w.disabled_at IS NULL)";
-/// Server-side mirror of the documented UI readiness derivation, used only for aggregate counts.
-/// Video models are never ready: OpenAI shut down its Videos API on 2026-09-24 and no adapter offers video.
-pub(super) fn ready_model() -> String {
-    let serving = &*SERVING_ROUTE;
-    format!(
-        "(m.enabled AND NOT ('videos'=ANY(m.supported_protocols)) AND EXISTS(SELECT 1 FROM deployments d WHERE d.model_id=m.id AND {serving}) AND (EXISTS(SELECT 1 FROM catalog_models cm WHERE cm.model_id=m.id) OR {DIRECT_WORKSPACES}>0))"
-    )
-}
 /// Configuration check (best effort): the smallest tokens-per-minute limit
 /// among the workspace-type defaults that offer
 /// model `m` through their default catalogs (every type when none does).
