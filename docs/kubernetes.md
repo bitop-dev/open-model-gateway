@@ -458,6 +458,9 @@ failed in 28 checks.
   Deployment does not count terminating pods against the surge,
   [Updating a Deployment](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#updating-a-deployment)) and the other sessions ([connection sizing](postgresql-ha.md#connection-sizing)). A pod that cannot
   open its pool fails startup naming that setting and the rollout stops with the old pods serving.
+  On a direct connection, a new pod's first burst on a busy workspace is slower, and part of it
+  can be shed ([operations](operations.md#bursts-shed-with-scope_busy)); behind the Pooler with
+  its server connections warm it was not seen (a new or restarted Pooler is not warm).
 - `cnpg.pooler.instances` and `cnpg.pooler.parameters.default_pool_size` size the PgBouncer tier;
   size `max_client_conn` for `(replicaCount + 1) × GATEWAY_DATABASE_MAX_CONNECTIONS` plus headroom
   ([connection sizing](postgresql-ha.md#connection-sizing)).

@@ -230,11 +230,12 @@ async fn serve_opens_every_connection_of_its_pool_before_listening(pool: PgPool)
 /// Refused at login, a connection never enters the pool, so nothing else
 /// opens one: every connection that reaches the pooler is one it refused or
 /// one the pool keeps, `connections + refused` in all (a fresh pool per
-/// attempt would open the kept ones again). Refused at its first query, the
-/// connection was in the pool, and sqlx also replaces it in the background
-/// (the pool's minimum is its maximum) while the next attempt may open one:
-/// then every refused connection is replaced, at least once, and the pool
-/// still ends whole.
+/// attempt would open the kept ones again), which is what shows the open
+/// keeps the connections that answered. Refused at its first query, the
+/// connection was in the pool, and sqlx also opens a replacement for it in
+/// the background (the pool's minimum is its maximum), as the next attempt
+/// may: how many are opened then depends on timing, so the count is a lower
+/// bound (each refused connection was replaced) and the pool ends whole.
 async fn waited_out_until_whole(pool: &PgPool, connections: u32, refused: usize, refuse: Refuse) {
     let (result, seen, elapsed) =
         through_front_refusing(pool, connections, refused, CACHED, WINDOW, refuse).await;

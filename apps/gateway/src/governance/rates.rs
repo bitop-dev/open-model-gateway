@@ -90,36 +90,6 @@ pub(super) async fn read_limits(
     read_state(tx, workspace, lineage, at, policies, false).await
 }
 
-/// The admission's live policy, budget and counter state in one round trip.
-pub(crate) static LIMITS_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    format!(
-        r#"WITH pol AS MATERIALIZED (SELECT row_number() OVER () i,p.* FROM ({policies_sql}) p WHERE $4),
-        bud AS MATERIALIZED (SELECT row_number() OVER () i,b.* FROM ({budgets_sql}) b),
-        expired AS MATERIALIZED (SELECT k.governance_key_id lineage,c.inflight,c.jobs
-          FROM governance_reservations r JOIN inference_executions e ON e.id=r.execution_id AND e.started_at=r.admitted_at
-          JOIN api_keys k ON k.id=r.api_key_id LEFT JOIN async_jobs j ON j.execution_id=r.execution_id
-          CROSS JOIN LATERAL rate_contribution(r,e.workload_kind,e.batch_job_id,j.id IS NOT NULL,j.state,j.cancel_requested_at,1) c
-          WHERE r.state='pending' AND r.lease_expires_at<=$3 AND r.workspace_id=$1)
-        SELECT * FROM (
-        SELECT 1 g,i,workspace_id,api_key_id,requests_per_minute::bigint a,tokens_per_minute::bigint b,concurrent_requests::bigint c,concurrent_jobs::bigint d,NULL::text period,NULL::text v FROM pol
-        UNION ALL
-        SELECT 2,b.i,b.workspace_id,b.api_key_id,b.amount_microusd::bigint,(coalesce(t.unresolved+t.unreserved_executions,0)>0)::int::bigint,NULL,NULL,b.period,coalesce(t.settled_microusd+t.held_microusd,0)::text
-         FROM bud b LEFT JOIN budget_totals t ON t.scope_kind=CASE WHEN b.api_key_id IS NULL THEN 'workspace' ELSE 'key' END
-         AND t.scope_id=coalesce(b.api_key_id,b.workspace_id) AND t.period=b.period
-         AND t.period_start=CASE WHEN b.period='lifetime' THEN 'epoch'::timestamptz ELSE date_trunc(b.period,$3::timestamptz,'UTC') END
-        UNION ALL
-        SELECT 3,s.i,$1,CASE WHEN s.kind='key' THEN $2::uuid END,coalesce(m.requests,0),coalesce(m.unreserved,0),coalesce(f.requests,0)-x.inflight,coalesce(f.jobs,0)-x.jobs,NULL,coalesce(m.tokens,0)::text
-         FROM (VALUES ('workspace',$1::uuid,1::bigint),('key',$2::uuid,2::bigint)) s(kind,id,i)
-         LEFT JOIN rate_minute_counters m ON m.minute_start=date_trunc('minute',$3::timestamptz,'UTC') AND m.scope_kind=s.kind AND m.scope_id=s.id
-         LEFT JOIN inflight_counters f ON f.scope_kind=s.kind AND f.scope_id=s.id
-         CROSS JOIN LATERAL (SELECT coalesce(sum(d.inflight),0)::bigint inflight,coalesce(sum(d.jobs),0)::bigint jobs FROM expired d WHERE s.kind='workspace' OR d.lineage=s.id) x
-         WHERE $5 OR EXISTS(SELECT 1 FROM pol)
-        ) q ORDER BY g,i"#,
-        policies_sql = super::POLICIES,
-        budgets_sql = super::BUDGETS,
-    )
-});
-
 /// The workspace and key-lineage counters at `at` (whether or not a policy
 /// applies), read by the same statement as admission.
 #[cfg(all(test, feature = "integration-tests"))]
@@ -161,14 +131,39 @@ async fn read_state(
         Option<String>,
         Option<String>,
     );
-    let rows: Vec<Row> = sqlx::query_as(LIMITS_SQL.as_str())
-        .bind(workspace)
-        .bind(lineage)
-        .bind(at)
-        .bind(policies)
-        .bind(counters)
-        .fetch_all(&mut **tx)
-        .await?;
+    let rows: Vec<Row> = sqlx::query_as(&format!(
+        r#"WITH pol AS MATERIALIZED (SELECT row_number() OVER () i,p.* FROM ({policies_sql}) p WHERE $4),
+        bud AS MATERIALIZED (SELECT row_number() OVER () i,b.* FROM ({budgets_sql}) b),
+        expired AS MATERIALIZED (SELECT k.governance_key_id lineage,c.inflight,c.jobs
+          FROM governance_reservations r JOIN inference_executions e ON e.id=r.execution_id AND e.started_at=r.admitted_at
+          JOIN api_keys k ON k.id=r.api_key_id LEFT JOIN async_jobs j ON j.execution_id=r.execution_id
+          CROSS JOIN LATERAL rate_contribution(r,e.workload_kind,e.batch_job_id,j.id IS NOT NULL,j.state,j.cancel_requested_at,1) c
+          WHERE r.state='pending' AND r.lease_expires_at<=$3 AND r.workspace_id=$1)
+        SELECT * FROM (
+        SELECT 1 g,i,workspace_id,api_key_id,requests_per_minute::bigint a,tokens_per_minute::bigint b,concurrent_requests::bigint c,concurrent_jobs::bigint d,NULL::text period,NULL::text v FROM pol
+        UNION ALL
+        SELECT 2,b.i,b.workspace_id,b.api_key_id,b.amount_microusd::bigint,(coalesce(t.unresolved+t.unreserved_executions,0)>0)::int::bigint,NULL,NULL,b.period,coalesce(t.settled_microusd+t.held_microusd,0)::text
+         FROM bud b LEFT JOIN budget_totals t ON t.scope_kind=CASE WHEN b.api_key_id IS NULL THEN 'workspace' ELSE 'key' END
+         AND t.scope_id=coalesce(b.api_key_id,b.workspace_id) AND t.period=b.period
+         AND t.period_start=CASE WHEN b.period='lifetime' THEN 'epoch'::timestamptz ELSE date_trunc(b.period,$3::timestamptz,'UTC') END
+        UNION ALL
+        SELECT 3,s.i,$1,CASE WHEN s.kind='key' THEN $2::uuid END,coalesce(m.requests,0),coalesce(m.unreserved,0),coalesce(f.requests,0)-x.inflight,coalesce(f.jobs,0)-x.jobs,NULL,coalesce(m.tokens,0)::text
+         FROM (VALUES ('workspace',$1::uuid,1::bigint),('key',$2::uuid,2::bigint)) s(kind,id,i)
+         LEFT JOIN rate_minute_counters m ON m.minute_start=date_trunc('minute',$3::timestamptz,'UTC') AND m.scope_kind=s.kind AND m.scope_id=s.id
+         LEFT JOIN inflight_counters f ON f.scope_kind=s.kind AND f.scope_id=s.id
+         CROSS JOIN LATERAL (SELECT coalesce(sum(d.inflight),0)::bigint inflight,coalesce(sum(d.jobs),0)::bigint jobs FROM expired d WHERE s.kind='workspace' OR d.lineage=s.id) x
+         WHERE $5 OR EXISTS(SELECT 1 FROM pol)
+        ) q ORDER BY g,i"#,
+        policies_sql = super::POLICIES,
+        budgets_sql = super::BUDGETS,
+    ))
+    .bind(workspace)
+    .bind(lineage)
+    .bind(at)
+    .bind(policies)
+    .bind(counters)
+    .fetch_all(&mut **tx)
+    .await?;
     let decode = |e: std::num::ParseIntError| sqlx::Error::Decode(Box::new(e));
     let mut state = LimitState {
         policies: Vec::new(),

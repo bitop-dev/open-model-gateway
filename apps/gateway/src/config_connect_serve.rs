@@ -8,17 +8,14 @@ impl super::Config {
     /// ready) and kept open, with a pooler's cached failed server login from
     /// before PostgreSQL accepted connections waited out
     /// ([`crate::db::startup`]). Any other failure to open them stops
-    /// startup; one that ran out of time names the setting. Then every
-    /// connection is warmed for the hot path ([`crate::db::warm`], best
-    /// effort, within what is left of the startup window). One-shot
+    /// startup; one that ran out of time names the setting. One-shot
     /// commands keep the pool that opens connections when needed
     /// ([`Self::connect`]).
     pub async fn connect_serve(&self) -> Result<sqlx::PgPool> {
-        let started = std::time::Instant::now();
         let options =
             <sqlx::postgres::PgConnectOptions as std::str::FromStr>::from_str(&self.database_url)
                 .context("could not connect to PostgreSQL")?;
-        let pool = crate::db::startup::connect(
+        crate::db::startup::connect(
             self.primary_pool_options(),
             options,
             crate::db::startup::WINDOW,
@@ -38,12 +35,6 @@ impl super::Config {
             };
             anyhow::Error::new(error).context(context)
         })
-        .context("could not connect to PostgreSQL")?;
-        // The scoped protocol's statements; the global mode is not warmed.
-        if self.admission_mode == crate::governance::locks::AdmissionMode::Scoped {
-            let left = crate::db::startup::WINDOW.saturating_sub(started.elapsed());
-            crate::db::warm::warm(&pool, crate::db::warm::WITHIN.min(left)).await;
-        }
-        Ok(pool)
+        .context("could not connect to PostgreSQL")
     }
 }

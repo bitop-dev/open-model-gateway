@@ -206,12 +206,13 @@ pub(crate) async fn admission(
     tx: &mut Transaction<'_, Postgres>,
     principal: &crate::auth::Principal,
 ) -> Result<Option<Uuid>, sqlx::Error> {
-    let (lineage, _kind): (Option<Uuid>, Option<String>) = sqlx::query_as(ADMISSION_LOCKS_SQL)
-        .bind(principal.workspace_id)
-        .bind(principal.user_id)
-        .bind(principal.key_id)
-        .fetch_one(&mut **tx)
-        .await?;
+    let (lineage, _kind): (Option<Uuid>, Option<String>) =
+        sqlx::query_as("SELECT lineage,kind FROM omg_admission_locks($1,$2,$3)")
+            .bind(principal.workspace_id)
+            .bind(principal.user_id)
+            .bind(principal.key_id)
+            .fetch_one(&mut **tx)
+            .await?;
     Ok(lineage)
 }
 
@@ -248,9 +249,9 @@ pub(crate) async fn rows(
     let keys: Vec<Uuid> = touches.iter().map(|t| t.api_key).collect();
     let ats: Vec<UtcInstant> = touches.iter().map(|t| t.at).collect();
     let sql = if bound.is_some() {
-        BOUNDED_ROWS_SQL
+        "WITH p AS MATERIALIZED (SELECT current_setting('lock_timeout') AS before),b AS MATERIALIZED (SELECT p.before,set_config('lock_timeout',$5,true) FROM p),l AS MATERIALIZED (SELECT omg_lock_scope_rows($1,$2,$3,$4) FROM b) SELECT set_config('lock_timeout',b.before,true) FROM l,b"
     } else {
-        ROWS_SQL
+        "SELECT omg_lock_scope_rows($1,$2,$3,$4)"
     };
     let mut query = sqlx::query(sql)
         .bind(&workspaces)
@@ -446,10 +447,3 @@ mod tests {
         assert_eq!(AdmissionMode::default(), AdmissionMode::Scoped);
     }
 }
-
-pub(crate) const ADMISSION_LOCKS_SQL: &str =
-    "SELECT lineage,kind FROM omg_admission_locks($1,$2,$3)";
-
-pub(crate) const BOUNDED_ROWS_SQL: &str = "WITH p AS MATERIALIZED (SELECT current_setting('lock_timeout') AS before),b AS MATERIALIZED (SELECT p.before,set_config('lock_timeout',$5,true) FROM p),l AS MATERIALIZED (SELECT omg_lock_scope_rows($1,$2,$3,$4) FROM b) SELECT set_config('lock_timeout',b.before,true) FROM l,b";
-
-pub(crate) const ROWS_SQL: &str = "SELECT omg_lock_scope_rows($1,$2,$3,$4)";

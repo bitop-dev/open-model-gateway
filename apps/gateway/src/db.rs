@@ -24,7 +24,6 @@ pub(crate) mod diagnostics;
 pub(crate) mod startup;
 #[cfg(all(test, feature = "integration-tests"))]
 mod tests;
-pub(crate) mod warm;
 
 /// Begin a READ COMMITTED transaction, inheriting the session's read-only policy.
 pub(crate) async fn begin(pool: &PgPool) -> sqlx::Result<Transaction<'static, Postgres>> {

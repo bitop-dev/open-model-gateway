@@ -25,10 +25,6 @@ static PRICES: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| crate::cache::ImmutableCache::new("prices", 20_000));
 /// The immutable price version `id` of `deployment` (cached; a missing row is
 /// a storage error).
-/// One price version of a deployment, by id.
-pub(crate) static PRICE_BY_ID_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    format!("SELECT {PRICE_COLUMNS} FROM deployment_prices WHERE id=$1 AND deployment_id=$2")
-});
 pub(super) async fn price_version(
     tx: &mut Tx<'_>,
     id: Uuid,
@@ -37,12 +33,14 @@ pub(super) async fn price_version(
     if let Some(price) = PRICES.get(&(id, deployment)) {
         return Ok(price.as_ref().clone());
     }
-    let price = sqlx::query_as::<_, Price>(PRICE_BY_ID_SQL.as_str())
-        .bind(id)
-        .bind(deployment)
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(storage)?;
+    let price = sqlx::query_as::<_, Price>(&format!(
+        "SELECT {PRICE_COLUMNS} FROM deployment_prices WHERE id=$1 AND deployment_id=$2"
+    ))
+    .bind(id)
+    .bind(deployment)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(storage)?;
     PRICES.insert((id, deployment), std::sync::Arc::new(price.clone()));
     Ok(price)
 }
