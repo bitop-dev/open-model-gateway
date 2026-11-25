@@ -101,7 +101,7 @@ impl<'de> Deserialize<'de> for LayerIn {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LayerFields {
-    /// Absent is false; null is refused.
+    /// Required on platform layers, refused on a local one; null is refused.
     #[serde(default, deserialize_with = "supplied")]
     local_only: Option<Option<bool>>,
     rules: Vec<Value>,

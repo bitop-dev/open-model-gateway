@@ -104,31 +104,57 @@ pub(super) fn routes() -> Router<Store> {
 mod store;
 use store::{Platform, Scope, foreign_ids, load, platform, store};
 
-/// Pattern compiles run at most this many at a time per replica.
-const COMPILE_SLOTS: usize = 2;
-static COMPILES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(COMPILE_SLOTS);
+/// Pattern compiles per replica, in separate slots for the platform layers
+/// (Platform Admins) and the local layers (every User owns one, on their
+/// personal workspace), so local writers never queue ahead of the platform.
+static PLATFORM_COMPILES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+static LOCAL_COMPILES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
-/// The body's custom patterns that compile within the limits. Compiling needs
-/// no stored state, so it runs before the management transaction (never while
-/// it holds the installation row), off the async workers and in a bounded
-/// number of slots. Validation reaches at most the first `MAX_PATTERNS`
-/// patterns in body order, so only those are compiled, each distinct one
-/// once; any other pattern counts as not compiling.
-async fn compiled(body: &LayerIn) -> Result<HashSet<String>> {
-    let wanted: BTreeSet<String> = body.patterns(policy::MAX_PATTERNS).into_iter().collect();
-    if wanted.is_empty() {
-        return Ok(HashSet::new());
-    }
+/// Run `work` on the blocking pool while holding one of `slots`. The slot
+/// moves into the blocking task, so it is held until the work ends even when
+/// the request is dropped (a client that disconnects never frees a slot while
+/// its compile still runs).
+async fn in_slot<T: Send + 'static>(
+    slots: &'static tokio::sync::Semaphore,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T> {
     let unavailable = || {
         ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
             "Management storage unavailable",
         )
     };
-    let _slot = COMPILES.acquire().await.map_err(|_| unavailable())?;
-    tokio::task::spawn_blocking(move || wanted.into_iter().filter(|p| patterns::valid(p)).collect())
-        .await
-        .map_err(|_| unavailable().into())
+    let slot = slots.acquire().await.map_err(|_| unavailable())?;
+    tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        work()
+    })
+    .await
+    .map_err(|_| unavailable().into())
+}
+
+/// The body's custom patterns that compile within the limits. Compiling needs
+/// no stored state, so it runs before the management transaction (never while
+/// it holds the installation row), off the async workers and in a bounded
+/// number of slots. The route policy layer has already refused a caller who
+/// may not write this layer, before the body was read. Validation reaches at
+/// most the first `MAX_PATTERNS` patterns in body order, so only those are
+/// compiled, each distinct one once; any other pattern counts as not
+/// compiling.
+async fn compiled(body: &LayerIn, layer: Layer) -> Result<HashSet<String>> {
+    let wanted: BTreeSet<String> = body.patterns(policy::MAX_PATTERNS).into_iter().collect();
+    if wanted.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let slots = if layer == Layer::WorkspaceLocal {
+        &LOCAL_COMPILES
+    } else {
+        &PLATFORM_COMPILES
+    };
+    in_slot(slots, move || {
+        wanted.into_iter().filter(|p| patterns::valid(p)).collect()
+    })
+    .await
 }
 
 /// Validate a PUT body against its layer.
@@ -348,7 +374,7 @@ async fn put_type_guardrails(
     Json(body): Json<LayerIn>,
 ) -> Result<Json<Value>> {
     kind(&k)?;
-    let compiled = compiled(&body).await?;
+    let compiled = compiled(&body, Layer::TypeDefault).await?;
     let mut tx = platform_tx(&s, &u, true).await?;
     let scope = Scope::Type(&k);
     let current = load(&mut tx, scope).await?;
@@ -410,7 +436,7 @@ async fn put_platform_workspace_guardrails(
     Path(ws): Path<Uuid>,
     Json(body): Json<LayerIn>,
 ) -> Result<Json<Value>> {
-    let compiled = compiled(&body).await?;
+    let compiled = compiled(&body, Layer::WorkspaceOverride).await?;
     let mut tx = platform_tx(&s, &u, true).await?;
     platform(&mut tx, ws).await?;
     let scope = Scope::Override(ws);
@@ -520,7 +546,7 @@ async fn put_workspace_guardrails(
     Path(ws): Path<Uuid>,
     Json(body): Json<LayerIn>,
 ) -> Result<Json<Value>> {
-    let compiled = compiled(&body).await?;
+    let compiled = compiled(&body, Layer::WorkspaceLocal).await?;
     let (mut tx, a) = resources::workspace_tx(&s, &u, ws).await?;
     // Owners and admins of a shared workspace; the owner of a personal one.
     if !a.admin {
@@ -544,4 +570,32 @@ async fn put_workspace_guardrails(
     v["can_edit"] = json!(true);
     tx.commit().await?;
     Ok(Json(v))
+}
+
+#[cfg(test)]
+mod slot_tests {
+    use super::*;
+
+    static SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+    #[tokio::test]
+    async fn a_dropped_request_keeps_its_slot_until_the_work_ends() {
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (started, running) = tokio::sync::oneshot::channel::<()>();
+        let request = tokio::spawn(in_slot(&SLOT, move || {
+            started.send(()).unwrap();
+            wait.recv().unwrap();
+        }));
+        running.await.unwrap();
+        // The client goes away while the work runs: the slot stays taken.
+        request.abort();
+        assert!(request.await.is_err_and(|e| e.is_cancelled()));
+        assert_eq!(SLOT.available_permits(), 0);
+        release.send(()).unwrap();
+        // Freed once the blocking work itself has ended.
+        let _again = tokio::time::timeout(std::time::Duration::from_secs(5), SLOT.acquire())
+            .await
+            .expect("the slot is freed when the work ends")
+            .unwrap();
+    }
 }
