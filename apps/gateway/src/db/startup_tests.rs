@@ -41,12 +41,32 @@ fn error_response(code: &str, message: &str) -> Vec<u8> {
     [vec![b'E'], length.to_vec(), fields].concat()
 }
 
+/// When the front refuses a connection: at its login, as a pooler that
+/// never logged in to the server, or at its first query, as PgBouncer does
+/// once a pool has served (it completes the login from the server
+/// parameters it cached).
+#[derive(Clone, Copy)]
+enum Refuse {
+    AtLogin,
+    AtFirstQuery,
+}
+
+/// One frontend message after the startup phase: its type, length and body.
+async fn message(stream: &mut TcpStream) {
+    let mut header = [0u8; 5];
+    stream.read_exact(&mut header).await.unwrap();
+    let length = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
+    let mut body = vec![0u8; length - 4];
+    stream.read_exact(&mut body).await.unwrap();
+}
+
 /// A front on 127.0.0.1 that refuses its first `failing` connections with
 /// `message` (SQLSTATE 08P01) and forwards every later one to `target`.
 async fn front(
     target: (String, u16),
     failing: usize,
-    message: &'static str,
+    message_text: &'static str,
+    refuse: Refuse,
 ) -> (u16, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -66,10 +86,17 @@ async fn front(
                     startup = packet(&mut client).await;
                 }
                 if n < failing {
-                    client
-                        .write_all(&error_response("08P01", message))
-                        .await
-                        .unwrap();
+                    if let Refuse::AtFirstQuery = refuse {
+                        // AuthenticationOk, then ReadyForQuery (idle).
+                        client
+                            .write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0, b'Z', 0, 0, 0, 5, b'I'])
+                            .await
+                            .unwrap();
+                        message(&mut client).await;
+                    }
+                    let _ = client
+                        .write_all(&error_response("08P01", message_text))
+                        .await;
                     return;
                 }
                 let mut server = TcpStream::connect(target).await.unwrap();
@@ -88,9 +115,20 @@ async fn through_front(
     message: &'static str,
     window: Duration,
 ) -> (sqlx::Result<PgPool>, usize, Duration) {
+    through_front_refusing(pool, connections, failing, message, window, Refuse::AtLogin).await
+}
+
+async fn through_front_refusing(
+    pool: &PgPool,
+    connections: u32,
+    failing: usize,
+    message: &'static str,
+    window: Duration,
+    refuse: Refuse,
+) -> (sqlx::Result<PgPool>, usize, Duration) {
     let direct = pool.connect_options();
     let target = (direct.get_host().to_owned(), direct.get_port());
-    let (port, seen) = front(target, failing, message).await;
+    let (port, seen) = front(target, failing, message, refuse).await;
     let options = (*direct)
         .clone()
         .host("127.0.0.1")
@@ -151,10 +189,16 @@ async fn a_failure_that_lasts_fails_after_the_window(pool: PgPool) {
     );
 }
 
-/// Every connection of the pool open and idle (each returns to the pool
-/// asynchronously after an acquire).
+/// Every connection of the pool open, idle (each returns to the pool
+/// asynchronously after an acquire) and kept open (`min_connections`).
 async fn all_open_and_idle(pool: &PgPool, connections: u32) {
     assert_eq!(pool.size(), connections);
+    assert_eq!(pool.options().get_min_connections(), connections);
+    assert_eq!(
+        pool.options().get_idle_timeout(),
+        None,
+        "never reaped while idle"
+    );
     tokio::time::timeout(Duration::from_secs(5), async {
         while pool.num_idle() < connections as usize {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -181,19 +225,43 @@ async fn serve_opens_every_connection_of_its_pool_before_listening(pool: PgPool)
 
 /// The cached failure reaches some of the pool's connections (one of two
 /// Pooler instances): the whole open is tried again, keeping those already
-/// open, until every connection is open.
-#[sqlx::test(migrations = false)]
-async fn a_cached_failure_on_part_of_the_pool_is_waited_out_until_it_is_whole(pool: PgPool) {
-    let (result, seen, elapsed) = through_front(&pool, 4, 6, CACHED, WINDOW).await;
+/// open, until every connection is open. Each connection the pooler refused
+/// is opened once more and none other: `connections + refused` reach it
+/// (a fresh pool per attempt would open all of them again).
+async fn waited_out_until_whole(pool: &PgPool, connections: u32, refused: usize, refuse: Refuse) {
+    let (result, seen, elapsed) =
+        through_front_refusing(pool, connections, refused, CACHED, WINDOW, refuse).await;
     let serving = result.expect("the whole pool opened once the pooler forwards");
-    all_open_and_idle(&serving, 4).await;
-    assert!(seen >= 6 + 4, "six refusals, then four that work: {seen}");
+    all_open_and_idle(&serving, connections).await;
+    assert_eq!(seen, connections as usize + refused, "connections opened");
     assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");
     let one: i32 = sqlx::query_scalar("SELECT 1")
         .fetch_one(&serving)
         .await
         .unwrap();
     assert_eq!(one, 1);
+}
+
+/// Four connections, six refused: the first attempt opens none, the second
+/// two, the third the last two.
+#[sqlx::test(migrations = false)]
+async fn a_cached_failure_on_part_of_the_pool_is_waited_out_until_it_is_whole(pool: PgPool) {
+    waited_out_until_whole(&pool, 4, 6, Refuse::AtLogin).await;
+}
+
+/// The same when the pooler sends the cached failure at each connection's
+/// first query, as PgBouncer does once a pool has served: the pool only
+/// counts a connection that answered.
+#[sqlx::test(migrations = false)]
+async fn a_cached_failure_at_the_first_query_is_waited_out_until_the_pool_is_whole(pool: PgPool) {
+    waited_out_until_whole(&pool, 4, 6, Refuse::AtFirstQuery).await;
+}
+
+/// The chart's pool of 32 (more than `join_all`'s 30, where it collects in
+/// order): five refused.
+#[sqlx::test(migrations = false)]
+async fn a_cached_failure_on_part_of_a_pool_of_32_is_waited_out(pool: PgPool) {
+    waited_out_until_whole(&pool, 32, 5, Refuse::AtFirstQuery).await;
 }
 
 /// A cached failure that lasts fails the whole pool's open with the
@@ -210,9 +278,26 @@ async fn a_cached_failure_of_the_whole_pool_that_lasts_fails_after_the_window(po
     );
 }
 
+/// A cached failure at every first query that lasts fails after the window
+/// with the pooler's error.
+#[sqlx::test(migrations = false)]
+async fn a_cached_failure_at_the_first_query_that_lasts_fails_after_the_window(pool: PgPool) {
+    let window = Duration::from_secs(3);
+    let (result, _, elapsed) =
+        through_front_refusing(&pool, 4, usize::MAX, CACHED, window, Refuse::AtFirstQuery).await;
+    let error = result.expect_err("still refused after the window");
+    assert!(cached_reason(&error).is_some(), "{error}");
+    assert!(
+        elapsed >= Duration::from_secs(2) && elapsed < window,
+        "{elapsed:?}"
+    );
+}
+
 /// A database with fewer free connection slots than the pool (SQLSTATE
 /// 53300, here a role's connection limit) fails startup within the acquire
-/// timeout; it is not a pooler's cached failure and is not waited out.
+/// timeout, as a timeout (sqlx retries 53300 until then), which
+/// `Config::connect_serve` names `GATEWAY_DATABASE_MAX_CONNECTIONS` for; it
+/// is not a pooler's cached failure and is not waited out.
 #[sqlx::test(migrations = false)]
 async fn a_database_out_of_connection_slots_fails_at_once(pool: PgPool) {
     let role = format!("omg_startup_{}", uuid::Uuid::new_v4().simple());
@@ -242,17 +327,17 @@ async fn a_database_out_of_connection_slots_fails_at_once(pool: PgPool) {
         .unwrap();
     let error = result.expect_err("two slots for a pool of four");
     assert!(cached_reason(&error).is_none(), "{error}");
+    assert!(matches!(&error, sqlx::Error::PoolTimedOut), "{error:?}");
     assert!(
-        matches!(&error, sqlx::Error::PoolTimedOut)
-            || matches!(&error, sqlx::Error::Database(e) if e.code().as_deref() == Some("53300")),
-        "{error:?}"
+        elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(5),
+        "{elapsed:?}"
     );
-    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
 }
 
-/// The logged cause is PgBouncer's cached reason, without its frame.
+/// The logged cause is PgBouncer's cached reason, without its frame; which
+/// errors name the pool's setting; and which one startup stops with.
 #[test]
-fn the_cached_reason_is_the_cause_alone() {
+fn the_cached_reason_and_the_error_startup_stops_with() {
     struct Pooler(&'static str, &'static str);
     impl std::fmt::Display for Pooler {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -299,4 +384,32 @@ fn the_cached_reason_is_the_cause_alone() {
     );
     assert_eq!(cached_reason(&error("08P01", WRONG_PASSWORD)), None);
     assert_eq!(cached_reason(&error("57P03", CACHED)), None);
+
+    // Out of connection slots names GATEWAY_DATABASE_MAX_CONNECTIONS.
+    assert!(out_of_connections(&sqlx::Error::PoolTimedOut));
+    assert!(out_of_connections(&error(
+        "53300",
+        "sorry, too many clients already"
+    )));
+    assert!(out_of_connections(&error(
+        "08P01",
+        "no more connections allowed (max_client_conn)"
+    )));
+    assert!(!out_of_connections(&error("08P01", WRONG_PASSWORD)));
+    assert!(!out_of_connections(&error("08P01", CACHED)));
+
+    // A cached failure never hides another error of the same attempt.
+    let stopped = |errors| match reported(errors) {
+        sqlx::Error::Database(e) => e.message().to_owned(),
+        other => other.to_string(),
+    };
+    assert_eq!(
+        stopped(vec![error("08P01", CACHED), error("08P01", WRONG_PASSWORD)]),
+        WRONG_PASSWORD
+    );
+    assert_eq!(
+        stopped(vec![error("08P01", CACHED), sqlx::Error::PoolTimedOut]),
+        sqlx::Error::PoolTimedOut.to_string()
+    );
+    assert_eq!(stopped(vec![error("08P01", CACHED)]), CACHED);
 }

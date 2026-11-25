@@ -528,8 +528,9 @@ impl Config {
     /// ready) and kept open, with a pooler's cached failed server login from
     /// before PostgreSQL accepted connections waited out
     /// ([`crate::db::startup`]). Any other failure to open them stops
-    /// startup, naming the setting. One-shot commands keep the pool that
-    /// opens connections when needed ([`Self::connect`]).
+    /// startup; one that ran out of time names the setting. One-shot
+    /// commands keep the pool that opens connections when needed
+    /// ([`Self::connect`]).
     pub async fn connect_serve(&self) -> Result<sqlx::PgPool> {
         let options =
             <sqlx::postgres::PgConnectOptions as std::str::FromStr>::from_str(&self.database_url)
@@ -540,11 +541,19 @@ impl Config {
             crate::db::startup::WINDOW,
         )
         .await
-        .with_context(|| {
-            format!(
-                "could not open the database pool's {} connections (GATEWAY_DATABASE_MAX_CONNECTIONS)",
-                self.database_max_connections
-            )
+        .map_err(|error| {
+            let connections = self.database_max_connections;
+            // Out of connection slots at the database or the pooler (or a
+            // database still starting, or not answering, which sqlx also
+            // ends with a timeout): the setting is the one to check.
+            let context = if crate::db::startup::out_of_connections(&error) {
+                format!(
+                    "could not open the database pool's {connections} connections (GATEWAY_DATABASE_MAX_CONNECTIONS): the database or pooler is out of connection slots, still starting, or not answering"
+                )
+            } else {
+                format!("could not open the database pool's {connections} connections")
+            };
+            anyhow::Error::new(error).context(context)
         })
         .context("could not connect to PostgreSQL")
     }

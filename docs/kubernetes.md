@@ -192,7 +192,12 @@ answers its first client afterwards with PgBouncer's cached error ("server login
 failing, cached error: … (server_login_retry)"). The init container can pass through one instance
 while another still answers that way, so `serve` waits that error out instead of exiting: it tries
 again once a second while the next attempt would start within 30 s, keeping the connections of its
-pool already open, and logs the cached cause each time (#836). PgBouncer gives the same answer when PostgreSQL refuses the pooler's own login (a
+pool already open, and logs the cached cause each time (#836). Each connection counts as open once
+it has answered a query: a PgBouncer pool that has served completes a client's login from the
+server parameters it cached and sends the cached error at the first query (PgBouncer 1.25.2),
+while one that never logged in holds new clients until its next login attempt, past the pool's 3 s
+acquire timeout, and `serve` stops naming `GATEWAY_DATABASE_MAX_CONNECTIONS`. PgBouncer gives the
+same answer when PostgreSQL refuses the pooler's own login (a
 revoked CONNECT, a `pg_hba` rule), so such a refusal stops `serve` after those 30 s, with that
 error, instead of at once. Any other connection error (a wrong password included) still stops it at
 once. Later connections can still reach such an instance for a few seconds; they fail like any

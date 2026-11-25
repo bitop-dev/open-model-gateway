@@ -474,7 +474,8 @@ cnpg:
       # 500 holds hpa.maxReplicas (10) plus a rolling update's surge pod (1)
       # x GATEWAY_DATABASE_MAX_CONNECTIONS (32) = 352 on one instance, however
       # unevenly the Service spreads them, with room for four old pods that
-      # are still draining (they keep their connections until they exit).
+      # are still draining (they keep their connections until they exit); all
+      # ten draining at once (672) fits only spread over both instances.
       max_client_conn: "500"
       default_pool_size: "25"
       max_prepared_statements: "200"
