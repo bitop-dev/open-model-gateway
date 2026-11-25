@@ -200,9 +200,12 @@ async fn call(base: &str, token: &str, client: Client) -> Reply {
 impl World {
     async fn ask_hanging(&self, client: Client, wire: Vec<u8>, at: &str) -> Reply {
         let dropped = Arc::new(Notify::new());
+        // The reset runs first: its own wait is not the request's time.
+        self.prepare(vec![Step::BytesThenHang(wire, dropped.clone())])
+            .await;
         let reply = tokio::time::timeout(
             Duration::from_secs(5),
-            self.ask(client, vec![Step::BytesThenHang(wire, dropped.clone())]),
+            call(&self.base, &self.token, client),
         )
         .await
         .unwrap_or_else(|_| panic!("{at}: gateway waited for upstream EOF"));
@@ -214,31 +217,40 @@ impl World {
     }
 
     async fn ask(&self, client: Client, steps: Vec<Step>) -> Reply {
+        self.prepare(steps).await;
+        call(&self.base, &self.token, client).await
+    }
+    /// The next upstream answer, with routing health cleared.
+    async fn prepare(&self, steps: Vec<Step>) {
         *self.script.lock().unwrap() = steps;
         reset_health(&self.f.store.pool).await;
-        call(&self.base, &self.token, client).await
     }
 }
 
-/// Waits until no statement touching `deployment_health` is running on this
-/// test's database. A health observation that outlives its 250 ms advisory
-/// timeout (`ExecutionGuard::finish`) is abandoned by its request, but its
-/// single statement is already on the server and commits after the reply
-/// ended: a read must wait for it to see the case's own observation, and a
-/// reset must wait for it, or the straggler lands in the next case. Bounded
-/// at 10 s: a write still running then is a failure of its own.
+/// Waits until every statement the test pool started has finished: a
+/// completion barrier that takes all of the pool's connections at once (the
+/// gateway under test shares this pool). A health observation that outlives
+/// its 250 ms advisory timeout (`ExecutionGuard::finish`) is abandoned by its
+/// request, but its single statement is already on the server and commits
+/// after the reply ended; its connection returns to the pool only once that
+/// statement's reply was drained. So a read after the barrier sees the case's
+/// own observation, and a reset after it never precedes a straggler, which
+/// would otherwise land in the next case. One 10 s deadline bounds the whole
+/// barrier: a statement still running then is a failure of its own. A write
+/// whose timeout expired before it was sent (waiting for a connection) never
+/// happens, and its case's exact count still fails.
 async fn health_writes_settled(pool: &PgPool) {
-    for _ in 0..500 {
-        let running: bool = sqlx::query_scalar("SELECT EXISTS(SELECT FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() AND state<>'idle' AND query ILIKE '%deployment_health%')")
-            .fetch_one(pool)
-            .await
-            .unwrap();
-        if !running {
-            return;
+    let size = pool.options().get_max_connections() as usize;
+    let held = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut held = Vec::with_capacity(size);
+        for _ in 0..size {
+            held.push(pool.acquire().await.unwrap());
         }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    panic!("a routing-health write was still running after 10 s");
+        held
+    })
+    .await
+    .expect("a statement on the test pool was still running after 10 s");
+    drop(held);
 }
 /// Clears routing health for the next case, after every earlier write landed.
 async fn reset_health(pool: &PgPool) {
@@ -1056,36 +1068,52 @@ async fn transport_failures(pool: PgPool, kind: Kind) {
 }
 
 /// A health observation that outlives its 250 ms advisory timeout
-/// (`ExecutionGuard::finish`) is abandoned by the request, but its single
+/// (`ExecutionGuard::finish`) is abandoned by its request, but its single
 /// statement is already on the server and commits after the reply ended. Each
 /// case still records exactly its own observation: here the first write is
-/// held past its timeout, and must count for the first case, never for the
+/// held by an advisory lock until its reply has ended (so the race is really
+/// taken), then released, and must count for the first case, never for the
 /// second.
+/// A connection of its own to the test database, outside the test pool.
+async fn connect(pool: &PgPool) -> sqlx::postgres::PgConnection {
+    <sqlx::postgres::PgConnection as sqlx::Connection>::connect_with(&pool.connect_options())
+        .await
+        .unwrap()
+}
 #[dbtest::test]
 async fn a_health_write_that_outlives_its_timeout_counts_for_its_own_case(pool: PgPool) {
+    const HOLD: i64 = 828_828;
+    // The lock is held on a connection of its own, outside the test pool the
+    // barrier takes.
+    let mut gate = connect(&pool).await;
     sqlx::raw_sql(
-        // Only the first write is held, 0.6 s: past its 250 ms timeout. A
-        // sequence counts the writes outside any transaction.
-        "CREATE SEQUENCE health_delay_once;
-         CREATE FUNCTION health_delay_once() RETURNS trigger LANGUAGE plpgsql AS $$
+        // Only the first write waits for the lock; a sequence counts the
+        // writes outside any transaction.
+        "CREATE SEQUENCE health_hold_once;
+         CREATE FUNCTION health_hold_once() RETURNS trigger LANGUAGE plpgsql AS $$
          BEGIN
-          IF nextval('health_delay_once') = 1 THEN
-           PERFORM pg_sleep(0.6);
+          IF nextval('health_hold_once') = 1 THEN
+           PERFORM pg_advisory_xact_lock(828828);
           END IF;
           RETURN NEW;
          END $$;
-         CREATE TRIGGER health_delay_once BEFORE INSERT ON deployment_health
-          FOR EACH ROW EXECUTE FUNCTION health_delay_once();",
+         CREATE TRIGGER health_hold_once BEFORE INSERT ON deployment_health
+          FOR EACH ROW EXECUTE FUNCTION health_hold_once();",
     )
     .execute(&pool)
     .await
     .unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(HOLD)
+        .execute(&mut gate)
+        .await
+        .unwrap();
     let kind = Kind::Anthropic;
     let w = world(pool, kind, false).await;
     let (content, rest, _) = kind.valid();
     let cut = rest[..rest.len() / 2].to_vec();
     let mut problems = Vec::new();
-    for (place, steps) in [
+    for (n, (place, steps)) in [
         (
             "reset after content",
             vec![Step::Bytes(content.clone()), Step::Reset],
@@ -1094,9 +1122,31 @@ async fn a_health_write_that_outlives_its_timeout_counts_for_its_own_case(pool: 
             "reset inside a frame",
             vec![Step::Bytes([content.clone(), cut].concat()), Step::Reset],
         ),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let reply = w.ask(Client::Messages, steps).await;
-        let at = format!("{kind:?} delayed health {place}");
+        if n == 0 {
+            // The reply ended while its health write still waits for the lock.
+            let seen: i64 = sqlx::query_scalar("SELECT count(*) FROM deployment_health")
+                .fetch_one(&mut gate)
+                .await
+                .unwrap();
+            assert_eq!(seen, 0, "the held write landed before its reply ended");
+            // Released only after this case has gone on to read its health:
+            // the read must wait for the write, not find it already there.
+            let mut held = std::mem::replace(&mut gate, connect(&w.f.store.pool).await);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                sqlx::query("SELECT pg_advisory_unlock($1)")
+                    .bind(HOLD)
+                    .execute(&mut held)
+                    .await
+                    .unwrap();
+            });
+        }
+        let at = format!("{kind:?} held health {place}");
         check(
             &w,
             Client::Messages,
