@@ -165,6 +165,11 @@ jobs:
         env:
           RUST_TEST_NOCAPTURE: "1"
         run: node deploy/spark/test-integration.mjs key-contention
+      - name: Measure admission lock stalls (#132) on dedicated runtime-role PostgreSQL
+        # Load measurements on the shared rows of one scope: run alone, after the other probes.
+        env:
+          RUST_TEST_NOCAPTURE: "1"
+        run: node deploy/spark/test-integration.mjs lock-stall
       - name: Verify Anthropic terminal SDK and accounting contract on disposable PostgreSQL
         # Changes maintenance-database ACLs: run sequentially, never as a generic ignored-test sweep.
         run: node deploy/spark/test-integration.mjs terminal

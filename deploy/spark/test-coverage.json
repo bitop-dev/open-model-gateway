@@ -15,6 +15,7 @@
     {"ci": "npm run test:web", "suite": "web", "script": "npm run test --workspace @omg/web -- --maxWorkers"}
   ],
   "uncovered": [
+    {"ci": "node deploy/spark/test-integration.mjs lock-stall", "why": "load measurements (#132) whose bounds are relative to a calibrated capacity: a CPU-limited pod sharing its quota with another run measures noise", "suites": ["integration", "all"]},
     {"ci": "cargo clippy -p open-model-gateway --all-targets --locked -- -D warnings", "why": "default-feature test-target lint runs in GitHub CI; Spark checks retain the all-feature targets and the shipped default-feature build", "suites": ["checks", "all"]},
     {"ci": "node .github/scripts/rust-shards.mjs --check-special-sources", "why": "Spark checks the runtime_privileges source independently and does not run filestore_s3", "suites": ["integration", "all"]},
     {"ci": "cargo test -p open-model-gateway --all-features --test filestore_s3", "why": "filestore_s3 starts MinIO and RustFS containers; a pod has no Docker", "suites": ["integration", "all"]},

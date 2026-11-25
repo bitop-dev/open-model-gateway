@@ -47,6 +47,8 @@ esac
 case "$args" in
   *"-p open-model-gateway --all-features --lib -- --list"*"--color never"* | *"-p open-model-gateway --all-features --lib -- --ignored --exact"*)
     probes=(management::tests::authz_matrix_tests::key_issuance_contention_tests::key_issuance_contention_measurement
+            governance::lock_stall_tests::cold_bucket_admission_contention
+            governance::lock_stall_tests::steady_load_recovers_after_a_stall
             providers::anthropic::terminal_tests::terminal_fidelity_official_sdks_and_priced_http_evidence inert_library_probe)
     if [[ "$args" == *"--list"* ]]; then
       if [[ "${STUB_UNIGNORED_LIBRARY:-}" = 1 && "$args" == *"--ignored"* ]]; then unset 'probes[0]'; fi
@@ -55,7 +57,7 @@ case "$args" in
       n=0
       for name in "${probes[@]}"; do [[ " $args " == *" $name "* ]] && n=$((n+1)); done
       echo "running $n tests"
-      echo "test result: ok. $n passed; 0 failed; 0 ignored; 0 measured; $((3-n)) filtered out; finished in 0.01s"
+      echo "test result: ok. $n passed; 0 failed; 0 ignored; 0 measured; $((5-n)) filtered out; finished in 0.01s"
     fi
     exit 0 ;;
   *"--test runtime_privileges"*)
