@@ -14,7 +14,8 @@ for (const file of checkedComposeFiles()) {
     pins.push([`${file} services.${name}`, image, tag]);
   }
 }
-pins.push([chart, yaml(chart).cnpg.cluster.image]);
+pins.push([`${chart} cnpg.cluster.image`, yaml(chart).cnpg.cluster.image]);
+pins.push([`${chart} cnpg.pooler.image`, yaml(chart).cnpg.pooler.image]);
 
 for (const { file, text } of repoFiles()) {
   if (!file.startsWith(".github/workflows/")) continue;

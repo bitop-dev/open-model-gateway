@@ -200,9 +200,12 @@ async fn call(base: &str, token: &str, client: Client) -> Reply {
 impl World {
     async fn ask_hanging(&self, client: Client, wire: Vec<u8>, at: &str) -> Reply {
         let dropped = Arc::new(Notify::new());
+        // The reset runs first: its own wait is not the request's time.
+        self.prepare(vec![Step::BytesThenHang(wire, dropped.clone())])
+            .await;
         let reply = tokio::time::timeout(
             Duration::from_secs(5),
-            self.ask(client, vec![Step::BytesThenHang(wire, dropped.clone())]),
+            call(&self.base, &self.token, client),
         )
         .await
         .unwrap_or_else(|_| panic!("{at}: gateway waited for upstream EOF"));
@@ -214,13 +217,48 @@ impl World {
     }
 
     async fn ask(&self, client: Client, steps: Vec<Step>) -> Reply {
-        *self.script.lock().unwrap() = steps;
-        sqlx::query("DELETE FROM deployment_health")
-            .execute(&self.f.store.pool)
-            .await
-            .unwrap();
+        self.prepare(steps).await;
         call(&self.base, &self.token, client).await
     }
+    /// The next upstream answer, with routing health cleared.
+    async fn prepare(&self, steps: Vec<Step>) {
+        *self.script.lock().unwrap() = steps;
+        reset_health(&self.f.store.pool).await;
+    }
+}
+
+/// Waits until every statement the test pool started has finished: a
+/// completion barrier that takes all of the pool's connections at once (the
+/// gateway under test shares this pool). A health observation that outlives
+/// its 250 ms advisory timeout (`ExecutionGuard::finish`) is abandoned by its
+/// request, but its single statement is already on the server and commits
+/// after the reply ended; its connection returns to the pool only once that
+/// statement's reply was drained. So a read after the barrier sees the case's
+/// own observation, and a reset after it never precedes a straggler, which
+/// would otherwise land in the next case. One 10 s deadline bounds the whole
+/// barrier: a statement still running then is a failure of its own. A write
+/// whose timeout expired before it was sent (waiting for a connection) never
+/// happens, and its case's exact count still fails.
+async fn health_writes_settled(pool: &PgPool) {
+    let size = pool.options().get_max_connections() as usize;
+    let held = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut held = Vec::with_capacity(size);
+        for _ in 0..size {
+            held.push(pool.acquire().await.unwrap());
+        }
+        held
+    })
+    .await
+    .expect("a statement on the test pool was still running after 10 s");
+    drop(held);
+}
+/// Clears routing health for the next case, after every earlier write landed.
+async fn reset_health(pool: &PgPool) {
+    health_writes_settled(pool).await;
+    sqlx::query("DELETE FROM deployment_health")
+        .execute(pool)
+        .await
+        .unwrap();
 }
 
 /// The last `data:` payload of an SSE body that is JSON.
@@ -305,6 +343,7 @@ async fn recorded(pool: &PgPool, deployment: Uuid, request: Uuid) -> Recorded {
     .fetch_all(pool)
     .await
     .unwrap();
+    health_writes_settled(pool).await;
     let health_failures: i64 = sqlx::query_scalar(
         "SELECT COALESCE((SELECT consecutive_failures FROM deployment_health WHERE deployment_id=$1),0)::bigint",
     )
@@ -1028,6 +1067,100 @@ async fn transport_failures(pool: PgPool, kind: Kind) {
     assert!(problems.is_empty(), "{problems:#?}");
 }
 
+/// A connection of its own to the test database, outside the test pool.
+async fn connect(pool: &PgPool) -> sqlx::postgres::PgConnection {
+    <sqlx::postgres::PgConnection as sqlx::Connection>::connect_with(&pool.connect_options())
+        .await
+        .unwrap()
+}
+/// A health observation that outlives its 250 ms advisory timeout
+/// (`ExecutionGuard::finish`) is abandoned by its request, but its single
+/// statement is already on the server and commits after the reply ended. Each
+/// case still records exactly its own observation: here the first write is
+/// held by an advisory lock until its reply has ended (so the race is really
+/// taken), then released, and must count for the first case, never for the
+/// second.
+#[dbtest::test]
+async fn a_health_write_that_outlives_its_timeout_counts_for_its_own_case(pool: PgPool) {
+    const HOLD: i64 = 828_828;
+    // The lock is held on a connection of its own, outside the test pool the
+    // barrier takes.
+    let mut gate = connect(&pool).await;
+    sqlx::raw_sql(
+        // Only the first write waits for the lock; a sequence counts the
+        // writes outside any transaction.
+        "CREATE SEQUENCE health_hold_once;
+         CREATE FUNCTION health_hold_once() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+          IF nextval('health_hold_once') = 1 THEN
+           PERFORM pg_advisory_xact_lock(828828);
+          END IF;
+          RETURN NEW;
+         END $$;
+         CREATE TRIGGER health_hold_once BEFORE INSERT ON deployment_health
+          FOR EACH ROW EXECUTE FUNCTION health_hold_once();",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(HOLD)
+        .execute(&mut gate)
+        .await
+        .unwrap();
+    let kind = Kind::Anthropic;
+    let w = world(pool, kind, false).await;
+    let (content, rest, _) = kind.valid();
+    let cut = rest[..rest.len() / 2].to_vec();
+    let mut problems = Vec::new();
+    for (n, (place, steps)) in [
+        (
+            "reset after content",
+            vec![Step::Bytes(content.clone()), Step::Reset],
+        ),
+        (
+            "reset inside a frame",
+            vec![Step::Bytes([content.clone(), cut].concat()), Step::Reset],
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let reply = w.ask(Client::Messages, steps).await;
+        if n == 0 {
+            // The reply ended while its health write still waits for the lock.
+            let seen: i64 = sqlx::query_scalar("SELECT count(*) FROM deployment_health")
+                .fetch_one(&mut gate)
+                .await
+                .unwrap();
+            assert_eq!(seen, 0, "the held write landed before its reply ended");
+            // Released only after this case has gone on to read its health:
+            // the read must wait for the write, not find it already there.
+            let mut held = std::mem::replace(&mut gate, connect(&w.f.store.pool).await);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                sqlx::query("SELECT pg_advisory_unlock($1)")
+                    .bind(HOLD)
+                    .execute(&mut held)
+                    .await
+                    .unwrap();
+            });
+        }
+        let at = format!("{kind:?} held health {place}");
+        check(
+            &w,
+            Client::Messages,
+            &reply,
+            InferenceError::UpstreamUnavailable,
+            None,
+            &at,
+            &mut problems,
+        )
+        .await;
+    }
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
 /// The decision's main promise: a stream that fails, even before any content,
 /// is never retried or failed over, however permissive the route's policy.
 /// Control: the same overload as an HTTP error before any stream does fail
@@ -1099,10 +1232,7 @@ async fn never_failed_over(pool: PgPool, kind: Kind) {
     ];
     for client in clients(kind) {
         for (label, status, first) in &first_answers {
-            sqlx::query("DELETE FROM deployment_health")
-                .execute(&f.store.pool)
-                .await
-                .unwrap();
+            reset_health(&f.store.pool).await;
             let seen = Arc::new(Mutex::new(Vec::<String>::new()));
             let (log, first, good, status) = (seen.clone(), first.clone(), good.clone(), *status);
             let app = Router::new().fallback(move |body: Bytes| {
@@ -1217,15 +1347,13 @@ async fn breaker(pool: PgPool, kind: Kind) {
         ),
     ];
     for (label, steps, opens) in cases {
-        sqlx::query("DELETE FROM deployment_health")
-            .execute(&w.f.store.pool)
-            .await
-            .unwrap();
+        reset_health(&w.f.store.pool).await;
         *w.script.lock().unwrap() = steps;
         for n in 1..=3 {
             let reply = call(&w.base, &w.token, client).await;
             assert_eq!(reply.status, 200, "{kind:?} {label} #{n}: {}", reply.body);
         }
+        health_writes_settled(&w.f.store.pool).await;
         let (failures, open): (i32, bool) = sqlx::query_as(
             "SELECT COALESCE(consecutive_failures,0), COALESCE(open_until>clock_timestamp(),false) FROM (SELECT 1) one LEFT JOIN deployment_health ON deployment_id=$1",
         )
@@ -1258,10 +1386,7 @@ async fn client_drop(pool: PgPool, kind: Kind) {
     let w = world(pool, kind, false).await;
     let (content, _, _) = kind.valid();
     for client in clients(kind) {
-        sqlx::query("DELETE FROM deployment_health")
-            .execute(&w.f.store.pool)
-            .await
-            .unwrap();
+        reset_health(&w.f.store.pool).await;
         let dropped = Arc::new(Notify::new());
         *w.script.lock().unwrap() = vec![Step::BytesThenHang(content.clone(), dropped.clone())];
         let mut response = client_request(&w.base, client)
@@ -1307,8 +1432,9 @@ async fn client_drop(pool: PgPool, kind: Kind) {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         assert_eq!(state, "cancelled", "{at}");
-        // Give a wrongly recorded health observation time to land.
+        // Give a wrongly recorded health observation time to start, then to land.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        health_writes_settled(&w.f.store.pool).await;
         let rows: i64 =
             sqlx::query_scalar("SELECT count(*) FROM deployment_health WHERE deployment_id=$1")
                 .bind(w.deployment)
