@@ -469,7 +469,14 @@ cnpg:
     image: ghcr.io/cloudnative-pg/pgbouncer:1.25.2@sha256:b15c428057d1ffbc19fb70496911a5f1a47066dcc1315bf794f4e85ade29e2e5
     poolMode: transaction
     parameters:
-      max_client_conn: "200"
+      # Every replica opens its whole pool at startup (#132); idle client
+      # connections cost PgBouncer no server connection in transaction mode.
+      # 500 holds hpa.maxReplicas (10) plus a rolling update's surge pod (1)
+      # x GATEWAY_DATABASE_MAX_CONNECTIONS (32) = 352 on one instance, however
+      # unevenly the Service spreads them, with room for four old pods that
+      # are still draining (they keep their connections until they exit); all
+      # ten draining at once (672) fits only spread over both instances.
+      max_client_conn: "500"
       default_pool_size: "25"
       max_prepared_statements: "200"
     # For the pgbouncer container and the operator's bootstrap-controller

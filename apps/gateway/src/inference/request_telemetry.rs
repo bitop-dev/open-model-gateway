@@ -58,9 +58,10 @@ fn error_kind_of(error: InferenceError) -> telemetry::ErrorKind {
         InferenceError::ModelUnavailable => ErrorKind::NotFound,
         InferenceError::Unsupported => ErrorKind::Unsupported,
         InferenceError::Configuration | InferenceError::PriceUnbounded => ErrorKind::Configuration,
-        InferenceError::Busy | InferenceError::Overloaded | InferenceError::RouteCoolingDown(_) => {
-            ErrorKind::Busy
-        }
+        InferenceError::Busy
+        | InferenceError::ScopeBusy
+        | InferenceError::Overloaded
+        | InferenceError::RouteCoolingDown(_) => ErrorKind::Busy,
         InferenceError::BudgetExceeded(_)
         | InferenceError::UnresolvedUsage(_)
         | InferenceError::TokenReservationExceedsLimit(_)

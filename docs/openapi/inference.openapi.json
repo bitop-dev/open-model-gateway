@@ -3281,6 +3281,7 @@
           "price_unbounded",
           "provider_configuration_error",
           "rate_limit_error",
+          "scope_busy",
           "timeout_error",
           "token_reservation_exceeds_limit",
           "unresolved_usage",
