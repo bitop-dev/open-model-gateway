@@ -6,11 +6,10 @@ use crate::jobs::schedule::{Scheduler, claims::RetryClaim};
 
 /// How long a test waits for a line to reach the provider. A transient
 /// planning failure (`Storage` or `Timeout`) is treated like a route's
-/// cooldown: the line is planned again only after one [`REPLAN`]
-/// (`jobs::runner`), so a wait of exactly `REPLAN` expires after one such
-/// failure on a loaded machine. Two `REPLAN`s and a margin still bound a stuck
-/// runner.
-pub(super) const REACH: Duration = crate::jobs::runner::REPLAN
+/// cooldown: the line is planned again only after one `jobs::runner::REPLAN`,
+/// so a wait of exactly `REPLAN` can expire before the next plan reaches the
+/// provider. Two `REPLAN`s and a margin still bound a stuck runner.
+const REACH: Duration = crate::jobs::runner::REPLAN
     .saturating_mul(2)
     .saturating_add(Duration::from_secs(10));
 
@@ -272,6 +271,94 @@ async fn a_runner_that_lost_the_batch_claims_and_runs_no_further_line(pool: PgPo
         (Some(2), Some(1))
     );
     consistent(&w.f).await;
+}
+
+/// One transient planning failure right after a takeover (#835): the
+/// replacement runner's first planning read of routing health is cancelled
+/// while `deployment_health` is locked, so planning fails with `Storage`. The
+/// line waits one `REPLAN` (a transient failure is treated like a cooldown),
+/// then still reaches the provider, and the runner that lost the batch still
+/// starts nothing more.
+#[dbtest::test]
+async fn a_planning_failure_after_a_takeover_delays_the_line_one_replan(pool: PgPool) {
+    let (w, job) = batch(pool, &[("a", "hold-a"), ("b", "hold-b"), ("c", "plain-c")]).await;
+    let db = &w.f.store.pool;
+    sqlx::query("INSERT INTO deployment_batch_scheduling(deployment_id,max_concurrency,updated_by) VALUES($1,2,$2)")
+        .bind(w.f.deployment).bind(w.f.owner).execute(db).await.unwrap();
+    let (held_a, held_b) = (w.openai.gate("hold-a"), w.openai.gate("hold-b"));
+    let old = start(&w);
+    tokio::time::timeout(REACH, held_a.entered.notified())
+        .await
+        .expect("old runner reached the provider");
+    let mut lock = db.begin().await.unwrap();
+    sqlx::query("LOCK TABLE deployment_health IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let holder: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *lock)
+        .await
+        .unwrap();
+    lapse(&w, &job).await;
+    let taken = std::time::Instant::now();
+    let owner = start(&w);
+    // The replacement runner's planning read, waiting for the lock: cancel it.
+    let planning: i32 = tokio::time::timeout(REACH, async {
+        loop {
+            if let Some(pid) = sqlx::query_scalar("SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND $1=ANY(pg_blocking_pids(pid)) AND query LIKE '%deployment_health%'")
+                .bind(holder).fetch_optional(db).await.unwrap() {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the replacement runner's planning read reached the locked table");
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT pg_cancel_backend($1)")
+            .bind(planning)
+            .fetch_one(db)
+            .await
+            .unwrap()
+    );
+    tokio::time::timeout(REACH, async {
+        while sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT FROM pg_stat_activity WHERE pid=$1 AND $2=ANY(pg_blocking_pids(pid)))")
+            .bind(planning).bind(holder).fetch_one(db).await.unwrap() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the planning read was cancelled");
+    lock.commit().await.unwrap();
+    tokio::time::timeout(REACH, held_b.entered.notified())
+        .await
+        .expect("replacement runner used the second route slot after a planning failure");
+    assert!(
+        taken.elapsed() >= crate::jobs::runner::REPLAN,
+        "the line was planned again before one REPLAN: {:?}",
+        taken.elapsed()
+    );
+
+    held_a.release.notify_one();
+    let old = old.await.unwrap();
+    assert_eq!(
+        w.openai.executed(),
+        ["hold-a", "hold-b"],
+        "the old runner started a line after it lost the batch"
+    );
+    held_b.release.notify_one();
+    assert!(matches!(owner.await.unwrap(), Ok(true)));
+    assert!(
+        matches!(old, Ok(true)),
+        "the old runner stops quietly: {old:?}"
+    );
+    assert_eq!(w.openai.executed(), ["hold-a", "hold-b", "plain-c"]);
+    let job = w.reload(&job).await;
+    assert_eq!(job.state, "completed");
+    assert_eq!(
+        (job.request_completed, job.request_failed),
+        (Some(2), Some(1))
+    );
 }
 
 use crate::{
@@ -1583,8 +1670,9 @@ async fn a_segment_commit_error_keeps_the_file_and_recovery_does_not_replay(pool
     .execute(db)
     .await
     .unwrap();
+    // The whole run, provider calls included: a planning failure costs one REPLAN.
     assert!(
-        tokio::time::timeout(Duration::from_secs(9), start(&w))
+        tokio::time::timeout(REACH, start(&w))
             .await
             .unwrap()
             .unwrap()
