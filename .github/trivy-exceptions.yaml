@@ -1,9 +1,9 @@
 # Dated exceptions to the image scans of ci.yml (staging-image) and image.yml
 # (verify): docs/verification.md, "Scan exceptions". An entry names one
-# vulnerability in one package version, expires by itself at most 14 days
-# after it is added, and is removed by the pull request that re-pins the
-# runtime base. The owner approves each one. An empty list is the normal
-# state: `vulnerabilities: []`.
+# vulnerability in exact package versions, stops applying at 00:00 UTC of its
+# `expired_at` (at most 14 days ahead), and is removed by the pull request
+# that re-pins the runtime base. The owner approves each one. An empty list
+# is the normal state: `vulnerabilities: []`.
 vulnerabilities:
   - id: CVE-2026-124851
     purls:

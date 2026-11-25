@@ -15,7 +15,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "./process.mjs";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -3211,7 +3211,12 @@ test("pull requests scan the candidate image with the tag run's Trivy and policy
 // one vulnerability, in exact package versions, for at most SCAN_EXCEPTION_DAYS, with
 // its reason. Nothing wider can be written in the file.
 const SCAN_EXCEPTION_DAYS = 14;
-function scanExceptionViolations(text, today = new Date()) {
+const SCAN_EXCEPTION_ENTRIES = 3;
+const SCAN_EXCEPTION_PURLS = 4;
+function scanExceptionViolations(text, today = new Date(), notes = null) {
+  // Printable ASCII and line feeds only: Trivy's YAML reader breaks lines at characters
+  // (U+2028, U+2029, NEL, a lone CR) that the strict parser reads as comment text.
+  if (/[^\x20-\x7e\n]/.test(text)) return ["the file holds printable ASCII and line feeds only"];
   // A file the strict parser refuses (a duplicate key, an alias, no mapping) is refused here too.
   let data;
   try {
@@ -3223,6 +3228,7 @@ function scanExceptionViolations(text, today = new Date()) {
   if (data === null || typeof data !== "object" || Array.isArray(data) || Object.keys(data).join() !== "vulnerabilities" || !Array.isArray(data.vulnerabilities)) {
     return ["the file holds exactly one key, `vulnerabilities`, a list (empty when nothing is excepted)"];
   }
+  if (data.vulnerabilities.length > SCAN_EXCEPTION_ENTRIES) out.push(`at most ${SCAN_EXCEPTION_ENTRIES} entries`);
   const day = d => Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
   const seen = new Set();
   data.vulnerabilities.forEach((entry, i) => {
@@ -3230,49 +3236,115 @@ function scanExceptionViolations(text, today = new Date()) {
     if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return out.push(`${at} is not a mapping`);
     if (Object.keys(entry).sort().join() !== "expired_at,id,purls,statement") out.push(`${at} has exactly id, purls, expired_at and statement (no paths, no other key)`);
     if (typeof entry.id !== "string" || !/^CVE-\d{4}-\d{4,}$/.test(entry.id)) out.push(`${at}.id is one CVE identifier`);
+    else if (notes !== null && !notes.includes(entry.id)) out.push(`${at}.id is not named in docs/releases/unreleased.md: an image built while the entry is in force contains the finding, and its release notes must say so`);
     if (seen.has(entry.id)) out.push(`${at}.id is listed twice`);
     seen.add(entry.id);
-    if (!Array.isArray(entry.purls) || entry.purls.length === 0 || !entry.purls.every(p => typeof p === "string" && /^pkg:deb\/debian\/[a-z0-9][a-z0-9.+-]*@[A-Za-z0-9.~:%-]+$/.test(p))) {
-      out.push(`${at}.purls names exact Debian package versions (pkg:deb/debian/<name>@<version>, no qualifiers)`);
+    // An exact version: Debian's version characters, with `+` and `:` percent-encoded.
+    if (!Array.isArray(entry.purls) || entry.purls.length === 0 || entry.purls.length > SCAN_EXCEPTION_PURLS || !entry.purls.every(p => typeof p === "string" && /^pkg:deb\/debian\/[a-z0-9][a-z0-9.+-]*@(?:[A-Za-z0-9.~-]|%2B|%3A)+$/.test(p))) {
+      out.push(`${at}.purls names one to ${SCAN_EXCEPTION_PURLS} exact Debian package versions (pkg:deb/debian/<name>@<version>, no qualifiers)`);
     }
-    const expires = typeof entry.expired_at === "string" && /^\d{4}-\d{2}-\d{2}$/.test(entry.expired_at) ? Date.parse(`${entry.expired_at}T00:00:00Z`) : NaN;
-    if (Number.isNaN(expires)) out.push(`${at}.expired_at is a date (YYYY-MM-DD)`);
+    // Trivy reads the date as 00:00 UTC of that day: the entry no longer applies on it.
+    // It reads 0001-01-01 as "no expiry", which the lower bound refuses with every past date.
+    let expires = typeof entry.expired_at === "string" && /^\d{4}-\d{2}-\d{2}$/.test(entry.expired_at) ? Date.parse(`${entry.expired_at}T00:00:00Z`) : NaN;
+    if (!Number.isNaN(expires) && new Date(expires).toISOString().slice(0, 10) !== entry.expired_at) expires = NaN;
+    if (Number.isNaN(expires)) out.push(`${at}.expired_at is a calendar date (YYYY-MM-DD)`);
     else if (expires > day(today) + SCAN_EXCEPTION_DAYS * 86_400_000) out.push(`${at}.expired_at is more than ${SCAN_EXCEPTION_DAYS} days away`);
+    else if (expires <= day(today)) out.push(`${at} has expired: remove it (the scans report the finding again)`);
     if (typeof entry.statement !== "string" || !/#\d+/.test(entry.statement) || entry.statement.trim().length < 40) out.push(`${at}.statement gives the issue (#N) and the reason`);
   });
   return out;
 }
 
 test("scan exceptions are dated, package-scoped and reviewed (#837)", () => {
-  assert.deepEqual(scanExceptionViolations(readFileSync(join(root, SCAN_EXCEPTIONS), "utf8")), []);
+  const path = join(root, SCAN_EXCEPTIONS);
+  assert.ok(lstatSync(path).isFile(), `${SCAN_EXCEPTIONS} is a regular file, not a link`);
+  assert.deepEqual(scanExceptionViolations(readFileSync(path, "utf8"), new Date(), readFileSync(join(root, "docs/releases/unreleased.md"), "utf8")), []);
   const today = new Date("2026-11-25T12:00:00Z");
   const entry = { id: "CVE-2026-124851", purls: ["pkg:deb/debian/libzstd1@1.5.7%2Bdfsg-1"], expired_at: "2026-12-09", statement: "Issue #837. The pinned runtime base has not been rebuilt with the fix yet." };
   const file = (...entries) => JSON.stringify({ vulnerabilities: entries });
+  const other = n => ({ ...entry, id: `CVE-2026-10000${n}` });
   assert.deepEqual(scanExceptionViolations(file(entry), today), []);
+  assert.deepEqual(scanExceptionViolations(file(entry), today, "notes naming CVE-2026-124851"), []);
+  assert.deepEqual(scanExceptionViolations(file(entry, other(1), other(2)), today), []);
+  assert.deepEqual(scanExceptionViolations(file({ ...entry, expired_at: "2026-11-26" }), today), [], "tomorrow is the nearest date in force");
   assert.deepEqual(scanExceptionViolations(file(), today), [], "an empty list is the normal state");
-  const refused = [
-    ["no expiry", { ...entry, expired_at: undefined }],
-    ["an expiry that is not a date", { ...entry, expired_at: "never" }],
-    ["an expiry too far away", { ...entry, expired_at: "2026-12-10" }],
-    ["no package", { ...entry, purls: [] }],
-    ["every version of a package", { ...entry, purls: ["pkg:deb/debian/libzstd1"] }],
-    ["a package of another ecosystem", { ...entry, purls: ["pkg:cargo/zstd@0.13.0"] }],
-    ["qualifiers", { ...entry, purls: ["pkg:deb/debian/libzstd1@1.5.7%2Bdfsg-1?arch=arm64"] }],
-    ["a path instead of a package", { ...entry, paths: ["usr/lib/*"] }],
-    ["no reason", { ...entry, statement: "#837" }],
-    ["no issue", { ...entry, statement: "The pinned runtime base has not been rebuilt with the fix yet." }],
-    ["not a CVE", { ...entry, id: "*" }],
-    ["an advisory family", { ...entry, id: "CVE-2026-" }],
-  ];
-  for (const [name, bad] of refused) assert.notDeepEqual(scanExceptionViolations(file(JSON.parse(JSON.stringify(bad))), today), [], name);
-  assert.notDeepEqual(scanExceptionViolations(file(entry, entry), today), [], "the same CVE twice");
-  for (const [name, text] of [
-    ["another section", JSON.stringify({ vulnerabilities: [], misconfigurations: [] })],
-    ["secrets excepted", JSON.stringify({ secrets: [{ id: "x" }] })],
-    ["not a list", JSON.stringify({ vulnerabilities: {} })],
-    ["a bare list", JSON.stringify([entry])],
-    ["empty", "null"],
-  ]) assert.notDeepEqual(scanExceptionViolations(text, today), [], name);
+  const refuses = (name, text, message, notes = null) => {
+    const found = scanExceptionViolations(text, today, notes);
+    assert.ok(found.some(line => message.test(line)), `${name}: ${JSON.stringify(found)}`);
+  };
+  for (const [name, bad, message] of [
+    ["no expiry", { ...entry, expired_at: undefined }, /expired_at is a calendar date/],
+    ["an expiry that is not a date", { ...entry, expired_at: "never" }, /expired_at is a calendar date/],
+    ["an impossible date", { ...entry, expired_at: "2026-11-31" }, /expired_at is a calendar date/],
+    ["an expiry too far away", { ...entry, expired_at: "2026-12-10" }, /more than 14 days away/],
+    ["the date Trivy reads as no expiry", { ...entry, expired_at: "0001-01-01" }, /has expired/],
+    ["an expired entry", { ...entry, expired_at: "2026-11-25" }, /has expired/],
+    ["no package", { ...entry, purls: [] }, /purls names one to 4 exact/],
+    ["too many packages", { ...entry, purls: Array(5).fill(entry.purls[0]) }, /purls names one to 4 exact/],
+    ["every version of a package", { ...entry, purls: ["pkg:deb/debian/libzstd1"] }, /purls names one to 4 exact/],
+    ["an escaped wildcard", { ...entry, purls: ["pkg:deb/debian/libzstd1@%2A"] }, /purls names one to 4 exact/],
+    ["a package of another ecosystem", { ...entry, purls: ["pkg:cargo/zstd@0.13.0"] }, /purls names one to 4 exact/],
+    ["qualifiers", { ...entry, purls: ["pkg:deb/debian/libzstd1@1.5.7%2Bdfsg-1?arch=arm64"] }, /purls names one to 4 exact/],
+    ["a path instead of a package", { ...entry, paths: ["usr/lib/*"] }, /has exactly id, purls, expired_at and statement/],
+    ["no reason", { ...entry, statement: "#837" }, /statement gives the issue/],
+    ["no issue", { ...entry, statement: "The pinned runtime base has not been rebuilt with the fix yet." }, /statement gives the issue/],
+    ["not a CVE", { ...entry, id: "*" }, /id is one CVE identifier/],
+    ["an advisory family", { ...entry, id: "CVE-2026-" }, /id is one CVE identifier/],
+  ]) refuses(name, file(JSON.parse(JSON.stringify(bad))), message);
+  refuses("the same CVE twice", file(entry, entry), /listed twice/);
+  refuses("too many entries", file(entry, other(1), other(2), other(3)), /at most 3 entries/);
+  refuses("an entry the release notes do not name", file(entry), /not named in docs\/releases\/unreleased\.md/, "notes naming nothing");
+  for (const [name, text, message] of [
+    ["another section", JSON.stringify({ vulnerabilities: [], misconfigurations: [] }), /exactly one key/],
+    ["secrets excepted", JSON.stringify({ secrets: [{ id: "x" }] }), /exactly one key/],
+    ["not a list", JSON.stringify({ vulnerabilities: {} }), /exactly one key/],
+    ["a bare list", JSON.stringify([entry]), /not a mapping/],
+    ["empty", "null", /not a mapping/],
+    // Trivy's YAML reader ends the comment at each of these and reads the rest as an entry.
+    ...[" ", " ", "\u0085", "\r"].map(c => [`a line break only Trivy sees (U+${c.codePointAt(0).toString(16)})`, `vulnerabilities: [] # x${c}  - id: CVE-2026-124851\n`, /printable ASCII/]),
+  ]) refuses(name, text, message);
+});
+
+// The tag run's scan is held to its exact text too, as the last step of `verify`: a
+// config file (`-c`), a later `--exit-code 0`, other scanners, another database or a
+// moved GITHUB_WORKSPACE is a different text.
+const TAG_TRIVY_SCAN = {
+  name: "Scan image (${{ matrix.platform }})",
+  env: { PLATFORM: "${{ matrix.platform }}" },
+  run: [
+    "trivy image \\",
+    '  --platform "${PLATFORM}" \\',
+    "  --severity CRITICAL,HIGH \\",
+    "  --exit-code 1 \\",
+    "  --ignore-unfixed \\",
+    `  ${IGNOREFILE} \\`,
+    '  "${IMAGE}@${DIGEST}"',
+    "",
+  ].join("\n"),
+};
+
+test("the tag run's scan is its exact text, the last step of verify (#837)", () => {
+  const { image } = pullRequestScanData();
+  const check = workflow => assert.deepEqual(stepsOf(workflow.jobs.verify).at(-1), TAG_TRIVY_SCAN);
+  check(image);
+  for (const [name, mutate] of [
+    ["a config file", s => { s.run = s.run.replace("trivy image \\", "trivy image -c /tmp/x.yaml \\"); }],
+    ["a later exit code", s => { s.run = s.run.replace('"${IMAGE}@${DIGEST}"', '--exit-code 0 "${IMAGE}@${DIGEST}"'); }],
+    ["other scanners", s => { s.run = s.run.replace("--ignore-unfixed", "--ignore-unfixed --scanners secret"); }],
+    ["another database", s => { s.run = s.run.replace("--ignore-unfixed", "--ignore-unfixed --db-repository ghcr.io/x/db"); }],
+    ["a moved workspace", s => { s.run = `export GITHUB_WORKSPACE=/tmp/x\n${s.run}`; }],
+    ["no ignore file", s => { s.run = s.run.replace(`  ${IGNOREFILE} \\\n`, ""); }],
+    ["a forgiven scan", s => { s["continue-on-error"] = true; }],
+    ["a condition", s => { s.if = "false"; }],
+    ["TRIVY settings", s => { s.env.TRIVY_IGNOREFILE = "x"; }],
+  ]) {
+    const fixture = structuredClone(image);
+    mutate(fixture.jobs.verify.steps.at(-1));
+    assert.throws(() => check(fixture), { name: "AssertionError" }, name);
+  }
+  const moved = structuredClone(image);
+  moved.jobs.verify.steps.push({ run: "true" });
+  assert.throws(() => check(moved), { name: "AssertionError" }, "a step after the scan");
 });
 
 test("fixtures: a pull-request scan that is skipped, forgiven, redirected or reconfigured is refused (#475)", () => {
