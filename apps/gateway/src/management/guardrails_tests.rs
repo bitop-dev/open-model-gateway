@@ -628,6 +628,25 @@ async fn rules_change_only_with_their_sets_revision(pool: PgPool) {
         .unwrap_err();
     assert!(err.to_string().contains("at most 50"), "{err}");
     sp.rollback().await.unwrap();
+    // Two entries so far; 48 more fill the set, and one beyond is refused.
+    const SECRET_RULE: &str = "INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable) VALUES($1,$2,$3,'Secrets','secrets','pattern','{secret}','monitor','user_text','off','fail_open','{generation}','deny')";
+    for position in 2..50_i16 {
+        sqlx::query(SECRET_RULE)
+            .bind(Uuid::now_v7())
+            .bind(set)
+            .bind(position)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
+    let err = sqlx::query(SECRET_RULE)
+        .bind(Uuid::now_v7())
+        .bind(set)
+        .bind(50_i16)
+        .execute(&mut *tx)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("at most 50"), "{err}");
     drop(tx);
     // The route removes an override in one transaction with its revision.
     let (status, reset) = call(

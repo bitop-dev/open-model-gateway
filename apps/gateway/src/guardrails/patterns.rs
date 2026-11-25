@@ -48,6 +48,29 @@ mod tests {
         }
     }
 
+    /// The time the largest patterns that still compile take: run with
+    /// `--ignored --nocapture` to measure it on a given machine.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn worst_case_compile_time() {
+        for class in [r"\w", r"(?i)\p{L}", r"[\p{L}\p{N}]", r"(?i)[a-z]", "."] {
+            // The largest repetition that compiles within the limits.
+            let (mut low, mut high) = (1_u32, 4000_u32);
+            while low < high {
+                let mid = (low + high).div_ceil(2);
+                if valid(&format!("{class}{{{mid}}}")) {
+                    low = mid;
+                } else {
+                    high = mid - 1;
+                }
+            }
+            let pattern = format!("{class}{{{low}}}");
+            let started = std::time::Instant::now();
+            let compiled = valid(&pattern);
+            println!("{pattern}: compiles={compiled} in {:?}", started.elapsed());
+        }
+    }
+
     #[test]
     fn invalid_and_oversized_patterns_are_refused() {
         assert!(!valid(""));

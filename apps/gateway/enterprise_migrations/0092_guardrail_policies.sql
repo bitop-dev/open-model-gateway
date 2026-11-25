@@ -33,9 +33,12 @@ CREATE TABLE guardrail_rule_sets (
  revision bigint NOT NULL DEFAULT 1 CHECK (revision >= 1),
  updated_by uuid NOT NULL REFERENCES users(id),
  updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
- -- The transaction that last inserted or changed the set (set by the guard
- -- below): its rules are written or removed only in that transaction.
+ -- The transaction that last inserted or changed the set, by id and start
+ -- time (set by the guard below): its rules are written or removed only in
+ -- that transaction. The start time keeps a restored row (whose id another
+ -- cluster assigned) from matching a later transaction here.
  changed_xact xid8 NOT NULL,
+ changed_at timestamptz NOT NULL,
  CHECK ((layer = 'type_default') = (kind IS NOT NULL)),
  CHECK ((layer = 'type_default') = (workspace_id IS NULL)),
  CHECK ((layer = 'workspace_local') = (local_only IS NULL))
@@ -56,7 +59,7 @@ BEGIN
   IF OLD.layer <> 'workspace_override' THEN
    RAISE EXCEPTION 'only a guardrail override is removed' USING ERRCODE = '23514';
   END IF;
-  IF OLD.changed_xact <> pg_current_xact_id() THEN
+  IF OLD.changed_xact <> pg_current_xact_id() OR OLD.changed_at <> transaction_timestamp() THEN
    RAISE EXCEPTION 'a guardrail override is removed in the transaction that moved its revision' USING ERRCODE = '23514';
   END IF;
   RETURN OLD;
@@ -72,6 +75,7 @@ BEGIN
  NEW.updated_at := clock_timestamp();
  -- The top-level transaction, also from a subtransaction.
  NEW.changed_xact := pg_current_xact_id();
+ NEW.changed_at := transaction_timestamp();
  r := NEW;
  IF r.layer = 'workspace_local' THEN
   IF NOT EXISTS (SELECT FROM public.effective_workspace_memberships m
@@ -154,7 +158,7 @@ BEGIN
   RAISE EXCEPTION 'guardrail rules are replaced, not edited' USING ERRCODE = '23514';
  END IF;
  IF TG_OP = 'DELETE' THEN e := OLD; ELSE e := NEW; END IF;
- IF NOT EXISTS (SELECT FROM public.guardrail_rule_sets s WHERE s.id = e.rule_set_id AND s.changed_xact = pg_current_xact_id()) THEN
+ IF NOT EXISTS (SELECT FROM public.guardrail_rule_sets s WHERE s.id = e.rule_set_id AND s.changed_xact = pg_current_xact_id() AND s.changed_at = transaction_timestamp()) THEN
   RAISE EXCEPTION 'guardrail rules change only with their rule set''s revision' USING ERRCODE = '23514';
  END IF;
  IF TG_OP = 'DELETE' THEN

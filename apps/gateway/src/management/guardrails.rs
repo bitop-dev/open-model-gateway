@@ -24,7 +24,7 @@ use crate::guardrails::{
     patterns,
     policy::{self, Entry, Layer, LayerIn, Refusal, RuleSet, StoredRule},
 };
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 pub(super) const DETECTOR_UNAVAILABLE: &str = "This guardrail rule needs a detector, action, output mode or workload this gateway does not provide yet";
 pub(super) const EGRESS_NOT_ALLOWED: &str =
@@ -104,22 +104,31 @@ pub(super) fn routes() -> Router<Store> {
 mod store;
 use store::{Platform, Scope, foreign_ids, load, platform, store};
 
+/// Pattern compiles run at most this many at a time per replica.
+const COMPILE_SLOTS: usize = 2;
+static COMPILES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(COMPILE_SLOTS);
+
 /// The body's custom patterns that compile within the limits. Compiling needs
 /// no stored state, so it runs before the management transaction (never while
-/// it holds the installation row) and off the async workers. Validation
-/// reaches at most the first `MAX_PATTERNS` patterns in body order, so only
-/// those are compiled; any other pattern counts as not compiling.
+/// it holds the installation row), off the async workers and in a bounded
+/// number of slots. Validation reaches at most the first `MAX_PATTERNS`
+/// patterns in body order, so only those are compiled, each distinct one
+/// once; any other pattern counts as not compiling.
 async fn compiled(body: &LayerIn) -> Result<HashSet<String>> {
-    let wanted = body.patterns(policy::MAX_PATTERNS);
+    let wanted: BTreeSet<String> = body.patterns(policy::MAX_PATTERNS).into_iter().collect();
+    if wanted.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let unavailable = || {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Management storage unavailable",
+        )
+    };
+    let _slot = COMPILES.acquire().await.map_err(|_| unavailable())?;
     tokio::task::spawn_blocking(move || wanted.into_iter().filter(|p| patterns::valid(p)).collect())
         .await
-        .map_err(|_| {
-            ApiError(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Management storage unavailable",
-            )
-            .into()
-        })
+        .map_err(|_| unavailable().into())
 }
 
 /// Validate a PUT body against its layer.
