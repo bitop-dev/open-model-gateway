@@ -49,6 +49,12 @@ GATEWAY_PORT = 3000
 ISSUER_PORT = 18443
 POD_PORTS = (3101, 3102)
 METRICS_PORTS = (3201, 3202, 3203)
+# How long step 4 waits for a running replica to hold the lease it kills. A
+# stopping pod keeps renewing its terms through its preStop sleep (10 s) and
+# the gateway's drain window (5 s) and releases them as it exits; one that
+# dies instead leaves its term to expire, and another replica takes it within
+# the documented 40 s. 15 + 40 s, and a margin.
+LEASE_OWNER_WAIT = 90
 MODEL = "spark/mock"
 FIRST_ADMIN_JOB = "omg-first-admin"
 
@@ -729,27 +735,17 @@ class Check:
         self.expect(3, "pdb-refuses-a-second-eviction", (first, second) == ("evicted", "refused"), f"{first}, then {second}")
         self.wait_for_ready_replicas()
 
-    def lease_step(self, lease="metrics"):
-        """Delete the pod holding a lease; another replica takes it within the
-        documented time (TTL 30 s + renewal 10 s) and the old term is fenced."""
-        # Just after the rollout of step 3 the lease can be between holders
-        # (the old pod's term runs out, then a replica takes it): wait for a
-        # current holder, at most the documented takeover time and a margin.
-        current = []
-        for _ in range(60):
-            current = self.sql(f"SELECT holder||' '||epoch FROM work_leases WHERE name='{lease}' AND expires_at>clock_timestamp()").split()
-            if len(current) == 2:
-                break
-            time.sleep(1)
+    def lease_owner(self, lease):
+        """The lease's current term (holder, epoch) and the running replica
+        whose own metrics say it holds the lease: (holder, epoch, pod),
+        "free" while no term is current, "elsewhere" while no running replica
+        shows it (a stopping pod still holds it), or "invalid"."""
+        current = self.sql(f"SELECT holder||' '||epoch FROM work_leases WHERE name='{lease}' AND expires_at>clock_timestamp()").split()
         if len(current) != 2:
-            self.record(4, "lease-takeover", "fail", f"no replica holds the {lease} lease")
-            return
+            return "free"
         holder, epoch = current
         if not UUID.fullmatch(holder) or not epoch.isdigit():
-            self.record(4, "lease-takeover", "fail", "the lease row is not a holder UUID and an epoch")
-            return
-        # The holder is the replica whose own metrics say it holds the lease.
-        owner = None
+            return "invalid"
         for pod, port in zip(self.gateway_pods(), METRICS_PORTS):
             child = self.forward(f"pod/{pod['metadata']['name']}", [f"{port}:9464"])
             try:
@@ -757,10 +753,31 @@ class Check:
             finally:
                 self.stop(child)
             if status == 200 and re.search(rf'^gateway_work_leases_held\{{lease="{lease}"\}} 1$', body.decode(), re.M):
-                owner = pod["metadata"]["name"]
-        if owner is None:
-            self.record(4, "lease-takeover", "fail", f"no replica's metrics show the {lease} lease held")
+                return holder, epoch, pod["metadata"]["name"]
+        return "elsewhere"
+
+    def wait_for_lease_owner(self, lease):
+        """Wait, at most LEASE_OWNER_WAIT seconds, until a running replica
+        holds the lease (`lease_owner`); the last answer otherwise."""
+        deadline = time.monotonic() + LEASE_OWNER_WAIT
+        while True:
+            found = self.lease_owner(lease)
+            if isinstance(found, tuple) or found == "invalid" or time.monotonic() >= deadline:
+                return found
+            time.sleep(2)
+
+    def lease_step(self, lease="metrics"):
+        """Delete the pod holding a lease; another replica takes it within the
+        documented time (TTL 30 s + renewal 10 s) and the old term is fenced."""
+        found = self.wait_for_lease_owner(lease)
+        if found == "invalid":
+            self.record(4, "lease-takeover", "fail", "the lease row is not a holder UUID and an epoch")
             return
+        if not isinstance(found, tuple):
+            detail = ("no replica holds" if found == "free" else "no running replica's metrics show")
+            self.record(4, "lease-takeover", "fail", f"{detail} the {lease} lease after {LEASE_OWNER_WAIT} s")
+            return
+        holder, epoch, owner = found
         deleted = time.monotonic()
         self.kubectl(["delete", "pod", owner, "--wait=false"], capture=True)
         took = None
