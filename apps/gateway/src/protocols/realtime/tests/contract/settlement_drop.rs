@@ -581,12 +581,7 @@ async fn a_shed_window_growth_keeps_its_input_for_the_next_request(pool: PgPool)
     // Shed once, then sent again.
     let (mut shed, shed_id) = open(&g).await;
     shed.client_event(input);
-    let mut row = g.pool.begin().await.unwrap();
-    sqlx::query("SELECT 1 FROM budget_totals WHERE scope_kind='workspace' AND scope_id=$1 AND period='lifetime' FOR UPDATE")
-        .bind(g.keys.team_workspace_id)
-        .execute(&mut *row)
-        .await
-        .unwrap();
+    let row = super::hold_admission_row(&g).await;
     assert_eq!(
         shed.reserve_window(100).await,
         Err(InferenceError::ScopeBusy)

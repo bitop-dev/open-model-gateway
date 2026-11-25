@@ -123,6 +123,28 @@ struct Gateway {
     mock: Mock,
     pool: PgPool,
 }
+/// Holds the first row a window admission of the team workspace waits for:
+/// its lifetime totals row in the scoped mode, the installation row in the
+/// global mode (which locks no scope rows; every writer takes that row first).
+async fn hold_admission_row(g: &Gateway) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut held = g.pool.begin().await.unwrap();
+    match Store::new(g.pool.clone()).admission_mode() {
+        crate::governance::locks::AdmissionMode::Scoped => {
+            sqlx::query("SELECT 1 FROM budget_totals WHERE scope_kind='workspace' AND scope_id=$1 AND period='lifetime' FOR UPDATE")
+                .bind(g.keys.team_workspace_id)
+                .execute(&mut *held)
+                .await
+                .unwrap();
+        }
+        crate::governance::locks::AdmissionMode::Global => {
+            sqlx::query("SELECT 1 FROM installation WHERE singleton FOR NO KEY UPDATE")
+                .execute(&mut *held)
+                .await
+                .unwrap();
+        }
+    }
+    held
+}
 fn line(meter: &str, amount: &str) -> Value {
     json!({"meter":meter,"microusd_per_batch":amount,"batch":1000000,"unit_label":"/M tokens","sku_label":meter})
 }
@@ -679,12 +701,7 @@ async fn a_shed_response_create_is_refused_and_the_session_continues(pool: PgPoo
     opened(&mut client).await;
     speak(&mut client).await;
     respond(&mut client).await;
-    let mut held = g.pool.begin().await.unwrap();
-    sqlx::query("SELECT 1 FROM budget_totals WHERE scope_kind='workspace' AND scope_id=$1 AND period='lifetime' FOR UPDATE")
-        .bind(g.keys.team_workspace_id)
-        .execute(&mut *held)
-        .await
-        .unwrap();
+    let held = hold_admission_row(&g).await;
     send(
         &mut client,
         json!({"type":"response.create","event_id":"shed"}),
