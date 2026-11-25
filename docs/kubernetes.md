@@ -401,8 +401,8 @@ non-idempotent requests only where they are safe to repeat.
 
 Measured on the Spark multi-replica rehearsal (two replicas, four Node 22 `fetch` clients, one
 rolling restart per check, about 2,300 requests each): before the window existed, 3 of 18 checks
-lost one request each, about 1 in 14,000 requests. With the default window, 0 of 30,341 requests
-failed in 13 checks.
+lost one request each, about 1 in 14,000 requests. With the default window, 0 of 64,940 requests
+failed in 28 checks.
 
 ## Scaling
 
