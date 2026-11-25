@@ -1,0 +1,73 @@
+# Helm values for `scripts/spark-env.py up <name> --mode replicas`: the chart
+# as shipped (its gateway Deployment with two replicas, the CloudNativePG
+# Cluster and its PgBouncer Pooler, the migrate Job, the Service and the
+# PodDisruptionBudget) in production mode, signing in through a per-environment
+# Keycloak issuer in the namespace (issuer.yaml) whose certificate a CA
+# generated for this environment signs (GATEWAY_OIDC_CA_FILE, #826). The
+# script sets the image, the issuer and mock-upstream addresses, and whether
+# the chart's NetworkPolicy can be created. Sized against the shared quota's
+# CPU limit (8): a rolling update adds one gateway pod (maxSurge 1) while the
+# check's load pod runs, and that must still fit.
+fullnameOverride: omg
+replicaCount: 2
+# Reached only through `kubectl port-forward` bound to 127.0.0.1, whatever the
+# chart's defaults are.
+service: {type: ClusterIP}
+ingress: {enabled: false}
+pdb:
+  enabled: true
+  maxUnavailable: 1
+migrations:
+  run: true
+gateway:
+  env:
+    GATEWAY_ENV: production
+    GATEWAY_LISTEN: "0.0.0.0:8080"
+    GATEWAY_METRICS_ADDR: "0.0.0.0:9464"
+    GATEWAY_DATABASE_MAX_CONNECTIONS: "8"
+    GATEWAY_MAX_CONCURRENT_REQUESTS: "64"
+    GATEWAY_REQUEST_TIMEOUT_SECONDS: "60"
+    GATEWAY_ADMISSION_MODE: scoped
+    GATEWAY_CONFIG_CACHE: "on"
+  resources:
+    requests: {cpu: 150m, memory: 192Mi}
+    limits: {cpu: 500m, memory: 512Mi}
+  # The pods spread over nodes when there are several; the Spark has one.
+  topologySpreadConstraints: []
+secrets:
+  oidc:
+    enabled: true
+    existingSecret: omg-oidc
+    ca:
+      enabled: true
+      configMapName: omg-issuer-ca
+      key: ca.crt
+cnpg:
+  cluster:
+    enabled: true
+    instances: 1
+    # One instance cannot satisfy the legacy synchronous-replica default.
+    minSyncReplicas: 0
+    maxSyncReplicas: 0
+    storageClass: local-path
+    storageSize: 2Gi
+    walStorageSize: 1Gi
+    additionalPodAntiAffinity: false
+    # PostgreSQL 17.6, like CI and deploy/staging: the multi-arch index pinned by digest.
+    image: ghcr.io/cloudnative-pg/postgresql:17.6@sha256:30b304a2e300ed80b6d1b740e4369e9b0f25599fb518de78c01fd9f25531791b
+    resources:
+      requests: {cpu: 200m, memory: 512Mi}
+      limits: {cpu: 500m, memory: 1Gi}
+    roles:
+      migrator: {existingSecret: omg-migrator-role}
+      runtime: {existingSecret: omg-runtime-role}
+    postgresql:
+      parameters:
+        # CNPG rejects a value that exceeds the WAL volume.
+        max_wal_size: 512MB
+  pooler:
+    enabled: true
+    instances: 2
+    resources:
+      requests: {cpu: 50m, memory: 64Mi}
+      limits: {cpu: 250m, memory: 128Mi}

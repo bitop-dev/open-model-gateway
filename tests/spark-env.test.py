@@ -186,6 +186,7 @@ spark = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(spark)
 env = spark.Spark('/unused')
 env.environment = lambda name: 'coder-03-omg-t599'
+env.mode = lambda namespace: 'demo'
 env.forward_command = lambda name: [sys.executable, '-u', '-c', {self.CHILD!r}, {str(port)!r}, {mode!r}]
 spark.DEMO_PORTS = ({port},)
 with contextlib.redirect_stdout(sys.stderr):

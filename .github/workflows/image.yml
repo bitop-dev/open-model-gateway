@@ -604,6 +604,8 @@ jobs:
           echo "${RUNNER_TEMP}/trivy-bin" >> "$GITHUB_PATH"
 
       # Fixable HIGH and CRITICAL findings fail the build (Grounded's policy).
+      # The only exceptions are the dated, package-scoped entries of
+      # .github/trivy-exceptions.yaml (docs/verification.md).
       - name: Scan image (${{ matrix.platform }})
         env:
           PLATFORM: ${{ matrix.platform }}
@@ -613,6 +615,7 @@ jobs:
             --severity CRITICAL,HIGH \
             --exit-code 1 \
             --ignore-unfixed \
+            --ignorefile "${GITHUB_WORKSPACE}/.github/trivy-exceptions.yaml" \
             "${IMAGE}@${DIGEST}"
 
   # Joins the tested digests into one index, tags and signs it. It starts only
