@@ -34,13 +34,13 @@ fn inference_openapi_vocabulary_covers_every_variant_and_renderer() {
         strings(&doc, "OpenAiErrorType"),
     );
     let anthropic_types = strings(&doc, "AnthropicErrorType");
-    assert_eq!(e::all().len(), 17 + 2 * 4, "variant list is not exhaustive");
+    assert_eq!(e::all().len(), 18 + 2 * 4, "variant list is not exhaustive");
     // `guard` is exhaustive over InferenceError (a new variant does not compile);
     // `all()` must reach every one of its indices, so the two cannot drift apart.
     let reached: BTreeSet<usize> = e::all().into_iter().map(e::guard).collect();
     assert_eq!(
         reached,
-        (0..=20).collect::<BTreeSet<_>>(),
+        (0..=21).collect::<BTreeSet<_>>(),
         "all() misses an InferenceError variant that guard() knows"
     );
     for error in e::all() {

@@ -269,8 +269,26 @@ impl Relay {
             return Continue(());
         }
         self.session.client_event(size);
-        if let Err(error) = self.session.reserve_window(max_output_tokens).await {
-            return Break(End::Denied(error));
+        match self.session.reserve_window(max_output_tokens).await {
+            // Shed before anything was reserved or forwarded: this request
+            // is refused and the session stays open (its reserved window
+            // unchanged), so the client may send `response.create` again.
+            Err(InferenceError::ScopeBusy) => {
+                let error = InferenceError::ScopeBusy;
+                let error = error_text(
+                    "server_error",
+                    error.code(),
+                    error.message(),
+                    None,
+                    Some(&event_id),
+                );
+                if !send_client(&mut self.client_tx, error).await {
+                    return Break(End::ClientGone);
+                }
+                return Continue(());
+            }
+            Err(error) => return Break(End::Denied(error)),
+            Ok(()) => {}
         }
         self.requested = Some(event_id);
         if let Err(error) = send_upstream(&mut self.upstream, text).await {

@@ -324,7 +324,7 @@ async fn settle_session(
         ..MeterUsage::default()
     };
     let meter_json = serde_json::to_value(meters).map_err(|_| InferenceError::Storage)?;
-    lock_rows(store, tx, &[r.touch()], false).await?;
+    lock_rows(store, tx, &[r.touch()], None).await?;
     let settled = sqlx::query("UPDATE governance_reservations SET state='settled',actual_microusd=$3,input_tokens=$4,output_tokens=$5,billing_usage=NULL,cost_components=$6,meter_usage=$7 WHERE execution_id=$1 AND admitted_at=$2 AND state='unknown'")
         .bind(execution).bind(r.admitted_at).bind(t.actual).bind(t.input).bind(t.output).bind(components).bind(&meter_json)
         .execute(&mut **tx).await.map_err(storage)?.rows_affected();

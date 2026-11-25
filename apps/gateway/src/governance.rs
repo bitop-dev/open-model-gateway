@@ -100,6 +100,39 @@ impl LockGates {
         }
     }
 }
+/// When an admission that starts queueing now must have its rows:
+/// [`ADMISSION_LOCK_WAIT`] from the start of its wait for the replica's
+/// admission gate, which the gate and the row lock share (the row lock gets
+/// at least [`ADMISSION_LOCK_FLOOR`]).
+fn admission_deadline(store: &Store) -> tokio::time::Instant {
+    tokio::time::Instant::now() + store.admission_lock_wait
+}
+/// The replica's admission gate, waited for until `deadline`; past it the
+/// admission is shed (`ScopeBusy`) before it has a connection or a lock.
+async fn admission_gate(
+    store: &Store,
+    deadline: tokio::time::Instant,
+) -> Result<tokio::sync::SemaphorePermit<'_>, InferenceError> {
+    tokio::time::timeout_at(deadline, gate(&store.lock_gates.admission))
+        .await
+        .map_err(|_| {
+            crate::metrics::METRICS.observe_admission_shed();
+            InferenceError::ScopeBusy
+        })
+}
+/// What is left of an admission's bound for its row lock, and at least
+/// [`ADMISSION_LOCK_FLOOR`]: a wait the bound does not cover (a pool
+/// connection, or the catalog and authority locks a management change held)
+/// never leaves the row lock no time, so the admissions released together
+/// behind such a change are not shed by ordinary contention among
+/// themselves.
+fn remaining(deadline: tokio::time::Instant) -> std::time::Duration {
+    deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .max(ADMISSION_LOCK_FLOOR)
+}
+/// The least time an admission's row lock may wait (see [`remaining`]).
+const ADMISSION_LOCK_FLOOR: std::time::Duration = std::time::Duration::from_millis(250);
 async fn gate(semaphore: &tokio::sync::Semaphore) -> tokio::sync::SemaphorePermit<'_> {
     // Never closed; an error would mean a bug, and failing open is safe here
     // because the database lock still serializes the work.
@@ -125,14 +158,43 @@ async fn admission_prefix(
     store: &Store,
     tx: &mut Tx<'_>,
     principal: &crate::auth::Principal,
+    deadline: tokio::time::Instant,
 ) -> Result<std::time::Duration, InferenceError> {
     if scoped(store) {
         let wait = crate::metrics::METRICS.scope_lock_wait("authority", "admission");
         locks::admission(tx, principal).await.map_err(storage)?;
         Ok(wait.elapsed())
     } else {
-        lock(tx).await?;
+        catalog_lock(tx).await?;
+        installation_lock_bounded(tx, remaining(deadline)).await?;
         Ok(std::time::Duration::ZERO)
+    }
+}
+
+/// How long an admission waits, from when it starts queueing for the
+/// replica's admission gate, for that gate and the rows it must lock before
+/// it writes anything: its scope's totals and counter rows (`lock_rows` with
+/// counters), or in the global mode the installation row (each row lock
+/// wait gets what is left, at least [`ADMISSION_LOCK_FLOOR`]). Past it the
+/// admission ends as [`InferenceError::ScopeBusy`] with nothing written. Its
+/// pool connection is waited for as before (the pool's acquire timeout):
+/// the gate already keeps admissions to their share of the pool, and an
+/// abandoned acquire would keep queueing.
+/// Below the 3 s settlement deadline (`inference::SETTLEMENT_DEADLINE`), so a
+/// stall sheds new work before the settlements queued behind it run out of
+/// time, and above the waits of ordinary contention at a scope's ceiling.
+/// Only the lock wait is bounded, not the admission, and never a
+/// settlement's or a management change's wait.
+pub(crate) const ADMISSION_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// A lock wait of an admission that ran out of [`ADMISSION_LOCK_WAIT`] is a
+/// shed admission, never an accounting failure.
+fn shed_or_storage(error: sqlx::Error) -> InferenceError {
+    if locks::is_lock_timeout(&error) {
+        crate::metrics::METRICS.observe_admission_shed();
+        InferenceError::ScopeBusy
+    } else {
+        storage(error)
     }
 }
 /// Live authorization of `principal` after [`admission_prefix`]: its key
@@ -174,23 +236,36 @@ async fn settlement_prefix(store: &Store, tx: &mut Tx<'_>) -> Result<(), Inferen
         lock(tx).await
     }
 }
-/// Scoped mode: lock the totals rows (and with `counters` the minute and
-/// in-flight rows) the next writes change, in canonical order. A no-op in the
-/// global mode, where the installation row serializes everything. Returns the
-/// wait, observed as `gateway_scope_lock_wait_seconds{lock="rows"}` with path
-/// `admission` (counter rows: new consumption) or `settlement`.
+/// Scoped mode: lock the totals rows (and for an `admission`, with its
+/// deadline, the minute and in-flight rows) the next writes change, in
+/// canonical order. A no-op in the global mode, where the installation row
+/// serializes everything. Returns the wait, observed as
+/// `gateway_scope_lock_wait_seconds{lock="rows"}` with path `admission`
+/// (counter rows: new consumption) or `settlement`.
 async fn lock_rows(
     store: &Store,
     tx: &mut Tx<'_>,
     touches: &[locks::Touch],
-    counters: bool,
+    admission: Option<tokio::time::Instant>,
 ) -> Result<std::time::Duration, InferenceError> {
     if !scoped(store) {
         return Ok(std::time::Duration::ZERO);
     }
-    let path = if counters { "admission" } else { "settlement" };
+    let path = if admission.is_some() {
+        "admission"
+    } else {
+        "settlement"
+    };
     let wait = crate::metrics::METRICS.scope_lock_wait("rows", path);
-    locks::rows(tx, touches, counters).await.map_err(storage)?;
+    // An admission waits until its deadline; a settlement as long as it must.
+    match admission {
+        Some(deadline) => locks::rows(tx, touches, true, Some(remaining(deadline)))
+            .await
+            .map_err(shed_or_storage)?,
+        None => locks::rows(tx, touches, false, None)
+            .await
+            .map_err(storage)?,
+    }
     Ok(wait.elapsed())
 }
 /// The `FOR SHARE` clause of the global mode's catalog row reads (scoped
@@ -218,6 +293,28 @@ async fn catalog_lock(tx: &mut Tx<'_>) -> Result<(), InferenceError> {
 /// changes. Scoped admission and settlement use scoped authority locks.
 /// Admission reads limit data from the workspace and key lineage policies,
 /// budget totals and counters.
+/// [`installation_lock`] for a global-mode admission: its wait is bounded by
+/// `bound` (a transaction-local `lock_timeout`, set by the first statement,
+/// which returns the previous value, read before it is set, and restored by
+/// the locking statement itself once it holds the row).
+async fn installation_lock_bounded(
+    tx: &mut Tx<'_>,
+    bound: std::time::Duration,
+) -> Result<(), InferenceError> {
+    let before: String = sqlx::query_scalar(
+        "WITH b AS MATERIALIZED (SELECT current_setting('lock_timeout') AS before),s AS MATERIALIZED (SELECT set_config('lock_timeout',$1,true) FROM b) SELECT b.before FROM b,s",
+    )
+    .bind(locks::lock_timeout(bound))
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(storage)?;
+    sqlx::query("SELECT set_config('lock_timeout',$1,true) FROM (SELECT id FROM installation WHERE singleton FOR NO KEY UPDATE) i")
+        .bind(before)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(shed_or_storage)?;
+    Ok(())
+}
 async fn installation_lock(tx: &mut Tx<'_>) -> Result<(), InferenceError> {
     sqlx::query_scalar::<_, Uuid>("SELECT id FROM installation WHERE singleton FOR NO KEY UPDATE")
         .fetch_one(&mut **tx)
@@ -295,7 +392,8 @@ async fn admit_unobserved(
     }
     let workspace = record.principal.workspace_id;
     let key = record.principal.key_id;
-    let _queued = gate(&store.lock_gates.admission).await;
+    let deadline = admission_deadline(store);
+    let _queued = admission_gate(store, deadline).await?;
     timer.phase("queue");
     crate::telemetry::mark_phase(crate::telemetry::SpanName::AdmissionQueue);
     let mut tx = crate::db::begin(&store.pool).await.map_err(begin_storage)?;
@@ -312,7 +410,7 @@ async fn admit_unobserved(
     // and its immutable row comes from the price cache (one round trip less).
     let mut lock_wait = std::time::Duration::ZERO;
     let read_price = if scoped(store) {
-        lock_wait += admission_prefix(store, &mut tx, &record.principal).await?;
+        lock_wait += admission_prefix(store, &mut tx, &record.principal, deadline).await?;
         timer.phase("locks");
         // Scoped admission takes the shared catalog and authority locks
         // together (locks::admission): one real boundary, named for its
@@ -325,7 +423,7 @@ async fn admit_unobserved(
         let price = latest_price(&mut tx, record.deployment_id).await?;
         timer.phase("price");
         crate::telemetry::mark_phase(crate::telemetry::SpanName::AdmissionCatalogLocks);
-        installation_lock(&mut tx).await?;
+        installation_lock_bounded(&mut tx, remaining(deadline)).await?;
         timer.phase("locks");
         crate::telemetry::mark_phase(crate::telemetry::SpanName::AdmissionAuthorityLocks);
         Some(price)
@@ -432,7 +530,7 @@ async fn admit_unobserved(
             api_key: key,
             at: now,
         }],
-        true,
+        Some(deadline),
     )
     .await?;
     timer.phase("lock_rows");

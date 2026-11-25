@@ -335,7 +335,7 @@ impl RealtimeSession {
         if self.armed != Some(bound) {
             // An elapsed deadline is counted with what it waited on (#497);
             // it rolls back and holds nothing beyond the session.
-            realtime_admission(timeout(
+            let reserved = realtime_admission(timeout(
                 Duration::from_secs(5),
                 self.repository.realtime_reserve_window(
                     &self.principal,
@@ -346,7 +346,15 @@ impl RealtimeSession {
                 ),
             ))
             .await
-            .map_err(|_| InferenceError::Storage)??;
+            .map_err(|_| InferenceError::Storage)
+            .and_then(|r| r);
+            if let Err(error) = reserved {
+                // Nothing was reserved or forwarded: the input this request
+                // would have consumed stays the next request's (a shed
+                // request may be sent again; other refusals end the session).
+                self.context.rejected();
+                return Err(error);
+            }
         }
         self.armed = Some(bound);
         self.requested = true;

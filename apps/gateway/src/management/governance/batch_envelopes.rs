@@ -209,7 +209,7 @@ async fn resolve_page(s: Store, u: ManagementPrincipal, p: Resolve) -> ApiResult
                 at: r.admitted_at,
             })
             .collect();
-        locks::rows(&mut tx, &touches, false).await?;
+        locks::rows(&mut tx, &touches, false, None).await?;
         apply(
             &mut tx,
             &rows,

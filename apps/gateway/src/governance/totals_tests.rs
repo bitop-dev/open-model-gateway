@@ -507,7 +507,12 @@ async fn concurrent_writers_keep_totals_exact(pool: PgPool) {
         Some(budget),
     )
     .await;
-    let store = f.store.clone();
+    // 48 admissions at once on one scope test totals exactness, not the
+    // admission wait bound.
+    let store = f
+        .store
+        .clone()
+        .with_admission_lock_wait(std::time::Duration::from_secs(120));
     let mut tasks = Vec::new();
     for i in 0..48 {
         let (store, s) = (store.clone(), start_for(&f, f.team));
