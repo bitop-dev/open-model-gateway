@@ -362,7 +362,7 @@ pub fn validate(
     let mut seen = HashSet::new();
     let mut tightened = HashSet::new();
     let mut patterns = 0usize;
-    let mut out = Vec::with_capacity(body.rules.len());
+    let mut out = Vec::new();
     for raw in body.rules {
         if !raw.is_object() {
             return Err(Refusal::Invalid);

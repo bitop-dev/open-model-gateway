@@ -142,8 +142,7 @@ impl Client {
         assert_eq!(
             r.status.as_u16(),
             expected.as_u16(),
-            "{method} {path}: unexpected status: {}",
-            String::from_utf8_lossy(&r.bytes)
+            "{method}: unexpected status"
         );
         self.observed.lock().await.observe(&r);
         serde_json::from_slice(&r.bytes).unwrap_or(Value::Null)
