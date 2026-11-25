@@ -115,36 +115,16 @@ async fn revalidate_token(tx: &mut Tx<'_>, actor: ReconcilingActor) -> Result<()
     }
     Ok(())
 }
-/// Authorization remains live after waiting. Personal details never become platform-public.
-pub async fn resolve_usage(
+/// The start of an operator's reconciliation transaction: the shared catalog
+/// lock and the actor's authority (workspace, user) held until commit in
+/// scoped mode, the installation lock in global mode, then the admin-token
+/// liveness check. Callers lock the reservation row next, then its totals
+/// rows (the canonical order, `governance::locks`).
+pub(super) async fn operator_tx(
     store: &Store,
     workspace: Uuid,
-    execution: Uuid,
-    usage: Usage,
-    evidence: &str,
-    actor: impl Into<ReconcilingActor>,
-) -> Result<(), InferenceError> {
-    let actor = actor.into();
-    if evidence.trim().is_empty()
-        || evidence.chars().count() > 200
-        || evidence.chars().any(char::is_control)
-    {
-        return Err(InferenceError::InvalidRequest);
-    }
-    locks::retry_deadlocks!(
-        "reconciliation",
-        resolve_usage_once(store, workspace, execution, usage, evidence, actor).await
-    )
-}
-#[cfg_attr(not(test), expect(clippy::too_many_lines, reason = "#499"))]
-async fn resolve_usage_once(
-    store: &Store,
-    workspace: Uuid,
-    execution: Uuid,
-    usage: Usage,
-    evidence: &str,
     actor: ReconcilingActor,
-) -> Result<(), InferenceError> {
+) -> Result<Tx<'static>, InferenceError> {
     let mut tx = crate::db::begin(&store.pool).await.map_err(begin_storage)?;
     if scoped(store) {
         // The actor's authority (workspace, user) cannot be revoked until
@@ -174,17 +154,61 @@ async fn resolve_usage_once(
         }
     }
     revalidate_token(&mut tx, actor).await?;
+    Ok(tx)
+}
+/// The actor is still a live Platform Admin and the workspace is enabled and
+/// shared, or the actor's own personal workspace (personal details never
+/// become platform-public). Re-checked in the transaction after the locks.
+pub(super) async fn operator_authorized(
+    store: &Store,
+    tx: &mut Tx<'_>,
+    actor: ReconcilingActor,
+    workspace: Uuid,
+) -> Result<(), InferenceError> {
+    let authorized:Option<Uuid>=sqlx::query_scalar(&format!("SELECT u.id FROM users u JOIN effective_platform_roles p ON p.user_id=u.id AND p.role='admin' JOIN workspaces w ON w.id=$2 AND w.disabled_at IS NULL WHERE u.id=$1 AND u.disabled_at IS NULL AND u.cleaned_at IS NULL AND (w.kind IN('team','project') OR w.owner_user_id=u.id){}", if scoped(store) { "" } else { " FOR SHARE OF u,w" }))
+        .bind(actor.user_id).bind(workspace).fetch_optional(&mut **tx).await.map_err(storage)?;
+    if authorized.is_none() {
+        return Err(InferenceError::InvalidRequest);
+    }
+    Ok(())
+}
+/// Authorization remains live after waiting. Personal details never become platform-public.
+pub async fn resolve_usage(
+    store: &Store,
+    workspace: Uuid,
+    execution: Uuid,
+    usage: Usage,
+    evidence: &str,
+    actor: impl Into<ReconcilingActor>,
+) -> Result<(), InferenceError> {
+    let actor = actor.into();
+    if evidence.trim().is_empty()
+        || evidence.chars().count() > 200
+        || evidence.chars().any(char::is_control)
+    {
+        return Err(InferenceError::InvalidRequest);
+    }
+    locks::retry_deadlocks!(
+        "reconciliation",
+        resolve_usage_once(store, workspace, execution, usage, evidence, actor).await
+    )
+}
+async fn resolve_usage_once(
+    store: &Store,
+    workspace: Uuid,
+    execution: Uuid,
+    usage: Usage,
+    evidence: &str,
+    actor: ReconcilingActor,
+) -> Result<(), InferenceError> {
+    let mut tx = operator_tx(store, workspace, actor).await?;
     let r = reservation(&mut tx, execution, scoped(store)).await?;
     // Realtime sessions are valued per response (`realtime`); an aggregate
     // reconciliation could not reproduce that valuation, so it is refused.
     if r.workspace_id != workspace || r.workload_kind == WorkloadKind::Realtime.as_str() {
         return Err(InferenceError::InvalidRequest);
     }
-    let authorized:Option<Uuid>=sqlx::query_scalar(&format!("SELECT u.id FROM users u JOIN effective_platform_roles p ON p.user_id=u.id AND p.role='admin' JOIN workspaces w ON w.id=$2 AND w.disabled_at IS NULL WHERE u.id=$1 AND u.disabled_at IS NULL AND u.cleaned_at IS NULL AND (w.kind IN('team','project') OR w.owner_user_id=u.id){}", if scoped(store) { "" } else { " FOR SHARE OF u,w" }))
-        .bind(actor.user_id).bind(workspace).fetch_optional(&mut *tx).await.map_err(storage)?;
-    if authorized.is_none() {
-        return Err(InferenceError::InvalidRequest);
-    }
+    operator_authorized(store, &mut tx, actor, workspace).await?;
     let usage = workload_usage(&r, usage, InferenceError::InvalidRequest)?;
     let (input, output) = usage_values(usage)?;
     let billing = billing_json(usage)?;

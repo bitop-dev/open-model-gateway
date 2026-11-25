@@ -74,6 +74,7 @@ fn concrete_path(path: &str, team: Uuid) -> String {
         .replace("{model}", &filler)
         .replace("{deployment}", &filler)
         .replace("{execution}", &filler)
+        .replace("{sequence}", "1")
         .replace("{hold}", &filler)
         .replace("{session}", &filler)
         .replace("{token}", &filler)

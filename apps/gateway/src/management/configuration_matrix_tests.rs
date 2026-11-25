@@ -143,6 +143,23 @@ async fn every_json_management_write_rejects_unknown_fields_after_valid_control(
     let execution = Uuid::new_v4();
     sqlx::query("INSERT INTO inference_executions(id,workspace_id,api_key_id,deployment_id,public_model,provider,streamed,state,root_request_id,attempt_number) VALUES($1,$2,$3,$4,'matrix-existing','openai',false,'succeeded',$1,1)").bind(execution).bind(ws).bind(reconciliation_key_id).bind(deployment).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO governance_reservations(execution_id,workspace_id,api_key_id,deployment_id,admitted_at,minute_start,month_start,lease_expires_at,state,held_microusd,unbounded_cost,price_id) SELECT $1,$2,$3,$4,e.started_at,date_trunc('minute',e.started_at,'UTC'),date_trunc('month',e.started_at,'UTC'),now()-interval '1 day','unknown',10,false,$5 FROM inference_executions e WHERE e.id=$1").bind(execution).bind(ws).bind(reconciliation_key_id).bind(deployment).bind(price_id).execute(&pool).await.unwrap();
+    // A finished realtime session with one unknown response (#804), on its
+    // own pricing v3 version: the control resolves it.
+    let realtime = Uuid::new_v4();
+    let realtime_price = Uuid::new_v4();
+    let line = |m: &str| json!({"meter":m,"microusd_per_batch":"1000000","batch":1000000,"unit_label":"/M tokens","sku_label":"Line"});
+    let na = |m: &str| json!({"meter":m,"not_applicable":true});
+    let lines = json!([line("input_tokens"), line("cache_read_tokens"), line("output_tokens"), line("input_audio_tokens"), line("cache_read_audio_tokens"), line("output_audio_tokens"), na("cache_write_tokens"), na("cache_write_5m_tokens"), na("cache_write_1h_tokens"), na("output_images"), na("input_characters"), na("input_audio_seconds_ms"), na("output_audio_seconds_ms"), na("search_units"), {"meter":"requests","microusd_per_batch":"0","batch":1,"unit_label":"/request","sku_label":"Request"}]);
+    sqlx::query("INSERT INTO deployment_prices(id,deployment_id,input_token_limit,output_token_limit,pricing_version,price_lines,max_units) VALUES($1,$2,1000,100,3,$3,'{}')").bind(realtime_price).bind(deployment).bind(lines).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO inference_executions(id,workspace_id,api_key_id,deployment_id,public_model,provider,streamed,state,root_request_id,attempt_number,workload_kind) VALUES($1,$2,$3,$4,'matrix-realtime','openai',true,'succeeded',$1,1,'realtime')").bind(realtime).bind(ws).bind(reconciliation_key_id).bind(deployment).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO governance_reservations(execution_id,workspace_id,api_key_id,deployment_id,admitted_at,minute_start,month_start,lease_expires_at,state,held_microusd,unbounded_cost,price_id) SELECT $1,$2,$3,$4,e.started_at,date_trunc('minute',e.started_at,'UTC'),date_trunc('month',e.started_at,'UTC'),now()-interval '1 day','unknown',10,false,$5 FROM inference_executions e WHERE e.id=$1").bind(realtime).bind(ws).bind(reconciliation_key_id).bind(deployment).bind(realtime_price).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO realtime_responses(execution_id,sequence,state,window_hold_microusd,completed_at) VALUES($1,1,'unknown',10,clock_timestamp())").bind(realtime).execute(&pool).await.unwrap();
+    // An idle-killed realtime session (lease expiry; its one response settled
+    // live and its hold is that response's actual): the control settles it.
+    let idle = Uuid::new_v4();
+    sqlx::query("INSERT INTO inference_executions(id,workspace_id,api_key_id,deployment_id,public_model,provider,streamed,state,error_code,root_request_id,attempt_number,workload_kind) VALUES($1,$2,$3,$4,'matrix-realtime','openai',true,'cancelled','lease_expired',$1,1,'realtime')").bind(idle).bind(ws).bind(reconciliation_key_id).bind(deployment).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO governance_reservations(execution_id,workspace_id,api_key_id,deployment_id,admitted_at,minute_start,month_start,lease_expires_at,state,held_microusd,unbounded_cost,price_id) SELECT $1,$2,$3,$4,e.started_at,date_trunc('minute',e.started_at,'UTC'),date_trunc('month',e.started_at,'UTC'),now()-interval '1 day','unknown',2,false,$5 FROM inference_executions e WHERE e.id=$1").bind(idle).bind(ws).bind(reconciliation_key_id).bind(deployment).bind(realtime_price).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO realtime_responses(execution_id,sequence,state,status,window_hold_microusd,actual_microusd,input_text_tokens,cached_text_tokens,input_audio_tokens,cached_audio_tokens,output_text_tokens,output_audio_tokens,completed_at) VALUES($1,1,'settled','completed',10,2,1,0,0,0,1,0,clock_timestamp())").bind(idle).execute(&pool).await.unwrap();
     let cost_center = Uuid::new_v4();
     sqlx::query("INSERT INTO cost_centers(id,name,code) VALUES($1,'Existing','existing')")
         .bind(cost_center)
@@ -694,6 +711,20 @@ async fn every_json_management_write_rejects_unknown_fields_after_valid_control(
         format!("{workspace}/costs/{execution}/reconcile"),
         &f.admin,
         json!({"input_tokens":"1","output_tokens":"1","billing_usage":null,"evidence":"configuration control"})
+    );
+    case!(
+        "governance::realtime_resolution::reconcile_realtime_response",
+        "POST",
+        format!("{workspace}/costs/{realtime}/realtime-responses/1/reconcile"),
+        &f.admin,
+        json!({"input_text_tokens":"1","cached_text_tokens":"0","input_audio_tokens":"0","cached_audio_tokens":"0","output_text_tokens":"1","output_audio_tokens":"0","evidence":"configuration control"})
+    );
+    case!(
+        "governance::realtime_resolution::reconcile_realtime_session",
+        "POST",
+        format!("{workspace}/costs/{idle}/realtime-session/reconcile"),
+        &f.admin,
+        json!({"evidence":"configuration control"})
     );
     case!(
         "governance::batch_envelopes::resolve",

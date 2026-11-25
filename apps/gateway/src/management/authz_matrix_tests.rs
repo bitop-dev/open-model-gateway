@@ -876,6 +876,18 @@ async fn every_route_refuses_lower_principals_and_unverified_mutations(pool: PgP
             StatusCode::UNPROCESSABLE_ENTITY,
         ),
         (
+            "POST",
+            "/api/v1/workspaces/{ws}/costs/{execution}/realtime-responses/{sequence}/reconcile",
+            &admin,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "POST",
+            "/api/v1/workspaces/{ws}/costs/{execution}/realtime-session/reconcile",
+            &admin,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
             "GET",
             "/api/v1/workspaces/{ws}/keys",
             &member_session,

@@ -34,6 +34,7 @@ export default defineConfig({
     { name: "admin-tokens", testMatch: /admin-tokens\.spec\.ts/, dependencies: ["journey"] },
     { name: "scheduled-reports", testMatch: /scheduled-reports\.spec\.ts/, dependencies: ["journey"] },
     { name: "holds", testMatch: /holds\.spec\.ts/, dependencies: ["journey"] },
+    { name: "realtime-resolution", testMatch: /realtime-resolution\.spec\.ts/, dependencies: ["journey"] },
     { name: "provider-reconciliation", testMatch: /provider-reconciliation\.spec\.ts/, dependencies: ["journey"] },
     // Standalone real-stack acceptance; seeds its own scopes through management APIs.
     { name: "provider-cost-upload", testMatch: /provider-cost-upload\.spec\.ts/ },
