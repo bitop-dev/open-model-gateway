@@ -254,7 +254,7 @@ Every replica uses these connections:
 
 | Consumer | Connections | Target |
 |---|---|---|
-| Main pool | up to `GATEWAY_DATABASE_MAX_CONNECTIONS` (default 10, chart 32, range 2–500) | PgBouncer or the primary |
+| Main pool | `GATEWAY_DATABASE_MAX_CONNECTIONS` (default 10, chart 32, range 2–500), all opened before `serve` listens and kept open (#132) | PgBouncer or the primary |
 | LISTEN session | 1, when `GATEWAY_CONFIG_CACHE=on` | the primary directly |
 | Reporting pool (optional) | up to `GATEWAY_DATABASE_MAX_CONNECTIONS`, opened lazily | the standby set in `GATEWAY_REPORTING_DATABASE_URL` |
 
@@ -267,9 +267,11 @@ Outside the replicas:
 - Every CLI command (`budget verify`, `history verify`, `partitions`, `archive`, `wait-for-database` and others) opens its own connections; budget at least one per running command.
 - Leave room for your platform's own sessions (the Pooler's `auth_query`, monitoring, `superuser_reserved_connections`).
 
-Worked example with the chart defaults (`replicaCount: 3`, pool 32, Pooler `instances: 2`, `max_client_conn: 200`, `default_pool_size: 25`):
+`serve` opens its whole main pool before it listens, so a replica only becomes ready once the database (or PgBouncer) has given it every connection, within 10 s; otherwise startup fails, as it does for an unreachable database. A replica that joins under load therefore never opens connections while its first requests wait (#132: six replicas opening their pools under 20 requests/s turned a quarter of the first requests into `accounting_unavailable`). The budget is the same as before, `replicas × GATEWAY_DATABASE_MAX_CONNECTIONS`, but it is used from startup rather than at the first peak, so a deployment over its budget now fails at startup, with a message naming `GATEWAY_DATABASE_MAX_CONNECTIONS`.
 
-- **Gateway to PgBouncer:** up to 3 × 32 = 96 client connections. Each PgBouncer instance enforces its own `max_client_conn`, and the Service may not spread connections evenly, so size every instance for the total plus headroom. At 6 replicas the total is 192, close to the default 200.
+Worked example with the chart defaults (`replicaCount: 3`, pool 32, Pooler `instances: 2`, `max_client_conn: 400`, `default_pool_size: 25`):
+
+- **Gateway to PgBouncer:** 3 × 32 = 96 client connections, open from startup. Each PgBouncer instance enforces its own `max_client_conn`, and the Service may not spread connections evenly, so size every instance for the total plus headroom. At the HPA's maximum of 10 replicas the total is 320, within 400 on one instance. Idle client connections use no server connection in transaction mode.
 - **PgBouncer to PostgreSQL:** up to 2 × 25 = 50 server connections for the runtime role. Size `default_pool_size` for the connections that are actually busy, not the maximum ([PgBouncer](operations.md#pgbouncer)).
 - **Direct to the primary:** 3 LISTEN sessions, plus the migrator, backups and tools while they run.
 - **Standby:** 3 × 32 = 96 reporting connections if the reporting replica is enabled. PostgreSQL requires a hot standby's `max_connections` to be at least the primary's, so set both to the larger need.

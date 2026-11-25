@@ -453,7 +453,11 @@ cnpg:
     instances: 2
     poolMode: transaction
     parameters:
-      max_client_conn: "200"
+      # Every replica opens its whole pool at startup (#132); idle client
+      # connections cost PgBouncer no server connection in transaction mode.
+      # 400 holds hpa.maxReplicas (10) x GATEWAY_DATABASE_MAX_CONNECTIONS (32)
+      # on one instance, however unevenly the Service spreads them.
+      max_client_conn: "400"
       default_pool_size: "25"
       max_prepared_statements: "200"
     resources:

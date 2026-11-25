@@ -23,8 +23,10 @@
 //! condition, on a disposable database only.
 //!
 //! The recovery scenario reads `OMG_LOCK_STALL_REPLICAS` (1),
-//! `_COMMIT_MS` (5), `_UPSTREAM_MS` (250), `_STALL_MS` (5000) and `_RATE`
-//! (10 requests per second) for measurements off CI (several replicas, each
+//! `_COMMIT_MS` (5), `_UPSTREAM_MS` (250), `_STALL_MS` (5000), `_RATE`
+//! (10 requests per second) and `_MEASURE` (1: print without asserting the
+//! shed and recovery bounds; the accounting is still asserted) for
+//! measurements off CI (several replicas, each
 //! with its own pool of 10 and gates, share the scope); unset, it runs the
 //! CI configuration.
 //!
@@ -148,12 +150,20 @@ async fn on_multi_thread(scenario: impl Future<Output = ()> + Send + 'static) {
     }
 }
 
+/// `n`, or 0 for a measurement of cold pools (`OMG_LOCK_STALL_COLD_POOLS`).
+fn cold_or(n: u32) -> u32 {
+    if std::env::var("OMG_LOCK_STALL_COLD_POOLS").as_deref() == Ok("1") {
+        0
+    } else {
+        n
+    }
+}
 /// A runtime pool of 10 as `serve` opens one (all connections open before
-/// any load, as after a warm start).
+/// any load).
 async fn runtime_pool(options: &sqlx::postgres::PgConnectOptions) -> PgPool {
     let pool = PgPoolOptions::new()
         .max_connections(POOL_SIZE)
-        .min_connections(POOL_SIZE)
+        .min_connections(cold_or(POOL_SIZE))
         .acquire_timeout(crate::config::ACQUIRE_TIMEOUT)
         .after_connect(|c, _| {
             Box::pin(async move {
@@ -169,13 +179,13 @@ async fn runtime_pool(options: &sqlx::postgres::PgConnectOptions) -> PgPool {
         )
         .await
         .unwrap();
-    tokio::time::timeout(GUARD, async {
-        while pool.size() < POOL_SIZE {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
+    // As `serve` opens it (`Config::connect_serving`), unless the measurement
+    // asks for today's pool before #132, which opens connections on demand.
+    if std::env::var("OMG_LOCK_STALL_COLD_POOLS").as_deref() != Ok("1") {
+        crate::config::open_pool(&pool, POOL_SIZE, crate::config::OPEN_POOL_TIMEOUT)
+            .await
+            .unwrap();
+    }
     pool
 }
 
@@ -621,6 +631,9 @@ struct Knobs {
     stall: Duration,
     /// Offered requests per second.
     rate: f64,
+    /// Print the numbers without asserting the shed and recovery bounds (a
+    /// before/after comparison); the accounting is still asserted.
+    measure: bool,
 }
 impl Knobs {
     fn from_env() -> Self {
@@ -638,6 +651,7 @@ impl Knobs {
             upstream_ms: var("UPSTREAM_MS").unwrap_or(UPSTREAM_MS),
             stall: var("STALL_MS").map_or(STALL, Duration::from_millis),
             rate: var("RATE").unwrap_or(RATE),
+            measure: var::<u8>("MEASURE").is_some_and(|m| m == 1),
         };
         assert!(knobs.replicas >= 1, "OMG_LOCK_STALL_REPLICAS is at least 1");
         assert!(
@@ -669,7 +683,7 @@ async fn stall_recovery(setup: Setup) {
     // Only settlements caught in flight by the stall end unknown: the
     // requests sent into it were shed, and the ones after it settle.
     assert!(
-        unknown as usize <= in_flight,
+        knobs.measure || unknown as usize <= in_flight,
         "only the settlements in flight at the stall's start end unknown"
     );
 }
@@ -908,19 +922,20 @@ fn assess(rows: &[Row], run: &Run, knobs: &Knobs) {
         ms(median),
         ms(slowest)
     );
-    assert!(!into.is_empty(), "requests were sent into the stall");
-    assert!(
-        into.iter()
-            .all(|s| s.shed
-                && s.retry_after == Some(crate::inference::error::SCOPE_BUSY_RETRY_SECONDS)),
-        "every request sent into the stall is shed with Retry-After, not left waiting"
+    let check = |ok: bool, what: &str| assert!(knobs.measure || ok, "{what}");
+    check(!into.is_empty(), "requests were sent into the stall");
+    check(
+        into.iter().all(|s| {
+            s.shed && s.retry_after == Some(crate::inference::error::SCOPE_BUSY_RETRY_SECONDS)
+        }),
+        "every request sent into the stall is shed with Retry-After, not left waiting",
     );
     // Shed when the bound elapses (the time outside admission, a busy pool
     // or a slow disk, adds to some), never after the stall's length.
-    assert!(
+    check(
         median <= ADMISSION_LOCK_WAIT + Duration::from_millis(500)
             && slowest + Duration::from_secs(1) < stall,
-        "shed when the bound elapses, not after the stall"
+        "shed when the bound elapses, not after the stall",
     );
     // The windows before the stall after the first second, without the
     // requests still in flight when it began.
@@ -937,9 +952,9 @@ fn assess(rows: &[Row], run: &Run, knobs: &Knobs) {
         "lock_stall recovery baseline_ok_fraction={base_ok:.2} baseline_median_p99_ms={}",
         ms(base_p99)
     );
-    assert!(
+    check(
         sent > 0 && base_ok >= 0.99,
-        "the load is within capacity before the stall"
+        "the load is within capacity before the stall",
     );
     let p99_bound = base_p99 * 3 + Duration::from_millis(100);
     // Judged up to `HORIZON` past the bound: a later hiccup (a slow WAL fsync
@@ -959,9 +974,8 @@ fn assess(rows: &[Row], run: &Run, knobs: &Knobs) {
         ms(RECOVERY),
         ms(p99_bound)
     );
-    assert!(
+    check(
         recovered.is_some_and(|r| r <= RECOVERY),
-        "throughput and latency did not return to the pre-stall level within {}ms of the release",
-        ms(RECOVERY)
+        "throughput and latency did not return to the pre-stall level within the bound",
     );
 }

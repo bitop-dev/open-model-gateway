@@ -435,6 +435,32 @@ impl Environment {
 /// keeps the two equal), which starts first.
 pub(crate) const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How long `serve` waits for all its pool's connections at startup.
+pub(crate) const OPEN_POOL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Open `connections` connections of `pool` at once (each acquire opens one
+/// while fewer are open), within `within`, and return them to it.
+pub(crate) async fn open_pool(
+    pool: &sqlx::PgPool,
+    connections: u32,
+    within: Duration,
+) -> Result<()> {
+    let opening = futures_util::future::try_join_all((0..connections).map(|_| pool.acquire()));
+    match tokio::time::timeout(within, opening).await {
+        Ok(Ok(open)) => {
+            drop(open);
+            Ok(())
+        }
+        Ok(Err(_)) => bail!(
+            "could not open the database pool's {connections} connections (GATEWAY_DATABASE_MAX_CONNECTIONS): the database refused or ran out of connections"
+        ),
+        Err(_) => bail!(
+            "could not open the database pool's {connections} connections (GATEWAY_DATABASE_MAX_CONNECTIONS) within {}s",
+            within.as_secs()
+        ),
+    }
+}
+
 impl Config {
     pub fn from_env() -> Result<Self> {
         let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
@@ -521,6 +547,24 @@ impl Config {
             .connect(&self.database_url)
             .await
             .context("could not connect to PostgreSQL")
+    }
+
+    /// The primary pool of `serve`: all `GATEWAY_DATABASE_MAX_CONNECTIONS`
+    /// connections opened before the gateway listens (so before it is
+    /// ready), and kept open (`min_connections`), so a replica that joins
+    /// under load never opens connections while its first requests wait for
+    /// them. A database that cannot give them within [`OPEN_POOL_TIMEOUT`]
+    /// fails startup, as an unreachable one does. One-shot commands keep the
+    /// pool that opens connections when needed ([`Config::connect`]).
+    pub async fn connect_serving(&self) -> Result<sqlx::PgPool> {
+        let pool = self
+            .primary_pool_options()
+            .min_connections(self.database_max_connections)
+            .connect(&self.database_url)
+            .await
+            .context("could not connect to PostgreSQL")?;
+        open_pool(&pool, self.database_max_connections, OPEN_POOL_TIMEOUT).await?;
+        Ok(pool)
     }
 
     pub async fn connect_bootstrap_dev(&self) -> Result<sqlx::PgPool> {
@@ -781,6 +825,38 @@ mod metrics_export_config_tests;
 #[cfg(test)]
 #[path = "logs_export_config_tests.rs"]
 mod logs_export_config_tests;
+
+/// `serve` opens its whole pool before it listens: every connection is
+/// open and idle afterwards, and a database that cannot give them in time
+/// refuses startup.
+#[cfg(all(test, feature = "integration-tests"))]
+mod open_pool_tests {
+    use super::*;
+    #[dbtest::test]
+    async fn serve_opens_every_connection_of_its_pool_before_listening(pool: sqlx::PgPool) {
+        let serving = PgPoolOptions::new()
+            .max_connections(4)
+            .min_connections(4)
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .unwrap();
+        open_pool(&serving, 4, OPEN_POOL_TIMEOUT).await.unwrap();
+        assert_eq!(serving.size(), 4);
+        // Returned to the pool (asynchronously): all four idle and ready.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while serving.num_idle() < 4 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let lazy = PgPoolOptions::new()
+            .max_connections(4)
+            .connect_lazy_with((*pool.connect_options()).clone());
+        let error = open_pool(&lazy, 4, Duration::ZERO).await.unwrap_err();
+        assert!(error.to_string().contains("within 0s"), "{error}");
+    }
+}
 
 #[path = "config_count_limit.rs"]
 mod count_limit;

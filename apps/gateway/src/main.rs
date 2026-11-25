@@ -385,6 +385,9 @@ async fn run(cli: Cli, process_start_unix_nano: u64) -> Result<()> {
         .transpose()?;
     let pool = if matches!(cli.command, Some(Command::BootstrapDev)) {
         config.connect_bootstrap_dev().await?
+    } else if matches!(cli.command, None | Some(Command::Serve)) {
+        // Every connection open before the listener binds (`connect_serving`).
+        config.connect_serving().await?
     } else {
         config.connect().await?
     };
