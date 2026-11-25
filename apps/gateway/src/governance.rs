@@ -347,6 +347,9 @@ pub mod rates;
 mod reconcile;
 /// Settlement, valuation and ledger writes of one attempt.
 mod settlement;
+/// The hot statements `db::warm` prepares on every connection of `serve`.
+pub(crate) use pricing::PRICE_BY_ID_SQL;
+pub(crate) use settlement::{RESERVATION_LOCKED_SQL, SETTLE_SQL};
 /// Maintained per-scope, per-period budget totals and their consistency check.
 pub mod totals;
 pub(crate) use admission::generation_bound;
@@ -431,8 +434,15 @@ async fn admit_unobserved(
     let (lineage, shared) = authorize(store, &mut tx, &record.principal).await?;
     // The deployment check also reads the admission clock and the latest
     // price id (one round trip).
-    let row=sqlx::query(&format!("SELECT d.id,p.provider,d.upstream_model,p.credential_ref,p.endpoint,p.region,m.supported_protocols,clock_timestamp() AS admission_now,(SELECT x.id FROM deployment_prices x WHERE x.deployment_id=d.id ORDER BY x.created_at DESC,x.id DESC LIMIT 1) AS latest_price_id FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id JOIN models m ON m.id=d.model_id WHERE d.id=$2 AND m.public_name=$3 AND workspace_model_allowed($1,m.id) AND d.enabled AND p.enabled AND (NOT EXISTS(SELECT 1 FROM key_model_restrictions WHERE workspace_id=$1 AND governance_key_id=$4) OR EXISTS(SELECT 1 FROM key_model_selections WHERE workspace_id=$1 AND governance_key_id=$4 AND model_id=m.id)){}", catalog_share(store)))
-        .bind(workspace).bind(record.deployment_id).bind(&record.model).bind(lineage).fetch_optional(&mut *tx).await.map_err(storage)?.ok_or(InferenceError::ModelUnavailable)?;
+    let row = sqlx::query(&admission_deployment_sql(catalog_share(store)))
+        .bind(workspace)
+        .bind(record.deployment_id)
+        .bind(&record.model)
+        .bind(lineage)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(storage)?
+        .ok_or(InferenceError::ModelUnavailable)?;
     let current = <Deployment as sqlx::FromRow<_>>::from_row(&row).map_err(storage)?;
     let database_now: UtcInstant = sqlx::Row::try_get(&row, "admission_now").map_err(storage)?;
     let price = match read_price {
@@ -562,12 +572,32 @@ async fn admit_unobserved(
     // Execution, reservation and ledger hold in one statement (the totals and
     // counter triggers fire at its end); the hold row is what `ledger` writes
     // for a hold without usage.
-    let written = sqlx::query("WITH e AS (INSERT INTO inference_executions(id,workspace_id,api_key_id,deployment_id,public_model,provider,streamed,state,started_at,root_request_id,attempt_number,workload_kind,cost_center_id,cost_center_name,cost_center_code,upstream_model,client_session_id,client_app) SELECT $1,w.id,$3,$4,$5,$6,$7,'started',$8,$9,$10,$11,w.cost_center_id,c.name,c.code,$12,$13,$14 FROM workspaces w LEFT JOIN cost_centers c ON c.id=w.cost_center_id WHERE w.id=$2 RETURNING id),
-      r AS (INSERT INTO governance_reservations(execution_id,workspace_id,api_key_id,deployment_id,price_id,admitted_at,minute_start,month_start,lease_expires_at,state,reserved_tokens,held_microusd,unbounded_cost,request_count) SELECT e.id,$2,$3,$4,$15,$8,date_trunc('minute',$8::timestamptz,'UTC'),date_trunc('month',$8::timestamptz,'UTC'),$16,'pending',$17,$18,$19,$20 FROM e RETURNING execution_id)
-      INSERT INTO monetary_ledger(id,execution_id,kind,amount_microusd,admitted_at) SELECT $21,execution_id,'hold',$18,$8 FROM r")
-        .bind(record.id).bind(workspace).bind(key).bind(record.deployment_id).bind(&record.model).bind(&record.provider).bind(record.streamed).bind(now).bind(record.root_request_id).bind(record.attempt_number).bind(workload.kind.as_str()).bind(&record.upstream_model).bind(&record.client.session_id).bind(&record.client.app)
-        .bind(price.as_ref().map(|p|p.id)).bind(lease).bind(tokens).bind(held).bind(held.is_none()).bind(request_count).bind(Uuid::now_v7())
-        .execute(&mut *tx).await.map_err(storage)?.rows_affected();
+    let written = sqlx::query(ADMIT_SQL)
+        .bind(record.id)
+        .bind(workspace)
+        .bind(key)
+        .bind(record.deployment_id)
+        .bind(&record.model)
+        .bind(&record.provider)
+        .bind(record.streamed)
+        .bind(now)
+        .bind(record.root_request_id)
+        .bind(record.attempt_number)
+        .bind(workload.kind.as_str())
+        .bind(&record.upstream_model)
+        .bind(&record.client.session_id)
+        .bind(&record.client.app)
+        .bind(price.as_ref().map(|p| p.id))
+        .bind(lease)
+        .bind(tokens)
+        .bind(held)
+        .bind(held.is_none())
+        .bind(request_count)
+        .bind(Uuid::now_v7())
+        .execute(&mut *tx)
+        .await
+        .map_err(storage)?
+        .rows_affected();
     if written != 1 {
         return Err(InferenceError::Storage);
     }
@@ -661,3 +691,16 @@ mod v3_tests;
 mod workload_tests;
 
 pub(crate) use pricing::entirely_free_price;
+
+pub(crate) const ADMIT_SQL: &str = "WITH e AS (INSERT INTO inference_executions(id,workspace_id,api_key_id,deployment_id,public_model,provider,streamed,state,started_at,root_request_id,attempt_number,workload_kind,cost_center_id,cost_center_name,cost_center_code,upstream_model,client_session_id,client_app) SELECT $1,w.id,$3,$4,$5,$6,$7,'started',$8,$9,$10,$11,w.cost_center_id,c.name,c.code,$12,$13,$14 FROM workspaces w LEFT JOIN cost_centers c ON c.id=w.cost_center_id WHERE w.id=$2 RETURNING id),
+      r AS (INSERT INTO governance_reservations(execution_id,workspace_id,api_key_id,deployment_id,price_id,admitted_at,minute_start,month_start,lease_expires_at,state,reserved_tokens,held_microusd,unbounded_cost,request_count) SELECT e.id,$2,$3,$4,$15,$8,date_trunc('minute',$8::timestamptz,'UTC'),date_trunc('month',$8::timestamptz,'UTC'),$16,'pending',$17,$18,$19,$20 FROM e RETURNING execution_id)
+      INSERT INTO monetary_ledger(id,execution_id,kind,amount_microusd,admitted_at) SELECT $21,execution_id,'hold',$18,$8 FROM r";
+
+/// The deployment check of an admission, with the admission clock and the
+/// latest price id; `share` is [`catalog_share`] of the admission mode.
+pub(crate) fn admission_deployment_sql(share: &str) -> String {
+    format!(
+        "SELECT d.id,p.provider,d.upstream_model,p.credential_ref,p.endpoint,p.region,m.supported_protocols,clock_timestamp() AS admission_now,(SELECT x.id FROM deployment_prices x WHERE x.deployment_id=d.id ORDER BY x.created_at DESC,x.id DESC LIMIT 1) AS latest_price_id FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id JOIN models m ON m.id=d.model_id WHERE d.id=$2 AND m.public_name=$3 AND workspace_model_allowed($1,m.id) AND d.enabled AND p.enabled AND (NOT EXISTS(SELECT 1 FROM key_model_restrictions WHERE workspace_id=$1 AND governance_key_id=$4) OR EXISTS(SELECT 1 FROM key_model_selections WHERE workspace_id=$1 AND governance_key_id=$4 AND model_id=m.id)){}",
+        share
+    )
+}

@@ -170,6 +170,13 @@ pub(crate) async fn revalidate_admission(
 ) -> Result<Option<(Uuid, bool)>, sqlx::Error> {
     revalidate_admission_with(tx, principal, true).await
 }
+/// [`ADMISSION_SQL`] without its row locks, as scoped admission runs it.
+pub(crate) static ADMISSION_SQL_UNLOCKED: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        ADMISSION_SQL
+            .replace(" FOR SHARE OF k,w", "")
+            .replace(" FOR SHARE", "")
+    });
 
 /// [`revalidate_admission`] with (`lock`, the global admission mode) or
 /// without row locks (scoped admission: the caller holds the shared
@@ -186,15 +193,10 @@ pub(crate) async fn revalidate_admission_with(
     lock: bool,
 ) -> Result<Option<(Uuid, bool)>, sqlx::Error> {
     type Row = (Uuid, String, Option<Uuid>, i64, i64, i64, i64);
-    static UNLOCKED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        ADMISSION_SQL
-            .replace(" FOR SHARE OF k,w", "")
-            .replace(" FOR SHARE", "")
-    });
     let row: Option<Row> = sqlx::query_as(if lock {
         ADMISSION_SQL
     } else {
-        UNLOCKED.as_str()
+        ADMISSION_SQL_UNLOCKED.as_str()
     })
     .bind(principal.workspace_id)
     .bind(principal.key_id)

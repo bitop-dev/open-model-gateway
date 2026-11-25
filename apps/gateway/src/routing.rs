@@ -223,8 +223,17 @@ async fn live_inputs(
         .await
         .map_err(route_lookup_storage)?
         .unwrap_or_default();
-    let rows = sqlx::query_as::<_, Candidate>(
-        r#"SELECT d.id AS deployment_id, COALESCE(r.priority,0) AS priority,
+    let rows = sqlx::query_as::<_, Candidate>(CANDIDATES_SQL)
+        .bind(principal.workspace_id)
+        .bind(model)
+        .bind(ids)
+        .fetch_all(&store.pool)
+        .await
+        .map_err(route_lookup_storage)?;
+    Ok((policy, rows))
+}
+
+pub(crate) const CANDIDATES_SQL: &str = r#"SELECT d.id AS deployment_id, COALESCE(r.priority,0) AS priority,
                   COALESCE(r.weight,1) AS weight, COALESCE(r.residency,'unspecified') AS residency,
                   false AS operator_disabled,
                   COALESCE(h.open_until > statement_timestamp(),false) AS circuit_open,
@@ -238,18 +247,32 @@ async fn live_inputs(
            LEFT JOIN deployment_routing r ON r.deployment_id=d.id
            LEFT JOIN deployment_health h ON h.deployment_id=d.id
            WHERE m.public_name=$2 AND workspace_model_allowed($1,m.id) AND d.enabled AND p.enabled
-           ORDER BY input.position"#,
-    )
-    .bind(principal.workspace_id)
-    .bind(model)
-    .bind(ids)
-    .fetch_all(&store.pool)
-    .await
-    .map_err(route_lookup_storage)?;
-    Ok((policy, rows))
-}
+           ORDER BY input.position"#;
 
-const POLICY_SQL: &str = r#"SELECT r.strategy, r.max_attempts, r.allow_ambiguous_failover,
+pub(crate) const HEALTH_STATE_SQL: &str = "SELECT consecutive_failures=0 AND open_until IS NULL, last_observed_at>clock_timestamp()-$2*interval '1 second' FROM deployment_health WHERE deployment_id=$1";
+
+pub(crate) const HEALTH_RECORD_SQL: &str = r#"WITH policy AS (
+            SELECT COALESCE(p.failure_threshold,3) AS threshold,
+                   COALESCE(p.cooldown_seconds,30) AS cooldown
+            FROM deployments d LEFT JOIN deployment_routing p
+              ON p.deployment_id=d.id
+            WHERE d.id=$1
+        )
+        INSERT INTO deployment_health AS h
+            (deployment_id, consecutive_failures, open_until, last_observed_at)
+        SELECT $1, CASE WHEN $2 THEN 1 ELSE 0 END,
+            CASE WHEN $2 AND threshold <= 1 THEN clock_timestamp() + make_interval(secs => cooldown) ELSE NULL END,
+            clock_timestamp() FROM policy
+        ON CONFLICT (deployment_id) DO UPDATE SET
+            consecutive_failures=CASE WHEN $2 THEN LEAST(h.consecutive_failures::bigint+1,2147483647)::integer ELSE 0 END,
+            open_until=CASE
+                WHEN NOT $2 THEN NULL
+                WHEN h.consecutive_failures::bigint+1 >= (SELECT threshold FROM policy)
+                    THEN GREATEST(h.open_until, clock_timestamp() + make_interval(secs => (SELECT cooldown FROM policy)))
+                ELSE h.open_until END,
+            last_observed_at=clock_timestamp()"#;
+
+pub(crate) const POLICY_SQL: &str = r#"SELECT r.strategy, r.max_attempts, r.allow_ambiguous_failover,
                   3 AS failure_threshold, 30 AS cooldown_seconds, r.required_residency
            FROM routing_policies r JOIN models m ON m.id=r.model_id
            WHERE workspace_model_allowed($1,m.id) AND m.public_name=$2"#;
@@ -563,7 +586,7 @@ pub async fn record_result(
         return Ok(());
     }
     if error.is_none() {
-        let state: Option<(bool, bool)> = sqlx::query_as("SELECT consecutive_failures=0 AND open_until IS NULL, last_observed_at>clock_timestamp()-$2*interval '1 second' FROM deployment_health WHERE deployment_id=$1")
+        let state: Option<(bool, bool)> = sqlx::query_as(HEALTH_STATE_SQL)
             .bind(deployment)
             .bind(OBSERVED_REFRESH_SECONDS)
             .fetch_optional(&store.pool)
@@ -604,29 +627,12 @@ pub async fn record_result(
             _ => {}
         }
     }
-    let result = sqlx::query(
-        r#"WITH policy AS (
-            SELECT COALESCE(p.failure_threshold,3) AS threshold,
-                   COALESCE(p.cooldown_seconds,30) AS cooldown
-            FROM deployments d LEFT JOIN deployment_routing p
-              ON p.deployment_id=d.id
-            WHERE d.id=$1
-        )
-        INSERT INTO deployment_health AS h
-            (deployment_id, consecutive_failures, open_until, last_observed_at)
-        SELECT $1, CASE WHEN $2 THEN 1 ELSE 0 END,
-            CASE WHEN $2 AND threshold <= 1 THEN clock_timestamp() + make_interval(secs => cooldown) ELSE NULL END,
-            clock_timestamp() FROM policy
-        ON CONFLICT (deployment_id) DO UPDATE SET
-            consecutive_failures=CASE WHEN $2 THEN LEAST(h.consecutive_failures::bigint+1,2147483647)::integer ELSE 0 END,
-            open_until=CASE
-                WHEN NOT $2 THEN NULL
-                WHEN h.consecutive_failures::bigint+1 >= (SELECT threshold FROM policy)
-                    THEN GREATEST(h.open_until, clock_timestamp() + make_interval(secs => (SELECT cooldown FROM policy)))
-                ELSE h.open_until END,
-            last_observed_at=clock_timestamp()"#,
-    ).bind(deployment).bind(error.is_some()).execute(&store.pool)
-        .await.map_err(|_| InferenceError::Storage)?;
+    let result = sqlx::query(HEALTH_RECORD_SQL)
+        .bind(deployment)
+        .bind(error.is_some())
+        .execute(&store.pool)
+        .await
+        .map_err(|_| InferenceError::Storage)?;
     store.caches.forget_health(deployment);
     if result.rows_affected() != 1 {
         return Err(InferenceError::ModelUnavailable);

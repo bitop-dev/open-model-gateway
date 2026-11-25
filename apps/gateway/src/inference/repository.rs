@@ -511,16 +511,13 @@ impl Store {
             self.caches.forget_key(principal.key_id);
             return Err(InferenceError::Unauthenticated);
         };
-        let deployments = sqlx::query_as::<_, Deployment>(r#"
-            SELECT d.id,p.provider,d.upstream_model,p.credential_ref,p.endpoint,p.region,m.supported_protocols
-            FROM models m JOIN deployments d ON d.model_id=m.id
-            JOIN provider_connections p ON p.id=d.provider_connection_id
-            WHERE m.public_name=$2 AND workspace_model_allowed($1,m.id) AND d.enabled AND p.enabled
-              AND (NOT EXISTS(SELECT 1 FROM key_model_restrictions WHERE workspace_id=$1 AND governance_key_id=$3)
-                OR EXISTS(SELECT 1 FROM key_model_selections WHERE workspace_id=$1 AND governance_key_id=$3 AND model_id=m.id))
-            ORDER BY d.created_at,d.id LIMIT 257
-        "#).bind(principal.workspace_id).bind(model).bind(lineage)
-            .fetch_all(&mut *tx).await.map_err(route_lookup_storage)?;
+        let deployments = sqlx::query_as::<_, Deployment>(ROUTE_DEPLOYMENTS_SQL)
+            .bind(principal.workspace_id)
+            .bind(model)
+            .bind(lineage)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(route_lookup_storage)?;
         tx.commit().await.map_err(route_lookup_storage)?;
         if deployments.len() > crate::routing::MAX_CANDIDATES {
             return Err(InferenceError::Configuration);
@@ -544,3 +541,13 @@ impl Store {
         Ok(())
     }
 }
+
+pub(crate) const ROUTE_DEPLOYMENTS_SQL: &str = r#"
+            SELECT d.id,p.provider,d.upstream_model,p.credential_ref,p.endpoint,p.region,m.supported_protocols
+            FROM models m JOIN deployments d ON d.model_id=m.id
+            JOIN provider_connections p ON p.id=d.provider_connection_id
+            WHERE m.public_name=$2 AND workspace_model_allowed($1,m.id) AND d.enabled AND p.enabled
+              AND (NOT EXISTS(SELECT 1 FROM key_model_restrictions WHERE workspace_id=$1 AND governance_key_id=$3)
+                OR EXISTS(SELECT 1 FROM key_model_selections WHERE workspace_id=$1 AND governance_key_id=$3 AND model_id=m.id))
+            ORDER BY d.created_at,d.id LIMIT 257
+        "#;

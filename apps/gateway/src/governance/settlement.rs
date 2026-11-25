@@ -35,7 +35,7 @@ pub(super) async fn reservation(
     lock: bool,
 ) -> Result<Reservation, InferenceError> {
     sqlx::query_as(if lock {
-        "SELECT r.workspace_id,r.api_key_id,r.admitted_at,r.deployment_id,r.price_id,r.state,r.input_tokens,r.output_tokens,r.billing_usage,e.workload_kind,r.reserved_tokens,r.meter_usage,r.output_image_variant,r.provider_cost_microusd,e.provider,e.public_model,r.request_count,r.price_tier FROM governance_reservations r JOIN inference_executions e ON e.id=r.execution_id WHERE r.execution_id=$1 FOR UPDATE OF r"
+        RESERVATION_LOCKED_SQL
     } else {
         "SELECT r.workspace_id,r.api_key_id,r.admitted_at,r.deployment_id,r.price_id,r.state,r.input_tokens,r.output_tokens,r.billing_usage,e.workload_kind,r.reserved_tokens,r.meter_usage,r.output_image_variant,r.provider_cost_microusd,e.provider,e.public_model,r.request_count,r.price_tier FROM governance_reservations r JOIN inference_executions e ON e.id=r.execution_id WHERE r.execution_id=$1"
     }).bind(id).fetch_one(&mut **tx).await.map_err(storage)
@@ -701,15 +701,42 @@ async fn finish_unobserved(
     // enforced by the reservation -> execution key), so it touches one month
     // partition. The reservation and ledger writes run only when the
     // execution was still running; anything else fails and rolls back.
-    let (executions, reservations, entries): (i64, i64, i64) = sqlx::query_as("WITH e AS (UPDATE inference_executions SET state=$2,error_code=$3,input_tokens=$4,output_tokens=$5,billing_usage=$6,elapsed_ms=$7,completed_at=clock_timestamp(),meter_usage=$8,output_image_variant=$9,provider_cost_microusd=$10,finish_reason=$11,time_to_first_token_ms=$12,generation_ms=$13,reasoning_tokens=$14,reported_upstream_model=$15 WHERE id=$1 AND started_at=$16 AND state='started' RETURNING 1),
-      r AS (UPDATE governance_reservations SET state=$17,actual_microusd=$18,input_tokens=$4,output_tokens=$5,billing_usage=$6,cost_components=$19,held_microusd=CASE WHEN $20::bigint IS NULL THEN held_microusd ELSE greatest(held_microusd,$20) END,unbounded_cost=unbounded_cost OR $21,meter_usage=$8,output_image_variant=$9,provider_cost_microusd=$10 WHERE execution_id=$1 AND admitted_at=$16 AND EXISTS(SELECT 1 FROM e) RETURNING 1),
-      l AS (INSERT INTO monetary_ledger(id,execution_id,kind,amount_microusd,input_tokens,output_tokens,billing_usage,cost_components,evidence,meter_usage,output_image_variant,provider_cost_microusd,admitted_at) SELECT $22,$1,$23,$24,$4,$5,$6,$19,NULL,$8,$9,$10,$16 WHERE EXISTS(SELECT 1 FROM r) RETURNING 1)
-      SELECT (SELECT count(*) FROM e),(SELECT count(*) FROM r),(SELECT count(*) FROM l)")
-        .bind(record.id).bind(record.outcome.as_str()).bind(record.error.map(|e|e.code())).bind(input).bind(output).bind(&billing).bind(record.elapsed_ms.min(i64::MAX as u64)as i64).bind(&m.meters).bind(&m.variant).bind(m.provider_cost)
-        .bind(telemetry.finish_reason.map(|f|f.as_str())).bind(ms(telemetry.time_to_first_token_ms)).bind(ms(telemetry.generation_ms)).bind(reasoning).bind(&reported_model).bind(r.admitted_at)
-        .bind(if actual.is_some(){"settled"}else{"unknown"}).bind(actual).bind(components.map(|c|c.to_value())).bind(floor.filter(|_|actual.is_none())).bind(violated)
-        .bind(Uuid::now_v7()).bind(if actual.is_some(){"settlement"}else{"unknown"}).bind(actual.or(floor))
-        .fetch_one(&mut *tx).await.map_err(storage)?;
+    let (executions, reservations, entries): (i64, i64, i64) = sqlx::query_as(SETTLE_SQL)
+        .bind(record.id)
+        .bind(record.outcome.as_str())
+        .bind(record.error.map(|e| e.code()))
+        .bind(input)
+        .bind(output)
+        .bind(&billing)
+        .bind(record.elapsed_ms.min(i64::MAX as u64) as i64)
+        .bind(&m.meters)
+        .bind(&m.variant)
+        .bind(m.provider_cost)
+        .bind(telemetry.finish_reason.map(|f| f.as_str()))
+        .bind(ms(telemetry.time_to_first_token_ms))
+        .bind(ms(telemetry.generation_ms))
+        .bind(reasoning)
+        .bind(&reported_model)
+        .bind(r.admitted_at)
+        .bind(if actual.is_some() {
+            "settled"
+        } else {
+            "unknown"
+        })
+        .bind(actual)
+        .bind(components.map(|c| c.to_value()))
+        .bind(floor.filter(|_| actual.is_none()))
+        .bind(violated)
+        .bind(Uuid::now_v7())
+        .bind(if actual.is_some() {
+            "settlement"
+        } else {
+            "unknown"
+        })
+        .bind(actual.or(floor))
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(storage)?;
     if (executions, reservations, entries) != (1, 1, 1) {
         return Err(InferenceError::Storage);
     }
@@ -726,3 +753,10 @@ async fn finish_unobserved(
         output,
     })
 }
+
+pub(crate) const RESERVATION_LOCKED_SQL: &str = "SELECT r.workspace_id,r.api_key_id,r.admitted_at,r.deployment_id,r.price_id,r.state,r.input_tokens,r.output_tokens,r.billing_usage,e.workload_kind,r.reserved_tokens,r.meter_usage,r.output_image_variant,r.provider_cost_microusd,e.provider,e.public_model,r.request_count,r.price_tier FROM governance_reservations r JOIN inference_executions e ON e.id=r.execution_id WHERE r.execution_id=$1 FOR UPDATE OF r";
+
+pub(crate) const SETTLE_SQL: &str = "WITH e AS (UPDATE inference_executions SET state=$2,error_code=$3,input_tokens=$4,output_tokens=$5,billing_usage=$6,elapsed_ms=$7,completed_at=clock_timestamp(),meter_usage=$8,output_image_variant=$9,provider_cost_microusd=$10,finish_reason=$11,time_to_first_token_ms=$12,generation_ms=$13,reasoning_tokens=$14,reported_upstream_model=$15 WHERE id=$1 AND started_at=$16 AND state='started' RETURNING 1),
+      r AS (UPDATE governance_reservations SET state=$17,actual_microusd=$18,input_tokens=$4,output_tokens=$5,billing_usage=$6,cost_components=$19,held_microusd=CASE WHEN $20::bigint IS NULL THEN held_microusd ELSE greatest(held_microusd,$20) END,unbounded_cost=unbounded_cost OR $21,meter_usage=$8,output_image_variant=$9,provider_cost_microusd=$10 WHERE execution_id=$1 AND admitted_at=$16 AND EXISTS(SELECT 1 FROM e) RETURNING 1),
+      l AS (INSERT INTO monetary_ledger(id,execution_id,kind,amount_microusd,input_tokens,output_tokens,billing_usage,cost_components,evidence,meter_usage,output_image_variant,provider_cost_microusd,admitted_at) SELECT $22,$1,$23,$24,$4,$5,$6,$19,NULL,$8,$9,$10,$16 WHERE EXISTS(SELECT 1 FROM r) RETURNING 1)
+      SELECT (SELECT count(*) FROM e),(SELECT count(*) FROM r),(SELECT count(*) FROM l)";

@@ -93,6 +93,7 @@ impl Drop for Harness {
 }
 
 /// What the scenario needs from the test runtime's setup.
+#[derive(Clone)]
 struct Setup {
     options: sqlx::postgres::PgConnectOptions,
     user: Uuid,
@@ -174,9 +175,11 @@ async fn runtime_pool(options: &sqlx::postgres::PgConnectOptions) -> PgPool {
     if std::env::var("OMG_LOCK_STALL_COLD_POOLS").as_deref() == Ok("1") {
         pool.connect_with(options).await.unwrap()
     } else {
-        crate::db::startup::connect(pool, options, std::time::Duration::ZERO)
+        let pool = crate::db::startup::connect(pool, options, std::time::Duration::ZERO)
             .await
-            .unwrap()
+            .unwrap();
+        crate::db::warm::warm(&pool, crate::db::warm::WITHIN).await;
+        pool
     }
 }
 
@@ -536,6 +539,7 @@ async fn cold_buckets(setup: Setup) {
     // what is compared. It therefore does not show whether the production
     // bound would shed a burst; how many requests took longer than that
     // bound is printed per burst instead, a measurement of the runner.
+    let again = setup.clone();
     let h = harness(setup, 0, 1, GUARD).await;
     commit_latency(&h.owner).await;
     // A discarded first burst on a scope of its own: the first burst of a
@@ -600,10 +604,38 @@ async fn cold_buckets(setup: Setup) {
         ms(cold_max),
         ms(warm_max)
     );
+    // A new gateway on the same database, started as `serve` starts one
+    // (its whole pool opened and warmed) and with the production admission
+    // bound: its first burst, on a scope of its own, is not shed (`burst`
+    // requires every request to succeed) and is no slower than a later one,
+    // within the tolerance above.
+    let fresh = harness(again, 0, 1, ADMISSION_LOCK_WAIT).await;
+    let mut new_gateway = Vec::new();
+    for label in ["new_gateway_first", "new_gateway_later"] {
+        let (_, key) = new_scope(&fresh).await;
+        let (mut latencies, _) = burst(&fresh, &key, BURST).await;
+        let (p50, max) = (quantile(&mut latencies, 0.5), quantile(&mut latencies, 1.0));
+        eprintln!(
+            "lock_stall cold_bucket round={label} requests={BURST} p50_ms={} max_ms={} latency_over_admission_bound={}",
+            ms(p50),
+            ms(max),
+            over_bound(&latencies)
+        );
+        new_gateway.push((p50, max));
+    }
+    let ((first_p50, first_max), (later_p50, later_max)) = (new_gateway[0], new_gateway[1]);
+    assert!(
+        first_p50 <= bound(later_p50) && first_max <= bound(later_max),
+        "a new gateway's first burst is slower than a later one: p50 {}ms vs {}ms, max {}ms vs {}ms",
+        ms(first_p50),
+        ms(later_p50),
+        ms(first_max),
+        ms(later_max)
+    );
     let (settled, unknown) = assert_exact(&h).await;
     assert_eq!(
         (settled, unknown),
-        ((BURST + 1 + 2 * ROUNDS * BURST) as i64, 0),
+        ((BURST + 1 + 2 * ROUNDS * BURST + 2 * BURST) as i64, 0),
         "every burst request settled"
     );
 }
