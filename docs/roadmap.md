@@ -39,7 +39,7 @@ After v0.3.0 the remaining R-items were selected as one enterprise program, deli
 - **No installation-wide limits** (2026-10-09, done in migration 0026): limits only on personal/team/project workspaces and keys; total spend is watched with a non-blocking installation spend alert.
 - **Machine administration:** Platform-Admin-only admin API tokens, separate from inference keys (inference keys never authorize management), scoped, expiring and audited.
 - **Real self-hosted models:** acceptance uses the operator's own DGX Spark endpoints (chat, embeddings, rerank, System One).
-- **Guardrails** (PII redaction, moderation, DLP): **design complete** in [guardrails design](guardrails-design.md) (#36); implementation **not delivered** (#181). No content inspection/redaction/moderation enforcement is claimed.
+- **Guardrails** (secrets, PII redaction, moderation, DLP): [design](guardrails-design.md) (#36) complete; built in seven phases, #840 (pattern secrets on input) to #846 (external detectors). **Delivered so far:** phase 1's policy model only: rule storage in the three layers (workspace-type default, platform override, tighten-only workspace local layer), composition with `local_only`, the management API and the `guardrails` cache topic (migration 0092). **Not delivered:** any inspection. No request or response text is inspected, monitored, redacted or blocked yet; the detector, engine step, events, metrics and dashboard pages of phase 1 follow.
 
 **Phases**
 
@@ -66,7 +66,7 @@ v0.3.1 (2026-10-09): distroless runtime image (binary entrypoint, `open-model-ga
 - **SIEM and audit:** webhook, syslog/TLS or OTLP/HTTP audit export; sequence numbers, heartbeats and exported on/off transitions detect gaps and silence (#174). Personal-workspace events are excluded. Syslog lacks application acknowledgement and requires receiver-enforced mutual TLS for authenticity; OTLP partial rejections are counted, not retried. This is not a tamper-proof external audit service.
 - **Privacy and records:** own-data JSON export (bounded request/audit range), authorized admin export, early cleanup for suspended people, legal holds, documented retention and request-metadata compaction. Holds grant no new visibility; cleanup preserves immutable accounting history. File-store rekey re-wraps data keys without decrypting file contents.
 - **Follow-up assurance (v0.7.0):** exact route-policy inventory and caller matrix (#195), inference-steering tests and local IPv4-embedding/model/id fixes (#196), configuration/secret reference protection (#197), read-only verification separated from write-token publication and checksum-verified tooling (#194), and stronger real-path/review/coordinator gates (#198). No database migration after 0048 or new runtime privilege is part of the v0.7.0 scope.
-- **Still not delivered:** content guardrails (#181; design #36 complete) and certified capacity (#132/#149). No independent external security review is planned (#61, closed as not planned on 2026-11-24). Operations/finance, admin/configuration-as-code and provider expansion remain planned phases, not consequences of the security work.
+- **Still not delivered:** content guardrails (#840–#846; phase 1's policy model is in place, nothing is inspected yet) and certified capacity (#132/#149). No independent external security review is planned (#61, closed as not planned on 2026-11-24). Operations/finance, admin/configuration-as-code and provider expansion remain planned phases, not consequences of the security work.
 
 ## Historical proposal and restored baseline
 
@@ -280,7 +280,7 @@ Effort is relative: **S** = narrow change; **M** = several components plus tests
 ## Defer unless a concrete need emerges
 
 - Cross-tenant response/semantic caching: isolation, consent, invalidation and billing semantics need their own design.
-- Persisted chat/playground histories or prompt capture: new sensitive-data processing and retention obligations; not a default gateway feature. (DLP/moderation guardrails: design drafted in [guardrails design](guardrails-design.md), not implemented; it stores no prompt or response text.)
+- Persisted chat/playground histories or prompt capture: new sensitive-data processing and retention obligations; not a default gateway feature. (DLP/moderation guardrails: [guardrails design](guardrails-design.md), phases #840–#846; they store no prompt or response text.)
 - Automatic “cheapest/best model” routing, shadow traffic or broad retry policies: quality evaluation, capability/residency checks and duplicate-spend controls must come first.
 - Marketplace settlement, multi-region active-active, or a database-RLS rewrite merely for completeness: justify them with deployment requirements and measured risks. (A Helm chart and multi-replica single-region deployment are selected under phase 2.)
 - General-purpose hard deletion or personal-workspace impersonation: conflicts with immutable accounting and current privacy guarantees. A future shared-workspace archival/ownership-transfer workflow should be separately scoped.

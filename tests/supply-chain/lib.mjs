@@ -47,7 +47,7 @@ export const actionName = ref => String(ref).split("@")[0].toLowerCase();
 
 
 export const RUNTIME_DOCKERFILES = ["Dockerfile", "deploy/loadtest/Dockerfile"];
-export const APPROVED_RUNTIME = "gcr.io/distroless/cc-debian13:nonroot@sha256:cb87acc574abe719b6e5c547384defa2f7b1f24af9605d3f618cf852495d8be2";
+export const APPROVED_RUNTIME = "gcr.io/distroless/cc-debian13:nonroot@sha256:29ee70762214fe8190cea04ef1c0a84a8365879e047ce8f911ae5a5ab2355fa2";
 
 
 // Every Dockerfile anywhere in the repository (not a fixed list): a file named

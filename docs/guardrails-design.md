@@ -1,6 +1,6 @@
 # Guardrails design (issue #36)
 
-**Status:** design only, not implemented. **Date:** 2026-10-13.
+**Status:** phase 1 (#840) in progress. Implemented: the policy model of §5 (storage, layers, composition, `local_only`, the management API and the `guardrails` cache topic; migration 0092). **Nothing inspects prompt or response text yet:** the detector, the engine step, `guardrail_events`, the metrics and the dashboard pages follow. Phases 2–7 are #841–#846. **Date:** 2026-10-13; implementation notes 2026-11-25 ([§14](#14-implementation-notes-phase-1)).
 
 *User decision* marks the user's decisions of 2026-10-13. **Recommendation** marks proposals that still need review. Today the gateway never inspects prompt or response text.
 
@@ -208,7 +208,7 @@ All routes use the management envelope `{error:{code:"<status>",message,reason?}
 | --- | --- |
 | `GET/PUT /platform/workspace-types/{kind}/guardrails` | Admin writes; Auditor reads |
 | `GET/PUT/DELETE /platform/workspaces/{ws}/guardrails` | Override. DELETE restores the type default. |
-| `GET/PUT /workspaces/{ws}/guardrails` | Shared owner/admin. GET also returns `effective`, `provenance` and `egress`. |
+| `GET/PUT /workspaces/{ws}/guardrails` | PUT: shared owner/admin, and a personal workspace's owner. GET: members too (and platform staff on a Team or Project); also returns `effective`, provenance (`platform.source`, each entry's `source`) and `egress`. |
 | `GET /platform/guardrails/detectors` | Built-in kinds, categories and egress |
 
 Rejection reasons:
@@ -219,6 +219,7 @@ Rejection reasons:
 | 403 | `guardrail_egress_not_allowed` |
 | 400 | `guardrail_detector_unavailable` |
 | 400 | `guardrail_pattern_unbounded` (section 7) |
+| 400 | `guardrail_pattern_invalid`: a custom pattern does not compile within the limits ([§14](#14-implementation-notes-phase-1)) |
 
 Changes are audited as `guardrail_policy.updated`, with layer, rule IDs, actions and modes. For custom patterns only their count is recorded, never their content.
 
@@ -414,3 +415,16 @@ Each phase is one issue with tests, review and a PR.
 6. Model detectors judge **only new content** by default, to keep cost down.
 
 No open questions remain; implementation starts with phase 1 (section 12) after phase 2 of the program.
+
+## 14. Implementation notes (phase 1)
+
+Where the implementation had to choose, and what it chose (#840):
+
+- **Tightening a platform rule.** A local layer holds its own rules and *tightening entries*: `{"tightens":"<platform rule id>"}` with only `input.action`, `output.mode`, `on_error` or `threshold`. Each field may only be at least as strict as the platform rule's (`guardrail_loosen_not_allowed`, naming the platform rule, otherwise; also for a local rule that reuses a platform rule's id). Composition takes the stricter value of each field, so an entry written against an older platform rule never weakens the current one. An entry whose platform rule was removed stays, inactive, with `inactive_reason:"tightened_rule_missing"`. The local layer's own rules are freely edited and removed by its writers: tighten-only constrains the platform's rules, not the local layer's.
+- **Refusal order on write.** A shape error is a plain 400. Then `guardrail_egress_not_allowed` (403) when the rule's detector sends text out under `local_only` (set on the layer itself, or on the platform layer above a local one), before `guardrail_detector_unavailable` (400). So the stronger reason wins for a rule that could never be allowed. Phase 1 refuses every value it cannot enforce with `guardrail_detector_unavailable`: other detectors, categories other than `secret` and `custom`, `redact`, any output mode but `off`, workloads other than generation and embeddings, and `uninspectable: allow`.
+- **Storage keeps the design's whole rule shape** (every detector kind, action, output mode and workload). Later phases widen what the gateway accepts, not the table. A stored rule this release cannot run (written directly, or by a later release during a rolling upgrade) is still composed and shown. **Requirement on the engine step (part 2 of #840):** once anything is enforced, a rule the running release cannot run is never shown `active` and never skipped silently. It follows its own `on_error` as a detector failure (a block rule fails closed with `guardrail_detector_failed`; a `fail_open` rule passes and records the failure), and GET names the reason it cannot run instead of showing it `active`. In part 1 nothing is enforced and every response says `enforced: false`, so such a rule is composed and shown as stored.
+- **Custom patterns.** 1 to 50 per layer, at most 512 bytes each, compiled at save with `regex` under fixed limits (compiled program 1 MiB, lazy DFA 1 MiB, nesting 64; the largest patterns that still compile take 6 to 9 ms each on a 4-core build machine, so a full layer takes under half a second). Compiles run on the blocking pool in per-replica slots, one for the platform layers and two for the local layers, so local writers never queue ahead of Platform Admins; a slot is held until its compile ends, even when the client disconnects. The route policy layer refuses a caller who may not write the layer before the body is read, so a refused caller never gets a pattern compiled; one that does not compile is `guardrail_pattern_invalid`. Pattern text is configuration and is stored. It is shown to the layer's writers and, for platform layers and a Team or Project's local layer, to platform Admins and Auditors; everyone else sees `pattern_count`. Audit records only the count.
+- **A PUT replaces the whole layer**, so a platform layer's PUT states `local_only` every time: an omission is a plain 400, never a stored `false` that would lift a type default's restriction for one workspace by accident. A local PUT that names it is a 400 too.
+- **The database backs the writers.** A rule set records the transaction that last inserted it or moved its revision, and its rules are inserted or removed only in that transaction, so each change of a set's rules is made by the set's guarded writer and moves its revision. An override is removed only in a transaction that first moved its revision (by a Platform Admin). A set holds at most 50 entries and 50 custom patterns; a full rule carries patterns exactly when it has the `custom` category; arrays are one-dimensional. Patterns are compiled before the management transaction starts, never while it holds the installation row.
+- **Personal workspaces.** The owner's local layer is an owner-made choice: platform staff see a personal workspace's platform layers (`GET /platform/workspaces/{ws}/guardrails` answers `local: null, local_visible: false, effective: null`), never its local layer.
+- **Responses** carry `enforced: false` until the engine step lands, so no client of the API can read a stored rule as active protection.
