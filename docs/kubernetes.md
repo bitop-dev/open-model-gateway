@@ -382,6 +382,59 @@ durability safeguard; use the [explicit policy](#production-durability-policy-39
 - **Reporting replica.** `GATEWAY_REPORTING_DATABASE_URL` (optional) targets the Cluster's `-ro`
   service for reports/usage/logs only; admission, settlement and `/v1/models` always use the primary.
 
+## Pod shutdown and rolling restarts
+
+A stopping gateway pod goes through these steps:
+
+1. **`preStop` sleep** (`gateway.drainSeconds`, default 10 s). Kubernetes removes the pod from the
+   Service endpoints, so new connections go to other replicas. The gateway does not know yet and
+   serves as usual, including on keep-alive connections that clients opened earlier: those stay
+   with this pod.
+2. **SIGTERM.** The gateway logs `shutdown requested`, then `draining connections before shutdown`,
+   and keeps serving for `GATEWAY_SHUTDOWN_DRAIN_SECONDS` (default 5 s, at most 30). Every HTTP/1.1
+   response in this window carries `Connection: close`, so a client closes the connection after
+   reading its response instead of sending its next request on it. The listener still accepts, and
+   a connection that arrives from a stale endpoint list is answered the same way. Readiness is
+   unchanged: the pod is already out of the endpoints.
+3. **Graceful shutdown.** The listener closes and the connections no client used during the window
+   are closed. In-flight HTTP requests and streams run to completion (inference is bounded by
+   `GATEWAY_REQUEST_TIMEOUT_SECONDS`, default 120 s). HTTP/2 connections get GOAWAY. Realtime
+   (WebSocket) sessions are not HTTP requests once upgraded: they are not waited for, and end when
+   the process exits.
+4. **Stop.** Exporters get one shared 3 s budget and the work leases are released (2 s each, up
+   to about 22 s against a database that does not answer).
+
+A second SIGTERM or Ctrl-C ends the drain window at once. `GATEWAY_SHUTDOWN_DRAIN_SECONDS=0`
+closes idle connections at the signal, which is what the gateway did before the window existed.
+
+**Termination budget.** Steps 1 to 4 must fit in `gateway.terminationGracePeriodSeconds`, or
+Kubernetes kills the process. The default, 180 s, is sized for inference: with the defaults, a 120 s
+inference accepted at the end of the window, its 3 s settlement, the exporters and a database that
+does not answer the lease release need 10 + 5 + 120 + 3 + 3 + 22 = 163 s, and the rest of the exit
+(stopping background work, closing the database pool) has 17 s. It is not a bound for every request:
+a file upload that is still streaming, a batch creation still reading its input file and a realtime
+session (which ends when the process exits) can run longer and are cut off at the limit. A pod that
+finishes sooner exits sooner, so the grace period only bounds a slow or stuck pod; such a pod now
+gets up to 30 s more than with the former 150 s, its resources still count against a namespace's
+quota meanwhile, and `kubectl drain` waits for it. Raise the grace period by as much as you raise
+the window, the request timeout or the `preStop` sleep; `tests/helm-chart.test.mjs` fails when the
+chart's own settings no longer fit.
+
+**What remains.** A keep-alive connection that no client uses during the window is closed at step 3
+without a `Connection: close`. If a client sends a request on it at that instant, the request is
+lost: the client sees the socket close (Node's `UND_ERR_SOCKET`). The same goes for a connection
+whose stream started before the window and ended just before step 3. This is inherent to HTTP/1.1
+keep-alive: only the client can avoid it, by closing idle connections sooner than the window. Node's
+`fetch` closes them after 4 s by default (a server's `Keep-Alive: timeout` hint can lengthen that;
+the gateway sends none), so the default window covers it. HTTP/1.0 keep-alive responses are not
+marked. Make the window longer than your clients' idle keep-alive timeout, and retry
+non-idempotent requests only where they are safe to repeat.
+
+Measured on the Spark multi-replica rehearsal (two replicas, four Node 22 `fetch` clients, one
+rolling restart per check, about 2,300 requests each): before the window existed, 3 of 18 checks
+lost one request each, about 1 in 14,000 requests. With the default window, 0 of 64,940 requests
+failed in 28 checks.
+
 ## Scaling
 
 - `replicaCount` (or `hpa.enabled=true` with `hpa.minReplicas`/`maxReplicas`) sets gateway replicas.
