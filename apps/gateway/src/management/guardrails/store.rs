@@ -229,14 +229,16 @@ pub(super) async fn store(
 ) -> std::result::Result<(Uuid, i64), ApiError> {
     let (id, revision) = match current {
         Some(set) => {
-            sqlx::query("DELETE FROM guardrail_rules WHERE rule_set_id=$1")
-                .bind(set.id)
-                .execute(&mut **tx)
-                .await?;
+            // The revision moves first: the database accepts rule changes
+            // only in the transaction that moved it (0092).
             sqlx::query("UPDATE guardrail_rule_sets SET revision=revision+1,local_only=$2,updated_by=$3 WHERE id=$1")
                 .bind(set.id)
                 .bind(local_only)
                 .bind(actor)
+                .execute(&mut **tx)
+                .await?;
+            sqlx::query("DELETE FROM guardrail_rules WHERE rule_set_id=$1")
+                .bind(set.id)
                 .execute(&mut **tx)
                 .await?;
             (set.id, set.revision + 1)

@@ -24,6 +24,7 @@ use crate::guardrails::{
     patterns,
     policy::{self, Entry, Layer, LayerIn, Refusal, RuleSet, StoredRule},
 };
+use std::collections::HashSet;
 
 pub(super) const DETECTOR_UNAVAILABLE: &str = "This guardrail rule needs a detector, action, output mode or workload this gateway does not provide yet";
 pub(super) const EGRESS_NOT_ALLOWED: &str =
@@ -103,10 +104,29 @@ pub(super) fn routes() -> Router<Store> {
 mod store;
 use store::{Platform, Scope, foreign_ids, load, platform, store};
 
+/// The body's custom patterns that compile within the limits. Compiling needs
+/// no stored state, so it runs before the management transaction (never while
+/// it holds the installation row) and off the async workers. Validation
+/// reaches at most the first `MAX_PATTERNS` patterns in body order, so only
+/// those are compiled; any other pattern counts as not compiling.
+async fn compiled(body: &LayerIn) -> Result<HashSet<String>> {
+    let wanted = body.patterns(policy::MAX_PATTERNS);
+    tokio::task::spawn_blocking(move || wanted.into_iter().filter(|p| patterns::valid(p)).collect())
+        .await
+        .map_err(|_| {
+            ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Management storage unavailable",
+            )
+            .into()
+        })
+}
+
 /// Validate a PUT body against its layer.
 async fn validated(
     tx: &mut Transaction<'_, Postgres>,
     body: LayerIn,
+    compiled: &HashSet<String>,
     layer: Layer,
     platform: Option<&RuleSet>,
     current: Option<&RuleSet>,
@@ -120,7 +140,7 @@ async fn validated(
             platform,
             current,
             foreign_ids: &foreign,
-            compile: &patterns::valid,
+            compile: &|p| compiled.contains(p),
         },
     )
     .map_err(refused)
@@ -319,11 +339,19 @@ async fn put_type_guardrails(
     Json(body): Json<LayerIn>,
 ) -> Result<Json<Value>> {
     kind(&k)?;
+    let compiled = compiled(&body).await?;
     let mut tx = platform_tx(&s, &u, true).await?;
     let scope = Scope::Type(&k);
     let current = load(&mut tx, scope).await?;
-    let (local_only, rules) =
-        validated(&mut tx, body, Layer::TypeDefault, None, current.as_ref()).await?;
+    let (local_only, rules) = validated(
+        &mut tx,
+        body,
+        &compiled,
+        Layer::TypeDefault,
+        None,
+        current.as_ref(),
+    )
+    .await?;
     let (_, revision) = store(
         &mut tx,
         scope,
@@ -373,6 +401,7 @@ async fn put_platform_workspace_guardrails(
     Path(ws): Path<Uuid>,
     Json(body): Json<LayerIn>,
 ) -> Result<Json<Value>> {
+    let compiled = compiled(&body).await?;
     let mut tx = platform_tx(&s, &u, true).await?;
     platform(&mut tx, ws).await?;
     let scope = Scope::Override(ws);
@@ -380,6 +409,7 @@ async fn put_platform_workspace_guardrails(
     let (local_only, rules) = validated(
         &mut tx,
         body,
+        &compiled,
         Layer::WorkspaceOverride,
         None,
         current.as_ref(),
@@ -417,6 +447,14 @@ async fn reset_platform_workspace_guardrails(
     let mut tx = platform_tx(&s, &u, true).await?;
     platform(&mut tx, ws).await?;
     if let Some(set) = load(&mut tx, Scope::Override(ws)).await? {
+        // The removal is made by the Platform Admin who moves the revision:
+        // the database removes an override's rules and the override only in
+        // that transaction (0092).
+        sqlx::query("UPDATE guardrail_rule_sets SET revision=revision+1,updated_by=$2 WHERE id=$1")
+            .bind(set.id)
+            .bind(u.user_id())
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM guardrail_rules WHERE rule_set_id=$1")
             .bind(set.id)
             .execute(&mut *tx)
@@ -473,6 +511,7 @@ async fn put_workspace_guardrails(
     Path(ws): Path<Uuid>,
     Json(body): Json<LayerIn>,
 ) -> Result<Json<Value>> {
+    let compiled = compiled(&body).await?;
     let (mut tx, a) = resources::workspace_tx(&s, &u, ws).await?;
     // Owners and admins of a shared workspace; the owner of a personal one.
     if !a.admin {
@@ -484,6 +523,7 @@ async fn put_workspace_guardrails(
     let (_, rules) = validated(
         &mut tx,
         body,
+        &compiled,
         Layer::WorkspaceLocal,
         p.current(),
         current.as_ref(),

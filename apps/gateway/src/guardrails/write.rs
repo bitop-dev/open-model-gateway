@@ -115,6 +115,18 @@ impl LayerIn {
             .filter_map(|r| r.get("id")?.as_str()?.parse().ok())
             .collect()
     }
+
+    /// The first `limit` custom pattern strings, in body order (the order in
+    /// which `validate` reaches them).
+    pub fn patterns(&self, limit: usize) -> Vec<String> {
+        self.rules
+            .iter()
+            .filter_map(|r| r.get("detector")?.get("patterns")?.as_array())
+            .flatten()
+            .filter_map(|p| Some(p.as_str()?.to_owned()))
+            .take(limit)
+            .collect()
+    }
 }
 
 fn name_of<T: Copy>(parse: fn(&str) -> Option<T>, v: &str) -> Result<T, Refusal> {

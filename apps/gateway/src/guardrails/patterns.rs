@@ -1,6 +1,6 @@
-//! Custom patterns: compiled with fixed limits, at save and again when the
-//! detector loads them, so an administrator's pattern cannot exhaust memory or
-//! time. The `regex` crate matches in time linear in the input (no
+//! Custom patterns: compiled with fixed limits, so an administrator's pattern
+//! cannot exhaust memory or time. A pattern is compiled at save; whatever later
+//! compiles stored patterns uses `compile` too, so it holds the same limits. The `regex` crate matches in time linear in the input (no
 //! backtracking), and these limits bound what a compiled pattern may hold.
 use regex::{Regex, RegexBuilder};
 
@@ -13,7 +13,11 @@ pub const NEST_LIMIT: u32 = 64;
 
 /// Compile one custom pattern within the limits.
 pub fn compile(pattern: &str) -> Option<Regex> {
-    if pattern.is_empty() || pattern.len() > super::policy::MAX_PATTERN_BYTES {
+    // PostgreSQL text cannot hold NUL, so such a pattern is never storable.
+    if pattern.is_empty()
+        || pattern.len() > super::policy::MAX_PATTERN_BYTES
+        || pattern.contains('\0')
+    {
         return None;
     }
     RegexBuilder::new(pattern)
@@ -49,6 +53,7 @@ mod tests {
         assert!(!valid(""));
         assert!(!valid("(unclosed"));
         assert!(!valid(&"a".repeat(513)));
+        assert!(!valid("a\0b"), "NUL is not storable");
         // Small to write, enormous to compile: the size limit refuses it.
         assert!(!valid(r"\w{1000}\w{1000}"));
         assert!(

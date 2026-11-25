@@ -390,8 +390,16 @@ async fn local_only_makes_an_earlier_egress_rule_inactive_when_composing(pool: P
     .await
     .unwrap();
     let egress = Uuid::now_v7();
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("UPDATE guardrail_rule_sets SET revision=revision+1,updated_by=$2 WHERE id=$1")
+        .bind(set)
+        .bind(f.owner.user_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable) VALUES($1,$2,1,'Moderation','moderation','systemone','{moderation}','block','user_text','off','fail_closed','{generation}','deny')")
-        .bind(egress).bind(set).execute(&pool).await.unwrap();
+        .bind(egress).bind(set).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
     let (_, open) = call(&f.s, &f.owner, "GET", &local(f.team), Value::Null).await;
     assert!(
         open["effective"]
@@ -511,9 +519,17 @@ async fn the_database_refuses_writes_the_routes_would_refuse(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("UPDATE guardrail_rule_sets SET revision=revision+1,updated_by=$2 WHERE id=$1")
+        .bind(set)
+        .bind(f.owner.user_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     let err = sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,tightens_rule_id,input_action) VALUES($1,$2,0,$3,'block')")
-        .bind(Uuid::now_v7()).bind(set).bind(other).execute(&pool).await.unwrap_err();
+        .bind(Uuid::now_v7()).bind(set).bind(other).execute(&mut *tx).await.unwrap_err();
     assert!(err.to_string().contains("platform layer"), "{err}");
+    drop(tx);
     // Only an override is removed; rules are never edited in place.
     let err = sqlx::query("DELETE FROM guardrail_rule_sets WHERE id=$1")
         .bind(set)
@@ -524,4 +540,115 @@ async fn the_database_refuses_writes_the_routes_would_refuse(pool: PgPool) {
         err.to_string().contains("only a guardrail override"),
         "{err}"
     );
+}
+
+const FULL_RULE: &str = "INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable,patterns) VALUES($1,$2,$3,'Custom','custom','pattern','{custom}','block','user_text','off','fail_closed','{generation}','deny',$4)";
+
+#[dbtest::test]
+async fn rules_change_only_with_their_sets_revision(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let (status, _) = call(
+        &f.s,
+        &f.admin,
+        "PUT",
+        &platform_ws(f.project),
+        json!({"rules":[secrets("monitor")]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let set: Uuid = sqlx::query_scalar(
+        "SELECT id FROM guardrail_rule_sets WHERE layer='workspace_override' AND workspace_id=$1",
+    )
+    .bind(f.project)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    // Outside the transaction that moved the set's revision, its rules are
+    // neither added nor removed, and the override is not removed.
+    let err = sqlx::query(FULL_RULE)
+        .bind(Uuid::now_v7())
+        .bind(set)
+        .bind(1_i16)
+        .bind(vec!["x".to_owned()])
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("rule set's revision"), "{err}");
+    let err = sqlx::query("DELETE FROM guardrail_rules WHERE rule_set_id=$1")
+        .bind(set)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("rule set's revision"), "{err}");
+    let err = sqlx::query("DELETE FROM guardrail_rule_sets WHERE id=$1")
+        .bind(set)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("moved its revision"), "{err}");
+    // Inside it, the database still holds the per-set limits and shapes.
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("UPDATE guardrail_rule_sets SET revision=revision+1,updated_by=$2 WHERE id=$1")
+        .bind(set)
+        .bind(f.admin.user_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    for (categories, patterns) in [
+        ("{custom}", "{}"),
+        ("{secret}", "{x}"),
+        ("{custom}", "{{x}}"),
+    ] {
+        let mut sp = sqlx::Acquire::begin(&mut *tx).await.unwrap();
+        let err = sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable,patterns) VALUES($1,$2,3,'R','custom','pattern',$3::text[],'block','user_text','off','fail_closed','{generation}','deny',$4::text[])")
+            .bind(Uuid::now_v7()).bind(set).bind(categories).bind(patterns)
+            .execute(&mut *sp).await.unwrap_err();
+        assert!(
+            err.to_string().contains("check constraint"),
+            "{categories} {patterns}: {err}"
+        );
+        sp.rollback().await.unwrap();
+    }
+    sqlx::query(FULL_RULE)
+        .bind(Uuid::now_v7())
+        .bind(set)
+        .bind(1_i16)
+        .bind((0..50).map(|i| format!("p{i}")).collect::<Vec<_>>())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let mut sp = sqlx::Acquire::begin(&mut *tx).await.unwrap();
+    let err = sqlx::query(FULL_RULE)
+        .bind(Uuid::now_v7())
+        .bind(set)
+        .bind(2_i16)
+        .bind(vec!["one too many".to_owned()])
+        .execute(&mut *sp)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("at most 50"), "{err}");
+    sp.rollback().await.unwrap();
+    drop(tx);
+    // The route removes an override in one transaction with its revision.
+    let (status, reset) = call(
+        &f.s,
+        &f.admin,
+        "DELETE",
+        &platform_ws(f.project),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reset}");
+    assert_eq!(reset["platform"]["source"], "type_default");
+    // A pattern PostgreSQL cannot store is refused as a pattern, not a fault.
+    let (status, body) = call(
+        &f.s,
+        &f.owner,
+        "PUT",
+        &local(f.team),
+        json!({"rules":[custom("a\u{0}b")]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["reason"], "guardrail_pattern_invalid");
 }
