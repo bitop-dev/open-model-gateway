@@ -477,16 +477,27 @@ fn spawn_history_verify_and_lifecycle(
                 |fence| {
                     let store = lifecycle_store.clone();
                     async move {
-                        open_model_gateway::lifecycle::expire_access_requests_fenced(
+                        // Each step runs whatever the others did: a step
+                        // that keeps failing never holds the others back.
+                        // The first error is reported.
+                        let expired = open_model_gateway::lifecycle::expire_access_requests_fenced(
                             &store,
                             Some(&fence),
                         )
-                        .await?;
-                        open_model_gateway::lifecycle::cleanup_inactive_accounts_fenced(
-                            &store,
-                            Some(&fence),
-                        )
-                        .await
+                        .await;
+                        let cleaned =
+                            open_model_gateway::lifecycle::cleanup_inactive_accounts_fenced(
+                                &store,
+                                Some(&fence),
+                            )
+                            .await;
+                        let scheduled =
+                            open_model_gateway::lifecycle::start_scheduled_access_reviews_fenced(
+                                &store,
+                                Some(&fence),
+                            )
+                            .await;
+                        expired.and(scheduled).and(cleaned)
                     }
                 },
             )

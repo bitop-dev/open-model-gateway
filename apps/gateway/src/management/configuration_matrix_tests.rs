@@ -852,6 +852,30 @@ async fn every_json_management_write_rejects_unknown_fields_after_valid_control(
         &f.admin,
         json!({"user_id":null})
     );
+    // #481: access review schedules.
+    case!(
+        "access_reviews::schedules::create",
+        "POST",
+        "/api/v1/platform/access-review-schedules",
+        &f.admin,
+        json!({"name":"Matrix schedule","subjects":["platform_roles"],"cadence":"monthly","start_day":1})
+    );
+    let (status, schedule) = call(
+        &f.s,
+        &f.admin,
+        "POST",
+        "/api/v1/platform/access-review-schedules",
+        json!({"name":"Matrix schedule changed","subjects":["platform_roles"],"cadence":"monthly","start_day":1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{schedule}");
+    case!(
+        "access_reviews::schedules::change",
+        "PATCH",
+        format!("/api/v1/platform/access-review-schedules/{}", id(&schedule)),
+        &f.admin,
+        json!({"paused":true})
+    );
     let reviewer = user(&pool, "matrix-template-reviewer", "admin").await;
     let tid = id(&template);
     for step in ["review", "publish"] {

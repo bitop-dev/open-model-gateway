@@ -40,7 +40,10 @@ mod message;
 pub use evaluation::{BATCH_FAILED_HOURS, CEILING_MIN_REQUESTS, p95_at_least_ms};
 use evaluation::{budget_conditions, evaluate_rule};
 pub use incidents::Changes;
-pub(crate) use incidents::{fire_scim_last_admin, lock_delivery_buckets, resolve, retire_inactive};
+pub(crate) use incidents::{
+    fire_access_review_skipped, fire_scim_last_admin, lock_delivery_buckets, resolve,
+    resolve_access_review_skipped, retire_inactive,
+};
 use incidents::{reconcile, resolve_scim_last_admin};
 use key_expiry::KEY_EXPIRY_DELIVERABLE;
 pub(crate) use key_expiry::{key_expiring_tick, key_expiry_visible};
@@ -71,8 +74,18 @@ pub const PARTITIONS_MISSING: &str = "partitions_missing";
 /// Built-in installation incident: `history verify` found history rows whose
 /// parents are missing or belong to another scope (0034).
 pub const HISTORY_ORPHANS: &str = "history_orphans";
+/// Built-in installation incident (0091): a scheduled access review run was
+/// skipped. One per skipped run (its subject is the run); it clears when a
+/// later run of the schedule starts a campaign or the schedule is deleted.
+pub const ACCESS_REVIEW_SKIPPED: &str = "access_review_skipped";
+pub const ACCESS_REVIEW_SKIPPED_SUMMARY: &str = "A scheduled access review was skipped";
 /// Built-in installation incidents (no rule; Platform Admins are notified).
-pub const INSTALLATION_BUILTINS: [&str; 3] = [SCIM_LAST_ADMIN, PARTITIONS_MISSING, HISTORY_ORPHANS];
+pub const INSTALLATION_BUILTINS: [&str; 4] = [
+    SCIM_LAST_ADMIN,
+    PARTITIONS_MISSING,
+    HISTORY_ORPHANS,
+    ACCESS_REVIEW_SKIPPED,
+];
 /// Attempt failures that indicate the upstream (not the request) is failing.
 pub const UPSTREAM_FAILURES: [&str; 4] = [
     "upstream_unavailable",
@@ -645,6 +658,28 @@ mod unit_tests {
                 assert!(body.contains(&format!("Open holds: {base}/admin/costs?tab=holds")));
             }
         }
+    }
+
+    #[test]
+    fn a_skipped_access_review_email_names_its_built_in_source() {
+        let row = Pending {
+            transition: "fired".into(),
+            summary: ACCESS_REVIEW_SKIPPED_SUMMARY.into(),
+            severity: "warning".into(),
+            fired_at: UtcInstant::UNIX_EPOCH,
+            resolved_at: None,
+            rule_name: None,
+            workspace_name: None,
+            workspace_kind: None,
+            connection_name: None,
+            builtin: Some(ACCESS_REVIEW_SKIPPED.into()),
+            kind: ACCESS_REVIEW_SKIPPED.into(),
+            key_expires_at: None,
+        };
+        let (subject, body) = email_message_with_link(row, "Enterprise".into(), None);
+        assert!(subject.contains(ACCESS_REVIEW_SKIPPED_SUMMARY));
+        assert!(body.contains("Built-in access review schedule"));
+        assert!(!body.contains("Built-in budget alert"));
     }
 
     #[test]

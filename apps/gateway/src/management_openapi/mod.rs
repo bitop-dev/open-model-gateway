@@ -57,10 +57,10 @@ mod tests {
             "management OpenAPI: {operations} operations; {placeholders} incomplete request/response schemas remaining (#81)"
         );
         // #81 is complete: zero placeholders (a new route fails until its fragment is complete).
-        // 276 operations: #804 adds the resolution of one unknown realtime response
-        // and of a realtime session.
+        // 281 operations: #804 adds the resolution of one unknown realtime response
+        // and of a realtime session; #481 the five access review schedule operations.
         assert_eq!(
-            operations, 276,
+            operations, 281,
             "review route additions and update this progress baseline"
         );
         assert_eq!(
