@@ -1,0 +1,682 @@
+"""The second mode of scripts/spark-env.py: the chart as shipped (#601).
+
+TEST ONLY. Loaded by spark-env.py, which owns every safety check (the Spark
+kubeconfig only, the server-name check, the scrubbed child environment, the
+<base>-omg-<name> namespace rule, the digest-pinned gateway image built from
+the ref's commit, the arm64 check). This module only builds on its `Spark`.
+
+`up <name> --ref <ref> --mode replicas` deploys the chart's own gateway
+Deployment with two replicas, the CloudNativePG Cluster and Pooler, the
+migrate Job, the Service and the PodDisruptionBudget, in production mode, and
+the chart's NetworkPolicy when the platform lets the account create one. Sign-in
+uses a per-environment Keycloak issuer in the namespace (deploy/spark/replicas)
+with a generated client secret and generated user passwords, whose HTTPS
+certificate is signed by a CA generated for the environment (the gateway trusts
+it through GATEWAY_OIDC_CA_FILE). The CA's private key never leaves a
+temporary directory, which is deleted at once. The issuer is reached only from
+inside the namespace and through `kubectl port-forward` bound to 127.0.0.1.
+The first admin is created by `provision-user --platform-admin` as a Job. A
+free model server runs in the namespace.
+
+`check <name>` runs the scripted rehearsal and prints one PASS, FAIL or SKIP
+line per step; its summary holds statuses, counts and timings, never a secret.
+"""
+import http.client
+import html
+import json
+import re
+import secrets
+import shutil
+import socket
+import ssl
+import subprocess
+import tempfile
+import threading
+import time
+import urllib.parse
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+DEPLOY = ROOT / "deploy" / "spark" / "replicas"
+REALM = "omg"
+CLIENT_ID = "omg-gateway"
+ADMIN_EMAIL = "admin@spark.invalid"
+UNENTITLED_EMAIL = "unentitled@spark.invalid"
+# Local ports of `forward` and `check` (loopback only).
+GATEWAY_PORT = 3000
+ISSUER_PORT = 18443
+POD_PORTS = (3101, 3102)
+MODEL = "spark/mock"
+FIRST_ADMIN_JOB = "omg-first-admin"
+
+
+def issuer_host(namespace):
+    return f"omg-issuer.{namespace}.svc.cluster.local"
+
+
+def issuer_url(namespace):
+    return f"https://{issuer_host(namespace)}:8443/realms/{REALM}"
+
+
+def public_url(namespace):
+    """The gateway's canonical HTTPS origin. Nothing serves it: the check and
+    a browser reach the gateway through the loopback port-forward and present
+    this origin, which only the gateway and the issuer's redirect URI use."""
+    return f"https://omg.{namespace}.invalid"
+
+
+def fill(text, values):
+    """Substitute every `__NAME__` placeholder; each must occur and none may remain."""
+    for name, value in values.items():
+        marker = f"__{name}__"
+        if marker not in text:
+            raise ValueError(f"manifest has no {marker} placeholder")
+        if not re.fullmatch(r"[A-Za-z0-9.:/@_-]+", value):
+            raise ValueError(f"unusable value for {marker}")
+        text = text.replace(marker, value)
+    if re.search(r"__[A-Z_]+__", text):
+        raise ValueError("manifest has an unfilled placeholder")
+    return text
+
+
+def generate_pki(directory, host, runner=subprocess.run):
+    """A CA and the issuer's certificate (P-256, one year) with the `openssl`
+    CLI in `directory`: returns (CA certificate, issuer certificate, issuer
+    key) as PEM text. Arguments name files only; the CA key stays in the
+    directory, which the caller deletes."""
+    d = Path(directory)
+    (d / "issuer.ext").write_text(
+        f"subjectAltName=DNS:{host}\nbasicConstraints=critical,CA:FALSE\n"
+        "keyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\n")
+    steps = [
+        ["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
+         "-keyout", str(d / "ca.key"), "-out", str(d / "ca.crt"), "-days", "365", "-subj", "/CN=omg Spark environment CA",
+         "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign"],
+        ["openssl", "req", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
+         "-keyout", str(d / "tls.key"), "-out", str(d / "tls.csr"), "-subj", "/CN=omg-issuer"],
+        ["openssl", "x509", "-req", "-in", str(d / "tls.csr"), "-CA", str(d / "ca.crt"), "-CAkey", str(d / "ca.key"),
+         "-CAcreateserial", "-out", str(d / "tls.crt"), "-days", "365", "-extfile", str(d / "issuer.ext")],
+    ]
+    for step in steps:
+        result = runner(step, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if result.returncode:
+            raise RuntimeError(f"openssl {step[1]} failed (exit {result.returncode})")
+    return ((d / "ca.crt").read_text(), (d / "tls.crt").read_text(), (d / "tls.key").read_text())
+
+
+def realm(callback, client_secret, passwords):
+    """The issuer's realm: the gateway's confidential client (authorization
+    code with S256 PKCE, one redirect URI, a groups claim in the ID token) and
+    the users, with verified emails and the generated passwords."""
+    users = []
+    for (name, email), password in zip((("admin", ADMIN_EMAIL), ("unentitled", UNENTITLED_EMAIL)), passwords):
+        users.append({"username": name, "email": email, "emailVerified": True, "enabled": True,
+                      "firstName": "Spark", "lastName": name.capitalize(),
+                      "credentials": [{"type": "password", "value": password, "temporary": False}],
+                      "groups": ["/omg-users"]})
+    return {
+        "realm": REALM, "enabled": True, "sslRequired": "all", "registrationAllowed": False,
+        "resetPasswordAllowed": False, "rememberMe": False, "loginWithEmailAllowed": True,
+        "groups": [{"name": "omg-users"}], "users": users,
+        "clients": [{
+            "clientId": CLIENT_ID, "enabled": True, "protocol": "openid-connect", "publicClient": False,
+            "clientAuthenticatorType": "client-secret", "secret": client_secret,
+            "standardFlowEnabled": True, "implicitFlowEnabled": False, "directAccessGrantsEnabled": False,
+            "serviceAccountsEnabled": False, "redirectUris": [callback], "webOrigins": [],
+            "attributes": {"pkce.code.challenge.method": "S256"},
+            "protocolMappers": [{
+                "name": "groups", "protocol": "openid-connect", "protocolMapper": "oidc-group-membership-mapper",
+                "config": {"claim.name": "groups", "full.path": "false", "id.token.claim": "true",
+                           "access.token.claim": "false", "userinfo.token.claim": "true", "multivalued": "true"}}],
+        }],
+    }
+
+
+def secret(name, string_data, secret_type="Opaque"):
+    return {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": name}, "type": secret_type, "stringData": string_data}
+
+
+def helm_values(namespace, issuer_ip, mock_ip, network_policy):
+    """The per-environment values on top of values.yaml, as --set-json pairs."""
+    upstreams = json.dumps([{"endpoint": f"http://{mock_ip}:8000/v1", "addresses": [mock_ip]}], separators=(",", ":"))
+    return {
+        "gateway.env.GATEWAY_PUBLIC_URL": public_url(namespace),
+        # The issuer's ClusterIP is private: the identity egress policy allows it alone.
+        "gateway.env.GATEWAY_EGRESS_PRIVATE_ALLOW": f"{issuer_ip}/32",
+        "gateway.env.GATEWAY_LOCAL_UPSTREAMS": upstreams,
+        "networkPolicy.enabled": network_policy,
+    }
+
+
+def ip(value):
+    if not re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", value or ""):
+        raise ValueError("a Service has no IPv4 ClusterIP")
+    return value
+
+
+class Replicas:
+    """Deploy and check `--mode replicas` environments through a spark-env `Spark`."""
+
+    def __init__(self, env, spark):
+        self.env = env
+        self.spark = spark
+
+    def error(self, message):
+        return self.env.SparkError(message)
+
+    def can_create_network_policy(self, namespace):
+        """`kubectl auth can-i` answers "no" with exit status 1."""
+        try:
+            answer = self.spark.kubectl(["auth", "can-i", "create", "networkpolicies"], namespace=namespace, capture=True)
+        except self.env.SparkError:
+            return False
+        return answer.strip() == "yes"
+
+    def service_ip(self, namespace, name):
+        value = self.spark.kubectl(["get", f"service/{name}", "-o", "jsonpath={.spec.clusterIP}"], namespace=namespace, capture=True)
+        try:
+            return ip(value.strip())
+        except ValueError as error:
+            raise self.error(f"{name}: {error}") from None
+
+    def deploy(self, namespace, resolved, image, digest, source):
+        """Everything after the namespace's isolation policies, in the order the
+        invariants require: role Secrets, the issuer and the free model server,
+        the chart (CloudNativePG Cluster, migrate Job with runtime grants, then
+        the gateway, which waits for the schema), then the first admin."""
+        spark = self.spark
+        spark.kubectl(["create", "-f", "-"], namespace=namespace, stdin=self.env.role_secrets())
+        client_secret = secrets.token_urlsafe(32)
+        passwords = [secrets.token_urlsafe(18) for _ in range(2)]
+        self.env._REGISTERED_SECRETS.extend([client_secret, *passwords])
+        host = issuer_host(namespace)
+        with tempfile.TemporaryDirectory() as directory:
+            ca, certificate, key = generate_pki(directory, host)
+        self.env._REGISTERED_SECRETS.append(key.strip())
+        callback = f"{public_url(namespace)}/api/v1/auth/callback"
+        items = [
+            secret("omg-issuer-tls", {"tls.crt": certificate, "tls.key": key}, "kubernetes.io/tls"),
+            secret("omg-issuer-realm", {"realm.json": json.dumps(realm(callback, client_secret, passwords))}),
+            secret("omg-issuer-users", {"admin": passwords[0], "unentitled": passwords[1]}),
+            secret("omg-oidc", {"GATEWAY_OIDC_ISSUER": issuer_url(namespace), "GATEWAY_OIDC_CLIENT_ID": CLIENT_ID,
+                                "GATEWAY_OIDC_CLIENT_SECRET": client_secret}),
+            {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "omg-issuer-ca"}, "data": {"ca.crt": ca}},
+        ]
+        # `create`, never `apply`: apply would copy the values into an annotation.
+        spark.kubectl(["create", "-f", "-"], namespace=namespace, stdin=json.dumps({"apiVersion": "v1", "kind": "List", "items": items}))
+        spark.kubectl(["create", "configmap", "omg-spark-env", f"--from-literal=ref={resolved.name}", f"--from-literal=sha={resolved.sha}",
+                       f"--from-literal=image={image}", "--from-literal=mode=replicas"], namespace=namespace)
+        spark.kubectl(["create", "configmap", "omg-replicas-scripts", f"--from-file=mock-upstream.mjs={DEPLOY / 'mock-upstream.mjs'}",
+                       f"--from-file=load.mjs={DEPLOY / 'load.mjs'}"], namespace=namespace)
+        spark.kubectl(["apply", "-f", "-"], namespace=namespace, stdin=fill((DEPLOY / "issuer.yaml").read_text(), {"ISSUER_HOST": host}))
+        spark.kubectl(["apply", "-f", "-"], namespace=namespace, stdin=(DEPLOY / "mock-upstream.yaml").read_text())
+        issuer_ip = self.service_ip(namespace, "omg-issuer")
+        mock_ip = self.service_ip(namespace, "omg-mock-upstream")
+        spark.kubectl(["rollout", "status", "deployment/omg-issuer", "--timeout=600s"], namespace=namespace)
+        spark.kubectl(["rollout", "status", "deployment/omg-mock-upstream", "--timeout=300s"], namespace=namespace)
+        network_policy = self.can_create_network_policy(namespace)
+        args = ["install", "omg", f"{source}/deploy/helm/open-model-gateway", "-f", str(DEPLOY / "values.yaml"),
+                "--set", f"image.repository={image.split('@')[0]}", "--set", f"image.digest={digest}"]
+        for key_name, value in helm_values(namespace, issuer_ip, mock_ip, network_policy).items():
+            args += ["--set-json", f"{key_name}={json.dumps(value)}"]
+        spark.helm(args + ["--wait", "--wait-for-jobs", "--timeout", "15m", "--hide-notes"], namespace)
+        admin_job = fill(self.env.render((DEPLOY / "admin-job.yaml").read_text(), image), {"ADMIN_EMAIL": ADMIN_EMAIL})
+        spark.kubectl(["apply", "-f", "-"], namespace=namespace, stdin=admin_job)
+        spark.wait_for_job(namespace, FIRST_ADMIN_JOB)
+        return network_policy
+
+    def forward_command(self, namespace, target, ports):
+        return self.env.kubectl_command(self.spark.config, self.spark.base,
+                                        ["port-forward", "--address", "127.0.0.1", target, *ports], namespace)
+
+    def forwards(self, namespace):
+        return [self.forward_command(namespace, "service/omg", [f"{GATEWAY_PORT}:8080"]),
+                self.forward_command(namespace, "service/omg-issuer", [f"{ISSUER_PORT}:8443"])]
+
+    def creds_text(self, namespace):
+        read = " ".join(self.env.kubectl_command(self.spark.config, self.spark.base,
+                                                 ["get", "secret", "omg-issuer-users", "-o", "jsonpath={.data.admin}"], namespace))
+        return (f"{namespace}: sign in at http://127.0.0.1:{GATEWAY_PORT} after `forward` (the gateway's origin is {public_url(namespace)};\n"
+                f"a browser must also reach the issuer at {issuer_host(namespace)}:8443, for example with a hosts entry for 127.0.0.1,\n"
+                f"port {ISSUER_PORT} forwarded and the environment's CA from ConfigMap omg-issuer-ca trusted).\n"
+                f"  Platform Admin         admin ({ADMIN_EMAIL})\n"
+                f"  Unentitled             unentitled ({UNENTITLED_EMAIL}): authenticates, platform access denied\n"
+                f"The passwords are generated and stay in the cluster (Secret omg-issuer-users); this command never prints them.\n"
+                f"To read one yourself: {read} | base64 -d\n")
+
+
+# --- the scripted check --------------------------------------------------------
+
+class Http:
+    """Plain HTTP to the forwarded gateway, or HTTPS to the forwarded issuer
+    verified against the environment's CA under the issuer's own name. Cookies
+    are kept by hand (the gateway's are Secure, set for its HTTPS origin)."""
+
+    def __init__(self, port, host=None, ca=None):
+        self.port = port
+        self.host = host
+        self.context = None
+        if ca is not None:
+            self.context = ssl.create_default_context(cadata=ca)
+
+    def request(self, method, path, headers=None, body=None):
+        if self.context is None:
+            connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        else:
+            connection = _PinnedHTTPS(self.host, self.port, self.context)
+        try:
+            connection.request(method, path, body=body, headers=headers or {})
+            response = connection.getresponse()
+            return response.status, {k.lower(): v for k, v in response.getheaders()}, response.getheaders(), response.read()
+        finally:
+            connection.close()
+
+
+class _PinnedHTTPS(http.client.HTTPSConnection):
+    """HTTPS to 127.0.0.1:<port>, checking the certificate for `host`."""
+
+    def __init__(self, host, port, context):
+        super().__init__(host, 8443, timeout=30, context=context)
+        self._local = port
+
+    def connect(self):
+        raw = socket.create_connection(("127.0.0.1", self._local), timeout=30)
+        self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+
+
+def set_cookies(raw_headers):
+    out = {}
+    for name, value in raw_headers:
+        if name.lower() == "set-cookie":
+            pair = value.split(";", 1)[0]
+            if "=" in pair:
+                key, val = pair.split("=", 1)
+                out[key.strip()] = val.strip()
+    return out
+
+
+def cookie_header(jar):
+    return "; ".join(f"{k}={v}" for k, v in jar.items())
+
+
+class Browser:
+    """One person's sign-in through the real issuer and their gateway session."""
+
+    def __init__(self, gateway, issuer, namespace):
+        self.gateway = gateway
+        self.issuer = issuer
+        self.namespace = namespace
+        self.cookies = {}
+
+    def sign_in(self, username, password):
+        """Returns ("signed-in", status) or the step at which sign-in stopped."""
+        status, headers, raw, _ = self.gateway.request("GET", "/api/v1/auth/login")
+        if status not in (302, 303):
+            return ("login", status)
+        self.cookies.update(set_cookies(raw))
+        authorize = urllib.parse.urlsplit(headers["location"])
+        if f"{authorize.scheme}://{authorize.netloc}" != f"https://{issuer_host(self.namespace)}:8443":
+            return ("issuer", 0)
+        issuer_jar = {}
+        status, _, raw, body = self.issuer.request("GET", f"{authorize.path}?{authorize.query}")
+        issuer_jar.update(set_cookies(raw))
+        form = re.search(rb'<form[^>]*id="kc-form-login"[^>]*action="([^"]+)"', body)
+        if status != 200 or not form:
+            return ("issuer-form", status)
+        action = urllib.parse.urlsplit(html.unescape(form.group(1).decode()))
+        status, headers, raw, _ = self.issuer.request(
+            "POST", f"{action.path}?{action.query}",
+            {"content-type": "application/x-www-form-urlencoded", "cookie": cookie_header(issuer_jar)},
+            urllib.parse.urlencode({"username": username, "password": password, "credentialId": ""}))
+        if status not in (302, 303) or "location" not in headers:
+            return ("issuer-refused", status)
+        callback = urllib.parse.urlsplit(headers["location"])
+        if f"{callback.scheme}://{callback.netloc}" != public_url(self.namespace):
+            return ("redirect", 0)
+        status, headers, raw, _ = self.gateway.request("GET", f"{callback.path}?{callback.query}", {"cookie": cookie_header(self.cookies)})
+        self.cookies.update(set_cookies(raw))
+        if "omg_session" not in self.cookies:
+            return ("gateway-refused", status)
+        return ("signed-in", status)
+
+    def api(self, method, path, body=None, client=None):
+        headers = {"cookie": cookie_header(self.cookies), "origin": public_url(self.namespace)}
+        if method != "GET":
+            headers["x-csrf-token"] = self.cookies.get("omg_csrf", "")
+        data = None
+        if body is not None:
+            headers["content-type"] = "application/json"
+            data = json.dumps(body)
+        status, _, _, payload = (client or self.gateway).request(method, path, headers, data)
+        try:
+            return status, json.loads(payload or b"null")
+        except ValueError:
+            return status, None
+
+
+def inference(client, key, model=MODEL):
+    status, _, _, _ = client.request("POST", "/v1/chat/completions",
+                                     {"authorization": f"Bearer {key}", "content-type": "application/json"},
+                                     json.dumps({"model": model, "messages": [{"role": "user", "content": "hello"}], "max_tokens": 4}))
+    return status
+
+
+def models(client, key):
+    status, _, _, body = client.request("GET", "/v1/models", {"authorization": f"Bearer {key}"})
+    if status != 200:
+        return status, set()
+    return status, {m.get("id") for m in json.loads(body).get("data", [])}
+
+
+class Check:
+    """`spark-env.py check <name>` on a `--mode replicas` environment."""
+
+    def __init__(self, env, spark, namespace):
+        self.env = env
+        self.spark = spark
+        self.namespace = namespace
+        self.results = []
+        self.children = []
+
+    # -- cluster helpers --
+    def kubectl(self, args, **kwargs):
+        return self.spark.kubectl(args, namespace=self.namespace, **kwargs)
+
+    def sql(self, statement):
+        """One statement in the database as its owner, through the instance pod."""
+        pod = self.kubectl(["get", "pods", "-l", "cnpg.io/cluster=omg-db,cnpg.io/instanceRole=primary", "-o", "jsonpath={.items[0].metadata.name}"], capture=True).strip()
+        return self.kubectl(["exec", pod, "-c", "postgres", "--", "psql", "-U", "postgres", "-d", "gateway", "-Atqc", statement], capture=True).strip()
+
+    def gateway_pods(self):
+        out = self.kubectl(["get", "pods", "-l", "app.kubernetes.io/name=open-model-gateway,app.kubernetes.io/component=gateway",
+                            "-o", "json"], capture=True)
+        pods = json.loads(out)["items"]
+        return [p for p in pods if p["metadata"].get("deletionTimestamp") is None and p["status"].get("phase") == "Running"]
+
+    def forward(self, target, ports):
+        command = Replicas(self.env, self.spark).forward_command(self.namespace, target, ports)
+        child = subprocess.Popen(command, env=self.env.child_environment(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        self.children.append(child)
+        port = int(ports[0].split(":")[0])
+        for _ in range(100):
+            with socket.socket() as probe:
+                if probe.connect_ex(("127.0.0.1", port)) == 0:
+                    return child
+            time.sleep(0.1)
+        raise self.env.SparkError(f"port-forward to {target} did not open")
+
+    def stop(self, child):
+        if child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=5)
+
+    def record(self, step, name, outcome, detail=""):
+        self.results.append({"step": step, "name": name, "result": outcome, "detail": detail})
+        print(f"{outcome.upper():4} {step}.{name}" + (f" ({detail})" if detail else ""))
+
+    def expect(self, step, name, ok, detail=""):
+        self.record(step, name, "pass" if ok else "fail", detail)
+        return ok
+
+    # -- the run --
+    def run(self):
+        started = time.monotonic()
+        ca = self.kubectl(["get", "configmap", "omg-issuer-ca", "-o", "jsonpath={.data.ca\\.crt}"], capture=True)
+        users = {name: self.read_secret("omg-issuer-users", name) for name in ("admin", "unentitled")}
+        self.env._REGISTERED_SECRETS.extend(users.values())
+        for port in (GATEWAY_PORT, ISSUER_PORT, *POD_PORTS):
+            if not self.spark.port_free(port):
+                raise self.env.SparkError(f"local port {port} is in use; stop `forward` or what holds it and retry")
+        try:
+            gateway_forward = self.forward("service/omg", [f"{GATEWAY_PORT}:8080"])
+            self.forward("service/omg-issuer", [f"{ISSUER_PORT}:8443"])
+            gateway = Http(GATEWAY_PORT)
+            issuer = Http(ISSUER_PORT, issuer_host(self.namespace), ca)
+            admin = self.sign_in_step(gateway, issuer, users)
+            key = self.inference_step(gateway, admin) if admin else None
+            self.stop(gateway_forward)
+            self.restart_step(key)
+            self.lease_step()
+            self.notification_step(admin, key)
+            self.network_policy_step()
+            self.pooler_step()
+        finally:
+            for child in self.children:
+                self.stop(child)
+            self.cleanup()
+        return {"seconds": round(time.monotonic() - started), "steps": self.results,
+                "passed": all(r["result"] != "fail" for r in self.results)}
+
+    def read_secret(self, name, key):
+        import base64
+        value = self.kubectl(["get", "secret", name, "-o", f"jsonpath={{.data.{key}}}"], capture=True).strip()
+        return base64.b64decode(value).decode()
+
+    def cleanup(self):
+        for kind, name in (("pod", "omg-check-load"), ("secret", "omg-check-key")):
+            self.kubectl(["delete", kind, name, "--ignore-not-found", "--wait=false"], capture=True)
+
+    def sign_in_step(self, gateway, issuer, users):
+        admin = Browser(gateway, issuer, self.namespace)
+        outcome = admin.sign_in("admin", users["admin"])
+        signed = self.expect(1, "admin-signs-in", outcome[0] == "signed-in", f"{outcome[0]} {outcome[1]}")
+        if signed:
+            status, me = admin.api("GET", "/api/v1/me")
+            self.expect(1, "admin-is-platform-admin", status == 200 and (me or {}).get("user", {}).get("platform_admin") is True, f"GET /api/v1/me {status}")
+        wrong = Browser(gateway, issuer, self.namespace).sign_in("admin", users["admin"] + "-wrong")
+        self.expect(1, "wrong-password-refused", wrong[0] == "issuer-refused", f"stopped at {wrong[0]}")
+        unentitled = Browser(gateway, issuer, self.namespace).sign_in("unentitled", users["unentitled"])
+        self.expect(1, "unentitled-refused", unentitled[0] == "gateway-refused", f"stopped at {unentitled[0]} {unentitled[1]}")
+        return admin if signed else None
+
+    def ensure_model(self, admin):
+        """The free model, served by the in-namespace mock, priced, assigned to
+        the admin's personal workspace: created once, found on later runs."""
+        mock_ip = self.kubectl(["get", "service/omg-mock-upstream", "-o", "jsonpath={.spec.clusterIP}"], capture=True).strip()
+        status, me = admin.api("GET", "/api/v1/me")
+        workspace = next(w["id"] for w in me["workspaces"] if w["kind"] == "personal")
+        status, listed = admin.api("GET", f"/api/v1/platform/models?limit=200")
+        existing = [m for m in (listed or {}).get("data", []) if m.get("public_name") == MODEL]
+        if existing:
+            model = existing[0]["id"]
+        else:
+            status, provider = admin.api("POST", "/api/v1/platform/providers", {
+                "name": "Spark mock", "provider": "openai_compatible", "credential_ref": "none",
+                "endpoint": f"http://{ip(mock_ip)}:8000/v1", "enabled": True})
+            if status not in (200, 201):
+                raise self.env.SparkError(f"creating the mock connection failed: HTTP {status}")
+            status, created = admin.api("POST", "/api/v1/platform/model-setup", {
+                "model": {"public_name": MODEL, "display_name": "Spark mock", "description": None,
+                          "supported_protocols": ["chat_completions"], "enabled": True},
+                "route": {"provider_connection_id": provider["id"], "upstream_model": "mock", "enabled": True},
+                "price": {"input_microusd_per_million": "1000000", "output_microusd_per_million": "1000000",
+                          "input_token_limit": 4096, "output_token_limit": 256},
+                "catalog_ids": []})
+            if status not in (200, 201):
+                raise self.env.SparkError(f"model setup failed: HTTP {status}")
+            model = created["model_id"]
+        admin.api("POST", f"/api/v1/platform/workspaces/{workspace}/models", {"model_id": model})
+        status, issued = admin.api("POST", f"/api/v1/workspaces/{workspace}/keys", {"name": f"spark-check-{secrets.token_hex(3)}", "expires_in_days": 1})
+        if status not in (200, 201):
+            raise self.env.SparkError(f"issuing the check's key failed: HTTP {status}")
+        key = issued["token"]
+        self.env._REGISTERED_SECRETS.append(key)
+        return model, key
+
+    def inference_step(self, gateway, admin):
+        model, key = self.ensure_model(admin)
+        self.model_id = model
+        before = int(self.sql("SELECT count(*) FROM governance_reservations WHERE state='settled'") or "0")
+        status = inference(gateway, key)
+        self.expect(2, "inference-through-the-mock", status == 200, f"HTTP {status}")
+        latest = self.sql("SELECT state FROM governance_reservations ORDER BY admitted_at DESC LIMIT 1")
+        after = int(self.sql("SELECT count(*) FROM governance_reservations WHERE state='settled'") or "0")
+        self.expect(2, "reservation-settled", latest == "settled" and after == before + 1, f"latest {latest}, settled +{after - before}")
+        return key
+
+    def restart_step(self, key):
+        if key is None:
+            self.record(3, "rolling-restart-under-load", "fail", "no key: an earlier step failed")
+            return
+        self.kubectl(["create", "-f", "-"], stdin=json.dumps(secret("omg-check-key", {"key": key})), capture=True)
+        seconds = 120
+        self.kubectl(["apply", "-f", "-"], stdin=fill((DEPLOY / "load-pod.yaml").read_text(), {"MODEL": MODEL, "SECONDS": str(seconds)}), capture=True)
+        self.kubectl(["wait", "--for=condition=Ready", "pod/omg-check-load", "--timeout=120s"], capture=True)
+        time.sleep(10)
+        minimum = [len(self.gateway_pods())]
+        stop = threading.Event()
+
+        def watch():
+            while not stop.is_set():
+                ready = sum(1 for p in self.gateway_pods() if any(c.get("type") == "Ready" and c.get("status") == "True"
+                                                                for c in p["status"].get("conditions", [])))
+                minimum[0] = min(minimum[0], ready)
+                time.sleep(1)
+
+        watcher = threading.Thread(target=watch, daemon=True)
+        watcher.start()
+        restart = time.monotonic()
+        self.kubectl(["rollout", "restart", "deployment/omg"], capture=True)
+        self.kubectl(["rollout", "status", "deployment/omg", "--timeout=600s"], capture=True)
+        rolled = round(time.monotonic() - restart)
+        stop.set()
+        watcher.join()
+        self.kubectl(["wait", "--for=jsonpath={.status.phase}=Succeeded", "pod/omg-check-load", f"--timeout={seconds + 120}s"], capture=True)
+        counts = json.loads(self.kubectl(["logs", "pod/omg-check-load"], capture=True).strip().splitlines()[-1])
+        failures = sum(counts["failures"].values()) + sum(v for k, v in counts["statuses"].items() if k != "200")
+        self.expect(3, "rolling-restart-no-failed-request", failures == 0 and counts["statuses"].get("200", 0) > 0,
+                    f"{counts['statuses'].get('200', 0)} ok, {failures} failed of {counts['sent']}; rollout {rolled}s")
+        self.expect(3, "rolling-restart-kept-a-ready-replica", minimum[0] >= 1, f"fewest ready replicas {minimum[0]}")
+        self.pdb_check()
+
+    def evict(self, pod):
+        body = json.dumps({"apiVersion": "policy/v1", "kind": "Eviction", "metadata": {"name": pod, "namespace": self.namespace}})
+        try:
+            self.kubectl(["create", "--raw", f"/api/v1/namespaces/{self.namespace}/pods/{pod}/eviction", "-f", "-"], stdin=body, capture=True)
+            return "evicted"
+        except self.env.SparkError as error:
+            return "refused" if "disruption budget" in str(error).lower() or "429" in str(error) else "error"
+
+    def pdb_check(self):
+        pods = [p["metadata"]["name"] for p in self.gateway_pods()]
+        if len(pods) < 2:
+            self.record(3, "pdb-refuses-a-second-eviction", "fail", f"{len(pods)} running replicas")
+            return
+        first, second = self.evict(pods[0]), self.evict(pods[1])
+        self.expect(3, "pdb-refuses-a-second-eviction", (first, second) == ("evicted", "refused"), f"{first}, then {second}")
+        self.kubectl(["rollout", "status", "deployment/omg", "--timeout=600s"], capture=True)
+        for _ in range(120):
+            if len(self.gateway_pods()) >= 2:
+                break
+            time.sleep(2)
+
+    def lease_step(self, lease="metrics"):
+        """Delete the pod holding a lease; another replica takes it within the
+        documented time (TTL 30 s + renewal 10 s) and the old term is fenced."""
+        current = self.sql(f"SELECT holder||' '||epoch FROM work_leases WHERE name='{lease}' AND expires_at>clock_timestamp()").split()
+        if len(current) != 2:
+            self.record(4, "lease-takeover", "fail", f"no replica holds the {lease} lease")
+            return
+        holder, epoch = current
+        pods = self.gateway_pods()
+        owner = None
+        for pod in pods:
+            log = self.kubectl(["logs", pod["metadata"]["name"], "-c", "gateway"], capture=True)
+            if re.search(rf'"lease":"{lease}".*"epoch":{epoch}\b|"epoch":{epoch}\b.*"lease":"{lease}"', log):
+                owner = pod["metadata"]["name"]
+        if owner is None:
+            self.record(4, "lease-takeover", "fail", "no replica logged the current term")
+            return
+        deleted = time.monotonic()
+        self.kubectl(["delete", "pod", owner, "--wait=false"], capture=True)
+        took = None
+        for _ in range(90):
+            now = self.sql(f"SELECT holder||' '||epoch FROM work_leases WHERE name='{lease}' AND expires_at>clock_timestamp()").split()
+            if len(now) == 2 and now[0] != holder and int(now[1]) > int(epoch):
+                took = round(time.monotonic() - deleted, 1)
+                break
+            time.sleep(1)
+        self.expect(4, "lease-taken-over-by-another-replica", took is not None and took <= 40, f"{lease} lease after {took}s (documented: at most 40 s)")
+        # The old term's fence check must fail with 55006 (object_in_use).
+        probe = (f"SELECT CASE WHEN EXISTS (SELECT FROM work_leases WHERE name='{lease}' AND holder='{holder}'::uuid "
+                 f"AND epoch={int(epoch)} AND expires_at>clock_timestamp()) THEN 'current' ELSE 'stale' END")
+        try:
+            self.sql(f"SELECT omg_lease_fence('{lease}','{holder}'::uuid,{int(epoch)})")
+            fenced = False
+        except self.env.SparkError as error:
+            fenced = "is no longer held" in str(error)
+        self.expect(4, "stale-term-fenced", fenced and self.sql(probe) == "stale", "the old term's fence check fails (55006)")
+        self.kubectl(["rollout", "status", "deployment/omg", "--timeout=600s"], capture=True)
+
+    def notification_step(self, admin, key):
+        """A change made through one replica is seen through the other."""
+        if admin is None or key is None:
+            self.record(5, "change-crosses-replicas", "fail", "an earlier step failed")
+            return
+        pods = sorted(p["metadata"]["name"] for p in self.gateway_pods())
+        if len(pods) < 2:
+            self.record(5, "change-crosses-replicas", "fail", f"{len(pods)} running replicas")
+            return
+        clients = []
+        for pod, port in zip(pods, POD_PORTS):
+            self.forward(f"pod/{pod}", [f"{port}:8080"])
+            clients.append(Http(port))
+        a, b = clients
+        _, before = models(b, key)
+        if MODEL not in before:
+            self.record(5, "change-crosses-replicas", "fail", "the model is not listed through the second replica")
+            return
+        timings = []
+        for enabled in (False, True):
+            status, _ = admin.api("PATCH", f"/api/v1/platform/models/{self.model_id}", {"enabled": enabled}, client=a)
+            if status != 200:
+                self.record(5, "change-crosses-replicas", "fail", f"PATCH through the first replica: HTTP {status}")
+                return
+            changed = time.monotonic()
+            seen = None
+            for _ in range(100):
+                if (MODEL in models(b, key)[1]) == enabled:
+                    seen = round((time.monotonic() - changed) * 1000)
+                    break
+                time.sleep(0.05)
+            timings.append(seen)
+        ok = all(t is not None and t <= 3000 for t in timings)
+        self.expect(5, "change-crosses-replicas", ok, f"disable seen after {timings[0]} ms, enable after {timings[1]} ms")
+
+    def network_policy_step(self):
+        if not Replicas(self.env, self.spark).can_create_network_policy(self.namespace):
+            self.record(6, "network-policy", "skip", "the platform refuses NetworkPolicy to this account")
+            return
+        exists = self.kubectl(["get", "networkpolicy", "omg", "--ignore-not-found", "-o", "name"], capture=True).strip()
+        self.record(6, "network-policy", "fail", "deployed" if exists else "the environment was created without it: recreate it")
+
+    def pooler_step(self):
+        pooler = set(self.kubectl(["get", "pods", "-l", "cnpg.io/poolerName=omg-pooler", "-o", "jsonpath={.items[*].status.podIP}"], capture=True).split())
+        gateways = {p["status"].get("podIP") for p in self.gateway_pods()}
+        rows = self.sql("SELECT host(client_addr) FROM pg_stat_activity WHERE usename='gateway_runtime' AND client_addr IS NOT NULL").split()
+        via_pooler = sum(1 for r in rows if r in pooler)
+        direct = sum(1 for r in rows if r in gateways)
+        listening = self.sql("SELECT count(*) FROM pg_stat_activity WHERE usename='gateway_runtime' AND query ILIKE 'LISTEN%'") or "0"
+        self.expect(7, "runtime-traffic-through-the-pooler", via_pooler >= 1 and direct <= len(gateways),
+                    f"{via_pooler} sessions from the pooler, {direct} direct (LISTEN sessions {listening}, one per replica by design)")
+
+
+def quota(spark, namespace):
+    """What the account uses of its shared quota (requests, limits, pods,
+    volumes): the platform's quota objects, read in the environment's namespace."""
+    out = spark.kubectl(["get", "resourcequota", "-o", "json"], namespace=namespace, capture=True)
+    used = {}
+    for item in json.loads(out)["items"]:
+        for k, v in item.get("status", {}).get("used", {}).items():
+            if k in ("requests.cpu", "requests.memory", "limits.cpu", "limits.memory", "pods", "requests.storage"):
+                used[k] = v
+    return used
+
+
+def require_openssl(which=shutil.which):
+    if not which("openssl"):
+        raise RuntimeError("openssl is not installed")
