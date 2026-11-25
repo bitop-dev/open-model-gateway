@@ -69,18 +69,29 @@ TERMINAL = re.compile(
     rb'": response status code 4(?!29)[0-9]{2}\b',
     re.MULTILINE,
 )
-TRANSIENT = {"registry-server", "registry-rate-limit", "transport"}
+TRANSIENT = {"registry-server", "registry-rate-limit", "registry-readback", "transport"}
+# ORAS's text status output (`cp --no-tty`) re-reads each manifest it has
+# pushed from the destination, to list the manifest's children; a 404 there is
+# returned unwrapped and printed with the registry prefix as `<digest>: not
+# found` (ORAS v1.3.6 status/text.go PostCopy; oras-go v2.7.0 copy.go and
+# manifestStore.Fetch, which reads no body on a 404, so no registry text can
+# be part of it). The push had succeeded; the registry did not serve it yet.
+# Copying the same verified archive by digest again publishes nothing else.
+READBACK = re.compile(rb"sha256:[0-9a-f]{64}: not found")
 # The diagnostic of a failed copy is built only from these fixed words, numbers
 # and the match of a fixed alternation: never URL paths, queries, headers, tokens
 # or registry message text.
+# Each is matched only where ORAS writes it in its error line (`error_line`):
+# a code or a request record at the start of the text after the prefix, a
+# status right after the request record, transport words only after a
+# request record without a status (Go's own error text, not a registry's).
 OCI_CODE = re.compile(
-    rb'(?:Error response from registry: |Error from destination registry for "[^"\n]*": )'
     rb"(blob unknown|blob upload invalid|blob upload unknown|digest invalid|manifest blob unknown|"
     rb"manifest invalid|manifest unknown|name invalid|name unknown|size invalid|unauthorized|denied|"
     rb"unsupported|toomanyrequests|unknown): "
 )
-REQUEST = re.compile(rb'\b(GET|HEAD|POST|PATCH|PUT|DELETE) "https?://([^/"\s?]+)(/[^"\s?]*)?(?:\?[^"\s]*)?"', re.IGNORECASE)
-STATUS = re.compile(rb'"https?://[^"\s]+": response status code ([1-5][0-9]{2}): ')
+REQUEST = re.compile(rb'(GET|HEAD|POST|PATCH|PUT|DELETE) "https?://([^/"\s?]+)(/[^"\s?]*)?(?:\?[^"\s]*)?": ', re.IGNORECASE)
+STATUS = re.compile(rb"response status code ([1-5][0-9]{2}): ")
 TRANSPORT_MARKERS = (
     ("unexpected-eof", b"unexpected EOF"),
     ("eof", b": EOF"),
@@ -259,11 +270,15 @@ def snapshot(source, target, limit, executable=False):
     return hasher.hexdigest()
 
 
-def copy_failure_category(stderr, image):
-    stderr.seek(0)
-    report = stderr.read(DIAGNOSTIC_BYTES + 1)
+def error_line(report, image=None):
+    """ORAS's error line of a failed copy: after at most MAX_REGISTRY_WARNINGS
+    registry warnings, the one remaining line through EOF, with its prefix
+    `Error response from registry: ` ("registry") or `Error from destination
+    registry for "<image>": ` ("destination"; any quoted reference when
+    `image` is None). (kind, the text after the prefix, whether it is the
+    last line), or None."""
     if len(report) > DIAGNOSTIC_BYTES:
-        return "unknown"
+        return None
     offset = 0
     for _ in range(MAX_REGISTRY_WARNINGS):
         warning = REGISTRY_WARNING.match(report, offset)
@@ -272,18 +287,29 @@ def copy_failure_category(stderr, image):
         offset = warning.end()
     line, newline, trailing = report[offset:].partition(b"\n")
     if not newline:
-        return "unknown"
+        return None
     # After a warning, require exactly one remaining error line through EOF.
     # An embedded newline in registry-supplied warning text can mimic output.
     if offset and trailing:
+        return None
+    if line.startswith(b"Error response from registry: "):
+        return "registry", line[len(b"Error response from registry: "):], not trailing
+    destination = (re.escape(f'Error from destination registry for "{image}": '.encode("ascii")) if image
+                   else rb'Error from destination registry for "(?:[^"\\]|\\.)*": ')
+    prefix = re.match(destination, line)
+    return ("destination", line[prefix.end():], not trailing) if prefix else None
+
+
+def copy_failure_category(stderr, image):
+    stderr.seek(0)
+    found = error_line(stderr.read(DIAGNOSTIC_BYTES + 1), image)
+    if found is None:
         return "unknown"
-    for prefix in (b"Error response from registry: ",
-                   f'Error from destination registry for "{image}": '.encode("ascii")):
-        if line.startswith(prefix):
-            detail = line[len(prefix):]
-            break
-    else:
-        return "unknown"
+    kind, detail, alone = found
+    # The whole text after ORAS's registry prefix, on the report's only line
+    # (the error carries no usage text): the read-back of a pushed manifest.
+    if kind == "registry" and alone and READBACK.fullmatch(detail):
+        return "registry-readback"
 
     request = GHCR_REQUEST.match(detail)
     if request is None:
@@ -340,17 +366,26 @@ def copy_signals(stderr):
     """What the copy's stderr says, in fixed words: status, OCI error code, request,
     registry host class, transport markers and size. Safe to print."""
     report, cut = read_report(stderr)
-    # The status only from a request record (`"<url>": response status code NNN: `),
-    # never from message text.
-    status = STATUS.search(report)
-    code = next((m[1] for m in (OCI_CODE.match(line) for line in report.split(b"\n")) if m), None)
-    request = REQUEST.search(report)
+    status = code = request = None
+    markers = []
+    found = None if cut else error_line(report)
+    if found:
+        detail = found[1]
+        request = REQUEST.match(detail)
+        if request:
+            rest = detail[request.end():]
+            status = STATUS.match(rest)
+            if status is None:
+                # Go's transport error text; the separator ORAS prints is kept.
+                markers = [name for name, needle in TRANSPORT_MARKERS if needle in b": " + rest]
+        else:
+            code = OCI_CODE.match(detail)
+            code = code[1] if code else None
     if request:
         host = "ghcr.io" if request[2].lower() == b"ghcr.io" else "other"
         described = f"{request[1].decode().upper()} {path_kind(request[3])}"
     else:
         host, described = "none", "none"
-    markers = [name for name, needle in TRANSPORT_MARKERS if needle in report]
     lines = report.count(b"\n")
     return (f"status {status[1].decode() if status else 'none'}; "
             f"oci-code {code.decode().replace(' ', '-') if code else 'none'}; "
