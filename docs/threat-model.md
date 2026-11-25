@@ -1,6 +1,6 @@
 # Threat model
 
-This is a STRIDE-style threat model of Open Model Gateway for code reviews and the independent security review (#61). It records what the code does today, with the tests that cover it, and where it falls short. It is not a certification or a penetration test.
+This is a STRIDE-style threat model of Open Model Gateway for code reviews. It records what the code does today, with the tests that cover it, and where it falls short. It is not a certification or a penetration test, and no independent external review of it is planned (#61, closed as not planned on 2026-11-24).
 
 Every mitigation names the file and function that implement it. Every test is named by file and function and was found with `grep` on `main` at commit `527892f` (the v0.5.0 release merge). "No test found" means a search found none, not that the behaviour is wrong. Paths are relative to `apps/gateway/src/` unless they start with `apps/`, `deploy/`, `tests/`, `scripts/` or `.github/`; those start at the repository root. The gateway's integration tests are under `apps/gateway/tests/`; `tests/` holds the browser, container, Helm, demo and backup tests.
 
@@ -121,7 +121,7 @@ Regression checks enforce these specific boundaries:
 
 ## Threats
 
-Each entry gives the STRIDE category (S, T, R, I, D, E), the asset and attacker, the mitigation, the tests, the residual risk and a follow-up. "Review: #61" means no new work is proposed, but the independent review should check it.
+Each entry gives the STRIDE category (S, T, R, I, D, E), the asset and attacker, the mitigation, the tests, the residual risk and a follow-up. "None (#61 dropped)" means no new work is proposed and the residual risk stands as written: these were the items left for an independent external review to check, and the owner dropped that review on 2026-11-24.
 
 ### Tenancy and workspace isolation
 
@@ -129,7 +129,7 @@ Each entry gives the STRIDE category (S, T, R, I, D, E), the asset and attacker,
 - Mitigation: the workspace comes only from the `Principal` built by `auth.rs` `authenticate_live`, never from headers or bodies. Admission selects the deployment with `workspace_model_allowed($1,m.id)` and the key-restriction subqueries (`governance::admit_unobserved`). Files, batches and videos are filtered by `principal.workspace_id` (`protocols/files.rs` `list`, `retrieve`, `content`, `delete`; `jobs/store.rs` `list`). History tables check scoped parents with insert triggers (migration 0034).
 - Tests: `apps/gateway/tests/database.rs` `http_enforces_workspace_scope_and_unregistered_protocol_errors`; `apps/gateway/tests/inference.rs` `deployment_resolution_cannot_cross_workspaces`; `filestore/api_tests.rs` `files_are_scoped_to_the_key_workspace`; `jobs/db_tests.rs` `jobs_are_private_to_their_workspace`; `jobs/batch_tests.rs` `batches_are_private_to_their_workspace`; `history/tests.rs` `history_inserts_check_scoped_parents`.
 - Residual: isolation is in application queries, not PostgreSQL row-level security. A new query without the workspace predicate leaks.
-- Follow-up: Review: #61 (including the RLS assessment listed in the roadmap).
+- Follow-up: None (#61 dropped) (including the RLS assessment listed in the roadmap).
 
 **TEN-2. Platform staff read a personal workspace's keys or request details.** I · Asset: personal privacy · Attacker: Platform Auditor, Platform Admin.
 - Mitigation: `management/resources.rs` `access_inner` denies a personal workspace to anyone but its owner, whatever the platform role. The one defined exception (#400): Platform Admins and Auditors may see a personal workspace's identity (id; the cost report and usage also show an owner label), its usage, cost and storage totals and its platform-managed configuration (workspace policy and limits, catalog overrides on `/platform/workspaces/{ws}/policy` and `/catalogs`), never its keys, request or execution details, prompts or responses, sessions, file contents or owner-made choices. Provider-cost reconciliation keeps a stricter identity-free personal subset. The key-safety platform view returns personal keys as counts only.
@@ -179,7 +179,7 @@ Each entry gives the STRIDE category (S, T, R, I, D, E), the asset and attacker,
 - Mitigation: `auth.rs` `NewApiKey::generate` uses 256 bits from the OS CSPRNG and fails closed if it is unavailable. `token_id` rejects anything but the exact format before the database. `authenticate_live` compares SHA-256 digests in constant time (`subtle::ConstantTimeEq`). `http.rs` `credential` rejects duplicate or mixed credential headers.
 - Tests: `auth.rs` `keys_have_expected_format_and_independent_random_secrets`, `malformed_tokens_are_rejected_before_database_access`; `http.rs` `header_schemes_are_strict_and_ambiguous_credentials_are_rejected`, `all_inference_routes_require_authentication`; `apps/gateway/tests/database.rs` `key_revocation_expiration_and_wrong_secret_deny_access`.
 - Residual: every well-formed but unknown token costs one database query; the key cache stores only positive results, and there is no per-client rate limit. SECURITY.md treats volumetric DoS as out of scope.
-- Follow-up: Review: #61.
+- Follow-up: None (#61 dropped).
 
 **KEY-3. A revoked, expired or disabled key works again.** E · Asset: inference keys · Attacker: inference key holder; compromised DB credential.
 - Mitigation: `authenticate_live` and `revalidate_admission_with` require `revoked_at IS NULL`, `disabled_at IS NULL` and an unexpired key, plus live user, role and membership or service account. Revocation takes the lineage authority lock exclusively (trigger `omg_authority_api_keys`, migration 0027), so no admission commits after it. Reactivating a user, membership or service account never clears `revoked_at` (`lifecycle.rs`, `scim/users.rs` `reactivate`).
@@ -191,7 +191,7 @@ Each entry gives the STRIDE category (S, T, R, I, D, E), the asset and attacker,
 - Mitigation: only the hash is stored. `NewApiKey` has no `Debug` or `Serialize`. `http.rs` `request_context` logs a generated request ID, method, status and timing, never headers, paths with queries or bodies, and sets `Cache-Control: no-store` on every response except those marked `PublicCache` (the logo, `management/branding.rs`).
 - Tests: `apps/gateway/tests/database.rs` `bootstrap_is_idempotent_and_stores_only_hashes`; `http.rs` `requests_are_counted_by_route_template_not_raw_path`, `liveness_does_not_need_database_and_overrides_request_id`.
 - Residual: browser realtime clients send the key in `Sec-WebSocket-Protocol: openai-insecure-api-key.<key>` (`protocols/realtime.rs` `credential`), a header that proxies and ingress controllers may log. `bootstrap-dev` prints keys, in development only.
-- Follow-up: Review: #61.
+- Follow-up: None (#61 dropped).
 
 **KEY-5. A human key outlives its holder's access, or a service key dies with its creator.** E, D · Asset: shared-workspace keys · Attacker: departed workspace member.
 - Mitigation: human keys need live entitlement and actual membership (`revalidate_with`). Service-account keys need an active service account in an active Team or Project, independent of the creator (`revalidate_with`, the `None` branch). Removing a member revokes their keys in that workspace (`management/members.rs`).
@@ -250,7 +250,7 @@ Each entry gives the STRIDE category (S, T, R, I, D, E), the asset and attacker,
 - Mitigation: `verify_id_token` checks the signature against cached JWKS with asymmetric algorithms only (never `none` or HMAC), plus issuer, audience, expiry and nonce. `callback` adds the `azp` policy, requires `email_verified == true` and bounds email and subject.
 - Tests: `identity/tests.rs` `id_tokens_never_accept_none_or_shared_secret_algorithms`, `invalid_tokens_and_failed_exchange_consume_attempt_without_session`, `discovery_rejects_issuer_mismatch_and_unsafe_endpoints`.
 - Residual: none found in code. No live IdP acceptance beyond Authentik sign-in.
-- Follow-up: Review: #61.
+- Follow-up: None (#61 dropped).
 
 **OIDC-2. Login CSRF, code injection or open redirect.** S, T · Asset: sessions · Attacker: unauthenticated internet client.
 - Mitigation: `login` stores hashed `state` bound to a hashed `omg_oidc` browser cookie, with S256 PKCE and a 10-minute expiry. `consume_attempt` deletes the attempt and commits before the token request, so a code or state cannot be replayed. `safe_return_path` accepts only same-origin dashboard paths and is checked again at the callback and by a database constraint (migration 0006).
@@ -288,7 +288,7 @@ Each entry gives the STRIDE category (S, T, R, I, D, E), the asset and attacker,
 - Mitigation: SCIM is off unless `GATEWAY_SCIM_TOKEN_ENV` names a variable with a 32–1024 character token; only its SHA-256 is kept and compared in constant time (`scim.rs` `ScimConfig::from_lookup`, `authorized`). Disabled SCIM answers 404 everywhere. Provisioning a user grants nothing by itself.
 - Tests: `scim/tests.rs` `token_configuration_is_a_reference_and_strict`, `bearer_token_is_required_and_compared_by_hash`, `disabled_scim_is_not_found_everywhere`.
 - Residual: the token is one static secret, rotated only by restart, with no rate limit. Its holder can create a user with `oidc_link_allowed=true` (`create_user`) and push that user into any SCIM-managed group, including one mapped to Platform Admin. Holding the SCIM token is therefore close to holding admin, for anyone who can then sign in at the IdP with that email.
-- Follow-up: #60 (acceptance); Review: #61.
+- Follow-up: #60 (acceptance); None (#61 dropped).
 
 **SCIM-2. SCIM locks the installation out.** D · Asset: administration · Attacker: SCIM client (misconfigured or malicious).
 - Mitigation: `finish` rolls back any SCIM write that would leave no active Platform Admin, answers 409, audits it and raises a built-in alert.
@@ -344,7 +344,7 @@ Each entry gives the STRIDE category (S, T, R, I, D, E), the asset and attacker,
 - Mitigation: the hold uses the price's configured hard input ceiling plus the requested output maximum (`reservation_bounds`). Actual overspend is recorded and blocks the next admission. Cache and meter bounds that cannot be proven keep the settlement unknown (`cache_bound_violated`, `pinned_value`).
 - Tests: `governance/tests.rs` `failed_provider_retains_hold_actual_overspend_blocks_future`, `partial_usage_grows_hold_oversized_usage_rolls_back`, `nonrepresentable_reservation_is_rejected_before_dispatch`; `governance/safety_tests.rs` `every_attempt_pins_its_own_price_and_cost_center_snapshot`.
 - Residual: the input ceiling is trusted, not measured ([governance](governance.md)); a request larger than it can overshoot a budget once. A provider that under-reports usage is under-charged. There is no invoice reconciliation (roadmap R19).
-- Follow-up: Review: #61.
+- Follow-up: None (#61 dropped).
 
 **ADM-7. Prices, ledger or audit history are changed.** T, R · Asset: financial and audit history · Attacker: Platform Admin, compromised DB credential.
 - Mitigation: migration 0001 triggers (`immutable_history()`) refuse UPDATE, DELETE and TRUNCATE on `deployment_prices`, `monetary_ledger` and `audit_events`. The runtime role has INSERT and SELECT only on them. New prices are new versions; reservations pin their price.
@@ -441,7 +441,7 @@ Not covered end to end: Bedrock (its SigV4 SDK transport has no loopback test co
 - Tests: `providers/openai/tests.rs` `translates_payload_and_owns_authentication`; `providers/local/tests.rs` `all_profiles_mock_chat_and_embedding_contracts_with_pinned_host` (no `authorization` without a credential); `providers/anthropic/tests.rs` `local_contract_and_native_headers`; `providers/openai/realtime/tests.rs` `connect_uses_server_credential_enforces_configuration_and_closes_on_drop`.
 - Tests (#196): `inference/steering_tests.rs` `no_json_inference_input_can_steer_the_upstream`, `no_multipart_audio_input_can_steer_the_upstream` assert, for the OpenAI, Anthropic, OpenRouter and local adapters on every protocol they serve, that the caller's key and every caller-chosen header or field never appear upstream and that upstream authentication is the server's credential.
 - Residual: Bedrock is not in that matrix (the AWS SDK signs its own requests from server identity).
-- Follow-up: Review: #61.
+- Follow-up: None (#61 dropped).
 
 **EGR-7. The SMTP relay is used to exfiltrate a provider credential.** I, E · Asset: provider credentials · Attacker: Platform Admin.
 - Mitigation: SMTP needs STARTTLS or implicit TLS unless the relay and every address it resolves to are loopback (`email.rs` `send_with`); test sends are audited and rate-limited.
@@ -539,7 +539,7 @@ Not covered end to end: Bedrock (its SigV4 SDK transport has no loopback test co
 - Mitigation: each gateway-run line goes through the engine with its own admission, which re-checks the key live.
 - Tests: `jobs/batch_tests.rs` `lines_of_a_revoked_key_fail_with_the_authentication_error`.
 - Residual: a native batch (OpenAI, Anthropic) is one admission; once submitted, the provider keeps running until it finishes or is cancelled. No code found that cancels native batches or video jobs when the key is revoked.
-- Follow-up: Review: #61.
+- Follow-up: None (#61 dropped).
 
 **JOB-2. A batch line runs or is charged twice.** T · Asset: ledger · Attacker: replica crash.
 - Mitigation: exactly-once line claims; restart resumes without re-running; each line has its own reservation transferred from the batch ceiling.
@@ -620,7 +620,7 @@ Not covered end to end: Bedrock (its SigV4 SDK transport has no loopback test co
 - Mitigation: CI runs `cargo deny --all-features check` (advisories, licences, crates.io only), `npm audit --omit=dev --audit-level=high` and CodeQL; Dependabot opens weekly updates (`.github/workflows/ci.yml`, `codeql.yml`, `.github/dependabot.yml`, `deny.toml`).
 - Tests: CI jobs `cargo-deny` and the npm audit step (no unit tests).
 - Residual: `deny.toml` ignores advisories with recorded reasons (for example RUSTSEC-2023-0071 in `rsa`). Dev-dependency advisories are reported but do not fail the build.
-- Follow-up: Review: #61.
+- Follow-up: None (#61 dropped).
 
 **SUP-2. A CI action is replaced.** T · Asset: CI, release artifacts · Attacker: compromised action repository.
 - Mitigation: every workflow pins actions by commit SHA. `ci.yml` defaults to `contents: read` (only the image job, which releases `v*` tags, gets `contents: write`, `packages: write` and `id-token: write`) and has no `pull_request_target`. No third-party action shares a job with a write token (#194): in `image.yml` the `build` job pushes by digest with only `actions/checkout` and the `docker/*` build actions, the Trivy scan, staging rehearsal and runtime contract test run in a `verify` job with `contents: read` and `packages: read`, and `publish` (packages and `id-token: write`) starts only after it passes. `setup-buildx-action`, which can download an unchecked Buildx, is preceded by a runner-Buildx check in every write job and has no `version`. CodeQL's bundle download runs in a read-only job and only `upload-sarif` holds `security-events: write`. Every run-time download (Trivy, cosign, helm, kubeconform, Node.js) goes through `.github/scripts/fetch-verified.sh` (https only, SHA-256 checked before the file is moved into place, fail closed); `aquasecurity/trivy-action`, `azure/setup-helm`, `actions/setup-node` and `sigstore/cosign-installer` are gone ([verification](verification.md#supply-chain)).
@@ -633,7 +633,7 @@ Not covered end to end: Bedrock (its SigV4 SDK transport has no loopback test co
 - Mitigation: `image.yml` builds per-architecture images with SBOM and provenance attestations, gates on Trivy (fixable HIGH and CRITICAL; a pinned, checksum-verified binary in a read-only job, so the scanner cannot touch the push or signing credentials), signs the multi-arch index with cosign keyless only after that gate passes, and promotes by digest. The runtime is distroless, non-root, without a shell. Pull requests run the same scan on their own image and on the arm64 runtime base before a tag exists (`ci.yml` `staging-image`, #475).
 - Tests: `tests/container-image.test.mjs` "image config: binary entrypoint, serve by default, UID 10001, exec-form healthcheck", "filesystem has no shell, package manager, curl, perl, Node or Cargo"; `tests/helm-chart.test.mjs` "gateway Deployment never runs as root and has a read-only root filesystem".
 - Residual: branch images (`dev-<sha>`) are not scanned or signed. Nothing in the Helm chart verifies signatures at deploy time. A compromise of the `build` job itself (the runner, BuildKit, a Cargo or npm dependency fetched inside the Dockerfile) can still push a malicious digest: `verify` runs it with a read-only token and scans it, but a scan and the contract tests do not prove an image benign, and `publish` signs whatever passed them.
-- Follow-up: Review: #61.
+- Follow-up: None (#61 dropped).
 
 **SUP-4. Secrets enter the image or rendered manifests.** I · Asset: secrets · Attacker: anyone who can pull the image.
 - Mitigation: `.dockerignore` denies everything except listed build inputs; generated `.local/` secrets stay outside the context; the chart references Secrets by name.
@@ -653,7 +653,7 @@ Not covered end to end: Bedrock (its SigV4 SDK transport has no loopback test co
 - Mitigation: `deploy/staging/runtime-grants.sql` revokes everything, then grants a column allowlist; `grants verify` runs rollback-only probes. The migration Job never shares the runtime Secret.
 - Tests: `apps/gateway/tests/runtime_privileges.rs` `enterprise_runtime_allowlist_and_rollback_probes` and the `*_runs_as_runtime` tests (`scim_provisioning_runs_as_runtime`, `files_api_runs_as_runtime`, `history_partitions_run_as_runtime` and others).
 - Residual: by design the runtime role can insert `platform_role_grants`, `api_keys` and memberships and update `revoked_at`, so a stolen runtime credential controls authorization. A trigger refusing `revoked_at` → NULL (KEY-3) guards against application bugs, not this: the credential can insert new keys and grants instead. There is no row-level security.
-- Follow-up: the `revoked_at` trigger landed in #145 (against application bugs); review: #61.
+- Follow-up: the `revoked_at` trigger landed in #145 (against application bugs); none (#61 dropped).
 
 **OPS-3. The partition function is abused.** E · Asset: schema · Attacker: compromised runtime credential.
 - Mitigation: the `SECURITY DEFINER` functions (migrations 0030, 0035) pin `search_path=pg_catalog,public,pg_temp`, set `lock_timeout`, and create only canonical month partitions of registered parents; readiness accepts only those.
@@ -734,15 +734,15 @@ Not covered end to end: Bedrock (its SigV4 SDK transport has no loopback test co
 | `revoked_at` can be cleared by the runtime role; no trigger. A trigger guards against application bugs, not a stolen runtime credential, which can insert keys and grants | KEY-3, OPS-2 | Fixed in #145 |
 | Restore revives keys and grants revoked after the backup and loses spend; `--expect-version` and `--skip-file-key-check` weaken its checks | OPS-6 | Fixed in #146 (re-apply revocations, runbook); the weaker flags remain operator choices |
 | No secret manager; every replica holds every secret | EGR-10 | Deferred (roadmap R17), no issue |
-| SCIM token is one static secret that can effectively grant mapped admin roles | SCIM-1 | #60; Review: #61 |
+| SCIM token is one static secret that can effectively grant mapped admin roles | SCIM-1 | #60; None (#61 dropped) |
 | No off-host, tamper-evident audit export | ADM-7, AUD-1 | Fixed in #106 (webhook), #107 (syslog over TLS), #108 (OTLP logs) |
 | No data export, anonymization, legal hold or metadata retention | TEN-2, OPS-4, AUD-2 | Fixed in #74, #75, #76, #77 |
-| No row-level security; isolation depends on query predicates | TEN-1, OPS-2 | Review: #61 |
-| Native batches and video jobs keep running at the provider after revocation | JOB-1 | Review: #61 |
-| Input ceilings are trusted; provider usage is trusted; no invoice reconciliation | ADM-6 | Review: #61 (roadmap R19) |
-| Unknown well-formed keys cost a database query each; no per-client rate limit | KEY-2 | Review: #61 (volumetric DoS is out of scope in SECURITY.md) |
-| Realtime browser subprotocol puts the key in a request header | KEY-4, JOB-5 | Review: #61 |
-| Branch images unsigned; no signature check at deploy | SUP-3 | Review: #61 |
+| No row-level security; isolation depends on query predicates | TEN-1, OPS-2 | None (#61 dropped) |
+| Native batches and video jobs keep running at the provider after revocation | JOB-1 | None (#61 dropped) |
+| Input ceilings are trusted; provider usage is trusted; no invoice reconciliation | ADM-6 | None (#61 dropped) (roadmap R19) |
+| Unknown well-formed keys cost a database query each; no per-client rate limit | KEY-2 | None (#61 dropped) (volumetric DoS is out of scope in SECURITY.md) |
+| Realtime browser subprotocol puts the key in a request header | KEY-4, JOB-5 | None (#61 dropped) |
+| Branch images unsigned; no signature check at deploy | SUP-3 | None (#61 dropped) |
 | Live IdP and SCIM acceptance | OIDC-1, SCIM-3, SCIM-4 | #60 |
 | Prompt injection and output content | EGR-9 | #36 |
 

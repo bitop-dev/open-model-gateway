@@ -651,7 +651,7 @@ fn every_completed_operation_rejects_response_mutations(document: &Value) {
             }
         }
     }
-    assert_eq!((operations, json_operations), (279, 270));
+    assert_eq!((operations, json_operations), (281, 272));
 }
 
 /// A schema compiled as a fragment of the registered document must judge every

@@ -536,6 +536,10 @@ mod period_tests;
 mod rates_tests;
 /// Realtime session accounting: per-response windows on one reservation.
 pub mod realtime;
+/// Operator resolution of a finished realtime session's unknown responses.
+pub mod realtime_resolution;
+#[cfg(all(test, feature = "integration-tests"))]
+mod realtime_resolution_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod realtime_tests;
 #[cfg(all(test, feature = "integration-tests"))]

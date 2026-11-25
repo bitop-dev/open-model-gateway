@@ -22,7 +22,8 @@ import { formatUsd } from "../lib/governance";
 import { Money } from "../components/templates/money";
 import { costText, countText, dataPolicyOf, finishReasonLabel, jobStateTone, jobText, type JobDetail, latencyText, logPaths, logsSearch, requestFilters, requestQuery, requestStatusLabel, requestStatusTone, requestTarget, servedModel, sessionTarget, timelineStatus, tokensText, tpsText, unresolvedText, workloadText, modalityText, realtimeResponseState, realtimeStatusLabel, type LogsScope, type RealtimeResponse, type RequestAttempt, type RequestDetail, type RequestPage } from "../lib/requests";
 import type { DashboardSearch } from "../lib/permissions";
-import { Button, ErrorNotice, Stack, useApi } from "../components/ui";
+import { Button, ErrorNotice, Stack, useAction, useApi } from "../components/ui";
+import { canResolveRealtime, canSettleRealtimeSession, realtimeResolveAction, realtimeSessionAction } from "../lib/realtime-resolution";
 import { EmptyState } from "../components/ui/empty-state/empty-state";
 import { ResourceLink, useDashboardNavigation } from "../components/navigation-link";
 import { useResourceName } from "../components/layout/breadcrumbs";
@@ -61,8 +62,8 @@ export function attemptItem(a: RequestAttempt, attempts: RequestAttempt[], workl
   };
 }
 
-/** One realtime response: status, per-modality usage, its value (or retained hold) and duration. */
-export function realtimeResponseItem(r: RealtimeResponse, cached: (a: string | null, b: string | null) => string | null): TimelineItem {
+/** One realtime response: status, per-modality usage, its value (or retained hold) and duration; `resolve` offers a Platform Admin the evidence dialog for an unknown one. */
+export function realtimeResponseItem(r: RealtimeResponse, cached: (a: string | null, b: string | null) => string | null, resolve?: (r: RealtimeResponse, opener: HTMLElement) => void): TimelineItem {
   return {
     id: String(r.sequence), status: timelineStatus(realtimeResponseState(r)), durationMs: r.duration_ms,
     title: <>Response {r.sequence}</>,
@@ -71,6 +72,7 @@ export function realtimeResponseItem(r: RealtimeResponse, cached: (a: string | n
       <span>Input: {modalityText(r.input_text_tokens, r.input_audio_tokens, cached(r.cached_text_tokens, r.cached_audio_tokens))}</span>
       <span>Output: {modalityText(r.output_text_tokens, r.output_audio_tokens)}</span>
       {r.cost_microusd === null && <span className={s.muted}>Cost unknown: {r.unbounded_cost ? "the usage could not be priced or exceeded the window" : "no usage was reported"}; the response's budget window stays on hold.</span>}
+      {resolve && <span><Button size="sm" variant="secondary" aria-label={`Resolve response ${r.sequence}`} onClick={e => resolve(r, e.currentTarget)}>Resolve with evidence</Button></span>}
     </Stack>,
   };
 }
@@ -103,22 +105,22 @@ function RequestNotFound({ scope, back }: { scope: LogsScope; back: { label: str
 }
 
 /** `/requests/3cbfb500`: resolves a unique short id to the full one; otherwise the not-found state. */
-export function RequestDetailPage({ workspace, id }: Scope & { id: string }) {
-  return <RequestRoute scope={{ kind: "workspace", workspace }} id={id} />;
+export function RequestDetailPage({ session, workspace, id }: Scope & { id: string }) {
+  return <RequestRoute session={session} scope={{ kind: "workspace", workspace }} id={id} />;
 }
 /** Admin › Logs › request (Team/Project requests only). */
-export function PlatformRequestDetailPage({ id }: { session: Session; id: string }) {
-  return <RequestRoute scope={{ kind: "platform" }} id={id} />;
+export function PlatformRequestDetailPage({ session, id }: { session: Session; id: string }) {
+  return <RequestRoute session={session} scope={{ kind: "platform" }} id={id} />;
 }
 const scopeFilters = (scope: LogsScope, search: DashboardSearch) => requestFilters(scope.kind === "platform" ? search : { ...search, workspace_id: undefined });
-function RequestRoute({ scope, id }: { scope: LogsScope; id: string }) {
+function RequestRoute({ session, scope, id }: { session: Session; scope: LogsScope; id: string }) {
   const nav = useDashboardNavigation(), search: DashboardSearch = nav?.search ?? requestTarget(scope, id, {});
   const short = isShortRequestId(id), full = FULL_ID.test(id);
   const lookup = useApi<RequestPage>(`${logPaths(scope).requests}?${shortIdLookup(id)}`, short);
   const match = lookup.data?.data.length === 1 ? lookup.data.data[0]!.root_request_id : undefined;
   useEffect(() => { if (match && nav) nav.navigate({ ...search, record: match }); }, [match]); // eslint-disable-line react-hooks/exhaustive-deps
   const back = { label: "Logs", search: logsSearch(scope, scopeFilters(scope, search), "requests", { cols: search.cols, density: search.density }) };
-  if (full) return <RequestDetail scope={scope} id={id} />;
+  if (full) return <RequestDetail session={session} scope={scope} id={id} />;
   if (short && (lookup.isPending || match)) return <p role="status">Finding request {id}…</p>;
   if (short && lookup.isError && !(lookup.error instanceof ApiError && [400, 403, 404].includes(lookup.error.status))) return <ErrorNotice error={lookup.error} retry={() => void lookup.refetch()} />;
   return <RequestNotFound scope={scope} back={back} />;
@@ -140,8 +142,8 @@ export function JobCard({ job }: { job: JobDetail }) {
     ...(job.deleted_at ? [{ label: "Assets deleted", value: when(job.deleted_at, "") }] : []),
   ]} /></Card>;
 }
-function RequestDetail({ scope, id }: { scope: LogsScope; id: string }) {
-  const nav = useDashboardNavigation(), search: DashboardSearch = nav?.search ?? requestTarget(scope, id, {});
+function RequestDetail({ session, scope, id }: { session: Session; scope: LogsScope; id: string }) {
+  const ask = useAction(), nav = useDashboardNavigation(), search: DashboardSearch = nav?.search ?? requestTarget(scope, id, {});
   const filters = scopeFilters(scope, search), view = { cols: search.cols, density: search.density };
   // Neighbours follow the list's filters; filters the server would reject are left out rather than failing the page.
   const built = requestQuery(filters), query = built.error ? requestQuery({ ...filters, q: undefined, start_date: undefined, end_date: undefined, session_id: undefined }).query : built.query;
@@ -191,8 +193,8 @@ function RequestDetail({ scope, id }: { scope: LogsScope; id: string }) {
         <Timeline label="Upstream attempts" items={r!.attempts.map(a => attemptItem(a, r!.attempts, r!.workload_kind))} showDurationBars showTotal empty="No attempts are visible for this request." />
       </Card>
       {r!.job && <JobCard job={r!.job} />}
-      {served?.realtime_responses && <Card title="Realtime responses" titleAs="h2" description="One realtime session is one attempt. Each response reserved a bounded budget window and was valued from its own usage; responses without usage keep their window on hold.">
-        <Timeline label="Realtime responses" items={served.realtime_responses.map(x => realtimeResponseItem(x, cachedSum))} showDurationBars empty="No responses were created in this session." />
+      {served?.realtime_responses && <Card title="Realtime responses" titleAs="h2" description="One realtime session is one attempt. Each response reserved a bounded budget window and was valued from its own usage; responses without usage keep their window on hold." actions={canSettleRealtimeSession(session, served) && <Button size="sm" variant="secondary" onClick={e => ask({ ...realtimeSessionAction(r!.workspace_id, served.execution_id), returnFocus: e.currentTarget })}>Settle session</Button>}>
+        <Timeline label="Realtime responses" items={served.realtime_responses.map(x => realtimeResponseItem(x, cachedSum, canResolveRealtime(session, served, x) ? (resp, opener) => ask({ ...realtimeResolveAction(r!.workspace_id, served.execution_id, resp), returnFocus: opener }) : undefined))} showDurationBars empty="No responses were created in this session." />
       </Card>}
       <p className={s.note}>Prompts and responses are never stored or shown here.</p>
     </>}

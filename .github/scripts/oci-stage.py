@@ -18,6 +18,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 CONTROL = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("oci_layout", CONTROL / "oci-layout.py")
@@ -46,6 +47,54 @@ REGISTRY_CODES = {
     b"digest invalid": "registry-content",
     b"size invalid": "registry-content",
 }
+# A copy is retried only after a failure the classifier above recognises as
+# transient, within one time budget for every attempt (#711). The archive and its
+# root digest are verified locally before the first attempt, and every attempt
+# copies the same verified archive by digest.
+COPY_ATTEMPTS = 3
+COPY_BACKOFF = (10, 30)
+COPY_BUDGET = 600
+# A retry is made only if this much of the budget is left after its pause.
+MIN_ATTEMPT = 60
+# Login is one token exchange. With the copy budget it stays inside the import
+# job's 15 minutes, which also covers checkout, downloads and validation.
+LOGIN_TIMEOUT = 120
+# A failure is retried only if nothing in its report says it is not transient:
+# ORAS joins several OCI errors with "; " and may omit the HTTP status, so a
+# rate limit can be reported together with a denial or a content error.
+TERMINAL = re.compile(
+    rb"(?:^|[:;] )(?:unauthorized|denied|blob unknown|blob upload invalid|blob upload unknown|"
+    rb"digest invalid|manifest blob unknown|manifest invalid|manifest unknown|name invalid|"
+    rb"name unknown|size invalid|unsupported): |failed to verify certificate|"
+    rb'": response status code 4(?!29)[0-9]{2}\b',
+    re.MULTILINE,
+)
+TRANSIENT = {"registry-server", "registry-rate-limit", "transport"}
+# The diagnostic of a failed copy is built only from these fixed words, numbers
+# and the match of a fixed alternation: never URL paths, queries, headers, tokens
+# or registry message text.
+OCI_CODE = re.compile(
+    rb'(?:Error response from registry: |Error from destination registry for "[^"\n]*": )'
+    rb"(blob unknown|blob upload invalid|blob upload unknown|digest invalid|manifest blob unknown|"
+    rb"manifest invalid|manifest unknown|name invalid|name unknown|size invalid|unauthorized|denied|"
+    rb"unsupported|toomanyrequests|unknown): "
+)
+REQUEST = re.compile(rb'\b(GET|HEAD|POST|PATCH|PUT|DELETE) "https?://([^/"\s?]+)(/[^"\s?]*)?(?:\?[^"\s]*)?"', re.IGNORECASE)
+STATUS = re.compile(rb'"https?://[^"\s]+": response status code ([1-5][0-9]{2}): ')
+TRANSPORT_MARKERS = (
+    ("unexpected-eof", b"unexpected EOF"),
+    ("eof", b": EOF"),
+    ("connection-reset", b"connection reset by peer"),
+    ("broken-pipe", b"broken pipe"),
+    ("io-timeout", b"i/o timeout"),
+    ("tls-handshake-timeout", b"TLS handshake timeout"),
+    ("context-deadline", b"context deadline exceeded"),
+    ("client-timeout", b"Client.Timeout exceeded"),
+    ("no-such-host", b"no such host"),
+    ("connection-refused", b"connection refused"),
+    ("http2-goaway", b"GOAWAY"),
+    ("closed-connection", b"use of closed network connection"),
+)
 GHCR_REQUEST = re.compile(
     rb'(?:GET|HEAD|POST|PATCH|PUT|DELETE) "https://ghcr\.io/[^"\x00-\x20\x7f]*": ',
     re.IGNORECASE,
@@ -157,34 +206,121 @@ def copy_failure_category(stderr, image):
     token_request = re.match(rb'(?:Get|Post) "https://ghcr\.io/token(?:\?[^"\x00-\x20\x7f]*)?": ', detail)
     if token_request:
         detail = detail[token_request.end():]
+    # A certificate the runner cannot verify is not transient: not retried.
+    if detail.startswith(b"tls: failed to verify certificate: "):
+        return "transport-tls"
     if (detail in (b"EOF", b"unexpected EOF", b"net/http: TLS handshake timeout")
-            or detail.startswith((b"dial tcp: ", b"dial tcp ", b"tls: failed to verify certificate: "))):
+            or detail.startswith((b"dial tcp: ", b"dial tcp "))):
         return "transport"
     return "unknown"
 
 
-def run(tool, args, env, work, reason, password=b"", *, copy_image=None):
-    category = "unknown"
+def path_kind(path):
+    if not path or path == b"/v2/":
+        return "registry-root"
+    for marker, kind in ((b"/blobs/uploads", "blob-upload"), (b"/blobs/", "blob"), (b"/manifests/", "manifest"),
+                         (b"/referrers/", "referrers"), (b"/token", "token")):
+        if marker in path:
+            return kind
+    return "other"
+
+
+def read_report(stderr):
+    """The first DIAGNOSTIC_BYTES of stderr, cut back to whole lines, and whether it was cut."""
+    stderr.seek(0)
+    report = stderr.read(DIAGNOSTIC_BYTES + 1)
+    if len(report) <= DIAGNOSTIC_BYTES:
+        return report, False
+    whole = report[:DIAGNOSTIC_BYTES]
+    return whole[: whole.rfind(b"\n") + 1], True
+
+
+def terminal(stderr):
+    report, _ = read_report(stderr)
+    return TERMINAL.search(report) is not None
+
+
+def copy_signals(stderr):
+    """What the copy's stderr says, in fixed words: status, OCI error code, request,
+    registry host class, transport markers and size. Safe to print."""
+    report, cut = read_report(stderr)
+    # The status only from a request record (`"<url>": response status code NNN: `),
+    # never from message text.
+    status = STATUS.search(report)
+    code = next((m[1] for m in (OCI_CODE.match(line) for line in report.split(b"\n")) if m), None)
+    request = REQUEST.search(report)
+    if request:
+        host = "ghcr.io" if request[2].lower() == b"ghcr.io" else "other"
+        described = f"{request[1].decode().upper()} {path_kind(request[3])}"
+    else:
+        host, described = "none", "none"
+    markers = [name for name, needle in TRANSPORT_MARKERS if needle in report]
+    lines = report.count(b"\n")
+    return (f"status {status[1].decode() if status else 'none'}; "
+            f"oci-code {code.decode().replace(' ', '-') if code else 'none'}; "
+            f"request {described}; host {host}; transport {','.join(markers) or 'none'}; "
+            f"stderr {lines} lines" + (" (first 4096 bytes)" if cut else ""))
+
+
+def attempt_copy(tool, args, env, work, image, timeout):
+    """None on success, else (category, signals, retryable) of one copy attempt."""
+    signals = "status none; oci-code none; request none; host none; transport none; stderr 0 lines"
+    try:
+        with tempfile.TemporaryFile(dir=work) as err:
+            try:
+                result = subprocess.run([str(tool), *args], input=b"", env=env, cwd=work,
+                                        stdout=subprocess.DEVNULL, stderr=err, timeout=timeout, check=False)
+            except subprocess.TimeoutExpired:
+                return "deadline", copy_signals(err), False
+            if result.returncode == 0:
+                return None
+            signals = copy_signals(err)
+            if result.returncode < 0:
+                return "signal", signals, False
+            if result.returncode == 1:
+                category = copy_failure_category(err, image)
+                return category, signals, category in TRANSIENT and not terminal(err)
+            return "unknown", signals, False
+    except (OSError, subprocess.SubprocessError):
+        return "execution", signals, False
+
+
+def wait(seconds):
+    time.sleep(seconds)
+
+
+def copy(tool, args, env, work, image):
+    """Copy, retrying only a transient failure, within COPY_BUDGET seconds in all."""
+    deadline = time.monotonic() + COPY_BUDGET
+    for attempt in range(1, COPY_ATTEMPTS + 1):
+        outcome = attempt_copy(tool, args, env, work, image, deadline - time.monotonic())
+        if outcome is None:
+            return
+        category, signals, retryable = outcome
+        pause = COPY_BACKOFF[attempt - 1] if attempt < COPY_ATTEMPTS else 0
+        if retryable and attempt < COPY_ATTEMPTS and deadline - time.monotonic() >= pause + MIN_ATTEMPT:
+            print(f"oci-stage: copy attempt {attempt} of {COPY_ATTEMPTS} failed ({category}) "
+                  f"[{signals}]; retrying in {pause} s", file=sys.stderr)
+            wait(pause)
+            # The pause may have run long: an attempt starts only with a minute left.
+            if deadline - time.monotonic() < MIN_ATTEMPT:
+                raise Refusal(f"copy failed ({category}) [attempt {attempt} of {COPY_ATTEMPTS}; {signals}]")
+            continue
+        raise Refusal(f"copy failed ({category}) [attempt {attempt} of {COPY_ATTEMPTS}; {signals}]")
+
+
+def run(tool, args, env, work, reason, password=b""):
     try:
         # Discard stdout and keep stderr in a private temporary file so even
         # large child output never has to be buffered in memory.
         with tempfile.TemporaryFile(dir=work) as err:
             result = subprocess.run([str(tool), *args], input=password, env=env,
-                                    cwd=work, stdout=subprocess.DEVNULL, stderr=err, timeout=600,
+                                    cwd=work, stdout=subprocess.DEVNULL, stderr=err, timeout=LOGIN_TIMEOUT,
                                     check=False)
             if result.returncode == 0:
                 return
-            if copy_image is not None:
-                if result.returncode < 0:
-                    category = "signal"
-                elif result.returncode == 1:
-                    category = copy_failure_category(err, copy_image)
-    except subprocess.TimeoutExpired:
-        category = "deadline"
-    except (OSError, subprocess.SubprocessError):
-        category = "execution"
-    if copy_image is not None:
-        reason += f" ({category})"
+    except (subprocess.TimeoutExpired, OSError, subprocess.SubprocessError):
+        pass
     raise Refusal(reason)
 
 
@@ -216,10 +352,10 @@ def stage(args):
                    "--password-stdin", "ghcr.io"], env, work, "login failed", token.encode())
         # ORAS writes this file; retain private mode before its second use.
         auth.chmod(0o600)
-        run(tool, ["cp", "--force", "--no-tty", "--from-oci-layout",
-                   "--to-registry-config", str(auth), "--to-distribution-spec",
-                   "v1.1-referrers-api", str(archive) + "@" + args.root, args.image],
-            env, work, "copy failed", copy_image=args.image)
+        copy(tool, ["cp", "--force", "--no-tty", "--from-oci-layout",
+                    "--to-registry-config", str(auth), "--to-distribution-spec",
+                    "v1.1-referrers-api", str(archive) + "@" + args.root, args.image],
+             env, work, args.image)
 
 
 def main(argv=None):
