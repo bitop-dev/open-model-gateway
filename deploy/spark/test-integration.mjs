@@ -5,7 +5,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { checkSources, identity, KEY_CONTENTION, TERMINAL, DEDICATED_LIB_PROBES, LEGACY_RUNTIME_PROBES, DEDICATED_RUNTIME_PROBES } from "./target-inventory.mjs";
+import { checkSources, identity, KEY_CONTENTION, TERMINAL, LOCK_STALL, DEDICATED_LIB_PROBES, LEGACY_RUNTIME_PROBES, DEDICATED_RUNTIME_PROBES } from "./target-inventory.mjs";
 
 function checkLegacyLibraryProbes() {
   const list = (...flags) => new Set(execFileSync("cargo", [
@@ -33,7 +33,7 @@ async function main() {
   const { discoverTargets, parseListing, targetArgs, validateRun, runCargo } = selected;
   const metadata = JSON.parse(await runCargo(["metadata", "--no-deps", "--all-features", "--format-version", "1", "--locked"]));
   const runtime = group === "runtime" || group === "runtime-ignored";
-  if (runtime || group === "lib-preflight" || group === "key-contention" || group === "terminal") {
+  if (runtime || group === "lib-preflight" || group === "key-contention" || group === "lock-stall" || group === "terminal") {
     if (runtime) checkSources(metadata, ["runtime_privileges"]);
     const selection = runtime ? ["--test", "runtime_privileges"] : ["--lib"];
     const args = ["test", "-p", "open-model-gateway", "--all-features", ...selection, "--"];
@@ -51,7 +51,7 @@ async function main() {
     } else if (group === "lib-preflight") {
       probes = selected.DEDICATED_LIB_PROBES ?? optional(DEDICATED_LIB_PROBES);
     } else {
-      probes = [group === "terminal" ? TERMINAL : KEY_CONTENTION];
+      probes = group === "lock-stall" ? LOCK_STALL : [group === "terminal" ? TERMINAL : KEY_CONTENTION];
     }
     for (const name of probes) {
       assert.ok(listed(ignored, name), `missing ignored ${runtime ? "runtime" : "library"} probe: ${name}`);

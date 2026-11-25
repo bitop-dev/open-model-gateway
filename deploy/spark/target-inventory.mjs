@@ -3,7 +3,12 @@ import { isAbsolute, join } from "node:path";
 
 export const TERMINAL = "providers::anthropic::terminal_tests::terminal_fidelity_official_sdks_and_priced_http_evidence";
 export const KEY_CONTENTION = "management::tests::authz_matrix_tests::key_issuance_contention_tests::key_issuance_contention_measurement";
-export const DEDICATED_LIB_PROBES = [TERMINAL, KEY_CONTENTION];
+// #132: cold-bucket admission contention and stall recovery, run alone (lock-stall).
+export const LOCK_STALL = [
+  "governance::lock_stall_tests::cold_bucket_admission_contention",
+  "governance::lock_stall_tests::steady_load_recovers_after_a_stall",
+];
+export const DEDICATED_LIB_PROBES = [TERMINAL, KEY_CONTENTION, ...LOCK_STALL];
 export const LEGACY_RUNTIME_PROBES = [
   "controlled_lock_stall_recovers_on_runtime_http_path", "enterprise_runtime_allowlist_and_rollback_probes",
 ];

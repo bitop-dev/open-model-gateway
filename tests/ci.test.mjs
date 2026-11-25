@@ -179,6 +179,7 @@ test("special probes retain sequential ACL, exact contention/terminal, Docker an
     "node deploy/spark/test-integration.mjs runtime",
     "node deploy/spark/test-integration.mjs runtime-ignored",
     "node deploy/spark/test-integration.mjs key-contention",
+    "node deploy/spark/test-integration.mjs lock-stall",
     "node deploy/spark/test-integration.mjs terminal",
     AGE_INSTALL,
     "cargo build -p open-model-gateway --all-features --bin open-model-gateway",
@@ -399,9 +400,10 @@ function syntheticCargo({ liveIgnored, corrupt = "", failAt = -1, probe = "", pr
     const terminal = "providers::anthropic::terminal_tests::terminal_fidelity_official_sdks_and_priced_http_evidence";
     const keyContention = "management::tests::authz_matrix_tests::key_issuance_contention_tests::key_issuance_contention_measurement";
     const runtimeProbes = ["enterprise_runtime_allowlist_and_rollback_probes", "controlled_lock_stall_recovers_on_runtime_http_path", "populated_verifier_both", "populated_verifier_personal", "populated_verifier_scim"];
-    let entries = name === "open_model_gateway" ? Array.from({ length: 12 }, (_, i) => entry(i === 11 ? terminal : i === 10 ? keyContention : `m::test_${i}`))
+    const lockStall = ["governance::lock_stall_tests::cold_bucket_admission_contention", "governance::lock_stall_tests::steady_load_recovers_after_a_stall"];
+    let entries = name === "open_model_gateway" ? Array.from({ length: 16 }, (_, i) => entry(i === 15 ? lockStall[1] : i === 14 ? lockStall[0] : i === 13 ? terminal : i === 12 ? keyContention : `m::test_${i}`))
       : name === "runtime_privileges" ? runtimeProbes.map(name => entry(name)) : [entry("normal"), entry("live")];
-    let ignored = entries.filter(e => e.name === "live" || e.name === terminal || e.name === keyContention || (name === "runtime_privileges" && runtimeProbes.includes(e.name)));
+    let ignored = entries.filter(e => e.name === "live" || e.name === terminal || e.name === keyContention || lockStall.includes(e.name) || (name === "runtime_privileges" && runtimeProbes.includes(e.name)));
     if (name === "custom_name" && liveIgnored) ignored = entries;
     if (name === "open_model_gateway" || name === "runtime_privileges") {
       const mutate = items => items.flatMap(e => e.name !== probe ? [e]
@@ -439,7 +441,7 @@ test("orchestrator runs selected lib names once after -- --exact, runs doctests 
     assert.equal(libRuns.length, 1);
     const args = libRuns[0];
     assert.deepEqual(args.slice(args.indexOf("--"), args.indexOf("--exact") + 1), ["--", "--exact"]);
-    assert.equal(args.slice(args.indexOf("--exact") + 1).length, 3, "multiple full exact names, no substring filtering");
+    assert.equal(args.slice(args.indexOf("--exact") + 1).length, 4, "multiple full exact names, no substring filtering");
     assert.ok(!args.includes("--ignored") && !args.includes("--include-ignored"));
     assert.ok(!fake.calls.some(c => !c.includes("--list") && (c.includes("filestore_s3") || c.includes("runtime_privileges"))));
     assert.ok(logs.some(l => /passed=.*ignored=.*duration=/.test(l)));
@@ -499,6 +501,8 @@ test("orchestrator rejects each missing, renamed, unignored or non-test dedicate
   const { runShard } = await shards();
   const probes = [
     "management::tests::authz_matrix_tests::key_issuance_contention_tests::key_issuance_contention_measurement",
+    "governance::lock_stall_tests::cold_bucket_admission_contention",
+    "governance::lock_stall_tests::steady_load_recovers_after_a_stall",
     "providers::anthropic::terminal_tests::terminal_fidelity_official_sdks_and_priced_http_evidence",
     "enterprise_runtime_allowlist_and_rollback_probes",
     "controlled_lock_stall_recovers_on_runtime_http_path",
@@ -559,7 +563,7 @@ process.stdout.write(output);
     const good = invoke("");
     assert.equal(good.status, 0, good.stderr);
     assert.match(good.stdout, /default-ignored=1/);
-    assert.match(good.stdout, /listed=12 default-ignored=2/);
+    assert.match(good.stdout, /listed=16 default-ignored=4/);
     assert.match(good.stdout, /workspace doctests: owner=shard0/);
     assert.match(good.stderr, /Compiling fixture/);
     for (const mode of ["compile", "metadata", "list", "run", "doc", "zero", "listing", "mismatch", "ignored", "terminal"]) {
