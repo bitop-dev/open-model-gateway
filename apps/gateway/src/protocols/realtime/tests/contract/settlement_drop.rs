@@ -556,3 +556,46 @@ async fn a_session_logs_under_its_upgrade_request_span(pool: PgPool) {
     assert_eq!(line["span"]["name"], "http.request", "{line}");
     assert_eq!(line["span"]["request_id"], id.to_string());
 }
+
+/// A window growth shed behind a held scope row leaves the session's
+/// context as it was: the input it would have consumed is the next
+/// request's, so the request sent again reserves the window a session that
+/// never shed reserves.
+#[dbtest::test]
+async fn a_shed_window_growth_keeps_its_input_for_the_next_request(pool: PgPool) {
+    let g = gateway(pool, Init::Safe, vec![], limits()).await;
+    let input = crate::inference::realtime::context::EventSize {
+        text_bytes: 4000,
+        audio_bytes: 0,
+        audio_bytes_per_second: None,
+    };
+    let held = async |id: Uuid| -> i64 {
+        sqlx::query_scalar(
+            "SELECT held_microusd FROM governance_reservations WHERE execution_id=$1",
+        )
+        .bind(id)
+        .fetch_one(&g.pool)
+        .await
+        .unwrap()
+    };
+    // Shed once, then sent again.
+    let (mut shed, shed_id) = open(&g).await;
+    shed.client_event(input);
+    let mut row = g.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM budget_totals WHERE scope_kind='workspace' AND scope_id=$1 AND period='lifetime' FOR UPDATE")
+        .bind(g.keys.team_workspace_id)
+        .execute(&mut *row)
+        .await
+        .unwrap();
+    assert_eq!(
+        shed.reserve_window(100).await,
+        Err(InferenceError::ScopeBusy)
+    );
+    row.rollback().await.unwrap();
+    shed.reserve_window(100).await.unwrap();
+    // The same request, never shed.
+    let (mut plain, plain_id) = open(&g).await;
+    plain.client_event(input);
+    plain.reserve_window(100).await.unwrap();
+    assert_eq!(held(shed_id).await, held(plain_id).await);
+}

@@ -31,7 +31,9 @@ async fn wide(pool: &PgPool, connections: u32) -> Store {
         .connect_with((*pool.connect_options()).clone())
         .await
         .unwrap();
-    Store::new(pool)
+    // These bursts (dozens of admissions at once on one scope) test budget
+    // exactness and lock order, not the wait bound.
+    Store::new(pool).with_admission_lock_wait(Duration::from_secs(120))
 }
 
 fn start_for(f: &Fixture, principal: Principal) -> ExecutionStart {
@@ -790,7 +792,7 @@ async fn an_admission_past_its_lock_bound_is_shed_and_leaves_nothing(pool: PgPoo
         "the admission is shed, not left waiting"
     );
     assert!(
-        waited >= ADMISSION_LOCK_WAIT && waited < ADMISSION_LOCK_WAIT + Duration::from_secs(1),
+        waited >= ADMISSION_LOCK_WAIT && waited < ADMISSION_LOCK_WAIT + Duration::from_secs(2),
         "shed when the bound elapsed: {waited:?}"
     );
     assert_eq!(

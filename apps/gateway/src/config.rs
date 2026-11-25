@@ -435,7 +435,9 @@ impl Environment {
 /// keeps the two equal), which starts first.
 pub(crate) const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// How long `serve` waits for all its pool's connections at startup.
+/// The outer bound on opening `serve`'s pool at startup; each connection is
+/// also bounded by the pool's acquire timeout ([`ACQUIRE_TIMEOUT`], 3 s), and
+/// they open at once.
 pub(crate) const OPEN_POOL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Open `connections` connections of `pool` at once (each acquire opens one
@@ -451,9 +453,9 @@ pub(crate) async fn open_pool(
             drop(open);
             Ok(())
         }
-        Ok(Err(_)) => bail!(
-            "could not open the database pool's {connections} connections (GATEWAY_DATABASE_MAX_CONNECTIONS): the database refused or ran out of connections"
-        ),
+        Ok(Err(error)) => Err(error).with_context(|| {
+            format!("could not open the database pool's {connections} connections (GATEWAY_DATABASE_MAX_CONNECTIONS)")
+        }),
         Err(_) => bail!(
             "could not open the database pool's {connections} connections (GATEWAY_DATABASE_MAX_CONNECTIONS) within {}s",
             within.as_secs()
@@ -553,17 +555,22 @@ impl Config {
     /// connections opened before the gateway listens (so before it is
     /// ready), and kept open (`min_connections`), so a replica that joins
     /// under load never opens connections while its first requests wait for
-    /// them. A database that cannot give them within [`OPEN_POOL_TIMEOUT`]
-    /// fails startup, as an unreachable one does. One-shot commands keep the
+    /// them. A database that cannot give each one within the acquire timeout
+    /// (3 s; all of them within [`OPEN_POOL_TIMEOUT`]) fails startup, as an
+    /// unreachable one does. One-shot commands keep the
     /// pool that opens connections when needed ([`Config::connect`]).
     pub async fn connect_serving(&self) -> Result<sqlx::PgPool> {
+        // Lazily, then all at once: a pool built with `connect` would open
+        // its minimum one connection after another inside one acquire
+        // timeout.
         let pool = self
             .primary_pool_options()
             .min_connections(self.database_max_connections)
-            .connect(&self.database_url)
+            .connect_lazy(&self.database_url)
+            .context("DATABASE_URL is not a valid PostgreSQL URL")?;
+        open_pool(&pool, self.database_max_connections, OPEN_POOL_TIMEOUT)
             .await
             .context("could not connect to PostgreSQL")?;
-        open_pool(&pool, self.database_max_connections, OPEN_POOL_TIMEOUT).await?;
         Ok(pool)
     }
 

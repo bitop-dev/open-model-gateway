@@ -102,10 +102,10 @@ impl LockGates {
 }
 /// When an admission that starts queueing now must have its rows:
 /// [`ADMISSION_LOCK_WAIT`] from the start of its wait for the replica's
-/// admission gate, so the gate and the database lock together never keep it
-/// longer.
-fn admission_deadline() -> tokio::time::Instant {
-    tokio::time::Instant::now() + ADMISSION_LOCK_WAIT
+/// admission gate, which the gate and the row lock share (the row lock gets
+/// at least [`ADMISSION_LOCK_FLOOR`]).
+fn admission_deadline(store: &Store) -> tokio::time::Instant {
+    tokio::time::Instant::now() + store.admission_lock_wait
 }
 /// The replica's admission gate, waited for until `deadline`; past it the
 /// admission is shed (`ScopeBusy`) before it has a connection or a lock.
@@ -120,28 +120,19 @@ async fn admission_gate(
             InferenceError::ScopeBusy
         })
 }
-/// An admission's transaction, begun by `deadline`: waiting longer for a
-/// pool connection (the pool busy with waiting admissions and settlements)
-/// sheds it like a lock wait, before it has written anything.
-async fn admission_begin(
-    store: &Store,
-    deadline: tokio::time::Instant,
-) -> Result<Tx<'static>, InferenceError> {
-    match tokio::time::timeout_at(deadline, crate::db::begin(&store.pool)).await {
-        Ok(tx) => tx.map_err(begin_storage),
-        Err(_) => {
-            crate::metrics::METRICS.observe_admission_shed();
-            Err(InferenceError::ScopeBusy)
-        }
-    }
-}
-/// What is left of an admission's bound for its row lock (at least 1 ms, so
-/// a bound never becomes `lock_timeout = 0`, no bound at all).
+/// What is left of an admission's bound for its row lock, and at least
+/// [`ADMISSION_LOCK_FLOOR`]: a wait the bound does not cover (a pool
+/// connection, or the catalog and authority locks a management change held)
+/// never leaves the row lock no time, so the admissions released together
+/// behind such a change are not shed by ordinary contention among
+/// themselves.
 fn remaining(deadline: tokio::time::Instant) -> std::time::Duration {
     deadline
         .saturating_duration_since(tokio::time::Instant::now())
-        .max(std::time::Duration::from_millis(1))
+        .max(ADMISSION_LOCK_FLOOR)
 }
+/// The least time an admission's row lock may wait (see [`remaining`]).
+const ADMISSION_LOCK_FLOOR: std::time::Duration = std::time::Duration::from_millis(250);
 async fn gate(semaphore: &tokio::sync::Semaphore) -> tokio::sync::SemaphorePermit<'_> {
     // Never closed; an error would mean a bug, and failing open is safe here
     // because the database lock still serializes the work.
@@ -180,10 +171,15 @@ async fn admission_prefix(
     }
 }
 
-/// The longest an admission waits for the rows it must lock before it
-/// writes anything: its scope's totals and counter rows (`lock_rows` with
-/// counters), or in the global mode the installation row. Past it the
-/// admission ends as [`InferenceError::ScopeBusy`] with nothing written.
+/// How long an admission waits, from when it starts queueing for the
+/// replica's admission gate, for that gate and the rows it must lock before
+/// it writes anything: its scope's totals and counter rows (`lock_rows` with
+/// counters), or in the global mode the installation row (each row lock
+/// wait gets what is left, at least [`ADMISSION_LOCK_FLOOR`]). Past it the
+/// admission ends as [`InferenceError::ScopeBusy`] with nothing written. Its
+/// pool connection is waited for as before (the pool's acquire timeout):
+/// the gate already keeps admissions to their share of the pool, and an
+/// abandoned acquire would keep queueing.
 /// Below the 3 s settlement deadline (`inference::SETTLEMENT_DEADLINE`), so a
 /// stall sheds new work before the settlements queued behind it run out of
 /// time, and above the waits of ordinary contention at a scope's ceiling.
@@ -396,11 +392,11 @@ async fn admit_unobserved(
     }
     let workspace = record.principal.workspace_id;
     let key = record.principal.key_id;
-    let deadline = admission_deadline();
+    let deadline = admission_deadline(store);
     let _queued = admission_gate(store, deadline).await?;
     timer.phase("queue");
     crate::telemetry::mark_phase(crate::telemetry::SpanName::AdmissionQueue);
-    let mut tx = admission_begin(store, deadline).await?;
+    let mut tx = crate::db::begin(&store.pool).await.map_err(begin_storage)?;
     timer.phase("connect");
     crate::telemetry::mark_phase(crate::telemetry::SpanName::AdmissionConnect);
     // Catalog configuration (deployments, providers, models and their

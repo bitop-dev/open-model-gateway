@@ -286,9 +286,9 @@ async fn admit_batch_unobserved(
         .filter(|n| (1..=crate::jobs::types::BATCH_MAX_REQUESTS as i32).contains(n))
         .ok_or(InferenceError::Configuration)?;
     let workspace = record.principal.workspace_id;
-    let admit_by = admission_deadline();
+    let admit_by = admission_deadline(store);
     let _queued = admission_gate(store, admit_by).await?;
-    let mut tx = admission_begin(store, admit_by).await?;
+    let mut tx = crate::db::begin(&store.pool).await.map_err(begin_storage)?;
     admission_prefix(store, &mut tx, &record.principal, admit_by).await?;
     let (lineage, _shared) = authorize(store, &mut tx, &record.principal).await?;
     let (mut tokens, mut held) = (0i64, 0i64);
@@ -493,9 +493,9 @@ async fn admit_line_unobserved(
         return Err(InferenceError::Configuration);
     }
     let workspace = record.principal.workspace_id;
-    let admit_by = admission_deadline();
+    let admit_by = admission_deadline(store);
     let _queued = admission_gate(store, admit_by).await?;
-    let mut tx = admission_begin(store, admit_by).await?;
+    let mut tx = crate::db::begin(&store.pool).await.map_err(begin_storage)?;
     admission_prefix(store, &mut tx, &record.principal, admit_by).await?;
     let (lineage, _shared) = authorize(store, &mut tx, &record.principal).await?;
     // After the scope locks and before the reservation rows: a runner that no

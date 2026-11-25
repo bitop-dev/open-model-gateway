@@ -311,13 +311,14 @@ mod tests {
             "overloaded_error"
         );
         assert_eq!(batch_line_error(false, error).0, 503);
-        // Failed over and retried like `Busy`: nothing was sent.
+        // Never failed over: every route of the scope locks the same rows, so
+        // another attempt would only wait out the bound again.
         let plan = crate::routing::RoutePlan {
             deployment_ids: Vec::new(),
             max_attempts: 2,
             allow_ambiguous_failover: false,
         };
-        assert!(crate::routing::may_failover(&plan, error));
-        assert!(crate::routing::may_fail_over_unsent(&plan, error));
+        assert!(!crate::routing::may_failover(&plan, error));
+        assert!(!crate::routing::may_fail_over_unsent(&plan, error));
     }
 }

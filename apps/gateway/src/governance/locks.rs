@@ -249,7 +249,7 @@ pub(crate) async fn rows(
     let keys: Vec<Uuid> = touches.iter().map(|t| t.api_key).collect();
     let ats: Vec<UtcInstant> = touches.iter().map(|t| t.at).collect();
     let sql = if bound.is_some() {
-        "WITH b AS MATERIALIZED (SELECT current_setting('lock_timeout') AS before,set_config('lock_timeout',$5,true)),l AS MATERIALIZED (SELECT omg_lock_scope_rows($1,$2,$3,$4) FROM b) SELECT set_config('lock_timeout',b.before,true) FROM l,b"
+        "WITH p AS MATERIALIZED (SELECT current_setting('lock_timeout') AS before),b AS MATERIALIZED (SELECT p.before,set_config('lock_timeout',$5,true) FROM p),l AS MATERIALIZED (SELECT omg_lock_scope_rows($1,$2,$3,$4) FROM b) SELECT set_config('lock_timeout',b.before,true) FROM l,b"
     } else {
         "SELECT omg_lock_scope_rows($1,$2,$3,$4)"
     };

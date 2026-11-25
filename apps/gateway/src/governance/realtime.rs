@@ -161,7 +161,7 @@ pub async fn reserve_window(
     window: ResponseBound,
     armed: Option<ResponseBound>,
 ) -> Result<(), InferenceError> {
-    let deadline = admission_deadline();
+    let deadline = admission_deadline(store);
     let _queued = admission_gate(store, deadline).await?;
     locks::retry_deadlocks!(
         "admission",
@@ -180,7 +180,7 @@ async fn reserve_window_once(
 ) -> Result<(), InferenceError> {
     // What an elapsed realtime deadline was waiting on (#497).
     settlement_waiting(Waiting::Connection);
-    let mut tx = admission_begin(store, deadline).await?;
+    let mut tx = crate::db::begin(&store.pool).await.map_err(begin_storage)?;
     settlement_waiting(Waiting::Database);
     admission_prefix(store, &mut tx, principal, deadline).await?;
     let (lineage, _shared) = authorize(store, &mut tx, principal).await?;

@@ -74,8 +74,9 @@ pub enum InferenceError {
     /// for the scope rows (or, in the global mode, the installation row) it
     /// must lock, so it ended before anything existed: no reservation, no
     /// counter or hold, no upstream call. Transient: an HTTP 503 with
-    /// `Retry-After` ([`SCOPE_BUSY_RETRY_SECONDS`]), retried and failed over
-    /// like `Busy`.
+    /// `Retry-After` ([`SCOPE_BUSY_RETRY_SECONDS`]); gateway-run batch lines
+    /// retry it with their backoff. Never failed over: every route of the
+    /// scope locks the same rows.
     ScopeBusy,
     /// Admission would exceed a budget (in its current day/week/month window) at this scope.
     BudgetExceeded(LimitScope),

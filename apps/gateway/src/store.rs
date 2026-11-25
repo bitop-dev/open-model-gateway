@@ -42,6 +42,10 @@ pub struct Store {
     /// `governance::locks`): scoped locks (default) or the former
     /// installation row lock.
     pub(crate) admission_mode: crate::governance::locks::AdmissionMode,
+    /// How long an admission waits for its gate and rows
+    /// (`governance::ADMISSION_LOCK_WAIT`; only tests of other properties
+    /// under deliberately extreme bursts lengthen it).
+    pub(crate) admission_lock_wait: std::time::Duration,
     /// Optional reporting replica (`GATEWAY_REPORTING_DATABASE_URL`) for
     /// reports, usage and logs only; see [`crate::reporting`].
     pub(crate) reporting: Option<PgPool>,
@@ -386,6 +390,7 @@ impl Store {
             report_dispatch: Default::default(),
             report_calendar_scan: Default::default(),
             admission_mode: mode,
+            admission_lock_wait: crate::governance::ADMISSION_LOCK_WAIT,
             reporting: None,
             reporting_max_lag: std::time::Duration::from_secs(30),
             caches: std::sync::Arc::new(crate::cache::Caches::new()),
@@ -417,6 +422,13 @@ impl Store {
         self
     }
 
+    /// A longer admission wait bound, for a test of another property whose
+    /// bursts on one scope exceed what the production bound admits.
+    #[cfg(test)]
+    pub(crate) fn with_admission_lock_wait(mut self, wait: std::time::Duration) -> Self {
+        self.admission_lock_wait = wait;
+        self
+    }
     /// Select the admission protocol (`GATEWAY_ADMISSION_MODE`).
     pub fn with_admission_mode(mut self, mode: crate::governance::locks::AdmissionMode) -> Self {
         let gates =

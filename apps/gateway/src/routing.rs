@@ -488,7 +488,7 @@ fn valid_residency(value: &str) -> bool {
 pub fn may_failover(plan: &RoutePlan, error: InferenceError) -> bool {
     plan.max_attempts > 1
         && match error {
-            InferenceError::Busy | InferenceError::ScopeBusy => true,
+            InferenceError::Busy => true,
             // Ambiguous transport failures may already have incurred provider charges.
             InferenceError::UpstreamUnavailable | InferenceError::Overloaded => {
                 plan.allow_ambiguous_failover
@@ -510,7 +510,6 @@ pub fn may_fail_over_unsent(plan: &RoutePlan, error: InferenceError) -> bool {
         && matches!(
             error,
             InferenceError::Busy
-                | InferenceError::ScopeBusy
                 | InferenceError::Configuration
                 | InferenceError::UpstreamUnavailable
                 | InferenceError::Overloaded
