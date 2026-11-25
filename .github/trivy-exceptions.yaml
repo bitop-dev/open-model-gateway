@@ -3,14 +3,5 @@
 # vulnerability in exact package versions, stops applying at 00:00 UTC of its
 # `expired_at` (at most 14 days ahead), and is removed by the pull request
 # that re-pins the runtime base. The owner approves each one. An empty list
-# is the normal state: `vulnerabilities: []`.
-vulnerabilities:
-  - id: CVE-2026-124851
-    purls:
-      - "pkg:deb/debian/libzstd1@1.5.7%2Bdfsg-1"
-    expired_at: 2026-12-09
-    statement: >-
-      Issue #837. Fixed in Debian as 1.5.7+dfsg-1+deb13u1 (DSA-6657-1); the pinned
-      distroless runtime base has not been rebuilt with it yet. The gateway
-      does not link zstd: the package is in the base only as a dependency of
-      its OpenSSL.
+# is the normal state.
+vulnerabilities: []
