@@ -299,6 +299,9 @@ impl Gateway {
             .env("DATABASE_URL", database_url)
             .env("GATEWAY_LISTEN", addr.to_string())
             .env("GATEWAY_DATABASE_MAX_CONNECTIONS", "4")
+            // SIGTERM's bound below is the exporters' shared 3 s budget, so
+            // the HTTP drain window that runs before it is off (`crate::drain`).
+            .env("GATEWAY_SHUTDOWN_DRAIN_SECONDS", "0")
             .env("TOKIO_WORKER_THREADS", "2")
             // These must NOT opt either process into any OTLP signal.
             .env("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", collector_url)

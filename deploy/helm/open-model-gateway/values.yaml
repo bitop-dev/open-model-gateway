@@ -113,8 +113,18 @@ gateway:
   # Empty means the dashboard's origin + /v1. Does not configure ingress or routing.
   inferenceBaseUrl: ""
 
+  # A stopping pod (docs/kubernetes.md "Pod shutdown and rolling restarts"):
+  # the preStop sleep (drainSeconds), the gateway's drain window
+  # (GATEWAY_SHUTDOWN_DRAIN_SECONDS, 5 s), an inference request accepted at its
+  # end (GATEWAY_REQUEST_TIMEOUT_SECONDS above, 120 s) and its settlement (3 s),
+  # the exporters' 3 s and the work-lease release (11 leases, 2 s each against
+  # a database that does not answer): 10 + 5 + 120 + 3 + 3 + 22 = 163 s. The
+  # grace period adds 17 s for the rest of the exit; a pod that exits sooner
+  # ends sooner. It is sized for inference: a longer upload, a batch creation
+  # still reading its input or a realtime session is cut off at the limit.
+  # Raise it with any of those (tests/helm-chart.test.mjs checks the sum).
   drainSeconds: 10
-  terminationGracePeriodSeconds: 150
+  terminationGracePeriodSeconds: 180
 
   resources:
     requests:

@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 IMAGE = "ghcr.io/bitop-dev/open-model-gateway"
 COMMIT = "9b1fc815f6b7fba743f08b9b5c5846639cc11d3c"
 TOKEN = "fixture-private-token"
-TRANSIENT = {"registry-server", "registry-rate-limit", "transport"}
+TRANSIENT = {"registry-server", "registry-rate-limit", "registry-readback", "transport"}
 MARKERS = "|".join(['unexpected-eof', 'eof', 'connection-reset', 'broken-pipe', 'io-timeout', 'tls-handshake-timeout', 'context-deadline', 'client-timeout', 'no-such-host', 'connection-refused', 'http2-goaway', 'closed-connection'])
 # The fixed shape of a failed copy's last line (#711): the category, the attempt, and
 # signals made only of fixed words and numbers.
@@ -462,6 +462,105 @@ if kind == 'login':
                     code, _, _ = self.invoke()
                 self.assertEqual(code == 0, retried)
                 self.assertEqual(self.sleeps, [10] if retried else [])
+
+    # ORAS re-reads each manifest it pushed (its text status output lists the
+    # manifest's children) and a 404 there reads exactly so (#711), naming a
+    # manifest of the archive.
+    @property
+    def READBACK(self):
+        return b"Error response from registry: " + self.graph["root"]["digest"].encode() + b": not found"
+
+    def test_a_manifest_the_registry_does_not_serve_yet_is_retried_and_then_succeeds(self):
+        root = frozenset([self.graph["root"]["digest"]])
+        self.assertEqual(self.api.copy_failure_category(io.BytesIO(self.READBACK + b"\n"), IMAGE, root), "registry-readback")
+        # After a registry warning, the read-back as the last line is still the form.
+        warning = b"[2026-11-25T20:03:00Z][WARNING]: read\n[Data]:\n  registry=ghcr.io\n\n\n"
+        self.assertEqual(self.api.copy_failure_category(io.BytesIO(warning + self.READBACK + b"\n"), IMAGE, root),
+                         "registry-readback")
+        self.install_tool(diagnostic=self.READBACK + b"\n", cp_failures=1)
+        code, out, err = self.invoke()
+        self.assertEqual((code, out), (0, self.graph["root"]["digest"] + "\n"), err)
+        self.assertEqual(self.sleeps, [10])
+        self.assertEqual(err, (
+            "oci-stage: copy attempt 1 of 3 failed (registry-readback) [status none; oci-code none; request none; "
+            "host none; transport none; stderr 1 lines; first-line \"error response from registry: <x>: <x>: not found\"]; "
+            "retrying in 10 s\n"))
+        copies = [r for r in self.records() if r["argv"][0] == "cp"]
+        self.assertEqual(len(copies), 2)
+        self.assertEqual({json.dumps(r["argv"]) for r in copies}, {json.dumps(copies[0]["argv"])})
+
+    def test_a_manifest_never_served_ends_in_a_refusal_naming_the_form(self):
+        self.install_tool(fail="cp", diagnostic=self.READBACK + b"\n")
+        self.refused(calls=4, diagnostic="copy failed (registry-readback)")
+        self.assertEqual(self.sleeps, [10, 30])
+        _, _, err = self.invoke()
+        self.assertIn('first-line "error response from registry: <x>: <x>: not found"]', err.splitlines()[-1])
+
+    def test_only_the_exact_readback_form_is_retried(self):
+        digest = self.graph["root"]["digest"].encode()
+        for line in (
+            # A digest that is not a manifest of the archive: not this copy's read-back.
+            b"Error response from registry: sha256:" + b"7" * 64 + b": not found",
+            # Another prefix: that is a copy error of the destination, not the read-back.
+            self.DESTINATION + digest + b": not found",
+            # Anything before, after or instead of the digest is not ORAS's form.
+            b"Error response from registry: unauthorized: " + digest + b": not found",
+            b"Error response from registry: " + digest + b": not found; denied: forbidden",
+            b"Error response from registry: " + digest + b": not found: retry",
+            b"Error response from registry: sha256:" + b"7" * 63 + b": not found",
+            b"Error response from registry: sha256:" + b"A" * 64 + b": not found",
+            b"Error response from registry: sha512:" + b"7" * 128 + b": not found",
+            b"Error response from registry: " + digest + b": manifest unknown",
+            b"Error response from registry:  " + digest + b": not found",
+            # Real terminal errors, also as bare codes and joined with a rate limit.
+            b"Error response from registry: unauthorized: authentication required",
+            b"Error response from registry: denied: permission_denied",
+            self.DESTINATION + b"unauthorized: authentication required",
+            self.DESTINATION + b"toomanyrequests: slow; denied",
+            self.DESTINATION + b"toomanyrequests: slow; unauthorized; denied: no",
+            b"Error response from registry: toomanyrequests; denied",
+        ):
+            with self.subTest(line=line):
+                self.log.unlink(missing_ok=True)
+                self.sleeps.clear()
+                category = self.api.copy_failure_category(io.BytesIO(line + b"\n"), IMAGE, frozenset([digest.decode()]))
+                self.assertFalse(category in TRANSIENT and not self.api.terminal(io.BytesIO(line + b"\n")), category)
+                self.install_tool(fail="cp", diagnostic=line + b"\n")
+                code, _, err = self.invoke()
+                self.assertEqual(code, 1)
+                self.assertEqual(sum(1 for r in self.records() if r["argv"][0] == "cp"), 1, err)
+                self.assertEqual(self.sleeps, [])
+        # The form must be the whole report: after a warning, or with a second line, it is not.
+        warning = (b"[2026-11-25T20:03:00Z][WARNING]: read\n[Data]:\n  registry=ghcr.io\n\n\n")
+        for report in (warning + self.READBACK + b"\nmore\n", self.READBACK + b"\nmore\n", self.READBACK):
+            self.assertEqual(self.api.copy_failure_category(io.BytesIO(report), IMAGE, frozenset([digest.decode()])), "unknown")
+
+    def test_signals_never_come_from_registry_text(self):
+        # Registry-chosen text that imitates a request, a status, a code or a
+        # transport error is not read as one: fields come only from where ORAS
+        # writes them in its error line.
+        none = "status none; oci-code none; request none; host none; transport none; stderr {} lines"
+        for stderr, signals in (
+            (self.DESTINATION + b'unknown: GET "https://example.invalid/v2/test/manifests/example": response status code 503: read',
+             "status none; oci-code unknown; request none; host none; transport none; stderr 1 lines"),
+            (self.DESTINATION + b'POST "https://ghcr.io/v2/a/blobs/uploads/": response status code 400: i/o timeout; EOF',
+             "status 400; oci-code none; request POST blob-upload; host ghcr.io; transport none; stderr 1 lines"),
+            (b"[2026-11-25T20:03:00Z][WARNING]: GET \"https://x.invalid/v2/a/manifests/b\": response status code 503: EOF\n"
+             b"[Data]:\n  registry=ghcr.io\n\n\n" + self.DESTINATION + b"denied: no",
+             "status none; oci-code denied; request none; host none; transport none; stderr 6 lines"),
+            (b'note: GET "https://ghcr.io/v2/a/manifests/b": response status code 503: EOF', none.format(1)),
+            (b'toomanyrequests: x\n' + self.DESTINATION + b"denied: no", none.format(2)),
+            # oras-go's own response checks after a request record carry header
+            # values, not a transport error.
+            (self.DESTINATION + b'GET "https://ghcr.io/v2/a/manifests/b": invalid response Content-Type: EOF i/o timeout',
+             "status none; oci-code none; request GET manifest; host ghcr.io; transport none; stderr 1 lines"),
+            # A bare code (no message) is the code; joined entries name the first.
+            (self.DESTINATION + b"denied", "status none; oci-code denied; request none; host none; transport none; stderr 1 lines"),
+            (self.DESTINATION + b"toomanyrequests; denied: x",
+             "status none; oci-code toomanyrequests; request none; host none; transport none; stderr 1 lines"),
+        ):
+            with self.subTest(signals=signals):
+                self.assertEqual(self.api.copy_signals(io.BytesIO(stderr + b"\n")), signals)
 
     def test_a_rate_limit_reported_with_a_denial_or_content_error_is_not_retried(self):
         for detail in (b"toomanyrequests: slow; denied: forbidden", b"toomanyrequests: slow; digest invalid: wrong bytes",

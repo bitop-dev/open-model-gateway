@@ -48,7 +48,16 @@ UNENTITLED_EMAIL = "unentitled@spark.invalid"
 GATEWAY_PORT = 3000
 ISSUER_PORT = 18443
 POD_PORTS = (3101, 3102)
-METRICS_PORTS = (3201, 3202, 3203)
+# How long step 4 waits for a running replica to hold the lease it kills. A
+# stopping pod keeps renewing its terms through its preStop sleep (10 s) and
+# the gateway's drain window (5 s), and through whatever it still serves,
+# and releases them as it exits; one that dies instead leaves its term to
+# expire, and another replica takes it within the documented 40 s. 15 + 40 s,
+# and a margin for the rehearsal's short requests.
+LEASE_OWNER_WAIT = 90
+# Each gateway process logs its work-lease holder id once, at start
+# (`gateway listening`, field work_lease_holder): that names the pod of a term.
+LEASE_HOLDER_LOG = re.compile(r'"work_lease_holder":"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"')
 MODEL = "spark/mock"
 FIRST_ADMIN_JOB = "omg-first-admin"
 
@@ -424,13 +433,13 @@ class Check:
     def kubectl(self, args, **kwargs):
         return self.spark.kubectl(args, namespace=self.namespace, **kwargs)
 
-    def sql(self, statement):
+    def sql(self, statement, limit=()):
         """One statement in the database as its owner, through the instance pod."""
-        pod = self.kubectl(["get", "pods", "-l", "cnpg.io/cluster=omg-db,cnpg.io/instanceRole=primary", "-o", "jsonpath={.items[0].metadata.name}"], capture=True).strip()
-        return self.kubectl(["exec", pod, "-c", "postgres", "--", "psql", "-U", "postgres", "-d", "gateway", "-Atqc", statement], capture=True).strip()
+        pod = self.kubectl([*limit, "get", "pods", "-l", "cnpg.io/cluster=omg-db,cnpg.io/instanceRole=primary", "-o", "jsonpath={.items[0].metadata.name}"], capture=True).strip()
+        return self.kubectl([*limit, "exec", pod, "-c", "postgres", "--", "psql", "-U", "postgres", "-d", "gateway", "-Atqc", statement], capture=True).strip()
 
-    def gateway_pods(self):
-        out = self.kubectl(["get", "pods", "-l", "app.kubernetes.io/name=open-model-gateway,app.kubernetes.io/component=gateway",
+    def gateway_pods(self, limit=()):
+        out = self.kubectl([*limit, "get", "pods", "-l", "app.kubernetes.io/name=open-model-gateway,app.kubernetes.io/component=gateway",
                             "-o", "json"], capture=True)
         pods = json.loads(out)["items"]
         return [p for p in pods if p["metadata"].get("deletionTimestamp") is None and p["status"].get("phase") == "Running"]
@@ -729,38 +738,52 @@ class Check:
         self.expect(3, "pdb-refuses-a-second-eviction", (first, second) == ("evicted", "refused"), f"{first}, then {second}")
         self.wait_for_ready_replicas()
 
+    def lease_owner(self, lease, seconds):
+        """The lease's current term and the running replica that holds it:
+        (holder, epoch, pod), where the pod's own logged holder id is the
+        term's holder; "free" while no term is current, "elsewhere" while no
+        running replica holds it (a stopping pod still does), or "invalid".
+        Every request is bounded by `seconds`."""
+        limit = (f"--request-timeout={max(1, int(seconds))}s",)
+        current = self.sql(f"SELECT holder||' '||epoch FROM work_leases WHERE name='{lease}' AND expires_at>clock_timestamp()", limit).split()
+        if len(current) != 2:
+            return "free"
+        holder, epoch = current
+        if not UUID.fullmatch(holder) or not epoch.isdigit():
+            return "invalid"
+        for pod in self.gateway_pods(limit):
+            name = pod["metadata"]["name"]
+            logged = LEASE_HOLDER_LOG.search(self.kubectl([*limit, "logs", f"pod/{name}", "-c", "gateway", "--limit-bytes=262144"], capture=True))
+            if logged and logged[1] == holder:
+                return holder, epoch, name
+        return "elsewhere"
+
+    def wait_for_lease_owner(self, lease):
+        """Wait, at most LEASE_OWNER_WAIT seconds, until a running replica
+        holds the lease (`lease_owner`); an owner found only after that is
+        "late", otherwise the last answer."""
+        deadline = time.monotonic() + LEASE_OWNER_WAIT
+        while True:
+            found = self.lease_owner(lease, deadline - time.monotonic())
+            if time.monotonic() > deadline:
+                return "late" if isinstance(found, tuple) else found
+            if isinstance(found, tuple) or found == "invalid":
+                return found
+            time.sleep(min(2, max(0, deadline - time.monotonic())))
+
     def lease_step(self, lease="metrics"):
         """Delete the pod holding a lease; another replica takes it within the
         documented time (TTL 30 s + renewal 10 s) and the old term is fenced."""
-        # Just after the rollout of step 3 the lease can be between holders
-        # (the old pod's term runs out, then a replica takes it): wait for a
-        # current holder, at most the documented takeover time and a margin.
-        current = []
-        for _ in range(60):
-            current = self.sql(f"SELECT holder||' '||epoch FROM work_leases WHERE name='{lease}' AND expires_at>clock_timestamp()").split()
-            if len(current) == 2:
-                break
-            time.sleep(1)
-        if len(current) != 2:
-            self.record(4, "lease-takeover", "fail", f"no replica holds the {lease} lease")
-            return
-        holder, epoch = current
-        if not UUID.fullmatch(holder) or not epoch.isdigit():
+        found = self.wait_for_lease_owner(lease)
+        if found == "invalid":
             self.record(4, "lease-takeover", "fail", "the lease row is not a holder UUID and an epoch")
             return
-        # The holder is the replica whose own metrics say it holds the lease.
-        owner = None
-        for pod, port in zip(self.gateway_pods(), METRICS_PORTS):
-            child = self.forward(f"pod/{pod['metadata']['name']}", [f"{port}:9464"])
-            try:
-                status, _, _, body = Http(port, child=child).request("GET", "/metrics")
-            finally:
-                self.stop(child)
-            if status == 200 and re.search(rf'^gateway_work_leases_held\{{lease="{lease}"\}} 1$', body.decode(), re.M):
-                owner = pod["metadata"]["name"]
-        if owner is None:
-            self.record(4, "lease-takeover", "fail", f"no replica's metrics show the {lease} lease held")
+        if not isinstance(found, tuple):
+            detail = {"free": "no current term of", "late": "the holder was found only after the bound for"}.get(
+                found, "no running replica holds")
+            self.record(4, "lease-takeover", "fail", f"{detail} the {lease} lease after {LEASE_OWNER_WAIT} s")
             return
+        holder, epoch, owner = found
         deleted = time.monotonic()
         self.kubectl(["delete", "pod", owner, "--wait=false"], capture=True)
         took = None
