@@ -29,6 +29,7 @@ pub(crate) mod db;
 #[cfg(test)]
 mod dbtest_runtime;
 pub mod demo;
+pub mod drain;
 pub mod egress;
 pub mod email;
 pub mod entropy;

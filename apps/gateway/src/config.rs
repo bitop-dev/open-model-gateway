@@ -32,6 +32,7 @@ pub struct Config {
     /// `GATEWAY_REPORTING_MAX_LAG_SECONDS` (default 30, 1-3600): a replica
     /// replaying WAL further behind than this is skipped for the primary.
     pub reporting_max_lag: Duration,
+    pub shutdown_drain: Duration, // GATEWAY_SHUTDOWN_DRAIN_SECONDS (`crate::drain::window_from_env`)
     /// `GATEWAY_ADMISSION_MODE` selects scoped locks (the default) or
     /// serialization on the installation row (`global`). See `governance::locks`.
     pub admission_mode: crate::governance::locks::AdmissionMode,
@@ -482,6 +483,7 @@ impl Config {
             database_max_connections,
             reporting_database_url,
             reporting_max_lag,
+            shutdown_drain: crate::drain::window_from_env()?,
             admission_mode,
             listen_database_url,
             config_cache,
