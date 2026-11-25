@@ -3269,6 +3269,17 @@
           "name": {
             "type": "string"
           },
+          "schedule_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IdentityUuid"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "#481: the schedule that started this campaign; null for one started by hand."
+          },
           "subjects": {
             "description": "Sorted; platform_roles covers Admin and Auditor grants; workspace_keys the live key lineages of Teams and Projects.",
             "items": {
@@ -3302,6 +3313,7 @@
           "created_at",
           "due_at",
           "closed_at",
+          "schedule_id",
           "item_count"
         ],
         "type": "object"
@@ -3445,6 +3457,17 @@
           "name": {
             "type": "string"
           },
+          "schedule_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IdentityUuid"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "#481: the schedule that started this campaign; null for one started by hand."
+          },
           "subjects": {
             "description": "Sorted; platform_roles covers Admin and Auditor grants; workspace_keys the live key lineages of Teams and Projects.",
             "items": {
@@ -3478,6 +3501,7 @@
           "created_at",
           "due_at",
           "closed_at",
+          "schedule_id",
           "item_count",
           "counts"
         ],
@@ -3621,6 +3645,17 @@
           "name": {
             "type": "string"
           },
+          "schedule_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IdentityUuid"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "#481: the schedule that started this campaign; null for one started by hand."
+          },
           "subjects": {
             "description": "Sorted; platform_roles covers Admin and Auditor grants; workspace_keys the live key lineages of Teams and Projects.",
             "items": {
@@ -3654,6 +3689,7 @@
           "created_at",
           "due_at",
           "closed_at",
+          "schedule_id",
           "item_count",
           "counts"
         ],
@@ -3799,6 +3835,10 @@
           "name": {
             "type": "string"
           },
+          "schedule_id": {
+            "description": "A campaign started by hand has no schedule.",
+            "type": "null"
+          },
           "subjects": {
             "description": "Sorted; platform_roles covers Admin and Auditor grants; workspace_keys the live key lineages of Teams and Projects.",
             "items": {
@@ -3832,6 +3872,7 @@
           "created_at",
           "due_at",
           "closed_at",
+          "schedule_id",
           "item_count",
           "counts"
         ],
@@ -6323,6 +6364,7 @@
                   "access_review_removal_refused",
                   "access_review_remove_requires_manual",
                   "access_review_reviewer_ineligible",
+                  "access_review_schedule_limit",
                   "access_review_too_large",
                   "alert_rule_kind_fixed",
                   "alert_rule_limit",
@@ -7500,7 +7542,8 @@
               "aged_unknown_hold",
               "scim_last_admin",
               "partitions_missing",
-              "history_orphans"
+              "history_orphans",
+              "access_review_skipped"
             ]
           },
           "level": {
@@ -25643,6 +25686,55 @@
         ],
         "type": "object"
       },
+      "SettingsAccessReviewSkippedDetails": {
+        "additionalProperties": false,
+        "description": "alerts::fire_access_review_skipped: the skipped run's reason code only (no schedule or campaign names).",
+        "properties": {
+          "reason": {
+            "enum": [
+              "previous_open",
+              "open_limit",
+              "empty",
+              "too_large",
+              "changed"
+            ]
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "type": "object"
+      },
+      "SettingsAccessReviewSkippedEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/SettingsAlertEvent"
+          },
+          {
+            "properties": {
+              "builtin": {
+                "const": true
+              },
+              "connection": {
+                "type": "null"
+              },
+              "details": {
+                "$ref": "#/components/schemas/SettingsAccessReviewSkippedDetails"
+              },
+              "kind": {
+                "const": "access_review_skipped"
+              },
+              "rule": {
+                "type": "null"
+              },
+              "workspace": {
+                "type": "null"
+              }
+            }
+          }
+        ],
+        "description": "Built-in (#481): a scheduled access review run was skipped. One per run; cleared when a later run of the schedule starts a campaign or the schedule is deleted. No rule, workspace or connection."
+      },
       "SettingsAgedHoldDetails": {
         "additionalProperties": false,
         "description": "alerts.rs aged_hold / constraint alert_events_aged_shape: exactly {threshold_hours} (24 for level 1, 168 for level 2).",
@@ -25916,7 +26008,8 @@
               "aged_unknown_hold",
               "scim_last_admin",
               "partitions_missing",
-              "history_orphans"
+              "history_orphans",
+              "access_review_skipped"
             ]
           },
           "level": {
@@ -28564,6 +28657,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/SettingsHistoryOrphansEvent"
+                },
+                {
+                  "$ref": "#/components/schemas/SettingsAccessReviewSkippedEvent"
                 },
                 {
                   "$ref": "#/components/schemas/SettingsAgedHoldEvent"
@@ -32808,7 +32904,8 @@
               "aged_unknown_hold",
               "scim_last_admin",
               "partitions_missing",
-              "history_orphans"
+              "history_orphans",
+              "access_review_skipped"
             ]
           },
           "level": {
@@ -44726,6 +44823,19 @@
       "delete_api_v1_me_sessions_by_sessionResponse": {
         "$ref": "#/components/schemas/IdentityRevoked"
       },
+      "delete_api_v1_platform_access_review_schedules_by_idRequest": false,
+      "delete_api_v1_platform_access_review_schedules_by_idResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "deleted": {
+            "const": true
+          }
+        },
+        "required": [
+          "deleted"
+        ],
+        "type": "object"
+      },
       "delete_api_v1_platform_admin_tokens_by_tokenRequest": false,
       "delete_api_v1_platform_admin_tokens_by_tokenResponse": {
         "$ref": "#/components/schemas/S6Ok"
@@ -45819,6 +45929,478 @@
         },
         "required": [
           "data"
+        ],
+        "type": "object"
+      },
+      "get_api_v1_platform_access_review_schedulesRequest": false,
+      "get_api_v1_platform_access_review_schedulesResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "cadence": {
+                  "enum": [
+                    "monthly",
+                    "quarterly",
+                    "yearly"
+                  ],
+                  "type": "string"
+                },
+                "created_at": {
+                  "$ref": "#/components/schemas/IdentityTime"
+                },
+                "created_by": {
+                  "$ref": "#/components/schemas/IdentityUuid"
+                },
+                "id": {
+                  "$ref": "#/components/schemas/IdentityUuid"
+                },
+                "last_campaign": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "closed_at": {
+                          "$ref": "#/components/schemas/IdentityNullableTime"
+                        },
+                        "created_at": {
+                          "$ref": "#/components/schemas/IdentityTime"
+                        },
+                        "due_at": {
+                          "$ref": "#/components/schemas/IdentityTime"
+                        },
+                        "id": {
+                          "$ref": "#/components/schemas/IdentityUuid"
+                        },
+                        "name": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "name",
+                        "created_at",
+                        "due_at",
+                        "closed_at"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "The latest campaign this schedule started; null before the first."
+                },
+                "last_run": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "campaign_id": {
+                          "anyOf": [
+                            {
+                              "$ref": "#/components/schemas/IdentityUuid"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ],
+                          "description": "The campaign a started run created; null for a skipped run."
+                        },
+                        "id": {
+                          "$ref": "#/components/schemas/IdentityUuid"
+                        },
+                        "outcome": {
+                          "enum": [
+                            "started",
+                            "skipped"
+                          ],
+                          "type": "string"
+                        },
+                        "period_at": {
+                          "$ref": "#/components/schemas/IdentityTime"
+                        },
+                        "ran_at": {
+                          "$ref": "#/components/schemas/IdentityTime"
+                        },
+                        "reason": {
+                          "description": "Why a skipped run started nothing: the schedule's previous campaign was still open, 20 campaigns were open, nothing matched, more than 5,000 items, or access changed during the snapshot. Null for a started run.",
+                          "enum": [
+                            "previous_open",
+                            "open_limit",
+                            "empty",
+                            "too_large",
+                            "changed",
+                            null
+                          ],
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "period_at",
+                        "ran_at",
+                        "outcome",
+                        "reason",
+                        "campaign_id"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "The latest run by period; null before the first."
+                },
+                "name": {
+                  "type": "string"
+                },
+                "next_run_at": {
+                  "description": "The next period start (UTC); null while paused.",
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "open_days": {
+                  "maximum": 90,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "paused_at": {
+                  "$ref": "#/components/schemas/IdentityNullableTime"
+                },
+                "start_day": {
+                  "maximum": 31,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "start_month": {
+                  "maximum": 12,
+                  "minimum": 1,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "subjects": {
+                  "description": "Sorted.",
+                  "items": {
+                    "enum": [
+                      "workspace_memberships",
+                      "platform_roles",
+                      "workspace_keys"
+                    ],
+                    "type": "string"
+                  },
+                  "maxItems": 3,
+                  "minItems": 1,
+                  "type": "array",
+                  "uniqueItems": true
+                },
+                "updated_at": {
+                  "$ref": "#/components/schemas/IdentityTime"
+                },
+                "workspace_ids": {
+                  "items": {
+                    "$ref": "#/components/schemas/IdentityUuid"
+                  },
+                  "maxItems": 50,
+                  "type": "array",
+                  "uniqueItems": true
+                }
+              },
+              "required": [
+                "id",
+                "name",
+                "subjects",
+                "workspace_ids",
+                "open_days",
+                "cadence",
+                "start_day",
+                "start_month",
+                "created_by",
+                "created_at",
+                "updated_at",
+                "paused_at",
+                "next_run_at",
+                "last_run",
+                "last_campaign"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "type": "object"
+      },
+      "get_api_v1_platform_access_review_schedules_by_idRequest": false,
+      "get_api_v1_platform_access_review_schedules_by_idResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "cadence": {
+            "enum": [
+              "monthly",
+              "quarterly",
+              "yearly"
+            ],
+            "type": "string"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/IdentityTime"
+          },
+          "created_by": {
+            "$ref": "#/components/schemas/IdentityUuid"
+          },
+          "id": {
+            "$ref": "#/components/schemas/IdentityUuid"
+          },
+          "last_campaign": {
+            "anyOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "closed_at": {
+                    "$ref": "#/components/schemas/IdentityNullableTime"
+                  },
+                  "created_at": {
+                    "$ref": "#/components/schemas/IdentityTime"
+                  },
+                  "due_at": {
+                    "$ref": "#/components/schemas/IdentityTime"
+                  },
+                  "id": {
+                    "$ref": "#/components/schemas/IdentityUuid"
+                  },
+                  "name": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "name",
+                  "created_at",
+                  "due_at",
+                  "closed_at"
+                ],
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The latest campaign this schedule started; null before the first."
+          },
+          "last_run": {
+            "anyOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "campaign_id": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/IdentityUuid"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "The campaign a started run created; null for a skipped run."
+                  },
+                  "id": {
+                    "$ref": "#/components/schemas/IdentityUuid"
+                  },
+                  "outcome": {
+                    "enum": [
+                      "started",
+                      "skipped"
+                    ],
+                    "type": "string"
+                  },
+                  "period_at": {
+                    "$ref": "#/components/schemas/IdentityTime"
+                  },
+                  "ran_at": {
+                    "$ref": "#/components/schemas/IdentityTime"
+                  },
+                  "reason": {
+                    "description": "Why a skipped run started nothing: the schedule's previous campaign was still open, 20 campaigns were open, nothing matched, more than 5,000 items, or access changed during the snapshot. Null for a started run.",
+                    "enum": [
+                      "previous_open",
+                      "open_limit",
+                      "empty",
+                      "too_large",
+                      "changed",
+                      null
+                    ],
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "id",
+                  "period_at",
+                  "ran_at",
+                  "outcome",
+                  "reason",
+                  "campaign_id"
+                ],
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The latest run by period; null before the first."
+          },
+          "name": {
+            "type": "string"
+          },
+          "next_run_at": {
+            "description": "The next period start (UTC); null while paused.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "open_days": {
+            "maximum": 90,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "paused_at": {
+            "$ref": "#/components/schemas/IdentityNullableTime"
+          },
+          "runs": {
+            "description": "The 20 most recent runs, newest period first.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "campaign_id": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/IdentityUuid"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "The campaign a started run created; null for a skipped run."
+                },
+                "id": {
+                  "$ref": "#/components/schemas/IdentityUuid"
+                },
+                "outcome": {
+                  "enum": [
+                    "started",
+                    "skipped"
+                  ],
+                  "type": "string"
+                },
+                "period_at": {
+                  "$ref": "#/components/schemas/IdentityTime"
+                },
+                "ran_at": {
+                  "$ref": "#/components/schemas/IdentityTime"
+                },
+                "reason": {
+                  "description": "Why a skipped run started nothing: the schedule's previous campaign was still open, 20 campaigns were open, nothing matched, more than 5,000 items, or access changed during the snapshot. Null for a started run.",
+                  "enum": [
+                    "previous_open",
+                    "open_limit",
+                    "empty",
+                    "too_large",
+                    "changed",
+                    null
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "id",
+                "period_at",
+                "ran_at",
+                "outcome",
+                "reason",
+                "campaign_id"
+              ],
+              "type": "object"
+            },
+            "maxItems": 20,
+            "type": "array"
+          },
+          "start_day": {
+            "maximum": 31,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "start_month": {
+            "maximum": 12,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "subjects": {
+            "description": "Sorted.",
+            "items": {
+              "enum": [
+                "workspace_memberships",
+                "platform_roles",
+                "workspace_keys"
+              ],
+              "type": "string"
+            },
+            "maxItems": 3,
+            "minItems": 1,
+            "type": "array",
+            "uniqueItems": true
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/IdentityTime"
+          },
+          "workspace_ids": {
+            "items": {
+              "$ref": "#/components/schemas/IdentityUuid"
+            },
+            "maxItems": 50,
+            "type": "array",
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "subjects",
+          "workspace_ids",
+          "open_days",
+          "cadence",
+          "start_day",
+          "start_month",
+          "created_by",
+          "created_at",
+          "updated_at",
+          "paused_at",
+          "next_run_at",
+          "last_run",
+          "last_campaign",
+          "runs"
         ],
         "type": "object"
       },
@@ -47535,6 +48117,394 @@
       "get_api_v1_workspaces_by_ws_usage_storageResponse": {
         "$ref": "#/components/schemas/MoneyWorkspaceStorage"
       },
+      "patch_api_v1_platform_access_review_schedules_by_idRequest": {
+        "description": "Every field optional; null is the same as omitted. Serde accepts the closed object or the positional array [name, subjects, workspace_ids, open_days, cadence, start_day, start_month, paused].",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "cadence": {
+                "enum": [
+                  "monthly",
+                  "quarterly",
+                  "yearly",
+                  null
+                ],
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "name": {
+                "description": "Non-blank text without control characters, at most 100 characters (each campaign's name adds the period date). Same pattern as a campaign name.",
+                "maxLength": 100,
+                "minLength": 1,
+                "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\u0000-\\u001F\\u007F-\\u009F][^\\u0000-\\u001F\\u007F-\\u009F]*$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "open_days": {
+                "description": "Days each campaign stays open; null or omitted: 14.",
+                "maximum": 90,
+                "minimum": 1,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "paused": {
+                "description": "true pauses, false resumes; null or omitted: unchanged.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "start_day": {
+                "description": "Day of the month a period starts, 00:00 UTC; past a month's end, its last day.",
+                "maximum": 31,
+                "minimum": 1,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "start_month": {
+                "description": "Quarterly and yearly: a month that starts a period. Monthly: none.",
+                "maximum": 12,
+                "minimum": 1,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "subjects": {
+                "description": "Each kind at most once (the enum and uniqueItems bound it to three).",
+                "items": {
+                  "enum": [
+                    "workspace_memberships",
+                    "platform_roles",
+                    "workspace_keys"
+                  ],
+                  "type": "string"
+                },
+                "minItems": 1,
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "uniqueItems": true
+              },
+              "workspace_ids": {
+                "description": "Narrows workspace memberships and keys to these existing Teams/Projects (empty: all), at most 50.",
+                "items": {
+                  "$ref": "#/components/schemas/IdentityUuid"
+                },
+                "maxItems": 50,
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "uniqueItems": true
+              }
+            },
+            "required": [],
+            "type": "object"
+          },
+          {
+            "items": false,
+            "maxItems": 8,
+            "minItems": 0,
+            "prefixItems": [
+              {
+                "description": "Non-blank text without control characters, at most 100 characters (each campaign's name adds the period date). Same pattern as a campaign name.",
+                "maxLength": 100,
+                "minLength": 1,
+                "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\u0000-\\u001F\\u007F-\\u009F][^\\u0000-\\u001F\\u007F-\\u009F]*$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              {
+                "description": "Each kind at most once (the enum and uniqueItems bound it to three).",
+                "items": {
+                  "enum": [
+                    "workspace_memberships",
+                    "platform_roles",
+                    "workspace_keys"
+                  ],
+                  "type": "string"
+                },
+                "minItems": 1,
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "uniqueItems": true
+              },
+              {
+                "description": "Narrows workspace memberships and keys to these existing Teams/Projects (empty: all), at most 50.",
+                "items": {
+                  "$ref": "#/components/schemas/IdentityUuid"
+                },
+                "maxItems": 50,
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "uniqueItems": true
+              },
+              {
+                "description": "Days each campaign stays open; null or omitted: 14.",
+                "maximum": 90,
+                "minimum": 1,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              {
+                "enum": [
+                  "monthly",
+                  "quarterly",
+                  "yearly",
+                  null
+                ],
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              {
+                "description": "Day of the month a period starts, 00:00 UTC; past a month's end, its last day.",
+                "maximum": 31,
+                "minimum": 1,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              {
+                "description": "Quarterly and yearly: a month that starts a period. Monthly: none.",
+                "maximum": 12,
+                "minimum": 1,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              {
+                "description": "true pauses, false resumes; null or omitted: unchanged.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            ],
+            "type": "array"
+          }
+        ]
+      },
+      "patch_api_v1_platform_access_review_schedules_by_idResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "cadence": {
+            "enum": [
+              "monthly",
+              "quarterly",
+              "yearly"
+            ],
+            "type": "string"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/IdentityTime"
+          },
+          "created_by": {
+            "$ref": "#/components/schemas/IdentityUuid"
+          },
+          "id": {
+            "$ref": "#/components/schemas/IdentityUuid"
+          },
+          "last_campaign": {
+            "anyOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "closed_at": {
+                    "$ref": "#/components/schemas/IdentityNullableTime"
+                  },
+                  "created_at": {
+                    "$ref": "#/components/schemas/IdentityTime"
+                  },
+                  "due_at": {
+                    "$ref": "#/components/schemas/IdentityTime"
+                  },
+                  "id": {
+                    "$ref": "#/components/schemas/IdentityUuid"
+                  },
+                  "name": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "name",
+                  "created_at",
+                  "due_at",
+                  "closed_at"
+                ],
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The latest campaign this schedule started; null before the first."
+          },
+          "last_run": {
+            "anyOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "campaign_id": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/IdentityUuid"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "The campaign a started run created; null for a skipped run."
+                  },
+                  "id": {
+                    "$ref": "#/components/schemas/IdentityUuid"
+                  },
+                  "outcome": {
+                    "enum": [
+                      "started",
+                      "skipped"
+                    ],
+                    "type": "string"
+                  },
+                  "period_at": {
+                    "$ref": "#/components/schemas/IdentityTime"
+                  },
+                  "ran_at": {
+                    "$ref": "#/components/schemas/IdentityTime"
+                  },
+                  "reason": {
+                    "description": "Why a skipped run started nothing: the schedule's previous campaign was still open, 20 campaigns were open, nothing matched, more than 5,000 items, or access changed during the snapshot. Null for a started run.",
+                    "enum": [
+                      "previous_open",
+                      "open_limit",
+                      "empty",
+                      "too_large",
+                      "changed",
+                      null
+                    ],
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "id",
+                  "period_at",
+                  "ran_at",
+                  "outcome",
+                  "reason",
+                  "campaign_id"
+                ],
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The latest run by period; null before the first."
+          },
+          "name": {
+            "type": "string"
+          },
+          "next_run_at": {
+            "description": "The next period start (UTC); null while paused.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "open_days": {
+            "maximum": 90,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "paused_at": {
+            "$ref": "#/components/schemas/IdentityNullableTime"
+          },
+          "start_day": {
+            "maximum": 31,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "start_month": {
+            "maximum": 12,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "subjects": {
+            "description": "Sorted.",
+            "items": {
+              "enum": [
+                "workspace_memberships",
+                "platform_roles",
+                "workspace_keys"
+              ],
+              "type": "string"
+            },
+            "maxItems": 3,
+            "minItems": 1,
+            "type": "array",
+            "uniqueItems": true
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/IdentityTime"
+          },
+          "workspace_ids": {
+            "items": {
+              "$ref": "#/components/schemas/IdentityUuid"
+            },
+            "maxItems": 50,
+            "type": "array",
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "subjects",
+          "workspace_ids",
+          "open_days",
+          "cadence",
+          "start_day",
+          "start_month",
+          "created_by",
+          "created_at",
+          "updated_at",
+          "paused_at",
+          "next_run_at",
+          "last_run",
+          "last_campaign"
+        ],
+        "type": "object"
+      },
       "patch_api_v1_platform_alerts_webhooks_by_idRequest": {
         "$ref": "#/components/schemas/SettingsWebhookPatchInput"
       },
@@ -48737,6 +49707,259 @@
       "post_api_v1_platform_access_requests_by_id_denyRequest": false,
       "post_api_v1_platform_access_requests_by_id_denyResponse": {
         "$ref": "#/components/schemas/AccessDeniedMembershipRequest"
+      },
+      "post_api_v1_platform_access_review_schedulesRequest": {
+        "description": "Serde accepts the closed object or the positional array [name, subjects, workspace_ids, open_days, cadence, start_day, start_month] (the last optional).",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "cadence": {
+                "enum": [
+                  "monthly",
+                  "quarterly",
+                  "yearly"
+                ],
+                "type": "string"
+              },
+              "name": {
+                "description": "Non-blank text without control characters, at most 100 characters (each campaign's name adds the period date). Same pattern as a campaign name.",
+                "maxLength": 100,
+                "minLength": 1,
+                "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\u0000-\\u001F\\u007F-\\u009F][^\\u0000-\\u001F\\u007F-\\u009F]*$",
+                "type": "string"
+              },
+              "open_days": {
+                "description": "Days each campaign stays open; null or omitted: 14.",
+                "maximum": 90,
+                "minimum": 1,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "start_day": {
+                "description": "Day of the month a period starts, 00:00 UTC; past a month's end, its last day.",
+                "maximum": 31,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "start_month": {
+                "description": "Quarterly and yearly: a month that starts a period. Monthly: none.",
+                "maximum": 12,
+                "minimum": 1,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "subjects": {
+                "description": "Each kind at most once (the enum and uniqueItems bound it to three).",
+                "items": {
+                  "enum": [
+                    "workspace_memberships",
+                    "platform_roles",
+                    "workspace_keys"
+                  ],
+                  "type": "string"
+                },
+                "minItems": 1,
+                "type": "array",
+                "uniqueItems": true
+              },
+              "workspace_ids": {
+                "description": "Narrows workspace memberships and keys to these existing Teams/Projects (empty: all), at most 50.",
+                "items": {
+                  "$ref": "#/components/schemas/IdentityUuid"
+                },
+                "maxItems": 50,
+                "type": "array",
+                "uniqueItems": true
+              }
+            },
+            "required": [
+              "name",
+              "subjects",
+              "cadence",
+              "start_day"
+            ],
+            "type": "object"
+          },
+          {
+            "items": false,
+            "maxItems": 7,
+            "minItems": 6,
+            "prefixItems": [
+              {
+                "description": "Non-blank text without control characters, at most 100 characters (each campaign's name adds the period date). Same pattern as a campaign name.",
+                "maxLength": 100,
+                "minLength": 1,
+                "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\u0000-\\u001F\\u007F-\\u009F][^\\u0000-\\u001F\\u007F-\\u009F]*$",
+                "type": "string"
+              },
+              {
+                "description": "Each kind at most once (the enum and uniqueItems bound it to three).",
+                "items": {
+                  "enum": [
+                    "workspace_memberships",
+                    "platform_roles",
+                    "workspace_keys"
+                  ],
+                  "type": "string"
+                },
+                "minItems": 1,
+                "type": "array",
+                "uniqueItems": true
+              },
+              {
+                "description": "Narrows workspace memberships and keys to these existing Teams/Projects (empty: all), at most 50.",
+                "items": {
+                  "$ref": "#/components/schemas/IdentityUuid"
+                },
+                "maxItems": 50,
+                "type": "array",
+                "uniqueItems": true
+              },
+              {
+                "description": "Days each campaign stays open; null or omitted: 14.",
+                "maximum": 90,
+                "minimum": 1,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              {
+                "enum": [
+                  "monthly",
+                  "quarterly",
+                  "yearly"
+                ],
+                "type": "string"
+              },
+              {
+                "description": "Day of the month a period starts, 00:00 UTC; past a month's end, its last day.",
+                "maximum": 31,
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "description": "Quarterly and yearly: a month that starts a period. Monthly: none.",
+                "maximum": 12,
+                "minimum": 1,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            ],
+            "type": "array"
+          }
+        ]
+      },
+      "post_api_v1_platform_access_review_schedulesResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "cadence": {
+            "enum": [
+              "monthly",
+              "quarterly",
+              "yearly"
+            ],
+            "type": "string"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/IdentityTime"
+          },
+          "created_by": {
+            "$ref": "#/components/schemas/IdentityUuid"
+          },
+          "id": {
+            "$ref": "#/components/schemas/IdentityUuid"
+          },
+          "last_campaign": {
+            "description": "A new schedule has started no campaign.",
+            "type": "null"
+          },
+          "last_run": {
+            "description": "A new schedule has not run.",
+            "type": "null"
+          },
+          "name": {
+            "type": "string"
+          },
+          "next_run_at": {
+            "description": "The first period start after now (UTC).",
+            "format": "date-time",
+            "type": "string"
+          },
+          "open_days": {
+            "maximum": 90,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "paused_at": {
+            "description": "A new schedule is active.",
+            "type": "null"
+          },
+          "start_day": {
+            "maximum": 31,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "start_month": {
+            "maximum": 12,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "subjects": {
+            "description": "Sorted.",
+            "items": {
+              "enum": [
+                "workspace_memberships",
+                "platform_roles",
+                "workspace_keys"
+              ],
+              "type": "string"
+            },
+            "maxItems": 3,
+            "minItems": 1,
+            "type": "array",
+            "uniqueItems": true
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/IdentityTime"
+          },
+          "workspace_ids": {
+            "items": {
+              "$ref": "#/components/schemas/IdentityUuid"
+            },
+            "maxItems": 50,
+            "type": "array",
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "subjects",
+          "workspace_ids",
+          "open_days",
+          "cadence",
+          "start_day",
+          "start_month",
+          "created_by",
+          "created_at",
+          "updated_at",
+          "paused_at",
+          "next_run_at",
+          "last_run",
+          "last_campaign"
+        ],
+        "type": "object"
       },
       "post_api_v1_platform_access_reviewsRequest": {
         "description": "Serde accepts the closed object or the positional array [name, subjects, workspace_ids, due_in_days] (the last two optional).",
@@ -55322,6 +56545,480 @@
         "x-omg-token-policy": "Denied"
       }
     },
+    "/api/v1/platform/access-review-schedules": {
+      "get": {
+        "description": "#481: Platform Admins create, change, pause, resume and delete schedules; Platform Admins and Auditors read them. Browser only. The lifecycle job starts each due run once across replicas, acting as the system (never with the creating admin's authority). Schedules that are not deleted, oldest first, each with its next start (null while paused), its latest run and the latest campaign it started.",
+        "operationId": "get_api_v1_platform_access_review_schedules",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "default": 100,
+              "maximum": 200,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "schema": {
+              "default": 0,
+              "maximum": 100000,
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/get_api_v1_platform_access_review_schedulesResponse"
+                }
+              }
+            },
+            "description": "Successful handler representation"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Invalid input or malformed extraction"
+          },
+          "401": {
+            "$ref": "#/components/responses/ManagementMiddleware401Variant2"
+          },
+          "403": {
+            "$ref": "#/components/responses/ManagementMiddleware403Variant3"
+          },
+          "413": {
+            "$ref": "#/components/responses/ManagementMiddleware413Variant1"
+          },
+          "429": {
+            "$ref": "#/components/responses/ManagementMiddleware429Variant1"
+          },
+          "503": {
+            "$ref": "#/components/responses/ManagementMiddleware503Variant3"
+          }
+        },
+        "security": [
+          {
+            "browserSession": []
+          }
+        ],
+        "x-omg-access": "PlatformRead",
+        "x-omg-middleware-responses": {
+          "$ref": "#/x-omg-middleware-contracts/management"
+        },
+        "x-omg-request-schema": {
+          "$ref": "#/components/schemas/get_api_v1_platform_access_review_schedulesRequest"
+        },
+        "x-omg-response-schema": {
+          "$ref": "#/components/schemas/get_api_v1_platform_access_review_schedulesResponse"
+        },
+        "x-omg-token-policy": "Denied"
+      },
+      "post": {
+        "description": "#481: Platform Admins create, change, pause, resume and delete schedules; Platform Admins and Auditors read them. Browser only. The lifecycle job starts each due run once across replicas, acting as the system (never with the creating admin's authority). Creates a schedule; its first run is the first period start after now (UTC). Rules the schemas cannot express: cadence monthly takes no start_month (absent or null) and quarterly/yearly need one; a workspace filter needs the workspace_memberships or workspace_keys subject and existing Teams/Projects (400). 409: access_review_schedule_limit at 50 schedules.",
+        "operationId": "post_api_v1_platform_access_review_schedules",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/post_api_v1_platform_access_review_schedulesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/post_api_v1_platform_access_review_schedulesResponse"
+                }
+              }
+            },
+            "description": "Successful handler representation"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Invalid input or malformed extraction"
+          },
+          "401": {
+            "$ref": "#/components/responses/ManagementMiddleware401Variant2"
+          },
+          "403": {
+            "$ref": "#/components/responses/ManagementMiddleware403Variant3"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "access_review_schedule_limit"
+          },
+          "413": {
+            "$ref": "#/components/responses/ManagementMiddleware413Variant1"
+          },
+          "415": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "JSON content type required"
+          },
+          "422": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Axum JSON extraction refusal"
+          },
+          "429": {
+            "$ref": "#/components/responses/ManagementMiddleware429Variant1"
+          },
+          "503": {
+            "$ref": "#/components/responses/ManagementMiddleware503Variant3"
+          }
+        },
+        "security": [
+          {
+            "browserSession": [],
+            "csrfToken": [],
+            "origin": []
+          }
+        ],
+        "x-omg-access": "PlatformWrite",
+        "x-omg-middleware-responses": {
+          "$ref": "#/x-omg-middleware-contracts/management"
+        },
+        "x-omg-request-schema": {
+          "$ref": "#/components/schemas/post_api_v1_platform_access_review_schedulesRequest"
+        },
+        "x-omg-response-schema": {
+          "$ref": "#/components/schemas/post_api_v1_platform_access_review_schedulesResponse"
+        },
+        "x-omg-token-policy": "Denied"
+      }
+    },
+    "/api/v1/platform/access-review-schedules/{id}": {
+      "delete": {
+        "description": "#481: Platform Admins create, change, pause, resume and delete schedules; Platform Admins and Auditors read them. Browser only. The lifecycle job starts each due run once across replicas, acting as the system (never with the creating admin's authority). Deletes a schedule: no further runs. Its runs and the campaigns it started stay; its open skipped-run alerts clear.",
+        "operationId": "delete_api_v1_platform_access_review_schedules_by_id",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/IdentityUuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/delete_api_v1_platform_access_review_schedules_by_idResponse"
+                }
+              }
+            },
+            "description": "Successful handler representation"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Invalid input or malformed extraction"
+          },
+          "401": {
+            "$ref": "#/components/responses/ManagementMiddleware401Variant2"
+          },
+          "403": {
+            "$ref": "#/components/responses/ManagementMiddleware403Variant3"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unknown or deleted schedule"
+          },
+          "413": {
+            "$ref": "#/components/responses/ManagementMiddleware413Variant1"
+          },
+          "429": {
+            "$ref": "#/components/responses/ManagementMiddleware429Variant1"
+          },
+          "503": {
+            "$ref": "#/components/responses/ManagementMiddleware503Variant3"
+          }
+        },
+        "security": [
+          {
+            "browserSession": [],
+            "csrfToken": [],
+            "origin": []
+          }
+        ],
+        "x-omg-access": "PlatformWrite",
+        "x-omg-body-absent": true,
+        "x-omg-middleware-responses": {
+          "$ref": "#/x-omg-middleware-contracts/management"
+        },
+        "x-omg-request-schema": {
+          "$ref": "#/components/schemas/delete_api_v1_platform_access_review_schedules_by_idRequest"
+        },
+        "x-omg-response-schema": {
+          "$ref": "#/components/schemas/delete_api_v1_platform_access_review_schedules_by_idResponse"
+        },
+        "x-omg-token-policy": "Denied"
+      },
+      "get": {
+        "description": "#481: Platform Admins create, change, pause, resume and delete schedules; Platform Admins and Auditors read them. Browser only. The lifecycle job starts each due run once across replicas, acting as the system (never with the creating admin's authority). One schedule with its 20 most recent runs, newest period first.",
+        "operationId": "get_api_v1_platform_access_review_schedules_by_id",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/IdentityUuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/get_api_v1_platform_access_review_schedules_by_idResponse"
+                }
+              }
+            },
+            "description": "Successful handler representation"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Invalid input or malformed extraction"
+          },
+          "401": {
+            "$ref": "#/components/responses/ManagementMiddleware401Variant2"
+          },
+          "403": {
+            "$ref": "#/components/responses/ManagementMiddleware403Variant3"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unknown or deleted schedule"
+          },
+          "413": {
+            "$ref": "#/components/responses/ManagementMiddleware413Variant1"
+          },
+          "429": {
+            "$ref": "#/components/responses/ManagementMiddleware429Variant1"
+          },
+          "503": {
+            "$ref": "#/components/responses/ManagementMiddleware503Variant3"
+          }
+        },
+        "security": [
+          {
+            "browserSession": []
+          }
+        ],
+        "x-omg-access": "PlatformRead",
+        "x-omg-middleware-responses": {
+          "$ref": "#/x-omg-middleware-contracts/management"
+        },
+        "x-omg-request-schema": {
+          "$ref": "#/components/schemas/get_api_v1_platform_access_review_schedules_by_idRequest"
+        },
+        "x-omg-response-schema": {
+          "$ref": "#/components/schemas/get_api_v1_platform_access_review_schedules_by_idResponse"
+        },
+        "x-omg-token-policy": "Denied"
+      },
+      "patch": {
+        "description": "#481: Platform Admins create, change, pause, resume and delete schedules; Platform Admins and Auditors read them. Browser only. The lifecycle job starts each due run once across replicas, acting as the system (never with the creating admin's authority). Changes the template or calendar, pauses (paused: true) or resumes (paused: false). A new calendar, and resuming, set the next start to the first period start after now: periods missed while paused do not run. Campaigns already started are untouched. Rules the schemas cannot express: cadence monthly takes no start_month (absent or null) and quarterly/yearly need one; a workspace filter needs the workspace_memberships or workspace_keys subject and existing Teams/Projects (400). cadence replaces the whole calendar and needs start_day (start_month as given, absent meaning none); start_day or start_month without cadence, and a change with no field, are refused (400).",
+        "operationId": "patch_api_v1_platform_access_review_schedules_by_id",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/IdentityUuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/patch_api_v1_platform_access_review_schedules_by_idRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/patch_api_v1_platform_access_review_schedules_by_idResponse"
+                }
+              }
+            },
+            "description": "Successful handler representation"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Invalid input or malformed extraction"
+          },
+          "401": {
+            "$ref": "#/components/responses/ManagementMiddleware401Variant2"
+          },
+          "403": {
+            "$ref": "#/components/responses/ManagementMiddleware403Variant3"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unknown or deleted schedule"
+          },
+          "413": {
+            "$ref": "#/components/responses/ManagementMiddleware413Variant1"
+          },
+          "415": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "JSON content type required"
+          },
+          "422": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Axum JSON extraction refusal"
+          },
+          "429": {
+            "$ref": "#/components/responses/ManagementMiddleware429Variant1"
+          },
+          "503": {
+            "$ref": "#/components/responses/ManagementMiddleware503Variant3"
+          }
+        },
+        "security": [
+          {
+            "browserSession": [],
+            "csrfToken": [],
+            "origin": []
+          }
+        ],
+        "x-omg-access": "PlatformWrite",
+        "x-omg-middleware-responses": {
+          "$ref": "#/x-omg-middleware-contracts/management"
+        },
+        "x-omg-request-schema": {
+          "$ref": "#/components/schemas/patch_api_v1_platform_access_review_schedules_by_idRequest"
+        },
+        "x-omg-response-schema": {
+          "$ref": "#/components/schemas/patch_api_v1_platform_access_review_schedules_by_idResponse"
+        },
+        "x-omg-token-policy": "Denied"
+      }
+    },
     "/api/v1/platform/access-reviews": {
       "get": {
         "description": "#90: Platform Admin/Auditor, browser only. Access review campaigns, newest first.",
@@ -56371,7 +58068,8 @@
                 "aged_unknown_hold",
                 "scim_last_admin",
                 "partitions_missing",
-                "history_orphans"
+                "history_orphans",
+                "access_review_skipped"
               ]
             }
           },
@@ -75006,7 +76704,8 @@
                 "aged_unknown_hold",
                 "scim_last_admin",
                 "partitions_missing",
-                "history_orphans"
+                "history_orphans",
+                "access_review_skipped"
               ]
             }
           },

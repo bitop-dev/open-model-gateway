@@ -1530,6 +1530,8 @@ async fn slice2_fixtures(pool: PgPool, shard: usize) -> (Vec<String>, PositiveFi
     .await;
     // #90: access review campaigns (positives, query and body vectors).
     Box::pin(access_review_fixtures(c, &admin, &f, &pool)).await;
+    // #481: access review schedules and the campaigns they start.
+    Box::pin(access_review_schedule_fixtures(c, &admin, &f, &pool)).await;
 
     // Catalog and policy layers: populated replacement/default lists, never a union.
     let catalog = Uuid::new_v4();
@@ -4059,6 +4061,335 @@ async fn access_review_fixtures(c: &Client, admin: &Browser, f: &Fixture, pool: 
                     Probe::from(captured)
                 }
             }),
+        )
+        .await;
+    }
+}
+
+/// #481: access review schedules. Positives cover a schedule that never ran,
+/// one whose run started a campaign (open), one whose latest run was skipped
+/// while its earlier campaign was open (then closed), a paused one, monthly
+/// and quarterly calendars, both wire forms of create and change, and the
+/// campaign reads that name the schedule.
+async fn access_review_schedule_fixtures(c: &Client, admin: &Browser, f: &Fixture, pool: &PgPool) {
+    const SCHEDULES: &str = "/api/v1/platform/access-review-schedules";
+    const REVIEWS: &str = "/api/v1/platform/access-reviews";
+    let auditor = browser(pool, &f.auditor).await;
+    let store = Store::new(pool.clone());
+    let due = |schedule: Uuid, months_ago: i32| async move {
+        sqlx::query("UPDATE access_review_schedules SET next_run_at=(date_trunc('month',now() AT TIME ZONE 'UTC') - make_interval(months=>$2)) AT TIME ZONE 'UTC' WHERE id=$1")
+            .bind(schedule)
+            .bind(months_ago)
+            .execute(pool)
+            .await
+            .unwrap();
+    };
+    let never = c
+        .ok(
+            admin,
+            "POST",
+            SCHEDULES,
+            Some(json!({"name":"Contract quarterly","subjects":["platform_roles","workspace_memberships"],"open_days":30,"cadence":"quarterly","start_day":31,"start_month":2})),
+        )
+        .await;
+    let started = c
+        .ok(
+            admin,
+            "POST",
+            SCHEDULES,
+            Some(json!([
+                "Contract monthly",
+                ["workspace_memberships"],
+                [f.team],
+                null,
+                "monthly",
+                1
+            ])),
+        )
+        .await;
+    let skipped = c
+        .ok(
+            admin,
+            "POST",
+            SCHEDULES,
+            Some(json!({"name":"Contract skipped","subjects":["workspace_keys","workspace_memberships"],"workspace_ids":[f.team],"cadence":"monthly","start_day":1,"start_month":null})),
+        )
+        .await;
+    let paused = c
+        .ok(
+            admin,
+            "POST",
+            SCHEDULES,
+            Some(json!([
+                "Contract paused",
+                ["platform_roles"],
+                [],
+                7,
+                "yearly",
+                15,
+                11
+            ])),
+        )
+        .await;
+    // The skipped schedule's earlier campaign is still open when this
+    // period's run comes.
+    due(id(&skipped), 1).await;
+    sqlx::query("SELECT omg_access_review_start_scheduled($1,$2,$3,(date_trunc('month',now() AT TIME ZONE 'UTC') - interval '1 month') AT TIME ZONE 'UTC')")
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind(id(&skipped))
+        .execute(pool)
+        .await
+        .unwrap();
+    due(id(&skipped), 0).await;
+    due(id(&started), 0).await;
+    crate::management::access_review_schedules::run_due_fenced(&store, None)
+        .await
+        .unwrap();
+    let earlier: Uuid =
+        sqlx::query_scalar("SELECT id FROM access_review_campaigns WHERE schedule_id=$1")
+            .bind(id(&skipped))
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let running: Uuid =
+        sqlx::query_scalar("SELECT id FROM access_review_campaigns WHERE schedule_id=$1")
+            .bind(id(&started))
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    // Campaign reads name the schedule (closing one, reading both).
+    c.ok(admin, "POST", &format!("{REVIEWS}/{earlier}/close"), None)
+        .await;
+    for campaign in [earlier, running] {
+        c.ok(&auditor, "GET", &format!("{REVIEWS}/{campaign}"), None)
+            .await;
+    }
+    c.ok(
+        &auditor,
+        "GET",
+        &target(REVIEWS, "limit=200&offset=0"),
+        None,
+    )
+    .await;
+    // Change, pause and resume: both wire forms, on schedules with and
+    // without runs and campaigns.
+    let path = |v: &Value| format!("{SCHEDULES}/{}", id(v));
+    c.ok(admin, "PATCH", &path(&paused), Some(json!({"paused":true})))
+        .await;
+    c.ok(
+        admin,
+        "PATCH",
+        &path(&started),
+        Some(json!({"name":"Contract monthly renamed","open_days":10})),
+    )
+    .await;
+    c.ok(
+        admin,
+        "PATCH",
+        &path(&skipped),
+        Some(json!([null, null, null, null, "monthly", 2, null])),
+    )
+    .await;
+    c.ok(admin, "PATCH", &path(&never), Some(json!({"paused":true})))
+        .await;
+    c.ok(
+        admin,
+        "PATCH",
+        &path(&never),
+        Some(json!({"paused":false,"workspace_ids":[f.project]})),
+    )
+    .await;
+    for schedule in [&never, &started, &skipped, &paused] {
+        c.ok(&auditor, "GET", &path(schedule), None).await;
+    }
+    c.ok(
+        &auditor,
+        "GET",
+        &target(SCHEDULES, "limit=50&offset=0"),
+        None,
+    )
+    .await;
+    let doomed = c
+        .ok(
+            admin,
+            "POST",
+            SCHEDULES,
+            Some(json!({"name":"Contract deleted","subjects":["platform_roles"],"cadence":"monthly","start_day":28})),
+        )
+        .await;
+    c.ok(admin, "DELETE", &path(&doomed), None).await;
+    // Vectors. Accepted bodies create schedules: delete the extras first so
+    // the 50-schedule limit never decides a vector. A PATCH target that is
+    // only ever changed by vectors.
+    let target_schedule = c
+        .setup(
+            admin,
+            "POST",
+            SCHEDULES,
+            Some(json!({"name":"Vector target","subjects":["workspace_memberships"],"cadence":"monthly","start_day":3})),
+        )
+        .await;
+    let target_path = path(&target_schedule);
+    let keep = [
+        id(&never),
+        id(&started),
+        id(&skipped),
+        id(&paused),
+        id(&target_schedule),
+    ];
+    let prune = || async {
+        sqlx::query("UPDATE access_review_schedules SET deleted_at=now(),deleted_by=$1 WHERE deleted_at IS NULL AND NOT (id=ANY($2))")
+            .bind(f.admin.user_id)
+            .bind(&keep[..])
+            .execute(pool)
+            .await
+            .unwrap();
+    };
+    let mut o = c.observed.lock().await;
+    c.guarded(
+        "GET /platform/access-review-schedules",
+        query_vectors_fixed(
+            &mut o,
+            "GET",
+            SCHEDULES,
+            &[("limit", "50"), ("offset", "0")],
+            async |q| {
+                c.raw(&auditor, "GET", &target(SCHEDULES, &q), None, &[])
+                    .await
+            },
+        ),
+    )
+    .await;
+    let artifact = openapi::responses::artifact();
+    let schema_of = |method: &str, template: &str| {
+        artifact["paths"][template][method]["requestBody"]["content"]["application/json"]["schema"]
+            .clone()
+    };
+    let post_schema = schema_of("post", SCHEDULES);
+    let patch_schema = schema_of("patch", "/api/v1/platform/access-review-schedules/{id}");
+    // Described, not expressed: whether the real handler refuses a body the
+    // schema accepts, by the cross-field rules of the operation description.
+    let shared = |ids: Vec<Uuid>| async move {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM workspaces WHERE id=ANY($1) AND kind IN ('team','project')",
+        )
+        .bind(&ids)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        n as usize == ids.len()
+    };
+    let uuids = |v: &Value| -> Vec<Uuid> {
+        v.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().and_then(|s| Uuid::parse_str(s).ok()))
+            .collect()
+    };
+    let has_workspace_subject = |v: &Value| {
+        v.as_array().is_some_and(|s| {
+            s.iter()
+                .any(|v| v == "workspace_memberships" || v == "workspace_keys")
+        })
+    };
+    let field = |body: &Value, index: usize, name: &str| -> Value {
+        if body.is_array() {
+            body.get(index).cloned().unwrap_or(Value::Null)
+        } else {
+            body.get(name).cloned().unwrap_or(Value::Null)
+        }
+    };
+    let calendar_broken =
+        |cadence: &Value, month: &Value| (cadence == "monthly") != month.is_null();
+    for valid in [
+        json!({"name":"Vector schedule","subjects":["workspace_memberships"],"workspace_ids":[f.team],"open_days":7,"cadence":"quarterly","start_day":5,"start_month":1}),
+        json!([
+            "Vector schedule positional",
+            ["workspace_memberships"],
+            [f.project],
+            7,
+            "monthly",
+            5,
+            null
+        ]),
+    ] {
+        c.guarded(
+            "POST /platform/access-review-schedules",
+            body_vectors_http(&mut o, "POST", SCHEDULES, valid, async |body| {
+                prune().await;
+                let accepts =
+                    openapi::http_vectors::accepts(artifact, &post_schema, &body).unwrap_or(false);
+                let subjects = field(&body, 1, "subjects");
+                let filter = uuids(&field(&body, 2, "workspace_ids"));
+                let rule = accepts
+                    && (calendar_broken(
+                        &field(&body, 4, "cadence"),
+                        &field(&body, 6, "start_month"),
+                    ) || (!filter.is_empty()
+                        && (!has_workspace_subject(&subjects) || !shared(filter).await)));
+                let captured = c.raw(admin, "POST", SCHEDULES, Some(body), &[]).await;
+                if rule && captured.status == StatusCode::BAD_REQUEST {
+                    Probe::decided(captured, true)
+                } else {
+                    Probe::from(captured)
+                }
+            }),
+        )
+        .await;
+    }
+    for valid in [
+        json!({"name":"Vector target","subjects":["workspace_memberships"],"workspace_ids":[f.team],"open_days":14,"cadence":"monthly","start_day":3,"start_month":null,"paused":false}),
+        json!([
+            "Vector target",
+            ["workspace_memberships"],
+            [f.project],
+            14,
+            "yearly",
+            3,
+            6,
+            false
+        ]),
+    ] {
+        c.guarded(
+            "PATCH /platform/access-review-schedules/{id}",
+            body_vectors_http(
+                &mut o,
+                "PATCH",
+                "/api/v1/platform/access-review-schedules/{id}",
+                valid,
+                async |body| {
+                    let accepts = openapi::http_vectors::accepts(artifact, &patch_schema, &body)
+                        .unwrap_or(false);
+                    let names = ["name", "subjects", "workspace_ids", "open_days", "cadence", "start_day", "start_month", "paused"];
+                    let at = |i: usize| field(&body, i, names[i]);
+                    let (current_subjects, current_filter): (Vec<String>, Vec<Uuid>) = sqlx::query_as("SELECT subjects,workspace_ids FROM access_review_schedules WHERE id=$1")
+                        .bind(id(&target_schedule))
+                        .fetch_one(pool)
+                        .await
+                        .unwrap();
+                    let subjects = if at(1).is_null() { json!(current_subjects) } else { at(1) };
+                    let filter = if at(2).is_null() { current_filter } else { uuids(&at(2)) };
+                    let nothing = (0..8).all(|i| at(i).is_null());
+                    let calendar = match (at(4).is_null(), at(5).is_null()) {
+                        (false, false) => calendar_broken(&at(4), &at(6)),
+                        (true, true) => !at(6).is_null(),
+                        _ => true,
+                    };
+                    let rule = accepts
+                        && (nothing
+                            || calendar
+                            || (!filter.is_empty()
+                                && (!has_workspace_subject(&subjects)
+                                    || (!at(2).is_null() && !shared(filter).await))));
+                    let captured = c.raw(admin, "PATCH", &target_path, Some(body), &[]).await;
+                    if rule && captured.status == StatusCode::BAD_REQUEST {
+                        Probe::decided(captured, true)
+                    } else {
+                        Probe::from(captured)
+                    }
+                },
+            ),
         )
         .await;
     }

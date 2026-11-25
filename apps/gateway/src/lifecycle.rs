@@ -14,6 +14,19 @@ pub(crate) async fn lock(tx: &mut Transaction<'_, Postgres>) -> Result<(), sqlx:
     Ok(())
 }
 
+/// A transaction for a fenced lifecycle step that writes management state:
+/// the lease fence is its first statement, then [`lock`] (the catalog and
+/// installation locks every management write takes, in the same order).
+pub(crate) async fn installation_tx_fenced<'a>(
+    s: &'a Store,
+    fence: Option<&crate::leases::Fence>,
+) -> Result<Transaction<'a, Postgres>, sqlx::Error> {
+    let mut tx = crate::db::begin(&s.pool).await?;
+    crate::leases::fence(&mut tx, fence).await?;
+    lock(&mut tx).await?;
+    Ok(tx)
+}
+
 /// Exclusive authority locks (`governance::locks`) for changes to `users`
 /// (suspension, cleanup, entitlement loss, grant and membership changes, key
 /// revocation): their personal workspaces, the users, then the lineages of
@@ -189,6 +202,21 @@ pub async fn expire_access_requests_fenced(
     }
     tx.commit().await?;
     Ok(expired.len() as u64)
+}
+
+/// #481: starts each due scheduled access review once (or records it as
+/// skipped) under the same fenced lifecycle lease. Returns how many runs were
+/// recorded.
+pub async fn start_scheduled_access_reviews_fenced(
+    store: &Store,
+    fence: Option<&crate::leases::Fence>,
+) -> Result<u64, sqlx::Error> {
+    use crate::management::access_review_schedules::{Outcome, run_due_fenced};
+    Ok(run_due_fenced(store, fence)
+        .await?
+        .iter()
+        .filter(|(_, outcome)| !matches!(outcome, Outcome::Deferred(_)))
+        .count() as u64)
 }
 
 /// A mapping's write target: `Platform` role or `Workspace` membership.

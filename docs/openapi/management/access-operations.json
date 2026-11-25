@@ -5651,6 +5651,334 @@
       },
       "scope": null,
       "token_policy": "Denied"
+    },
+    "GET /api/v1/platform/access-review-schedules": {
+      "access": "PlatformRead",
+      "scope": null,
+      "token_policy": "Denied",
+      "operation": {
+        "description": "#481: Platform Admins create, change, pause, resume and delete schedules; Platform Admins and Auditors read them. Browser only. The lifecycle job starts each due run once across replicas, acting as the system (never with the creating admin's authority). Schedules that are not deleted, oldest first, each with its next start (null while paused), its latest run and the latest campaign it started.",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 100
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100000,
+              "default": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful handler representation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/get_api_v1_platform_access_review_schedulesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input or malformed extraction",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "POST /api/v1/platform/access-review-schedules": {
+      "access": "PlatformWrite",
+      "scope": null,
+      "token_policy": "Denied",
+      "operation": {
+        "description": "#481: Platform Admins create, change, pause, resume and delete schedules; Platform Admins and Auditors read them. Browser only. The lifecycle job starts each due run once across replicas, acting as the system (never with the creating admin's authority). Creates a schedule; its first run is the first period start after now (UTC). Rules the schemas cannot express: cadence monthly takes no start_month (absent or null) and quarterly/yearly need one; a workspace filter needs the workspace_memberships or workspace_keys subject and existing Teams/Projects (400). 409: access_review_schedule_limit at 50 schedules.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/post_api_v1_platform_access_review_schedulesRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful handler representation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/post_api_v1_platform_access_review_schedulesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input or malformed extraction",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "access_review_schedule_limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "JSON content type required",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Axum JSON extraction refusal",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /api/v1/platform/access-review-schedules/{id}": {
+      "access": "PlatformRead",
+      "scope": null,
+      "token_policy": "Denied",
+      "operation": {
+        "description": "#481: Platform Admins create, change, pause, resume and delete schedules; Platform Admins and Auditors read them. Browser only. The lifecycle job starts each due run once across replicas, acting as the system (never with the creating admin's authority). One schedule with its 20 most recent runs, newest period first.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/IdentityUuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful handler representation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/get_api_v1_platform_access_review_schedules_by_idResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input or malformed extraction",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown or deleted schedule",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "PATCH /api/v1/platform/access-review-schedules/{id}": {
+      "access": "PlatformWrite",
+      "scope": null,
+      "token_policy": "Denied",
+      "operation": {
+        "description": "#481: Platform Admins create, change, pause, resume and delete schedules; Platform Admins and Auditors read them. Browser only. The lifecycle job starts each due run once across replicas, acting as the system (never with the creating admin's authority). Changes the template or calendar, pauses (paused: true) or resumes (paused: false). A new calendar, and resuming, set the next start to the first period start after now: periods missed while paused do not run. Campaigns already started are untouched. Rules the schemas cannot express: cadence monthly takes no start_month (absent or null) and quarterly/yearly need one; a workspace filter needs the workspace_memberships or workspace_keys subject and existing Teams/Projects (400). cadence replaces the whole calendar and needs start_day (start_month as given, absent meaning none); start_day or start_month without cadence, and a change with no field, are refused (400).",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/IdentityUuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/patch_api_v1_platform_access_review_schedules_by_idRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful handler representation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/patch_api_v1_platform_access_review_schedules_by_idResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input or malformed extraction",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown or deleted schedule",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "JSON content type required",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Axum JSON extraction refusal",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "DELETE /api/v1/platform/access-review-schedules/{id}": {
+      "access": "PlatformWrite",
+      "scope": null,
+      "token_policy": "Denied",
+      "operation": {
+        "description": "#481: Platform Admins create, change, pause, resume and delete schedules; Platform Admins and Auditors read them. Browser only. The lifecycle job starts each due run once across replicas, acting as the system (never with the creating admin's authority). Deletes a schedule: no further runs. Its runs and the campaigns it started stay; its open skipped-run alerts clear.",
+        "x-omg-body-absent": true,
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/IdentityUuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful handler representation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/delete_api_v1_platform_access_review_schedules_by_idResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input or malformed extraction",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown or deleted schedule",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   }
 }

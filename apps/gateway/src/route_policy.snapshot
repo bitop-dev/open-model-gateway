@@ -92,6 +92,10 @@ GET	/api/v1/platform/access-reviews/{id}/items	PlatformRead	denied
 POST	/api/v1/platform/access-reviews/{id}/close	PlatformWrite	denied
 GET	/api/v1/platform/access-reviews/{id}/export	PlatformRead	denied
 POST	/api/v1/platform/access-reviews/{id}/items/{item}/reviewer	PlatformWrite	denied
+GET	/api/v1/platform/access-review-schedules	PlatformRead	denied
+POST	/api/v1/platform/access-review-schedules	PlatformWrite	denied
+GET	/api/v1/platform/access-review-schedules/{id}	PlatformRead	denied
+PATCH DELETE	/api/v1/platform/access-review-schedules/{id}	PlatformWrite	denied
 GET	/api/v1/me/access-reviews	Browser	denied
 POST	/api/v1/me/access-reviews/{item}/decision	Browser	denied
 GET	/api/v1/me	Browser	denied
