@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -22,6 +23,15 @@ ROOT = Path(__file__).resolve().parents[1]
 IMAGE = "ghcr.io/bitop-dev/open-model-gateway"
 COMMIT = "9b1fc815f6b7fba743f08b9b5c5846639cc11d3c"
 TOKEN = "fixture-private-token"
+TRANSIENT = {"registry-server", "registry-rate-limit", "transport"}
+# The fixed shape of a failed copy's last line (#711): the category, the attempt, and
+# signals made only of fixed words and numbers.
+SIGNALS = (r"status (?:none|[1-5][0-9]{2}); oci-code [a-z-]+; request (?:none|[A-Z]+ [a-z-]+); "
+           r"host (?:none|ghcr\.io|other); transport [a-z0-9,-]+; stderr [0-9]+ lines(?: \(first 4096 bytes\))?")
+
+
+def copy_failed(category, attempt):
+    return rf"oci-stage: copy failed \({re.escape(category)}\) \[attempt {attempt} of 3; {SIGNALS}\]"
 
 
 class OciStageTests(unittest.TestCase):
@@ -41,6 +51,10 @@ class OciStageTests(unittest.TestCase):
         self.config.parent.mkdir()
         self.tool, self.log = self.base / "fake-oras", self.base / "calls.jsonl"
         self.install_tool()
+        self.sleeps = []
+        sleeper = mock.patch.object(self.api, "wait", side_effect=self.sleeps.append)
+        sleeper.start()
+        self.addCleanup(sleeper.stop)
         self.graph = fixture()
         self.archive = self.base / "archive.tar"
         self.write_archive()
@@ -51,7 +65,7 @@ class OciStageTests(unittest.TestCase):
                         ACTIONS_ID_TOKEN_REQUEST_TOKEN="oidc-secret", PATH="/ambient/helpers",
                         HOME=str(self.base / "ambient-home"), TMPDIR=str(self.base / "ambient-tmp"))
 
-    def install_tool(self, fail="", sleep="", diagnostic=None):
+    def install_tool(self, fail="", sleep="", diagnostic=None, cp_failures=None):
         self.tool.write_text(f'''#!{sys.executable}
 import hashlib, json, os, pathlib, stat, sys, time
 args = sys.argv[1:]
@@ -73,6 +87,11 @@ else:
     print('credentialed-error fixture-private-token', file=sys.stderr)
 if kind == {fail!r}:
     sys.exit(1)
+failures = {cp_failures!r}
+if kind == 'cp' and failures is not None:
+    seen = sum(1 for line in open({str(self.log)!r}) if json.loads(line)['argv'][0] == 'cp')
+    if seen <= failures:
+        sys.exit(1)
 if kind == 'login':
     auth.write_text(json.dumps({{'auths': {{'ghcr.io': {{'auth': 'fixture-credential'}}}}}}))
 ''')
@@ -124,6 +143,14 @@ if kind == 'login':
         self.assertEqual(out, "")
         if diagnostic is None:
             self.assertIn(err, {"oci-stage: validation failed\n", "oci-stage: authentication unavailable\n"})
+        elif diagnostic.startswith("copy failed ("):
+            category = diagnostic[len("copy failed ("):-1]
+            attempts = calls - 1
+            lines = err.splitlines()
+            self.assertEqual(len(lines), attempts, err)
+            for attempt, line in enumerate(lines[:-1], 1):
+                self.assertRegex(line, rf"^oci-stage: copy attempt {attempt} of 3 failed \({re.escape(category)}\) \[{SIGNALS}\]; retrying in [0-9]+ s$")
+            self.assertRegex(lines[-1], f"^{copy_failed(category, attempts)}$")
         else:
             self.assertEqual(err, f"oci-stage: {diagnostic}\n")
         self.assertEqual(len(self.records()), calls)
@@ -170,8 +197,10 @@ if kind == 'login':
     def test_cli_copy_failure_has_no_digest_or_transport_text(self):
         self.install_tool(fail="cp", diagnostic=b"Error response from registry: denied: fixture-private-token\n")
         result = subprocess.run([sys.executable, str(self.script), *self.args()], env=self.env, capture_output=True, timeout=10)
-        self.assertEqual((result.returncode, result.stdout, result.stderr),
-                         (1, b"", b"oci-stage: copy failed (registry-access)\n"))
+        self.assertEqual((result.returncode, result.stdout), (1, b""))
+        self.assertRegex(result.stderr.decode(), f"^{copy_failed('registry-access', 1)}\n$")
+        self.assertIn("oci-code denied; request none; host none", result.stderr.decode())
+        self.assertNotIn(b"fixture-private-token", result.stderr)
         self.assertEqual(len(self.records()), 2)
         self.assert_cleanup()
 
@@ -302,7 +331,8 @@ if kind == 'login':
             with self.subTest(index=index, category=category):
                 self.log.unlink(missing_ok=True)
                 self.install_tool(fail="cp", diagnostic=stderr + b"\n")
-                self.refused(calls=2, diagnostic=f"copy failed ({category})")
+                # A transient failure is retried to the bound; any other is not.
+                self.refused(calls=1 + (3 if category in TRANSIENT else 1), diagnostic=f"copy failed ({category})")
 
     def test_copy_diagnostics_after_registry_warnings(self):
         warning = (b"[2026-11-22T08:12:08.123Z][WARNING]: fixture text\n"
@@ -330,11 +360,84 @@ if kind == 'login':
                 kwargs["stderr"].write(b"Error response from registry: denied\n")
                 return subprocess.CompletedProcess(args, code)
             with mock.patch.object(self.api.subprocess, "run", side_effect=terminated):
-                with self.assertRaisesRegex(self.api.Refusal, rf"^copy failed \({label}\)$"):
-                    self.api.run(self.tool, [], {}, self.base, "copy failed", copy_image=IMAGE)
+                self.assertEqual(self.api.attempt_copy(self.tool, [], {}, self.base, IMAGE, 60)[0], label)
         with mock.patch.object(self.api.subprocess, "run", side_effect=FileNotFoundError()):
-            with self.assertRaisesRegex(self.api.Refusal, r"^copy failed \(execution\)$"):
-                self.api.run(self.tool, [], {}, self.base, "copy failed", copy_image=IMAGE)
+            self.assertEqual(self.api.attempt_copy(self.tool, [], {}, self.base, IMAGE, 60)[0], "execution")
+
+    # The error shapes ORAS 1.3.6 (the pinned build) printed for a copy to a local stand-in
+    # registry that failed in each way, with ghcr.io and the image in place of the stand-in.
+    DESTINATION = f'Error from destination registry for "{IMAGE}": '.encode()
+    ORAS_OUTPUT = {
+        "503 without a body": (DESTINATION + b'POST "https://ghcr.io/v2/bitop-dev/open-model-gateway/blobs/uploads/": response status code 503: Service Unavailable',
+                               "registry-server", "status 503; oci-code none; request POST blob-upload; host ghcr.io; transport none"),
+        "500 with an UNKNOWN error body": (DESTINATION + b"unknown: internal", "unknown", "status none; oci-code unknown; request none; host none; transport none"),
+        "429 with an error body": (DESTINATION + b"toomanyrequests: retry later", "registry-rate-limit", "status none; oci-code toomanyrequests; request none; host none; transport none"),
+        "401": (DESTINATION + b"unauthorized: authentication required", "registry-access", "status none; oci-code unauthorized; request none; host none; transport none"),
+        "403": (DESTINATION + b"denied: permission_denied", "registry-access", "status none; oci-code denied; request none; host none; transport none"),
+        "a closed connection": (DESTINATION + b'Post "https://ghcr.io/v2/bitop-dev/open-model-gateway/blobs/uploads/?secret=fixture-private-token": EOF',
+                                "transport", "status none; oci-code none; request POST blob-upload; host ghcr.io; transport eof"),
+    }
+
+    def test_copy_signals_name_status_code_request_and_host_in_fixed_words_only(self):
+        for label, (stderr, category, signals) in self.ORAS_OUTPUT.items():
+            with self.subTest(label=label):
+                report = io.BytesIO(stderr + b"\n")
+                self.assertEqual(self.api.copy_failure_category(report, IMAGE), category)
+                self.assertEqual(self.api.copy_signals(report), signals + "; stderr 1 lines")
+        noisy = io.BytesIO(b"x" * 5000 + b'PUT "https://evil.example/v2/a/manifests/b?t=fixture-private-token": i/o timeout\n')
+        signals = self.api.copy_signals(noisy)
+        self.assertTrue(signals.endswith("(first 4096 bytes)"), signals)
+        self.assertNotIn(TOKEN, signals)
+        self.assertNotIn("evil", signals)
+
+    def test_a_transient_copy_failure_is_retried_and_then_succeeds(self):
+        stderr, _, _ = self.ORAS_OUTPUT["503 without a body"]
+        for failures, sleeps in ((1, [10]), (2, [10, 30])):
+            with self.subTest(failures=failures):
+                self.log.unlink(missing_ok=True)
+                self.sleeps.clear()
+                self.install_tool(diagnostic=stderr + b"\n", cp_failures=failures)
+                code, out, err = self.invoke()
+                self.assertEqual(code, 0, err)
+                self.assertEqual(out, self.graph["root"]["digest"] + "\n")
+                self.assertEqual(self.sleeps, sleeps)
+                lines = err.splitlines()
+                self.assertEqual(len(lines), failures)
+                for attempt, line in enumerate(lines, 1):
+                    self.assertRegex(line, rf"^oci-stage: copy attempt {attempt} of 3 failed \(registry-server\) \[{SIGNALS}\]; retrying in [0-9]+ s$")
+                copies = [r for r in self.records() if r["argv"][0] == "cp"]
+                self.assertEqual(len(copies), failures + 1)
+                # Every attempt copies the same verified archive by the same root digest.
+                self.assertEqual({json.dumps(r["argv"]) for r in copies}, {json.dumps(copies[0]["argv"])})
+                self.assertEqual({r["archive_sha256"] for r in copies}, {copies[0]["archive_sha256"]})
+                self.assertEqual(sum(1 for r in self.records() if r["argv"][0] == "login"), 1)
+                self.assert_cleanup()
+
+    def test_retries_end_at_the_attempt_bound_and_within_the_time_budget(self):
+        stderr, _, _ = self.ORAS_OUTPUT["a closed connection"]
+        self.install_tool(fail="cp", diagnostic=stderr + b"\n")
+        self.refused(calls=4, diagnostic="copy failed (transport)")
+        self.assertEqual(self.sleeps, [10, 30])
+        # With the budget nearly spent, the next pause would not fit: no retry.
+        self.log.unlink(missing_ok=True)
+        self.sleeps.clear()
+        clock = iter([0.0, 0.0, 595.0, 595.0, 595.0])
+        with mock.patch.object(self.api.time, "monotonic", side_effect=lambda: next(clock)):
+            self.refused(calls=2, diagnostic="copy failed (transport)")
+        self.assertEqual(self.sleeps, [])
+
+    def test_each_attempt_gets_the_rest_of_one_budget(self):
+        stderr, _, _ = self.ORAS_OUTPUT["503 without a body"]
+        self.install_tool(fail="cp", diagnostic=stderr + b"\n")
+        timeouts, run = [], subprocess.run
+        def recorded(*args, **kwargs):
+            if args[0][1] == "cp":
+                timeouts.append(kwargs["timeout"])
+            return run(*args, **kwargs)
+        with mock.patch.object(self.api.subprocess, "run", side_effect=recorded):
+            self.refused(calls=4, diagnostic="copy failed (registry-server)")
+        self.assertEqual(len(timeouts), 3)
+        self.assertTrue(all(0 < t <= 600 for t in timeouts) and timeouts == sorted(timeouts, reverse=True), timeouts)
 
     def test_login_and_copy_timeouts_are_bounded_redacted_and_cleaned(self):
         run = subprocess.run
