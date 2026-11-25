@@ -392,6 +392,20 @@ class CheckPieces(unittest.TestCase):
         for stderr, expected in cases.items():
             self.assertEqual(self.check(answer(stderr)).evict("omg-429"), expected, stderr)
 
+    def test_only_the_listen_sessions_may_bypass_the_pooler(self):
+        def run(rows):
+            check = self.check(lambda args, **kwargs: "10.42.0.5 10.42.0.6" if "poolerName" in " ".join(args) else "")
+            check.gateway_pods = lambda: [{"status": {"podIP": "10.42.0.7"}}, {"status": {"podIP": "10.42.0.8"}}]
+            check.sql = lambda statement: "\n".join(rows)
+            with contextlib.redirect_stdout(io.StringIO()):
+                check.pooler_step()
+            return check.results[-1]["result"]
+        listen = ["10.42.0.7|listen", "10.42.0.8|listen"]
+        self.assertEqual(run(["10.42.0.5|other", "10.42.0.6|other", *listen]), "pass")
+        self.assertEqual(run(["10.42.0.5|other", *listen, "10.42.0.7|other"]), "fail", "a direct pool session")
+        self.assertEqual(run(["10.42.0.5|other", "10.42.0.7|listen"]), "fail", "a replica without its LISTEN session")
+        self.assertEqual(run([*listen]), "fail", "nothing through the pooler")
+
     def test_a_failed_listing_is_never_a_vanished_model(self):
         client = mock.Mock()
         client.request.return_value = (503, {}, [], b"")

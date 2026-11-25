@@ -831,11 +831,11 @@ class Check:
         pooler = set(self.kubectl(["get", "pods", "-l", "cnpg.io/poolerName=omg-pooler", "-o", "jsonpath={.items[*].status.podIP}"], capture=True).split())
         gateways = {p["status"].get("podIP") for p in self.gateway_pods()}
         rows = [r.split("|") for r in self.sql(
-            "SELECT host(client_addr)||'|'||(query ILIKE 'LISTEN%') FROM pg_stat_activity "
-            "WHERE usename='gateway_runtime' AND client_addr IS NOT NULL").split()]
+            "SELECT host(client_addr)||'|'||CASE WHEN query ILIKE 'LISTEN%' THEN 'listen' ELSE 'other' END "
+            "FROM pg_stat_activity WHERE usename='gateway_runtime' AND client_addr IS NOT NULL").split()]
         via_pooler = sum(1 for address, _ in rows if address in pooler)
-        listening = {address for address, listen in rows if address in gateways and listen == "t"}
-        other_direct = sum(1 for address, listen in rows if address in gateways and listen != "t")
+        listening = {address for address, kind in rows if address in gateways and kind == "listen"}
+        other_direct = sum(1 for address, kind in rows if address in gateways and kind != "listen")
         # PgBouncer's transaction mode cannot carry LISTEN, so each replica
         # holds one direct LISTEN session by design; anything else goes
         # through the pooler.
