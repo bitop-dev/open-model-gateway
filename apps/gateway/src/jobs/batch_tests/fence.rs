@@ -1019,8 +1019,14 @@ async fn crashed_batch_finalization_outputs_are_reclaimed_without_retention(pool
     assert_eq!(sweep_once(db, runtime, 100).await.unwrap().claimed, 0);
     old.abort();
     assert!(old.await.unwrap_err().is_cancelled());
-    lapse(&w, &job).await;
-    assert!(Runner::new(w.jobs.clone()).run_next().await.unwrap());
+    // Aborting the run leaves its lease renewal task running (its handle is
+    // dropped, not aborted): the replacement claims as the runner loop does.
+    assert!(
+        start_replacement(&w, &job, w.jobs.clone())
+            .await
+            .unwrap()
+            .unwrap()
+    );
     let done = w.reload(&job).await;
     assert!(done.settled_at.is_some());
     let cost = crate::governance::batch::batch_cost(db, job.id)

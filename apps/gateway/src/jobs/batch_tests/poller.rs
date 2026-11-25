@@ -204,13 +204,21 @@ async fn take_over(w: &World, job: &JobRow, owner: Uuid) -> BatchFence {
 /// Another poller takes the batch over through a whole poll pass, as the
 /// poller loop does: the holder (still running) renews on its own schedule
 /// and a claim skips a job row another transaction holds, so the lease is
-/// lapsed before each pass and a pass that claimed nothing is polled again.
-/// The jobs that pass polled.
+/// lapsed before each pass, and a pass is repeated only while it did not
+/// claim the batch (its claim epoch is unchanged). A pass that claimed it
+/// and still refreshed nothing is returned as it is. The jobs that pass
+/// refreshed.
 async fn poll_taking_over(w: &World, job: &JobRow) -> usize {
+    let epoch = || {
+        sqlx::query_scalar::<_, i64>("SELECT runner_epoch FROM async_jobs WHERE id=$1")
+            .bind(job.id)
+            .fetch_one(&w.f.store.pool)
+    };
     for _ in 0..50 {
         lapse(w, job).await;
+        let before = epoch().await.unwrap();
         let polled = w.jobs.poll_once().await.unwrap();
-        if polled > 0 {
+        if polled > 0 || epoch().await.unwrap() != before {
             return polled;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -488,7 +496,10 @@ async fn a_submission_that_fails_after_its_claim_ended_writes_and_settles_nothin
     // The poller that holds the batch ends it interrupted after the grace,
     // with the hold kept as unknown cost.
     w.jobs.submit_grace = TimeDelta::minutes(0);
-    assert_eq!(poll_taking_over(&w, &job).await, 1);
+    // Nothing renews here (the first poller has returned, the holder is a
+    // bare claim): one pass must take the batch.
+    lapse(&w, &job).await;
+    assert_eq!(w.jobs.poll_once().await.unwrap(), 1);
     let ended = w.reload(&job).await;
     assert_eq!(
         (ended.state.as_str(), ended.error_code.as_deref()),

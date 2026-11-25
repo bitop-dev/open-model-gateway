@@ -836,8 +836,9 @@ async fn a_failed_job_claim_names_its_cause(pool: PgPool) {
     use sqlx::Connection;
     // One connection, so holding it makes the claim's acquire time out. The
     // test asserts that timeout's cause, not its length; opening the
-    // connection is set-up, bounded on its own, so a slow machine cannot
-    // turn the first connect into the timeout under test.
+    // connection is set-up, bounded on its own (attempts of 3 s each, the
+    // acquire timeout, within 60 s), so a slow machine cannot turn the first
+    // connect into the timeout under test.
     let one = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .acquire_timeout(std::time::Duration::from_secs(3))

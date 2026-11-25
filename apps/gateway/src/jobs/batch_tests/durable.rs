@@ -1306,9 +1306,9 @@ async fn check_backoff_retry(
 
 #[dbtest::test]
 async fn a_takeover_keeps_the_pending_provider_call_in_route_capacity(pool: PgPool) {
-    // The replacement's claim alone may take REACH.
+    // The sum of `check_takeover_capacity`'s phase bounds, and set-up.
     tokio::time::timeout(
-        REACH + Duration::from_secs(30),
+        REACH * 4 + Duration::from_secs(30),
         run_case(pool, Case::CapacityTakeover(Loss::Takeover)),
     )
     .await
@@ -1317,9 +1317,9 @@ async fn a_takeover_keeps_the_pending_provider_call_in_route_capacity(pool: PgPo
 
 #[dbtest::test]
 async fn lease_recovery_releases_a_crashed_runners_route_slot(pool: PgPool) {
-    // The replacement's claim alone may take REACH.
+    // The sum of `check_takeover_capacity`'s phase bounds, and set-up.
     tokio::time::timeout(
-        REACH + Duration::from_secs(30),
+        REACH * 4 + Duration::from_secs(30),
         run_case(pool, Case::CapacityTakeover(Loss::Crash)),
     )
     .await
@@ -1333,29 +1333,39 @@ async fn check_takeover_capacity(
     release: &tokio::sync::Semaphore,
     mut process: Option<tokio::process::Child>,
 ) {
+    // Each phase has its own bound, from REACH: a line reaches the provider
+    // within REACH (a planning failure costs a REPLAN).
     let old = process.is_none().then(|| start(w));
-    while calls.load(Ordering::SeqCst) == 0 {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    tokio::time::timeout(REACH, async {
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first runner reaches the provider");
     // The old runner still renews its lease, and a claim skips a job row
     // another transaction holds: the replacement claims as the runner loop
-    // does (`start_replacement`), within REACH.
+    // does (`start_replacement`, within REACH), then plans (within REACH).
     let owner = start_replacement(w, job, w.jobs.clone());
-    loop {
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "takeover exceeded route capacity"
-        );
-        // Only a demand heartbeat after interruption shows that the new
-        // owner has tried to dispatch the remaining line.
-        let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT FROM batch_lines l JOIN batch_route_waits w USING(job_id,deployment_id) WHERE l.job_id=$1 AND l.state='interrupted' AND w.reason='concurrency' AND w.updated_at>l.finished_at)")
-            .bind(job.id).fetch_one(&w.f.store.pool).await.unwrap();
-        if waiting {
-            break;
+    tokio::time::timeout(REACH * 2, async {
+        loop {
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "takeover exceeded route capacity"
+            );
+            // Only a demand heartbeat after interruption shows that the new
+            // owner has tried to dispatch the remaining line.
+            let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT FROM batch_lines l JOIN batch_route_waits w USING(job_id,deployment_id) WHERE l.job_id=$1 AND l.state='interrupted' AND w.reason='concurrency' AND w.updated_at>l.finished_at)")
+                .bind(job.id).fetch_one(&w.f.store.pool).await.unwrap();
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    })
+    .await
+    .expect("the replacement tries to dispatch the remaining line");
     let scheduler = crate::jobs::schedule::Scheduler::new(w.jobs.store.clone(), None);
     assert_eq!(
         scheduler.running_lines(w.claude_deployment).await.unwrap(),
@@ -1375,9 +1385,16 @@ async fn check_takeover_capacity(
     }
     release.add_permits(1);
     if let Some(old) = old {
-        assert!(old.await.unwrap().unwrap());
+        let finished = tokio::time::timeout(REACH, old).await;
+        assert!(finished.expect("the old runner finishes").unwrap().unwrap());
     }
-    assert!(owner.await.unwrap().unwrap());
+    let finished = tokio::time::timeout(REACH, owner).await;
+    assert!(
+        finished
+            .expect("the replacement finishes")
+            .unwrap()
+            .unwrap()
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     let done = w.reload(job).await;
     assert_eq!(
