@@ -127,7 +127,7 @@ async fn a_cached_failed_server_login_is_waited_out(pool: PgPool) {
 #[sqlx::test(migrations = false)]
 async fn every_other_refusal_fails_at_once(pool: PgPool) {
     let (result, seen, elapsed) = through_front(&pool, 1, WRONG_PASSWORD, WINDOW).await;
-    let error = result.err().expect("refused");
+    let error = result.expect_err("refused");
     assert!(!pooler_reports_failed_server_login(&error));
     assert!(matches!(&error, sqlx::Error::Database(e) if e.message() == WRONG_PASSWORD));
     assert_eq!(seen, 1, "one attempt");
@@ -140,7 +140,7 @@ async fn every_other_refusal_fails_at_once(pool: PgPool) {
 async fn a_failure_that_lasts_fails_after_the_window(pool: PgPool) {
     let window = Duration::from_secs(2);
     let (result, seen, elapsed) = through_front(&pool, usize::MAX, CACHED, window).await;
-    let error = result.err().expect("still refused after the window");
+    let error = result.expect_err("still refused after the window");
     assert!(pooler_reports_failed_server_login(&error), "{error}");
     assert!((2..=4).contains(&seen), "{seen} attempts in {elapsed:?}");
     assert!(
