@@ -146,9 +146,11 @@ spec:
             preStop:
               # Kubernetes runs this before sending SIGTERM. While it sleeps the
               # pod is removed from the Service endpoints but still serves, so
-              # requests already routed here are not refused. SIGTERM then
-              # starts the gateway's graceful shutdown: no new connections, and
-              # in-flight requests finish within terminationGracePeriodSeconds.
+              # requests already routed here are not refused. On SIGTERM the
+              # gateway serves for GATEWAY_SHUTDOWN_DRAIN_SECONDS more, marking
+              # responses Connection: close, then closes idle connections and
+              # lets in-flight requests finish within
+              # terminationGracePeriodSeconds (docs/kubernetes.md).
               sleep:
                 seconds: {{ .Values.gateway.drainSeconds }}
           resources:

@@ -4,6 +4,7 @@ or external network access."""
 import contextlib
 import importlib.util
 import io
+import itertools
 import json
 from pathlib import Path
 import re
@@ -391,6 +392,83 @@ class CheckPieces(unittest.TestCase):
         }
         for stderr, expected in cases.items():
             self.assertEqual(self.check(answer(stderr)).evict("omg-429"), expected, stderr)
+
+    def test_the_lease_step_kills_only_the_running_replica_whose_term_is_current(self):
+        a, b = "5f0c9a52-4c1e-4c8e-9a3e-0d9b2f4b7a10", "0b7d3c1e-9a2f-4e6d-8c5b-1f2e3d4c5b6a"
+        logs = {"pod/omg-a": a, "pod/omg-b": b}
+        calls = []
+
+        def kubectl(args, **kwargs):
+            calls.append(args)
+            target = next(arg for arg in args if arg.startswith("pod/"))
+            return ('{"fields":{"message":"gateway listening","work_lease_holder":"%s"}}\n' % logs[target])
+        check = self.check(kubectl)
+        pods = [{"metadata": {"name": "omg-a"}}, {"metadata": {"name": "omg-b"}}]
+        check.gateway_pods = lambda limit=(): pods if limit else []
+        rows = {"value": ""}
+        check.sql = lambda statement, limit=(): rows["value"] if limit else ""
+        # No current term, then the term of a stopping pod (no running pod
+        # logged its holder), then omg-b's term.
+        self.assertEqual(check.lease_owner("metrics", 40), "free")
+        rows["value"] = "1d2c3b4a-5e6f-4a8b-9c0d-e1f2a3b4c5d6 7"
+        self.assertEqual(check.lease_owner("metrics", 40), "elsewhere")
+        rows["value"] = f"{b} 8"
+        self.assertEqual(check.lease_owner("metrics", 40), (b, "8", "omg-b"))
+        # The term read names its pod: omg-a's term is never paired with omg-b.
+        rows["value"] = f"{a} 7"
+        self.assertEqual(check.lease_owner("metrics", 40), (a, "7", "omg-a"))
+        # Every request is bounded by the time left.
+        self.assertTrue(all(args[0] == "--request-timeout=40s" for args in calls), calls)
+        rows["value"] = "not-a-uuid 7"
+        self.assertEqual(check.lease_owner("metrics", 40), "invalid")
+
+    def test_the_lease_step_waits_for_a_running_holder_within_its_bound(self):
+        check = self.check()
+        owner = ("5f0c9a52-4c1e-4c8e-9a3e-0d9b2f4b7a10", "7", "omg-b")
+        clock = {"now": 0.0}
+        sleeps, limits = [], []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock["now"] += seconds
+
+        def answering(answers, cost=0.0):
+            def lease_owner(lease, seconds):
+                limits.append(seconds)
+                clock["now"] += cost
+                return next(answers)
+            return lease_owner
+        with mock.patch.object(replicas.time, "monotonic", lambda: clock["now"]), \
+                mock.patch.object(replicas.time, "sleep", sleep):
+            # A stopping pod holds the lease for a while: the step waits for
+            # the event, not a fixed time.
+            check.lease_owner = answering(iter(["elsewhere", "free", "elsewhere", owner]))
+            self.assertEqual(check.wait_for_lease_owner("metrics"), owner)
+            self.assertEqual(sleeps, [2, 2, 2])
+            self.assertEqual(limits, [90, 88, 86, 84])
+            # Never past the bound, even when a poll itself is slow; an owner
+            # found only after it does not count.
+            for answers, expected in ((itertools.repeat("elsewhere"), "elsewhere"), (iter(["elsewhere", owner]), "late")):
+                clock["now"] = 0.0
+                check.lease_owner = answering(answers, cost=50.0)
+                self.assertEqual(check.wait_for_lease_owner("metrics"), expected)
+                self.assertLessEqual(clock["now"], replicas.LEASE_OWNER_WAIT + 50.0)
+            deleted = []
+            check.kubectl = lambda args, **kwargs: deleted.append(args)
+            for answer, detail in (("elsewhere", "no running replica holds the metrics lease after 90 s"),
+                                   ("free", "no current term of the metrics lease after 90 s"),
+                                   ("late", "the holder was found only after the bound for the metrics lease after 90 s")):
+                clock["now"] = 0.0
+                check.lease_owner = answering(itertools.repeat(answer), cost=50.0)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    check.lease_step()
+                self.assertEqual((check.results[-1]["result"], check.results[-1]["detail"]), ("fail", detail))
+        self.assertEqual(deleted, [])
+        # An invalid row fails at once.
+        check.lease_owner = lambda lease, seconds: "invalid"
+        with contextlib.redirect_stdout(io.StringIO()):
+            check.lease_step()
+        self.assertEqual(check.results[-1]["detail"], "the lease row is not a holder UUID and an epoch")
 
     def test_only_the_listen_sessions_may_bypass_the_pooler(self):
         def run(rows):
