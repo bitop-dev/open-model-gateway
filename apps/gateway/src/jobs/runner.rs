@@ -236,6 +236,8 @@ impl Runner {
             pauses: self.jobs.rate_limit_pauses.clone(),
             #[cfg(test)]
             soft_loss: self.jobs.soft_loss.clone(),
+            #[cfg(test)]
+            segment_age: self.jobs.segment_age,
             ..RunState::new(fence)
         });
         // Lease renewal (and cancel observation) while the batch runs.
