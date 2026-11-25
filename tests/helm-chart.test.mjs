@@ -484,6 +484,11 @@ test("CNPG Pooler pins its image and sizes its init container like the pooler", 
     assert.match(init, extra.length ? /cpu: 250m/ : /cpu: 500m/);
   }
   assertHelmRefuses(["-f", join(chart, "ci/cnpg-values.yaml"), "--set", "cnpg.pooler.image="], /cnpg\.pooler\.image is required/);
+  for (const unpinned of ["ghcr.io/cloudnative-pg/pgbouncer:1.25.2", "pgbouncer:latest", `pgbouncer@sha256:${"a".repeat(63)}`, `pgbouncer@sha256:${"A".repeat(64)}`]) {
+    assertHelmRefuses(["-f", join(chart, "ci/cnpg-values.yaml"), "--set", `cnpg.pooler.image=${unpinned}`], /cnpg\.pooler\.image must be pinned by digest/);
+  }
+  // The Pooler disabled: nothing is required of the value.
+  assert.doesNotMatch(helmTemplate(["-f", join(chart, "ci/cnpg-values.yaml"), "--set", "cnpg.pooler.enabled=false", "--set", "cnpg.pooler.image=pgbouncer:latest"]), /kind: Pooler/);
 });
 
 test("migration Job applies runtime grants with the gateway image itself, from no copied SQL", () => {

@@ -190,8 +190,13 @@ pass `/health/ready`. Verified on kind with CloudNativePG 1.30.1: about two minu
 The Pooler's instances start before PostgreSQL accepts connections, and each that tried by then
 answers its first client afterwards with PgBouncer's cached error ("server login has been
 failing, cached error: … (server_login_retry)"). The init container can pass through one instance
-while another still answers that way, so `serve` waits that error out (once a second, at most
-30 s) instead of exiting; any other connection error still stops it at once (#836).
+while another still answers that way, so `serve` waits that error out instead of exiting: it tries
+again once a second while the next attempt would start within 30 s, and logs the cached cause each
+time (#836). PgBouncer gives the same answer when PostgreSQL refuses the pooler's own login (a
+revoked CONNECT, a `pg_hba` rule), so such a refusal stops `serve` after those 30 s, with that
+error, instead of at once. Any other connection error (a wrong password included) still stops it at
+once. Later connections can still reach such an instance for a few seconds; they fail like any
+database error, without stopping the process.
 
 Every later migrating upgrade is `helm upgrade ... --set migrations.run=true --wait`; there the Job
 is a `pre-upgrade` hook, so the schema changes before any new gateway pod starts.
@@ -354,7 +359,8 @@ durability safeguard; use the [explicit policy](#production-durability-policy-39
 
 - **Image:** `cnpg.pooler.image` pins PgBouncer by digest (the multi-arch index), PgBouncer 1.25.2,
   CloudNativePG 1.30.1's own default. Without a pin the Pooler would run whatever image the installed
-  operator defaults to; set it to another digest-pinned PgBouncer to move.
+  operator defaults to. The chart refuses a value without a `@sha256:` digest; set another
+  digest-pinned PgBouncer (1.21 or newer, for `max_prepared_statements`) to move.
 - **Resources:** `cnpg.pooler.resources` applies to the `pgbouncer` container and to the operator's
   `bootstrap-controller` init container, which CloudNativePG keeps when the Pooler template sets it.
   A pod counts the larger of its init and main containers against a quota, and an init container

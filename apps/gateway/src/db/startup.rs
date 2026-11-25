@@ -12,11 +12,15 @@
 //! one, and `serve` can then reach the other and exit. sqlx retries only a
 //! refused connection and 53300/57P03 within its acquire timeout.
 //!
-//! So that error alone is tried again, once a second, for at most
-//! [`WINDOW`]; every other failure (a wrong password, which PgBouncer also
-//! reports as 08P01 but with another message, a refused role, an unreachable
-//! host after sqlx's own retries) fails at once, as before. A login that
-//! keeps failing fails after the window with the same error.
+//! So that error alone is tried again, once a second, while the next attempt
+//! would start within [`WINDOW`]; every other failure (a wrong password,
+//! which PgBouncer also reports as 08P01 but with another message, an
+//! unreachable host after sqlx's own retries) fails at once, as before.
+//! PgBouncer gives the same cached answer when PostgreSQL itself refuses the
+//! pooler's login (a revoked CONNECT, a pg_hba rule, a role connection
+//! limit), so such a refusal is tried for the window too and then fails with
+//! that error: delayed by at most the window and one attempt's acquire
+//! timeout, never hidden.
 use std::time::{Duration, Instant};
 
 use sqlx::{
@@ -30,11 +34,23 @@ use sqlx::{
 pub(crate) const WINDOW: Duration = Duration::from_secs(30);
 const INTERVAL: Duration = Duration::from_secs(1);
 
-/// PgBouncer's cached server-login failure (see the module documentation).
-pub(crate) fn pooler_reports_failed_server_login(error: &sqlx::Error) -> bool {
-    matches!(error, sqlx::Error::Database(e)
-        if e.code().as_deref() == Some("08P01")
-            && e.message().starts_with("server login has been failing"))
+/// PgBouncer's cached server-login failure (see the module documentation):
+/// the cause it cached ("connect failed", or PostgreSQL's own message,
+/// at most 128 bytes): no credential, no address.
+fn cached_reason(error: &sqlx::Error) -> Option<&str> {
+    let sqlx::Error::Database(e) = error else {
+        return None;
+    };
+    if e.code().as_deref() != Some("08P01") {
+        return None;
+    }
+    let rest = e.message().strip_prefix("server login has been failing")?;
+    Some(
+        rest.strip_prefix(", cached error: ")
+            .map_or(rest, |reason| {
+                reason.trim_end_matches(" (server_login_retry)")
+            }),
+    )
 }
 
 /// Connect `pool` with `options`, trying again while the pooler reports a
@@ -47,11 +63,13 @@ pub(crate) async fn connect(
     let deadline = Instant::now() + window;
     loop {
         match pool.clone().connect_with(options.clone()).await {
-            Err(error)
-                if pooler_reports_failed_server_login(&error) && Instant::now() < deadline =>
-            {
+            Err(error) if Instant::now() + INTERVAL < deadline => {
+                let Some(reason) = cached_reason(&error) else {
+                    return Err(error);
+                };
                 tracing::warn!(
-                    "the database pooler still reports a failed server login from before PostgreSQL accepted connections; trying again"
+                    reason,
+                    "the database pooler still reports a failed server login; trying again"
                 );
                 tokio::time::sleep(INTERVAL).await;
             }

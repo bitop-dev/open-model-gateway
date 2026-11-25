@@ -1,4 +1,8 @@
 {{- if and .Values.cnpg.cluster.enabled .Values.cnpg.pooler.enabled }}
+{{- $image := required "cnpg.pooler.image is required" .Values.cnpg.pooler.image }}
+{{- if not (regexMatch "^[^@\\s]+@sha256:[0-9a-f]{64}$" $image) }}
+{{- fail "cnpg.pooler.image must be pinned by digest: <name>[:tag]@sha256:<64 hex digits>" }}
+{{- end }}
 apiVersion: postgresql.cnpg.io/v1
 kind: Pooler
 metadata:
@@ -37,7 +41,7 @@ spec:
             {{- toYaml .Values.cnpg.pooler.resources | nindent 12 }}
       containers:
         - name: pgbouncer
-          image: {{ required "cnpg.pooler.image is required" .Values.cnpg.pooler.image | quote }}
+          image: {{ $image | quote }}
           resources:
             {{- toYaml .Values.cnpg.pooler.resources | nindent 12 }}
 {{- end }}

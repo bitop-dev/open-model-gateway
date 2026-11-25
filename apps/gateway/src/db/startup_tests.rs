@@ -128,23 +128,75 @@ async fn a_cached_failed_server_login_is_waited_out(pool: PgPool) {
 async fn every_other_refusal_fails_at_once(pool: PgPool) {
     let (result, seen, elapsed) = through_front(&pool, 1, WRONG_PASSWORD, WINDOW).await;
     let error = result.expect_err("refused");
-    assert!(!pooler_reports_failed_server_login(&error));
+    assert!(cached_reason(&error).is_none());
     assert!(matches!(&error, sqlx::Error::Database(e) if e.message() == WRONG_PASSWORD));
     assert_eq!(seen, 1, "one attempt");
     assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
 }
 
-/// A server login that keeps failing fails after the window, with the
-/// pooler's error.
+/// A server login that keeps failing fails with the pooler's error once no
+/// further attempt would start within the window: a second apart, the
+/// attempts start at 0, 1 and 2 s of a 3 s window.
 #[sqlx::test(migrations = false)]
 async fn a_failure_that_lasts_fails_after_the_window(pool: PgPool) {
-    let window = Duration::from_secs(2);
+    let window = Duration::from_secs(3);
     let (result, seen, elapsed) = through_front(&pool, usize::MAX, CACHED, window).await;
     let error = result.expect_err("still refused after the window");
-    assert!(pooler_reports_failed_server_login(&error), "{error}");
-    assert!((2..=4).contains(&seen), "{seen} attempts in {elapsed:?}");
+    assert!(cached_reason(&error).is_some(), "{error}");
+    assert_eq!(seen, 3, "attempts in {elapsed:?}");
     assert!(
-        elapsed >= window && elapsed < window + Duration::from_secs(2),
+        elapsed >= Duration::from_secs(2) && elapsed < window,
         "{elapsed:?}"
     );
+}
+
+/// The logged cause is PgBouncer's cached reason, without its frame.
+#[test]
+fn the_cached_reason_is_the_cause_alone() {
+    struct Pooler(&'static str, &'static str);
+    impl std::fmt::Display for Pooler {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.1)
+        }
+    }
+    impl std::fmt::Debug for Pooler {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.1)
+        }
+    }
+    impl std::error::Error for Pooler {}
+    impl sqlx::error::DatabaseError for Pooler {
+        fn message(&self) -> &str {
+            self.1
+        }
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(self.0.into())
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+    let error = |code, message| sqlx::Error::Database(Box::new(Pooler(code, message)));
+    assert_eq!(
+        cached_reason(&error("08P01", CACHED)),
+        Some("connect failed")
+    );
+    assert_eq!(
+        cached_reason(&error(
+            "08P01",
+            "server login has been failing, cached error: the database system is shutting down (server_login_retry)"
+        )),
+        Some("the database system is shutting down")
+    );
+    assert_eq!(cached_reason(&error("08P01", WRONG_PASSWORD)), None);
+    assert_eq!(cached_reason(&error("57P03", CACHED)), None);
 }
