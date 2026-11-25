@@ -10,6 +10,10 @@
 # check's load pod runs, and that must still fit.
 fullnameOverride: omg
 replicaCount: 2
+# Reached only through `kubectl port-forward` bound to 127.0.0.1, whatever the
+# chart's defaults are.
+service: {type: ClusterIP}
+ingress: {enabled: false}
 pdb:
   enabled: true
   maxUnavailable: 1

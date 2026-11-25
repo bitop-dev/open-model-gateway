@@ -53,6 +53,11 @@ spec:
             - --health-enabled=true
           env:
             - {name: KC_LOG_LEVEL, value: WARN}
+            # The master-realm admin, from a generated password: with none,
+            # Keycloak lets a request from its own loopback (which is what a
+            # port-forward is) create one on the welcome page.
+            - {name: KC_BOOTSTRAP_ADMIN_USERNAME, value: omg-bootstrap}
+            - {name: KC_BOOTSTRAP_ADMIN_PASSWORD, valueFrom: {secretKeyRef: {name: omg-issuer-bootstrap, key: password}}}
           ports:
             - {name: https, containerPort: 8443}
             - {name: management, containerPort: 9000}

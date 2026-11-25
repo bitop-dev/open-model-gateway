@@ -24,7 +24,9 @@ line per step; its summary holds statuses, counts and timings, never a secret.
 import http.client
 import html
 import json
+import os
 import re
+import shlex
 import secrets
 import shutil
 import socket
@@ -80,11 +82,12 @@ def fill(text, values):
     return text
 
 
-def generate_pki(directory, host, runner=subprocess.run):
+def generate_pki(directory, host, runner=subprocess.run, path=os.defpath):
     """A CA and the issuer's certificate (P-256, one year) with the `openssl`
     CLI in `directory`: returns (CA certificate, issuer certificate, issuer
     key) as PEM text. Arguments name files only; the CA key stays in the
-    directory, which the caller deletes."""
+    directory, which the caller deletes. openssl gets only PATH and an empty
+    configuration: no ambient OPENSSL_CONF, engines or providers."""
     d = Path(directory)
     (d / "issuer.ext").write_text(
         f"subjectAltName=DNS:{host}\nbasicConstraints=critical,CA:FALSE\n"
@@ -99,7 +102,8 @@ def generate_pki(directory, host, runner=subprocess.run):
          "-CAcreateserial", "-out", str(d / "tls.crt"), "-days", "365", "-extfile", str(d / "issuer.ext")],
     ]
     for step in steps:
-        result = runner(step, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        result = runner(step, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                        env={"PATH": path, "OPENSSL_CONF": os.devnull, "LC_ALL": "C"})
         if result.returncode:
             raise RuntimeError(f"openssl {step[1]} failed (exit {result.returncode})")
     return ((d / "ca.crt").read_text(), (d / "tls.crt").read_text(), (d / "tls.key").read_text())
@@ -137,16 +141,37 @@ def secret(name, string_data, secret_type="Opaque"):
     return {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": name}, "type": secret_type, "stringData": string_data}
 
 
+# Pods of the check that the chart's NetworkPolicy admits to the gateway
+# (the load pod and the allowed probe); the refused probe has another name.
+ALLOWED_CLIENT = "omg-check-load"
+REFUSED_CLIENT = "omg-check-probe"
+
+
 def helm_values(namespace, issuer_ip, mock_ip, network_policy):
     """The per-environment values on top of values.yaml, as --set-json pairs."""
     upstreams = json.dumps([{"endpoint": f"http://{mock_ip}:8000/v1", "addresses": [mock_ip]}], separators=(",", ":"))
-    return {
+    values = {
         "gateway.env.GATEWAY_PUBLIC_URL": public_url(namespace),
         # The issuer's ClusterIP is private: the identity egress policy allows it alone.
         "gateway.env.GATEWAY_EGRESS_PRIVATE_ALLOW": f"{issuer_ip}/32",
         "gateway.env.GATEWAY_LOCAL_UPSTREAMS": upstreams,
         "networkPolicy.enabled": network_policy,
     }
+    if network_policy:
+        # The chart's policy as shipped, with this environment as its
+        # neighbourhood: ingress from the check's own client pods (there is no
+        # ingress controller), egress also to the issuer and the free model.
+        values.update({
+            "networkPolicy.ingress.fromNamespace": namespace,
+            "networkPolicy.ingress.fromPodLabels": {"app.kubernetes.io/name": ALLOWED_CLIENT},
+            "networkPolicy.egress.extraEgress": [
+                {"to": [{"podSelector": {"matchLabels": {"app.kubernetes.io/name": "omg-issuer"}}}],
+                 "ports": [{"protocol": "TCP", "port": 8443}]},
+                {"to": [{"podSelector": {"matchLabels": {"app.kubernetes.io/name": "omg-mock-upstream"}}}],
+                 "ports": [{"protocol": "TCP", "port": 8000}]},
+            ],
+        })
+    return values
 
 
 def ip(value):
@@ -189,16 +214,21 @@ class Replicas:
         spark.kubectl(["create", "-f", "-"], namespace=namespace, stdin=self.env.role_secrets())
         client_secret = secrets.token_urlsafe(32)
         passwords = [secrets.token_urlsafe(18) for _ in range(2)]
-        self.env._REGISTERED_SECRETS.extend([client_secret, *passwords])
+        # Keycloak's master-realm admin, created at start so that no request
+        # (a port-forward arrives from the pod's own loopback) can create one
+        # on the welcome page. Never used by the tool.
+        bootstrap = secrets.token_urlsafe(24)
+        self.env._REGISTERED_SECRETS.extend([client_secret, *passwords, bootstrap])
         host = issuer_host(namespace)
         with tempfile.TemporaryDirectory() as directory:
-            ca, certificate, key = generate_pki(directory, host)
+            ca, certificate, key = generate_pki(directory, host, path=self.env.child_environment().get("PATH", os.defpath))
         self.env._REGISTERED_SECRETS.append(key.strip())
         callback = f"{public_url(namespace)}/api/v1/auth/callback"
         items = [
             secret("omg-issuer-tls", {"tls.crt": certificate, "tls.key": key}, "kubernetes.io/tls"),
             secret("omg-issuer-realm", {"realm.json": json.dumps(realm(callback, client_secret, passwords))}),
             secret("omg-issuer-users", {"admin": passwords[0], "unentitled": passwords[1]}),
+            secret("omg-issuer-bootstrap", {"password": bootstrap}),
             secret("omg-oidc", {"GATEWAY_OIDC_ISSUER": issuer_url(namespace), "GATEWAY_OIDC_CLIENT_ID": CLIENT_ID,
                                 "GATEWAY_OIDC_CLIENT_SECRET": client_secret}),
             {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "omg-issuer-ca"}, "data": {"ca.crt": ca}},
@@ -208,7 +238,7 @@ class Replicas:
         spark.kubectl(["create", "configmap", "omg-spark-env", f"--from-literal=ref={resolved.name}", f"--from-literal=sha={resolved.sha}",
                        f"--from-literal=image={image}", "--from-literal=mode=replicas"], namespace=namespace)
         spark.kubectl(["create", "configmap", "omg-replicas-scripts", f"--from-file=mock-upstream.mjs={DEPLOY / 'mock-upstream.mjs'}",
-                       f"--from-file=load.mjs={DEPLOY / 'load.mjs'}"], namespace=namespace)
+                       f"--from-file=load.mjs={DEPLOY / 'load.mjs'}", f"--from-file=probe.mjs={DEPLOY / 'probe.mjs'}"], namespace=namespace)
         spark.kubectl(["apply", "-f", "-"], namespace=namespace, stdin=fill((DEPLOY / "issuer.yaml").read_text(), {"ISSUER_HOST": host}))
         spark.kubectl(["apply", "-f", "-"], namespace=namespace, stdin=(DEPLOY / "mock-upstream.yaml").read_text())
         issuer_ip = self.service_ip(namespace, "omg-issuer")
@@ -235,7 +265,7 @@ class Replicas:
                 self.forward_command(namespace, "service/omg-issuer", [f"{ISSUER_PORT}:8443"])]
 
     def creds_text(self, namespace):
-        read = " ".join(self.env.kubectl_command(self.spark.config, self.spark.base,
+        read = shlex.join(self.env.kubectl_command(self.spark.config, self.spark.base,
                                                  ["get", "secret", "omg-issuer-users", "-o", "jsonpath={.data.admin}"], namespace))
         return (f"{namespace}: sign in at http://127.0.0.1:{GATEWAY_PORT} after `forward` (the gateway's origin is {public_url(namespace)};\n"
                 f"a browser must also reach the issuer at {issuer_host(namespace)}:8443, for example with a hosts entry for 127.0.0.1,\n"
@@ -325,18 +355,20 @@ class Browser:
         if status != 200 or not form:
             return ("issuer-form", status)
         action = urllib.parse.urlsplit(html.unescape(form.group(1).decode()))
-        status, headers, raw, _ = self.issuer.request(
+        status, headers, raw, body = self.issuer.request(
             "POST", f"{action.path}?{action.query}",
             {"content-type": "application/x-www-form-urlencoded", "cookie": cookie_header(issuer_jar)},
             urllib.parse.urlencode({"username": username, "password": password, "credentialId": ""}))
         if status not in (302, 303) or "location" not in headers:
-            return ("issuer-refused", status)
+            # Keycloak refuses a wrong password by showing its form again.
+            again = status == 200 and re.search(rb'id="kc-form-login"', body or b"")
+            return ("issuer-refused" if again else "issuer-error", status)
         callback = urllib.parse.urlsplit(headers["location"])
         if f"{callback.scheme}://{callback.netloc}" != public_url(self.namespace):
             return ("redirect", 0)
         status, headers, raw, _ = self.gateway.request("GET", f"{callback.path}?{callback.query}", {"cookie": cookie_header(self.cookies)})
         self.cookies.update(set_cookies(raw))
-        if "omg_session" not in self.cookies:
+        if not self.cookies.get("omg_session"):
             return ("gateway-refused", status)
         return ("signed-in", status)
 
@@ -363,10 +395,14 @@ def inference(client, key, model=MODEL):
 
 
 def models(client, key):
+    """The listed model ids, or None when the listing failed (never an empty set)."""
     status, _, _, body = client.request("GET", "/v1/models", {"authorization": f"Bearer {key}"})
     if status != 200:
-        return status, set()
+        return status, None
     return status, {m.get("id") for m in json.loads(body).get("data", [])}
+
+
+UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
 class Check:
@@ -395,16 +431,33 @@ class Check:
         return [p for p in pods if p["metadata"].get("deletionTimestamp") is None and p["status"].get("phase") == "Running"]
 
     def forward(self, target, ports):
-        command = Replicas(self.env, self.spark).forward_command(self.namespace, target, ports)
-        child = subprocess.Popen(command, env=self.env.child_environment(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-        self.children.append(child)
+        """A port-forward that this process's own kubectl holds: the port is
+        free just before, and the forward counts as open only once kubectl
+        reports it listens there. Anything else that answered on the port (a
+        listener another local user started) would receive the session cookie
+        or the key, so the check refuses instead."""
         port = int(ports[0].split(":")[0])
-        for _ in range(100):
-            with socket.socket() as probe:
-                if probe.connect_ex(("127.0.0.1", port)) == 0:
-                    return child
-            time.sleep(0.1)
-        raise self.env.SparkError(f"port-forward to {target} did not open")
+        if not self.spark.port_free(port):
+            raise self.env.SparkError(f"local port {port} is in use; stop what holds it and retry")
+        command = Replicas(self.env, self.spark).forward_command(self.namespace, target, ports)
+        child = subprocess.Popen(command, env=self.env.child_environment(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 start_new_session=True, text=True)
+        self.children.append(child)
+        ready = threading.Event()
+        expected = f"Forwarding from 127.0.0.1:{port} -> "
+
+        def drain():
+            # Read every line, so kubectl never blocks on a full pipe.
+            with child.stdout:
+                for line in child.stdout:
+                    if line.startswith(expected):
+                        ready.set()
+
+        threading.Thread(target=drain, daemon=True).start()
+        if ready.wait(20) and child.poll() is None:
+            return child
+        self.stop(child)
+        raise self.env.SparkError(f"port-forward to {target} did not open on 127.0.0.1:{port}")
 
     def stop(self, child):
         if child.poll() is None:
@@ -424,31 +477,39 @@ class Check:
         return ok
 
     # -- the run --
+    def guarded(self, step, name, action, *args):
+        """Run one step; an error fails that step (its message redacted and
+        shortened) and the check goes on with the next."""
+        try:
+            return action(*args)
+        except (self.env.SparkError, OSError, ValueError, KeyError, TypeError, StopIteration) as error:
+            message = re.sub(r"\s+", " ", self.env.redact(str(error) or type(error).__name__))[:300]
+            self.record(step, name, "fail", f"error: {message}")
+            return None
+
     def run(self):
         started = time.monotonic()
         ca = self.kubectl(["get", "configmap", "omg-issuer-ca", "-o", "jsonpath={.data.ca\\.crt}"], capture=True)
         users = {name: self.read_secret("omg-issuer-users", name) for name in ("admin", "unentitled")}
         self.env._REGISTERED_SECRETS.extend(users.values())
-        for port in (GATEWAY_PORT, ISSUER_PORT, *POD_PORTS):
-            if not self.spark.port_free(port):
-                raise self.env.SparkError(f"local port {port} is in use; stop `forward` or what holds it and retry")
+        admin = key = None
         try:
             gateway_forward = self.forward("service/omg", [f"{GATEWAY_PORT}:8080"])
             self.forward("service/omg-issuer", [f"{ISSUER_PORT}:8443"])
             gateway = Http(GATEWAY_PORT)
             issuer = Http(ISSUER_PORT, issuer_host(self.namespace), ca)
-            admin = self.sign_in_step(gateway, issuer, users)
-            key = self.inference_step(gateway, admin) if admin else None
+            admin = self.guarded(1, "sign-in", self.sign_in_step, gateway, issuer, users)
+            key = self.guarded(2, "inference", self.inference_step, gateway, admin) if admin else None
             self.stop(gateway_forward)
-            self.restart_step(key)
-            self.lease_step()
-            self.notification_step(admin, key)
-            self.network_policy_step()
-            self.pooler_step()
+            self.guarded(3, "rolling-restart", self.restart_step, key)
+            self.guarded(4, "lease-takeover", self.lease_step)
+            self.guarded(5, "change-crosses-replicas", self.notification_step, admin, key)
+            self.guarded(6, "network-policy", self.network_policy_step, key)
+            self.guarded(7, "runtime-traffic-through-the-pooler", self.pooler_step)
         finally:
             for child in self.children:
                 self.stop(child)
-            self.cleanup()
+            self.cleanup(admin)
         return {"seconds": round(time.monotonic() - started), "steps": self.results,
                 "passed": all(r["result"] != "fail" for r in self.results)}
 
@@ -457,9 +518,24 @@ class Check:
         value = self.kubectl(["get", "secret", name, "-o", f"jsonpath={{.data.{key}}}"], capture=True).strip()
         return base64.b64decode(value).decode()
 
-    def cleanup(self):
-        for kind, name in (("pod", "omg-check-load"), ("secret", "omg-check-key")):
-            self.kubectl(["delete", kind, name, "--ignore-not-found", "--wait=false"], capture=True)
+    def cleanup(self, admin=None):
+        """Remove what the check created in the namespace and revoke its key;
+        each removal is tried even if another fails."""
+        for kind, name in (("pod", "omg-check-load"), ("pod", "omg-check-allowed"), ("pod", "omg-check-refused"),
+                           ("secret", "omg-check-key")):
+            try:
+                self.kubectl(["delete", kind, name, "--ignore-not-found", "--wait=false"], capture=True)
+            except self.env.SparkError as error:
+                print(f"cleanup: deleting {kind}/{name} failed: {self.env.redact(str(error))[:200]}")
+        if admin is not None and getattr(self, "key_path", None):
+            try:
+                child = self.forward("service/omg", [f"{GATEWAY_PORT}:8080"])
+                status, _ = admin.api("DELETE", self.key_path)
+                self.stop(child)
+                if status not in (200, 204):
+                    print(f"cleanup: revoking the check's key returned HTTP {status} (it expires in a day)")
+            except (self.env.SparkError, OSError) as error:
+                print(f"cleanup: revoking the check's key failed: {self.env.redact(str(error))[:200]} (it expires in a day)")
 
     def sign_in_step(self, gateway, issuer, users):
         admin = Browser(gateway, issuer, self.namespace)
@@ -468,11 +544,22 @@ class Check:
         if signed:
             status, me = admin.api("GET", "/api/v1/me")
             self.expect(1, "admin-is-platform-admin", status == 200 and (me or {}).get("user", {}).get("platform_role") == "admin", f"GET /api/v1/me {status}")
+        # The refusals mean something only if the same path signs the admin in.
+        if not signed:
+            self.record(1, "wrong-password-refused", "fail", "the admin's sign-in failed, so a refusal proves nothing")
+            self.record(1, "unentitled-refused", "fail", "the admin's sign-in failed, so a refusal proves nothing")
+            return None
         wrong = Browser(gateway, issuer, self.namespace).sign_in("admin", users["admin"] + "-wrong")
-        self.expect(1, "wrong-password-refused", wrong[0] == "issuer-refused", f"stopped at {wrong[0]}")
+        self.expect(1, "wrong-password-refused", wrong == ("issuer-refused", 200), f"stopped at {wrong[0]} {wrong[1]}")
         unentitled = Browser(gateway, issuer, self.namespace).sign_in("unentitled", users["unentitled"])
-        self.expect(1, "unentitled-refused", unentitled[0] == "gateway-refused", f"stopped at {unentitled[0]} {unentitled[1]}")
-        return admin if signed else None
+        # Refused by the gateway for its platform role: the identity was
+        # linked (the token exchange and ID token checks passed) and no
+        # session exists for it.
+        linked = self.sql(f"SELECT count(*) FROM oidc_identities i JOIN users u ON u.id=i.user_id WHERE u.email='{UNENTITLED_EMAIL}'")
+        sessions = self.sql(f"SELECT count(*) FROM browser_sessions s JOIN users u ON u.id=s.user_id WHERE u.email='{UNENTITLED_EMAIL}'")
+        self.expect(1, "unentitled-refused", unentitled == ("gateway-refused", 403) and linked == "1" and sessions == "0",
+                    f"stopped at {unentitled[0]} {unentitled[1]}, identity linked {linked}, sessions {sessions}")
+        return admin
 
     def ensure_model(self, admin):
         """The free model, served by the in-namespace mock, priced, assigned to
@@ -506,6 +593,7 @@ class Check:
             raise self.env.SparkError(f"issuing the check's key failed: HTTP {status}")
         key = issued["token"]
         self.env._REGISTERED_SECRETS.append(key)
+        self.key_path = f"/api/v1/workspaces/{workspace}/keys/{issued['id']}"
         return model, key
 
     def inference_step(self, gateway, admin):
@@ -528,15 +616,19 @@ class Check:
         self.kubectl(["apply", "-f", "-"], stdin=fill((DEPLOY / "load-pod.yaml").read_text(), {"MODEL": MODEL, "SECONDS": str(seconds)}), capture=True)
         self.kubectl(["wait", "--for=condition=Ready", "pod/omg-check-load", "--timeout=120s"], capture=True)
         time.sleep(10)
-        minimum = [len(self.gateway_pods())]
+        minimum = [self.ready_replicas()]
+        samples = [0]
+        errors = [0]
         stop = threading.Event()
 
         def watch():
             while not stop.is_set():
-                ready = sum(1 for p in self.gateway_pods() if any(c.get("type") == "Ready" and c.get("status") == "True"
-                                                                for c in p["status"].get("conditions", [])))
-                minimum[0] = min(minimum[0], ready)
-                time.sleep(1)
+                try:
+                    minimum[0] = min(minimum[0], self.ready_replicas())
+                    samples[0] += 1
+                except Exception:  # noqa: BLE001 - counted; the step fails on any
+                    errors[0] += 1
+                time.sleep(0.5)
 
         watcher = threading.Thread(target=watch, daemon=True)
         watcher.start()
@@ -551,16 +643,36 @@ class Check:
         rolled = round(time.monotonic() - restart)
         stop.set()
         watcher.join()
-        # Load covers the whole rollout and ten seconds after it, then stops.
+        # Load covers the whole rollout and ten seconds after it, then stops
+        # at the marker (a pod that already ended stopped too early).
         time.sleep(10)
         self.kubectl(["exec", "omg-check-load", "--", "node", "-e", "require('fs').writeFileSync('/tmp/stop', '')"], capture=True)
         self.kubectl(["wait", "--for=jsonpath={.status.phase}=Succeeded", "pod/omg-check-load", "--timeout=120s"], capture=True)
         counts = json.loads(self.kubectl(["logs", "pod/omg-check-load"], capture=True).strip().splitlines()[-1])
+        ok = counts["statuses"].get("200", 0)
         failures = sum(counts["failures"].values()) + sum(v for k, v in counts["statuses"].items() if k != "200")
-        self.expect(3, "rolling-restart-no-failed-request", failures == 0 and counts["statuses"].get("200", 0) > 0,
-                    f"{counts['statuses'].get('200', 0)} ok, {failures} failed of {counts['sent']}, sent from 10 s before the restart until 10 s after its {rolled} s rollout")
-        self.expect(3, "rolling-restart-kept-a-ready-replica", minimum[0] >= 1, f"fewest ready replicas {minimum[0]}")
+        # At least two requests a second over the whole window (the measured
+        # rate is about a hundred): an idle load generator proves nothing.
+        enough = ok >= 2 * (rolled + 20)
+        self.expect(3, "rolling-restart-no-failed-request", failures == 0 and enough and counts.get("stopped") == "marker",
+                    f"{ok} ok, {failures} failed of {counts['sent']}, stopped at {counts.get('stopped')}, "
+                    f"sent from 10 s before the restart until 10 s after its {rolled} s rollout")
+        sampled = samples[0] >= max(1, rolled)
+        self.expect(3, "rolling-restart-kept-a-ready-replica", minimum[0] >= 1 and sampled and errors[0] == 0,
+                    f"fewest ready replicas {minimum[0]} in {samples[0]} samples, {errors[0]} failed samples")
         self.pdb_check()
+
+    def ready_replicas(self):
+        return sum(1 for p in self.gateway_pods() if any(c.get("type") == "Ready" and c.get("status") == "True"
+                                                        for c in p["status"].get("conditions", [])))
+
+    def wait_for_ready_replicas(self, count=2, seconds=600):
+        self.kubectl(["rollout", "status", "deployment/omg", f"--timeout={seconds}s"], capture=True)
+        for _ in range(seconds):
+            if self.ready_replicas() >= count:
+                return
+            time.sleep(1)
+        raise self.env.SparkError(f"fewer than {count} ready replicas after {seconds} s")
 
     def replica_failure(self):
         """Why the Deployment cannot create a pod (for example the quota), if it says."""
@@ -576,10 +688,12 @@ class Check:
             self.kubectl(["create", "--raw", f"/api/v1/namespaces/{self.namespace}/pods/{pod}/eviction", "-f", "-"], stdin=body, capture=True)
             return "evicted"
         except self.env.SparkError as error:
-            text = str(error).lower()
+            # The API's answer only, never the command's own text (which names
+            # the namespace and pod).
+            text = re.split(r" failed \(exit \d+\): ", str(error), maxsplit=1)[-1].lower()
             if "forbidden" in text and "pods/eviction" in text:
                 return "forbidden"
-            return "refused" if "disruption budget" in text or "429" in text else "error"
+            return "refused" if "violate the pod's disruption budget" in text or "toomanyrequests" in text else "error"
 
     def pdb_check(self):
         """The budget covers the gateway pods (one may be disrupted of two), and
@@ -597,11 +711,7 @@ class Check:
             return
         second = self.evict(pods[1])
         self.expect(3, "pdb-refuses-a-second-eviction", (first, second) == ("evicted", "refused"), f"{first}, then {second}")
-        self.kubectl(["rollout", "status", "deployment/omg", "--timeout=600s"], capture=True)
-        for _ in range(120):
-            if len(self.gateway_pods()) >= 2:
-                break
-            time.sleep(2)
+        self.wait_for_ready_replicas()
 
     def lease_step(self, lease="metrics"):
         """Delete the pod holding a lease; another replica takes it within the
@@ -619,6 +729,9 @@ class Check:
             self.record(4, "lease-takeover", "fail", f"no replica holds the {lease} lease")
             return
         holder, epoch = current
+        if not UUID.fullmatch(holder) or not epoch.isdigit():
+            self.record(4, "lease-takeover", "fail", "the lease row is not a holder UUID and an epoch")
+            return
         # The holder is the replica whose own metrics say it holds the lease.
         owner = None
         for pod, port in zip(self.gateway_pods(), METRICS_PORTS):
@@ -648,8 +761,9 @@ class Check:
             fenced = False
         except self.env.SparkError as error:
             fenced = "is no longer held" in str(error)
-        self.expect(4, "stale-term-fenced", fenced and self.sql(probe) == "stale", "the old term's fence check fails (55006)")
-        self.kubectl(["rollout", "status", "deployment/omg", "--timeout=600s"], capture=True)
+        self.expect(4, "stale-term-fenced", fenced and self.sql(probe) == "stale",
+                    "the old term's fence check (omg_lease_fence) fails in the database (55006)")
+        self.wait_for_ready_replicas()
 
     def notification_step(self, admin, key):
         """A change made through one replica is seen through the other."""
@@ -666,42 +780,68 @@ class Check:
             clients.append(Http(port))
         a, b = clients
         _, before = models(b, key)
-        if MODEL not in before:
+        if before is None or MODEL not in before:
             self.record(5, "change-crosses-replicas", "fail", "the model is not listed through the second replica")
             return
         timings = []
-        for enabled in (False, True):
+        # Replicas also poll the configuration versions every second, so a
+        # bound of 300 ms on six changes in a row is met by the change
+        # notification, not by a poll that happened to come soon.
+        for enabled in (False, True) * 3:
             status, _ = admin.api("PATCH", f"/api/v1/platform/models/{self.model_id}", {"enabled": enabled}, client=a)
             if status != 200:
                 self.record(5, "change-crosses-replicas", "fail", f"PATCH through the first replica: HTTP {status}")
                 return
             changed = time.monotonic()
             seen = None
-            for _ in range(100):
-                if (MODEL in models(b, key)[1]) == enabled:
+            for _ in range(200):
+                listed = models(b, key)[1]
+                if listed is not None and (MODEL in listed) == enabled:
                     seen = round((time.monotonic() - changed) * 1000)
                     break
-                time.sleep(0.05)
+                time.sleep(0.01)
             timings.append(seen)
-        ok = all(t is not None and t <= 3000 for t in timings)
-        self.expect(5, "change-crosses-replicas", ok, f"disable seen after {timings[0]} ms, enable after {timings[1]} ms")
+            time.sleep(1.5)
+        ok = all(t is not None and t <= 300 for t in timings)
+        self.expect(5, "change-crosses-replicas", ok,
+                    f"through {pods[0][-5:]}, seen through {pods[1][-5:]} after {', '.join(str(t) for t in timings)} ms (disable, enable, three times)")
 
-    def network_policy_step(self):
-        if not Replicas(self.env, self.spark).can_create_network_policy(self.namespace):
-            self.record(6, "network-policy", "skip", "the platform refuses NetworkPolicy to this account")
+    def network_policy_step(self, key):
+        """With the chart's policy deployed: a pod it admits reaches the
+        gateway, one it does not is refused."""
+        policies = self.kubectl(["get", "networkpolicy", "-l", "app.kubernetes.io/name=open-model-gateway", "-o", "name"], capture=True).split()
+        if not policies:
+            if not Replicas(self.env, self.spark).can_create_network_policy(self.namespace):
+                self.record(6, "network-policy", "skip", "the platform refuses NetworkPolicy to this account")
+            else:
+                self.record(6, "network-policy", "fail", "the platform now allows NetworkPolicy, but this environment was created without it: recreate it")
             return
-        exists = self.kubectl(["get", "networkpolicy", "omg", "--ignore-not-found", "-o", "name"], capture=True).strip()
-        self.record(6, "network-policy", "fail", "deployed" if exists else "the environment was created without it: recreate it")
+        outcomes = {}
+        for pod, label in (("omg-check-allowed", ALLOWED_CLIENT), ("omg-check-refused", REFUSED_CLIENT)):
+            self.kubectl(["apply", "-f", "-"], stdin=fill((DEPLOY / "probe-pod.yaml").read_text(), {"NAME": pod, "LABEL": label}), capture=True)
+        for pod in ("omg-check-allowed", "omg-check-refused"):
+            self.kubectl(["wait", "--for=jsonpath={.status.phase}=Succeeded", f"pod/{pod}", "--timeout=120s"], capture=True)
+            outcomes[pod] = json.loads(self.kubectl(["logs", f"pod/{pod}"], capture=True).strip().splitlines()[-1]).get("probe")
+        self.expect(6, "network-policy-allows-a-client", outcomes["omg-check-allowed"] == 200,
+                    f"{ALLOWED_CLIENT}: {outcomes['omg-check-allowed']} ({len(policies)} policies)")
+        self.expect(6, "network-policy-refuses-another-pod", outcomes["omg-check-refused"] in ("timeout", "refused"),
+                    f"{REFUSED_CLIENT}: {outcomes['omg-check-refused']}")
 
     def pooler_step(self):
         pooler = set(self.kubectl(["get", "pods", "-l", "cnpg.io/poolerName=omg-pooler", "-o", "jsonpath={.items[*].status.podIP}"], capture=True).split())
         gateways = {p["status"].get("podIP") for p in self.gateway_pods()}
-        rows = self.sql("SELECT host(client_addr) FROM pg_stat_activity WHERE usename='gateway_runtime' AND client_addr IS NOT NULL").split()
-        via_pooler = sum(1 for r in rows if r in pooler)
-        direct = sum(1 for r in rows if r in gateways)
-        listening = self.sql("SELECT count(*) FROM pg_stat_activity WHERE usename='gateway_runtime' AND query ILIKE 'LISTEN%'") or "0"
-        self.expect(7, "runtime-traffic-through-the-pooler", via_pooler >= 1 and direct <= len(gateways),
-                    f"{via_pooler} sessions from the pooler, {direct} direct (LISTEN sessions {listening}, one per replica by design)")
+        rows = [r.split("|") for r in self.sql(
+            "SELECT host(client_addr)||'|'||(query ILIKE 'LISTEN%') FROM pg_stat_activity "
+            "WHERE usename='gateway_runtime' AND client_addr IS NOT NULL").split()]
+        via_pooler = sum(1 for address, _ in rows if address in pooler)
+        listening = {address for address, listen in rows if address in gateways and listen == "t"}
+        other_direct = sum(1 for address, listen in rows if address in gateways and listen != "t")
+        # PgBouncer's transaction mode cannot carry LISTEN, so each replica
+        # holds one direct LISTEN session by design; anything else goes
+        # through the pooler.
+        self.expect(7, "runtime-traffic-through-the-pooler",
+                    via_pooler >= 1 and other_direct == 0 and listening == gateways,
+                    f"{via_pooler} sessions from the pooler, {len(listening)} replicas with a direct LISTEN session, {other_direct} other direct sessions")
 
 
 def quota(spark, namespace):

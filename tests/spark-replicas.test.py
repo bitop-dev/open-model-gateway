@@ -68,7 +68,7 @@ class Cluster:
         raise AssertionError(f"no call {needle!r} ({data!r}) in {self.commands()}")
 
 
-def fake_pki(directory, host, runner=None):
+def fake_pki(directory, host, runner=None, path=None):
     return ("-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n",
             "-----BEGIN CERTIFICATE-----\nLEAF\n-----END CERTIFICATE-----\n",
             "-----BEGIN PRIVATE KEY-----\nSECRETKEYMATERIAL\n-----END PRIVATE KEY-----\n")
@@ -112,6 +112,15 @@ class Deploy(unittest.TestCase):
             self.assertFalse(any(value in " ".join(command) for command, _ in cluster.calls), "a secret in a command line")
             self.assertFalse([1 for command, stdin in cluster.calls if "apply" in command and stdin and value in stdin], "a secret applied")
         self.assertIn("SECRETKEYMATERIAL", key)
+        # Keycloak's master admin exists from the start, from a generated
+        # password in its own Secret that the issuer reads by reference.
+        bootstrap = values["omg-issuer-bootstrap"]["password"]
+        self.assertGreaterEqual(len(bootstrap), 24)
+        self.assertFalse(any(bootstrap in " ".join(command) or (stdin and "apply" in command and bootstrap in stdin)
+                             for command, stdin in cluster.calls))
+        issuer = cluster.calls[cluster.index("apply -f -", "omg-issuer")][1]
+        self.assertIn("KC_BOOTSTRAP_ADMIN_PASSWORD, valueFrom: {secretKeyRef: {name: omg-issuer-bootstrap", issuer)
+        self.assertIn("[redacted]", spark.redact(bootstrap))
         # The realm carries the same generated values; nothing else does.
         realm = json.loads(values["omg-issuer-realm"]["realm.json"])
         self.assertEqual(realm["clients"][0]["secret"], client_secret)
@@ -160,6 +169,24 @@ class Deploy(unittest.TestCase):
             self.assertEqual(self.deploy(cluster), allowed)
             install = cluster.commands()[cluster.index("install omg")]
             self.assertIn(f"networkPolicy.enabled={json.dumps(allowed)}", install)
+            self.assertEqual("networkPolicy.ingress.fromNamespace" in install, allowed)
+
+    def test_the_deployed_policy_admits_the_check_and_reaches_the_issuer_and_the_model(self):
+        values = replicas.helm_values(NAMESPACE, "10.43.0.10", "10.43.0.11", True)
+        self.assertEqual(values["networkPolicy.ingress.fromNamespace"], NAMESPACE)
+        self.assertEqual(values["networkPolicy.ingress.fromPodLabels"], {"app.kubernetes.io/name": replicas.ALLOWED_CLIENT})
+        egress = {(rule["to"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/name"], rule["ports"][0]["port"])
+                  for rule in values["networkPolicy.egress.extraEgress"]}
+        self.assertEqual(egress, {("omg-issuer", 8443), ("omg-mock-upstream", 8000)})
+        self.assertNotEqual(replicas.ALLOWED_CLIENT, replicas.REFUSED_CLIENT)
+        load = (ROOT / "deploy/spark/replicas/load-pod.yaml").read_text()
+        self.assertIn(f"app.kubernetes.io/name: {replicas.ALLOWED_CLIENT}", load)
+        self.assertNotIn("networkPolicy.ingress.fromNamespace", replicas.helm_values(NAMESPACE, "10.43.0.10", "10.43.0.11", False))
+
+    def test_the_spark_values_keep_the_gateway_off_any_ingress(self):
+        values = (ROOT / "deploy/spark/replicas/values.yaml").read_text()
+        self.assertIn("service: {type: ClusterIP}", values)
+        self.assertIn("ingress: {enabled: false}", values)
 
 
 class Pieces(unittest.TestCase):
@@ -312,9 +339,21 @@ class SignIn(unittest.TestCase):
         self.assertEqual(browser.cookies["omg_session"], "s")
 
     def test_a_wrong_password_stops_at_the_issuer(self):
-        outcome, gateway, _, _ = self.walk((200, {}, [], b"<html>Invalid username or password.</html>"))
-        self.assertEqual(outcome[0], "issuer-refused")
+        again = b'<html>Invalid username or password.<form id="kc-form-login" action="x"></html>'
+        outcome, gateway, _, _ = self.walk((200, {}, [], again))
+        self.assertEqual(outcome, ("issuer-refused", 200))
         self.assertEqual(gateway.request.call_count, 1, "the callback is never called")
+
+    def test_an_issuer_error_is_not_a_refusal(self):
+        for answer in ((500, {}, [], b"oops"), (200, {}, [], b"<html>no form</html>")):
+            outcome, _, _, _ = self.walk(answer)
+            self.assertEqual(outcome[0], "issuer-error")
+
+    def test_a_cleared_session_cookie_is_no_sign_in(self):
+        callback = f"https://omg.{NAMESPACE}.invalid/api/v1/auth/callback?state=s1&code=k"
+        outcome, _, _, _ = self.walk((302, {"location": callback}, [], b""),
+                                     gateway_callback=(303, [("set-cookie", "omg_session=; Max-Age=0")]))
+        self.assertEqual(outcome, ("gateway-refused", 303))
 
     def test_a_redirect_elsewhere_is_never_followed(self):
         outcome, gateway, _, _ = self.walk((302, {"location": "https://elsewhere.example/api/v1/auth/callback?code=k"}, [], b""))
@@ -326,6 +365,90 @@ class SignIn(unittest.TestCase):
         outcome, _, _, browser = self.walk((302, {"location": callback}, [], b""), gateway_callback=(403, []))
         self.assertEqual(outcome, ("gateway-refused", 403))
         self.assertNotIn("omg_session", browser.cookies)
+
+
+class CheckPieces(unittest.TestCase):
+    """Parts of `check` that decide PASS or FAIL, against canned answers."""
+
+    def check(self, kubectl=None):
+        env = spark.Spark(CONFIG, Cluster())
+        env._base = "coder-03"
+        check = replicas.Check(spark, env, NAMESPACE)
+        if kubectl is not None:
+            check.kubectl = kubectl
+        return check
+
+    def test_an_eviction_is_refused_only_for_the_budget(self):
+        def answer(stderr):
+            def kubectl(args, **kwargs):
+                raise spark.SparkError(f"kubectl create --raw /api/v1/namespaces/coder-03-omg-e429/pods/omg-429/eviction "
+                                       f"-n coder-03-omg-e429 failed (exit 1): {stderr}")
+            return kubectl
+        cases = {
+            "Error from server (InternalError): an error on the server": "error",
+            "Error from server (TooManyRequests): Cannot evict pod as it would violate the pod's disruption budget.": "refused",
+            'Error from server (Forbidden): pods "omg-429" is forbidden: User "u" cannot create resource "pods/eviction"': "forbidden",
+        }
+        for stderr, expected in cases.items():
+            self.assertEqual(self.check(answer(stderr)).evict("omg-429"), expected, stderr)
+
+    def test_a_failed_listing_is_never_a_vanished_model(self):
+        client = mock.Mock()
+        client.request.return_value = (503, {}, [], b"")
+        self.assertEqual(replicas.models(client, "k"), (503, None))
+        client.request.return_value = (200, {}, [], b'{"data": []}')
+        self.assertEqual(replicas.models(client, "k"), (200, set()))
+
+    def test_an_error_fails_its_step_and_the_check_goes_on(self):
+        check = self.check()
+        planted = "omg_sk_" + "y" * 24
+        spark._REGISTERED_SECRETS.append(planted)
+
+        def broken():
+            raise spark.SparkError(f"kubectl exec failed (exit 1): token {planted}")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertIsNone(check.guarded(4, "lease-takeover", broken))
+            self.assertEqual(check.guarded(5, "x", lambda: 7), 7)
+        self.assertEqual(check.results, [{"step": 4, "name": "lease-takeover", "result": "fail",
+                                          "detail": "error: kubectl exec failed (exit 1): token [redacted]"}])
+        self.assertNotIn(planted, out.getvalue())
+
+    def test_a_forward_counts_only_when_its_own_kubectl_listens(self):
+        check = self.check()
+        check.spark.port_free = lambda port: True
+        script = "import sys; print(sys.argv[1], flush=True); import time; time.sleep(30)"
+        for line, opens in (("Forwarding from 127.0.0.1:3101 -> 8080", True),
+                            ("Unable to listen on port 3101: address already in use", False)):
+            check.children = []
+            command = [sys.executable, "-c", script, line]
+            with mock.patch.object(replicas.Replicas, "forward_command", return_value=command):
+                if opens:
+                    child = check.forward("pod/omg-a", ["3101:8080"])
+                    self.assertIsNone(child.poll())
+                    check.stop(child)
+                else:
+                    with mock.patch.object(replicas.threading.Event, "wait", lambda self, timeout=None: self.is_set()):
+                        with self.assertRaisesRegex(spark.SparkError, "did not open"):
+                            check.forward("pod/omg-a", ["3101:8080"])
+                    self.assertIsNotNone(check.children[0].poll(), "the child is stopped")
+
+    def test_a_port_in_use_is_refused_before_any_forward(self):
+        check = self.check()
+        check.spark.port_free = lambda port: False
+        with mock.patch.object(replicas.subprocess, "Popen") as popen, self.assertRaisesRegex(spark.SparkError, "in use"):
+            check.forward("pod/omg-a", ["3101:8080"])
+        popen.assert_not_called()
+
+    def test_openssl_gets_no_ambient_configuration(self):
+        seen = []
+
+        def runner(command, **kwargs):
+            seen.append(kwargs["env"])
+            return mock.Mock(returncode=1)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(replicas.os.environ, {"OPENSSL_CONF": "/evil.cnf"}):
+            with self.assertRaises(RuntimeError):
+                replicas.generate_pki(directory, "h", runner, path="/usr/bin")
+        self.assertEqual(seen, [{"PATH": "/usr/bin", "OPENSSL_CONF": replicas.os.devnull, "LC_ALL": "C"}])
 
 
 if __name__ == "__main__":
