@@ -14,6 +14,19 @@ pub(crate) async fn lock(tx: &mut Transaction<'_, Postgres>) -> Result<(), sqlx:
     Ok(())
 }
 
+/// A transaction for a fenced lifecycle step that writes management state:
+/// the lease fence is its first statement, then [`lock`] (the catalog and
+/// installation locks every management write takes, in the same order).
+pub(crate) async fn installation_tx_fenced<'a>(
+    s: &'a Store,
+    fence: Option<&crate::leases::Fence>,
+) -> Result<Transaction<'a, Postgres>, sqlx::Error> {
+    let mut tx = crate::db::begin(&s.pool).await?;
+    crate::leases::fence(&mut tx, fence).await?;
+    lock(&mut tx).await?;
+    Ok(tx)
+}
+
 /// Exclusive authority locks (`governance::locks`) for changes to `users`
 /// (suspension, cleanup, entitlement loss, grant and membership changes, key
 /// revocation): their personal workspaces, the users, then the lineages of

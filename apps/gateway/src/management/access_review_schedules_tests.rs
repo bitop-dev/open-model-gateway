@@ -119,7 +119,9 @@ async fn a_claimant_that_dies_before_committing_leaves_one_late_run(pool: PgPool
     due_since(&pool, schedule, 0).await;
     // The claimant takes the scheduler's locks, claims the schedule row and
     // starts the campaign, then dies before committing.
-    let mut claimant = resources::installation_tx_fenced(&f.s, None).await.unwrap();
+    let mut claimant = crate::lifecycle::installation_tx_fenced(&f.s, None)
+        .await
+        .unwrap();
     sqlx::query("SELECT id FROM access_review_schedules WHERE id=$1 FOR UPDATE SKIP LOCKED")
         .bind(schedule)
         .fetch_one(&mut *claimant)

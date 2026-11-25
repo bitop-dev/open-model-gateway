@@ -1097,9 +1097,9 @@ async fn scim_provisioning_runs_as_runtime(pool: &PgPool) {
 /// a skipped run with its alert, audits both, and moves each schedule to its
 /// next period.
 async fn scheduled_access_reviews_run_as_runtime(pool: &PgPool) {
-    sqlx::raw_sql(r#"DO $$ DECLARE u uuid:=gen_random_uuid(); ws uuid:=gen_random_uuid(); empty uuid:=gen_random_uuid(); BEGIN
- INSERT INTO users(id,email) VALUES(u,'schedules-'||u||'@example.invalid');
- INSERT INTO platform_role_grants(user_id,role,source) VALUES(u,'admin','manual');
+    // The admin the alert probe seeded: the SCIM probe after this one
+    // expects exactly one.
+    sqlx::raw_sql(r#"DO $$ DECLARE u uuid:=(SELECT user_id FROM effective_platform_roles WHERE role='admin' ORDER BY user_id LIMIT 1); ws uuid:=gen_random_uuid(); empty uuid:=gen_random_uuid(); BEGIN
  INSERT INTO workspaces(id,name,kind) VALUES(ws,'Scheduled review team','team'),(empty,'Scheduled review empty','project');
  INSERT INTO workspace_membership_grants(workspace_id,user_id,role,source) VALUES(ws,u,'owner','manual');
  INSERT INTO access_review_schedules(id,name,subjects,workspace_ids,open_days,cadence,start_day,created_by,next_run_at) VALUES

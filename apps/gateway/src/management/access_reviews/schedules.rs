@@ -557,7 +557,7 @@ async fn run_one(
     fence: Option<&crate::leases::Fence>,
     id: Uuid,
 ) -> Result<Option<Outcome>, sqlx::Error> {
-    let mut tx = resources::installation_tx_fenced(store, fence).await?;
+    let mut tx = crate::lifecycle::installation_tx_fenced(store, fence).await?;
     let Some(due) = sqlx::query_as::<_, Due>("SELECT s.subjects,s.workspace_ids,s.cadence,s.start_day,s.start_month,s.created_by,s.next_run_at,c.now FROM access_review_schedules s, (SELECT clock_timestamp() AS now) c WHERE s.id=$1 AND s.paused_at IS NULL AND s.deleted_at IS NULL AND s.next_run_at<=c.now FOR UPDATE OF s SKIP LOCKED")
         .bind(id)
         .fetch_optional(&mut *tx)
