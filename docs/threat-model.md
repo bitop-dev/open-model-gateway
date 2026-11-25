@@ -282,6 +282,12 @@ Each entry gives the STRIDE category (S, T, R, I, D, E), the asset and attacker,
 - Residual: filling the cap within the 10-minute expiry takes about 1,000 starts a minute: at the default 60 per address per replica, roughly 17 IPv4 addresses divided by the replica count, or a single IPv6 /60 (16 /64s). That refuses sign-in for everyone until attempts expire; existing sessions keep working. Once 10,000 addresses are tracked, new clients share one overflow bucket until refilled buckets are swept (at most once a second). Without `GATEWAY_TRUSTED_PROXIES` behind a proxy, all users share one per-address budget. The cap can be exceeded by concurrent inserts, at most one per database connection. Expired attempts are deleted every minute (#80).
 - Follow-up: none (cleanup of expired attempts is #80, fixed).
 
+**OIDC-7. An operator-supplied trust anchor makes an impostor issuer trusted.** S · Asset: accounts, platform entitlement · Attacker: someone who can change `GATEWAY_OIDC_CA_FILE` or the Secret or ConfigMap it is mounted from.
+- Mitigation (#826): the roots are read once at startup from a file only an operator controls (environment and mounted files, never the management API) and checked (CA certificates only, each well-formed and within its validity, at least one, at most 1 MiB; no other PEM section). They are added to the OIDC client alone, on top of the public roots; certificate name and validity checks are unchanged, and no other client (providers, webhooks, exports, SMTP, the file store) trusts them.
+- Tests: `identity/oidc_ca_tests.rs` `a_private_ca_issuer_is_reached_only_with_its_roots`, `the_roots_never_accept_a_wrong_certificate`, `no_other_client_trusts_the_roots`; `egress_ca_tests.rs`; `tests/startup.rs` `an_unusable_oidc_ca_file_stops_startup_naming_the_setting`.
+- Residual: whoever controls that file controls who can act as the issuer, and so can sign in as any user, including a Platform Admin. Protect it like the client secret; a rotation needs a restart.
+- Follow-up: none.
+
 ### SCIM
 
 **SCIM-1. A stolen SCIM token grants access.** S, E · Asset: users, memberships, platform roles · Attacker: unauthenticated internet client with the SCIM token.

@@ -257,7 +257,7 @@ async fn connect_provider(
     policy: JwksPolicy,
     clock: jwks::Clock,
 ) -> anyhow::Result<Arc<Provider>> {
-    let http = OidcHttp::new(config.allow_loopback_http)?;
+    let http = OidcHttp::new(config.allow_loopback_http, config.ca.as_deref())?;
     // The issuer must pass the egress policy (#33); say which setting
     // to change instead of a bare discovery failure.
     let egress = crate::egress::policy().permit_loopback(config.allow_loopback_http);
@@ -687,6 +687,9 @@ use oidc::{EnterpriseIdToken, SignedClaims};
 #[cfg(all(test, feature = "integration-tests"))]
 #[path = "identity/bootstrap_race_tests.rs"]
 mod bootstrap_race_tests;
+#[cfg(test)]
+#[path = "identity/pki_tests.rs"]
+pub(crate) mod test_pki;
 #[cfg(test)]
 #[path = "identity/tests.rs"]
 pub(crate) mod tests;

@@ -950,3 +950,32 @@ test("gateway and migrate steps use the selected repository and digest together"
     assert.deepEqual([...new Set(images)], [`${repository}@${digest}`]);
   }
 });
+
+test("the OIDC issuer's private CA is mounted for GATEWAY_OIDC_CA_FILE from one Secret or ConfigMap (#826)", () => {
+  const base = profiles.cnpg;
+  const [plain] = docsOfKind(helmTemplate(base), "Deployment");
+  assert.doesNotMatch(plain, /GATEWAY_OIDC_CA_FILE|oidc-ca/);
+  for (const [source, flag, volume] of [
+    ["Secret", "secrets.oidc.ca.secretName=issuer-ca", /- name: oidc-ca\n\s+secret:\n\s+secretName: issuer-ca\n\s+items:\n\s+- key: roots.pem\n\s+path: roots.pem/],
+    ["ConfigMap", "secrets.oidc.ca.configMapName=issuer-ca", /- name: oidc-ca\n\s+configMap:\n\s+name: issuer-ca\n\s+items:\n\s+- key: roots.pem\n\s+path: roots.pem/],
+  ]) {
+    const [deployment] = docsOfKind(
+      helmTemplate([...base, "--set", "secrets.oidc.ca.enabled=true", "--set", flag, "--set", "secrets.oidc.ca.key=roots.pem"]),
+      "Deployment",
+    );
+    assert.match(deployment, /- name: GATEWAY_OIDC_CA_FILE\n\s+value: \/var\/run\/omg-secrets\/oidc-ca\/roots.pem/, source);
+    assert.match(deployment, /- name: oidc-ca\n\s+mountPath: \/var\/run\/omg-secrets\/oidc-ca\n\s+readOnly: true/, source);
+    assert.match(deployment, volume, source);
+    // Only the gateway container gets it; the schema-wait init container does not.
+    assert.equal(deployment.match(/GATEWAY_OIDC_CA_FILE/g).length, 1, source);
+  }
+  assertHelmRefuses([...base, "--set", "secrets.oidc.ca.enabled=true"], /exactly one of secretName or configMapName/);
+  assertHelmRefuses(
+    [...base, "--set", "secrets.oidc.enabled=false", "--set", "secrets.oidc.ca.enabled=true", "--set", "secrets.oidc.ca.secretName=a"],
+    /needs secrets\.oidc\.enabled/,
+  );
+  assertHelmRefuses(
+    [...base, "--set", "secrets.oidc.ca.enabled=true", "--set", "secrets.oidc.ca.secretName=a", "--set", "secrets.oidc.ca.configMapName=b"],
+    /exactly one of secretName or configMapName/,
+  );
+});
