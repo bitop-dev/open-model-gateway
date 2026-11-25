@@ -7,6 +7,7 @@ import { abortRequests } from "../lib/api";
 import { ActionProvider } from "./ui";
 import { DashboardNavigationProvider } from "./navigation-link";
 import { AccessReviewDetail, AccessReviewInbox, PlatformAccessReviewsPage } from "../pages/access-reviews";
+import { schedulesPath } from "../lib/access-review-schedules";
 import { campaignState, decisionPath, inboxPath, reviewClosePath, reviewerPath, reviewItemsPath, reviewPath, reviewsPath, type InboxItem, type ReviewCampaignDetail, type ReviewItem } from "../lib/access-reviews";
 import { admin, auditor, session, team, testClient } from "../lib/test-fixtures";
 
@@ -38,7 +39,7 @@ const serviceKey: ReviewItem = { ...humanKey, id: "k-2", api_key_id: "9f8e7d6c-0
 const masked = (k: ReviewItem): ReviewItem => ({ ...k, user_id: null, email: null, display_name: null, key_name: null, service_account_id: null, service_account_name: null });
 const asAdminOf = (ws: string) => ({ ...session, workspaces: [...session.workspaces.filter(w => w.id !== ws), { ...team, id: ws, role: "admin" as const }] });
 const inbox = (patch: Partial<InboxItem>): InboxItem => ({ ...base, campaign_name: "Q4 review", due_at: "2026-11-20T00:00:00Z", ...patch });
-const campaign: ReviewCampaignDetail = { id: "c-1", name: "Q4 review", subjects: ["workspace_memberships", "platform_roles"], workspace_ids: [], created_by: "admin", created_at: "2026-11-06T00:00:00Z", due_at: "2099-11-20T00:00:00Z", closed_at: null, item_count: 3,
+const campaign: ReviewCampaignDetail = { id: "c-1", name: "Q4 review", subjects: ["workspace_memberships", "platform_roles"], workspace_ids: [], created_by: "admin", created_at: "2026-11-06T00:00:00Z", due_at: "2099-11-20T00:00:00Z", closed_at: null, item_count: 3, schedule_id: null,
   counts: { by_kind: { workspace_membership: 2, platform_role: 1, workspace_key: 0 }, by_source: { manual: 2, group: 1, bootstrap: 0 }, by_decision: { pending: 2, keep: 1, flag_idp: 0, remove: 0 }, inactive: 0, without_reviewer: 1 } };
 
 describe("Review access (#90)", () => {
@@ -101,7 +102,7 @@ describe("Review access (#90)", () => {
 
 describe("Admin › Access reviews (#90)", () => {
   it("lists reviews and starts one with what the admin chose", async () => {
-    const fetch = serve({ [reviewsPath]: init => init?.method === "POST" ? campaign : { data: [campaign] } });
+    const fetch = serve({ [reviewsPath]: init => init?.method === "POST" ? campaign : { data: [campaign] }, [schedulesPath]: () => ({ data: [] }) });
     const user = mount(<PlatformAccessReviewsPage session={admin} />);
     await screen.findByText("Q4 review");
     expect(screen.getByText("Open")).toBeTruthy();
@@ -114,7 +115,7 @@ describe("Admin › Access reviews (#90)", () => {
     expect(writes(fetch)[0]).toEqual([reviewsPath, { name: "Roles", subjects: ["workspace_memberships", "platform_roles"], workspace_ids: [], due_in_days: 14 }]);
   });
   it("reviews platform roles alone with another due date, and offers the workspace filter only with memberships", async () => {
-    const fetch = serve({ [reviewsPath]: init => init?.method === "POST" ? campaign : { data: [] } });
+    const fetch = serve({ [reviewsPath]: init => init?.method === "POST" ? campaign : { data: [] }, [schedulesPath]: () => ({ data: [] }) });
     const user = mount(<PlatformAccessReviewsPage session={admin} />);
     await user.click(await screen.findByRole("button", { name: /Start review/ }));
     const dialog = await screen.findByRole("dialog", { name: "Start an access review" });
@@ -130,7 +131,7 @@ describe("Admin › Access reviews (#90)", () => {
     await waitFor(() => expect(writes(fetch)).toEqual([[reviewsPath, { name: "Roles only", subjects: ["platform_roles"], workspace_ids: [], due_in_days: 30 }]]));
   });
   it("is read-only for an Auditor", async () => {
-    serve({ [reviewsPath]: () => ({ data: [] }) });
+    serve({ [reviewsPath]: () => ({ data: [] }), [schedulesPath]: () => ({ data: [] }) });
     mount(<PlatformAccessReviewsPage session={auditor} />);
     await screen.findByText("No access reviews yet.");
     expect(screen.queryByRole("button", { name: /Start review/ })).toBeNull();
@@ -250,7 +251,7 @@ describe("Keys in access reviews (#90 slice 6)", () => {
     expect((await screen.findByRole("dialog", { name: "Revoke zebra-human-key in Product?" })).textContent).toContain("Held by Casey, ID 77776666.");
   });
   it("starts a review of keys alone, narrowed to chosen workspaces", async () => {
-    const fetch = serve({ [reviewsPath]: init => init?.method === "POST" ? campaign : { data: [] }, ["/api/v1/platform/workspaces?status=active"]: () => ({ data: [{ id: "team", name: "Product", kind: "team" }] }) });
+    const fetch = serve({ [reviewsPath]: init => init?.method === "POST" ? campaign : { data: [] }, [schedulesPath]: () => ({ data: [] }), ["/api/v1/platform/workspaces?status=active"]: () => ({ data: [{ id: "team", name: "Product", kind: "team" }] }) });
     const user = mount(<PlatformAccessReviewsPage session={admin} />);
     await user.click(await screen.findByRole("button", { name: /Start review/ }));
     const dialog = await screen.findByRole("dialog", { name: "Start an access review" });
