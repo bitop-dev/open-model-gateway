@@ -149,6 +149,12 @@ fn sql_rule(sql: &str, helper: bool) -> Option<&'static str> {
 const INSTALLATION: &str = "SELECT id FROM installation WHERE singleton FOR NO KEY UPDATE";
 const ROW_LOCKS: &[(&str, &str)] = &[
     ("governance::installation_lock", INSTALLATION),
+    // #132: a global-mode admission's installation row, its wait bounded by
+    // the transaction-local lock_timeout the statement restores once held.
+    (
+        "governance::installation_lock_bounded",
+        "SELECT set_config('lock_timeout',$1,true) FROM (SELECT id FROM installation WHERE singleton FOR NO KEY UPDATE) i",
+    ),
     (
         "governance::batch::admit_line_unobserved",
         "SELECT r.state,r.held_microusd,r.api_key_id,r.admitted_at FROM governance_reservations r JOIN async_jobs j ON j.execution_id=r.execution_id WHERE r.execution_id=$1 AND r.workspace_id=$2 AND j.id=$3 AND j.batch_mode='gateway' FOR UPDATE OF r",

@@ -385,8 +385,9 @@ async fn run(cli: Cli, process_start_unix_nano: u64) -> Result<()> {
         .transpose()?;
     let pool = match cli.command {
         Some(Command::BootstrapDev) => config.connect_bootstrap_dev().await?,
-        // Only `serve` waits out a pooler's cached failed server login (a
-        // first install); every other command connects once, as before.
+        // Only `serve` opens its whole pool before it listens and waits out
+        // a pooler's cached failed server login (a first install); every
+        // other command connects once, as before.
         None | Some(Command::Serve) => config.connect_serve().await?,
         _ => config.connect().await?,
     };

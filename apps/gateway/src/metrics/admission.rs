@@ -122,6 +122,18 @@ impl Metrics {
             .inc();
     }
 
+    /// An admission shed after waiting `governance::ADMISSION_LOCK_WAIT` for
+    /// its scope's rows (`scope_busy`): counted where the wait ends, once per
+    /// admission attempt, whatever path it took.
+    pub fn observe_admission_shed(&self) {
+        self.denials
+            .get_or_create(&[
+                ("code", InferenceError::ScopeBusy.code().to_owned()),
+                ("scope", "scope_lock".to_owned()),
+            ])
+            .inc();
+    }
+
     /// Gateway-local concurrency limit (`GATEWAY_MAX_CONCURRENT_REQUESTS`).
     pub fn observe_capacity_denial(&self) {
         self.denials

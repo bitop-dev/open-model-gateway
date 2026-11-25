@@ -39,6 +39,7 @@ pub(super) fn all() -> Vec<InferenceError> {
         InferenceError::Unsupported,
         InferenceError::Configuration,
         InferenceError::Busy,
+        InferenceError::ScopeBusy,
         InferenceError::PriceUnbounded,
         InferenceError::RouteCoolingDown(1),
         InferenceError::Timeout,
@@ -80,6 +81,7 @@ pub(super) const fn guard(error: InferenceError) -> usize {
         InferenceError::UpstreamUnavailable => 18,
         InferenceError::InvalidUpstream => 19,
         InferenceError::Storage => 20,
+        InferenceError::ScopeBusy => 21,
     }
 }
 const _: fn(InferenceError) -> usize = guard;

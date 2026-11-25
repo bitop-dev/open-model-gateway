@@ -251,6 +251,7 @@ impl LineRun {
                     let retryable = matches!(
                         e,
                         InferenceError::Busy
+                            | InferenceError::ScopeBusy
                             | InferenceError::UpstreamUnavailable
                             | InferenceError::Timeout
                     );

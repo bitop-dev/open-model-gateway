@@ -191,8 +191,13 @@ The Pooler's instances start before PostgreSQL accepts connections, and each tha
 answers its first client afterwards with PgBouncer's cached error ("server login has been
 failing, cached error: … (server_login_retry)"). The init container can pass through one instance
 while another still answers that way, so `serve` waits that error out instead of exiting: it tries
-again once a second while the next attempt would start within 30 s, and logs the cached cause each
-time (#836). PgBouncer gives the same answer when PostgreSQL refuses the pooler's own login (a
+again once a second while the next attempt would start within 30 s, keeping the connections of its
+pool already open, and logs the cached cause each time (#836). Each connection counts as open once
+it has answered a query: a PgBouncer pool that has served completes a client's login from the
+server parameters it cached and sends the cached error at the first query (PgBouncer 1.25.2),
+while one that never logged in holds new clients until its next login attempt, past the pool's 3 s
+acquire timeout, and `serve` stops naming `GATEWAY_DATABASE_MAX_CONNECTIONS`. PgBouncer gives the
+same answer when PostgreSQL refuses the pooler's own login (a
 revoked CONNECT, a `pg_hba` rule), so such a refusal stops `serve` after those 30 s, with that
 error, instead of at once. Any other connection error (a wrong password included) still stops it at
 once. Later connections can still reach such an instance for a few seconds; they fail like any
@@ -446,8 +451,15 @@ failed in 28 checks.
   waits until its deadline with the old pods still serving. With the chart's default limits (each
   gateway at 2 CPU, the database instance at 2 CPU) two replicas and their surge pod did not fit an
   8-CPU limits quota in the multi-replica rehearsal on Spark (#601), whose values lower them.
+- **A rollout needs database connections for its new pods while the old ones hold theirs.** Each
+  new pod opens its whole pool (`GATEWAY_DATABASE_MAX_CONNECTIONS`) before it is ready (#132), so
+  size PostgreSQL's `max_connections` (direct) or the Pooler's `max_client_conn` for
+  `(replicas + 1 surge pod) × GATEWAY_DATABASE_MAX_CONNECTIONS` plus the pods still draining (a
+  Deployment does not count terminating pods against the surge,
+  [Updating a Deployment](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#updating-a-deployment)) and the other sessions ([connection sizing](postgresql-ha.md#connection-sizing)). A pod that cannot
+  open its pool fails startup naming that setting and the rollout stops with the old pods serving.
 - `cnpg.pooler.instances` and `cnpg.pooler.parameters.default_pool_size` size the PgBouncer tier;
-  size `max_client_conn` for `replicaCount × GATEWAY_DATABASE_MAX_CONNECTIONS` plus headroom
+  size `max_client_conn` for `(replicaCount + 1) × GATEWAY_DATABASE_MAX_CONNECTIONS` plus headroom
   ([connection sizing](postgresql-ha.md#connection-sizing)).
 - Scale the gateway with `kubectl scale` or the HPA; scale CNPG with `cnpg.cluster.instances`
   (requires a migrating upgrade is not pending) — see `docs/operations.md` for connection sizing.
