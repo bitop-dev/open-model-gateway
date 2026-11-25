@@ -419,13 +419,56 @@ class CheckPieces(unittest.TestCase):
         spark._REGISTERED_SECRETS.append(planted)
 
         def broken():
-            raise spark.SparkError(f"kubectl exec failed (exit 1): token {planted}")
+            raise spark.SparkError(f"kubectl exec failed (exit 1): User system:serviceaccount:coder-03:x token {planted}")
         with contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertIsNone(check.guarded(4, "lease-takeover", broken))
+            # Any error at all is that step's FAIL, never the end of the check.
+            self.assertIsNone(check.guarded(6, "network-policy", lambda: [][-1]))
             self.assertEqual(check.guarded(5, "x", lambda: 7), 7)
-        self.assertEqual(check.results, [{"step": 4, "name": "lease-takeover", "result": "fail",
-                                          "detail": "error: kubectl exec failed (exit 1): token [redacted]"}])
+        self.assertEqual([(r["step"], r["result"]) for r in check.results], [(4, "fail"), (6, "fail")])
+        # The summary holds the error's type only; the terminal its redacted text.
+        self.assertEqual(check.results[0]["detail"], "error (SparkError; its text is in the terminal output only)")
+        self.assertEqual(check.results[1]["detail"], "error (IndexError; its text is in the terminal output only)")
+        self.assertNotIn("serviceaccount", json.dumps(check.results))
+        self.assertIn("token [redacted]", out.getvalue())
         self.assertNotIn(planted, out.getvalue())
+
+    def test_nothing_is_sent_through_a_forward_that_stopped(self):
+        child = mock.Mock()
+        child.poll.return_value = 1
+        with mock.patch.object(replicas.http.client, "HTTPConnection") as connection:
+            with self.assertRaisesRegex(ConnectionError, "has stopped"):
+                replicas.Http(3101, child=child).request("PATCH", "/x", {"cookie": "omg_session=s"})
+        connection.assert_not_called()
+
+    def network_policy(self, outcomes, others=()):
+        chart = ["networkpolicy.networking.k8s.io/omg-default-deny", "networkpolicy.networking.k8s.io/omg-ingress"]
+
+        def kubectl(args, **kwargs):
+            text = " ".join(args)
+            if text.startswith("get networkpolicy -l"):
+                return "\n".join(chart)
+            if text.startswith("get networkpolicy"):
+                return "\n".join([*chart, *others])
+            if text.startswith("logs pod/"):
+                return json.dumps(outcomes[args[1].split("/")[1]])
+            return ""
+        check = self.check(kubectl)
+        with contextlib.redirect_stdout(io.StringIO()):
+            check.network_policy_step("k")
+        return [(r["name"], r["result"]) for r in check.results]
+
+    def test_the_policy_step_needs_a_working_network_and_a_real_refusal(self):
+        good = {"omg-check-allowed": {"control": 200, "probe": 200}, "omg-check-refused": {"control": 200, "probe": "timeout"}}
+        self.assertEqual(self.network_policy(good), [("network-policy-allows-a-client", "pass"), ("network-policy-refuses-another-pod", "pass")])
+        # A probe pod without a network proves no refusal.
+        dead = {**good, "omg-check-refused": {"control": "timeout", "probe": "timeout"}}
+        self.assertEqual(self.network_policy(dead)[1], ("network-policy-refuses-another-pod", "fail"))
+        # Admitted anyway: a fail, unless another policy admits it (policies add up).
+        through = {**good, "omg-check-refused": {"control": 200, "probe": 200}}
+        self.assertEqual(self.network_policy(through)[1], ("network-policy-refuses-another-pod", "fail"))
+        self.assertEqual(self.network_policy(through, ["networkpolicy.networking.k8s.io/platform-same-namespace"])[1],
+                         ("network-policy-refuses-another-pod", "skip"))
 
     def test_a_forward_counts_only_when_its_own_kubectl_listens(self):
         check = self.check()

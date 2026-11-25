@@ -283,14 +283,19 @@ class Http:
     verified against the environment's CA under the issuer's own name. Cookies
     are kept by hand (the gateway's are Secure, set for its HTTPS origin)."""
 
-    def __init__(self, port, host=None, ca=None):
+    def __init__(self, port, host=None, ca=None, child=None):
         self.port = port
         self.host = host
+        self.child = child
         self.context = None
         if ca is not None:
             self.context = ssl.create_default_context(cadata=ca)
 
     def request(self, method, path, headers=None, body=None):
+        # A forward whose kubectl has exited frees its port for any local
+        # listener: nothing (a cookie, a key) is sent to it then.
+        if self.child is not None and self.child.poll() is not None:
+            raise ConnectionError(f"the port-forward on 127.0.0.1:{self.port} has stopped")
         if self.context is None:
             connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
         else:
@@ -478,13 +483,16 @@ class Check:
 
     # -- the run --
     def guarded(self, step, name, action, *args):
-        """Run one step; an error fails that step (its message redacted and
-        shortened) and the check goes on with the next."""
+        """Run one step; an error fails that step and the check goes on with
+        the next. The summary gets the error's type only (it may be attached
+        to a public PR, and cluster error text can name accounts and
+        addresses); the terminal also gets its redacted, shortened text."""
         try:
             return action(*args)
-        except (self.env.SparkError, OSError, ValueError, KeyError, TypeError, StopIteration) as error:
-            message = re.sub(r"\s+", " ", self.env.redact(str(error) or type(error).__name__))[:300]
-            self.record(step, name, "fail", f"error: {message}")
+        except Exception as error:  # noqa: BLE001 - every error is that step's FAIL
+            message = re.sub(r"\s+", " ", self.env.redact(str(error)))[:300]
+            print(f"     step {step} error: {message}")
+            self.record(step, name, "fail", f"error ({type(error).__name__}; its text is in the terminal output only)")
             return None
 
     def run(self):
@@ -495,9 +503,9 @@ class Check:
         admin = key = None
         try:
             gateway_forward = self.forward("service/omg", [f"{GATEWAY_PORT}:8080"])
-            self.forward("service/omg-issuer", [f"{ISSUER_PORT}:8443"])
-            gateway = Http(GATEWAY_PORT)
-            issuer = Http(ISSUER_PORT, issuer_host(self.namespace), ca)
+            issuer_forward = self.forward("service/omg-issuer", [f"{ISSUER_PORT}:8443"])
+            gateway = Http(GATEWAY_PORT, child=gateway_forward)
+            issuer = Http(ISSUER_PORT, issuer_host(self.namespace), ca, child=issuer_forward)
             admin = self.guarded(1, "sign-in", self.sign_in_step, gateway, issuer, users)
             key = self.guarded(2, "inference", self.inference_step, gateway, admin) if admin else None
             self.stop(gateway_forward)
@@ -525,16 +533,18 @@ class Check:
                            ("secret", "omg-check-key")):
             try:
                 self.kubectl(["delete", kind, name, "--ignore-not-found", "--wait=false"], capture=True)
-            except self.env.SparkError as error:
+            except Exception as error:  # noqa: BLE001 - reported; the next item is still removed
                 print(f"cleanup: deleting {kind}/{name} failed: {self.env.redact(str(error))[:200]}")
         if admin is not None and getattr(self, "key_path", None):
             try:
                 child = self.forward("service/omg", [f"{GATEWAY_PORT}:8080"])
-                status, _ = admin.api("DELETE", self.key_path)
-                self.stop(child)
+                try:
+                    status, _ = admin.api("DELETE", self.key_path, client=Http(GATEWAY_PORT, child=child))
+                finally:
+                    self.stop(child)
                 if status not in (200, 204):
                     print(f"cleanup: revoking the check's key returned HTTP {status} (it expires in a day)")
-            except (self.env.SparkError, OSError) as error:
+            except Exception as error:  # noqa: BLE001 - reported; cleanup never hides the check's result
                 print(f"cleanup: revoking the check's key failed: {self.env.redact(str(error))[:200]} (it expires in a day)")
 
     def sign_in_step(self, gateway, issuer, users):
@@ -551,14 +561,19 @@ class Check:
             return None
         wrong = Browser(gateway, issuer, self.namespace).sign_in("admin", users["admin"] + "-wrong")
         self.expect(1, "wrong-password-refused", wrong == ("issuer-refused", 200), f"stopped at {wrong[0]} {wrong[1]}")
-        unentitled = Browser(gateway, issuer, self.namespace).sign_in("unentitled", users["unentitled"])
-        # Refused by the gateway for its platform role: the identity was
+        # Refused by the gateway for its platform role: the identity is
         # linked (the token exchange and ID token checks passed) and no
-        # session exists for it.
-        linked = self.sql(f"SELECT count(*) FROM oidc_identities i JOIN users u ON u.id=i.user_id WHERE u.email='{UNENTITLED_EMAIL}'")
+        # session exists for it. A first run shows the link appear; a rerun
+        # finds it from before (the admin's sign-in, through the same realm,
+        # client and mappers, shows the token checks pass).
+        link = f"SELECT count(*) FROM oidc_identities i JOIN users u ON u.id=i.user_id WHERE u.email='{UNENTITLED_EMAIL}'"
+        before = self.sql(link)
+        unentitled = Browser(gateway, issuer, self.namespace).sign_in("unentitled", users["unentitled"])
+        linked = self.sql(link)
         sessions = self.sql(f"SELECT count(*) FROM browser_sessions s JOIN users u ON u.id=s.user_id WHERE u.email='{UNENTITLED_EMAIL}'")
         self.expect(1, "unentitled-refused", unentitled == ("gateway-refused", 403) and linked == "1" and sessions == "0",
-                    f"stopped at {unentitled[0]} {unentitled[1]}, identity linked {linked}, sessions {sessions}")
+                    f"stopped at {unentitled[0]} {unentitled[1]}, identity linked {before} -> {linked}"
+                    f"{' (by an earlier run)' if before == '1' else ''}, sessions {sessions}")
         return admin
 
     def ensure_model(self, admin):
@@ -633,16 +648,17 @@ class Check:
         watcher = threading.Thread(target=watch, daemon=True)
         watcher.start()
         restart = time.monotonic()
-        self.kubectl(["rollout", "restart", "deployment/omg"], capture=True)
         try:
-            self.kubectl(["rollout", "status", "deployment/omg", "--timeout=420s"], capture=True)
-        except self.env.SparkError:
+            self.kubectl(["rollout", "restart", "deployment/omg"], capture=True)
+            try:
+                self.kubectl(["rollout", "status", "deployment/omg", "--timeout=420s"], capture=True)
+            except self.env.SparkError:
+                self.record(3, "rolling-restart-no-failed-request", "fail", f"the rollout did not finish: {self.replica_failure()}")
+                return
+            rolled = round(time.monotonic() - restart)
+        finally:
             stop.set()
-            self.record(3, "rolling-restart-no-failed-request", "fail", f"the rollout did not finish: {self.replica_failure()}")
-            return
-        rolled = round(time.monotonic() - restart)
-        stop.set()
-        watcher.join()
+            watcher.join()
         # Load covers the whole rollout and ten seconds after it, then stops
         # at the marker (a pod that already ended stopped too early).
         time.sleep(10)
@@ -736,8 +752,10 @@ class Check:
         owner = None
         for pod, port in zip(self.gateway_pods(), METRICS_PORTS):
             child = self.forward(f"pod/{pod['metadata']['name']}", [f"{port}:9464"])
-            status, _, _, body = Http(port).request("GET", "/metrics")
-            self.stop(child)
+            try:
+                status, _, _, body = Http(port, child=child).request("GET", "/metrics")
+            finally:
+                self.stop(child)
             if status == 200 and re.search(rf'^gateway_work_leases_held\{{lease="{lease}"\}} 1$', body.decode(), re.M):
                 owner = pod["metadata"]["name"]
         if owner is None:
@@ -776,8 +794,7 @@ class Check:
             return
         clients = []
         for pod, port in zip(pods, POD_PORTS):
-            self.forward(f"pod/{pod}", [f"{port}:8080"])
-            clients.append(Http(port))
+            clients.append(Http(port, child=self.forward(f"pod/{pod}", [f"{port}:8080"])))
         a, b = clients
         _, before = models(b, key)
         if before is None or MODEL not in before:
@@ -801,7 +818,8 @@ class Check:
                     break
                 time.sleep(0.01)
             timings.append(seen)
-            time.sleep(1.5)
+            # A random spacing, so no change lands at a fixed phase of the poll.
+            time.sleep(1.0 + secrets.randbelow(1000) / 1000)
         ok = all(t is not None and t <= 300 for t in timings)
         self.expect(5, "change-crosses-replicas", ok,
                     f"through {pods[0][-5:]}, seen through {pods[1][-5:]} after {', '.join(str(t) for t in timings)} ms (disable, enable, three times)")
@@ -817,15 +835,28 @@ class Check:
                 self.record(6, "network-policy", "fail", "the platform now allows NetworkPolicy, but this environment was created without it: recreate it")
             return
         outcomes = {}
-        for pod, label in (("omg-check-allowed", ALLOWED_CLIENT), ("omg-check-refused", REFUSED_CLIENT)):
-            self.kubectl(["apply", "-f", "-"], stdin=fill((DEPLOY / "probe-pod.yaml").read_text(), {"NAME": pod, "LABEL": label}), capture=True)
-        for pod in ("omg-check-allowed", "omg-check-refused"):
+        pods = (("omg-check-allowed", ALLOWED_CLIENT), ("omg-check-refused", REFUSED_CLIENT))
+        for pod, label in pods:
+            # A fresh pod each run: never the result of an earlier one.
+            self.kubectl(["delete", "pod", pod, "--ignore-not-found", "--wait=true", "--timeout=60s"], capture=True)
+            self.kubectl(["create", "-f", "-"], stdin=fill((DEPLOY / "probe-pod.yaml").read_text(), {"NAME": pod, "LABEL": label}), capture=True)
+        for pod, _ in pods:
             self.kubectl(["wait", "--for=jsonpath={.status.phase}=Succeeded", f"pod/{pod}", "--timeout=120s"], capture=True)
-            outcomes[pod] = json.loads(self.kubectl(["logs", f"pod/{pod}"], capture=True).strip().splitlines()[-1]).get("probe")
-        self.expect(6, "network-policy-allows-a-client", outcomes["omg-check-allowed"] == 200,
-                    f"{ALLOWED_CLIENT}: {outcomes['omg-check-allowed']} ({len(policies)} policies)")
-        self.expect(6, "network-policy-refuses-another-pod", outcomes["omg-check-refused"] in ("timeout", "refused"),
-                    f"{REFUSED_CLIENT}: {outcomes['omg-check-refused']}")
+            lines = self.kubectl(["logs", f"pod/{pod}"], capture=True).strip().splitlines()
+            outcomes[pod] = json.loads(lines[-1]) if lines else {}
+        allowed, refused = outcomes["omg-check-allowed"], outcomes["omg-check-refused"]
+        self.expect(6, "network-policy-allows-a-client", allowed.get("control") == 200 and allowed.get("probe") == 200,
+                    f"{ALLOWED_CLIENT}: control {allowed.get('control')}, gateway {allowed.get('probe')} ({len(policies)} chart policies)")
+        # The refused pod has a working network (it reaches the free model,
+        # which the chart's policy does not cover), so a timeout is the policy.
+        if refused.get("control") == 200 and refused.get("probe") == 200:
+            others = sorted(set(self.kubectl(["get", "networkpolicy", "-o", "name"], capture=True).split()) - set(policies))
+            if others:
+                self.record(6, "network-policy-refuses-another-pod", "skip",
+                            f"another policy in the namespace ({len(others)}) admits {REFUSED_CLIENT}: policies add up, so the chart's refusal cannot be shown here")
+                return
+        self.expect(6, "network-policy-refuses-another-pod", refused.get("control") == 200 and refused.get("probe") in ("timeout", "refused"),
+                    f"{REFUSED_CLIENT}: control {refused.get('control')}, gateway {refused.get('probe')}")
 
     def pooler_step(self):
         pooler = set(self.kubectl(["get", "pods", "-l", "cnpg.io/poolerName=omg-pooler", "-o", "jsonpath={.items[*].status.podIP}"], capture=True).split())
@@ -835,7 +866,9 @@ class Check:
             "FROM pg_stat_activity WHERE usename='gateway_runtime' AND client_addr IS NOT NULL").split()]
         via_pooler = sum(1 for address, _ in rows if address in pooler)
         listening = {address for address, kind in rows if address in gateways and kind == "listen"}
-        other_direct = sum(1 for address, kind in rows if address in gateways and kind != "listen")
+        # Any address but the pooler's: a current replica, or one still
+        # terminating after step 4 (whose LISTEN session may linger).
+        other_direct = sum(1 for address, kind in rows if address not in pooler and kind != "listen")
         # PgBouncer's transaction mode cannot carry LISTEN, so each replica
         # holds one direct LISTEN session by design; anything else goes
         # through the pooler.
