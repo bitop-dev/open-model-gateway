@@ -692,7 +692,7 @@ async fn finish_unobserved(
     crate::telemetry::mark_phase(crate::telemetry::SpanName::SettlementRead);
     // Scoped: the reservation's totals rows, held from here to commit (its
     // triggers then take the counter rows in canonical order).
-    lock_rows(store, &mut tx, &[r.touch()], false).await?;
+    lock_rows(store, &mut tx, &[r.touch()], None).await?;
     timer.phase("lock_rows");
     crate::telemetry::mark_phase(crate::telemetry::SpanName::SettlementTotalsLocks);
     // One statement (one round trip while the totals rows are held): the

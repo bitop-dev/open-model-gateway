@@ -79,6 +79,7 @@ fn http_status(error: InferenceError) -> StatusCode {
         InferenceError::Configuration
         | InferenceError::PriceUnbounded
         | InferenceError::Storage
+        | InferenceError::ScopeBusy
         | InferenceError::RouteCoolingDown(_) => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
@@ -131,7 +132,10 @@ fn openai_error_body(error: InferenceError) -> serde_json::Value {
         InferenceError::TokenReservationExceedsLimit(_) | InferenceError::JobLimitExceeded(_)
     ) {
         "rate_limit_error"
-    } else if matches!(error, InferenceError::RouteCoolingDown(_)) {
+    } else if matches!(
+        error,
+        InferenceError::RouteCoolingDown(_) | InferenceError::ScopeBusy
+    ) {
         // OpenAI's type for transient server-side unavailability (HTTP 5xx).
         "server_error"
     } else {
@@ -283,5 +287,37 @@ mod tests {
         );
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
         assert!(missing.headers().get("retry-after").is_none());
+    }
+
+    /// A shed admission (nothing admitted or sent) is a retryable 503 with an
+    /// honest `Retry-After`, on every wire shape and for batch lines.
+    #[test]
+    fn a_shed_admission_is_a_retryable_503_with_retry_after() {
+        let error = InferenceError::ScopeBusy;
+        let response = error_with_body(error, openai_error_body(error));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers()["retry-after"],
+            crate::inference::error::SCOPE_BUSY_RETRY_SECONDS
+                .to_string()
+                .as_str()
+        );
+        assert!(response.headers().get("x-should-retry").is_none());
+        let body = openai_error_body(error);
+        assert_eq!(body["error"]["type"], "server_error");
+        assert_eq!(body["error"]["code"], "scope_busy");
+        assert_eq!(
+            messages::batch_error_body(error)["error"]["type"],
+            "overloaded_error"
+        );
+        assert_eq!(batch_line_error(false, error).0, 503);
+        // Failed over and retried like `Busy`: nothing was sent.
+        let plan = crate::routing::RoutePlan {
+            deployment_ids: Vec::new(),
+            max_attempts: 2,
+            allow_ambiguous_failover: false,
+        };
+        assert!(crate::routing::may_failover(&plan, error));
+        assert!(crate::routing::may_fail_over_unsent(&plan, error));
     }
 }

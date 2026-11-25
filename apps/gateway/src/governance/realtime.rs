@@ -161,10 +161,11 @@ pub async fn reserve_window(
     window: ResponseBound,
     armed: Option<ResponseBound>,
 ) -> Result<(), InferenceError> {
-    let _queued = gate(&store.lock_gates.admission).await;
+    let deadline = admission_deadline();
+    let _queued = admission_gate(store, deadline).await?;
     locks::retry_deadlocks!(
         "admission",
-        reserve_window_once(store, principal, id, model, window, armed).await
+        reserve_window_once(store, principal, id, model, window, armed, deadline).await
     )
 }
 #[cfg_attr(not(test), expect(clippy::too_many_lines, reason = "#499"))]
@@ -175,12 +176,13 @@ async fn reserve_window_once(
     model: &str,
     window: ResponseBound,
     armed: Option<ResponseBound>,
+    deadline: tokio::time::Instant,
 ) -> Result<(), InferenceError> {
     // What an elapsed realtime deadline was waiting on (#497).
     settlement_waiting(Waiting::Connection);
-    let mut tx = crate::db::begin(&store.pool).await.map_err(begin_storage)?;
+    let mut tx = admission_begin(store, deadline).await?;
     settlement_waiting(Waiting::Database);
-    admission_prefix(store, &mut tx, principal).await?;
+    admission_prefix(store, &mut tx, principal, deadline).await?;
     let (lineage, _shared) = authorize(store, &mut tx, principal).await?;
     let s = session(&mut tx, id).await?;
     if s.workspace_id != principal.workspace_id
@@ -228,7 +230,7 @@ async fn reserve_window_once(
             api_key: s.api_key_id,
             at: s.admitted_at,
         }],
-        true,
+        Some(deadline),
     )
     .await?;
     let policies = sqlx::query_as::<_, Policy>(POLICIES)
@@ -483,7 +485,7 @@ async fn settle_response_once(
             api_key: s.api_key_id,
             at: s.admitted_at,
         }],
-        false,
+        None,
     )
     .await?;
     sqlx::query("UPDATE realtime_responses SET state=$3,status=$4,actual_microusd=$5,floor_microusd=$6,unbounded_cost=unbounded_cost OR $7,input_text_tokens=$8,cached_text_tokens=$9,input_audio_tokens=$10,cached_audio_tokens=$11,output_text_tokens=$12,output_audio_tokens=$13,cost_components=$14,completed_at=clock_timestamp() WHERE execution_id=$1 AND sequence=$2")
@@ -639,7 +641,7 @@ async fn finish_once(store: &Store, record: &RealtimeFinish) -> Result<Finished,
         ..MeterUsage::default()
     };
     let meter_json = serde_json::to_value(meters).map_err(|_| InferenceError::Storage)?;
-    lock_rows(store, &mut tx, &[r.touch()], false).await?;
+    lock_rows(store, &mut tx, &[r.touch()], None).await?;
     let changed = sqlx::query("UPDATE inference_executions SET state=$2,error_code=$3,input_tokens=$4,output_tokens=$5,billing_usage=NULL,elapsed_ms=$6,completed_at=clock_timestamp(),meter_usage=$7,finish_reason=$8,time_to_first_token_ms=$9,generation_ms=$10 WHERE id=$1 AND state='started'")
         .bind(record.id).bind(record.outcome.as_str()).bind(record.error.map(|e| e.code()))
         .bind(input).bind(output).bind(record.elapsed_ms.min(i64::MAX as u64) as i64).bind(&meter_json)

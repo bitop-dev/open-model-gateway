@@ -198,7 +198,7 @@ pub(super) async fn resolve(
                 at: r.admitted_at,
             })
             .collect();
-        locks::rows(&mut tx, &touches, false).await?;
+        locks::rows(&mut tx, &touches, false, None).await?;
         let reason = p.reason.as_deref().ok_or_else(invalid)?;
         settle(&mut tx, &eligible, u.user_id(), reason).await?;
         audit(&mut tx, &eligible, u.user_id(), reason).await?;

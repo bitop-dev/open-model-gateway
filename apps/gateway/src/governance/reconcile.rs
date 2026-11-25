@@ -43,7 +43,7 @@ async fn reconcile_batch(store: &Store, batch: i64) -> Result<usize, InferenceEr
                 at: d.3,
             })
             .collect();
-        lock_rows(store, &mut tx, &touches, false).await?;
+        lock_rows(store, &mut tx, &touches, None).await?;
         let claimed: Vec<Uuid> = due.iter().map(|d| d.0).collect();
         let ids: Vec<Uuid> = sqlx::query_scalar("UPDATE governance_reservations SET state='unknown' WHERE execution_id=ANY($1) AND state='pending' RETURNING execution_id")
             .bind(&claimed)
@@ -264,7 +264,7 @@ async fn resolve_usage_once(
     }
     let value = pinned_value(&mut tx, &r, usage).await?;
     let actual = value.actual.ok_or(InferenceError::Configuration)?;
-    lock_rows(store, &mut tx, &[r.touch()], false).await?;
+    lock_rows(store, &mut tx, &[r.touch()], None).await?;
     sqlx::query("UPDATE governance_reservations SET state='settled',actual_microusd=$2,input_tokens=$3,output_tokens=$4,billing_usage=$5,cost_components=$6,meter_usage=$7,output_image_variant=$8,provider_cost_microusd=$9 WHERE execution_id=$1 AND admitted_at=$10").bind(execution).bind(actual).bind(input).bind(output).bind(&billing).bind(value.components.map(|c|c.to_value())).bind(&m.meters).bind(&m.variant).bind(m.provider_cost).bind(r.admitted_at).execute(&mut *tx).await.map_err(storage)?;
     sqlx::query("UPDATE inference_executions SET input_tokens=$2,output_tokens=$3,billing_usage=$4,meter_usage=$5,output_image_variant=$6,provider_cost_microusd=$7 WHERE id=$1 AND started_at=$8").bind(execution).bind(input).bind(output).bind(billing).bind(m.meters).bind(m.variant).bind(m.provider_cost).bind(r.admitted_at).execute(&mut *tx).await.map_err(storage)?;
     ledger(

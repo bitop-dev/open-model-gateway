@@ -286,9 +286,10 @@ async fn admit_batch_unobserved(
         .filter(|n| (1..=crate::jobs::types::BATCH_MAX_REQUESTS as i32).contains(n))
         .ok_or(InferenceError::Configuration)?;
     let workspace = record.principal.workspace_id;
-    let _queued = gate(&store.lock_gates.admission).await;
-    let mut tx = crate::db::begin(&store.pool).await.map_err(begin_storage)?;
-    admission_prefix(store, &mut tx, &record.principal).await?;
+    let admit_by = admission_deadline();
+    let _queued = admission_gate(store, admit_by).await?;
+    let mut tx = admission_begin(store, admit_by).await?;
+    admission_prefix(store, &mut tx, &record.principal, admit_by).await?;
     let (lineage, _shared) = authorize(store, &mut tx, &record.principal).await?;
     let (mut tokens, mut held) = (0i64, 0i64);
     let mut pinned: Option<(Uuid, PriceTier)> = None;
@@ -343,7 +344,7 @@ async fn admit_batch_unobserved(
             api_key: record.principal.key_id,
             at: now,
         }],
-        true,
+        Some(admit_by),
     )
     .await?;
     enforce_limits(
@@ -492,9 +493,10 @@ async fn admit_line_unobserved(
         return Err(InferenceError::Configuration);
     }
     let workspace = record.principal.workspace_id;
-    let _queued = gate(&store.lock_gates.admission).await;
-    let mut tx = crate::db::begin(&store.pool).await.map_err(begin_storage)?;
-    admission_prefix(store, &mut tx, &record.principal).await?;
+    let admit_by = admission_deadline();
+    let _queued = admission_gate(store, admit_by).await?;
+    let mut tx = admission_begin(store, admit_by).await?;
+    admission_prefix(store, &mut tx, &record.principal, admit_by).await?;
     let (lineage, _shared) = authorize(store, &mut tx, &record.principal).await?;
     // After the scope locks and before the reservation rows: a runner that no
     // longer holds the batch admits nothing for it.
@@ -578,7 +580,7 @@ async fn admit_line_unobserved(
                 at: envelope_at,
             },
         ],
-        true,
+        Some(admit_by),
     )
     .await?;
     enforce_limits(
@@ -703,7 +705,7 @@ async fn close_batch_once(
                     api_key,
                     at,
                 }],
-                false,
+                None,
             )
             .await?;
         }

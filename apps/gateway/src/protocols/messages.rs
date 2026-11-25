@@ -462,6 +462,7 @@ fn error_body(e: InferenceError) -> Value {
         | InferenceError::JobLimitExceeded(_) => "rate_limit_error",
         InferenceError::UpstreamUnavailable
         | InferenceError::Overloaded
+        | InferenceError::ScopeBusy
         | InferenceError::RouteCoolingDown(_) => "overloaded_error",
         _ => "api_error",
     };

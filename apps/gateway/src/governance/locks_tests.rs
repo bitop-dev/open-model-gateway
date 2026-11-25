@@ -746,3 +746,117 @@ async fn scoped_admission_takes_no_authority_row_locks(pool: PgPool) {
     assert!(other.is_ok(), "{other:?}");
     tx.rollback().await.unwrap();
 }
+
+/// What an admission writes: executions, reservations, ledger entries, the
+/// in-flight and minute counters' sums and the held budget totals.
+async fn written(pool: &PgPool) -> (i64, i64, i64, i64, i64, i64) {
+    sqlx::query_as(
+        "SELECT (SELECT count(*) FROM inference_executions),(SELECT count(*) FROM governance_reservations),
+          (SELECT count(*) FROM monetary_ledger),(SELECT coalesce(sum(requests),0)::bigint FROM inflight_counters),
+          (SELECT coalesce(sum(requests),0)::bigint FROM rate_minute_counters),(SELECT coalesce(sum(held_microusd),0)::bigint FROM budget_totals)",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// An admission whose scope rows (or, globally, the installation row) are
+/// held past `ADMISSION_LOCK_WAIT` ends as `ScopeBusy` once the bound
+/// elapses, with nothing written: no execution, reservation, hold, in-flight
+/// or minute count. Its transaction rolled back, so no pooled session keeps
+/// the bound, and the key's per-minute rate allowance is unspent: the next
+/// admission of the minute (one per minute here) succeeds.
+#[dbtest::test]
+async fn an_admission_past_its_lock_bound_is_shed_and_leaves_nothing(pool: PgPool) {
+    let f = fixture(pool.clone()).await;
+    f.price(1_000_000).await;
+    f.policy("workspace_local_policies", Some(1), None, None, None)
+        .await;
+    let mode = f.store.admission_mode();
+    let before = written(&pool).await;
+    let held = hold_admission(&pool, mode, &f.principal).await;
+    let start = f.start();
+    let waited = std::time::Instant::now();
+    let shed = tokio::time::timeout(
+        ADMISSION_LOCK_WAIT + Duration::from_secs(3),
+        admit(&f.store, &start, &request(), 30),
+    )
+    .await;
+    let waited = waited.elapsed();
+    held.rollback().await.unwrap();
+    assert_eq!(
+        shed,
+        Ok(Err(InferenceError::ScopeBusy)),
+        "the admission is shed, not left waiting"
+    );
+    assert!(
+        waited >= ADMISSION_LOCK_WAIT && waited < ADMISSION_LOCK_WAIT + Duration::from_secs(1),
+        "shed when the bound elapsed: {waited:?}"
+    );
+    assert_eq!(
+        written(&pool).await,
+        before,
+        "a shed admission writes nothing"
+    );
+    let executions: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM inference_executions WHERE id=$1")
+            .bind(start.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(executions, 0);
+    // Every pooled session is back at the default: the bound was local to
+    // the rolled-back transaction.
+    let mut sessions = Vec::new();
+    for _ in 0..f.store.pool.options().get_max_connections() {
+        sessions.push(f.store.pool.acquire().await.unwrap());
+    }
+    for session in &mut sessions {
+        let timeout: String = sqlx::query_scalar("SELECT current_setting('lock_timeout')")
+            .fetch_one(&mut **session)
+            .await
+            .unwrap();
+        assert_eq!(timeout, "0");
+    }
+    drop(sessions);
+    // The minute's one admission is still available.
+    admit(&f.store, &f.start(), &request(), 30).await.unwrap();
+    verify_clean(&pool, "shed").await;
+}
+
+/// The bound is the admission's alone: a settlement waits for held rows
+/// (or, globally, the installation row) as long as they are held.
+#[dbtest::test]
+async fn a_settlement_waits_past_the_admission_bound(pool: PgPool) {
+    let f = fixture(pool.clone()).await;
+    f.price(1_000_000).await;
+    let mode = f.store.admission_mode();
+    let start = f.start();
+    admit(&f.store, &start, &request(), 30).await.unwrap();
+    let held = hold_admission(&pool, mode, &f.principal).await;
+    let record = done(start.id, Some(10), Some(5));
+    let settle = finish(&f.store, &record);
+    tokio::pin!(settle);
+    assert!(
+        tokio::time::timeout(
+            ADMISSION_LOCK_WAIT + Duration::from_millis(500),
+            &mut settle
+        )
+        .await
+        .is_err(),
+        "the settlement is still waiting past the admission bound"
+    );
+    held.commit().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), settle)
+        .await
+        .unwrap()
+        .unwrap();
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM governance_reservations WHERE execution_id=$1")
+            .bind(start.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "settled");
+    verify_clean(&pool, "settlement past the bound").await;
+}

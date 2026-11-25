@@ -661,6 +661,50 @@ async fn budget_exhaustion_sends_an_error_event_and_closes(pool: PgPool) {
     assert!(RESPONSE + hold(second, 1000) > BUDGET);
 }
 
+/// A `response.create` whose window growth waits past the admission lock
+/// bound (the scope's rows held elsewhere) is refused with a `scope_busy`
+/// error event before anything is reserved or forwarded; the session stays
+/// open and the next `response.create` is served.
+#[dbtest::test]
+async fn a_shed_response_create_is_refused_and_the_session_continues(pool: PgPool) {
+    let u = usage(10, 4, 20, 5, 10, 40);
+    let g = gateway(
+        pool,
+        Init::Safe,
+        vec![Reply::Done(u.clone()), Reply::Done(u)],
+        limits(),
+    )
+    .await;
+    let mut client = g.connect().await;
+    opened(&mut client).await;
+    speak(&mut client).await;
+    respond(&mut client).await;
+    let mut held = g.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM budget_totals WHERE scope_kind='workspace' AND scope_id=$1 AND period='lifetime' FOR UPDATE")
+        .bind(g.keys.team_workspace_id)
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    send(
+        &mut client,
+        json!({"type":"response.create","event_id":"shed"}),
+    )
+    .await;
+    let error = until(&mut client, "error").await;
+    held.rollback().await.unwrap();
+    assert_eq!(error["error"]["code"], "scope_busy");
+    assert_eq!(error["error"]["type"], "server_error");
+    assert_eq!(error["error"]["event_id"], "shed");
+    assert_eq!(
+        g.mock.shared.received_of("response.create").len(),
+        1,
+        "the shed request is never forwarded"
+    );
+    // The session is open: the next request is served.
+    respond(&mut client).await;
+    assert_eq!(g.mock.shared.received_of("response.create").len(), 2);
+}
+
 /// A key revoked during a session: the next response's live re-check refuses
 /// it as authentication would (`authentication_error`, never
 /// `model_not_found`), with an error event and a policy close; nothing more

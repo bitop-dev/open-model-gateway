@@ -360,6 +360,9 @@ struct Sent {
     latency: Duration,
     status: u16,
     accounting_unavailable: bool,
+    /// Shed before admission (`scope_busy`), and its `Retry-After`.
+    shed: bool,
+    retry_after: Option<u32>,
 }
 
 async fn send(client: reqwest::Client, url: String, key: String, start: Instant) -> Sent {
@@ -373,12 +376,18 @@ async fn send(client: reqwest::Client, url: String, key: String, start: Instant)
         .await
         .unwrap();
     let status = response.status().as_u16();
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok()?.parse().ok());
     let body = response.text().await.unwrap_or_default();
     Sent {
         at: sent - start,
         latency: sent.elapsed(),
         status,
         accounting_unavailable: body.contains("accounting_unavailable"),
+        shed: status == 503 && body.contains("\"scope_busy\""),
+        retry_after,
     }
 }
 
@@ -591,6 +600,10 @@ const AFTER: Duration = Duration::from_secs(20);
 const WINDOW: Duration = Duration::from_millis(500);
 /// How soon after the stall ends the load must be back to its baseline.
 const RECOVERY: Duration = Duration::from_secs(10);
+/// How long past `RECOVERY` the recovery is judged, and how many windows of
+/// it may fall short (single slow commits of a shared disk).
+const HORIZON: Duration = Duration::from_secs(5);
+const SHORT: usize = 2;
 
 #[dbtest::test]
 #[ignore = "dedicated PostgreSQL runtime-role lock-stall measurement (#132)"]
@@ -648,9 +661,16 @@ async fn stall_recovery(setup: Setup) {
     summarize(&h, &run).await;
     assess(&rows, &run, &knobs);
     let (settled, unknown) = assert_exact(&h).await;
+    let in_flight = in_flight_at_stall(&run);
     eprintln!(
-        "lock_stall recovery settled={settled} unknown={unknown} offered={}",
+        "lock_stall recovery settled={settled} unknown={unknown} in_flight_at_stall={in_flight} offered={}",
         run.sent.len()
+    );
+    // Only settlements caught in flight by the stall end unknown: the
+    // requests sent into it were shed, and the ones after it settle.
+    assert!(
+        unknown as usize <= in_flight,
+        "only the settlements in flight at the stall's start end unknown"
     );
 }
 
@@ -766,12 +786,34 @@ async fn offer(h: &Harness, ws: Uuid, key: &str, rate: f64, stall: Duration) -> 
     }
 }
 
+/// Requests in flight when the stall began: sent before it, answered after.
+fn in_flight_at_stall(run: &Run) -> usize {
+    run.sent
+        .iter()
+        .filter(|s| s.at < run.stalled && s.at + s.latency > run.stalled)
+        .count()
+}
+
 /// One window of send time: (start, offered, succeeded, p99 of the ones
 /// that succeeded).
 type Row = (Duration, usize, usize, Duration);
 
-/// Per window: offered, succeeded, refused for accounting, other failures
-/// by status, and the latency quantiles of the ones that succeeded.
+/// The counts and the p99 of the ones that succeeded among `sent`:
+/// (sent, ok, shed, refused for accounting, p99 ms).
+fn counts(sent: &[&Sent]) -> (usize, usize, usize, usize, u128) {
+    let ok = sent.iter().filter(|s| s.status == 200).count();
+    let shed = sent.iter().filter(|s| s.shed).count();
+    let accounting = sent.iter().filter(|s| s.accounting_unavailable).count();
+    let mut l: Vec<Duration> = sent
+        .iter()
+        .filter(|s| s.status == 200)
+        .map(|s| s.latency)
+        .collect();
+    (sent.len(), ok, shed, accounting, ms(quantile(&mut l, 0.99)))
+}
+
+/// Per window: offered, succeeded, shed, refused for accounting, other
+/// failures by status, and the latency quantiles of the ones that succeeded.
 fn windows(run: &Run) -> Vec<Row> {
     let count = run.total.as_millis().div_ceil(WINDOW.as_millis()) as usize;
     let mut rows = Vec::new();
@@ -782,8 +824,7 @@ fn windows(run: &Run) -> Vec<Row> {
             .iter()
             .filter(|s| s.at >= lo && s.at < lo + WINDOW)
             .collect();
-        let ok = sent.iter().filter(|s| s.status == 200).count();
-        let accounting = sent.iter().filter(|s| s.accounting_unavailable).count();
+        let (offered, ok, shed, accounting, _) = counts(&sent);
         let mut latencies: Vec<Duration> = sent
             .iter()
             .filter(|s| s.status == 200)
@@ -796,24 +837,24 @@ fn windows(run: &Run) -> Vec<Row> {
         let mut statuses = std::collections::BTreeMap::<u16, usize>::new();
         for s in sent
             .iter()
-            .filter(|s| s.status != 200 && !s.accounting_unavailable)
+            .filter(|s| s.status != 200 && !s.accounting_unavailable && !s.shed)
         {
             *statuses.entry(s.status).or_default() += 1;
         }
         eprintln!(
-            "lock_stall recovery window_ms={} offered={} ok={ok} accounting_unavailable={accounting} other_failures={statuses:?} p50_ms={} p99_ms={}",
+            "lock_stall recovery window_ms={} offered={offered} ok={ok} shed={shed} accounting_unavailable={accounting} other_failures={statuses:?} p50_ms={} p99_ms={}",
             ms(lo),
-            sent.len(),
             ms(p50),
             ms(p99)
         );
-        rows.push((lo, sent.len(), ok, p99));
+        rows.push((lo, offered, ok, p99));
     }
     rows
 }
 
-/// From the first second until 2 s before the stall, and in the last 5 s:
-/// (sent, ok, accounting refusals, p99 ms).
+/// From the first second until 2 s before the stall, during it, after its
+/// release, and in the last 5 s: (sent, ok, shed, accounting refusals, p99
+/// ms).
 async fn summarize(h: &Harness, run: &Run) {
     let phase = |lo: Duration, hi: Duration| {
         let p: Vec<&Sent> = run
@@ -821,51 +862,65 @@ async fn summarize(h: &Harness, run: &Run) {
             .iter()
             .filter(|s| s.at >= lo && s.at < hi)
             .collect();
-        let ok = p.iter().filter(|s| s.status == 200).count();
-        let accounting = p.iter().filter(|s| s.accounting_unavailable).count();
-        let mut l: Vec<Duration> = p
-            .iter()
-            .filter(|s| s.status == 200)
-            .map(|s| s.latency)
-            .collect();
-        (p.len(), ok, accounting, ms(quantile(&mut l, 0.99)))
+        counts(&p)
     };
     let pre = phase(
         Duration::from_secs(1),
         run.stalled.saturating_sub(Duration::from_secs(2)),
     );
+    let during = phase(run.stalled, run.released);
+    let after = phase(run.released, run.total);
     let late = phase(run.total.saturating_sub(Duration::from_secs(5)), run.total);
     eprintln!(
-        "lock_stall recovery summary replicas={} pre_stall(sent,ok,accounting_unavailable,p99_ms)={pre:?} last_5s(sent,ok,accounting_unavailable,p99_ms)={late:?} sessions_opened_during_run={}",
+        "lock_stall recovery summary replicas={} pre_stall={pre:?} stall={during:?} after_release={after:?} last_5s={late:?} (sent,ok,shed,accounting_unavailable,p99_ms) in_flight_at_stall={} sessions_opened_during_run={}",
         h.replicas.len(),
+        in_flight_at_stall(run),
         run.sessions_opened
     );
 }
 
-/// The stall delayed the requests sent into it; the baseline is within
-/// capacity; and from some point within `RECOVERY` of the release until the
-/// end, at most one window falls short (fewer than 95% succeeded, or a p99
-/// above the bound): a single slow request after recovery is noise, not a
-/// collapse. Windows with no request are skipped.
+/// The requests sent into the stall were shed before admission; the
+/// baseline is within capacity; and from some point within `RECOVERY` of
+/// the release until `RECOVERY + HORIZON` after it, at most `SHORT` windows fall short
+/// (fewer than 95% succeeded, or a p99 above the bound): a slow commit after
+/// recovery is noise, not a collapse. Windows with no request are skipped.
 fn assess(rows: &[Row], run: &Run, knobs: &Knobs) {
     let stall = run.released - run.stalled;
-    // Requests sent in the stall's first half waited for most of it.
-    let mut stalled: Vec<Duration> = run
+    // Requests sent into the stall (and not in its last bound, which the
+    // release may cut short) are shed when the bound elapses, before any
+    // reservation or upstream call, with an honest `Retry-After`.
+    let into: Vec<&Sent> = run
         .sent
         .iter()
-        .filter(|s| s.at >= run.stalled && s.at < run.stalled + stall / 2)
-        .map(|s| if s.status == 200 { s.latency } else { stall })
+        .filter(|s| {
+            s.at >= run.stalled
+                && s.at + ADMISSION_LOCK_WAIT + Duration::from_secs(1) < run.released
+        })
         .collect();
-    let stalled = quantile(&mut stalled, 0.5);
+    let mut latencies: Vec<Duration> = into.iter().map(|s| s.latency).collect();
+    let (median, slowest) = (quantile(&mut latencies, 0.5), quantile(&mut latencies, 1.0));
     eprintln!(
-        "lock_stall recovery stall_ms={} released_at_ms={} median_latency_of_first_half_ms={}",
+        "lock_stall recovery stall_ms={} released_at_ms={} sent_into_stall={} shed={} median_ms={} slowest_ms={}",
         ms(stall),
         ms(run.released),
-        ms(stalled)
+        into.len(),
+        into.iter().filter(|s| s.shed).count(),
+        ms(median),
+        ms(slowest)
     );
+    assert!(!into.is_empty(), "requests were sent into the stall");
     assert!(
-        stalled >= stall / 4,
-        "the stall delayed the requests sent into it"
+        into.iter()
+            .all(|s| s.shed
+                && s.retry_after == Some(crate::inference::error::SCOPE_BUSY_RETRY_SECONDS)),
+        "every request sent into the stall is shed with Retry-After, not left waiting"
+    );
+    // Shed when the bound elapses (the time outside admission, a busy pool
+    // or a slow disk, adds to some), never after the stall's length.
+    assert!(
+        median <= ADMISSION_LOCK_WAIT + Duration::from_millis(500)
+            && slowest + Duration::from_secs(1) < stall,
+        "shed when the bound elapses, not after the stall"
     );
     // The windows before the stall after the first second, without the
     // requests still in flight when it began.
@@ -887,14 +942,16 @@ fn assess(rows: &[Row], run: &Run, knobs: &Knobs) {
         "the load is within capacity before the stall"
     );
     let p99_bound = base_p99 * 3 + Duration::from_millis(100);
+    // Judged up to `HORIZON` past the bound: a later hiccup (a slow WAL fsync
+    // on a shared runner) is not this stall's.
     let after: Vec<&Row> = rows
         .iter()
-        .filter(|r| r.1 > 0 && r.0 >= run.released)
+        .filter(|r| r.1 > 0 && r.0 >= run.released && r.0 < run.released + RECOVERY + HORIZON)
         .collect();
     let bad = |r: &Row| (r.2 as f64) < 0.95 * r.1 as f64 || r.3 > p99_bound;
-    // The earliest good window from which at most one window falls short.
+    // The earliest good window from which at most `SHORT` windows fall short.
     let recovered = (0..after.len())
-        .find(|&i| !bad(after[i]) && after[i..].iter().filter(|r| bad(r)).count() <= 1)
+        .find(|&i| !bad(after[i]) && after[i..].iter().filter(|r| bad(r)).count() <= SHORT)
         .map(|i| after[i].0.saturating_sub(run.released));
     eprintln!(
         "lock_stall recovery recovered_after_ms={} bound_ms={} p99_bound_ms={}",

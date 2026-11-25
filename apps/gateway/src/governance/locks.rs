@@ -229,10 +229,18 @@ pub(crate) struct Touch {
 /// every minute and in-flight counter row) the writes `touches` will change,
 /// creating missing rows as zeros. The next statement reads the latest
 /// committed values of the held rows.
+///
+/// With `bound`, each lock wait of this one statement ends after `bound`
+/// with SQLSTATE 55P03 ([`is_lock_timeout`]): a transaction-local
+/// `lock_timeout`, set and restored to its previous value within the
+/// statement (each step reads the one before, so they run in that order),
+/// so no other statement of the transaction is bounded and the restore costs
+/// no round trip while the rows are held.
 pub(crate) async fn rows(
     tx: &mut Transaction<'_, Postgres>,
     touches: &[Touch],
     counters: bool,
+    bound: Option<std::time::Duration>,
 ) -> Result<(), sqlx::Error> {
     if touches.is_empty() {
         return Ok(());
@@ -240,14 +248,32 @@ pub(crate) async fn rows(
     let workspaces: Vec<Uuid> = touches.iter().map(|t| t.workspace).collect();
     let keys: Vec<Uuid> = touches.iter().map(|t| t.api_key).collect();
     let ats: Vec<UtcInstant> = touches.iter().map(|t| t.at).collect();
-    sqlx::query("SELECT omg_lock_scope_rows($1,$2,$3,$4)")
+    let sql = if bound.is_some() {
+        "WITH b AS MATERIALIZED (SELECT current_setting('lock_timeout') AS before,set_config('lock_timeout',$5,true)),l AS MATERIALIZED (SELECT omg_lock_scope_rows($1,$2,$3,$4) FROM b) SELECT set_config('lock_timeout',b.before,true) FROM l,b"
+    } else {
+        "SELECT omg_lock_scope_rows($1,$2,$3,$4)"
+    };
+    let mut query = sqlx::query(sql)
         .bind(&workspaces)
         .bind(&keys)
         .bind(&ats)
-        .bind(counters)
-        .execute(&mut **tx)
-        .await?;
+        .bind(counters);
+    if let Some(bound) = bound {
+        query = query.bind(lock_timeout(bound));
+    }
+    query.execute(&mut **tx).await?;
     Ok(())
+}
+
+/// A `lock_timeout` value: whole milliseconds, at least 1 (0 would disable).
+pub(crate) fn lock_timeout(bound: std::time::Duration) -> String {
+    format!("{}ms", bound.as_millis().max(1))
+}
+
+/// Whether `error` is a lock wait that ran out of its `lock_timeout`
+/// (SQLSTATE 55P03).
+pub(crate) fn is_lock_timeout(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Database(e) if e.code().as_deref() == Some("55P03"))
 }
 
 /// Whether `error` is a deadlock the database resolved by aborting this
