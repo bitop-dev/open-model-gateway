@@ -395,6 +395,35 @@ test("gateway Deployment never runs as root and has a read-only root filesystem"
   assert.doesNotMatch(deployment, /automountServiceAccountToken: true/);
 });
 
+test("the default grace period covers the worst documented shutdown, with a margin", () => {
+  // The gateway's own bounds, from its source.
+  const source = (path) => readFileSync(join(root, "apps/gateway/src", path), "utf8");
+  const number = (text, pattern, what) => {
+    const match = text.match(pattern);
+    assert.ok(match, `${what} not found`);
+    return Number(match[1]);
+  };
+  const drainDefault = number(source("drain.rs"), /GATEWAY_SHUTDOWN_DRAIN_SECONDS"\)\s*\.unwrap_or_else\(\|_\| "(\d+)"/, "drain default");
+  const exporters = number(source("telemetry.rs"), /^const DRAIN: Duration = Duration::from_secs\((\d+)\);/m, "exporter budget");
+  const leases = number(source("leases.rs"), /pub const ALL: \[Self; (\d+)\]/, "lease count");
+  const release = number(source("leases.rs"), /const RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs\((\d+)\);/, "lease release");
+  const requestDefault = number(source("config.rs"), /"GATEWAY_REQUEST_TIMEOUT_SECONDS"\)\s*\.unwrap_or_else\(\|_\| "(\d+)"/, "request timeout default");
+  for (const [name, args] of Object.entries(profiles)) {
+    const rendered = helmTemplate(args);
+    const [deployment] = docsOfKind(rendered, "Deployment").filter((d) => /component: gateway/.test(d));
+    assert.ok(deployment, `${name}: gateway Deployment`);
+    const grace = number(deployment, /terminationGracePeriodSeconds: (\d+)/, `${name}: grace period`);
+    const preStop = number(deployment, /preStop:[\s\S]*?seconds: (\d+)/, `${name}: preStop sleep`);
+    const setting = (key, fallback) => {
+      const match = rendered.match(new RegExp(`${key}: "?(\\d+)"?`));
+      return match ? Number(match[1]) : fallback;
+    };
+    const budget = preStop + setting("GATEWAY_SHUTDOWN_DRAIN_SECONDS", drainDefault)
+      + setting("GATEWAY_REQUEST_TIMEOUT_SECONDS", requestDefault) + exporters + leases * release;
+    assert.ok(budget + 10 <= grace, `${name}: a stopping pod may need ${budget} s; the grace period is ${grace} s`);
+  }
+});
+
 test("gateway probes are httpGet, never exec (distroless has no shell)", () => {
   const rendered = helmTemplate(["-f", join(chart, "ci/external-db-values.yaml")]);
   const [deployment] = docsOfKind(rendered, "Deployment");

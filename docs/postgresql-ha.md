@@ -196,7 +196,7 @@ Measured on the same setup at 60 requests/s (#25):
 
 Measured on bitop-talos (#25):
 
-- **Graceful pod delete:** the replica finished its in-flight work before exiting (3,600 of 3,600 requests succeeded). The chart allows `gateway.terminationGracePeriodSeconds: 150`, which is longer than the default 120 s request timeout plus the 10 s `preStop` sleep.
+- **Graceful pod delete:** the replica finished its in-flight work before exiting (3,600 of 3,600 requests succeeded). The chart then allowed `gateway.terminationGracePeriodSeconds: 150`, longer than the default 120 s request timeout plus the 10 s `preStop` sleep; it is now 180 s, which also covers the drain window, the exporters and the lease release ([pod shutdown](kubernetes.md#pod-shutdown-and-rolling-restarts)).
 - **Hard kill mid-stream:** 28 streams were cut. All 28 reservations were reconciled as `unknown` with their holds kept.
 
 ## Synchronous or asynchronous replication

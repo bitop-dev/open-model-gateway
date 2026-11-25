@@ -402,12 +402,14 @@ A stopping gateway pod goes through these steps:
 A second SIGTERM or Ctrl-C ends the drain window at once. `GATEWAY_SHUTDOWN_DRAIN_SECONDS=0`
 closes idle connections at the signal, which is what the gateway did before the window existed.
 
-**Termination budget.** Steps 1 to 4 must fit in `gateway.terminationGracePeriodSeconds` (default
-150 s), or Kubernetes kills the process. With the defaults, a 120 s inference accepted at the end of
-the window gives 10 + 5 + 120 + 3 = 138 s before the lease release. That leaves 12 s, enough when the
-database answers but not for the 22 s worst case, which already exceeded 150 s before the window
-existed. Raise the grace period by as much as you raise the window, the request timeout or the
-`preStop` sleep.
+**Termination budget.** Steps 1 to 4 must fit in `gateway.terminationGracePeriodSeconds`, or
+Kubernetes kills the process. With the defaults, a 120 s inference accepted at the end of the window
+and a database that does not answer the lease release need 10 + 5 + 120 + 3 + 22 = 160 s. The default
+grace period is 180 s: that worst case plus 20 s for the process to exit. A pod that finishes sooner
+exits sooner, so the grace period only bounds a stuck pod. While a pod runs out its grace, its
+resources still count against a namespace's quota, and `kubectl drain` waits for it. Raise the grace
+period by as much as you raise the window, the request timeout or the `preStop` sleep;
+`tests/helm-chart.test.mjs` fails when the chart's own defaults no longer fit.
 
 **What remains.** A keep-alive connection that no client uses during the window is closed at step 3
 without a `Connection: close`. If a client sends a request on it at that instant, the request is
