@@ -28,7 +28,9 @@ MARKERS = "|".join(['unexpected-eof', 'eof', 'connection-reset', 'broken-pipe', 
 # The fixed shape of a failed copy's last line (#711): the category, the attempt, and
 # signals made only of fixed words and numbers.
 SIGNALS = (r"status (?:none|[1-5][0-9]{2}); oci-code [a-z-]+; request (?:none|[A-Z]+ [a-z-]+); "
-           r"host (?:none|ghcr\.io|other); transport (?:none|(?:" + MARKERS + r")(?:,(?:" + MARKERS + r"))*); stderr [0-9]+ lines(?: \(first 4096 bytes\))?")
+           r"host (?:none|ghcr\.io|other); transport (?:none|(?:" + MARKERS + r")(?:,(?:" + MARKERS + r"))*); stderr [0-9]+ lines(?: \(first 4096 bytes\))?"
+           # The first line's skeleton: reviewed words, statuses, punctuation and placeholders only.
+           r'; first-line "[a-z0-9\' :;,"()\[\]<>x\-…]{1,170}"')
 
 
 def copy_failed(category, attempt):
@@ -473,6 +475,52 @@ if kind == 'login':
                     self.assertEqual(code, 1)
                     self.assertEqual(sum(1 for r in self.records() if r["argv"][0] == "cp"), 1, err)
                     self.assertEqual(self.sleeps, [])
+
+    def test_the_first_line_skeleton_keeps_only_reviewed_words(self):
+        def sk(line):
+            return self.api.skeleton(io.BytesIO(line + b"\nsecond line " + TOKEN.encode() + b"\n"))
+        cases = (
+            # A path: a placeholder, the error words readable.
+            (b"Error: failed to open /home/runner/work/x/image.tar: no such file or directory",
+             "error: failed to open <x>: no such file or directory"),
+            # A bearer token and a key=value secret never survive.
+            (b"Error: Authorization: Bearer " + TOKEN.encode() + b" rejected; token=" + TOKEN.encode(),
+             "error: <x>: bearer <x> rejected; <x>"),
+            # A URL with a query that carries a token: one placeholder.
+            (b'Error: GET "https://ghcr.io/token?scope=repository%3Aa%3Apush&access_token=' + TOKEN.encode() + b'": unexpected EOF',
+             'error: get "https:<x>": unexpected eof'),
+            # Letter case carries nothing; words outside the list are placeholders.
+            (b"ERROR: Failed To Open hunter2Secret", "error: failed to open <x>"),
+            (b"Error: password supersecret", "error: password <x>"),
+            # Only a three-digit status survives among numbers.
+            (b"Error: response status code 503: 5000 12 0x1f", "error: response status code 503: <x>"),
+            # Control characters and non-ASCII text are placeholders.
+            ("Error: \x1b[31mrouge élève\x07".encode(), "error: <x>[<x>"),
+            # A realistic layout error.
+            (b'Error: failed to resolve "sha256:2f1c" in OCI layout: not found',
+             'error: failed to resolve "<x>:<x>" in oci layout: not found'),
+            (b"", "none"),
+        )
+        for line, expected in cases:
+            with self.subTest(expected=expected):
+                got = sk(line)
+                self.assertEqual(got, expected)
+                self.assertNotIn(TOKEN, got)
+        # Bounded in tokens and characters, whatever the line holds.
+        long = sk(b"error " * 200)
+        self.assertTrue(long.endswith(" \u2026") and len(long) <= self.api.SKELETON_CHARS + 2, long)
+        wide = sk(b" ".join([b"a"] * 30 + [b"x" * 50] * 30))
+        self.assertLessEqual(len(wide), self.api.SKELETON_CHARS + 2)
+        # A failed attempt reports it with the other signals, never the line itself.
+        line = b'Error: failed to push "ghcr.io/bitop-dev/x@sha256:aa": ' + TOKEN.encode()
+        def failed(args, **kwargs):
+            kwargs["stderr"].write(line + b"\n")
+            return subprocess.CompletedProcess(args, 1)
+        with mock.patch.object(self.api.subprocess, "run", side_effect=failed):
+            outcome = self.api.attempt_copy(self.tool, [], {}, self.base, IMAGE, 60)
+        self.assertIn('first-line "error: failed to push "<x>:<x>": <x>"', outcome[1])
+        self.assertNotIn(TOKEN, outcome[1])
+        self.assertNotIn("bitop", outcome[1])
 
     def test_signals_come_from_request_records_only(self):
         cases = (
