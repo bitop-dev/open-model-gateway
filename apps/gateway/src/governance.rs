@@ -528,6 +528,9 @@ pub(crate) async fn set_test_budget(
 mod diagnostic_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod image_tests;
+/// #132: dedicated lock-stall measurements (ignored; run alone).
+#[cfg(all(test, feature = "integration-tests"))]
+mod lock_stall_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod locks_tests;
 #[cfg(test)]
