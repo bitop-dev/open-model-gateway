@@ -186,6 +186,26 @@ fn local_only_refuses_egress_on_write_before_availability() {
 }
 
 #[test]
+fn a_platform_layer_states_local_only_on_every_write() {
+    // A PUT replaces the layer: an omitted `local_only` is refused, never
+    // stored as `false` (which would lift a type default's restriction).
+    for layer in [Layer::TypeDefault, Layer::WorkspaceOverride] {
+        assert_eq!(
+            write(layer, None, None, body(None, json!([secrets("block")]))).unwrap_err(),
+            Refusal::Invalid
+        );
+        for stated in [false, true] {
+            assert_eq!(
+                write(layer, None, None, body(Some(stated), json!([])))
+                    .unwrap()
+                    .0,
+                Some(stated)
+            );
+        }
+    }
+}
+
+#[test]
 fn a_local_layer_tightens_but_never_loosens_a_platform_rule() {
     let p = platform_with("monitor", false);
     let (target, _) = only_rule(&p);

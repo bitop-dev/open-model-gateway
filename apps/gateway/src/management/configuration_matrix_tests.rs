@@ -882,7 +882,7 @@ async fn every_json_management_write_rejects_unknown_fields_after_valid_control(
         "PUT",
         "/api/v1/platform/workspace-types/team/guardrails",
         &f.admin,
-        json!({"rules":[]})
+        json!({"local_only":false,"rules":[]})
     );
     case!(
         "guardrails::put_platform_workspace_guardrails",

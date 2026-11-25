@@ -57087,6 +57087,7 @@
         "additionalProperties": false,
         "properties": {
           "local_only": {
+            "description": "Required: a PUT replaces the whole layer, so the restriction is stated every time.",
             "type": "boolean"
           },
           "rules": {
@@ -57099,6 +57100,7 @@
           }
         },
         "required": [
+          "local_only",
           "rules"
         ],
         "type": "object"
@@ -57733,6 +57735,7 @@
         "additionalProperties": false,
         "properties": {
           "local_only": {
+            "description": "Required: a PUT replaces the whole layer, so the restriction is stated every time.",
             "type": "boolean"
           },
           "rules": {
@@ -57745,6 +57748,7 @@
           }
         },
         "required": [
+          "local_only",
           "rules"
         ],
         "type": "object"
@@ -80186,7 +80190,7 @@
         "x-omg-token-policy": "Scope"
       },
       "put": {
-        "description": "#840: replace the type default's rules (full set) and local_only; moves its revision forward by one; audited as guardrail_policy.updated with ids, actions and a pattern count. An entry keeps its id when it names one of this layer's rules; new entries get new ids. Tightening entries belong to local layers (400 here). Phase 1 (#840) stores and composes policies only: nothing inspects request text yet (enforced is false).",
+        "description": "#840: replace the type default's rules (full set) and local_only (required); moves its revision forward by one; audited as guardrail_policy.updated with ids, actions and a pattern count. An entry keeps its id when it names one of this layer's rules; new entries get new ids. Tightening entries belong to local layers (400 here). Phase 1 (#840) stores and composes policies only: nothing inspects request text yet (enforced is false).",
         "operationId": "put_api_v1_platform_workspace_types_by_kind_guardrails",
         "parameters": [
           {
@@ -81553,7 +81557,7 @@
         "x-omg-token-policy": "Scope"
       },
       "put": {
-        "description": "#840: replace the workspace's override (full set) and local_only; the override replaces the type default. Personal workspaces are addressable (platform-managed configuration). Phase 1 (#840) stores and composes policies only: nothing inspects request text yet (enforced is false).",
+        "description": "#840: replace the workspace's override (full set) and local_only (required); the override replaces the type default. Personal workspaces are addressable (platform-managed configuration). Phase 1 (#840) stores and composes policies only: nothing inspects request text yet (enforced is false).",
         "operationId": "put_api_v1_platform_workspaces_by_ws_guardrails",
         "parameters": [
           {

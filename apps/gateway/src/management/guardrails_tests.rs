@@ -38,7 +38,7 @@ async fn platform_layers_are_written_by_admins_and_read_by_auditors(pool: PgPool
         &f.admin,
         "PUT",
         TYPE_TEAM,
-        json!({"rules":[secrets("block"), custom(r"PROJECT-\d{4}")]}),
+        json!({"local_only":false,"rules":[secrets("block"), custom(r"PROJECT-\d{4}")]}),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -69,7 +69,7 @@ async fn platform_layers_are_written_by_admins_and_read_by_auditors(pool: PgPool
         &f.admin,
         "PUT",
         "/api/v1/platform/workspace-types/galaxy/guardrails",
-        json!({"rules":[]}),
+        json!({"local_only":false,"rules":[]}),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -77,7 +77,14 @@ async fn platform_layers_are_written_by_admins_and_read_by_auditors(pool: PgPool
     let id = read["rule_set"]["rules"][0]["id"].clone();
     let mut kept = secrets("monitor");
     kept["id"] = id.clone();
-    let (status, body) = call(&f.s, &f.admin, "PUT", TYPE_TEAM, json!({"rules":[kept]})).await;
+    let (status, body) = call(
+        &f.s,
+        &f.admin,
+        "PUT",
+        TYPE_TEAM,
+        json!({"local_only":false,"rules":[kept]}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["rule_set"]["revision"], 2);
     assert_eq!(body["rule_set"]["rules"][0]["id"], id);
@@ -208,7 +215,7 @@ async fn a_local_layer_cannot_loosen_a_platform_rule(pool: PgPool) {
         &f.admin,
         "PUT",
         TYPE_TEAM,
-        json!({"rules":[secrets("monitor")]}),
+        json!({"local_only":false,"rules":[secrets("monitor")]}),
     )
     .await;
     let target = platform["rule_set"]["rules"][0]["id"].clone();
@@ -257,7 +264,14 @@ async fn a_local_layer_cannot_loosen_a_platform_rule(pool: PgPool) {
         json!([body["local"]["rules"][0]["id"]])
     );
     // The platform rule is removed: the entry stays, inactive.
-    call(&f.s, &f.admin, "PUT", TYPE_TEAM, json!({"rules":[]})).await;
+    call(
+        &f.s,
+        &f.admin,
+        "PUT",
+        TYPE_TEAM,
+        json!({"local_only":false,"rules":[]}),
+    )
+    .await;
     let (_, read) = call(&f.s, &f.owner, "GET", &local(f.team), Value::Null).await;
     assert_eq!(
         read["effective"][0]["inactive_reason"],
@@ -288,7 +302,7 @@ async fn later_phase_rules_and_egress_are_refused_on_write(pool: PgPool) {
         &f.admin,
         "PUT",
         TYPE_TEAM,
-        json!({"rules":[redact.clone()]}),
+        json!({"local_only":false,"rules":[redact.clone()]}),
     )
     .await;
     assert_eq!(
@@ -297,7 +311,14 @@ async fn later_phase_rules_and_egress_are_refused_on_write(pool: PgPool) {
     );
     redact["input"]["action"] = json!("block");
     redact["output"] = json!({"mode":"monitor"});
-    let (status, body) = call(&f.s, &f.admin, "PUT", TYPE_TEAM, json!({"rules":[redact]})).await;
+    let (status, body) = call(
+        &f.s,
+        &f.admin,
+        "PUT",
+        TYPE_TEAM,
+        json!({"local_only":false,"rules":[redact]}),
+    )
+    .await;
     assert_eq!(
         (status, reason(&body)),
         (StatusCode::BAD_REQUEST, "guardrail_detector_unavailable")
@@ -443,7 +464,7 @@ async fn an_override_replaces_the_type_default_until_reset(pool: PgPool) {
         &f.admin,
         "PUT",
         TYPE_TEAM,
-        json!({"rules":[secrets("monitor")]}),
+        json!({"local_only":false,"rules":[secrets("monitor")]}),
     )
     .await;
     let (status, body) = call(
@@ -451,7 +472,7 @@ async fn an_override_replaces_the_type_default_until_reset(pool: PgPool) {
         &f.admin,
         "PUT",
         &platform_ws(f.team),
-        json!({"rules":[secrets("block"), custom("acme-[a-z]+")]}),
+        json!({"local_only":false,"rules":[secrets("block"), custom("acme-[a-z]+")]}),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -507,7 +528,7 @@ async fn the_database_refuses_writes_the_routes_would_refuse(pool: PgPool) {
         &f.admin,
         "PUT",
         &platform_ws(f.project),
-        json!({"rules":[secrets("monitor")]}),
+        json!({"local_only":false,"rules":[secrets("monitor")]}),
     )
     .await;
     let other: Uuid = sqlx::query_scalar("SELECT r.id FROM guardrail_rules r JOIN guardrail_rule_sets s ON s.id=r.rule_set_id WHERE s.workspace_id=$1").bind(f.project).fetch_one(&pool).await.unwrap();
@@ -552,7 +573,7 @@ async fn rules_change_only_with_their_sets_revision(pool: PgPool) {
         &f.admin,
         "PUT",
         &platform_ws(f.project),
-        json!({"rules":[secrets("monitor")]}),
+        json!({"local_only":false,"rules":[secrets("monitor")]}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);

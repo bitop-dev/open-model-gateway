@@ -81,8 +81,8 @@ fn supplied<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     Option::<T>::deserialize(d).map(Some)
 }
 
-/// The body of a layer's PUT. `local_only` only on platform layers. Only a
-/// JSON object: a positional array is refused.
+/// The body of a layer's PUT. `local_only` is required on platform layers and
+/// refused on a local one. Only a JSON object: a positional array is refused.
 pub struct LayerIn {
     local_only: Option<Option<bool>>,
     rules: Vec<Value>,
@@ -327,10 +327,11 @@ pub fn validate(
     cx: &WriteContext<'_>,
 ) -> Result<(Option<bool>, Vec<StoredRule>), Refusal> {
     let platform_layer = cx.layer != Layer::WorkspaceLocal;
+    // A PUT replaces the whole layer, so a platform layer states `local_only`
+    // every time: an omission never lifts an egress restriction by accident.
     let local_only = match (platform_layer, body.local_only) {
-        (true, None) => Some(false),
         (true, Some(Some(v))) => Some(v),
-        (_, Some(None)) | (false, Some(Some(_))) => return Err(Refusal::Invalid),
+        (true, None) | (_, Some(None)) | (false, Some(Some(_))) => return Err(Refusal::Invalid),
         (false, None) => None,
     };
     if body.rules.len() > MAX_RULES {

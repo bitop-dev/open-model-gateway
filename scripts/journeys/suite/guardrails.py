@@ -27,11 +27,13 @@ def guardrails(t):
     t.expect("guardrails.detectors", auditor.get("/api/v1/platform/guardrails/detectors"), 200)
     t.expect("guardrails.detectors-member-refused", alex.get("/api/v1/platform/guardrails/detectors"), 403)
     t.expect("guardrails.type-default-read", auditor.get("/api/v1/platform/workspace-types/team/guardrails"), 200)
-    t.expect("guardrails.type-default-auditor-write-refused", auditor.put("/api/v1/platform/workspace-types/team/guardrails", {"rules": []}), 403)
+    t.expect("guardrails.type-default-auditor-write-refused", auditor.put("/api/v1/platform/workspace-types/team/guardrails", {"local_only": False, "rules": []}), 403)
 
     # The platform override, with a monitor rule a workspace may tighten.
-    t.expect("guardrails.override-member-refused", alex.put(platform, {"rules": [SECRETS]}), 403)
-    written = operator.put(platform, {"rules": [SECRETS]})
+    t.expect("guardrails.override-member-refused", alex.put(platform, {"local_only": False, "rules": [SECRETS]}), 403)
+    # A PUT replaces the layer, so the egress restriction is stated every time.
+    t.expect("guardrails.override-local-only-required", operator.put(platform, {"rules": [SECRETS]}), 400)
+    written = operator.put(platform, {"local_only": False, "rules": [SECRETS]})
     t.expect("guardrails.override-write", written, 200)
     t.undo("remove guardrail override", lambda: operator.delete(platform))
     target = first(written.get("override", "rules")).get("id")

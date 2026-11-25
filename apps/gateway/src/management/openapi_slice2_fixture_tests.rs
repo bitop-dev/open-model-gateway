@@ -4219,7 +4219,7 @@ async fn guardrail_fixtures(
             admin,
             "PUT",
             TEAM_TYPE,
-            Some(json!({"rules":[{"name":"Secrets","protection":"secrets","detector":{"kind":"pattern","categories":["secret"]},"input":{"action":"off"},"on_error":"fail_open"}, custom("PROJECT-[0-9]{4}")]})),
+            Some(json!({"local_only":false,"rules":[{"name":"Secrets","protection":"secrets","detector":{"kind":"pattern","categories":["secret"]},"input":{"action":"off"},"on_error":"fail_open"}, custom("PROJECT-[0-9]{4}")]})),
         )
         .await;
     let rules = platform_rules(&team_type["rule_set"]);
@@ -4239,12 +4239,12 @@ async fn guardrail_fixtures(
         rule
     };
     // Type defaults with custom patterns (the personal one stays unwritten).
-    c.ok(admin, "PUT", TEAM_TYPE, Some(json!({"rules":[keep(&target, secrets("monitor")), keep(&custom_rule, custom("PROJECT-[0-9]{4}"))]}))).await;
+    c.ok(admin, "PUT", TEAM_TYPE, Some(json!({"local_only":false,"rules":[keep(&target, secrets("monitor")), keep(&custom_rule, custom("PROJECT-[0-9]{4}"))]}))).await;
     c.ok(
         admin,
         "PUT",
         PROJECT_TYPE,
-        Some(json!({"rules":[secrets("monitor"), custom("PROJECT-[0-9]{4}")]})),
+        Some(json!({"local_only":false,"rules":[secrets("monitor"), custom("PROJECT-[0-9]{4}")]})),
     )
     .await;
     c.ok(auditor, "GET", TEAM_TYPE, None).await;
@@ -4300,7 +4300,7 @@ async fn guardrail_fixtures(
         admin,
         "PUT",
         TEAM_TYPE,
-        Some(json!({"rules":[keep(&target, secrets("monitor")), custom("OTHER-[0-9]{4}")]})),
+        Some(json!({"local_only":false,"rules":[keep(&target, secrets("monitor")), custom("OTHER-[0-9]{4}")]})),
     )
     .await;
     c.ok(admin, "DELETE", &platform_team, None).await;
@@ -4318,7 +4318,7 @@ async fn guardrail_fixtures(
         admin,
         "PUT",
         &platform_personal,
-        Some(json!({"rules":[secrets("block")]})),
+        Some(json!({"local_only":false,"rules":[secrets("block")]})),
     )
     .await;
     c.ok(admin, "DELETE", &platform_personal, None).await;
