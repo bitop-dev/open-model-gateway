@@ -7,11 +7,18 @@ unless that file exists and names the Spark server, runs every tool with a scrub
 environment, and only ever creates, targets or deletes namespaces named
 <base>-omg-<name>. See AGENTS.md "Running a branch on the cluster".
 
-  up <name> --ref <branch|commit|release tag>   create the environment (about a minute)
+  up <name> --ref <branch|commit|release tag> [--mode demo|replicas]
+                                                create the environment (demo: about a minute)
   status [name]                                 list environments, or show one
-  forward <name>                                port-forward the demo (loopback only)
-  creds <name>                                  the passwordless demo accounts
+  forward <name>                                port-forward it (loopback only)
+  creds <name>                                  the demo accounts, or where a replicas environment keeps its own
+  check <name> [--summary file]                 the scripted rehearsal of a replicas environment
   down <name>                                   delete the namespace and everything in it
+
+`--mode replicas` deploys the chart as shipped (two gateway replicas, the
+CloudNativePG Pooler, the Service, the PodDisruptionBudget and, when the
+platform allows it, the chart's NetworkPolicy) in production mode, with its
+own issuer: see scripts/spark_replicas.py.
 
 The image, chart and demo issuer come from the ref; the Spark glue in deploy/spark comes
 from this checkout. Environments have no time limit: only `down` removes them. Order, as
@@ -55,6 +62,7 @@ SHA256 = re.compile(r"sha256:[0-9a-f]{64}")
 # creates, lists or touches them, and that script never touches <base>-omg-<name> environments.
 RESERVED_PREFIX = "test-"
 DEMO_PORTS = (3000, 18084)
+MODES = ("demo", "replicas")
 BOOTSTRAP_JOB = "omg-bootstrap-demo"
 ACCOUNTS = (
     ("Platform Admin", "operator@demo.invalid"),
@@ -80,6 +88,14 @@ CHILD_ENVIRONMENT = ("PATH", "HOME", "LANG", "TMPDIR", "SSL_CERT_FILE", "SSL_CER
 FIXED_ENVIRONMENT = {"KUBECTL_KUBERC": "false"}
 # Generated passwords of this process, removed from anything printed.
 _REGISTERED_SECRETS = []
+
+
+def write_private(path, text):
+    """Write a file only its owner can read (0600, also when it existed), never through a symbolic link."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    with os.fdopen(os.open(path, flags, 0o600), "w") as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        handle.write(text)
 
 
 class SparkError(RuntimeError):
@@ -174,10 +190,13 @@ def launch(command, stdin=None, capture=False, pipe_stderr=False):
                           stderr=subprocess.PIPE if pipe_stderr else None, env=child_environment())
 
 
-def launch_forward(command):
-    """Own exactly one forward child; parent-only signals cannot leave its listener behind."""
+def launch_forward(command, *more):
+    """Own the forward children (one per command); parent-only signals cannot leave a listener behind.
+
+    Returns when any child exits (its status) or a signal arrives; every other child is stopped."""
     received = None
     child = None
+    children = []
 
     def stopping(signum, _frame):
         nonlocal received
@@ -190,28 +209,35 @@ def launch_forward(command):
         # Record signals before spawning so a signal during Popen cannot lose the child handle.
         for sig in handlers:
             signal.signal(sig, stopping)
-        child = subprocess.Popen(command, env=child_environment(), start_new_session=True)
-        while received is None:
-            try:
-                code = child.wait(timeout=0.1)
+        for each in (command, *more):
+            child = subprocess.Popen(each, env=child_environment(), start_new_session=True)
+            children.append(child)
+            if received is not None:
                 break
+        code = None
+        while received is None:
+            codes = [c.poll() for c in children]
+            if any(c is not None for c in codes):
+                code = next(c for c in codes if c is not None)
+                break
+            try:
+                children[0].wait(timeout=0.1)
             except subprocess.TimeoutExpired:
                 continue
-        else:
-            code = None
     finally:
         try:
-            if child is not None and child.poll() is None:
-                # Signal the owned process handle only, never a PID search or a process group.
-                child.terminate()
-                try:
-                    child.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    child.kill()
+            for child in children:
+                if child.poll() is None:
+                    # Signal the owned process handle only, never a PID search or a process group.
+                    child.terminate()
                     try:
                         child.wait(timeout=3)
                     except subprocess.TimeoutExpired:
-                        raise SparkError("port-forward child did not exit after SIGKILL") from None
+                        child.kill()
+                        try:
+                            child.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            raise SparkError("port-forward child did not exit after SIGKILL") from None
         finally:
             for sig, handler in handlers.items():
                 signal.signal(sig, handler)
@@ -424,6 +450,15 @@ def port_is_free(port):
     return True
 
 
+def replicas_module():
+    """scripts/spark_replicas.py, loaded by path (`python3 -I` adds no script directory to sys.path)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("spark_replicas", Path(__file__).with_name("spark_replicas.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def creds_text(namespace):
     rows = "\n".join(f"  {title:<52} {email}" for title, email in ACCOUNTS)
     return (f"{namespace}: the demo is passwordless; there are no stored credentials.\n"
@@ -483,7 +518,9 @@ class Spark:
             time.sleep(3)
         raise SparkError(f"job {job} did not finish in {polls * 3} seconds; read its logs with: {self.logs_hint(namespace, f'job/{job}')}")
 
-    def up(self, name, ref):
+    def up(self, name, ref, mode="demo"):
+        if mode not in MODES:
+            raise SparkError(f"unknown mode {mode!r}: {' or '.join(MODES)}")
         namespace = namespace_for(self.base, name)
         resolved = resolve_ref(ref)
         tag = image_tag(resolved.name, resolved.sha, resolved.is_tag)
@@ -493,31 +530,48 @@ class Spark:
         if self.namespace_exists(namespace):
             raise SparkError(f"{namespace} already exists; run `down {name}` first")
         job, demo = (render((DEPLOY / file).read_text(), image) for file in ("bootstrap-job.yaml", "demo.yaml"))
-        print(f"{namespace}: {resolved.name} {resolved.sha[:12]} -> {repository}:{tag} ({digest[:19]}...)")
+        print(f"{namespace}: {resolved.name} {resolved.sha[:12]} -> {repository}:{tag} ({digest[:19]}...), mode {mode}")
+        started = time.monotonic() if mode == "replicas" else 0
         try:
             with tempfile.TemporaryDirectory() as source:
                 extract_ref(resolved.sha, source)
-                self.deploy(namespace, resolved, image, digest, source, job, demo)
+                if mode == "replicas":
+                    self.isolated(namespace)
+                    policy = replicas_module().Replicas(sys.modules[__name__], self).deploy(namespace, resolved, image, digest, source)
+                    if not policy:
+                        print(f"{namespace}: the platform refuses NetworkPolicy to this account; the chart's policy is not deployed.")
+                else:
+                    self.deploy(namespace, resolved, image, digest, source, job, demo)
         except BaseException:
             if self.touched:
                 print(f"{namespace} may have been created and is left behind. `status {name}` inspects it; `down {name}` removes it.", file=sys.stderr)
             raise
+        if mode == "replicas":
+            print(f"ready after {round(time.monotonic() - started)} s. Next: spark-env.py check {name}, or forward {name} and creds {name}. Remove with: spark-env.py down {name}")
+            return
         print(f"ready. Next: spark-env.py forward {name}, then open http://127.0.0.1:3000 (spark-env.py creds {name}). Remove with: spark-env.py down {name}")
 
-    def deploy(self, namespace, resolved, image, digest, source, job, demo):
+    def isolated(self, namespace):
+        """Create the namespace and wait for the platform's two isolation policies."""
         self.touched = namespace
         self.create_namespace(namespace)
         # Permissions arrive in seconds and the isolation policies a little later: wait for both.
         for _ in range(60):
             try:
                 if len(self.kubectl(["get", "networkpolicy", "-o", "name"], namespace=namespace, capture=True).split()) >= 2:
-                    break
+                    return
             except SparkError as error:
                 if "Forbidden" not in str(error):  # rights for a new namespace arrive a second or two late
                     raise
             time.sleep(2)
-        else:
-            raise SparkError(f"{namespace} never received its two network policies; refusing to deploy without isolation")
+        raise SparkError(f"{namespace} never received its two network policies; refusing to deploy without isolation")
+
+    def mode(self, namespace):
+        value = self.kubectl(["get", "configmap", "omg-spark-env", "--ignore-not-found", "-o", "jsonpath={.data.mode}"], namespace=namespace, capture=True).strip()
+        return value or "demo"
+
+    def deploy(self, namespace, resolved, image, digest, source, job, demo):
+        self.isolated(namespace)
         # `create`, not `apply`: apply would copy the passwords into the last-applied-configuration annotation.
         self.kubectl(["create", "-f", "-"], namespace=namespace, stdin=role_secrets())
         self.kubectl(["create", "configmap", "omg-spark-env", f"--from-literal=ref={resolved.name}", f"--from-literal=sha={resolved.sha}",
@@ -555,7 +609,21 @@ class Spark:
         return kubectl_command(self.config, self.base, ["port-forward", "--address", "127.0.0.1", "deployment/omg-demo", *ports], namespace_for(self.base, name))
 
     def forward(self, name):
-        self.environment(name)
+        namespace = self.environment(name)
+        if self.mode(namespace) == "replicas":
+            replicas = replicas_module().Replicas(sys.modules[__name__], self)
+            for port in (replicas_module().GATEWAY_PORT, replicas_module().ISSUER_PORT):
+                if not self.port_free(port):
+                    raise SparkError(f"local port {port} is already in use (only one environment can be forwarded at a time); stop what holds it and retry")
+            print(f"Forwarding the gateway Service to http://127.0.0.1:{replicas_module().GATEWAY_PORT} and the issuer to 127.0.0.1:{replicas_module().ISSUER_PORT}; "
+                  "Ctrl-C stops. Loopback only.")
+            try:
+                code = self.launcher(*replicas.forwards(namespace)).returncode
+            except KeyboardInterrupt:
+                return
+            if code:
+                raise SparkError(f"kubectl port-forward exited with status {code}")
+            return
         for port in DEMO_PORTS:
             if not self.port_free(port):
                 raise SparkError(f"local port {port} is already in use (only one environment can be forwarded at a time); stop what holds it and retry")
@@ -568,7 +636,27 @@ class Spark:
             raise SparkError(f"kubectl port-forward exited with status {code}")
 
     def creds(self, name):
-        print(creds_text(self.environment(name)), end="")
+        namespace = self.environment(name)
+        if self.mode(namespace) == "replicas":
+            print(replicas_module().Replicas(sys.modules[__name__], self).creds_text(namespace), end="")
+            return
+        print(creds_text(namespace), end="")
+
+    def check(self, name, summary=None):
+        """The scripted rehearsal of a replicas environment; exit status 1 on any failed step."""
+        namespace = self.environment(name)
+        if self.mode(namespace) != "replicas":
+            raise SparkError(f"{name} is a demo environment; `check` rehearses `--mode replicas` environments")
+        module = replicas_module()
+        result = module.Check(sys.modules[__name__], self, namespace).run()
+        result["environment"] = name
+        result["sha"] = self.kubectl(["get", "configmap", "omg-spark-env", "-o", "jsonpath={.data.sha}"], namespace=namespace, capture=True).strip()
+        result["quota_used"] = module.quota(self, namespace)
+        if summary:
+            write_private(summary, redact(json.dumps(result, indent=2)) + "\n")
+        print(f"{'passed' if result['passed'] else 'FAILED'} in {result['seconds']} s")
+        if not result["passed"]:
+            raise SystemExit(1)
 
     def down(self, name):
         namespace = self.environment(name)
@@ -587,18 +675,25 @@ def main(argv=None):
     up = commands.add_parser("up", help="create an environment from a ref", description="Create <name> from a branch, commit or release tag of this clone.")
     up.add_argument("name", help="2-20 characters: lowercase letters, digits, dashes")
     up.add_argument("--ref", required=True, help="branch, commit or release tag of this clone")
+    up.add_argument("--mode", choices=MODES, default="demo", help="demo (one passwordless loopback pod) or replicas (the chart as shipped)")
     status = commands.add_parser("status", help="list environments, or show one", description="Without a name, list the environments; with one, show its ref, pods, jobs and database.")
     status.add_argument("name", nargs="?", help="environment name")
-    for command, text in (("forward", "port-forward the demo to 127.0.0.1:3000 and :18084"), ("creds", "show the passwordless demo accounts"),
+    for command, text in (("forward", "port-forward the environment to loopback (demo: 127.0.0.1:3000 and :18084)"),
+                          ("creds", "show the demo accounts, or where a replicas environment keeps its own"),
                           ("down", "delete the environment's namespace")):
         commands.add_parser(command, help=text, description=text).add_argument("name", help="environment name")
+    check = commands.add_parser("check", help="rehearse a replicas environment", description="Sign-in, inference, a rolling restart under load, lease takeover, change notification, NetworkPolicy and the Pooler path on a --mode replicas environment.")
+    check.add_argument("name", help="environment name")
+    check.add_argument("--summary", help="write the JSON summary (statuses, counts, timings; no secrets) here")
     args = parser.parse_args(argv)
     try:
         spark = Spark(kubeconfig_path(os.environ))
-        require_tools(("kubectl", "helm", "git") if args.command == "up" else ("kubectl",))
+        require_tools(("kubectl", "helm", "git") + (("openssl",) if getattr(args, "mode", "") == "replicas" else ()) if args.command == "up" else ("kubectl",))
         if args.command == "up":
             require_tarfile_filters()
-            spark.up(args.name, args.ref)
+            spark.up(args.name, args.ref, args.mode)
+        elif args.command == "check":
+            spark.check(args.name, args.summary)
         elif args.command == "status":
             spark.status(args.name)
         else:

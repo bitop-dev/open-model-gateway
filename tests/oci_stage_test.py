@@ -28,7 +28,9 @@ MARKERS = "|".join(['unexpected-eof', 'eof', 'connection-reset', 'broken-pipe', 
 # The fixed shape of a failed copy's last line (#711): the category, the attempt, and
 # signals made only of fixed words and numbers.
 SIGNALS = (r"status (?:none|[1-5][0-9]{2}); oci-code [a-z-]+; request (?:none|[A-Z]+ [a-z-]+); "
-           r"host (?:none|ghcr\.io|other); transport (?:none|(?:" + MARKERS + r")(?:,(?:" + MARKERS + r"))*); stderr [0-9]+ lines(?: \(first 4096 bytes\))?")
+           r"host (?:none|ghcr\.io|other); transport (?:none|(?:" + MARKERS + r")(?:,(?:" + MARKERS + r"))*); stderr [0-9]+ lines(?: \(first 4096 bytes\))?"
+           # The first line's skeleton: reviewed words, statuses, punctuation and placeholders only.
+           r'; first-line "[a-z0-9\' :,<>\-…]{1,160}"')
 
 
 def copy_failed(category, attempt):
@@ -473,6 +475,64 @@ if kind == 'login':
                     self.assertEqual(code, 1)
                     self.assertEqual(sum(1 for r in self.records() if r["argv"][0] == "cp"), 1, err)
                     self.assertEqual(self.sleeps, [])
+
+    def test_the_first_line_skeleton_keeps_only_reviewed_words(self):
+        def sk(stderr):
+            return self.api.skeleton(io.BytesIO(stderr))
+        line = lambda text: text + b"\nsecond line " + TOKEN.encode() + b"\n"
+        cases = (
+            # A path is a placeholder; the error words stay readable.
+            (b"Error: failed to open /home/runner/work/x/image.tar: no such file or directory",
+             "error: failed to open <x>: no such file or directory"),
+            # A bearer token and a key=value secret never survive.
+            (b"Error: Bearer " + TOKEN.encode() + b" rejected; token=" + TOKEN.encode(), "error: bearer <x>"),
+            # A quoted segment (a reference, URL or value) is one placeholder,
+            # even when it holds listed words or a query with a colon.
+            (b'Error: GET "https://ghcr.io/token?scope=repository%3Aa%3Apush&access_token=' + TOKEN.encode() + b'": unexpected EOF',
+             "error: get <x>: unexpected eof"),
+            (b'Error: password "COPY"; host "cache"; file "config"; repository "backup"',
+             "error: <x> host <x> file <x> repository <x>"),
+            (b'Error: "https://registry.fixture.invalid/v2?fixture=opaque:copy"', "error: <x>"),
+            (b'Error: failed to resolve "sha256:2f1c" in OCI layout: not found',
+             "error: failed to resolve <x> in oci layout: not found"),
+            # Letter case carries nothing; words outside the list are placeholders.
+            (b"ERROR: Failed To Open hunter2Secret", "none"),
+            (b"Error: FAILED To Open hunter2Secret", "error: failed to open <x>"),
+            # A number survives only as the status of a status code.
+            (b"Error: response status code 503: 5000 12 0x1f", "error: response status code 503: <x>"),
+            (b"Error: pin 123, 599 600", "error: <x>, <x>"),
+            # Control characters and non-ASCII text are placeholders; CR ends the line.
+            ("Error: \x1b[31mrouge élève\x07".encode(), "error: <x>"),
+            (b"Error: read\rpassword copy", "error: read"),
+            # Brackets, quotes and semicolons never show: the skeleton cannot
+            # imitate the fields printed around it.
+            (b'Error: copy"]; status 418; [read', "error: <x>"),
+            # Only ORAS's own error line is shown.
+            (b"[2026-11-22T08:12:08.123Z][WARNING]: copy read", "none"),
+            (b"\nError: failed", "none"),
+            (b"", "none"),
+        )
+        for text, expected in cases:
+            with self.subTest(expected=expected):
+                got = sk(line(text))
+                self.assertEqual(got, expected)
+                self.assertNotIn(TOKEN, got)
+        # Bounded in tokens and characters, the omission marker included.
+        for text in (b"Error: " + b"error " * 200, b"Error: " + b" ".join([b"failed"] * 30 + [b"x" * 50] * 30),
+                     b"Error: " + b":" * 100):
+            got = sk(text + b"\n")
+            self.assertLessEqual(len(got), self.api.SKELETON_CHARS, got)
+            self.assertTrue(got.endswith(" \u2026"), got)
+        # A failed attempt reports it with the other signals, never the line itself.
+        failure = b'Error: failed to push "ghcr.io/bitop-dev/x@sha256:aa": ' + TOKEN.encode()
+        def failed(args, **kwargs):
+            kwargs["stderr"].write(failure + b"\n")
+            return subprocess.CompletedProcess(args, 1)
+        with mock.patch.object(self.api.subprocess, "run", side_effect=failed):
+            outcome = self.api.attempt_copy(self.tool, [], {}, self.base, IMAGE, 60)
+        self.assertIn('first-line "error: failed to push <x>: <x>"', outcome[1])
+        self.assertNotIn(TOKEN, outcome[1])
+        self.assertNotIn("bitop", outcome[1])
 
     def test_signals_come_from_request_records_only(self):
         cases = (
