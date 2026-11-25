@@ -12,6 +12,8 @@ export { gitEnv } from "../git.mjs";
 
 export const CONFIG_FILE = ".gitleaks.toml";
 export const HOOK = "scripts/secret-scan.py";
+export const EXTRAS = ".github/scripts/secret-scan-extras.py";
+export const HISTORY_WORKFLOW = "secret-scan-history";
 export const ZEROS = "0".repeat(40);
 export const SCAN_STEP = "Scan the commits and the tree for secrets";
 export const INSTALL_STEP = "Install gitleaks (pinned release, SHA-256 verified)";
@@ -20,6 +22,7 @@ export const ASSET = /^https:\/\/github\.com\/gitleaks\/gitleaks\/releases\/down
 export const RULES_IN_CANARY = ["aws-access-token", "omg-gateway-key", "omg-session-cookie", "omg-file-encryption-key", "omg-url-credentials", "generic-api-key", "private-key"];
 
 export const copy = () => structuredClone(loadWorkflow("ci"));
+export const copyHistory = () => structuredClone(loadWorkflow(HISTORY_WORKFLOW));
 export const jobOf = data => data.jobs["secret-scan"];
 export const stepNamed = (data, name) => stepsOf(jobOf(data)).find(s => s.name === name);
 export const scanStep = data => stepNamed(data, SCAN_STEP);
@@ -75,6 +78,9 @@ export function makeRepo({ real } = {}) {
   mkdirSync(bin);
   git(dir, "init", "-q", "-b", "main");
   copyFileSync(join(root, CONFIG_FILE), join(dir, CONFIG_FILE));
+  // The step runs the extras script from the checkout, as in CI.
+  mkdirSync(join(dir, ".github/scripts"), { recursive: true });
+  copyFileSync(join(root, EXTRAS), join(dir, EXTRAS));
   const c1 = commitAll(dir, "config");
   writeFileSync(join(dir, "a.txt"), "one\n");
   const c2 = commitAll(dir, "one");
@@ -97,12 +103,15 @@ if "--report-template" in a:
     rec["template"] = open(a[a.index("--report-template") + 1]).read()
 if "--config" in a:
     rec["config"] = a[a.index("--config") + 1]
+    if os.path.exists(rec["config"]):
+        rec["config_text"] = open(rec["config"]).read()
 if os.environ.get("STUB_TREE") == "1" and a[:1] == ["dir"]:
     tree = {}
-    for folder, _, names in os.walk("."):
+    top = a[-1] if os.path.isdir(a[-1]) else "."
+    for folder, _, names in os.walk(top):
         for name in names:
             path = os.path.join(folder, name)
-            tree[os.path.relpath(path)] = open(path, "rb").read().decode("latin-1")
+            tree[os.path.relpath(path, top)] = open(path, "rb").read().decode("latin-1")
     rec["tree"] = tree
 open(os.environ["STUB_LOG"], "a").write(json.dumps(rec) + "\\n")
 if a == ["version"]:
@@ -112,6 +121,24 @@ mode, path = a[0], a[-1]
 RULES = ${JSON.stringify(RULES_IN_CANARY)}
 def finding(rule):
     print("finding rule=%s file=x.txt line=1 commit=" % rule)
+if path.endswith("/extras-canary"):
+    if os.environ.get("STUB_CANARY_EXTRAS") == "miss":
+        sys.exit(0)
+    for source in ["messages.txt", "tags.txt", "names.txt", "utf16/0-x.txt", "archives/0-x.zip!c.txt"]:
+        if not source.startswith(os.environ.get("STUB_EXTRAS_SKIP", "-")):
+            print("finding rule=aws-access-token file=%s/%s line=1 commit=" % (path, source))
+    sys.exit(1)
+if path.endswith("/extras"):
+    if os.environ.get("STUB_SCAN_EXTRAS") == "find":
+        finding("generic-api-key")
+        sys.exit(1)
+    sys.exit(0)
+if path == "." and os.environ.get("STUB_FIND_UNLESS") and os.environ["STUB_FIND_UNLESS"] not in rec.get("config_text", ""):
+    finding("aws-access-token")
+    sys.exit(1)
+if path == "." and os.environ.get("STUB_SCAN_BASE") == "find" and rec.get("config", "").endswith("/base-config.toml"):
+    finding("generic-api-key")
+    sys.exit(1)
 if path != "." and os.environ.get("STUB_NO_CANARY") != "1":
     if os.environ.get("STUB_CANARY_" + mode.upper(), "find") == "miss":
         sys.exit(0)
@@ -119,6 +146,8 @@ if path != "." and os.environ.get("STUB_NO_CANARY") != "1":
         if rule != os.environ.get("STUB_CANARY_SKIP"):
             finding(rule)
     sys.exit(1)
+if mode == "git" and os.environ.get("STUB_GIT_ERR") == "1":
+    sys.stderr.write("6:50PM ERR [git] fatal: bad object\\n")
 if mode == "git" and os.environ.get("STUB_COUNT", "1") == "1":
     sys.stderr.write("INF 3 commits scanned.\\n")
 if os.environ.get("STUB_SCAN_" + mode.upper(), "clean") == "find":
