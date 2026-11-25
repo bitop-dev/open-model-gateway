@@ -1,6 +1,7 @@
 """Guardrail policy layers (#840) on a throwaway Team: an override, a local layer
-that tightens it and adds a custom pattern, the refusals, and the read views.
-The type defaults are read, never changed (they apply to every workspace)."""
+that tightens it and adds a custom pattern, the refusals, and the read views;
+then a personal workspace's local layer, which platform staff never see. The
+type defaults are read, never changed (they apply to every workspace)."""
 from ..registry import journey
 
 SECRETS = {"name": "Secrets", "protection": "secrets", "detector": {"kind": "pattern", "categories": ["secret"]}, "input": {"action": "monitor"}}
@@ -46,6 +47,9 @@ def guardrails(t):
     later = alex.put(local, {"rules": [MODERATION]})
     t.expect("guardrails.later-phase-refused", later, 400)
     t.ok("guardrails.later-phase-reason", later.error_reason == "guardrail_detector_unavailable")
+    broken = alex.put(local, {"rules": [{**CUSTOM, "detector": {**CUSTOM["detector"], "patterns": ["JOURNEY-(unclosed"]}}]})
+    t.expect("guardrails.pattern-invalid-refused", broken, 400)
+    t.ok("guardrails.pattern-invalid-reason", broken.error_reason == "guardrail_pattern_invalid" and "JOURNEY-" not in str(broken.json()))
     t.expect("guardrails.member-write-refused", blair.put(local, {"rules": []}), 403)
     tightened = alex.put(local, {"rules": [{"tightens": target, "input": {"action": "block"}}, CUSTOM]})
     t.expect("guardrails.local-write", tightened, 200)
@@ -60,3 +64,16 @@ def guardrails(t):
     reset = operator.delete(platform)
     t.expect("guardrails.override-reset", reset, 200)
     t.ok("guardrails.type-default-restored", reset.get("platform", "source") == "type_default")
+
+    # A personal workspace's local layer is the owner's choice: staff see its
+    # platform layers, never the local one or its patterns.
+    mine = t.personal_workspace("blair")
+    own = f"/api/v1/workspaces/{mine}/guardrails"
+    t.undo("empty personal guardrails", lambda: blair.put(own, {"rules": []}))
+    t.expect("guardrails.personal-local-write", blair.put(own, {"rules": [CUSTOM]}), 200)
+    staff = operator.get(f"/api/v1/platform/workspaces/{mine}/guardrails")
+    t.expect("guardrails.personal-platform-read", staff, 200)
+    t.ok("guardrails.personal-local-hidden", staff.get("local") is None and staff.get("local_visible") is False and staff.get("effective") is None and "JOURNEY-" not in str(staff.json()))
+    # The workspace itself is not visible to them, as on its policy route.
+    t.expect("guardrails.personal-staff-refused", auditor.get(own), 404)
+    t.expect("guardrails.personal-staff-policy-refused", auditor.get(f"/api/v1/workspaces/{mine}/policy"), 404)
