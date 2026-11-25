@@ -1453,6 +1453,10 @@ BEGIN
    INSERT INTO access_review_items(id,campaign_id,subject_kind,membership_grant_id) VALUES(gen_random_uuid(),sc,'workspace_membership',sg);
    IF NOT EXISTS (SELECT FROM access_review_campaigns c JOIN access_review_schedule_runs r ON r.campaign_id=c.id WHERE c.id=sc AND c.schedule_id=sch AND c.created_by=t_reviewer AND r.outcome='started') THEN RAISE EXCEPTION 'scheduled review not recorded'; END IF;
    BEGIN PERFORM omg_access_review_start_scheduled(gen_random_uuid(),gen_random_uuid(),sch,now()); RAISE EXCEPTION 'second scheduled review while the first is open'; EXCEPTION WHEN check_violation THEN NULL; END;
+   BEGIN INSERT INTO access_review_schedule_runs(id,schedule_id,period_at,outcome,reason) VALUES(gen_random_uuid(),sch,now(),'skipped','previous_open'); RAISE EXCEPTION 'second run for one due period'; EXCEPTION WHEN check_violation THEN NULL; END;
+   BEGIN UPDATE access_review_schedules SET next_run_at=now()-interval '1 hour' WHERE id=sch; RAISE EXCEPTION 'schedule cursor moved back onto a period that ran'; EXCEPTION WHEN check_violation THEN NULL; END;
+   BEGIN INSERT INTO access_review_schedule_runs(id,schedule_id,period_at,outcome,reason) VALUES(gen_random_uuid(),later,now()+interval '2 days','skipped','empty'); RAISE EXCEPTION 'run recorded for a future period'; EXCEPTION WHEN check_violation THEN NULL; END;
+   BEGIN UPDATE access_review_schedules SET subjects='{platform_roles}',workspace_ids='{}',updated_by=t_author WHERE id=later; RAISE EXCEPTION 'schedule template changed by a non-admin'; EXCEPTION WHEN check_violation THEN NULL; END;
    BEGIN UPDATE access_review_campaigns SET schedule_id=later WHERE id=sc; RAISE EXCEPTION 'campaign schedule relinked'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
    BEGIN UPDATE access_review_schedules SET created_by=t_author WHERE id=sch; RAISE EXCEPTION 'schedule creator rewritten'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
    BEGIN UPDATE access_review_schedules SET paused_at=now(),paused_by=t_author WHERE id=sch; RAISE EXCEPTION 'schedule paused by a non-admin'; EXCEPTION WHEN check_violation THEN NULL; END;

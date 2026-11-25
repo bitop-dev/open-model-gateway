@@ -24,7 +24,7 @@ async fn create(f: &Fixture, body: Value) -> Uuid {
 /// Makes a schedule due for the period that started on the 1st of `months_ago`
 /// months back (0: this month).
 async fn due_since(pool: &PgPool, schedule: Uuid, months_ago: i32) {
-    sqlx::query(&format!("UPDATE access_review_schedules SET next_run_at=(date_trunc('month',now() AT TIME ZONE 'UTC') - make_interval(months=>$2)) AT TIME ZONE 'UTC' WHERE id=$1"))
+    sqlx::query("UPDATE access_review_schedules SET next_run_at=(date_trunc('month',now() AT TIME ZONE 'UTC') - make_interval(months=>$2)) AT TIME ZONE 'UTC' WHERE id=$1")
         .bind(schedule)
         .bind(months_ago)
         .execute(pool)
@@ -360,7 +360,11 @@ async fn pausing_resuming_and_deleting_never_touch_past_campaigns(pool: PgPool) 
     assert_eq!(status, StatusCode::OK, "{paused}");
     assert!(paused["paused_at"].is_string() && paused["next_run_at"].is_null());
     // While paused, a due period does not run.
-    due_since(&pool, schedule, 0).await;
+    sqlx::query("UPDATE access_review_schedules SET next_run_at=clock_timestamp()-interval '1 minute' WHERE id=$1")
+        .bind(schedule)
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query("UPDATE access_review_campaigns SET closed_by=$2,closed_at=now() WHERE id=$1")
         .bind(campaign)
         .bind(f.admin.user_id)
@@ -552,4 +556,126 @@ async fn a_schedule_is_validated_and_first_runs_at_the_next_period_start(pool: P
             .0
             .is_client_error()
     );
+}
+
+#[dbtest::test]
+async fn resending_the_stored_calendar_keeps_a_due_run(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let schedule = create(&f, monthly(&f, "Resent")).await;
+    due_since(&pool, schedule, 0).await;
+    // An edit that wins the lock after the boundary, before the run: same
+    // calendar, new name. The due period still runs.
+    let (status, changed) = call(
+        &f.s,
+        &f.admin,
+        "PATCH",
+        &format!("{SCHEDULES}/{schedule}"),
+        json!({"name":"Resent renamed","cadence":"monthly","start_day":1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{changed}");
+    let ran = run_due_fenced(&f.s, None).await.unwrap();
+    assert!(
+        matches!(ran[..], [(id, Outcome::Started(_))] if id == schedule),
+        "{ran:?}"
+    );
+    let actions: Vec<String> = sqlx::query_scalar("SELECT action FROM audit_events WHERE resource_id=$1 AND action='access_review_schedule.changed'")
+        .bind(schedule)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(actions.len(), 1, "the name changed");
+}
+
+/// The database keeps one run per cursor position whoever writes: the guards
+/// refuse a second run for a due period, a run for a future period, moving
+/// the cursor back onto a period that ran, a change by a non-admin, and a
+/// second incident for one skipped run, even after the first cleared.
+#[dbtest::test]
+async fn the_database_keeps_one_run_per_period(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let schedule = create(&f, monthly(&f, "Guarded")).await;
+    due_since(&pool, schedule, 0).await;
+    let ran = run_due_fenced(&f.s, None).await.unwrap();
+    assert!(matches!(ran[0].1, Outcome::Started(_)));
+    let refused = |r: Result<sqlx::postgres::PgQueryResult, sqlx::Error>| {
+        r.err().and_then(|e| {
+            e.as_database_error()
+                .and_then(|d| d.code())
+                .map(|c| c.into_owned())
+        })
+    };
+    // The cursor back onto this month's period, which ran.
+    assert_eq!(
+        refused(
+            sqlx::query(&format!(
+                "UPDATE access_review_schedules SET next_run_at={THIS_MONTH} WHERE id=$1"
+            ))
+            .bind(schedule)
+            .execute(&pool)
+            .await
+        )
+        .as_deref(),
+        Some("23514")
+    );
+    // A run for the current cursor when one ran, and one for a future period.
+    let other = create(&f, monthly(&f, "Guarded other")).await;
+    due_since(&pool, other, 0).await;
+    let insert = |id: Uuid, period: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(&format!("INSERT INTO access_review_schedule_runs(id,schedule_id,period_at,outcome,reason) VALUES($1,$2,{period},'skipped','empty')"))
+                .bind(Uuid::now_v7())
+                .bind(id)
+                .execute(&pool)
+                .await
+        }
+    };
+    assert_eq!(
+        refused(insert(other, "now()+interval '1 day'").await).as_deref(),
+        Some("23514")
+    );
+    assert_eq!(refused(insert(other, THIS_MONTH).await), None);
+    assert_eq!(
+        refused(insert(other, "(date_trunc('month',now() AT TIME ZONE 'UTC') + interval '1 hour') AT TIME ZONE 'UTC'").await).as_deref(),
+        Some("23514"),
+        "one run per cursor position"
+    );
+    // A template change or a resume needs a current Platform Admin.
+    assert_eq!(
+        refused(sqlx::query("UPDATE access_review_schedules SET subjects='{platform_roles}',workspace_ids='{}',updated_by=$2 WHERE id=$1").bind(other).bind(f.member.user_id).execute(&pool).await).as_deref(),
+        Some("23514")
+    );
+    // One incident per skipped run, for good.
+    let run: Uuid =
+        sqlx::query_scalar("SELECT id FROM access_review_schedule_runs WHERE schedule_id=$1")
+            .bind(other)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    assert!(
+        crate::alerts::fire_access_review_skipped(&mut tx, run, "empty")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        crate::alerts::resolve_access_review_skipped(&mut tx, other)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(
+        !crate::alerts::fire_access_review_skipped(&mut tx, run, "empty")
+            .await
+            .unwrap()
+    );
+    let incidents: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM alert_events WHERE subject_key='access_review_run:'||$1::text",
+    )
+    .bind(run)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(incidents, 1);
 }

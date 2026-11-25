@@ -26,6 +26,8 @@ CREATE TABLE access_review_schedules (
  created_by uuid NOT NULL REFERENCES users(id),
  created_at timestamptz NOT NULL DEFAULT now(),
  updated_at timestamptz NOT NULL DEFAULT now(),
+ -- The Platform Admin who last changed the template, calendar or pause.
+ updated_by uuid NOT NULL REFERENCES users(id),
  -- The next period start (UTC), computed by the gateway from the cadence.
  next_run_at timestamptz NOT NULL,
  paused_at timestamptz,
@@ -41,12 +43,16 @@ CREATE INDEX access_review_schedules_due ON access_review_schedules (next_run_at
 
 -- Created by a current Platform Admin with a filter of shared workspaces;
 -- created_by and created_at never change; a deleted schedule never changes
--- again; pausing and deleting name a current Platform Admin. Never deleted.
+-- again; changing the template or calendar, pausing, resuming and deleting
+-- name a current Platform Admin (updated_by, paused_by, deleted_by). The
+-- cursor never moves to or before a period that already ran, so no period
+-- runs twice. Never deleted.
 CREATE FUNCTION access_review_schedules_guard() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
 BEGIN
  IF TG_OP = 'INSERT' THEN
   NEW.created_at := now();
   NEW.updated_at := now();
+  NEW.updated_by := NEW.created_by;
   IF NOT EXISTS (SELECT FROM public.effective_platform_roles p WHERE p.user_id = NEW.created_by AND p.role = 'admin')
      OR NEW.paused_at IS NOT NULL OR NEW.deleted_at IS NOT NULL THEN
    RAISE EXCEPTION 'an access review schedule is created by a Platform Admin' USING ERRCODE = '23514';
@@ -57,8 +63,16 @@ BEGIN
      OR (NEW.paused_by IS DISTINCT FROM OLD.paused_by AND NEW.paused_by IS NOT NULL
          AND NOT EXISTS (SELECT FROM public.effective_platform_roles p WHERE p.user_id = NEW.paused_by AND p.role = 'admin'))
      OR (NEW.deleted_by IS NOT NULL
-         AND NOT EXISTS (SELECT FROM public.effective_platform_roles p WHERE p.user_id = NEW.deleted_by AND p.role = 'admin')) THEN
-   RAISE EXCEPTION 'access review schedules keep their creator; a deleted schedule never changes' USING ERRCODE = '23514';
+         AND NOT EXISTS (SELECT FROM public.effective_platform_roles p WHERE p.user_id = NEW.deleted_by AND p.role = 'admin'))
+     OR (((NEW.name, NEW.subjects, NEW.workspace_ids, NEW.open_days, NEW.cadence, NEW.start_day, NEW.start_month)
+           IS DISTINCT FROM (OLD.name, OLD.subjects, OLD.workspace_ids, OLD.open_days, OLD.cadence, OLD.start_day, OLD.start_month)
+          OR (OLD.paused_at IS NOT NULL AND NEW.paused_at IS NULL))
+         AND NOT EXISTS (SELECT FROM public.effective_platform_roles p WHERE p.user_id = NEW.updated_by AND p.role = 'admin')) THEN
+   RAISE EXCEPTION 'access review schedules keep their creator and change only by a Platform Admin; a deleted schedule never changes' USING ERRCODE = '23514';
+  END IF;
+  IF NEW.next_run_at IS DISTINCT FROM OLD.next_run_at
+     AND EXISTS (SELECT FROM public.access_review_schedule_runs r WHERE r.schedule_id = NEW.id AND r.period_at >= NEW.next_run_at) THEN
+   RAISE EXCEPTION 'an access review schedule never runs a period twice' USING ERRCODE = '23514';
   END IF;
  END IF;
  IF cardinality(NEW.subjects) <> (SELECT count(DISTINCT s) FROM unnest(NEW.subjects) s)
@@ -131,10 +145,20 @@ CREATE TABLE access_review_schedule_runs (
  CHECK ((outcome = 'started') = (campaign_id IS NOT NULL) AND (outcome = 'started') = (reason IS NULL))
 );
 CREATE INDEX access_review_schedule_runs_recent ON access_review_schedule_runs (schedule_id, ran_at DESC);
--- A started run names a campaign of its own schedule.
+-- One run per cursor position: a run is for a period from the schedule's
+-- current next_run_at up to the server clock, of an active schedule, and none
+-- is recorded there yet (the schedule then moves its cursor past it). A
+-- started run names a campaign of its own schedule.
 CREATE FUNCTION access_review_schedule_runs_guard() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
+DECLARE cursor_at timestamptz;
 BEGIN
  NEW.ran_at := clock_timestamp();
+ SELECT s.next_run_at INTO cursor_at FROM public.access_review_schedules s
+  WHERE s.id = NEW.schedule_id AND s.paused_at IS NULL AND s.deleted_at IS NULL;
+ IF cursor_at IS NULL OR NEW.period_at < cursor_at OR NEW.period_at > NEW.ran_at
+    OR EXISTS (SELECT FROM public.access_review_schedule_runs r WHERE r.schedule_id = NEW.schedule_id AND r.period_at >= cursor_at) THEN
+  RAISE EXCEPTION 'a schedule run is for its due period, once' USING ERRCODE = '23514';
+ END IF;
  IF NEW.campaign_id IS NOT NULL AND NOT EXISTS (SELECT FROM public.access_review_campaigns c WHERE c.id = NEW.campaign_id AND c.schedule_id = NEW.schedule_id) THEN
   RAISE EXCEPTION 'a started run names a campaign of its schedule' USING ERRCODE = '23514';
  END IF;
@@ -170,9 +194,10 @@ BEGIN
 END $$;
 REVOKE ALL ON FUNCTION omg_access_review_start_scheduled(uuid, uuid, uuid, timestamptz) FROM PUBLIC;
 
--- The built-in installation incident of a skipped run, one per run (its
--- subject is the run), to Platform Admins. As in 0058, NOT VALID: every old
--- row satisfies the new constraints, which only add a kind.
+-- The built-in installation incident of a skipped run, one per run for good
+-- (its subject is the run), to Platform Admins, with a fixed summary and the
+-- run's reason code as its only detail. As in 0058, NOT VALID: every old row
+-- satisfies the new constraints, which only add a kind.
 ALTER TABLE alert_events DROP CONSTRAINT alert_events_kind_check;
 ALTER TABLE alert_events ADD CONSTRAINT alert_events_kind_check CHECK(kind IN (
  'budget_threshold','spend_spike','error_rate','provider_failing','scim_last_admin',
@@ -188,8 +213,12 @@ ALTER TABLE alert_events ADD CONSTRAINT alert_events_builtin_shape CHECK(builtin
  OR (builtin='partitions_missing' AND kind='partitions_missing' AND workspace_id IS NULL AND provider_connection_id IS NULL)
  OR (builtin='history_orphans' AND kind='history_orphans' AND workspace_id IS NULL AND provider_connection_id IS NULL)
  OR (builtin='access_review_skipped' AND kind='access_review_skipped' AND workspace_id IS NULL AND provider_connection_id IS NULL
-     AND subject_key ~ '^access_review_run:[0-9a-f-]{36}$')) NOT VALID;
+     AND subject_key ~ '^access_review_run:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+     AND level = 1 AND severity = 'warning' AND summary = 'A scheduled access review was skipped'
+     AND details = jsonb_build_object('reason', details->>'reason')
+     AND details->>'reason' IN ('previous_open','open_limit','empty','too_large','changed'))) NOT VALID;
 ALTER TABLE alert_events ADD CONSTRAINT alert_events_access_review_kind CHECK(kind<>'access_review_skipped' OR builtin IS NOT DISTINCT FROM 'access_review_skipped') NOT VALID;
+CREATE UNIQUE INDEX alert_events_access_review_run ON alert_events (subject_key) WHERE builtin = 'access_review_skipped';
 
 -- As in 0058, with the skipped-run incident: a Platform Admin incident, its
 -- webhook summary kind-only (no schedule or campaign names).

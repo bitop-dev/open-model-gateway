@@ -21,6 +21,9 @@ const MAX_NAME_CHARS: usize = 100;
 /// Due schedules the lifecycle job runs per tick (each in its own
 /// transaction); the rest run on the next tick.
 const RUNS_PER_TICK: i64 = 20;
+/// No new run starts after this much of a tick: the lifecycle job's deadline
+/// (30 s) is never spent on schedules alone, and the rest run next tick.
+const TICK_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 /// Recent runs in a schedule's detail.
 const RECENT_RUNS: i64 = 20;
 
@@ -241,9 +244,9 @@ struct Current {
 }
 
 /// `PATCH /api/v1/platform/access-review-schedules/{id}`: changes the
-/// template or calendar, pauses or resumes. A new calendar, and resuming,
-/// set the next run to the first period start after now: periods missed
-/// while paused do not run. Campaigns already started are untouched.
+/// template or calendar, pauses or resumes. A changed calendar, and
+/// resuming, set the next run to the first period start after now: periods
+/// missed while paused do not run. Campaigns already started are untouched.
 pub(in crate::management) async fn change(
     State(s): State<Store>,
     Extension(u): Extension<BrowserPrincipal>,
@@ -281,13 +284,25 @@ pub(in crate::management) async fn change(
     }
     let (cadence, start_day, start_month) = match (&b.cadence, b.start_day) {
         (Some(c), Some(day)) => (c.clone(), day as i16, b.start_month.map(|m| m as i16)),
-        _ => (current.cadence, current.start_day, current.start_month),
+        _ => (
+            current.cadence.clone(),
+            current.start_day,
+            current.start_month,
+        ),
     };
     let pause = b.paused == Some(true) && !current.paused;
     let resume = b.paused == Some(false) && current.paused;
     let calendar = calendar_of(&cadence, start_day.into(), start_month.map(Into::into))
         .ok_or_else(calendar_exhausted)?;
-    let next = if new_calendar.is_some() || resume {
+    // Resending the stored calendar is no change: the cursor stays, so a
+    // period that is due but not yet run still runs.
+    let calendar_changed = (cadence.as_str(), start_day, start_month)
+        != (
+            current.cadence.as_str(),
+            current.start_day,
+            current.start_month,
+        );
+    let next = if calendar_changed || resume {
         Some(
             calendar
                 .first_after(now(&mut tx).await?)
@@ -296,7 +311,7 @@ pub(in crate::management) async fn change(
     } else {
         None
     };
-    sqlx::query("UPDATE access_review_schedules SET name=$2,subjects=$3,workspace_ids=$4,open_days=$5,cadence=$6,start_day=$7,start_month=$8,next_run_at=coalesce($9,next_run_at),paused_at=CASE WHEN $10 THEN clock_timestamp() WHEN $11 THEN NULL ELSE paused_at END,paused_by=CASE WHEN $10 THEN $12 WHEN $11 THEN NULL ELSE paused_by END,updated_at=clock_timestamp() WHERE id=$1")
+    sqlx::query("UPDATE access_review_schedules SET name=$2,subjects=$3,workspace_ids=$4,open_days=$5,cadence=$6,start_day=$7,start_month=$8,next_run_at=coalesce($9,next_run_at),paused_at=CASE WHEN $10 THEN clock_timestamp() WHEN $11 THEN NULL ELSE paused_at END,paused_by=CASE WHEN $10 THEN $12 WHEN $11 THEN NULL ELSE paused_by END,updated_by=$12,updated_at=clock_timestamp() WHERE id=$1")
         .bind(id)
         .bind(&name)
         .bind(distinct_subjects(&subjects))
@@ -311,7 +326,7 @@ pub(in crate::management) async fn change(
         .bind(u.user_id)
         .execute(&mut *tx)
         .await?;
-    if template_changed || new_calendar.is_some() {
+    if template_changed || calendar_changed {
         audit(
             &mut tx,
             &u,
@@ -450,7 +465,11 @@ pub(crate) async fn run_due_fenced(
     // returned after every due schedule was tried. A lost lease stops at once.
     let mut done = Vec::new();
     let mut first_error = None;
+    let started = std::time::Instant::now();
     for id in due {
+        if started.elapsed() >= TICK_BUDGET {
+            break;
+        }
         match run_one(store, fence, id).await {
             Ok(Some(outcome)) => done.push((id, outcome)),
             Ok(None) => {}
@@ -480,7 +499,7 @@ async fn run_one(
     id: Uuid,
 ) -> Result<Option<Outcome>, sqlx::Error> {
     let mut tx = resources::installation_tx_fenced(store, fence).await?;
-    let Some(due) = sqlx::query_as::<_, Due>("SELECT subjects,workspace_ids,cadence,start_day,start_month,created_by,next_run_at,clock_timestamp() AS now FROM access_review_schedules WHERE id=$1 AND paused_at IS NULL AND deleted_at IS NULL AND next_run_at<=clock_timestamp() FOR UPDATE SKIP LOCKED")
+    let Some(due) = sqlx::query_as::<_, Due>("SELECT s.subjects,s.workspace_ids,s.cadence,s.start_day,s.start_month,s.created_by,s.next_run_at,c.now FROM access_review_schedules s, (SELECT clock_timestamp() AS now) c WHERE s.id=$1 AND s.paused_at IS NULL AND s.deleted_at IS NULL AND s.next_run_at<=c.now FOR UPDATE OF s SKIP LOCKED")
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?

@@ -52,7 +52,7 @@ impl Calendar {
     fn in_cycle(self, month: u8) -> bool {
         match (self.cadence, self.start_month) {
             (Cadence::Monthly, _) => true,
-            (Cadence::Quarterly, Some(start)) => (month + 12 - start) % 3 == 0,
+            (Cadence::Quarterly, Some(start)) => (month + 12 - start).is_multiple_of(3),
             (Cadence::Yearly, Some(start)) => month == start,
             _ => false,
         }
