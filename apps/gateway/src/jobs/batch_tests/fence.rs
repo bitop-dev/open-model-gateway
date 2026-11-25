@@ -34,15 +34,26 @@ pub(super) fn start(w: &World) -> tokio::task::JoinHandle<JobResult<bool>> {
     tokio::spawn(async move { runner.run_next().await })
 }
 
-/// A replacement runner as the runner's loop runs it. A claim skips a batch
-/// whose job row another transaction holds at that moment (`claim_gateway`
-/// takes `FOR UPDATE SKIP LOCKED`), and the loop claims again on its next
-/// tick: this claims again until it has the batch, within [`REACH`].
-fn start_replacement(jobs: Jobs) -> tokio::task::JoinHandle<JobResult<bool>> {
+/// A replacement runner taking `job` over from a runner that stopped
+/// renewing, as the runner's loop runs it. Before each claim the lease is
+/// lapsed again ([`lapse`]): the old runner still renews on its own schedule
+/// here, and a renewal that lands before a claim would otherwise extend the
+/// lease (a renewal after the claim is refused: the epoch moved on). A claim
+/// also skips a batch whose job row another transaction holds at that moment
+/// (`claim_gateway` takes `FOR UPDATE SKIP LOCKED`), and the loop claims again
+/// on its next tick. So this claims again until it has the batch, within
+/// [`REACH`].
+fn start_replacement(
+    w: &World,
+    job: &JobRow,
+    jobs: Jobs,
+) -> tokio::task::JoinHandle<JobResult<bool>> {
     let runner = Runner::new(jobs);
+    let (pool, id) = (w.f.store.pool.clone(), job.id);
     tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + REACH;
         loop {
+            lapse_lease(&pool, id).await;
             match runner.run_next().await {
                 Ok(false) if tokio::time::Instant::now() < deadline => {
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -54,12 +65,16 @@ fn start_replacement(jobs: Jobs) -> tokio::task::JoinHandle<JobResult<bool>> {
 }
 
 /// The batch's lease lapses: it is backdated as if its runner had stopped
-/// renewing. The runner still renews on its own schedule, so a renewal that
-/// lands before a replacement claims extends the lease again.
+/// renewing. A runner still running renews on its own schedule, so a renewal
+/// that lands before a replacement claims extends the lease again: a takeover
+/// from a running runner uses [`start_replacement`].
 pub(super) async fn lapse(w: &World, job: &JobRow) {
+    lapse_lease(&w.f.store.pool, job.id).await;
+}
+async fn lapse_lease(pool: &PgPool, job: Uuid) {
     sqlx::query("UPDATE async_jobs SET runner_lease_until=now()-interval '1 second' WHERE id=$1")
-        .bind(job.id)
-        .execute(&w.f.store.pool)
+        .bind(job)
+        .execute(pool)
         .await
         .unwrap();
 }
@@ -101,9 +116,13 @@ async fn a_runner_that_lost_the_batch_cannot_change_a_batch_the_new_owner_finish
     let held = w.openai.gate("hold-a");
     let old = start(&w);
     held.entered.notified().await;
-    lapse(&w, &job).await;
     // The new owner interrupts the line and finishes the batch.
-    assert!(Runner::new(w.jobs.clone()).run_next().await.unwrap());
+    assert!(
+        start_replacement(&w, &job, w.jobs.clone())
+            .await
+            .unwrap()
+            .unwrap()
+    );
     let done = w.reload(&job).await;
     assert_eq!(done.state, "completed");
     assert_eq!(
@@ -162,7 +181,12 @@ async fn a_runner_that_lost_the_batch_cannot_change_a_batch_the_new_owner_finish
         "the old runner stops quietly: {old:?}"
     );
     // The refused outcome is logged once, with ids only, so the charged line
-    // can be attributed.
+    // can be attributed. Any other event naming the execution must be one of
+    // the advisory events listed here: its routing-health write that outlived
+    // its 250 ms timeout (`ExecutionGuard::finish`) is logged with the same id.
+    const NOT_RECORDED: &str =
+        "batch line outcome not recorded: the runner no longer holds the batch";
+    const ADVISORY: [&str; 1] = ["routing health update failed"];
     let execution: Uuid =
         sqlx::query_scalar("SELECT execution_id FROM batch_lines WHERE job_id=$1 AND line_no=0")
             .bind(job.id)
@@ -170,16 +194,35 @@ async fn a_runner_that_lost_the_batch_cannot_change_a_batch_the_new_owner_finish
             .await
             .unwrap();
     let text = log.text();
-    let logged: Vec<&str> = text
+    let events: Vec<Value> = text
         .lines()
         .filter(|l| l.contains(&execution.to_string()))
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|_| panic!("not a log event: {l}")))
         .collect();
-    assert_eq!(logged.len(), 1, "{text}");
-    assert!(
-        logged[0].contains("batch line outcome not recorded"),
-        "{}",
-        logged[0]
+    let refused: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["fields"]["message"] == NOT_RECORDED)
+        .collect();
+    assert_eq!(refused.len(), 1, "{text}");
+    let mut fields: Vec<&str> = refused[0]["fields"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    fields.sort_unstable();
+    assert_eq!(
+        fields,
+        ["execution_id", "line", "message"],
+        "ids only: {text}"
     );
+    for event in &events {
+        let message = event["fields"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message == NOT_RECORDED || ADVISORY.contains(&message),
+            "an unexpected event names the execution: {event}"
+        );
+    }
     consistent(&w.f).await;
 }
 
@@ -200,8 +243,7 @@ async fn overlapping_runners(
     tokio::time::timeout(REACH, held_a.entered.notified())
         .await
         .expect("old runner reached the provider");
-    lapse(w, job).await;
-    let owner = start_replacement(w.jobs.clone());
+    let owner = start_replacement(w, job, w.jobs.clone());
     tokio::time::timeout(REACH, held_b.entered.notified())
         .await
         .expect("replacement runner used the second route slot");
@@ -336,8 +378,7 @@ async fn a_planning_failure_after_a_takeover_delays_the_line_one_replan(pool: Pg
         .unwrap();
     let mut jobs = w.jobs.clone();
     jobs.store.pool = replacement_pool.clone();
-    lapse(&w, &job).await;
-    let owner = start_replacement(jobs);
+    let owner = start_replacement(&w, &job, jobs);
     // The replacement runner's planning read, waiting for the lock: cancel it.
     let planning: i32 = tokio::time::timeout(REACH, async {
         loop {
@@ -1288,8 +1329,12 @@ async fn a_committed_result_survives_takeover_with_another_line_in_flight(pool: 
     .await
     .expect("the oldest outcome must flush while another provider is blocked");
     assert_eq!(segments(&w, &job).await, 1);
-    lapse(&w, &job).await;
-    assert!(Runner::new(w.jobs.clone()).run_next().await.unwrap());
+    assert!(
+        start_replacement(&w, &job, w.jobs.clone())
+            .await
+            .unwrap()
+            .unwrap()
+    );
     let done = w.reload(&job).await;
     let output = w
         .read(w.f.principal.workspace_id, done.output_file_id)
