@@ -198,11 +198,12 @@ pub async fn start_scheduled_access_reviews_fenced(
     store: &Store,
     fence: Option<&crate::leases::Fence>,
 ) -> Result<u64, sqlx::Error> {
-    Ok(
-        crate::management::access_review_schedules::run_due_fenced(store, fence)
-            .await?
-            .len() as u64,
-    )
+    use crate::management::access_review_schedules::{Outcome, run_due_fenced};
+    Ok(run_due_fenced(store, fence)
+        .await?
+        .iter()
+        .filter(|(_, outcome)| !matches!(outcome, Outcome::Deferred(_)))
+        .count() as u64)
 }
 
 /// A mapping's write target: `Platform` role or `Workspace` membership.

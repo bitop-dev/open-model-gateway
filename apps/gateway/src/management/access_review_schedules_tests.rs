@@ -679,3 +679,203 @@ async fn the_database_keeps_one_run_per_period(pool: PgPool) {
     .unwrap();
     assert_eq!(incidents, 1);
 }
+
+/// Twenty open campaigns can close within minutes: the run is retried each
+/// tick for a day after its period starts, recording nothing, and only then
+/// recorded as skipped.
+#[dbtest::test]
+async fn a_passing_condition_is_retried_for_a_day_before_the_run_is_skipped(pool: PgPool) {
+    let f = fixture(&pool).await;
+    for i in 0..20 {
+        let (status, body) = call(
+            &f.s,
+            &f.admin,
+            "POST",
+            "/api/v1/platform/access-reviews",
+            json!({"name":format!("Open {i}"),"subjects":["platform_roles"]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    // A start day of today (UTC), due since today's midnight.
+    let today: i32 = sqlx::query_scalar("SELECT extract(day FROM now() AT TIME ZONE 'UTC')::int")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let mut body = monthly(&f, "Busy");
+    body["start_day"] = json!(today);
+    let schedule = create(&f, body).await;
+    sqlx::query("UPDATE access_review_schedules SET next_run_at=date_trunc('day',now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' WHERE id=$1")
+        .bind(schedule)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            run_due_fenced(&f.s, None).await.unwrap(),
+            vec![(schedule, Outcome::Deferred(Skip::OpenLimit))]
+        );
+    }
+    let recorded: i64 = scalar(&pool, "SELECT (SELECT count(*) FROM access_review_schedule_runs WHERE schedule_id=$1)+(SELECT count(*) FROM alert_events WHERE builtin='access_review_skipped')", schedule).await;
+    assert_eq!(recorded, 0, "nothing recorded while retrying");
+    // A campaign closes: the next tick starts the period's campaign.
+    sqlx::query("UPDATE access_review_campaigns SET closed_by=$1,closed_at=now() WHERE id=(SELECT id FROM access_review_campaigns WHERE schedule_id IS NULL AND closed_at IS NULL LIMIT 1)")
+        .bind(f.admin.user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let ran = run_due_fenced(&f.s, None).await.unwrap();
+    assert!(
+        matches!(ran[..], [(id, Outcome::Started(_))] if id == schedule),
+        "{ran:?}"
+    );
+    // A period that began over a day ago with the limit still reached is skipped.
+    let late = create(&f, monthly(&f, "Busy late")).await;
+    due_since(&pool, late, 0).await;
+    let open: i64 = scalar(&pool, "SELECT count(*) FROM access_review_campaigns WHERE closed_at IS NULL AND $1::uuid IS NOT NULL", late).await;
+    assert_eq!(open, 20);
+    let started_today: bool =
+        sqlx::query_scalar("SELECT extract(day FROM now() AT TIME ZONE 'UTC') > 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    if started_today {
+        assert_eq!(
+            run_due_fenced(&f.s, None).await.unwrap(),
+            vec![(late, Outcome::Skipped(Skip::OpenLimit))]
+        );
+    }
+}
+
+#[dbtest::test]
+async fn a_later_started_run_clears_the_skipped_run_alert(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let schedule = create(&f, monthly(&f, "Clears")).await;
+    due_since(&pool, schedule, 1).await;
+    sqlx::query(&format!(
+        "SELECT omg_access_review_start_scheduled($1,$2,$3,{THIS_MONTH} - interval '1 month')"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(Uuid::now_v7())
+    .bind(schedule)
+    .execute(&pool)
+    .await
+    .unwrap();
+    due_since(&pool, schedule, 0).await;
+    assert_eq!(
+        run_due_fenced(&f.s, None).await.unwrap(),
+        vec![(schedule, Outcome::Skipped(Skip::PreviousOpen))]
+    );
+    sqlx::query(
+        "UPDATE access_review_campaigns SET closed_by=$2,closed_at=now() WHERE schedule_id=$1",
+    )
+    .bind(schedule)
+    .bind(f.admin.user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // A new calendar (the 2nd), due for this month's 2nd: a new period.
+    let (status, _) = call(
+        &f.s,
+        &f.admin,
+        "PATCH",
+        &format!("{SCHEDULES}/{schedule}"),
+        json!({"cadence":"monthly","start_day":2}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    sqlx::query(&format!(
+        "UPDATE access_review_schedules SET next_run_at={THIS_MONTH} + interval '1 day' WHERE id=$1"
+    ))
+    .bind(schedule)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let ran = run_due_fenced(&f.s, None).await.unwrap();
+    assert!(matches!(ran[..], [(_, Outcome::Started(_))]), "{ran:?}");
+    let (resolution, transitions): (Option<String>, Vec<String>) = sqlx::query_as("SELECT e.resolution,(SELECT array_agg(d.transition ORDER BY d.created_at) FROM alert_deliveries d WHERE d.event_id=e.id) FROM alert_events e WHERE e.builtin='access_review_skipped'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(resolution.as_deref(), Some("cleared"));
+    assert_eq!(transitions, ["fired", "resolved"]);
+}
+
+#[dbtest::test]
+async fn schedules_are_limited_and_cover_shared_workspaces_only(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let first = create(&f, monthly(&f, "Limit 0")).await;
+    let (status, refused) = call(
+        &f.s,
+        &f.admin,
+        "PATCH",
+        &format!("{SCHEDULES}/{first}"),
+        json!({"workspace_ids":[f.personal]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    for i in 1..50 {
+        create(&f, monthly(&f, &format!("Limit {i}"))).await;
+    }
+    let (status, refused) = call(&f.s, &f.admin, "POST", SCHEDULES, monthly(&f, "Limit 50")).await;
+    assert_eq!(
+        (status, refused["error"]["reason"].as_str()),
+        (StatusCode::CONFLICT, Some("access_review_schedule_limit"))
+    );
+    // A deleted schedule frees its place.
+    assert_eq!(
+        call(
+            &f.s,
+            &f.admin,
+            "DELETE",
+            &format!("{SCHEDULES}/{first}"),
+            Value::Null
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&f.s, &f.admin, "POST", SCHEDULES, monthly(&f, "Limit 50"))
+            .await
+            .0,
+        StatusCode::OK
+    );
+}
+
+#[dbtest::test]
+async fn a_change_that_changes_nothing_writes_nothing(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let schedule = create(&f, monthly(&f, "Unchanged")).await;
+    let before: Value =
+        sqlx::query_scalar("SELECT to_jsonb(s) FROM access_review_schedules s WHERE id=$1")
+            .bind(schedule)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    for body in [
+        json!({"paused":false}),
+        json!({"name":"Unchanged","cadence":"monthly","start_day":1}),
+    ] {
+        assert_eq!(
+            call(
+                &f.s,
+                &f.admin,
+                "PATCH",
+                &format!("{SCHEDULES}/{schedule}"),
+                body
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    let after: Value =
+        sqlx::query_scalar("SELECT to_jsonb(s) FROM access_review_schedules s WHERE id=$1")
+            .bind(schedule)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(before, after);
+    assert_eq!(scalar(&pool, "SELECT count(*) FROM audit_events WHERE resource_id=$1 AND action<>'access_review_schedule.created'", schedule).await, 0);
+}

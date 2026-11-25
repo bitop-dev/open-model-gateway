@@ -661,6 +661,28 @@ mod unit_tests {
     }
 
     #[test]
+    fn a_skipped_access_review_email_names_its_built_in_source() {
+        let row = Pending {
+            transition: "fired".into(),
+            summary: ACCESS_REVIEW_SKIPPED_SUMMARY.into(),
+            severity: "warning".into(),
+            fired_at: UtcInstant::UNIX_EPOCH,
+            resolved_at: None,
+            rule_name: None,
+            workspace_name: None,
+            workspace_kind: None,
+            connection_name: None,
+            builtin: Some(ACCESS_REVIEW_SKIPPED.into()),
+            kind: ACCESS_REVIEW_SKIPPED.into(),
+            key_expires_at: None,
+        };
+        let (subject, body) = email_message_with_link(row, "Enterprise".into(), None);
+        assert!(subject.contains(ACCESS_REVIEW_SKIPPED_SUMMARY));
+        assert!(body.contains("Built-in access review schedule"));
+        assert!(!body.contains("Built-in budget alert"));
+    }
+
+    #[test]
     fn emails_carry_only_scope_labels_and_strip_controls() {
         let facts = EmailFacts {
             installation: "Acme AI".into(),

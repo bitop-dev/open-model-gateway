@@ -272,9 +272,15 @@ pub(in crate::management) async fn change(
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(missing)?;
-    let name = b.name.clone().unwrap_or(current.name);
-    let subjects = b.subjects.clone().unwrap_or(current.subjects);
-    let workspace_ids = b.workspace_ids.clone().unwrap_or(current.workspace_ids);
+    let name = b.name.clone().unwrap_or_else(|| current.name.clone());
+    let subjects = b
+        .subjects
+        .clone()
+        .unwrap_or_else(|| current.subjects.clone());
+    let workspace_ids = b
+        .workspace_ids
+        .clone()
+        .unwrap_or_else(|| current.workspace_ids.clone());
     let open_days = b.open_days.unwrap_or(current.open_days);
     if !template_valid(&name, &subjects, &workspace_ids, open_days) {
         return Err(invalid().into());
@@ -302,6 +308,23 @@ pub(in crate::management) async fn change(
             current.start_day,
             current.start_month,
         );
+    let template_differs = (
+        &name,
+        &distinct_subjects(&subjects),
+        &workspace_ids,
+        open_days,
+    ) != (
+        &current.name,
+        &current.subjects,
+        &current.workspace_ids,
+        current.open_days,
+    );
+    if !template_differs && !calendar_changed && !pause && !resume {
+        // Nothing changes: no write and no audit event.
+        let result = one(&mut tx, id, false).await?;
+        tx.commit().await?;
+        return Ok(result);
+    }
     let next = if calendar_changed || resume {
         Some(
             calendar
@@ -326,7 +349,7 @@ pub(in crate::management) async fn change(
         .bind(u.user_id)
         .execute(&mut *tx)
         .await?;
-    if template_changed || calendar_changed {
+    if template_differs || calendar_changed {
         audit(
             &mut tx,
             &u,
@@ -420,6 +443,13 @@ pub(crate) enum Skip {
     Changed,
 }
 impl Skip {
+    /// A condition that can pass within minutes (a campaign closes, or a
+    /// revocation finishes): the run is retried each tick for a day after its
+    /// period starts before it is recorded as skipped, so a race never costs
+    /// a whole period.
+    const fn transient(self) -> bool {
+        matches!(self, Self::OpenLimit | Self::Changed)
+    }
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::PreviousOpen => "previous_open",
@@ -436,6 +466,8 @@ impl Skip {
 pub(crate) enum Outcome {
     Started(Uuid),
     Skipped(Skip),
+    /// Nothing recorded: the schedule stays due and is retried next tick.
+    Deferred(Skip),
 }
 
 #[derive(sqlx::FromRow)]
@@ -475,6 +507,7 @@ pub(crate) async fn run_due_fenced(
             Ok(None) => {}
             Err(e) if crate::leases::is_fenced(&e) => return Err(e),
             Err(e) => {
+                tracing::warn!(schedule_id=%id, "access review schedule run failed; it stays due and is retried next tick");
                 first_error.get_or_insert(e);
             }
         }
@@ -521,6 +554,13 @@ async fn run_one(
         .first_after(due.now)
         .ok_or_else(|| sqlx::Error::Protocol("access review schedule has no next period".into()))?;
     let outcome = start_or_skip(&mut tx, id, period, &due).await?;
+    if let Outcome::Skipped(reason) = outcome
+        && reason.transient()
+        && due.now < period + gateway_datetime_compat::SignedDuration::days(1)
+    {
+        tx.rollback().await?;
+        return Ok(Some(Outcome::Deferred(reason)));
+    }
     match outcome {
         Outcome::Started(campaign) => {
             crate::alerts::resolve_access_review_skipped(&mut tx, id).await?;
@@ -537,6 +577,10 @@ async fn run_one(
                 .bind(count)
                 .execute(&mut *tx)
                 .await?;
+        }
+        Outcome::Deferred(_) => {
+            tx.rollback().await?;
+            return Ok(Some(outcome));
         }
         Outcome::Skipped(reason) => {
             let run = Uuid::now_v7();

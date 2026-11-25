@@ -113,12 +113,7 @@ pub(crate) async fn installation_tx_fenced<'a>(
 ) -> Result<Transaction<'a, Postgres>, sqlx::Error> {
     let mut tx = crate::db::begin(&s.pool).await?;
     crate::leases::fence(&mut tx, fence).await?;
-    sqlx::query("SELECT pg_advisory_xact_lock_shared(72419502)")
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("SELECT id FROM installation WHERE singleton FOR NO KEY UPDATE")
-        .fetch_one(&mut *tx)
-        .await?;
+    crate::lifecycle::lock(&mut tx).await?;
     Ok(tx)
 }
 async fn installation_lock(tx: &mut Transaction<'_, Postgres>) -> Result<(), ApiError> {

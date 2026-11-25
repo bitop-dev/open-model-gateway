@@ -2,9 +2,10 @@
 -- schedule: a campaign template (name, subjects, workspace filter, how many
 -- days each campaign stays open) and a fixed cadence (monthly, quarterly or
 -- yearly) with a start day, and for quarterly and yearly cycles a start month.
--- The gateway's lifecycle job starts each due run once across replicas (the
--- lifecycle work lease, the schedule row locked FOR UPDATE SKIP LOCKED, and one
--- run row per schedule and period). A run either starts an ordinary campaign,
+-- The gateway's lifecycle job starts each due run once across replicas: under
+-- the lifecycle work lease, each run takes the installation row lock (a second
+-- scheduler waits for it, then finds the schedule no longer due), and the
+-- guards below keep one run per cursor position. A run either starts an ordinary campaign,
 -- recorded as started by the schedule and naming the admin who created the
 -- schedule as its creator, or is skipped and recorded: while the schedule's
 -- previous campaign is still open, at the 20-open limit, or when the snapshot

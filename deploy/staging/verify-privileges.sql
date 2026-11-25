@@ -1438,7 +1438,7 @@ BEGIN
   -- Access review schedules (0091): created by a Platform Admin; never
   -- deleted; the runtime cannot link a campaign to a schedule or record a
   -- started run except through the definer, which starts one campaign per
-  -- due schedule while its previous campaign is open.
+  -- due schedule and refuses while its previous campaign is open.
   DECLARE sws uuid:=gen_random_uuid(); sg uuid:=gen_random_uuid(); sch uuid:=gen_random_uuid(); later uuid:=gen_random_uuid(); sc uuid:=gen_random_uuid(); BEGIN
    INSERT INTO workspaces(id,name,kind) VALUES(sws,'Schedule probe '||sws,'team');
    INSERT INTO workspace_membership_grants(id,workspace_id,user_id,role,source) VALUES(sg,sws,t_author,'member','manual');
