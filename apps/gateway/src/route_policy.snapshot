@@ -151,6 +151,8 @@ GET	/api/v1/workspaces/{ws}/costs	WorkspaceMetadata	scope:platform:read
 GET	/api/v1/workspaces/{ws}/holds	WorkspaceMetadata	denied
 GET	/api/v1/workspaces/{ws}/usage-export	WorkspaceMetadata	scope:platform:read
 POST	/api/v1/workspaces/{ws}/costs/{execution}/reconcile	WorkspacePlatformWrite	scope:governance:write
+POST	/api/v1/workspaces/{ws}/costs/{execution}/realtime-responses/{sequence}/reconcile	WorkspacePlatformWrite	scope:governance:write
+POST	/api/v1/workspaces/{ws}/costs/{execution}/realtime-session/reconcile	WorkspacePlatformWrite	scope:governance:write
 GET	/api/v1/workspaces/{ws}/files	WorkspaceMember	denied
 DELETE	/api/v1/workspaces/{ws}/files/{id}	WorkspaceMember	denied
 GET	/api/v1/workspaces/{ws}/files/{id}/content	WorkspaceMember	denied

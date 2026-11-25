@@ -1444,7 +1444,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(count, 274);
+        assert_eq!(count, 276);
     }
     #[test]
     fn management_openapi_response_rejects_incomplete_completed_slot() {
