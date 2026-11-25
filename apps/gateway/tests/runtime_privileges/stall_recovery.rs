@@ -168,6 +168,8 @@ fn measure(phase: &str, began: Instant, pool: &PgPool, a: &Activity) {
 
 struct Reply {
     status: u16,
+    retry_after: Option<String>,
+    scope_busy: bool,
     accounting_unavailable: bool,
     done: bool,
     transport_incomplete: bool,
@@ -176,6 +178,11 @@ struct Reply {
 impl Reply {
     async fn read(mut response: reqwest::Response) -> Self {
         let status = response.status().as_u16();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let mut bytes = Vec::new();
         let mut transport_incomplete = false;
         loop {
@@ -196,6 +203,8 @@ impl Reply {
                 .is_some_and(|v| v["choices"][0]["message"]["content"] == "controlled fixture");
         Self {
             status,
+            retry_after,
+            scope_busy: text.contains("\"scope_busy\""),
             accounting_unavailable: text.contains("accounting_unavailable"),
             done,
             transport_incomplete,
@@ -212,6 +221,14 @@ impl Reply {
             !self.done,
             "failed settlement fabricated a successful stream terminator"
         );
+    }
+    /// Admission gave up waiting for the scope's rows: a retryable 503 before
+    /// anything was admitted or sent.
+    fn shed(&self) {
+        assert_eq!(self.status, 503);
+        assert!(self.scope_busy, "a stalled admission must be shed");
+        assert_eq!(self.retry_after.as_deref(), Some("2"));
+        assert!(!self.accounting_unavailable && !self.successful_response);
     }
     fn succeeded(&self) {
         assert_eq!(self.status, 200);
@@ -435,12 +452,16 @@ async fn scenario(owner: &PgPool, runtime: &PgPool, keys: bootstrap::Development
         &activity(owner, pid).await,
     );
 
-    let mut traffic = JoinSet::new();
+    // Same-scope admissions sent into the stall wait for its rows only up to
+    // admission's bound, which is shorter than the settlement deadline, so they
+    // are shed while the blocker still holds.
+    let mut burst = JoinSet::new();
     for _ in 0..BURST {
         let req = request(&client, &url, &keys.team_key.token, false);
-        traffic.spawn(async move { Reply::read(req.send().await.unwrap()).await });
+        burst.spawn(async move { Reply::read(req.send().await.unwrap()).await });
     }
     until(|| async { activity(owner, pid).await.locks > 3 }).await;
+    let mut traffic = JoinSet::new();
     let probe = request(&client, &url, &keys.personal_key.token, false);
     traffic.spawn(async move { Reply::read(probe.send().await.unwrap()).await });
     // Unrelated admission/dispatch must have pool and engine capacity while the
@@ -470,6 +491,23 @@ async fn scenario(owner: &PgPool, runtime: &PgPool, keys: bootstrap::Development
         runtime,
         &activity(owner, pid).await,
     );
+    tokio::time::timeout(GUARD, async {
+        while let Some(reply) = burst.join_next().await {
+            reply.unwrap().shed();
+        }
+    })
+    .await
+    .expect("same-scope admissions were not shed while the stall held");
+    // A shed admission leaves nothing: the three initial attempts are still
+    // the scope's only reservations, and nothing more was dispatched for it.
+    let reserved: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM governance_reservations WHERE workspace_id=$1")
+            .bind(keys.team_workspace_id)
+            .fetch_one(owner)
+            .await
+            .unwrap();
+    assert_eq!(reserved, 3, "a shed admission wrote a reservation");
+    assert_eq!(mock.calls.load(Ordering::SeqCst), 4);
     // Do not release early on client timeout: HTTP accounting refusal above is
     // the evidence that the gateway's actual finalization deadline fired.
     tx.rollback().await.unwrap();
@@ -499,7 +537,7 @@ async fn scenario(owner: &PgPool, runtime: &PgPool, keys: bootstrap::Development
         let pending: Vec<Uuid> = sqlx::query_scalar("SELECT execution_id FROM governance_reservations WHERE workspace_id=ANY($1) AND state='pending'")
         .bind([keys.team_workspace_id, keys.personal_workspace_id].as_slice())
         .fetch_all(owner).await.unwrap();
-        assert!(pending.len() <= 3 + BURST + 1);
+        assert!(pending.len() <= 3 + 1);
         assert!(ids.iter().all(|id| pending.contains(id)));
         sqlx::query("UPDATE governance_reservations SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE execution_id=ANY($1) AND state='pending'")
         .bind(&pending).execute(owner).await.unwrap();
@@ -546,7 +584,7 @@ async fn scenario(owner: &PgPool, runtime: &PgPool, keys: bootstrap::Development
         .unwrap();
         assert_eq!(inflight, 0);
         let dispatches = mock.calls.load(Ordering::SeqCst);
-        assert_eq!(dispatches, 3 + BURST + 1 + 6, "no implicit request replay");
+        assert_eq!(dispatches, 3 + 1 + 6, "no implicit request replay");
         assert_accounting(owner, dispatches as i64).await;
         let totals = governance::totals::verify(&store).await.unwrap();
         assert!(
