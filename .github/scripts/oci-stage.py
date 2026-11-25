@@ -95,6 +95,77 @@ TRANSPORT_MARKERS = (
     ("http2-goaway", b"GOAWAY"),
     ("closed-connection", b"use of closed network connection"),
 )
+# The skeleton of a failed copy's first stderr line (#711), printed only for
+# ORAS's own `Error: ` line. A token survives only if it is one of these words
+# (printed in lower case, so letter case carries nothing), or a three-digit
+# HTTP status right after "status code"; every quoted segment (where ORAS
+# puts references, paths and other values) and every other token (paths,
+# hosts, digests, other numbers, tokens, words outside this list) becomes one
+# placeholder, and a run of placeholders is one. Only ':' and ',' are kept,
+# with fixed spacing: the input's spacing, brackets and quotes never show.
+# The words are those of the error messages ORAS v1.3.6 (SOURCE_COMMIT) and
+# oras-go v2.7.0 can print for `cp --from-oci-layout` (its command, options
+# and internals, oras-go's errdef, content, oci, registry, remote and auth
+# errors), with the words of the standard Go, go-digest and cobra errors
+# they wrap (os and syscall, encoding/json, archive/tar, gzip, context, net,
+# tls, x509, flags) and the OCI distribution error codes, less nouns that are
+# also likely names or values (copy, cache, config, credential, token, ...).
+# Never a value: this list only changes by review.
+SKELETON_WORDS = frozenset((
+    "a", "absolute", "accepts", "access", "actual", "add", "after", "algorithm", "allowed",
+    "already", "an", "and", "annotation", "annotations", "another", "apply", "arch",
+    "architecture", "archive", "are", "arg", "argument", "array", "arrays", "artifact",
+    "artifact-type", "artifacts", "as", "at", "attempt", "auth", "authentication", "authority",
+    "auths", "back", "bad", "base", "basic", "be", "bearer", "been", "before", "beginning",
+    "between", "blob", "blocked", "body", "both", "broken", "build", "but", "by", "bytes",
+    "calculate", "can", "canceled", "cannot", "capability", "certificate", "changed", "character",
+    "characters", "check", "checksum", "children", "client", "close", "closed", "code", "colons",
+    "command", "committed", "configured", "confirm", "conform", "conjunction", "connect",
+    "connection", "contacted", "contain", "contains", "content", "content-length", "content-type",
+    "context", "could", "count", "create", "current", "custom", "customized", "dangling", "data",
+    "date", "deadline", "decode", "delete", "deletion", "denied", "depth", "descriptor",
+    "destination", "determine", "device", "dial", "different", "digest", "digests", "dir",
+    "directories", "directory", "disable-path-validation", "disabled", "disallowed", "display",
+    "distribution", "does", "doesn't", "downgrades", "duplicate", "duplicated", "early", "either",
+    "empty", "encoded", "end", "ensure", "eof", "error", "exceeded", "exceeds", "exist",
+    "existence", "exists", "expect", "expected", "expecting", "extra", "extract", "fail", "failed",
+    "fetch", "fetching", "field", "file", "files", "filter", "find", "flag", "flags", "for",
+    "force", "format", "found", "from", "generate", "get", "getting", "given", "go", "got", "gzip",
+    "handshake", "hard", "has", "have", "header", "helpers", "host", "http", "https", "identity",
+    "if", "image", "image-spec", "implemented", "in", "index", "ingest", "initialized", "input",
+    "insecure", "intentional", "into", "invalid", "is", "it", "it's", "json", "layer", "layout",
+    "least", "left", "length", "like", "limit", "link", "list", "listing", "literal", "load",
+    "location", "look", "looking", "lookup", "lstat", "made", "make", "manager", "manifest",
+    "manifests", "many", "marshal", "match", "matching", "media", "media-type", "mismatch",
+    "mismatched", "missing", "mkdir", "move", "multiple", "must", "name", "needs", "neither",
+    "new", "next", "no", "nor", "not", "number", "object", "obtained", "oci", "of", "on", "once",
+    "only", "open", "or", "oras", "os", "output", "outside", "over", "overwrite", "pages", "parse",
+    "path", "paths", "peer", "permission", "pipe", "plaintext", "platform", "platforms", "pointer",
+    "portion", "prefix", "prepare", "printing", "progress", "provided", "pulled", "push",
+    "putting", "query", "read", "read-only", "readlink", "readonly", "received", "recognize",
+    "recommended", "redirect", "redirects", "reference", "references", "referrer", "referrers",
+    "refused", "refusing", "registry", "rejected", "reload", "remove", "rename", "repositories",
+    "repository", "request", "requested", "required", "requires", "resend", "reserved", "reset",
+    "resolve", "resolves", "resolving", "resource", "response", "restore", "returned",
+    "rewindable", "running", "same", "save", "scheme", "seek", "seems", "set", "shorthand",
+    "should", "signed", "size", "skip", "skipped", "source", "space", "specification", "specified",
+    "stat", "status", "stdin", "stopped", "storage", "string", "sub-command", "subject",
+    "successor", "such", "support", "supported", "symbolic", "symlink", "system", "tag", "tagged",
+    "tags", "tar", "target", "tcp", "temporary", "text", "than", "the", "there", "this", "time",
+    "timeout", "tls", "to", "too", "toomanyrequests", "top-level", "trailing", "traversal", "type",
+    "udp", "unable", "unauthorized", "unexpected", "unknown", "unmarshal", "unmatched", "unnamed",
+    "unsupported", "up", "update", "upload", "usage", "use", "used", "uses", "valid", "validate",
+    "value", "values", "variant", "verify", "version", "via", "warning", "was", "when", "whence",
+    "with", "write", "writing",
+))
+SKELETON_PREFIX = b"Error: "
+SKELETON_TOKEN = re.compile(rb'"[^"]*"?|[:,]|[^\s:,"]+')
+SKELETON_WORD = re.compile(rb"[A-Za-z][A-Za-z'-]{0,23}")
+SKELETON_STATUS = re.compile(rb"[1-5][0-9]{2}")
+SKELETON_TOKENS = 40
+# Including the omission marker.
+SKELETON_CHARS = 160
+SKELETON_OMITTED = " …"
 GHCR_REQUEST = re.compile(
     rb'(?:GET|HEAD|POST|PATCH|PUT|DELETE) "https://ghcr\.io/[^"\x00-\x20\x7f]*": ',
     re.IGNORECASE,
@@ -262,6 +333,37 @@ def copy_signals(stderr):
             f"stderr {lines} lines" + (" (first 4096 bytes)" if cut else ""))
 
 
+def skeleton(stderr):
+    """ORAS's `Error: ` line with only reviewed words, a status after "status
+    code", ':' and ',' kept, everything else one placeholder per run, bounded
+    (marker included). "none" for any other first line. Safe to print."""
+    report, _ = read_report(stderr)
+    line = re.split(rb"[\r\n]", report, maxsplit=1)[0]
+    if not line.startswith(SKELETON_PREFIX):
+        return "none"
+    pieces = ["error:"]
+    for match in SKELETON_TOKEN.finditer(line[len(SKELETON_PREFIX):]):
+        token = match.group()
+        if token in (b":", b","):
+            piece = token.decode()
+        elif SKELETON_WORD.fullmatch(token) and token.lower().decode() in SKELETON_WORDS:
+            piece = token.lower().decode()
+        elif SKELETON_STATUS.fullmatch(token) and pieces[-2:] == ["status", "code"]:
+            piece = token.decode()
+        else:
+            piece = "<x>"
+        if piece == "<x>" and pieces[-1] == "<x>":
+            continue
+        pieces.append(piece)
+    text = ""
+    for count, piece in enumerate(pieces):
+        part = piece if not text or piece in (":", ",") else " " + piece
+        if count == SKELETON_TOKENS or len(text) + len(part) > SKELETON_CHARS - len(SKELETON_OMITTED):
+            return text + SKELETON_OMITTED
+        text += part
+    return text
+
+
 def attempt_copy(tool, args, env, work, image, timeout):
     """None on success, else (category, signals, retryable) of one copy attempt."""
     signals = "status none; oci-code none; request none; host none; transport none; stderr 0 lines"
@@ -271,10 +373,10 @@ def attempt_copy(tool, args, env, work, image, timeout):
                 result = subprocess.run([str(tool), *args], input=b"", env=env, cwd=work,
                                         stdout=subprocess.DEVNULL, stderr=err, timeout=timeout, check=False)
             except subprocess.TimeoutExpired:
-                return "deadline", copy_signals(err), False
+                return "deadline", f'{copy_signals(err)}; first-line "{skeleton(err)}"', False
             if result.returncode == 0:
                 return None
-            signals = copy_signals(err)
+            signals = f'{copy_signals(err)}; first-line "{skeleton(err)}"'
             if result.returncode < 0:
                 return "signal", signals, False
             if result.returncode == 1:

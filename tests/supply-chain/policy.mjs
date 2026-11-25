@@ -325,6 +325,7 @@ export const PINNED_JOB_INPUTS = [
   ".github/scripts/oci-stage.py",
   ".github/scripts/publication-tags.py",
   ".github/tools/oras.json",
+  ".github/trivy-exceptions.yaml",
   ".github/workflows/image.yml",
   "apps/gateway/Cargo.toml",
   "package.json: test:container",
