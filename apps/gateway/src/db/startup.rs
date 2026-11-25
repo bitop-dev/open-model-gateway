@@ -8,7 +8,7 @@
 //! once (a pool built with `connect` would open its minimum one after
 //! another inside one acquire timeout), and each counts as open once it has
 //! answered a query; each acquire is bounded by the pool's acquire timeout
-//! and an attempt by [`OPEN_WITHIN`].
+//! and each connection by [`OPEN_WITHIN`].
 //!
 //! PgBouncer answers a client with SQLSTATE 08P01 "server login has been
 //! failing, cached error: … (server_login_retry)" while its pool's last
@@ -24,9 +24,10 @@
 //! retries only a refused connection and 53300/57P03 within its acquire
 //! timeout.
 //!
-//! So that error alone is tried again, once a second, while the next attempt
-//! would start within [`WINDOW`]: the connections already open stay in the
-//! pool and the next attempt opens the rest. Every other failure (a wrong
+//! So that error is tried again, once a second, while the next attempt
+//! would start within [`WINDOW`] and the attempt failed with nothing else
+//! but timeouts: the connections already open stay in the pool and the next
+//! attempt opens the rest. Every other failure (a wrong
 //! password, which PgBouncer also reports as 08P01 but with another message;
 //! an unreachable host or a database out of connection slots after sqlx's
 //! own retries) fails at once. PgBouncer gives the same cached answer when
@@ -47,10 +48,10 @@ use sqlx::{
 pub(crate) const WINDOW: Duration = Duration::from_secs(30);
 const INTERVAL: Duration = Duration::from_secs(1);
 
-/// The bound on one attempt to open the whole pool: each connection's
-/// acquire is bounded by the pool's acquire timeout (`ACQUIRE_TIMEOUT`, 3 s,
-/// in `serve`), and its first query by this (a pooler can hold a query
-/// while it waits for a server connection).
+/// The bound on each connection of an attempt, its acquire and its first
+/// query together. The acquire is also bounded by the pool's acquire
+/// timeout (`ACQUIRE_TIMEOUT`, 3 s, in `serve`); the query by this alone (a
+/// pooler holds a query while it waits for a server connection).
 pub(crate) const OPEN_WITHIN: Duration = Duration::from_secs(10);
 
 /// PgBouncer's cached server-login failure (see the module documentation):
@@ -103,8 +104,7 @@ pub(crate) async fn connect(
             Ok(()) => return Ok(pool),
             Err(failed) => failed,
         };
-        let cached = errors.iter().find_map(cached_reason);
-        match cached {
+        match retried(&errors) {
             Some(reason) if Instant::now() + INTERVAL < deadline => {
                 tracing::warn!(
                     reason,
@@ -122,39 +122,65 @@ pub(crate) async fn connect(
     }
 }
 
-/// The error startup stops with: any other than a pooler's cached failure,
-/// which would otherwise hide it, else the cached failure itself.
-fn reported(mut errors: Vec<sqlx::Error>) -> sqlx::Error {
-    let index = errors
+/// The pooler's cached cause when the attempt is tried again: it failed with
+/// that cached failure and nothing else but timeouts (a pooler instance
+/// that never logged in holds its clients until its next login attempt,
+/// which can fall in the window). Any other error stops startup at once.
+fn retried(errors: &[sqlx::Error]) -> Option<&str> {
+    let only_cached_or_timeouts = errors
         .iter()
-        .position(|e| cached_reason(e).is_none())
+        .all(|e| cached_reason(e).is_some() || matches!(e, sqlx::Error::PoolTimedOut));
+    errors
+        .iter()
+        .find_map(cached_reason)
+        .filter(|_| only_cached_or_timeouts)
+}
+
+/// The error startup stops with, the most definite first: one that is
+/// neither a pooler's cached failure nor a timeout (a wrong password, 53300,
+/// `max_client_conn`), then the cached failure (its cause persists), then a
+/// timeout (which may only be a side effect of either).
+fn reported(mut errors: Vec<sqlx::Error>) -> sqlx::Error {
+    let rank = |e: &sqlx::Error| match (cached_reason(e).is_some(), e) {
+        (true, _) => 1,
+        (false, sqlx::Error::PoolTimedOut) => 2,
+        (false, _) => 0,
+    };
+    let index = (0..errors.len())
+        .min_by_key(|&i| rank(&errors[i]))
         .unwrap_or(0);
     errors.swap_remove(index)
 }
 
 /// Acquire `connections` connections of `pool` at once (each acquire opens
-/// one while fewer are open), each answering a query, within
+/// one while fewer are open), each answering a query within
 /// [`OPEN_WITHIN`], and return them to it. The query is what proves a
 /// connection through PgBouncer: once a pool has served, PgBouncer completes
 /// a client's login from the server parameters it cached and sends a cached
-/// failed server login at the client's first query instead. Every
-/// connection's attempt runs to its end, so the ones that answered stay in
-/// the pool whichever failed (a refused one is closed by the pooler and
-/// dropped); on a failure, how many answered and all of the errors, so a
-/// slower connection's timeout never hides a pooler's cached failure.
+/// failed server login at the client's first query instead. In transaction
+/// mode the query needs a free server connection for a moment. Each
+/// connection is bounded on its own and runs to its end, so the ones that
+/// answered stay in the pool whichever failed; on a failure, how many
+/// answered and all of the errors, so one connection's timeout never hides
+/// another's cached failure.
 async fn open(pool: &PgPool, connections: u32) -> Result<(), (usize, Vec<sqlx::Error>)> {
-    let opening = futures_util::future::join_all((0..connections).map(|_| async {
-        let mut connection = pool.acquire().await?;
-        if let Err(error) = sqlx::Executor::execute(&mut *connection, "SELECT 1").await {
-            // Closed by the pooler: out of the pool, never handed out again.
-            connection.close_on_drop();
-            return Err(error);
-        }
-        Ok::<_, sqlx::Error>(connection)
-    }));
-    let Ok(results) = tokio::time::timeout(OPEN_WITHIN, opening).await else {
-        return Err((0, vec![sqlx::Error::PoolTimedOut]));
-    };
+    let results = futures_util::future::join_all((0..connections).map(|_| async {
+        let opening = async {
+            let mut connection = pool.acquire().await?;
+            if let Err(error) = sqlx::Executor::execute(&mut *connection, "SELECT 1").await {
+                // Closed by the pooler: out of the pool, never handed out
+                // again (sqlx opens a replacement in the background, which a
+                // later attempt proves the same way).
+                connection.close_on_drop();
+                return Err(error);
+            }
+            Ok::<_, sqlx::Error>(connection)
+        };
+        tokio::time::timeout(OPEN_WITHIN, opening)
+            .await
+            .unwrap_or(Err(sqlx::Error::PoolTimedOut))
+    }))
+    .await;
     let mut errors = Vec::new();
     let mut open = Vec::with_capacity(results.len());
     for result in results {

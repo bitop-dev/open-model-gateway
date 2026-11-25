@@ -225,9 +225,9 @@ async fn serve_opens_every_connection_of_its_pool_before_listening(pool: PgPool)
 
 /// The cached failure reaches some of the pool's connections (one of two
 /// Pooler instances): the whole open is tried again, keeping those already
-/// open, until every connection is open. Each connection the pooler refused
-/// is opened once more and none other: `connections + refused` reach it
-/// (a fresh pool per attempt would open all of them again).
+/// open, until every connection is open. Every connection that reaches the
+/// pooler is one it refused or one the pool keeps: `connections + refused`
+/// in all (a fresh pool per attempt would open the kept ones again).
 async fn waited_out_until_whole(pool: &PgPool, connections: u32, refused: usize, refuse: Refuse) {
     let (result, seen, elapsed) =
         through_front_refusing(pool, connections, refused, CACHED, WINDOW, refuse).await;
@@ -407,9 +407,25 @@ fn the_cached_reason_and_the_error_startup_stops_with() {
         stopped(vec![error("08P01", CACHED), error("08P01", WRONG_PASSWORD)]),
         WRONG_PASSWORD
     );
+    // A timeout may only be a side effect: the cached cause is reported.
     assert_eq!(
-        stopped(vec![error("08P01", CACHED), sqlx::Error::PoolTimedOut]),
-        sqlx::Error::PoolTimedOut.to_string()
+        stopped(vec![sqlx::Error::PoolTimedOut, error("08P01", CACHED)]),
+        CACHED
     );
     assert_eq!(stopped(vec![error("08P01", CACHED)]), CACHED);
+    assert_eq!(
+        stopped(vec![sqlx::Error::PoolTimedOut, error("53300", "too many")]),
+        "too many"
+    );
+
+    // Tried again only for the cached failure, alone or with timeouts.
+    assert_eq!(
+        retried(&[error("08P01", CACHED), sqlx::Error::PoolTimedOut]),
+        Some("connect failed")
+    );
+    assert_eq!(
+        retried(&[error("08P01", CACHED), error("08P01", WRONG_PASSWORD)]),
+        None
+    );
+    assert_eq!(retried(&[sqlx::Error::PoolTimedOut]), None);
 }
