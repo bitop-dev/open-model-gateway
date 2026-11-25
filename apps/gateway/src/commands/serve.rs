@@ -35,9 +35,6 @@ pub(crate) async fn serve(
     local_approvals: &mut Option<ApprovedEndpoints>,
     process_start_unix_nano: u64,
 ) -> Result<()> {
-    // Registered once, before anything starts, so a signal during the
-    // drain is seen.
-    let signals = Signals::register().context("could not register shutdown signals")?;
     let (traces, _recorder, store, web, engine) =
         build_engine(&config, store, provider_secrets, local_approvals).await?;
     let Prepared {
@@ -67,6 +64,16 @@ pub(crate) async fn serve(
         Err(error) => {
             release_leases(lease_task, &leases, pool).await;
             return Err(error);
+        }
+    };
+    // Registered only now, as before: until here a signal ends the process
+    // (its default action) instead of waiting for start-up to finish. Once,
+    // so a second signal during the drain is seen.
+    let signals = match Signals::register() {
+        Ok(signals) => signals,
+        Err(error) => {
+            shutdown(traces, tasks, lease_task, &leases, pool).await;
+            return Err(anyhow::Error::new(error).context("could not register shutdown signals"));
         }
     };
     let draining = Drain::default();

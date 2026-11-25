@@ -3,7 +3,7 @@
 //! until the server says otherwise, so the server must answer on it with
 //! `Connection: close` before it closes it: a connection closed without that
 //! can meet the client's next request on the way and lose it.
-#![cfg(feature = "integration-tests")]
+#![cfg(all(feature = "integration-tests", unix))]
 #![allow(clippy::disallowed_methods)]
 use sqlx::{ConnectOptions, PgPool};
 use std::{process::Stdio, time::Duration};
@@ -16,6 +16,8 @@ use tokio::{
 
 /// The drain window the tests configure.
 const DRAIN: Duration = Duration::from_secs(3);
+/// Deadline of one exchange or close on a connection (longer than `DRAIN`).
+const IO: Duration = Duration::from_secs(15);
 
 struct Serve {
     child: Child,
@@ -101,6 +103,12 @@ impl Serve {
 /// One `GET /health/live` on `stream`: its status line and lowercase header
 /// block, or `None` when the server closed the connection without answering.
 async fn live(stream: &mut TcpStream) -> Option<(String, String)> {
+    tokio::time::timeout(IO, exchange(stream))
+        .await
+        .expect("the exchange ends within its deadline")
+}
+
+async fn exchange(stream: &mut TcpStream) -> Option<(String, String)> {
     stream
         .write_all(b"GET /health/live HTTP/1.1\r\nHost: gateway\r\n\r\n")
         .await
@@ -147,7 +155,10 @@ fn closes(headers: &str) -> bool {
 /// reset), never data.
 async fn closed(stream: &mut TcpStream) -> bool {
     let mut byte = [0; 1];
-    matches!(stream.read(&mut byte).await, Ok(0) | Err(_))
+    let read = tokio::time::timeout(IO, stream.read(&mut byte))
+        .await
+        .expect("the connection closes within its deadline");
+    matches!(read, Ok(0) | Err(_))
 }
 
 #[sqlx::test(migrations = "./enterprise_migrations")]
@@ -162,9 +173,10 @@ async fn an_idle_keep_alive_connection_is_told_to_close_before_it_is_closed(pool
         assert!(!closes(&headers), "{headers}");
     }
 
+    // Before the signal: the gateway's window starts after it.
+    let signalled = tokio::time::Instant::now();
     serve.signal();
     serve.line("shutdown requested").await;
-    let signalled = tokio::time::Instant::now();
     // Idle connections stay open while the gateway drains: a client may
     // already be sending its next request on one.
     let mut byte = [0; 1];
@@ -192,7 +204,7 @@ async fn an_idle_keep_alive_connection_is_told_to_close_before_it_is_closed(pool
     // One that stays idle all along is closed when the window ends.
     assert!(closed(&mut idle).await);
     let waited = signalled.elapsed();
-    assert!(waited >= DRAIN - Duration::from_millis(100), "{waited:?}");
+    assert!(waited >= DRAIN, "{waited:?}");
     let status = tokio::time::timeout(Duration::from_secs(30), serve.child.wait())
         .await
         .expect("serve exits after the drain")
@@ -203,14 +215,14 @@ async fn an_idle_keep_alive_connection_is_told_to_close_before_it_is_closed(pool
 /// A second signal ends the drain at once (an operator's second Ctrl-C).
 #[sqlx::test(migrations = "./enterprise_migrations")]
 async fn a_second_signal_ends_the_drain(pool: PgPool) {
-    let mut serve = Serve::start(&pool, &[("GATEWAY_SHUTDOWN_DRAIN_SECONDS", "60")]).await;
+    let mut serve = Serve::start(&pool, &[("GATEWAY_SHUTDOWN_DRAIN_SECONDS", "30")]).await;
     let mut idle = serve.connect().await;
     assert!(live(&mut idle).await.is_some());
     serve.signal();
     serve.line("shutdown requested").await;
     serve.line("draining").await;
     serve.signal();
-    let status = tokio::time::timeout(Duration::from_secs(30), serve.child.wait())
+    let status = tokio::time::timeout(Duration::from_secs(15), serve.child.wait())
         .await
         .expect("a second signal ends the drain")
         .unwrap();

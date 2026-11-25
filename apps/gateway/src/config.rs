@@ -32,7 +32,7 @@ pub struct Config {
     /// `GATEWAY_REPORTING_MAX_LAG_SECONDS` (default 30, 1-3600): a replica
     /// replaying WAL further behind than this is skipped for the primary.
     pub reporting_max_lag: Duration,
-    /// `GATEWAY_SHUTDOWN_DRAIN_SECONDS` (default 5, 0-60): after a shutdown
+    /// `GATEWAY_SHUTDOWN_DRAIN_SECONDS` (default 5, 0-30): after a shutdown
     /// signal the gateway keeps serving this long and marks every HTTP/1.1
     /// response `Connection: close` before it closes idle connections
     /// (`crate::drain`). 0 closes them at the signal.
@@ -711,9 +711,9 @@ fn shutdown_drain_from_env() -> Result<Duration> {
         .unwrap_or_else(|_| "5".into())
         .parse::<u64>()
         .ok()
-        .filter(|n| *n <= 60)
+        .filter(|n| *n <= 30)
         .map(Duration::from_secs)
-        .context("GATEWAY_SHUTDOWN_DRAIN_SECONDS must be an integer from 0 to 60")
+        .context("GATEWAY_SHUTDOWN_DRAIN_SECONDS must be an integer from 0 to 30")
 }
 
 fn config_cache_from_env() -> Result<bool> {
