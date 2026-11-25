@@ -243,6 +243,68 @@ struct Current {
     paused: bool,
 }
 
+/// A change applied to the stored schedule: the resulting template (subjects
+/// sorted and distinct) and calendar, and whether each differs from what is
+/// stored. Resending the stored calendar is no change: the cursor stays, so a
+/// period that is due but not yet run still runs.
+struct Merged {
+    name: String,
+    subjects: Vec<String>,
+    workspace_ids: Vec<Uuid>,
+    open_days: i32,
+    cadence: String,
+    start_day: i16,
+    start_month: Option<i16>,
+    template_differs: bool,
+    calendar_changed: bool,
+}
+
+fn merge(b: &ScheduleChange, current: &Current) -> Result<Merged, ApiError> {
+    let name = b.name.clone().unwrap_or_else(|| current.name.clone());
+    let subjects = b.subjects.as_ref().unwrap_or(&current.subjects);
+    let workspace_ids = b
+        .workspace_ids
+        .clone()
+        .unwrap_or_else(|| current.workspace_ids.clone());
+    let open_days = b.open_days.unwrap_or(current.open_days);
+    if !template_valid(&name, subjects, &workspace_ids, open_days) {
+        return Err(invalid());
+    }
+    let subjects = distinct_subjects(subjects);
+    let (cadence, start_day, start_month) = match (&b.cadence, b.start_day) {
+        (Some(c), Some(day)) => (c.clone(), day as i16, b.start_month.map(|m| m as i16)),
+        _ => (
+            current.cadence.clone(),
+            current.start_day,
+            current.start_month,
+        ),
+    };
+    let template_differs = (&name, &subjects, &workspace_ids, open_days)
+        != (
+            &current.name,
+            &current.subjects,
+            &current.workspace_ids,
+            current.open_days,
+        );
+    let calendar_changed = (cadence.as_str(), start_day, start_month)
+        != (
+            current.cadence.as_str(),
+            current.start_day,
+            current.start_month,
+        );
+    Ok(Merged {
+        name,
+        subjects,
+        workspace_ids,
+        open_days,
+        cadence,
+        start_day,
+        start_month,
+        template_differs,
+        calendar_changed,
+    })
+}
+
 /// `PATCH /api/v1/platform/access-review-schedules/{id}`: changes the
 /// template or calendar, pauses or resumes. A changed calendar, and
 /// resuming, set the next run to the first period start after now: periods
@@ -272,53 +334,22 @@ pub(in crate::management) async fn change(
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(missing)?;
-    let name = b.name.clone().unwrap_or_else(|| current.name.clone());
-    let subjects = b
-        .subjects
-        .clone()
-        .unwrap_or_else(|| current.subjects.clone());
-    let workspace_ids = b
-        .workspace_ids
-        .clone()
-        .unwrap_or_else(|| current.workspace_ids.clone());
-    let open_days = b.open_days.unwrap_or(current.open_days);
-    if !template_valid(&name, &subjects, &workspace_ids, open_days) {
-        return Err(invalid().into());
-    }
+    let Merged {
+        name,
+        subjects,
+        workspace_ids,
+        open_days,
+        cadence,
+        start_day,
+        start_month,
+        template_differs,
+        calendar_changed,
+    } = merge(&b, &current)?;
     if b.workspace_ids.is_some() && !workspace_ids.is_empty() {
         check_workspace_filter(&mut tx, &workspace_ids, workspace_ids.len()).await?;
     }
-    let (cadence, start_day, start_month) = match (&b.cadence, b.start_day) {
-        (Some(c), Some(day)) => (c.clone(), day as i16, b.start_month.map(|m| m as i16)),
-        _ => (
-            current.cadence.clone(),
-            current.start_day,
-            current.start_month,
-        ),
-    };
     let pause = b.paused == Some(true) && !current.paused;
     let resume = b.paused == Some(false) && current.paused;
-    let calendar = calendar_of(&cadence, start_day.into(), start_month.map(Into::into))
-        .ok_or_else(calendar_exhausted)?;
-    // Resending the stored calendar is no change: the cursor stays, so a
-    // period that is due but not yet run still runs.
-    let calendar_changed = (cadence.as_str(), start_day, start_month)
-        != (
-            current.cadence.as_str(),
-            current.start_day,
-            current.start_month,
-        );
-    let template_differs = (
-        &name,
-        &distinct_subjects(&subjects),
-        &workspace_ids,
-        open_days,
-    ) != (
-        &current.name,
-        &current.subjects,
-        &current.workspace_ids,
-        current.open_days,
-    );
     if !template_differs && !calendar_changed && !pause && !resume {
         // Nothing changes: no write and no audit event.
         let result = one(&mut tx, id, false).await?;
@@ -326,6 +357,8 @@ pub(in crate::management) async fn change(
         return Ok(result);
     }
     let next = if calendar_changed || resume {
+        let calendar = calendar_of(&cadence, start_day.into(), start_month.map(Into::into))
+            .ok_or_else(calendar_exhausted)?;
         Some(
             calendar
                 .first_after(now(&mut tx).await?)
@@ -337,7 +370,7 @@ pub(in crate::management) async fn change(
     sqlx::query("UPDATE access_review_schedules SET name=$2,subjects=$3,workspace_ids=$4,open_days=$5,cadence=$6,start_day=$7,start_month=$8,next_run_at=coalesce($9,next_run_at),paused_at=CASE WHEN $10 THEN clock_timestamp() WHEN $11 THEN NULL ELSE paused_at END,paused_by=CASE WHEN $10 THEN $12 WHEN $11 THEN NULL ELSE paused_by END,updated_by=$12,updated_at=clock_timestamp() WHERE id=$1")
         .bind(id)
         .bind(&name)
-        .bind(distinct_subjects(&subjects))
+        .bind(&subjects)
         .bind(&workspace_ids)
         .bind(open_days)
         .bind(&cadence)
@@ -349,21 +382,14 @@ pub(in crate::management) async fn change(
         .bind(u.user_id)
         .execute(&mut *tx)
         .await?;
-    if template_differs || calendar_changed {
-        audit(
-            &mut tx,
-            &u,
-            None,
+    for (happened, action, metadata) in [
+        (
+            template_differs || calendar_changed,
             "access_review_schedule.changed",
-            "access_review_schedule",
-            Some(id),
             json!({"mode":cadence}),
-        )
-        .await?;
-    }
-    for (happened, action) in [
-        (pause, "access_review_schedule.paused"),
-        (resume, "access_review_schedule.resumed"),
+        ),
+        (pause, "access_review_schedule.paused", json!({})),
+        (resume, "access_review_schedule.resumed", json!({})),
     ] {
         if happened {
             audit(
@@ -373,7 +399,7 @@ pub(in crate::management) async fn change(
                 action,
                 "access_review_schedule",
                 Some(id),
-                json!({}),
+                metadata,
             )
             .await?;
         }
