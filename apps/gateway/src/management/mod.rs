@@ -1,6 +1,8 @@
 mod access;
 mod access_requests;
 mod access_reviews;
+/// The scheduler of access review schedules (#481), run by the lifecycle job.
+pub(crate) use access_reviews::schedules as access_review_schedules;
 mod admin_tokens;
 mod alerts;
 mod audit_export;

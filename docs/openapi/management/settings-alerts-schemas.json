@@ -2008,7 +2008,8 @@
             "aged_unknown_hold",
             "scim_last_admin",
             "partitions_missing",
-            "history_orphans"
+            "history_orphans",
+            "access_review_skipped"
           ]
         },
         "state": {
@@ -4880,6 +4881,9 @@
               },
               {
                 "$ref": "#/components/schemas/SettingsHistoryOrphansEvent"
+              },
+              {
+                "$ref": "#/components/schemas/SettingsAccessReviewSkippedEvent"
               },
               {
                 "$ref": "#/components/schemas/SettingsAgedHoldEvent"
@@ -8968,7 +8972,8 @@
             "aged_unknown_hold",
             "scim_last_admin",
             "partitions_missing",
-            "history_orphans"
+            "history_orphans",
+            "access_review_skipped"
           ]
         },
         "state": {
@@ -9135,6 +9140,55 @@
           }
         }
       ]
+    },
+    "SettingsAccessReviewSkippedDetails": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reason"
+      ],
+      "properties": {
+        "reason": {
+          "enum": [
+            "previous_open",
+            "open_limit",
+            "empty",
+            "too_large",
+            "changed"
+          ]
+        }
+      },
+      "description": "alerts::fire_access_review_skipped: the skipped run's reason code only (no schedule or campaign names)."
+    },
+    "SettingsAccessReviewSkippedEvent": {
+      "allOf": [
+        {
+          "$ref": "#/components/schemas/SettingsAlertEvent"
+        },
+        {
+          "properties": {
+            "builtin": {
+              "const": true
+            },
+            "kind": {
+              "const": "access_review_skipped"
+            },
+            "rule": {
+              "type": "null"
+            },
+            "workspace": {
+              "type": "null"
+            },
+            "connection": {
+              "type": "null"
+            },
+            "details": {
+              "$ref": "#/components/schemas/SettingsAccessReviewSkippedDetails"
+            }
+          }
+        }
+      ],
+      "description": "Built-in (#481): a scheduled access review run was skipped. One per run; cleared when a later run of the schedule starts a campaign or the schedule is deleted. No rule, workspace or connection."
     }
   }
 }

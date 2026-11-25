@@ -210,6 +210,16 @@ GRANT INSERT(id,item_id,decision,decided_by) ON public.access_review_decisions T
 GRANT EXECUTE ON FUNCTION public.access_review_item_active(uuid),public.access_review_candidate(uuid,uuid),public.access_review_may_decide(uuid,uuid) TO gateway_runtime;
 -- #90 slice 4: reminder read marks, insert-only with the server's read time.
 GRANT SELECT,INSERT(user_id,campaign_id,state) ON public.access_review_notification_reads TO gateway_runtime;
+-- #481: access review schedules. The runtime creates, changes, pauses and
+-- soft-deletes schedules (the guard keeps the creator, requires Platform
+-- Admins and refuses changes to a deleted schedule) and records skipped runs;
+-- only the definer starts a scheduled campaign and records its started run
+-- (no grant on access_review_campaigns.schedule_id or on a run's campaign_id).
+GRANT SELECT ON public.access_review_schedules,public.access_review_schedule_runs TO gateway_runtime;
+GRANT INSERT(id,name,subjects,workspace_ids,open_days,cadence,start_day,start_month,created_by,next_run_at) ON public.access_review_schedules TO gateway_runtime;
+GRANT UPDATE(name,subjects,workspace_ids,open_days,cadence,start_day,start_month,next_run_at,paused_at,paused_by,deleted_at,deleted_by,updated_at) ON public.access_review_schedules TO gateway_runtime;
+GRANT INSERT(id,schedule_id,period_at,outcome,reason) ON public.access_review_schedule_runs TO gateway_runtime;
+GRANT EXECUTE ON FUNCTION public.omg_access_review_start_scheduled(uuid,uuid,uuid,timestamptz) TO gateway_runtime;
 -- Installation spend rules (0026) edit their period and reference amount.
 GRANT UPDATE(name,enabled,budget_layers,thresholds,spike_factor_percent,min_spend_microusd,
  window_minutes,error_rate_percent,min_requests,consecutive_failures,provider_connection_id,

@@ -647,7 +647,7 @@ async fn platform_events(
         &q,
         // Platform history explicitly includes aged holds. Key-expiry still
         // needs its key-specific authority, never platform role alone.
-        &format!("(r.scope='installation' OR e.builtin IN ('scim_last_admin','partitions_missing','history_orphans') OR ({})) AND $6::uuid IS NULL", core::aged_hold_visible("$7")),
+        &format!("(r.scope='installation' OR e.builtin IN ('scim_last_admin','partitions_missing','history_orphans','access_review_skipped') OR ({})) AND $6::uuid IS NULL", core::aged_hold_visible("$7")),
         None,
         u.user_id(),
     )
@@ -682,7 +682,7 @@ fn visible() -> String {
     let key_visible = core::key_expiry_visible("$1");
     let aged_visible = core::aged_hold_visible("$1");
     format!(
-        "e.fired_at>now()-interval '90 days' AND ((e.builtin IS NOT NULL AND w.kind='personal' AND w.owner_user_id=$1 AND w.disabled_at IS NULL) OR (r.scope='installation' AND $2) OR (e.builtin IN ('scim_last_admin','partitions_missing','history_orphans') AND $2) OR (r.scope='workspace' AND w.kind IN ('team','project') AND w.disabled_at IS NULL AND (EXISTS(SELECT 1 FROM effective_workspace_memberships m WHERE m.workspace_id=e.workspace_id AND m.user_id=$1 AND m.role IN ('owner','admin')) OR (r.notify_platform_admins AND $2))) OR ({key_visible}) OR ({aged_visible}))"
+        "e.fired_at>now()-interval '90 days' AND ((e.builtin IS NOT NULL AND w.kind='personal' AND w.owner_user_id=$1 AND w.disabled_at IS NULL) OR (r.scope='installation' AND $2) OR (e.builtin IN ('scim_last_admin','partitions_missing','history_orphans','access_review_skipped') AND $2) OR (r.scope='workspace' AND w.kind IN ('team','project') AND w.disabled_at IS NULL AND (EXISTS(SELECT 1 FROM effective_workspace_memberships m WHERE m.workspace_id=e.workspace_id AND m.user_id=$1 AND m.role IN ('owner','admin')) OR (r.notify_platform_admins AND $2))) OR ({key_visible}) OR ({aged_visible}))"
     )
 }
 

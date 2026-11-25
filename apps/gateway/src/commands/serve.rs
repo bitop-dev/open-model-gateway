@@ -482,11 +482,20 @@ fn spawn_history_verify_and_lifecycle(
                             Some(&fence),
                         )
                         .await?;
-                        open_model_gateway::lifecycle::cleanup_inactive_accounts_fenced(
+                        let cleaned =
+                            open_model_gateway::lifecycle::cleanup_inactive_accounts_fenced(
+                                &store,
+                                Some(&fence),
+                            )
+                            .await?;
+                        // Last, so a failing schedule never holds back the
+                        // lifecycle work above.
+                        open_model_gateway::lifecycle::start_scheduled_access_reviews_fenced(
                             &store,
                             Some(&fence),
                         )
-                        .await
+                        .await?;
+                        Ok(cleaned)
                     }
                 },
             )

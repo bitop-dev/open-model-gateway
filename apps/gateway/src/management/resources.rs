@@ -104,6 +104,23 @@ pub(crate) async fn installation_tx(s: &Store) -> Result<Transaction<'_, Postgre
     installation_lock(&mut tx).await?;
     Ok(tx)
 }
+/// [`installation_tx`] for a fenced background job: the lease fence is the
+/// transaction's first statement, then the same catalog and installation
+/// locks in the same order.
+pub(crate) async fn installation_tx_fenced<'a>(
+    s: &'a Store,
+    fence: Option<&crate::leases::Fence>,
+) -> Result<Transaction<'a, Postgres>, sqlx::Error> {
+    let mut tx = crate::db::begin(&s.pool).await?;
+    crate::leases::fence(&mut tx, fence).await?;
+    sqlx::query("SELECT pg_advisory_xact_lock_shared(72419502)")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SELECT id FROM installation WHERE singleton FOR NO KEY UPDATE")
+        .fetch_one(&mut *tx)
+        .await?;
+    Ok(tx)
+}
 async fn installation_lock(tx: &mut Transaction<'_, Postgres>) -> Result<(), ApiError> {
     sqlx::query_scalar::<_, Uuid>("SELECT id FROM installation WHERE singleton FOR NO KEY UPDATE")
         .fetch_optional(&mut **tx)

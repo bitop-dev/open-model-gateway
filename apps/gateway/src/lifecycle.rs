@@ -191,6 +191,20 @@ pub async fn expire_access_requests_fenced(
     Ok(expired.len() as u64)
 }
 
+/// #481: starts each due scheduled access review once (or records it as
+/// skipped) under the same fenced lifecycle lease. Returns how many runs were
+/// recorded.
+pub async fn start_scheduled_access_reviews_fenced(
+    store: &Store,
+    fence: Option<&crate::leases::Fence>,
+) -> Result<u64, sqlx::Error> {
+    Ok(
+        crate::management::access_review_schedules::run_due_fenced(store, fence)
+            .await?
+            .len() as u64,
+    )
+}
+
 /// A mapping's write target: `Platform` role or `Workspace` membership.
 /// Shared by `apply_group_grants` and the preview evaluator
 /// (`management::group_mapping_preview`, #89) instead of either side typing
