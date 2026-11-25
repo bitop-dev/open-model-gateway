@@ -11,6 +11,7 @@ use crate::governance::locks;
 
 mod campaign_export;
 mod removal;
+pub(crate) mod schedules;
 use campaign_export::*;
 use removal::*;
 
@@ -32,7 +33,7 @@ pub(super) struct NewCampaign {
     due_in_days: Option<i32>,
 }
 
-const CAMPAIGN_JSON: &str = "jsonb_build_object('id',c.id,'name',c.name,'subjects',to_jsonb(c.subjects),'workspace_ids',to_jsonb(c.workspace_ids),'created_by',c.created_by,'created_at',c.created_at,'due_at',c.due_at,'closed_at',c.closed_at,'item_count',(SELECT count(*) FROM access_review_items i WHERE i.campaign_id=c.id))";
+const CAMPAIGN_JSON: &str = "jsonb_build_object('id',c.id,'name',c.name,'subjects',to_jsonb(c.subjects),'workspace_ids',to_jsonb(c.workspace_ids),'created_by',c.created_by,'created_at',c.created_at,'due_at',c.due_at,'closed_at',c.closed_at,'schedule_id',c.schedule_id,'item_count',(SELECT count(*) FROM access_review_items i WHERE i.campaign_id=c.id))";
 
 /// The latest decision and assignment of item `i` (as `d` and `a`).
 const LATEST_DECISION: &str = "LEFT JOIN LATERAL (SELECT x.decision,x.decided_by,x.decided_at FROM access_review_decisions x WHERE x.item_id=i.id ORDER BY x.seq DESC LIMIT 1) d ON true LEFT JOIN LATERAL (SELECT y.reviewer_user_id FROM access_review_assignments y WHERE y.item_id=i.id ORDER BY y.seq DESC LIMIT 1) a ON true";
@@ -243,20 +244,13 @@ async fn snapshot_items(
     subjects: &std::collections::BTreeSet<&str>,
     workspace_ids: &[Uuid],
 ) -> Result<i64, ManagementError> {
-    let inserted = sqlx::query("WITH m AS (SELECT 'workspace_membership' AS kind, g.id AS membership_grant_id, NULL::uuid AS platform_grant_id, NULL::uuid AS api_key_id FROM workspace_membership_grants g JOIN workspaces w ON w.id=g.workspace_id JOIN users u ON u.id=g.user_id WHERE $2 AND g.revoked_at IS NULL AND w.kind IN ('team','project') AND w.disabled_at IS NULL AND (cardinality($4::uuid[])=0 OR w.id=ANY($4)) AND u.disabled_at IS NULL AND u.cleaned_at IS NULL), p AS (SELECT 'platform_role', NULL::uuid, g.id, NULL::uuid FROM platform_role_grants g JOIN users u ON u.id=g.user_id WHERE $3 AND g.revoked_at IS NULL AND g.role IN ('admin','auditor') AND u.disabled_at IS NULL AND u.cleaned_at IS NULL), k AS (SELECT DISTINCT ON (k.workspace_id,k.governance_key_id) 'workspace_key', NULL::uuid, NULL::uuid, k.id FROM api_keys k JOIN workspaces w ON w.id=k.workspace_id LEFT JOIN users u ON u.id=k.issued_to_user_id WHERE $6 AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at>now()) AND w.kind IN ('team','project') AND w.disabled_at IS NULL AND (cardinality($4::uuid[])=0 OR w.id=ANY($4)) AND (k.issued_to_user_id IS NULL OR (u.disabled_at IS NULL AND u.cleaned_at IS NULL)) ORDER BY k.workspace_id,k.governance_key_id,k.created_at DESC,k.id), s AS (SELECT * FROM m UNION ALL SELECT * FROM p UNION ALL SELECT * FROM k LIMIT $5) INSERT INTO access_review_items(id,campaign_id,subject_kind,membership_grant_id,platform_grant_id,api_key_id) SELECT gen_random_uuid(),$1,kind,membership_grant_id,platform_grant_id,api_key_id FROM s")
-        .bind(id)
-        .bind(subjects.contains("workspace_memberships"))
-        .bind(subjects.contains("platform_roles"))
-        .bind(workspace_ids)
-        .bind(MAX_ITEMS + 1)
-        .bind(subjects.contains("workspace_keys"))
-        .execute(&mut **tx)
+    snapshot_rows(tx, id, subjects, workspace_ids)
         .await
         .map_err(|e| {
             // The guard rechecks each grant in its own snapshot: a grant
             // revoked (or a person or workspace disabled) while the
             // snapshot was taken refuses the whole campaign.
-            if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("23514") {
+            if snapshot_changed(&e) {
                 ManagementError::detailed(
                     StatusCode::CONFLICT,
                     "access_review_changed",
@@ -266,7 +260,28 @@ async fn snapshot_items(
             } else {
                 e.into()
             }
-        })?
+        })
+}
+/// Whether a snapshot failed because access changed while it was taken.
+fn snapshot_changed(e: &sqlx::Error) -> bool {
+    e.as_database_error().and_then(|d| d.code()).as_deref() == Some("23514")
+}
+/// [`snapshot_items`] with the database error unmapped.
+async fn snapshot_rows(
+    tx: &mut Transaction<'_, Postgres>,
+    id: Uuid,
+    subjects: &std::collections::BTreeSet<&str>,
+    workspace_ids: &[Uuid],
+) -> Result<i64, sqlx::Error> {
+    let inserted = sqlx::query("WITH m AS (SELECT 'workspace_membership' AS kind, g.id AS membership_grant_id, NULL::uuid AS platform_grant_id, NULL::uuid AS api_key_id FROM workspace_membership_grants g JOIN workspaces w ON w.id=g.workspace_id JOIN users u ON u.id=g.user_id WHERE $2 AND g.revoked_at IS NULL AND w.kind IN ('team','project') AND w.disabled_at IS NULL AND (cardinality($4::uuid[])=0 OR w.id=ANY($4)) AND u.disabled_at IS NULL AND u.cleaned_at IS NULL), p AS (SELECT 'platform_role', NULL::uuid, g.id, NULL::uuid FROM platform_role_grants g JOIN users u ON u.id=g.user_id WHERE $3 AND g.revoked_at IS NULL AND g.role IN ('admin','auditor') AND u.disabled_at IS NULL AND u.cleaned_at IS NULL), k AS (SELECT DISTINCT ON (k.workspace_id,k.governance_key_id) 'workspace_key', NULL::uuid, NULL::uuid, k.id FROM api_keys k JOIN workspaces w ON w.id=k.workspace_id LEFT JOIN users u ON u.id=k.issued_to_user_id WHERE $6 AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at>now()) AND w.kind IN ('team','project') AND w.disabled_at IS NULL AND (cardinality($4::uuid[])=0 OR w.id=ANY($4)) AND (k.issued_to_user_id IS NULL OR (u.disabled_at IS NULL AND u.cleaned_at IS NULL)) ORDER BY k.workspace_id,k.governance_key_id,k.created_at DESC,k.id), s AS (SELECT * FROM m UNION ALL SELECT * FROM p UNION ALL SELECT * FROM k LIMIT $5) INSERT INTO access_review_items(id,campaign_id,subject_kind,membership_grant_id,platform_grant_id,api_key_id) SELECT gen_random_uuid(),$1,kind,membership_grant_id,platform_grant_id,api_key_id FROM s")
+        .bind(id)
+        .bind(subjects.contains("workspace_memberships"))
+        .bind(subjects.contains("platform_roles"))
+        .bind(workspace_ids)
+        .bind(MAX_ITEMS + 1)
+        .bind(subjects.contains("workspace_keys"))
+        .execute(&mut **tx)
+        .await?
         .rows_affected() as i64;
     Ok(inserted)
 }
@@ -679,4 +694,5 @@ pub(super) fn routes() -> Router<Store> {
         )
         .route("/api/v1/me/access-reviews", get(inbox))
         .route("/api/v1/me/access-reviews/{item}/decision", post(decide))
+        .merge(schedules::routes())
 }

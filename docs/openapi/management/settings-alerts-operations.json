@@ -221,7 +221,8 @@
                 "aged_unknown_hold",
                 "scim_last_admin",
                 "partitions_missing",
-                "history_orphans"
+                "history_orphans",
+                "access_review_skipped"
               ]
             }
           },
@@ -642,7 +643,8 @@
                 "aged_unknown_hold",
                 "scim_last_admin",
                 "partitions_missing",
-                "history_orphans"
+                "history_orphans",
+                "access_review_skipped"
               ]
             }
           },

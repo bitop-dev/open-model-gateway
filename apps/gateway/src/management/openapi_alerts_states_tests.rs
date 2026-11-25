@@ -238,6 +238,20 @@ impl<'a> Seed<'a> {
         ));
         seed
     }
+    /// A skipped scheduled access review run exactly as
+    /// `alerts::fire_access_review_skipped` writes it (#481): level 1, warning,
+    /// the run as its subject, the run's reason as its details.
+    pub(super) fn access_review_skipped(reason: &'static str) -> Self {
+        let mut seed = Self::builtin("access_review_skipped").details(json!({ "reason": reason }));
+        seed.severity = "warning";
+        seed.shape = Some((
+            1,
+            "warning",
+            format!("access_review_run:{}", Uuid::new_v4()),
+            crate::alerts::ACCESS_REVIEW_SKIPPED_SUMMARY,
+        ));
+        seed
+    }
     pub(super) fn email(mut self, email: Mail, cleared: Option<Mail>) -> Self {
         self.email = email;
         self.cleared = cleared;
@@ -648,6 +662,12 @@ pub(super) async fn platform_events(
                 - gateway_datetime_compat::SignedDuration::days(2),
         ))),
     );
+    s.resolution = Some("cleared");
+    seed(pool, s).await;
+    // A skipped scheduled access review: one incident per run; a later
+    // started run of the schedule clears it.
+    seed(pool, Seed::access_review_skipped("previous_open")).await;
+    let mut s = sent_pair(Seed::access_review_skipped("empty"));
     s.resolution = Some("cleared");
     seed(pool, s).await;
     // Aged unknown-cost holds: a Team/Project incident names the workspace, a

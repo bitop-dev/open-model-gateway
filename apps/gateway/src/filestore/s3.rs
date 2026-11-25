@@ -73,13 +73,14 @@ impl S3Auth {
     }
 }
 
-/// Operator-configured trust material, held privately by `S3Settings`.
+/// The bytes of `GATEWAY_S3_CA_FILE`, held privately by `S3Settings`: read
+/// when the configuration is, parsed when the client is built, with the rules
+/// S3 has always had ([`crate::egress::CaBundle::pem_bundle`]).
 pub(crate) struct S3CaBundle(Vec<u8>);
 
 impl S3CaBundle {
-    pub(crate) fn certificates(&self) -> anyhow::Result<Vec<reqwest::Certificate>> {
-        reqwest::Certificate::from_pem_bundle(&self.0)
-            .map_err(|_| anyhow::anyhow!("{CA_FILE_ENV} is not a PEM certificate bundle"))
+    pub(crate) fn bundle(&self) -> anyhow::Result<crate::egress::CaBundle> {
+        crate::egress::CaBundle::pem_bundle(CA_FILE_ENV, &self.0)
     }
 }
 

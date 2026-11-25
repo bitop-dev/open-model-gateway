@@ -49,6 +49,7 @@ pub(crate) const SLICE4_AREAS: &[&str] = &[
 ];
 pub(crate) const SLICE2_AREAS: &[&str] = &[
     "platform/access-requests",
+    "platform/access-review-schedules",
     "platform/access-reviews",
     "platform/oidc",
     "platform/users",
@@ -1444,7 +1445,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(count, 276);
+        assert_eq!(count, 281);
     }
     #[test]
     fn management_openapi_response_rejects_incomplete_completed_slot() {

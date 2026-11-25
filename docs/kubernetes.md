@@ -67,6 +67,7 @@ fast with a `required()` error if a needed reference is missing, instead of sile
 | Optional reporting replica | `secrets.database.reporting.existingSecret` (when `secrets.database.reporting.enabled`) | one key named by `urlKey` |
 | Migrator (separate from runtime) | `secrets.migrator.existingSecret` | one key named by `urlKey` |
 | OIDC | `secrets.oidc.existingSecret` | `GATEWAY_OIDC_ISSUER`, `GATEWAY_OIDC_CLIENT_ID`, `GATEWAY_OIDC_CLIENT_SECRET` (mounted as a file; the binary reads `_FILE`) |
+| OIDC issuer's private CA (optional) | `secrets.oidc.ca` (`enabled`, exactly one of `secretName` or `configMapName`, and `key`, default `ca.crt`) | a PEM bundle of root certificates, mounted read-only at `/var/run/omg-secrets/oidc-ca/<key>` as `GATEWAY_OIDC_CA_FILE` ([identity](identity.md#issuers-on-a-private-ca)); read at startup, so roll the pods after changing it |
 | Provider keys | `secrets.providers.openaiApiKey`/`anthropicApiKey` | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` (mounted as files) |
 | File-store encryption keys | `secrets.fileStore.existingSecret` | key named by `encryptionKeysKey`, `kid:base64key[,kid:base64key…]` |
 | CNPG roles (CNPG mode only) | `cnpg.cluster.roles.migrator.existingSecret`, `.runtime.existingSecret` | `kubernetes.io/basic-auth` Secrets (`username`, `password`); CNPG consumes them directly via `bootstrap.initdb.secret` and `managed.roles[].passwordSecret` |

@@ -154,6 +154,53 @@ pub(crate) async fn fire_scim_last_admin(
     Ok(inserted == 1)
 }
 
+/// Raise the incident of one skipped scheduled access review run, once per
+/// run (its subject is the run id; `reason` is the run's closed reason code).
+/// No schedule or campaign names leave the database in the event.
+pub(crate) async fn fire_access_review_skipped(
+    tx: &mut Transaction<'_, Postgres>,
+    run: Uuid,
+    reason: &str,
+) -> Result<bool, sqlx::Error> {
+    lock_delivery_buckets(tx, &[Uuid::nil()]).await?;
+    let id = Uuid::new_v4();
+    let inserted = sqlx::query("INSERT INTO alert_events(id,builtin,kind,subject_key,level,severity,summary,details) VALUES($1,$2,$2,'access_review_run:'||$3::text,1,'warning',$4,jsonb_build_object('reason',$5::text)) ON CONFLICT DO NOTHING")
+        .bind(id)
+        .bind(super::ACCESS_REVIEW_SKIPPED)
+        .bind(run)
+        .bind(super::ACCESS_REVIEW_SKIPPED_SUMMARY)
+        .bind(reason)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+    if inserted == 1 {
+        sqlx::query("INSERT INTO alert_deliveries(id,event_id,transition) VALUES($1,$2,'fired')")
+            .bind(Uuid::new_v4())
+            .bind(id)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(inserted == 1)
+}
+
+/// Clears the open skipped-run incidents of one schedule: a later run
+/// started a campaign, or the schedule was deleted.
+pub(crate) async fn resolve_access_review_skipped(
+    tx: &mut Transaction<'_, Postgres>,
+    schedule: Uuid,
+) -> Result<usize, sqlx::Error> {
+    lock_delivery_buckets(tx, &[Uuid::nil()]).await?;
+    let open: Vec<Uuid> = sqlx::query_scalar("SELECT e.id FROM alert_events e JOIN access_review_schedule_runs r ON e.subject_key='access_review_run:'||r.id::text WHERE e.builtin=$1 AND e.resolved_at IS NULL AND r.schedule_id=$2 ORDER BY e.id FOR UPDATE OF e")
+        .bind(super::ACCESS_REVIEW_SKIPPED)
+        .bind(schedule)
+        .fetch_all(&mut **tx)
+        .await?;
+    for id in &open {
+        resolve(tx, *id, "cleared").await?;
+    }
+    Ok(open.len())
+}
+
 /// The SCIM last-admin incident clears once a second active Platform Admin
 /// exists (the installation is no longer one SCIM change away from lockout).
 pub(super) async fn resolve_scim_last_admin(
