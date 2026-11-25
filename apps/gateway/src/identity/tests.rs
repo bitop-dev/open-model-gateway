@@ -34,6 +34,28 @@ pub(crate) struct MockProvider {
     jwks_fail: Arc<std::sync::atomic::AtomicBool>,
     task: tokio::task::JoinHandle<()>,
 }
+/// Accepts TLS connections; a handshake the client refuses is dropped.
+struct TlsListener {
+    tcp: tokio::net::TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+}
+impl axum::serve::Listener for TlsListener {
+    type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+    type Addr = std::net::SocketAddr;
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let Ok((socket, addr)) = self.tcp.accept().await else {
+                continue;
+            };
+            if let Ok(stream) = self.acceptor.accept(socket).await {
+                return (stream, addr);
+            }
+        }
+    }
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.tcp.local_addr()
+    }
+}
 impl Drop for MockProvider {
     fn drop(&mut self) {
         self.task.abort();
@@ -41,8 +63,17 @@ impl Drop for MockProvider {
 }
 impl MockProvider {
     pub(crate) async fn start(change: Option<(&str, Value)>) -> Self {
+        Self::launch(change, None).await
+    }
+    /// The same issuer over HTTPS with `tls` (an `https://127.0.0.1:<port>` issuer).
+    #[cfg(feature = "integration-tests")]
+    pub(crate) async fn start_tls(tls: Arc<rustls::ServerConfig>) -> Self {
+        Self::launch(None, Some(tls)).await
+    }
+    async fn launch(change: Option<(&str, Value)>, tls: Option<Arc<rustls::ServerConfig>>) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let scheme = if tls.is_some() { "https" } else { "http" };
+        let issuer = format!("{scheme}://{}", listener.local_addr().unwrap());
         let mut metadata = json!({
             "issuer": issuer,
             "authorization_endpoint": format!("{issuer}/authorize"),
@@ -119,7 +150,18 @@ impl MockProvider {
                 }
             }));
         let task = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+            match tls {
+                None => axum::serve(listener, app).await.unwrap(),
+                Some(tls) => axum::serve(
+                    TlsListener {
+                        tcp: listener,
+                        acceptor: tokio_rustls::TlsAcceptor::from(tls),
+                    },
+                    app,
+                )
+                .await
+                .unwrap(),
+            }
         });
         Self {
             issuer,
@@ -710,7 +752,7 @@ async fn identity_requests_never_reuse_a_provider_connection() {
             });
         }
     });
-    let http = OidcHttp::new(true).unwrap();
+    let http = OidcHttp::new(true, None).unwrap();
     for attempt in 1..=3 {
         let request = axum::http::Request::builder()
             .method(Method::GET)
@@ -3513,3 +3555,7 @@ mod abuse_controls {
         assert_eq!(attempts(&pool).await, 0);
     }
 }
+
+#[cfg(feature = "integration-tests")]
+#[path = "oidc_ca_tests.rs"]
+mod oidc_ca_tests;

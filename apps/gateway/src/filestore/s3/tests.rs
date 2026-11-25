@@ -414,9 +414,9 @@ async fn invalid_ca_file_fails_through_s3_configuration() {
         "-----BEGIN CERTIFICATE-----\n!invalid-base64!\n-----END CERTIFICATE-----\n",
     )
     .unwrap();
+    // Refused when the configuration is read, before any client is built.
     let settings = s3_lookup("https://127.0.0.1:1", Some(path));
-    let config = FileStoreConfig::from_lookup(&*settings).unwrap();
-    let error = FileStoreRuntime::build(config).await.err().unwrap();
+    let error = FileStoreConfig::from_lookup(&*settings).err().unwrap();
     assert_eq!(
         error.to_string(),
         "GATEWAY_S3_CA_FILE is not a PEM certificate bundle"

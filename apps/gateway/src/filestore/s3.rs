@@ -73,16 +73,6 @@ impl S3Auth {
     }
 }
 
-/// Operator-configured trust material, held privately by `S3Settings`.
-pub(crate) struct S3CaBundle(Vec<u8>);
-
-impl S3CaBundle {
-    pub(crate) fn certificates(&self) -> anyhow::Result<Vec<reqwest::Certificate>> {
-        reqwest::Certificate::from_pem_bundle(&self.0)
-            .map_err(|_| anyhow::anyhow!("{CA_FILE_ENV} is not a PEM certificate bundle"))
-    }
-}
-
 /// Validated S3 configuration. No Debug.
 pub struct S3Settings {
     pub(crate) bucket: String,
@@ -91,7 +81,7 @@ pub struct S3Settings {
     pub(crate) endpoint: Option<String>,
     pub(crate) path_style: bool,
     pub(crate) auth: S3Auth,
-    ca_bundle: Option<S3CaBundle>,
+    ca_bundle: Option<crate::egress::CaBundle>,
 }
 
 fn charset(value: &str, extra: &[u8]) -> bool {
@@ -264,14 +254,9 @@ impl S3Settings {
             );
             S3Auth::Aws(auth)
         };
-        let ca_bundle = match get(CA_FILE_ENV) {
-            None => None,
-            Some(path) => {
-                let pem = std::fs::read(path)
-                    .map_err(|_| anyhow::anyhow!("{CA_FILE_ENV} could not be read"))?;
-                Some(S3CaBundle(pem))
-            }
-        };
+        let ca_bundle = get(CA_FILE_ENV)
+            .map(|path| crate::egress::CaBundle::read(CA_FILE_ENV, &path))
+            .transpose()?;
         Ok(Self {
             bucket,
             prefix,

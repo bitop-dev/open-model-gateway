@@ -2609,6 +2609,7 @@ dependencies = [
  "regex",
  "regex-syntax",
  "reqwest",
+ "ring",
  "rustls",
  "serde",
  "serde_json",

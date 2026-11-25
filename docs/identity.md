@@ -10,6 +10,7 @@ Browser sessions and inference keys are separate credentials. A bearer key canno
 | `GATEWAY_OIDC_ISSUER` | Exact discovered issuer, including any issuer path. |
 | `GATEWAY_OIDC_CLIENT_ID` | Registered authorization-code client. |
 | `GATEWAY_OIDC_CLIENT_SECRET` | Optional confidential-client secret. |
+| `GATEWAY_OIDC_CA_FILE` | Optional. A PEM file of extra root certificates for an issuer whose certificate chains to a private CA (internal PKI); see [Issuers on a private CA](#issuers-on-a-private-ca). |
 | `GATEWAY_OIDC_GROUPS_CLAIM` | Signed ID-token claim name/path; default `groups`. Literal names take precedence over dotted nested paths. |
 | `GATEWAY_TRUSTED_PROXIES` | Optional. Comma-separated addresses or CIDR networks of your reverse proxies, such as `10.42.0.0/16`. Only a request from one of them has its `X-Forwarded-For` believed, and then only the right-most entry that isn't itself a trusted proxy. Used for sign-in rate limits only. |
 | `GATEWAY_LOGIN_RATE_PER_MINUTE` | Optional. Sign-in starts, and separately callbacks, allowed per client address per minute; default 60, allowed 1–10000. |
@@ -18,6 +19,19 @@ Browser sessions and inference keys are separate credentials. A bearer key canno
 Register `${GATEWAY_PUBLIC_URL}/api/v1/auth/callback` with the origin's trailing slash removed. Admin › Settings › Sign-in shows the active issuer, client ID, client type, groups claim and this callback URL read-only (never the secret); see [settings](settings.md#sign-in). Use authorization code and S256 PKCE. ID tokens must contain `email`, boolean `email_verified:true`, and a valid string-array group claim, including `[]` when no groups match. The gateway requests the `openid email profile` scopes; an optional `name` claim is stored as the user's display name (trimmed, at most 200 characters, replaced at every sign-in and cleared at account cleanup). It is presentation only and never used for matching or authorization. The gateway does not fetch userinfo or retain upstream access/refresh tokens.
 
 HTTPS is required for identity URLs. Only `GATEWAY_ENV=development` allows HTTP on localhost/literal loopback. Forwarded headers do not alter this policy. Cookies are Secure except on explicitly configured development-loopback HTTP. Missing all OIDC client settings disables login; partial/empty settings and configured discovery failures fail startup. Discovery/JWKS responses are bounded to 1 MiB, with redirects disabled, a 15-second timeout and five-second connection timeout. Identity requests are never retried and each uses a new connection: an idle connection the provider is closing would lose the request and fail that sign-in. This is not provider certification.
+
+### Issuers on a private CA
+
+The OIDC client trusts the public web PKI roots. For an identity provider whose certificate chains to an internal CA (ADFS, an in-cluster Keycloak), set `GATEWAY_OIDC_CA_FILE` to a PEM file of that CA's root (or several roots, concatenated):
+
+- The roots are **added** to the public roots, not a replacement, so a public issuer keeps working with the setting.
+- They belong to the OIDC client alone: discovery, the token exchange and the JWKS fetches (with every refresh), which are all the requests sign-in makes (the gateway does not fetch user-info). Provider APIs, alert webhooks, the trace, metrics and audit exports, SMTP and the file store never trust them; the file store has its own `GATEWAY_S3_CA_FILE`.
+- Nothing else about the client changes: HTTPS outside development loopback, no redirects, no ambient proxy, no implicit retry, the egress policy for identity (a private issuer address needs `GATEWAY_EGRESS_PRIVATE_ALLOW`), and a certificate must still match the issuer's name and be within its validity.
+- Every certificate in the file becomes a trust anchor, so the file must hold **CA certificates** only: PEM `CERTIFICATE` sections, at least one, each with `basicConstraints` CA set and within its validity period, at most 1 MiB. A missing, unreadable, empty or oversized file, any other PEM section (a private key, an OpenSSL `TRUSTED CERTIFICATE`, an indented or unknown label), a malformed certificate, a server certificate (such as a mounted `tls.crt`) or an expired or not yet valid CA stops startup with an error naming the setting, never the file's path or contents. Setting it without OIDC sign-in configured also stops startup.
+- It is read once, at startup: rotating the CA needs a restart (a rolling restart of the replicas). The TLS verifier does not check an anchor's own validity, so a CA that expires while the gateway runs stays trusted until the next restart.
+- Whoever can change this file, or the Secret or ConfigMap it is mounted from, can make the gateway trust an impostor issuer and so sign in as anyone. Protect it like the client secret.
+
+Kubernetes: `secrets.oidc.ca` in the chart ([kubernetes](kubernetes.md#secrets-this-chart-never-generates)).
 
 ### Sign-in abuse controls
 

@@ -114,6 +114,10 @@ spec:
             - name: GATEWAY_OIDC_CLIENT_SECRET_FILE
               value: /var/run/omg-secrets/oidc/{{ .Values.secrets.oidc.clientSecretKey }}
             {{- end }}
+            {{- if .Values.secrets.oidc.ca.enabled }}
+            - name: GATEWAY_OIDC_CA_FILE
+              value: /var/run/omg-secrets/oidc-ca/{{ .Values.secrets.oidc.ca.key }}
+            {{- end }}
             {{- if .Values.secrets.providers.openaiApiKey.enabled }}
             - name: OPENAI_API_KEY_FILE
               value: /var/run/omg-secrets/openai/{{ .Values.secrets.providers.openaiApiKey.key }}
@@ -159,6 +163,11 @@ spec:
               mountPath: /var/run/omg-secrets/oidc
               readOnly: true
             {{- end }}
+            {{- if .Values.secrets.oidc.ca.enabled }}
+            - name: oidc-ca
+              mountPath: /var/run/omg-secrets/oidc-ca
+              readOnly: true
+            {{- end }}
             {{- if .Values.secrets.providers.openaiApiKey.enabled }}
             - name: openai-secret
               mountPath: /var/run/omg-secrets/openai
@@ -180,6 +189,27 @@ spec:
             items:
               - key: {{ .Values.secrets.oidc.clientSecretKey }}
                 path: {{ .Values.secrets.oidc.clientSecretKey }}
+        {{- end }}
+        {{- with .Values.secrets.oidc.ca }}
+        {{- if .enabled }}
+        {{- if not $.Values.secrets.oidc.enabled }}
+        {{- fail "secrets.oidc.ca needs secrets.oidc.enabled: the CA is for the OIDC issuer" }}
+        {{- end }}
+        {{- if eq (empty .secretName) (empty .configMapName) }}
+        {{- fail "secrets.oidc.ca needs exactly one of secretName or configMapName" }}
+        {{- end }}
+        - name: oidc-ca
+          {{- if .secretName }}
+          secret:
+            secretName: {{ .secretName }}
+          {{- else }}
+          configMap:
+            name: {{ .configMapName }}
+          {{- end }}
+            items:
+              - key: {{ required "secrets.oidc.ca.key is required" .key }}
+                path: {{ .key }}
+        {{- end }}
         {{- end }}
         {{- if .Values.secrets.providers.openaiApiKey.enabled }}
         - name: openai-secret

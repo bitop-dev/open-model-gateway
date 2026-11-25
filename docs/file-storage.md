@@ -32,7 +32,7 @@ Everything comes from the server environment. Invalid configuration stops startu
 | `GATEWAY_S3_AUTH` | `aws:default` | `aws:default`, `aws:profile:<name>`, `aws:role:<role-arn>`, or `static`. |
 | `GATEWAY_S3_ACCESS_KEY_ID_ENV`, `GATEWAY_S3_SECRET_ACCESS_KEY_ENV` | — | `static` only: the **names** of the variables that hold the access key ID and secret. The values are read at startup and never stored or logged. |
 | `GATEWAY_AWS_PROFILE_ALLOWLIST` | empty | Shared with [Bedrock](bedrock.md): profiles that `aws:profile:<name>` may use. |
-| `GATEWAY_S3_CA_FILE` | none | A PEM bundle of extra trust anchors for a private endpoint's TLS certificate. |
+| `GATEWAY_S3_CA_FILE` | none | A PEM bundle of extra trust anchors for a private endpoint's TLS certificate: CA certificates only (PEM `CERTIFICATE` sections with the CA flag, within their validity, at least one, at most 1 MiB); anything else stops startup naming the setting. Read at startup. |
 
 The AWS identity modes are parsed and allowlisted by the same code as Bedrock. See [Bedrock identity modes](bedrock.md#identity-modes). `aws:role:` uses STS AssumeRole with the server's default chain. The S3 client is built directly, so `AWS_ENDPOINT_URL*` and profile endpoint overrides are never inherited.
 

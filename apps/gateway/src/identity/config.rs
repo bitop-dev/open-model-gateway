@@ -16,7 +16,13 @@ pub struct IdentityConfig {
     pub(super) pending_login_cap: i64,
     pub(super) pending_cap_latch: Duration,
     pub(super) session_policy: SessionPolicy,
+    /// `GATEWAY_OIDC_CA_FILE`: extra roots for the OIDC client only.
+    pub(super) ca: Option<Arc<crate::egress::CaBundle>>,
 }
+
+/// Extra trust anchors for the OIDC issuer (a private CA), added to the
+/// public roots of the OIDC client and of no other client.
+pub const CA_FILE_ENV: &str = "GATEWAY_OIDC_CA_FILE";
 
 impl IdentityConfig {
     pub fn from_env() -> anyhow::Result<Option<Self>> {
@@ -37,7 +43,12 @@ impl IdentityConfig {
             read("GATEWAY_SESSION_LIFETIME")?.as_deref(),
             read("GATEWAY_SESSION_IDLE_TIMEOUT")?.as_deref(),
         )?;
+        let ca = read(CA_FILE_ENV)?;
         if issuer.is_none() && client_id.is_none() && secret.is_none() {
+            anyhow::ensure!(
+                ca.is_none(),
+                "{CA_FILE_ENV} is set but OIDC sign-in is not configured"
+            );
             // A public URL may also be used by non-identity application features.
             if let Some(public) = public {
                 Self::validate_origin(
@@ -66,6 +77,10 @@ impl IdentityConfig {
             config.trusted_proxies = throttle::TrustedProxies::parse(&value)?;
         }
         config.session_policy = session_policy;
+        // Read and checked once, here at startup; never reloaded.
+        config.ca = ca
+            .map(|path| crate::egress::CaBundle::read(CA_FILE_ENV, &path).map(Arc::new))
+            .transpose()?;
         if let Some(value) = read("GATEWAY_LOGIN_RATE_PER_MINUTE")? {
             config.login_rate_per_minute = value
                 .parse::<u32>()
@@ -122,6 +137,7 @@ impl IdentityConfig {
             pending_login_cap: PENDING_LOGIN_CAP,
             pending_cap_latch: Duration::from_secs(5),
             session_policy: SessionPolicy::default(),
+            ca: None,
         })
     }
 }

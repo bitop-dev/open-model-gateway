@@ -111,3 +111,6 @@ hyper-rustls = { version = "=0.27.10", default-features = false, features = ["ht
 # `#[dbtest::test]`: database tests that clone a pre-migrated template (docs/verification.md, "Database tests").
 dbtest = { path = "../../crates/dbtest" }
 proptest = { version = "=1.12.0", default-features = false, features = ["std"] }
+# Test-time PKI for the private-CA OIDC tests (#826): P-256 keys and ECDSA
+# signatures from the ring version rustls already links (no new crate).
+ring = "=0.17.14"

@@ -1178,3 +1178,93 @@ async fn bootstrap_dev_cli_seeds_once(pool: sqlx::PgPool) {
     assert!(refused.stdout.is_empty());
     assert!(text(&refused.stderr).contains("requires an empty"));
 }
+
+/// #826: an unusable `GATEWAY_OIDC_CA_FILE` stops `serve` in production mode
+/// before the issuer is contacted (read with the rest of the identity
+/// configuration, after the schema check, as `GATEWAY_S3_CA_FILE` is), naming
+/// the setting and never the file's path or contents; the setting without
+/// OIDC is refused.
+#[cfg(feature = "integration-tests")]
+#[sqlx::test(migrations = "./enterprise_migrations")]
+async fn an_unusable_oidc_ca_file_stops_startup_naming_the_setting(pool: sqlx::PgPool) {
+    use sqlx::ConnectOptions;
+    let f = Fixture::new();
+    let url = pool.connect_options().to_url_lossy().to_string();
+    let database = url.as_str();
+    let oidc = [
+        ("DATABASE_URL", database),
+        ("GATEWAY_PUBLIC_URL", "https://gateway.example.test"),
+        ("GATEWAY_OIDC_ISSUER", "https://issuer.example.test"),
+        ("GATEWAY_OIDC_CLIENT_ID", "gateway"),
+    ];
+    // Assembled at run time so the source holds no key marker (it holds no key).
+    let label = ["PRIVATE", "KEY"].join(" ");
+    let key =
+        &format!("-----BEGIN {label}-----\nTUlJQkFrLW5vdC1hLWtleQ==\n-----END {label}-----\n");
+    let broken = "-----BEGIN CERTIFICATE-----\n!invalid-base64!\n-----END CERTIFICATE-----\n";
+    let not_der = "-----BEGIN CERTIFICATE-----\nbm90IGEgY2VydGlmaWNhdGUgYXQgYWxs\n-----END CERTIFICATE-----\n";
+    let missing = f.dir.path().join("missing-ca-marker.pem");
+    let cases = [
+        ("missing", missing.clone(), "could not be read"),
+        (
+            "a directory",
+            f.dir.path().to_path_buf(),
+            "could not be read",
+        ),
+        (
+            "empty",
+            f.secret("empty-ca-marker.pem", ""),
+            "contains no certificate",
+        ),
+        (
+            "not PEM",
+            f.secret("text-ca-marker.pem", "ca-contents-marker\n"),
+            "contains no certificate",
+        ),
+        (
+            "a key",
+            f.secret("key-ca-marker.pem", key),
+            "must contain only PEM certificates",
+        ),
+        (
+            "broken",
+            f.secret("broken-ca-marker.pem", broken),
+            "is not a PEM certificate bundle",
+        ),
+        (
+            "not DER",
+            f.secret("der-ca-marker.pem", not_der),
+            "is not a PEM certificate bundle",
+        ),
+    ];
+    for (case, path, message) in cases {
+        let path = path.to_str().unwrap().to_owned();
+        let mut env: Vec<(&str, &str)> = oidc.to_vec();
+        env.push(("GATEWAY_OIDC_CA_FILE", &path));
+        let output = f.run(&["serve"], env);
+        assert_eq!(output.status.code(), Some(1), "{case}");
+        assert!(output.stdout.is_empty(), "{case}");
+        let stderr = text(&output.stderr);
+        assert!(
+            stderr.contains(&format!("GATEWAY_OIDC_CA_FILE {message}")),
+            "{case}: {stderr}"
+        );
+        for leak in ["marker", "BEGIN", "TUlJ", "ca-contents"] {
+            assert!(!stderr.contains(leak), "{case}: {leak}: {stderr}");
+        }
+    }
+    let ca = f.secret("unused-ca.pem", "");
+    let output = f.run(
+        &["serve"],
+        [
+            ("DATABASE_URL", database),
+            ("GATEWAY_OIDC_CA_FILE", ca.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.contains("GATEWAY_OIDC_CA_FILE is set but OIDC sign-in is not configured"),
+        "{stderr}"
+    );
+}

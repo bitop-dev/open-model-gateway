@@ -115,7 +115,9 @@ impl HttpConnector for Connector {
 }
 
 /// Optional extra trust anchors for a private S3-compatible endpoint.
-pub(super) fn client(ca_bundle: Option<&super::S3CaBundle>) -> anyhow::Result<SharedHttpClient> {
+pub(super) fn client(
+    ca_bundle: Option<&crate::egress::CaBundle>,
+) -> anyhow::Result<SharedHttpClient> {
     // Every resolved address must pass the egress policy (#33).
     let mut builder =
         crate::egress::client_builder(crate::egress::resolver(crate::egress::Purpose::Storage))
@@ -124,7 +126,7 @@ pub(super) fn client(ca_bundle: Option<&super::S3CaBundle>) -> anyhow::Result<Sh
             .count_connections(crate::egress::UpstreamClient::S3)
             .read_timeout(Duration::from_secs(60));
     if let Some(bundle) = ca_bundle {
-        builder = crate::egress::add_root_certificates(builder, bundle)?;
+        builder = crate::egress::add_root_certificates(builder, bundle);
     }
     let client = builder
         .build()
