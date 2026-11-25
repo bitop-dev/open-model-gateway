@@ -604,6 +604,12 @@ async fn cold_buckets(setup: Setup) {
         ms(cold_max),
         ms(warm_max)
     );
+    let (settled, unknown) = assert_exact(&h).await;
+    assert_eq!(
+        (settled, unknown),
+        ((BURST + 1 + 2 * ROUNDS * BURST) as i64, 0),
+        "every burst request settled"
+    );
     // A new gateway on the same database, started as `serve` starts one
     // (its whole pool opened and warmed) and with the production admission
     // bound: its first burst, on a scope of its own, is not shed (`burst`
@@ -631,12 +637,6 @@ async fn cold_buckets(setup: Setup) {
         ms(later_p50),
         ms(first_max),
         ms(later_max)
-    );
-    let (settled, unknown) = assert_exact(&h).await;
-    assert_eq!(
-        (settled, unknown),
-        ((BURST + 1 + 2 * ROUNDS * BURST + 2 * BURST) as i64, 0),
-        "every burst request settled"
     );
 }
 
