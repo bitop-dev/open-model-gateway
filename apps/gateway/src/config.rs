@@ -32,6 +32,11 @@ pub struct Config {
     /// `GATEWAY_REPORTING_MAX_LAG_SECONDS` (default 30, 1-3600): a replica
     /// replaying WAL further behind than this is skipped for the primary.
     pub reporting_max_lag: Duration,
+    /// `GATEWAY_SHUTDOWN_DRAIN_SECONDS` (default 5, 0-60): after a shutdown
+    /// signal the gateway keeps serving this long and marks every HTTP/1.1
+    /// response `Connection: close` before it closes idle connections
+    /// (`crate::drain`). 0 closes them at the signal.
+    pub shutdown_drain: Duration,
     /// `GATEWAY_ADMISSION_MODE` selects scoped locks (the default) or
     /// serialization on the installation row (`global`). See `governance::locks`.
     pub admission_mode: crate::governance::locks::AdmissionMode,
@@ -463,6 +468,7 @@ impl Config {
         let reporting_database_url =
             optional_postgres_url_from_env("GATEWAY_REPORTING_DATABASE_URL")?;
         let reporting_max_lag = reporting_max_lag_from_env()?;
+        let shutdown_drain = shutdown_drain_from_env()?;
         let admission_mode = crate::governance::locks::AdmissionMode::from_env()?;
         let listen_database_url = optional_postgres_url_from_env("GATEWAY_LISTEN_DATABASE_URL")?;
         let config_cache = config_cache_from_env()?;
@@ -482,6 +488,7 @@ impl Config {
             database_max_connections,
             reporting_database_url,
             reporting_max_lag,
+            shutdown_drain,
             admission_mode,
             listen_database_url,
             config_cache,
@@ -697,6 +704,16 @@ fn reporting_max_lag_from_env() -> Result<Duration> {
         .filter(|n| (1..=3600).contains(n))
         .map(Duration::from_secs)
         .context("GATEWAY_REPORTING_MAX_LAG_SECONDS must be an integer from 1 to 3600")
+}
+
+fn shutdown_drain_from_env() -> Result<Duration> {
+    std::env::var("GATEWAY_SHUTDOWN_DRAIN_SECONDS")
+        .unwrap_or_else(|_| "5".into())
+        .parse::<u64>()
+        .ok()
+        .filter(|n| *n <= 60)
+        .map(Duration::from_secs)
+        .context("GATEWAY_SHUTDOWN_DRAIN_SECONDS must be an integer from 0 to 60")
 }
 
 fn config_cache_from_env() -> Result<bool> {

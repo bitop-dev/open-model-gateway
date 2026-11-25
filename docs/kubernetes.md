@@ -357,6 +357,36 @@ durability safeguard; use the [explicit policy](#production-durability-policy-39
 - **Reporting replica.** `GATEWAY_REPORTING_DATABASE_URL` (optional) targets the Cluster's `-ro`
   service for reports/usage/logs only; admission, settlement and `/v1/models` always use the primary.
 
+## Pod shutdown and rolling restarts
+
+A stopping gateway pod goes through these steps, all within `gateway.terminationGracePeriodSeconds`
+(default 150 s):
+
+1. **`preStop` sleep** (`gateway.drainSeconds`, default 10 s). Kubernetes removes the pod from the
+   Service endpoints, so new connections go to other replicas. The gateway does not know yet and
+   serves as usual, including on keep-alive connections that clients opened earlier: those stay
+   with this pod.
+2. **SIGTERM.** The gateway logs `shutdown requested`, then `draining connections before shutdown`,
+   and keeps serving for `GATEWAY_SHUTDOWN_DRAIN_SECONDS` (default 5 s). Every HTTP/1.x response in
+   this window carries `Connection: close`, so a client closes the connection after reading its
+   response instead of sending its next request on it. The listener still accepts, and a connection
+   that arrives from a stale endpoint list is answered the same way. Readiness is unchanged: the pod
+   is already out of the endpoints.
+3. **Graceful shutdown.** The listener closes and the connections no client used during the window
+   are closed. In-flight requests and streams run to completion. HTTP/2 connections get GOAWAY.
+   Then background work stops and the work leases are released.
+
+A second SIGTERM or Ctrl-C ends the drain window at once. `GATEWAY_SHUTDOWN_DRAIN_SECONDS=0`
+closes idle connections at the signal, which is what the gateway did before the window existed.
+
+**What remains.** A keep-alive connection that a client left idle for the whole window is closed at
+step 3 without a `Connection: close`. If the client sends a request on it at that instant, the
+request is lost: the client sees the socket close (Node's `UND_ERR_SOCKET`). This is inherent to
+HTTP/1.1 keep-alive, and only the client can avoid it by closing idle connections sooner than the
+window. Node's `fetch` closes them after 4 s, so a window longer than that covers it. Make the window
+longer than your clients' idle keep-alive timeout, and retry non-idempotent requests only where they
+are safe to repeat.
+
 ## Scaling
 
 - `replicaCount` (or `hpa.enabled=true` with `hpa.minReplicas`/`maxReplicas`) sets gateway replicas.

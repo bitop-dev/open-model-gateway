@@ -444,25 +444,6 @@ fn ensure_demo_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("could not register Ctrl-C handler")
-    };
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("could not register SIGTERM handler")
-            .recv()
-            .await;
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! { _ = ctrl_c => {}, _ = terminate => {} }
-    tracing::info!("shutdown requested");
-}
-
 #[cfg(test)]
 mod demo {
     use super::*;
@@ -676,6 +657,7 @@ mod demo {
             database_max_connections: 10,
             reporting_database_url: None,
             reporting_max_lag: std::time::Duration::from_secs(30),
+            shutdown_drain: std::time::Duration::from_secs(5),
             admission_mode: Default::default(),
             listen_database_url: None,
             config_cache: true,

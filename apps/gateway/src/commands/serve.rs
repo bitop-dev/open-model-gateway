@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use open_model_gateway::{
     audit_export::Exporter,
     config::Config,
+    drain::{self, Drain, Signals},
     filestore::FileStoreRuntime,
     http,
     identity::{IdentityConfig, IdentityState},
@@ -24,8 +25,6 @@ use open_model_gateway::{
 use sqlx::PgPool;
 use tokio::task::JoinHandle;
 
-use crate::shutdown_signal;
-
 /// Start the gateway: the steps below, in this order, then serve until a
 /// shutdown signal and stop everything that was started.
 pub(crate) async fn serve(
@@ -36,6 +35,9 @@ pub(crate) async fn serve(
     local_approvals: &mut Option<ApprovedEndpoints>,
     process_start_unix_nano: u64,
 ) -> Result<()> {
+    // Registered once, before anything starts, so a signal during the
+    // drain is seen.
+    let signals = Signals::register().context("could not register shutdown signals")?;
     let (traces, _recorder, store, web, engine) =
         build_engine(&config, store, provider_secrets, local_approvals).await?;
     let Prepared {
@@ -67,15 +69,21 @@ pub(crate) async fn serve(
             return Err(error);
         }
     };
+    let draining = Drain::default();
     let served = axum::serve(
         listener,
         http::router_with_identity(store, web, engine, identity)
             .layer(axum::Extension(files))
             .layer(axum::Extension(config.inference_base_url))
+            // Outermost, so every response is marked while draining.
+            .layer(axum::middleware::from_fn_with_state(
+                draining.clone(),
+                drain::mark,
+            ))
             // The peer address feeds sign-in abuse controls (#78).
             .into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(drain::shutdown(signals, draining, config.shutdown_drain))
     .await;
     shutdown(traces, tasks, lease_task, &leases, pool).await;
     served?;
