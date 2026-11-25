@@ -834,22 +834,34 @@ async fn a_failed_job_claim_names_its_cause(pool: PgPool) {
         diagnostics::{self, Handle},
     };
     use sqlx::Connection;
-    let store = Store::new(
-        sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .acquire_timeout(std::time::Duration::from_millis(300))
-            .after_connect(|connection, _| {
-                Box::pin(async move {
-                    sqlx::query("SET lock_timeout = '200ms'")
-                        .execute(connection)
-                        .await?;
-                    Ok(())
-                })
+    // One connection, so holding it makes the claim's acquire time out. The
+    // test asserts that timeout's cause, not its length; opening the
+    // connection is set-up, bounded on its own, so a slow machine cannot
+    // turn the first connect into the timeout under test.
+    let one = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(3))
+        .after_connect(|connection, _| {
+            Box::pin(async move {
+                sqlx::query("SET lock_timeout = '200ms'")
+                    .execute(connection)
+                    .await?;
+                Ok(())
             })
-            .connect_with((*pool.connect_options()).clone())
-            .await
-            .unwrap(),
-    );
+        })
+        .connect_lazy_with((*pool.connect_options()).clone());
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        loop {
+            match one.acquire().await {
+                Ok(_) => break,
+                Err(sqlx::Error::PoolTimedOut) => {}
+                Err(error) => panic!("{error}"),
+            }
+        }
+    })
+    .await
+    .expect("the pool opens its connection");
+    let store = Store::new(one);
     let jobs = Jobs::with(store, ProviderRegistry::default(), JobLimits::default());
     let poll = || async {
         let handle = Handle::new();
