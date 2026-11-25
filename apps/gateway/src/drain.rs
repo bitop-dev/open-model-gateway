@@ -30,6 +30,21 @@ use axum::{
     response::Response,
 };
 
+/// `GATEWAY_SHUTDOWN_DRAIN_SECONDS` (default 5, 0-30): how long the gateway
+/// keeps serving after a shutdown signal, marking HTTP/1.1 responses
+/// `Connection: close`, before it closes idle connections. 0 closes them at
+/// the signal.
+pub fn window_from_env() -> anyhow::Result<Duration> {
+    use anyhow::Context;
+    std::env::var("GATEWAY_SHUTDOWN_DRAIN_SECONDS")
+        .unwrap_or_else(|_| "5".into())
+        .parse::<u64>()
+        .ok()
+        .filter(|n| *n <= 30)
+        .map(Duration::from_secs)
+        .context("GATEWAY_SHUTDOWN_DRAIN_SECONDS must be an integer from 0 to 30")
+}
+
 /// Whether the gateway is draining for shutdown. Shared by the middleware
 /// ([`mark`]) and [`shutdown`], which sets it.
 #[derive(Clone, Default)]
