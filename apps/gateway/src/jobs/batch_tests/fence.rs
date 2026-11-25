@@ -350,6 +350,11 @@ async fn a_planning_failure_after_a_takeover_delays_the_line_one_replan(pool: Pg
     })
     .await
     .expect("the replacement runner's planning read reached the locked table");
+    // Taken before the cancel is sent: the plan fails after the cancel is
+    // issued, `head.planned` is set after the plan fails, and the line is
+    // planned again no earlier than `planned + REPLAN` (all monotonic), so
+    // cancel issued <= failed plan <= replan - REPLAN.
+    let cancelled = std::time::Instant::now();
     assert!(
         sqlx::query_scalar::<_, bool>("SELECT pg_cancel_backend($1)")
             .bind(planning)
@@ -365,17 +370,15 @@ async fn a_planning_failure_after_a_takeover_delays_the_line_one_replan(pool: Pg
     })
     .await
     .expect("the planning read was cancelled");
-    let failed = std::time::Instant::now();
     lock.commit().await.unwrap();
     tokio::time::timeout(REACH, held_b.entered.notified())
         .await
         .expect("replacement runner used the second route slot after a planning failure");
-    // From the failed plan to the line's provider call: one REPLAN at least
-    // (less the moment between the plan's failure and its observation here).
+    // From the cancel to the line's provider call: one REPLAN at least.
     assert!(
-        failed.elapsed() + Duration::from_millis(250) >= crate::jobs::runner::REPLAN,
+        cancelled.elapsed() >= crate::jobs::runner::REPLAN,
         "the line was planned again before one REPLAN: {:?}",
-        failed.elapsed()
+        cancelled.elapsed()
     );
 
     held_a.release.notify_one();
