@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { readLocalFromRepo, root, stepsOf } from "./lib.mjs";
-import { CONFIG_FILE, FETCH, commitAll, copy, fakes, git, gitEnv, installStep, jobOf, pinOf, readConfig, scanStep } from "./secret-scan-lib.mjs";
+import { CONFIG_FILE, FETCH, commitAll, copy, copyHistory, fakes, git, gitEnv, installStep, jobOf, pinOf, readConfig, scanStep } from "./secret-scan-lib.mjs";
 
 // ---- the CI job ----
 
@@ -21,14 +21,36 @@ const EXPECTED_ENV = {
   BEFORE_SHA: "${{ github.event.before }}",
   AFTER_SHA: "${{ github.sha }}",
 };
-const COMMON = 'common=(--config .gitleaks.toml --redact --no-banner --no-color --ignore-gitleaks-allow --log-level info --report-format template --report-template "${work}/report.tmpl" --report-path -)';
-// Every line that runs gitleaks on a repository or a directory, exactly. The last one is the
-// scan of the checked-out tree; the first two are the canaries.
+const COMMON = 'common=(--redact --no-banner --no-color --ignore-gitleaks-allow --max-archive-depth 2 --log-level info --report-format template --report-template "${work}/report.tmpl" --report-path -)';
+// Every line that runs gitleaks on a repository or a directory, exactly. The first three are
+// the canaries, with this checkout's config; the last three run once per config (this
+// checkout's and the base's), and the last of them is the scan of the checked-out tree.
 const CALLS = [
-  'if report="$(gitleaks dir "${common[@]}" "${work}/dir-canary" 2>/dev/null)"; then',
-  'if report="$(gitleaks git "${common[@]}" --log-opts="-m --text HEAD" "${work}/git-canary" 2>/dev/null)"; then',
-  'gitleaks git "${common[@]}" --log-opts="-m --text ${range}" . 2>"${work}/gitleaks.log" || status=$?',
-  'gitleaks dir "${common[@]}" .',
+  'if report="$(gitleaks dir "${common[@]}" --config .gitleaks.toml "${work}/dir-canary" 2>/dev/null)"; then',
+  'if report="$(gitleaks git "${common[@]}" --config .gitleaks.toml --log-opts="-m --text HEAD" "${work}/git-canary" 2>/dev/null)"; then',
+  'if report="$(gitleaks dir "${common[@]}" --config .gitleaks.toml "${work}/extras-canary" 2>/dev/null)"; then',
+  'gitleaks git "${common[@]}" --config "${config}" --log-opts="-m --text ${range}" . 2>"${work}/gitleaks.log" || status=$?',
+  'gitleaks dir "${common[@]}" --config "${config}" "${work}/extras"',
+  'gitleaks dir "${common[@]}" --config "${config}" .',
+];
+// The lines that decide the configs and the scheduled range, exactly: the base's own config is
+// read from its git objects (nothing from the change runs), and every real scan loops over them.
+const CONFIG_LINES = [
+  'base="${BASE_SHA}"',
+  'if is_commit "${BEFORE_SHA}"; then range="${BEFORE_SHA}..${AFTER_SHA}"; base="${BEFORE_SHA}"; else range="${AFTER_SHA}"; fi',
+  'configs=(.gitleaks.toml)',
+  'elif git cat-file -e "${base}:.gitleaks.toml" 2>/dev/null; then',
+  'git cat-file blob "${base}:.gitleaks.toml" > "${work}/base-config.toml"',
+  'configs+=("${work}/base-config.toml")',
+  'for config in "${configs[@]}"; do',
+  'schedule|workflow_dispatch)',
+  'main="$(git rev-parse --verify --quiet \'refs/remotes/origin/main^{commit}\')" || { echo "origin/main is not in this checkout" >&2; exit 1; }',
+  'range="${main} --tags"',
+  'read -r -a revs <<<"${range}"',
+  'tags=(--tag-messages)',
+  'extras="${PWD}/.github/scripts/secret-scan-extras.py"',
+  'python3 -I "${extras}" "${work}/extras" "${tags[@]}" "${revs[@]}"',
+  'if grep -Eq \'(^| )(ERR|FTL) \' "${work}/gitleaks.log"; then echo "gitleaks reported an error reading the history" >&2; exit 1; fi',
 ];
 
 function scriptViolations(run) {
@@ -36,15 +58,19 @@ function scriptViolations(run) {
   const bad = (cond, message) => { if (cond) out.push(message); };
   const lines = run.split("\n").map(l => l.trim()).filter(l => l && !l.startsWith("#"));
   bad(lines[0] !== "set -euo pipefail", "the script must start with set -euo pipefail");
+  bad(lines[1] !== 'echo "::stop-commands::$(cat /proc/sys/kernel/random/uuid)"', "workflow commands are switched off before anything prints a file name");
+  bad(lines.filter(l => l.includes("::stop-commands::")).length !== 1 || /::[0-9a-f-]{36}::|\$\{?stop/.test(run), "workflow commands stay off for the whole step");
   bad(/set \+[eo]|set \+o errexit|\|\|\s*(true|:)(\s|$)|;\s*true(\s|$)|\btrap\b.*\bERR\b/.test(run), "nothing may switch off errexit or swallow a failure");
   bad(JSON.stringify(lines.filter(l => l.startsWith("common="))) !== JSON.stringify([COMMON]), "common must be exactly the reviewed option list");
-  bad((run.match(/--config/g) ?? []).length !== 1, "--config must appear once, in common");
+  bad((run.match(/--config/g) ?? []).length !== CALLS.length, "--config appears only in the reviewed gitleaks calls");
   const calls = lines.filter(l => /(^|[\s(])gitleaks (git|dir)\b/.test(l));
   bad(JSON.stringify(calls) !== JSON.stringify(CALLS), `every gitleaks call must be exactly one of the reviewed forms, got ${JSON.stringify(calls)}`);
   bad(lines.some(l => /(^|[\s(])gitleaks\s+(?!git |dir )[a-z]/.test(l) && !/echo "/.test(l)), "no other gitleaks command");
-  bad(lines.at(-1) !== CALLS[3], "the last command must be the scan of the whole checked-out tree");
+  bad(JSON.stringify(lines.slice(-2)) !== JSON.stringify([CALLS[5], "done"]), "the last command must be the scan of the whole checked-out tree, the end of the config loop");
+  for (const line of CONFIG_LINES) bad(!lines.includes(line), `the step must keep: ${line}`);
+  bad(lines.filter(l => /^configs\+?=/.test(l)).length !== 2, "configs is set once and extended once, with the base's config only");
   bad(/(^|[\s;])(BASE_SHA|HEAD_SHA|BEFORE_SHA|AFTER_SHA|EVENT_NAME)=/.test(run), "the event values must not be reassigned in the script");
-  bad(/--first-parent|--exit-code|--baseline|-b\s|--no-git|--max-target|--enable-rule|--redact=|--verbose|\s-v\s|--gitleaks-ignore-path|-i\s|--max-decode|--diagnostics/.test(run), "an option that narrows or weakens the scan");
+  bad(/--first-parent|--exit-code|--baseline|-b\s|--no-git|--max-target|--enable-rule|--redact=|--verbose|\s-v\s|--gitleaks-ignore-path|-i\s|--max-decode|--diagnostics|--max-archive-depth [01]\b/.test(run), "an option that narrows or weakens the scan");
   bad(!lines.includes('echo "scanning ${commits} commits of ${range}"'), "the scan must say what it scans");
   return out;
 }
@@ -135,12 +161,22 @@ const MUTATIONS = [
   ["the final scan swallowed", d => set(d, t => `${t.trimEnd()} || true\n`), /swallow a failure/],
   ["the final scan swallowed with a colon", d => set(d, t => `${t.trimEnd()} || :\n`), /swallow a failure/],
   ["a failure followed by true", d => set(d, t => `${t.trimEnd()}; true\n`), /swallow a failure/],
-  ["a second config on the tree scan", d => set(d, t => t.replace(/gitleaks dir "\$\{common\[@\]\}" \.\s*$/, 'gitleaks dir "${common[@]}" --config /dev/null .\n')), /--config must appear once|reviewed forms/],
+  ["a second config on the tree scan", d => set(d, t => t.replace('--config "${config}" .\n', '--config "${config}" --config /dev/null .\n')), /--config appears only|reviewed forms/],
   ["a second config on the range scan", d => set(d, t => t.replace('--log-opts="-m --text ${range}"', '--config /dev/null --log-opts="-m --text ${range}"')), /--config must appear once|reviewed forms/],
-  ["a second config in common", d => set(d, t => t.replace("--config .gitleaks.toml ", "--config .gitleaks.toml --config /dev/null ")), /common must be exactly|--config must appear once/],
-  ["another config in common", d => set(d, t => t.replace("--config .gitleaks.toml", "--config /dev/null")), /common must be exactly/],
-  ["the tree scan dropped", d => set(d, t => t.replace(/\n\s*gitleaks dir "\$\{common\[@\]\}" \.\s*$/, "\n")), /reviewed forms|last command/],
-  ["the tree scan of a subdirectory", d => set(d, t => t.replace(/gitleaks dir "\$\{common\[@\]\}" \.\s*$/, 'gitleaks dir "${common[@]}" apps\n')), /reviewed forms|last command/],
+  ["a second config in common", d => set(d, t => t.replace("common=(--redact ", "common=(--config /dev/null --redact ")), /common must be exactly|--config appears only/],
+  ["a canary with another config", d => set(d, t => t.replace('--config .gitleaks.toml "${work}/dir-canary"', '--config /dev/null "${work}/dir-canary"')), /reviewed forms/],
+  ["the base config dropped", d => set(d, t => t.replace(/\n\s*configs\+=\("\$\{work\}\/base-config\.toml"\)/, "")), /must keep|extended once/],
+  ["the base config read from the head", d => set(d, t => t.replace('git cat-file blob "${base}:.gitleaks.toml"', 'git cat-file blob "HEAD:.gitleaks.toml"')), /must keep/],
+  ["a third config", d => set(d, t => t.replace('configs+=("${work}/base-config.toml")', 'configs+=("${work}/base-config.toml")\n            configs+=(/dev/null)')), /extended once/],
+  ["the base of a push not used", d => set(d, t => t.replace('range="${BEFORE_SHA}..${AFTER_SHA}"; base="${BEFORE_SHA}";', 'range="${BEFORE_SHA}..${AFTER_SHA}";')), /must keep/],
+  ["archives not opened", d => set(d, t => t.replace("--max-archive-depth 2 ", "--max-archive-depth 0 ")), /common must be exactly|narrows/],
+  ["the extras scan dropped", d => set(d, t => t.replace(/\n\s*gitleaks dir "\$\{common\[@\]\}" --config "\$\{config\}" "\$\{work\}\/extras"/, "")), /reviewed forms/],
+  ["the extras never collected", d => set(d, t => t.replace('python3 -I "${extras}" "${work}/extras" "${tags[@]}" "${revs[@]}"', 'mkdir "${work}/extras"')), /must keep/],
+  ["no tag messages in the scheduled scan", d => set(d, t => t.replace("tags=(--tag-messages)", "tags=()")), /must keep/],
+  ["the scheduled scan of HEAD instead of main", d => set(d, t => t.replace("'refs/remotes/origin/main^{commit}'", "'HEAD^{commit}'")), /must keep/],
+  ["the scheduled scan without tags", d => set(d, t => t.replace('range="${main} --tags"', 'range="${main}"')), /must keep/],
+  ["the tree scan dropped", d => set(d, t => t.replace(/\n\s*gitleaks dir "\$\{common\[@\]\}" --config "\$\{config\}" \.\n/, "\n")), /reviewed forms|last command/],
+  ["the tree scan of a subdirectory", d => set(d, t => t.replace('--config "${config}" .\n', '--config "${config}" apps\n')), /reviewed forms|last command/],
   ["the tree scan before something else", d => set(d, t => `${t.trimEnd()}\n          echo done\n`), /last command/],
   ["--first-parent on the range", d => set(d, t => t.replace("-m --text ${range}", "--first-parent -m --text ${range}")), /reviewed forms|narrows/],
   ["no -m on the range", d => set(d, t => t.replace('--log-opts="-m --text ${range}"', '--log-opts="--text ${range}"')), /reviewed forms/],
@@ -160,6 +196,7 @@ const MUTATIONS = [
   ["no redaction", d => set(d, t => t.replace("--redact ", "")), /common must be exactly/],
   ["inline allow comments honoured", d => set(d, t => t.replace("--ignore-gitleaks-allow ", "")), /common must be exactly/],
   ["verbose findings", d => set(d, t => t.replace("--log-level info ", "--log-level info --verbose ")), /common must be exactly|narrows/],
+  ["workflow commands left on", d => set(d, t => t.replace(/\n\s*echo "::stop-commands::\$\(cat \/proc\/sys\/kernel\/random\/uuid\)"/, "")), /workflow commands are switched off/],
   ["the message of what is scanned removed", d => set(d, t => t.replace('echo "scanning ${commits} commits of ${range}"', "true")), /say what it scans/],
 ];
 for (const [label, mutate, reason] of MUTATIONS) {
@@ -167,6 +204,76 @@ for (const [label, mutate, reason] of MUTATIONS) {
     const data = copy();
     mutate(data);
     assert.match(jobViolations(data).join("\n"), reason);
+  });
+}
+
+// ---- the real-scanner tests in CI (#603) ----
+
+test("the web job runs the secret-scan tests with the real scanner, at the secret-scan job's pin", () => {
+  const data = copy();
+  const steps = stepsOf(data.jobs.web);
+  const install = steps.findIndex(s => typeof s.run === "string" && s.run.includes("gitleaks_") && s.run.includes("fetch-verified.sh"));
+  const tests = steps.findIndex(s => s.run === "npm run test:supply-chain");
+  assert.ok(install >= 0 && install < tests, "gitleaks is installed before npm run test:supply-chain");
+  const run = steps[install].run;
+  const pin = pinOf(jobOf(data));
+  assert.ok(run.includes(`${FETCH} ${pin.url} ${pin.sha256} `), "the same URL and checksum as the secret-scan job");
+  assert.match(run, /echo "GITLEAKS_BIN=\$\{RUNNER_TEMP\}\/gitleaks" >> "\$\{GITHUB_ENV\}"/);
+  assert.equal(steps[install].if, undefined);
+  assert.equal(steps[install]["continue-on-error"], undefined);
+});
+
+// ---- the scheduled full-history scan (#603) ----
+
+// The weekly scan is ci.yml's job, run on a schedule and by hand: the same steps and env (so
+// the scan step's own checks above cover it), a read-only token, and no other job or trigger.
+function historyViolations(history, ci) {
+  const out = [];
+  const bad = (cond, message) => { if (cond) out.push(message); };
+  bad(JSON.stringify(Object.keys(history.on ?? {}).sort()) !== JSON.stringify(["schedule", "workflow_dispatch"]), "the history scan runs on a schedule and by hand only");
+  const cron = history.on?.schedule;
+  bad(!Array.isArray(cron) || cron.length !== 1 || !/^\d{1,2} \d{1,2} \* \* [0-6]$/.test(cron[0]?.cron ?? ""), "one weekly schedule (minute, hour, any date, one day of the week)");
+  bad(history.on?.workflow_dispatch !== null && JSON.stringify(history.on?.workflow_dispatch ?? {}) !== "{}", "a manual run takes no inputs");
+  bad(JSON.stringify(history.permissions) !== JSON.stringify({ contents: "read" }), "the workflow token is contents: read");
+  bad(JSON.stringify(Object.keys(history.jobs ?? {})) !== JSON.stringify(["secret-scan"]), "one job, secret-scan");
+  const job = history.jobs?.["secret-scan"] ?? {};
+  const reference = ci.jobs["secret-scan"];
+  bad(JSON.stringify(job.steps) !== JSON.stringify(reference.steps), "the steps are exactly ci.yml's secret-scan steps");
+  bad(JSON.stringify(job.env) !== JSON.stringify(reference.env), "the env is exactly ci.yml's secret-scan env");
+  bad(JSON.stringify(job.permissions) !== JSON.stringify({ contents: "read" }), "the job token is contents: read");
+  bad(job["runs-on"] !== reference["runs-on"], "the same runner as ci.yml");
+  bad(!(Number(job["timeout-minutes"]) >= 10 && Number(job["timeout-minutes"]) <= 60), "timeout-minutes between 10 and 60");
+  const extra = Object.keys(job).filter(k => !["runs-on", "timeout-minutes", "permissions", "env", "steps"].includes(k));
+  bad(extra.length > 0, `the job must always run as written (no ${extra.join(", ")})`);
+  bad(history.env !== undefined || history.defaults !== undefined, "no workflow env or defaults");
+  return out;
+}
+
+test("the weekly full-history scan is ci.yml's secret-scan job on a schedule, read-only (#603)", () => {
+  assert.deepEqual(historyViolations(copyHistory(), copy()), []);
+});
+
+const HISTORY_MUTATIONS = [
+  ["a push trigger", d => { d.on.push = { branches: ["main"] }; }, /schedule and by hand only/],
+  ["a pull_request_target trigger", d => { d.on.pull_request_target = {}; }, /schedule and by hand only/],
+  ["a daily schedule", d => { d.on.schedule = [{ cron: "23 5 * * *" }]; }, /one weekly schedule/],
+  ["two schedules", d => { d.on.schedule.push({ cron: "0 0 * * 3" }); }, /one weekly schedule/],
+  ["an input that picks the range", d => { d.on.workflow_dispatch = { inputs: { range: { default: "HEAD" } } }; }, /takes no inputs/],
+  ["a write token", d => { d.permissions = { contents: "write" }; }, /workflow token is contents: read/],
+  ["a job write token", d => { d.jobs["secret-scan"].permissions = { contents: "read", issues: "write" }; }, /job token is contents: read/],
+  ["a second job", d => { d.jobs.report = { "runs-on": "ubuntu-24.04", steps: [{ run: "true" }] }; }, /one job/],
+  ["a changed scan step", d => { d.jobs["secret-scan"].steps[2].run = "true\n"; }, /exactly ci.yml's secret-scan steps/],
+  ["an extra step", d => { d.jobs["secret-scan"].steps.push({ run: "true" }); }, /exactly ci.yml's secret-scan steps/],
+  ["a different event value", d => { d.jobs["secret-scan"].env.EVENT_NAME = "push"; }, /exactly ci.yml's secret-scan env/],
+  ["a job condition", d => { d.jobs["secret-scan"].if = "false"; }, /always run as written/],
+  ["allowed to fail", d => { d.jobs["secret-scan"]["continue-on-error"] = true; }, /always run as written/],
+  ["a workflow env", d => { d.env = { GITLEAKS_CONFIG: "/dev/null" }; }, /no workflow env/],
+];
+for (const [label, mutate, reason] of HISTORY_MUTATIONS) {
+  test(`the history scan check refuses: ${label}`, () => {
+    const data = copyHistory();
+    mutate(data);
+    assert.match(historyViolations(data, copy()).join("\n"), reason);
   });
 }
 

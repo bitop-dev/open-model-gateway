@@ -84,7 +84,7 @@ def scan(scanner: str, mode: list[str], root: Path, work: Path, cwd: Path) -> in
     template.write_text(REPORT_TEMPLATE)
     common = [
         "--config", str(root / ".gitleaks.toml"), "--redact", "--no-banner", "--no-color", "--ignore-gitleaks-allow",
-        "--log-level", "info", "--report-format", "template", "--report-template", str(template), "--report-path", "-",
+        "--max-archive-depth", "2", "--log-level", "info", "--report-format", "template", "--report-template", str(template), "--report-path", "-",
     ]
     command = [scanner, mode[0], *common, *mode[1:]]
     return subprocess.run(command, cwd=cwd, check=False).returncode
