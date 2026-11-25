@@ -90,7 +90,7 @@ const SEGMENT_AGE: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(500);
 /// A waiting line's route is planned again after this long (routes can be
 /// disabled or cool down meanwhile).
-const REPLAN: Duration = Duration::from_secs(10);
+pub(super) const REPLAN: Duration = Duration::from_secs(10);
 /// Unchanged demand rows are re-published (heartbeat) at least this often.
 const HEARTBEAT: Duration = Duration::from_secs(3);
 

@@ -523,6 +523,22 @@ impl Config {
             .context("could not connect to PostgreSQL")
     }
 
+    /// `serve`'s primary pool: as [`Self::connect`], but a pooler's cached
+    /// failed server login from before PostgreSQL accepted connections is
+    /// waited out ([`crate::db::startup`]).
+    pub async fn connect_serve(&self) -> Result<sqlx::PgPool> {
+        let options =
+            <sqlx::postgres::PgConnectOptions as std::str::FromStr>::from_str(&self.database_url)
+                .context("could not connect to PostgreSQL")?;
+        crate::db::startup::connect(
+            self.primary_pool_options(),
+            options,
+            crate::db::startup::WINDOW,
+        )
+        .await
+        .context("could not connect to PostgreSQL")
+    }
+
     pub async fn connect_bootstrap_dev(&self) -> Result<sqlx::PgPool> {
         let options = crate::bootstrap::dev_connect_options(self.environment, &self.database_url)?;
         self.primary_pool_options()

@@ -1,0 +1,40 @@
+# The first Platform Admin of `spark-env.py up --mode replicas`, created the
+# way a real installation creates it: `provision-user --platform-admin` with
+# trusted (migrator) database access, after the chart's migrate Job. The
+# issuer's admin account signs in with the same verified email. __IMAGE__ is
+# the gateway image under test; __ADMIN_EMAIL__ the issuer account's email.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: omg-first-admin
+  labels: {app.kubernetes.io/name: omg-first-admin}
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: omg-first-admin}
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: provision-user
+          image: __IMAGE__
+          args: [provision-user, --email, __ADMIN_EMAIL__, --platform-admin]
+          env:
+            - {name: PG_USER, valueFrom: {secretKeyRef: {name: omg-migrator-role, key: username}}}
+            - {name: PG_PASSWORD, valueFrom: {secretKeyRef: {name: omg-migrator-role, key: password}}}
+            - {name: DATABASE_URL, value: "postgres://$(PG_USER):$(PG_PASSWORD)@omg-db-rw:5432/gateway"}
+            - {name: GATEWAY_ENV, value: production}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
