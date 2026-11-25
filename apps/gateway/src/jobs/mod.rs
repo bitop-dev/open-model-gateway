@@ -236,6 +236,12 @@ pub struct Jobs {
     /// Test-only: the next finished line of a run turns it soft-lost.
     #[cfg(test)]
     pub(crate) soft_loss: Arc<std::sync::atomic::AtomicBool>,
+    /// Test-only age after which a run's buffered results are flushed as a
+    /// segment (the production age is the runner's `SEGMENT_AGE`; `None`
+    /// keeps it). A test that asserts results are not yet flushed while a
+    /// later line waits for a plan sets an age no planning delay can reach.
+    #[cfg(test)]
+    pub(crate) segment_age: Option<std::time::Duration>,
     /// Test-only lease term and renewal period of a poller claim (the
     /// production values are [`poller::PollLease::DEFAULT`]).
     #[cfg(test)]
@@ -326,6 +332,8 @@ impl Jobs {
             finalize_hold: Arc::default(),
             #[cfg(test)]
             soft_loss: Arc::default(),
+            #[cfg(test)]
+            segment_age: None,
             #[cfg(test)]
             poll_lease: poller::PollLease::DEFAULT,
             #[cfg(test)]

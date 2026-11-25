@@ -95,8 +95,9 @@ TRANSPORT_MARKERS = (
     ("http2-goaway", b"GOAWAY"),
     ("closed-connection", b"use of closed network connection"),
 )
-# The skeleton of a failed copy's first stderr line (#711), printed only for
-# ORAS's own `Error: ` line. A token survives only if it is one of these words
+# The skeleton of a failed copy's first stderr line (#711), under the name of
+# its form (SKELETON_FORMS), or as unrecognised. A token survives only if it
+# is one of these words
 # (printed in lower case, so letter case carries nothing), or a three-digit
 # HTTP status right after "status code"; every quoted segment (where ORAS
 # puts references, paths and other values) and every other token (paths,
@@ -158,8 +159,32 @@ SKELETON_WORDS = frozenset((
     "value", "values", "variant", "verify", "version", "via", "warning", "was", "when", "whence",
     "with", "write", "writing",
 ))
-SKELETON_PREFIX = b"Error: "
-SKELETON_TOKEN = re.compile(rb'"[^"]*"?|[:,]|[^\s:,"]+')
+# The first-line forms of a failed `cp`, each by its fixed prefix: cobra
+# v1.10.2 prints `<prefix> <error>`, where ORAS v1.3.6 sets the prefix to
+# "Error response from registry:" for a registry's answer
+# (cmd/oras/internal/errors) or to `Error from <origin> <type> for <%q
+# reference>:` for an error of either end of a copy (option/binary_target.go),
+# and cobra's own is "Error:". ORAS's log formatter starts a registry warning
+# with `[<RFC 3339 time>][WARNING]: ` (internal/trace), and the Go runtime
+# (go1.26.7, ORAS's toolchain) starts a crash with "panic: ", "fatal error: ",
+# "runtime: " or "unexpected fault address ". The name printed for a form is
+# fixed text; only the rest of the line is masked. After a registry's prefix
+# the text is the registry's (its error code and message): it can choose
+# among the listed words, so it can mislead, and a value shows only if it is
+# itself a listed word, as on every form.
+SKELETON_FORMS = (
+    (re.compile(rb"Error: "), "error:"),
+    (re.compile(rb"Error response from registry: "), "error response from registry:"),
+    (re.compile(rb'Error from (source|destination) (registry|oci-layout) for "(?:[^"\\]|\\.)*": '), None),
+    (re.compile(rb"\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})\]\[WARNING\]: "), "warning:"),
+    (re.compile(rb"panic: "), "panic:"),
+    (re.compile(rb"fatal error: "), "fatal error:"),
+    (re.compile(rb"runtime: "), "runtime:"),
+    (re.compile(rb"unexpected fault address "), "unexpected fault address"),
+)
+# A quoted segment runs to its closing quote, past Go's escaped quotes; one
+# in single quotes too (a token that starts with one, so "doesn't" stays a word).
+SKELETON_TOKEN = re.compile(rb'"(?:[^"\\]|\\.)*"?|\'[^\']*\'?|[:,]|[^\s:,"]+')
 SKELETON_WORD = re.compile(rb"[A-Za-z][A-Za-z'-]{0,23}")
 SKELETON_STATUS = re.compile(rb"[1-5][0-9]{2}")
 SKELETON_TOKENS = 40
@@ -333,18 +358,44 @@ def copy_signals(stderr):
             f"stderr {lines} lines" + (" (first 4096 bytes)" if cut else ""))
 
 
+def first_line(stderr):
+    """The first line of stderr within DIAGNOSTIC_BYTES, whether it was cut
+    there (it goes on past them), and whether stderr is empty."""
+    stderr.seek(0)
+    head = stderr.read(DIAGNOSTIC_BYTES + 1)
+    line = re.split(rb"[\r\n]", head[:DIAGNOSTIC_BYTES], maxsplit=1)
+    cut = len(line) == 1 and head[DIAGNOSTIC_BYTES:] not in (b"", b"\r", b"\n")
+    return line[0], cut, not head
+
+
 def skeleton(stderr):
-    """ORAS's `Error: ` line with only reviewed words, a status after "status
-    code", ':' and ',' kept, everything else one placeholder per run, bounded
-    (marker included). "none" for any other first line. Safe to print."""
-    report, _ = read_report(stderr)
-    line = re.split(rb"[\r\n]", report, maxsplit=1)[0]
-    if not line.startswith(SKELETON_PREFIX):
+    """The first stderr line as the name of its form, then only reviewed words,
+    a status after "status code", ':' and ',' kept, everything else one
+    placeholder per run, bounded (marker included). "unrecognised: " and the
+    whole line masked for any other line, "blank" for an empty line and "none"
+    only for an empty stderr. Safe to print."""
+    line, cut, empty = first_line(stderr)
+    if empty:
         return "none"
-    pieces = ["error:"]
-    for match in SKELETON_TOKEN.finditer(line[len(SKELETON_PREFIX):]):
+    if not line.strip():
+        return "blank"
+    for form, name in SKELETON_FORMS:
+        prefix = form.match(line)
+        if prefix:
+            # The origin and type come from fixed alternations, never the input.
+            name = name or f"error from {prefix[1].decode()} {prefix[2].decode()} for <x>:"
+            rest = line[prefix.end():]
+            break
+    else:
+        name, rest = "unrecognised:", line
+    # Each word of the name counts against the bound.
+    pieces = name.split(" ")
+    for match in SKELETON_TOKEN.finditer(rest):
         token = match.group()
-        if token in (b":", b","):
+        # A token the cut ends may read as a listed word ("opened" as "open").
+        if cut and match.end() == len(rest):
+            piece = "<x>"
+        elif token in (b":", b","):
             piece = token.decode()
         elif SKELETON_WORD.fullmatch(token) and token.lower().decode() in SKELETON_WORDS:
             piece = token.lower().decode()
@@ -361,7 +412,7 @@ def skeleton(stderr):
         if count == SKELETON_TOKENS or len(text) + len(part) > SKELETON_CHARS - len(SKELETON_OMITTED):
             return text + SKELETON_OMITTED
         text += part
-    return text
+    return text + SKELETON_OMITTED if cut else text
 
 
 def attempt_copy(tool, args, env, work, image, timeout):
