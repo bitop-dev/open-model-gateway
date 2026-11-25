@@ -38,8 +38,8 @@ pub(super) fn start(w: &World) -> tokio::task::JoinHandle<JobResult<bool>> {
 /// whose job row another transaction holds at that moment (`claim_gateway`
 /// takes `FOR UPDATE SKIP LOCKED`), and the loop claims again on its next
 /// tick: this claims again until it has the batch, within [`REACH`].
-fn start_replacement(w: &World) -> tokio::task::JoinHandle<JobResult<bool>> {
-    let runner = Runner::new(w.jobs.clone());
+fn start_replacement(jobs: Jobs) -> tokio::task::JoinHandle<JobResult<bool>> {
+    let runner = Runner::new(jobs);
     tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + REACH;
         loop {
@@ -53,7 +53,9 @@ fn start_replacement(w: &World) -> tokio::task::JoinHandle<JobResult<bool>> {
     })
 }
 
-/// The runner that holds the batch stops renewing: its lease lapses.
+/// The batch's lease lapses: it is backdated as if its runner had stopped
+/// renewing. The runner still renews on its own schedule, so a renewal that
+/// lands before a replacement claims extends the lease again.
 pub(super) async fn lapse(w: &World, job: &JobRow) {
     sqlx::query("UPDATE async_jobs SET runner_lease_until=now()-interval '1 second' WHERE id=$1")
         .bind(job.id)
@@ -199,7 +201,7 @@ async fn overlapping_runners(
         .await
         .expect("old runner reached the provider");
     lapse(w, job).await;
-    let owner = start_replacement(w);
+    let owner = start_replacement(w.jobs.clone());
     tokio::time::timeout(REACH, held_b.entered.notified())
         .await
         .expect("replacement runner used the second route slot");
@@ -318,14 +320,29 @@ async fn a_planning_failure_after_a_takeover_delays_the_line_one_replan(pool: Pg
         .fetch_one(&mut *lock)
         .await
         .unwrap();
+    // The replacement plans on a pool of its own, named, so the statement
+    // cancelled below is its planning read and never the old runner's (which
+    // plans its next line too, though it can no longer start it).
+    const REPLACEMENT: &str = "omg-fence-replacement";
+    let replacement_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .idle_timeout(Some(Duration::from_secs(1)))
+        .connect_with(
+            (*db.connect_options())
+                .clone()
+                .application_name(REPLACEMENT),
+        )
+        .await
+        .unwrap();
+    let mut jobs = w.jobs.clone();
+    jobs.store.pool = replacement_pool.clone();
     lapse(&w, &job).await;
-    let taken = std::time::Instant::now();
-    let owner = start_replacement(&w);
+    let owner = start_replacement(jobs);
     // The replacement runner's planning read, waiting for the lock: cancel it.
     let planning: i32 = tokio::time::timeout(REACH, async {
         loop {
-            if let Some(pid) = sqlx::query_scalar("SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND $1=ANY(pg_blocking_pids(pid)) AND query LIKE '%deployment_health%'")
-                .bind(holder).fetch_optional(db).await.unwrap() {
+            if let Some(pid) = sqlx::query_scalar("SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND application_name=$2 AND $1=ANY(pg_blocking_pids(pid)) AND query LIKE '%deployment_health%'")
+                .bind(holder).bind(REPLACEMENT).fetch_optional(db).await.unwrap() {
                 return pid;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -348,14 +365,17 @@ async fn a_planning_failure_after_a_takeover_delays_the_line_one_replan(pool: Pg
     })
     .await
     .expect("the planning read was cancelled");
+    let failed = std::time::Instant::now();
     lock.commit().await.unwrap();
     tokio::time::timeout(REACH, held_b.entered.notified())
         .await
         .expect("replacement runner used the second route slot after a planning failure");
+    // From the failed plan to the line's provider call: one REPLAN at least
+    // (less the moment between the plan's failure and its observation here).
     assert!(
-        taken.elapsed() >= crate::jobs::runner::REPLAN,
+        failed.elapsed() + Duration::from_millis(250) >= crate::jobs::runner::REPLAN,
         "the line was planned again before one REPLAN: {:?}",
-        taken.elapsed()
+        failed.elapsed()
     );
 
     held_a.release.notify_one();
@@ -378,6 +398,7 @@ async fn a_planning_failure_after_a_takeover_delays_the_line_one_replan(pool: Pg
         (job.request_completed, job.request_failed),
         (Some(2), Some(1))
     );
+    replacement_pool.close().await;
 }
 
 use crate::{
