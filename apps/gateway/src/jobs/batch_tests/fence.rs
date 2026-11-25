@@ -4,6 +4,16 @@ use super::*;
 use crate::jobs::fence::{FenceError, Renewed, SegmentLines};
 use crate::jobs::schedule::{Scheduler, claims::RetryClaim};
 
+/// How long a test waits for a line to reach the provider. A transient
+/// planning failure (`Storage` or `Timeout`) is treated like a route's
+/// cooldown: the line is planned again only after one [`REPLAN`]
+/// (`jobs::runner`), so a wait of exactly `REPLAN` expires after one such
+/// failure on a loaded machine. Two `REPLAN`s and a margin still bound a stuck
+/// runner.
+pub(super) const REACH: Duration = crate::jobs::runner::REPLAN
+    .saturating_mul(2)
+    .saturating_add(Duration::from_secs(10));
+
 /// `world` with one batch of `lines` (chat completions, one line each).
 async fn batch(pool: PgPool, lines: &[(&str, &str)]) -> (World, JobRow) {
     let w = world(pool, false, false, 1).await;
@@ -167,12 +177,12 @@ async fn overlapping_runners(
         .bind(w.f.deployment).bind(w.f.owner).execute(&w.f.store.pool).await.unwrap();
     let (held_a, held_b) = (w.openai.gate("hold-a"), w.openai.gate("hold-b"));
     let old = start(w);
-    tokio::time::timeout(Duration::from_secs(10), held_a.entered.notified())
+    tokio::time::timeout(REACH, held_a.entered.notified())
         .await
         .expect("old runner reached the provider");
     lapse(w, job).await;
     let owner = start(w);
-    tokio::time::timeout(Duration::from_secs(10), held_b.entered.notified())
+    tokio::time::timeout(REACH, held_b.entered.notified())
         .await
         .expect("replacement runner used the second route slot");
     (old, owner, held_a, held_b)
