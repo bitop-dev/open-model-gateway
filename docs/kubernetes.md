@@ -403,13 +403,17 @@ A second SIGTERM or Ctrl-C ends the drain window at once. `GATEWAY_SHUTDOWN_DRAI
 closes idle connections at the signal, which is what the gateway did before the window existed.
 
 **Termination budget.** Steps 1 to 4 must fit in `gateway.terminationGracePeriodSeconds`, or
-Kubernetes kills the process. With the defaults, a 120 s inference accepted at the end of the window
-and a database that does not answer the lease release need 10 + 5 + 120 + 3 + 22 = 160 s. The default
-grace period is 180 s: that worst case plus 20 s for the process to exit. A pod that finishes sooner
-exits sooner, so the grace period only bounds a stuck pod. While a pod runs out its grace, its
-resources still count against a namespace's quota, and `kubectl drain` waits for it. Raise the grace
-period by as much as you raise the window, the request timeout or the `preStop` sleep;
-`tests/helm-chart.test.mjs` fails when the chart's own defaults no longer fit.
+Kubernetes kills the process. The default, 180 s, is sized for inference: with the defaults, a 120 s
+inference accepted at the end of the window, its 3 s settlement, the exporters and a database that
+does not answer the lease release need 10 + 5 + 120 + 3 + 3 + 22 = 163 s, and the rest of the exit
+(stopping background work, closing the database pool) has 17 s. It is not a bound for every request:
+a file upload that is still streaming, a batch creation still reading its input file and a realtime
+session (which ends when the process exits) can run longer and are cut off at the limit. A pod that
+finishes sooner exits sooner, so the grace period only bounds a slow or stuck pod; such a pod now
+gets up to 30 s more than with the former 150 s, its resources still count against a namespace's
+quota meanwhile, and `kubectl drain` waits for it. Raise the grace period by as much as you raise
+the window, the request timeout or the `preStop` sleep; `tests/helm-chart.test.mjs` fails when the
+chart's own settings no longer fit.
 
 **What remains.** A keep-alive connection that no client uses during the window is closed at step 3
 without a `Connection: close`. If a client sends a request on it at that instant, the request is

@@ -395,33 +395,58 @@ test("gateway Deployment never runs as root and has a read-only root filesystem"
   assert.doesNotMatch(deployment, /automountServiceAccountToken: true/);
 });
 
-test("the default grace period covers the worst documented shutdown, with a margin", () => {
-  // The gateway's own bounds, from its source.
+// The longest a stopping gateway pod may need, from the rendered chart and the
+// gateway's own bounds (docs/kubernetes.md "Pod shutdown and rolling restarts").
+function shutdownBudget(rendered) {
   const source = (path) => readFileSync(join(root, "apps/gateway/src", path), "utf8");
   const number = (text, pattern, what) => {
     const match = text.match(pattern);
     assert.ok(match, `${what} not found`);
     return Number(match[1]);
   };
-  const drainDefault = number(source("drain.rs"), /GATEWAY_SHUTDOWN_DRAIN_SECONDS"\)\s*\.unwrap_or_else\(\|_\| "(\d+)"/, "drain default");
-  const exporters = number(source("telemetry.rs"), /^const DRAIN: Duration = Duration::from_secs\((\d+)\);/m, "exporter budget");
+  const deployments = docsOfKind(rendered, "Deployment").filter((d) => /^\s+app\.kubernetes\.io\/component: gateway$/m.test(d));
+  assert.equal(deployments.length, 1, "one gateway Deployment");
+  const [deployment] = deployments;
+  const grace = number(deployment, /^\s+terminationGracePeriodSeconds: (\d+)$/m, "grace period");
+  const preStop = number(deployment, /^\s+lifecycle:\n\s+preStop:\n(?:\s+#[^\n]*\n)*\s+sleep:\n\s+seconds: (\d+)$/m, "preStop sleep");
+  // The container's own env entry (the last one) overrides the ConfigMap.
+  const configMaps = docsOfKind(rendered, "ConfigMap").join("\n");
+  const setting = (key, fallback) => {
+    const own = [...deployment.matchAll(new RegExp(`-\\s+name: ${key}\\n\\s+value(From)?: "?(\\d*)"?$`, "gm"))].at(-1);
+    if (own) {
+      assert.ok(!own[1], `${key} comes from a reference the chart cannot read`);
+      return Number(own[2]);
+    }
+    const mapped = configMaps.match(new RegExp(`^  ${key}: "?(\\d+)"?$`, "m"));
+    return mapped ? Number(mapped[1]) : fallback;
+  };
+  const drain = setting("GATEWAY_SHUTDOWN_DRAIN_SECONDS",
+    number(source("drain.rs"), /"GATEWAY_SHUTDOWN_DRAIN_SECONDS"\)\s*\.unwrap_or_else\(\|_\| "(\d+)"/, "drain default"));
+  const request = setting("GATEWAY_REQUEST_TIMEOUT_SECONDS",
+    number(source("config.rs"), /"GATEWAY_REQUEST_TIMEOUT_SECONDS"\)\s*\.unwrap_or_else\(\|_\| "(\d+)"/, "request timeout default"));
+  // A request's settlement may run past its upstream deadline.
+  const settlement = number(source("inference/mod.rs"), /const SETTLEMENT_DEADLINE: Duration = Duration::from_secs\((\d+)\);/, "settlement deadline");
+  // Traces, metrics and operational logs drain at the same time: the longest counts.
+  const exporters = Math.max(...["telemetry.rs", "metrics_export.rs", "ops_log.rs"].map((file) =>
+    number(source(file), /^const DRAIN: Duration = Duration::from_secs\((\d+)\);/m, `${file} drain`)));
+  // The work leases are released one after another.
   const leases = number(source("leases.rs"), /pub const ALL: \[Self; (\d+)\]/, "lease count");
   const release = number(source("leases.rs"), /const RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs\((\d+)\);/, "lease release");
-  const requestDefault = number(source("config.rs"), /"GATEWAY_REQUEST_TIMEOUT_SECONDS"\)\s*\.unwrap_or_else\(\|_\| "(\d+)"/, "request timeout default");
+  return { grace, budget: preStop + drain + request + settlement + exporters + leases * release };
+}
+
+test("the default grace period covers a stopping pod's longest documented shutdown, with a margin", () => {
   for (const [name, args] of Object.entries(profiles)) {
-    const rendered = helmTemplate(args);
-    const [deployment] = docsOfKind(rendered, "Deployment").filter((d) => /component: gateway/.test(d));
-    assert.ok(deployment, `${name}: gateway Deployment`);
-    const grace = number(deployment, /terminationGracePeriodSeconds: (\d+)/, `${name}: grace period`);
-    const preStop = number(deployment, /preStop:[\s\S]*?seconds: (\d+)/, `${name}: preStop sleep`);
-    const setting = (key, fallback) => {
-      const match = rendered.match(new RegExp(`${key}: "?(\\d+)"?`));
-      return match ? Number(match[1]) : fallback;
-    };
-    const budget = preStop + setting("GATEWAY_SHUTDOWN_DRAIN_SECONDS", drainDefault)
-      + setting("GATEWAY_REQUEST_TIMEOUT_SECONDS", requestDefault) + exporters + leases * release;
+    const { grace, budget } = shutdownBudget(helmTemplate(args));
     assert.ok(budget + 10 <= grace, `${name}: a stopping pod may need ${budget} s; the grace period is ${grace} s`);
   }
+  // The sum follows what the container really gets: a longer timeout set
+  // through extraEnv no longer fits the default grace period.
+  const longer = shutdownBudget(helmTemplate([...profiles["external-db"],
+    "--set", "gateway.extraEnv[0].name=GATEWAY_REQUEST_TIMEOUT_SECONDS", "--set-string", "gateway.extraEnv[0].value=200"]));
+  assert.ok(longer.budget + 10 > longer.grace, `${longer.budget} s`);
+  const drained = shutdownBudget(helmTemplate([...profiles["external-db"], "--set-string", "gateway.env.GATEWAY_SHUTDOWN_DRAIN_SECONDS=30"]));
+  assert.equal(drained.budget - shutdownBudget(helmTemplate(profiles["external-db"])).budget, 25);
 });
 
 test("gateway probes are httpGet, never exec (distroless has no shell)", () => {
