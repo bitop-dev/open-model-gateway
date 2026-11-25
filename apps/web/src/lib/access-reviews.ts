@@ -16,6 +16,8 @@ export type ReviewDecision = "keep" | "flag_idp" | "remove";
 export type ReviewCampaign = {
   id: string; name: string; subjects: ReviewSubject[]; workspace_ids: string[]; created_by: string; created_at: string;
   due_at: string; closed_at: string | null; item_count: number;
+  /** The schedule that started it (#481); null for one started by hand. */
+  schedule_id: string | null;
 };
 export type ReviewCounts = {
   by_kind: { workspace_membership: number; platform_role: number; workspace_key: number };

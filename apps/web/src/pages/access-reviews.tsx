@@ -5,17 +5,20 @@
  *     decide now: keep, remove (applied at once, after a confirmation that
  *     says what it does) or flag group-provided access for the identity
  *     provider. A key is kept or revoked.
- *   - Admin › Access reviews: campaigns, and starting one (Platform Admins).
+ *   - Admin › Access reviews: campaigns, and starting one (Platform Admins);
+ *     schedules that start one each period (#481): Platform Admins create,
+ *     change, pause, resume and delete them; Auditors read them.
  *   - A campaign: its counts and items with each latest decision and
  *     reviewer; Platform Admins assign a reviewer and close it. Keys show
  *     no name or holder here and are never assigned.
  * The server decides who may review what and refuses anything else; the
  * dashboard offers only the steps the viewer can take.
  */
-import { ClipboardCheck, Plus } from "lucide-react";
+import { CalendarClock, ClipboardCheck, Plus } from "lucide-react";
 import { api, platformPath, type Session } from "../lib/api";
 import { accessText, decisionText, isKey, keyIdentity, keyHolderText, keyText, keyUseText, subjectsText, itemLabel, removalTarget, campaignState, campaignStateLabels, campaignStateTone, decisionPath, decisionTone, inboxPath, personText, removalConsequence, reviewClosePath, reviewExportPath, reviewerPath, reviewItemsPath, reviewPath, reviewsPath, sourceLabels, subjectLabels, type ReviewSubject, type InboxItem, type ReviewCampaign, type ReviewCampaignDetail, type ReviewItem } from "../lib/access-reviews";
-import { nameField, type Field } from "../lib/forms";
+import { cadenceLabels, cadenceText, calendarBody, lastRunText, monthNames, schedulePath, schedulesPath, scheduleState, utcDate, type ReviewSchedule } from "../lib/access-review-schedules";
+import { nameField, type Field, type Values } from "../lib/forms";
 import type { DirectoryUser, DirectoryWorkspace } from "../lib/people";
 import { Button, ErrorNotice, Heading, Inline, Stack, useAction, useApi } from "../components/ui";
 import { DirectoryTable } from "../components/people";
@@ -110,7 +113,74 @@ export function PlatformAccessReviewsPage({ session }: { session: Session }) {
     <Heading title="Access reviews" description="One-off reviews of who has access to Teams and Projects, of their keys, and of Admin and Auditor roles. Workspace owners and admins review their workspaces and their keys; Platform Admins review platform roles." actions={writable && <Button onClick={start}><Plus aria-hidden />Start review</Button>} />
     <DirectoryTable<ReviewCampaign> path={reviewsPath} label="Access reviews" storageKey="access-reviews" columns={columns} rowKey={c => c.id} rowLabel={c => c.name}
       empty={{ icon: <ClipboardCheck />, title: "No access reviews yet.", description: writable ? "Start one to have owners and admins confirm who should keep access." : "Platform Admins start access reviews." }} />
+    <AccessReviewSchedules session={session} />
   </Stack>;
+}
+
+/** The calendar fields of a schedule, with its current values when changing one. */
+function calendarFields(current?: ReviewSchedule): Field[] {
+  return [
+    { name: "cadence", label: "Repeats", type: "select", required: true, value: current?.cadence ?? "monthly", options: Object.entries(cadenceLabels).map(([value, label]) => ({ value, label })) },
+    { name: "start_day", label: "Start day", type: "number", required: true, min: 1, max: 31, value: String(current?.start_day ?? 1), help: "Each review starts at 00:00 UTC on this day of the month, or on the month's last day when it is shorter." },
+    { name: "start_month", label: "Start month", type: "select", value: String(current?.start_month ?? 1), options: monthNames.map((m, i) => ({ value: String(i + 1), label: m })),
+      visibleWhen: (v: Values) => v.cadence !== "monthly", requiredWhen: (v: Values) => v.cadence !== "monthly", help: "Quarterly: a month of the cycle (every third month from it). Yearly: the month." },
+  ];
+}
+const openDaysField = (value = "14"): Field => ({ name: "open_days", label: "Each review is due after (days)", type: "number", value, required: true, min: 1, max: 90 });
+
+/**
+ * Schedules that start an ordinary review each period. A run while the
+ * schedule's previous review is still open is skipped (Platform Admins get
+ * an alert) and is never queued.
+ */
+function AccessReviewSchedules({ session }: { session: Session }) {
+  const ask = useAction(), writable = session.capabilities.platform_write;
+  const create = () => ask({
+    title: "New review schedule", description: "Starts a review like the one below each period. The first one starts at the next start day, never today.",
+    fields: [{ ...nameField, maxLength: 100, help: "Each review is named after it, with the date it starts." },
+      { name: "subjects", label: "What to review", type: "checkboxes", required: true, value: JSON.stringify(["workspace_memberships"]), options: Object.entries(subjectLabels).map(([value, label]) => ({ value, label })) },
+      workspaceField, openDaysField(), ...calendarFields()],
+    submitLabel: "Create schedule", successNotice: "Review schedule created.",
+    run: (v, signal) => {
+      const subjects = parseIds(v.subjects), ids = narrowable(subjects) ? parseIds(v.workspace_ids) : [];
+      return api<ReviewSchedule>(schedulesPath, { method: "POST", body: { name: v.name, subjects, workspace_ids: ids, open_days: Number(v.open_days), ...calendarBody(v) }, signal });
+    },
+  });
+  const change = (x: ReviewSchedule) => ask({
+    title: `Change ${x.name}`, description: "Applies to reviews it starts from now on; reviews already started are unchanged. A new calendar starts at its next start day.",
+    fields: [{ ...nameField, maxLength: 100, value: x.name }, openDaysField(String(x.open_days)), ...calendarFields(x)],
+    submitLabel: "Save", successNotice: "Review schedule changed.",
+    run: (v, signal) => api<ReviewSchedule>(schedulePath(x.id), { method: "PATCH", body: { name: v.name, open_days: Number(v.open_days), ...calendarBody(v) }, signal }),
+  });
+  const pause = (x: ReviewSchedule, paused: boolean) => ask({
+    title: paused ? `Pause ${x.name}?` : `Resume ${x.name}?`,
+    description: paused ? "No review starts while it is paused. Reviews already started are unchanged." : "The next review starts at the next start day; periods missed while it was paused do not run.",
+    submitLabel: paused ? "Pause" : "Resume", successNotice: paused ? "Review schedule paused." : "Review schedule resumed.",
+    run: (_, signal) => api<ReviewSchedule>(schedulePath(x.id), { method: "PATCH", body: { paused }, signal }),
+  });
+  const remove = (x: ReviewSchedule) => ask({
+    title: `Delete ${x.name}?`, danger: true, description: "No further reviews start. Reviews it already started stay as they are.",
+    submitLabel: "Delete schedule", successNotice: "Review schedule deleted.",
+    run: (_, signal) => api(schedulePath(x.id), { method: "DELETE", signal }),
+  });
+  const columns: DataTableColumn<ReviewSchedule>[] = [
+    { id: "name", header: "Schedule", accessor: x => x.name, rowHeader: true, hideable: false, cell: x => <CellText primary={x.name} secondary={`${subjectsText(x.subjects)}${x.workspace_ids.length ? ` · ${x.workspace_ids.length} selected workspaces` : ""}`} /> },
+    { id: "repeats", header: "Repeats", accessor: x => x.cadence, cell: x => <CellText primary={cadenceText(x)} secondary={`Due after ${x.open_days} days`} /> },
+    { id: "next", header: "Next start", accessor: x => x.next_run_at ?? "", cell: x => x.next_run_at ? <span className={s.secondary}>{utcDate(x.next_run_at)}</span> : <StatusBadge tone="neutral">Paused</StatusBadge> },
+    { id: "last", header: "Last run", accessor: x => x.last_run?.period_at ?? "", cell: x => <CellText primary={lastRunText(x.last_run)} secondary={x.last_run ? utcDate(x.last_run.period_at) : undefined} /> },
+    { id: "review", header: "Last review", accessor: x => x.last_campaign?.created_at ?? "", cell: x => x.last_campaign ? <ResourceLink search={{ page: "access-review-detail", record: x.last_campaign.id }}>{x.last_campaign.name}</ResourceLink> : <span className={s.muted}>None yet</span> },
+  ];
+  return <>
+    <Heading title="Schedules" description="Reviews that start on their own each month, quarter or year, in UTC. A review is skipped (Platform Admins are alerted) while the schedule's previous one is still open." actions={writable && <Button variant="secondary" onClick={create}><Plus aria-hidden />New schedule</Button>} />
+    <DirectoryTable<ReviewSchedule> path={schedulesPath} label="Review schedules" storageKey="access-review-schedules" columns={columns} rowKey={x => x.id} rowLabel={x => x.name}
+      rowActions={x => !writable ? [] : [
+        { label: "Change…", onSelect: () => change(x) },
+        { label: "Pause…", hidden: scheduleState(x) === "paused", onSelect: () => pause(x, true) },
+        { label: "Resume…", hidden: scheduleState(x) === "active", onSelect: () => pause(x, false) },
+        { label: "Delete…", danger: true, onSelect: () => remove(x) },
+      ]}
+      empty={{ icon: <CalendarClock />, title: "No review schedules.", description: writable ? "Create one to start a review every month, quarter or year." : "Platform Admins create review schedules." }} />
+  </>;
 }
 
 /** One campaign: counts, items with their decision and reviewer. */
@@ -138,7 +208,7 @@ export function AccessReviewDetail({ session, id }: { session: Session; id: stri
   ];
   const summary = `${n.by_decision.pending} undecided · ${n.by_decision.keep} kept · ${n.by_decision.remove} removed${n.by_kind.workspace_key ? " or revoked" : ""} · ${n.by_decision.flag_idp} flagged${n.without_reviewer ? ` · ${n.without_reviewer} without a reviewer` : ""}${n.inactive ? ` · ${n.inactive} no longer in effect` : ""}`;
   return <Stack gap={6} className={s.page}>
-    <Heading title={c.name} description={`${subjectsText(c.subjects)} · ${c.item_count} items · due ${new Date(c.due_at).toLocaleDateString()} · ${summary}`}
+    <Heading title={c.name} description={`${subjectsText(c.subjects)} · ${c.item_count} items · due ${new Date(c.due_at).toLocaleDateString()} · ${summary}${c.schedule_id ? " · started by a schedule" : ""}`}
       actions={<Inline gap={2}><StatusBadge tone={campaignStateTone[state]}>{campaignStateLabels[state]}</StatusBadge><TextLink href={reviewExportPath(id)} download>Export CSV</TextLink>{writable && open && <Button variant="secondary" onClick={close}>Close review</Button>}</Inline>} />
     <DirectoryTable<ReviewItem> path={reviewItemsPath(id)} label="Items" storageKey="access-review-items" columns={columns} rowKey={i => i.id} rowLabel={itemLabel}
       rowActions={i => !writable || !open || isKey(i) || i.user_id === session.user.id ? [] : [
