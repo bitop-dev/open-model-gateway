@@ -34,6 +34,25 @@ pub(super) fn start(w: &World) -> tokio::task::JoinHandle<JobResult<bool>> {
     tokio::spawn(async move { runner.run_next().await })
 }
 
+/// A replacement runner as the runner's loop runs it. A claim skips a batch
+/// whose job row another transaction holds at that moment (`claim_gateway`
+/// takes `FOR UPDATE SKIP LOCKED`), and the loop claims again on its next
+/// tick: this claims again until it has the batch, within [`REACH`].
+fn start_replacement(w: &World) -> tokio::task::JoinHandle<JobResult<bool>> {
+    let runner = Runner::new(w.jobs.clone());
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + REACH;
+        loop {
+            match runner.run_next().await {
+                Ok(false) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                other => return other,
+            }
+        }
+    })
+}
+
 /// The runner that holds the batch stops renewing: its lease lapses.
 pub(super) async fn lapse(w: &World, job: &JobRow) {
     sqlx::query("UPDATE async_jobs SET runner_lease_until=now()-interval '1 second' WHERE id=$1")
@@ -180,7 +199,7 @@ async fn overlapping_runners(
         .await
         .expect("old runner reached the provider");
     lapse(w, job).await;
-    let owner = start(w);
+    let owner = start_replacement(w);
     tokio::time::timeout(REACH, held_b.entered.notified())
         .await
         .expect("replacement runner used the second route slot");
@@ -301,7 +320,7 @@ async fn a_planning_failure_after_a_takeover_delays_the_line_one_replan(pool: Pg
         .unwrap();
     lapse(&w, &job).await;
     let taken = std::time::Instant::now();
-    let owner = start(&w);
+    let owner = start_replacement(&w);
     // The replacement runner's planning read, waiting for the lock: cancel it.
     let planning: i32 = tokio::time::timeout(REACH, async {
         loop {
