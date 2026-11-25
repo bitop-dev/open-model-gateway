@@ -318,6 +318,7 @@ if kind == 'login':
             (destination + b"PUT " + url + b": response status code 503: Service Unavailable", "registry-server"),
             (destination + b"Head " + url + b": dial tcp: lookup ghcr.io: no such host", "transport"),
             (destination + b"Head " + url + b": net/http: TLS handshake timeout", "transport"),
+            (destination + b"Head " + url + b": tls: failed to verify certificate: x509: unknown authority", "transport-tls"),
             (registry + b"unknown: response status code 403: fixture-private-token", "unknown"),
             (registry + b"unauthorized-ish: fixture-private-token", "unknown"),
             (destination + b'POST "https://ghcr.io.example/v2/": response status code 429: fake', "unknown"),
@@ -429,15 +430,35 @@ if kind == 'login':
     def test_each_attempt_gets_the_rest_of_one_budget(self):
         stderr, _, _ = self.ORAS_OUTPUT["503 without a body"]
         self.install_tool(fail="cp", diagnostic=stderr + b"\n")
+        # A clock that only the pauses move: attempt n gets 600 s minus the pauses before it.
+        now = [1000.0]
+        def pause(seconds):
+            self.sleeps.append(seconds)
+            now[0] += seconds
         timeouts, run = [], subprocess.run
         def recorded(*args, **kwargs):
             if args[0][1] == "cp":
                 timeouts.append(kwargs["timeout"])
             return run(*args, **kwargs)
-        with mock.patch.object(self.api.subprocess, "run", side_effect=recorded):
+        with mock.patch.object(self.api, "wait", side_effect=pause), \
+                mock.patch.object(self.api.time, "monotonic", side_effect=lambda: now[0]), \
+                mock.patch.object(self.api.subprocess, "run", side_effect=recorded):
             self.refused(calls=4, diagnostic="copy failed (registry-server)")
-        self.assertEqual(len(timeouts), 3)
-        self.assertTrue(all(0 < t <= 600 for t in timeouts) and timeouts == sorted(timeouts, reverse=True), timeouts)
+        self.assertEqual(timeouts, [600, 590, 560])
+        self.assertEqual(self.sleeps, [10, 30])
+
+    def test_a_retry_needs_a_minute_of_budget_after_its_pause(self):
+        stderr, _, _ = self.ORAS_OUTPUT["503 without a body"]
+        for left, retried in ((69.0, False), (70.0, True)):
+            with self.subTest(left=left):
+                self.log.unlink(missing_ok=True)
+                self.sleeps.clear()
+                self.install_tool(diagnostic=stderr + b"\n", cp_failures=1)
+                clock = iter([0.0, 0.0] + [600.0 - left] * 10)
+                with mock.patch.object(self.api.time, "monotonic", side_effect=lambda: next(clock)):
+                    code, _, _ = self.invoke()
+                self.assertEqual(code == 0, retried)
+                self.assertEqual(self.sleeps, [10] if retried else [])
 
     def test_login_and_copy_timeouts_are_bounded_redacted_and_cleaned(self):
         run = subprocess.run

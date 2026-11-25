@@ -54,6 +54,8 @@ REGISTRY_CODES = {
 COPY_ATTEMPTS = 3
 COPY_BACKOFF = (10, 30)
 COPY_BUDGET = 600
+# A retry is made only if this much of the budget is left after its pause.
+MIN_ATTEMPT = 60
 TRANSIENT = {"registry-server", "registry-rate-limit", "transport"}
 # The diagnostic of a failed copy is built only from these fixed words, numbers
 # and the match of a fixed alternation: never URL paths, queries, headers, tokens
@@ -190,8 +192,11 @@ def copy_failure_category(stderr, image):
     token_request = re.match(rb'(?:Get|Post) "https://ghcr\.io/token(?:\?[^"\x00-\x20\x7f]*)?": ', detail)
     if token_request:
         detail = detail[token_request.end():]
+    # A certificate the runner cannot verify is not transient: not retried.
+    if detail.startswith(b"tls: failed to verify certificate: "):
+        return "transport-tls"
     if (detail in (b"EOF", b"unexpected EOF", b"net/http: TLS handshake timeout")
-            or detail.startswith((b"dial tcp: ", b"dial tcp ", b"tls: failed to verify certificate: "))):
+            or detail.startswith((b"dial tcp: ", b"dial tcp "))):
         return "transport"
     return "unknown"
 
@@ -263,7 +268,7 @@ def copy(tool, args, env, work, image):
             return
         category, signals = outcome
         pause = COPY_BACKOFF[attempt - 1] if attempt < COPY_ATTEMPTS else 0
-        if category in TRANSIENT and attempt < COPY_ATTEMPTS and deadline - time.monotonic() > pause + 1:
+        if category in TRANSIENT and attempt < COPY_ATTEMPTS and deadline - time.monotonic() >= pause + MIN_ATTEMPT:
             print(f"oci-stage: copy attempt {attempt} of {COPY_ATTEMPTS} failed ({category}) "
                   f"[{signals}]; retrying in {pause} s", file=sys.stderr)
             wait(pause)
