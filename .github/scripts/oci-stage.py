@@ -56,6 +56,19 @@ COPY_BACKOFF = (10, 30)
 COPY_BUDGET = 600
 # A retry is made only if this much of the budget is left after its pause.
 MIN_ATTEMPT = 60
+# Login is one token exchange. With the copy budget it stays inside the import
+# job's 15 minutes, which also covers checkout, downloads and validation.
+LOGIN_TIMEOUT = 120
+# A failure is retried only if nothing in its report says it is not transient:
+# ORAS joins several OCI errors with "; " and may omit the HTTP status, so a
+# rate limit can be reported together with a denial or a content error.
+TERMINAL = re.compile(
+    rb"(?:^|[:;] )(?:unauthorized|denied|blob unknown|blob upload invalid|blob upload unknown|"
+    rb"digest invalid|manifest blob unknown|manifest invalid|manifest unknown|name invalid|"
+    rb"name unknown|size invalid|unsupported): |failed to verify certificate|"
+    rb'": response status code 4(?!29)[0-9]{2}\b',
+    re.MULTILINE,
+)
 TRANSIENT = {"registry-server", "registry-rate-limit", "transport"}
 # The diagnostic of a failed copy is built only from these fixed words, numbers
 # and the match of a fixed alternation: never URL paths, queries, headers, tokens
@@ -66,7 +79,8 @@ OCI_CODE = re.compile(
     rb"manifest invalid|manifest unknown|name invalid|name unknown|size invalid|unauthorized|denied|"
     rb"unsupported|toomanyrequests|unknown): "
 )
-REQUEST = re.compile(rb'\b(GET|HEAD|POST|PATCH|PUT|DELETE) "https?://([^/"\s]+)(/[^"\s]*)?"', re.IGNORECASE)
+REQUEST = re.compile(rb'\b(GET|HEAD|POST|PATCH|PUT|DELETE) "https?://([^/"\s?]+)(/[^"\s?]*)?(?:\?[^"\s]*)?"', re.IGNORECASE)
+STATUS = re.compile(rb'"https?://[^"\s]+": response status code ([1-5][0-9]{2}): ')
 TRANSPORT_MARKERS = (
     ("unexpected-eof", b"unexpected EOF"),
     ("eof", b": EOF"),
@@ -211,14 +225,28 @@ def path_kind(path):
     return "other"
 
 
+def read_report(stderr):
+    """The first DIAGNOSTIC_BYTES of stderr, cut back to whole lines, and whether it was cut."""
+    stderr.seek(0)
+    report = stderr.read(DIAGNOSTIC_BYTES + 1)
+    if len(report) <= DIAGNOSTIC_BYTES:
+        return report, False
+    whole = report[:DIAGNOSTIC_BYTES]
+    return whole[: whole.rfind(b"\n") + 1], True
+
+
+def terminal(stderr):
+    report, _ = read_report(stderr)
+    return TERMINAL.search(report) is not None
+
+
 def copy_signals(stderr):
     """What the copy's stderr says, in fixed words: status, OCI error code, request,
     registry host class, transport markers and size. Safe to print."""
-    stderr.seek(0)
-    report = stderr.read(DIAGNOSTIC_BYTES + 1)
-    cut = len(report) > DIAGNOSTIC_BYTES
-    report = report[:DIAGNOSTIC_BYTES]
-    status = re.search(rb"response status code ([1-5][0-9]{2})\b", report)
+    report, cut = read_report(stderr)
+    # The status only from a request record (`"<url>": response status code NNN: `),
+    # never from message text.
+    status = STATUS.search(report)
     code = next((m[1] for m in (OCI_CODE.match(line) for line in report.split(b"\n")) if m), None)
     request = REQUEST.search(report)
     if request:
@@ -235,24 +263,26 @@ def copy_signals(stderr):
 
 
 def attempt_copy(tool, args, env, work, image, timeout):
-    """None on success, else (category, signals) of one copy attempt."""
+    """None on success, else (category, signals, retryable) of one copy attempt."""
     signals = "status none; oci-code none; request none; host none; transport none; stderr 0 lines"
     try:
         with tempfile.TemporaryFile(dir=work) as err:
-            result = subprocess.run([str(tool), *args], input=b"", env=env, cwd=work,
-                                    stdout=subprocess.DEVNULL, stderr=err, timeout=timeout, check=False)
+            try:
+                result = subprocess.run([str(tool), *args], input=b"", env=env, cwd=work,
+                                        stdout=subprocess.DEVNULL, stderr=err, timeout=timeout, check=False)
+            except subprocess.TimeoutExpired:
+                return "deadline", copy_signals(err), False
             if result.returncode == 0:
                 return None
             signals = copy_signals(err)
             if result.returncode < 0:
-                return "signal", signals
+                return "signal", signals, False
             if result.returncode == 1:
-                return copy_failure_category(err, image), signals
-            return "unknown", signals
-    except subprocess.TimeoutExpired:
-        return "deadline", signals
+                category = copy_failure_category(err, image)
+                return category, signals, category in TRANSIENT and not terminal(err)
+            return "unknown", signals, False
     except (OSError, subprocess.SubprocessError):
-        return "execution", signals
+        return "execution", signals, False
 
 
 def wait(seconds):
@@ -263,15 +293,18 @@ def copy(tool, args, env, work, image):
     """Copy, retrying only a transient failure, within COPY_BUDGET seconds in all."""
     deadline = time.monotonic() + COPY_BUDGET
     for attempt in range(1, COPY_ATTEMPTS + 1):
-        outcome = attempt_copy(tool, args, env, work, image, max(1, deadline - time.monotonic()))
+        outcome = attempt_copy(tool, args, env, work, image, deadline - time.monotonic())
         if outcome is None:
             return
-        category, signals = outcome
+        category, signals, retryable = outcome
         pause = COPY_BACKOFF[attempt - 1] if attempt < COPY_ATTEMPTS else 0
-        if category in TRANSIENT and attempt < COPY_ATTEMPTS and deadline - time.monotonic() >= pause + MIN_ATTEMPT:
+        if retryable and attempt < COPY_ATTEMPTS and deadline - time.monotonic() >= pause + MIN_ATTEMPT:
             print(f"oci-stage: copy attempt {attempt} of {COPY_ATTEMPTS} failed ({category}) "
                   f"[{signals}]; retrying in {pause} s", file=sys.stderr)
             wait(pause)
+            # The pause may have run long: an attempt starts only with a minute left.
+            if deadline - time.monotonic() < MIN_ATTEMPT:
+                raise Refusal(f"copy failed ({category}) [attempt {attempt} of {COPY_ATTEMPTS}; {signals}]")
             continue
         raise Refusal(f"copy failed ({category}) [attempt {attempt} of {COPY_ATTEMPTS}; {signals}]")
 
@@ -282,7 +315,7 @@ def run(tool, args, env, work, reason, password=b""):
         # large child output never has to be buffered in memory.
         with tempfile.TemporaryFile(dir=work) as err:
             result = subprocess.run([str(tool), *args], input=password, env=env,
-                                    cwd=work, stdout=subprocess.DEVNULL, stderr=err, timeout=600,
+                                    cwd=work, stdout=subprocess.DEVNULL, stderr=err, timeout=LOGIN_TIMEOUT,
                                     check=False)
             if result.returncode == 0:
                 return

@@ -24,10 +24,11 @@ IMAGE = "ghcr.io/bitop-dev/open-model-gateway"
 COMMIT = "9b1fc815f6b7fba743f08b9b5c5846639cc11d3c"
 TOKEN = "fixture-private-token"
 TRANSIENT = {"registry-server", "registry-rate-limit", "transport"}
+MARKERS = "|".join(['unexpected-eof', 'eof', 'connection-reset', 'broken-pipe', 'io-timeout', 'tls-handshake-timeout', 'context-deadline', 'client-timeout', 'no-such-host', 'connection-refused', 'http2-goaway', 'closed-connection'])
 # The fixed shape of a failed copy's last line (#711): the category, the attempt, and
 # signals made only of fixed words and numbers.
 SIGNALS = (r"status (?:none|[1-5][0-9]{2}); oci-code [a-z-]+; request (?:none|[A-Z]+ [a-z-]+); "
-           r"host (?:none|ghcr\.io|other); transport [a-z0-9,-]+; stderr [0-9]+ lines(?: \(first 4096 bytes\))?")
+           r"host (?:none|ghcr\.io|other); transport (?:none|(?:" + MARKERS + r")(?:,(?:" + MARKERS + r"))*); stderr [0-9]+ lines(?: \(first 4096 bytes\))?")
 
 
 def copy_failed(category, attempt):
@@ -404,8 +405,8 @@ if kind == 'login':
                 self.assertEqual(self.sleeps, sleeps)
                 lines = err.splitlines()
                 self.assertEqual(len(lines), failures)
-                for attempt, line in enumerate(lines, 1):
-                    self.assertRegex(line, rf"^oci-stage: copy attempt {attempt} of 3 failed \(registry-server\) \[{SIGNALS}\]; retrying in [0-9]+ s$")
+                for attempt, (line, pause) in enumerate(zip(lines, (10, 30)), 1):
+                    self.assertRegex(line, rf"^oci-stage: copy attempt {attempt} of 3 failed \(registry-server\) \[{SIGNALS}\]; retrying in {pause} s$")
                 copies = [r for r in self.records() if r["argv"][0] == "cp"]
                 self.assertEqual(len(copies), failures + 1)
                 # Every attempt copies the same verified archive by the same root digest.
@@ -459,6 +460,57 @@ if kind == 'login':
                     code, _, _ = self.invoke()
                 self.assertEqual(code == 0, retried)
                 self.assertEqual(self.sleeps, [10] if retried else [])
+
+    def test_a_rate_limit_reported_with_a_denial_or_content_error_is_not_retried(self):
+        for detail in (b"toomanyrequests: slow; denied: forbidden", b"toomanyrequests: slow; digest invalid: wrong bytes",
+                       b'POST "https://ghcr.io/v2/a/blobs/uploads/": response status code 429: x; unauthorized: no'):
+            for prefix in (self.DESTINATION, b"Error response from registry: "):
+                with self.subTest(detail=detail, prefix=prefix):
+                    self.log.unlink(missing_ok=True)
+                    self.sleeps.clear()
+                    self.install_tool(fail="cp", diagnostic=prefix + detail + b"\n")
+                    code, _, err = self.invoke()
+                    self.assertEqual(code, 1)
+                    self.assertEqual(sum(1 for r in self.records() if r["argv"][0] == "cp"), 1, err)
+                    self.assertEqual(self.sleeps, [])
+
+    def test_signals_come_from_request_records_only(self):
+        cases = (
+            (self.DESTINATION + b"denied: xresponse status code 503-opaque", "status none"),
+            (self.DESTINATION + b'GET "https://ghcr.io/v2/a/blobs/sha256:1?next=/manifests/x": EOF', "request GET blob"),
+            (self.DESTINATION + b'GET "https://ghcr.io/v2/?x=/token": EOF', "request GET registry-root"),
+        )
+        for stderr, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertIn(expected, self.api.copy_signals(io.BytesIO(stderr + b"\n")))
+        # A report over 4096 bytes is read only to its last whole line.
+        long = b"y" * 4090 + b"\n" + self.DESTINATION + b'PUT "https://ghcr.io/v2/a/manifests/b": EOF\n'
+        signals = self.api.copy_signals(io.BytesIO(long))
+        self.assertIn("request none", signals)
+        self.assertTrue(signals.endswith("stderr 1 lines (first 4096 bytes)"), signals)
+
+    def test_a_timed_out_attempt_reports_what_it_wrote(self):
+        def slow(args, **kwargs):
+            kwargs["stderr"].write(self.DESTINATION + b'PUT "https://ghcr.io/v2/a/blobs/uploads/x": EOF\n')
+            raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+        with mock.patch.object(self.api.subprocess, "run", side_effect=slow):
+            category, signals, retryable = self.api.attempt_copy(self.tool, [], {}, self.base, IMAGE, 60)
+        self.assertEqual((category, retryable), ("deadline", False))
+        self.assertIn("request PUT blob-upload; host ghcr.io; transport eof; stderr 1 lines", signals)
+
+    def test_no_attempt_starts_with_less_than_a_minute_left_after_a_long_pause(self):
+        stderr, _, _ = self.ORAS_OUTPUT["503 without a body"]
+        self.install_tool(diagnostic=stderr + b"\n", cp_failures=1)
+        # 500 s left before the pause; after it overruns, 45 s left: no second attempt.
+        clock = iter([0.0, 0.0, 100.0, 555.0, 555.0, 555.0])
+        with mock.patch.object(self.api.time, "monotonic", side_effect=lambda: next(clock)):
+            code, out, err = self.invoke()
+        self.assertEqual((code, out), (1, ""))
+        announced, final = err.splitlines()
+        self.assertTrue(announced.endswith("; retrying in 10 s"), announced)
+        self.assertRegex(final, f"^{copy_failed('registry-server', 1)}$")
+        self.assertEqual(sum(1 for r in self.records() if r["argv"][0] == "cp"), 1)
+        self.assertEqual(self.sleeps, [10])
 
     def test_login_and_copy_timeouts_are_bounded_redacted_and_cleaned(self):
         run = subprocess.run
