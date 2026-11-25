@@ -1,7 +1,7 @@
 //! A provider answer is charged once across either side of the result commit.
 use super::*;
 use super::{
-    fence::{REACH, lapse, start},
+    fence::{REACH, start, start_replacement},
     http_support::{Resolver, Server, client},
 };
 use crate::jobs::schedule::claims::RetryCommitFault;
@@ -517,9 +517,11 @@ async fn run_case(pool: PgPool, case: Case) {
             child.kill().await.unwrap();
             assert!(!child.wait().await.unwrap().success());
         }
-        lapse(&w, &job).await;
-        let owner = start(&w);
-        tokio::time::timeout(Duration::from_secs(10), async {
+        // The replacement claims as the runner loop does (`start_replacement`):
+        // the old runner of a takeover still renews, and a claim skips a job
+        // row another transaction holds.
+        let owner = start_replacement(&w, &job, w.jobs.clone());
+        tokio::time::timeout(REACH, async {
             while sqlx::query_scalar::<_, i64>("SELECT runner_epoch FROM async_jobs WHERE id=$1")
                 .bind(job.id)
                 .fetch_one(&w.f.store.pool)
@@ -1304,8 +1306,9 @@ async fn check_backoff_retry(
 
 #[dbtest::test]
 async fn a_takeover_keeps_the_pending_provider_call_in_route_capacity(pool: PgPool) {
+    // The replacement's claim alone may take REACH.
     tokio::time::timeout(
-        Duration::from_secs(30),
+        REACH + Duration::from_secs(30),
         run_case(pool, Case::CapacityTakeover(Loss::Takeover)),
     )
     .await
@@ -1314,8 +1317,9 @@ async fn a_takeover_keeps_the_pending_provider_call_in_route_capacity(pool: PgPo
 
 #[dbtest::test]
 async fn lease_recovery_releases_a_crashed_runners_route_slot(pool: PgPool) {
+    // The replacement's claim alone may take REACH.
     tokio::time::timeout(
-        Duration::from_secs(30),
+        REACH + Duration::from_secs(30),
         run_case(pool, Case::CapacityTakeover(Loss::Crash)),
     )
     .await
@@ -1333,8 +1337,10 @@ async fn check_takeover_capacity(
     while calls.load(Ordering::SeqCst) == 0 {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    lapse(w, job).await;
-    let owner = start(w);
+    // The old runner still renews its lease, and a claim skips a job row
+    // another transaction holds: the replacement claims as the runner loop
+    // does (`start_replacement`), within REACH.
+    let owner = start_replacement(w, job, w.jobs.clone());
     loop {
         assert_eq!(
             calls.load(Ordering::SeqCst),

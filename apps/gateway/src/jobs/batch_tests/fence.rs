@@ -57,7 +57,7 @@ fn flushing_after(w: &World, age: Duration) -> Jobs {
 /// (`claim_gateway` takes `FOR UPDATE SKIP LOCKED`), and the loop claims
 /// again on its next tick. So an empty claim is retried, for at most
 /// [`REACH`]; a run that claimed returns its own result.
-fn start_replacement(
+pub(super) fn start_replacement(
     w: &World,
     job: &JobRow,
     jobs: Jobs,
