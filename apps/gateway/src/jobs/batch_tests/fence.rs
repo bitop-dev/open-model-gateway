@@ -34,15 +34,15 @@ pub(super) fn start(w: &World) -> tokio::task::JoinHandle<JobResult<bool>> {
     tokio::spawn(async move { runner.run_next().await })
 }
 
-/// A replacement runner taking `job` over from a runner that stopped
-/// renewing, as the runner's loop runs it. Before each claim the lease is
-/// lapsed again ([`lapse`]): the old runner still renews on its own schedule
-/// here, and a renewal that lands before a claim would otherwise extend the
-/// lease (a renewal after the claim is refused: the epoch moved on). A claim
-/// also skips a batch whose job row another transaction holds at that moment
-/// (`claim_gateway` takes `FOR UPDATE SKIP LOCKED`), and the loop claims again
-/// on its next tick. So this claims again until it has the batch, within
-/// [`REACH`].
+/// A replacement runner taking `job` over, as the runner's loop runs it. The
+/// tests simulate the lease's expiry while the old runner still renews on its
+/// own schedule, so before each claim the lease is lapsed again ([`lapse`]):
+/// a renewal that lands before a claim would otherwise extend the lease (one
+/// after the claim is refused: the epoch moved on). A claim also skips a
+/// batch whose job row another transaction holds at that moment
+/// (`claim_gateway` takes `FOR UPDATE SKIP LOCKED`), and the loop claims
+/// again on its next tick. So an empty claim is retried, for at most
+/// [`REACH`]; a run that claimed returns its own result.
 fn start_replacement(
     w: &World,
     job: &JobRow,
@@ -182,8 +182,9 @@ async fn a_runner_that_lost_the_batch_cannot_change_a_batch_the_new_owner_finish
     );
     // The refused outcome is logged once, with ids only, so the charged line
     // can be attributed. Any other event naming the execution must be one of
-    // the advisory events listed here: its routing-health write that outlived
-    // its 250 ms timeout (`ExecutionGuard::finish`) is logged with the same id.
+    // the advisory events listed here: a routing-health write of its attempt
+    // that failed or outlived its 250 ms timeout (`ExecutionGuard::finish`) is
+    // logged with the same id.
     const NOT_RECORDED: &str =
         "batch line outcome not recorded: the runner no longer holds the batch";
     const ADVISORY: [&str; 1] = ["routing health update failed"];
@@ -204,17 +205,10 @@ async fn a_runner_that_lost_the_batch_cannot_change_a_batch_the_new_owner_finish
         .filter(|e| e["fields"]["message"] == NOT_RECORDED)
         .collect();
     assert_eq!(refused.len(), 1, "{text}");
-    let mut fields: Vec<&str> = refused[0]["fields"]
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(String::as_str)
-        .collect();
-    fields.sort_unstable();
     assert_eq!(
-        fields,
-        ["execution_id", "line", "message"],
-        "ids only: {text}"
+        refused[0]["fields"],
+        json!({"message": NOT_RECORDED, "execution_id": execution.to_string(), "line": 0}),
+        "ids only, of this execution and line: {text}"
     );
     for event in &events {
         let message = event["fields"]["message"].as_str().unwrap_or_default();
@@ -914,8 +908,13 @@ async fn a_takeover_between_the_result_files_and_finishing_leaves_no_duplicate_f
     w.jobs.finalize_hold.arm();
     let old = start(&w);
     w.jobs.finalize_hold.reached().await;
-    lapse(&w, &job).await;
-    assert!(Runner::new(w.jobs.clone()).run_next().await.unwrap());
+    // The old runner still renews while its finalization is held.
+    assert!(
+        start_replacement(&w, &job, w.jobs.clone())
+            .await
+            .unwrap()
+            .unwrap()
+    );
     let done = w.reload(&job).await;
     assert_eq!(done.state, "completed");
     let files = live_files(&w).await;
