@@ -8,13 +8,16 @@
 //!   not exist yet (a period boundary, at its widest: every period at once)
 //!   against the same bursts on rows that exist. Every admission locks the
 //!   same rows either way (`omg_lock_scope_rows`); the question is whether
-//!   creating them adds a stall of its own.
+//!   creating them adds a stall of its own. It measures how long admissions
+//!   take, so it runs with an admission bound longer than any burst; it
+//!   prints the server's commit latency, the first burst of the process and,
+//!   per burst, how many requests took longer than the production bound.
 //! - [`steady_load_recovers_after_a_stall`]: steady open-loop load on one
 //!   scope, a held lock on its hot totals row for longer than the settlement
-//!   deadline (asserted to hold the row and to delay the requests sent into
-//!   it), then release: throughput and latency must return to the
-//!   pre-stall level within a bounded time, the settlement gate must drain,
-//!   and the accounting must stay exact.
+//!   deadline (asserted to hold the row; the requests sent into it must be
+//!   shed by the production admission bound), then release: throughput and
+//!   latency must return to the pre-stall level within a bounded time, the
+//!   settlement gate must drain, and the accounting must stay exact.
 //!
 //! The database is local, so its commits are fast; the cluster's were slow
 //! (synchronous standby, WAL). [`slow_commits`] adds a fixed delay at commit
@@ -180,7 +183,16 @@ async fn runtime_pool(options: &sqlx::postgres::PgConnectOptions) -> PgPool {
 /// On the scenario's runtime: an owner pool, the runtime pool of 10, an
 /// HTTP gateway on it and a mock OpenAI upstream that answers after
 /// `upstream_ms`.
-async fn harness(setup: Setup, upstream_ms: u64, replicas: usize) -> Harness {
+///
+/// `admission_lock_wait`: the production bound
+/// ([`crate::governance::ADMISSION_LOCK_WAIT`]) for a probe of the bound, or
+/// a longer one for a probe that measures how long admissions take.
+async fn harness(
+    setup: Setup,
+    upstream_ms: u64,
+    replicas: usize,
+    admission_lock_wait: Duration,
+) -> Harness {
     let options = setup.options;
     let owner = PgPoolOptions::new()
         .max_connections(3)
@@ -209,7 +221,7 @@ async fn harness(setup: Setup, upstream_ms: u64, replicas: usize) -> Harness {
         )
         .await
         .unwrap();
-    let store = Store::new(runtime.clone());
+    let store = Store::new(runtime.clone()).with_admission_lock_wait(admission_lock_wait);
     assert_eq!(store.admission_mode(), locks::AdmissionMode::Scoped);
     let calls = Arc::new(AtomicUsize::new(0));
     let counted = calls.clone();
@@ -251,7 +263,7 @@ async fn harness(setup: Setup, upstream_ms: u64, replicas: usize) -> Harness {
     // More replicas: each its own pool of 10, gates and engine, as `serve`.
     for _ in 1..replicas {
         let pool = runtime_pool(&options).await;
-        let replica = Store::new(pool.clone());
+        let replica = Store::new(pool.clone()).with_admission_lock_wait(admission_lock_wait);
         let engine = Engine::new(
             Arc::new(replica.clone()),
             registry.clone(),
@@ -518,11 +530,24 @@ async fn cold_bucket_admission_contention(owner: PgPool) {
     on_multi_thread(cold_buckets(setup)).await;
 }
 async fn cold_buckets(setup: Setup) {
-    let h = harness(setup, 0, 1).await;
+    // A probe of how long admissions on missing and existing rows take, so
+    // with a bound longer than any burst (its orchestration guard): the
+    // production bound would cut the slowest latencies off at 1.5 s and hide
+    // what is compared. It therefore does not show whether the production
+    // bound would shed a burst; how many requests took longer than that
+    // bound is printed per burst instead, a measurement of the runner.
+    let h = harness(setup, 0, 1, GUARD).await;
+    commit_latency(&h.owner).await;
     // A discarded first burst on a scope of its own: the first burst of a
     // process also opens connections and prepares statements.
     let (_, first) = new_scope(&h).await;
-    burst(&h, &first, BURST).await;
+    let (mut latencies, _) = burst(&h, &first, BURST).await;
+    eprintln!(
+        "lock_stall cold_bucket round=first requests={BURST} p50_ms={} max_ms={} latency_over_admission_bound={}",
+        ms(quantile(&mut latencies, 0.5)),
+        ms(quantile(&mut latencies, 1.0)),
+        over_bound(&latencies)
+    );
     let (_, warm_key) = new_scope(&h).await;
     // Warm: its rows exist after one request.
     burst(&h, &warm_key, 1).await;
@@ -543,9 +568,10 @@ async fn cold_buckets(setup: Setup) {
         {
             let (p50, max) = (quantile(&mut latencies, 0.5), quantile(&mut latencies, 1.0));
             eprintln!(
-                "lock_stall cold_bucket round={round} buckets={label} requests={BURST} p50_ms={} max_ms={} most_lock_waiters={most} samples_waiting_at_scope_rows={at_rows} samples_waiting={any} samples={samples}",
+                "lock_stall cold_bucket round={round} buckets={label} requests={BURST} p50_ms={} max_ms={} latency_over_admission_bound={} most_lock_waiters={most} samples_waiting_at_scope_rows={at_rows} samples_waiting={any} samples={samples}",
                 ms(p50),
-                ms(max)
+                ms(max),
+                over_bound(&latencies)
             );
             into.0.push(p50);
             into.1.push(max);
@@ -579,6 +605,47 @@ async fn cold_buckets(setup: Setup) {
         (settled, unknown),
         ((BURST + 1 + 2 * ROUNDS * BURST) as i64, 0),
         "every burst request settled"
+    );
+}
+
+/// Requests of a burst whose whole latency exceeded the production admission
+/// bound. Their admission wait (from the admission gate to the row locks) is
+/// part of that latency, so this is an upper bound on how many the bound
+/// would have shed (`scope_busy`) on this runner.
+fn over_bound(latencies: &[Duration]) -> usize {
+    latencies
+        .iter()
+        .filter(|l| **l > ADMISSION_LOCK_WAIT)
+        .count()
+}
+
+/// The server's commit latency, measured before the bursts: single-row
+/// commits of a logged table (each one waits for its WAL flush), printed as
+/// p50 and maximum of 50. Admissions on one scope serialize on its rows, so
+/// a burst's slowest wait grows with this.
+async fn commit_latency(owner: &PgPool) {
+    sqlx::query("CREATE TABLE omg_test_commit_latency(n integer)")
+        .execute(owner)
+        .await
+        .unwrap();
+    let mut latencies = Vec::new();
+    for n in 0..50 {
+        let start = Instant::now();
+        sqlx::query("INSERT INTO omg_test_commit_latency VALUES ($1)")
+            .bind(n)
+            .execute(owner)
+            .await
+            .unwrap();
+        latencies.push(start.elapsed());
+    }
+    sqlx::query("DROP TABLE omg_test_commit_latency")
+        .execute(owner)
+        .await
+        .unwrap();
+    eprintln!(
+        "lock_stall commit_latency commits=50 p50_us={} max_us={}",
+        quantile(&mut latencies, 0.5).as_micros(),
+        quantile(&mut latencies, 1.0).as_micros()
     );
 }
 
@@ -652,7 +719,13 @@ impl Knobs {
 
 async fn stall_recovery(setup: Setup) {
     let knobs = Knobs::from_env();
-    let h = harness(setup, knobs.upstream_ms, knobs.replicas).await;
+    let h = harness(
+        setup,
+        knobs.upstream_ms,
+        knobs.replicas,
+        ADMISSION_LOCK_WAIT,
+    )
+    .await;
     let (ws, key) = prepare(&h, &knobs).await;
     let run = offer(&h, ws, &key, knobs.rate, knobs.stall).await;
     let rows = windows(&run);
