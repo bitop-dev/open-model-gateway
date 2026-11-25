@@ -35,8 +35,11 @@ pub(crate) const WINDOW: Duration = Duration::from_secs(30);
 const INTERVAL: Duration = Duration::from_secs(1);
 
 /// PgBouncer's cached server-login failure (see the module documentation):
-/// the cause it cached ("connect failed", or PostgreSQL's own message,
-/// at most 128 bytes): no credential, no address.
+/// the cause it cached ("connect failed", or PostgreSQL's own message, at
+/// most 128 bytes). It never holds a password, but PostgreSQL's message can
+/// name a client address, the role and the database (a `pg_hba` refusal
+/// does): the same text `serve` prints when it stops with that error, so
+/// logging it while waiting discloses nothing more.
 fn cached_reason(error: &sqlx::Error) -> Option<&str> {
     let sqlx::Error::Database(e) = error else {
         return None;
