@@ -81,7 +81,8 @@ export type PolicyResponse = { policy: Policy; effective: Policy; provenance: { 
 /** Bytes counted against a workspace's storage quota (live files plus uploads in progress); null quota = no cap. */
 export type StorageUse = { quota_bytes: number | null; used_bytes: number | null; usage_visible?: boolean };
 export type ModelRouting = { strategy: "priority" | "weighted"; max_attempts: number; allow_ambiguous_failover: boolean; required_residency: string | null };
-export type DeploymentRouting = { routing: { priority: number; weight: number; residency: string | null; failure_threshold: number; cooldown_seconds: number }; health: { consecutive_failures: number; open_until: string | null; last_observed_at?: string | null } };
+export type RouteHealth = { consecutive_failures: number; open_until: string | null; last_observed_at: string | null; circuit: "closed" | "open" | "half_open"; cooling_until: string | null; probe_in_progress: boolean; probe_until: string | null; reopen_count: number; observation: "none" | "stale" | "current"; as_of: string };
+export type DeploymentRouting = { routing: { priority: number; weight: number; residency: string | null; failure_threshold: number; cooldown_seconds: number }; health: RouteHealth };
 export type CostSummary = { currency: "USD"; known_cost_microusd: string; held_microusd: string; unknown_cost_requests: number; requests: number };
 export type BillingUsage = { total_input_tokens: string | null; uncached_input_tokens: string | null; cache_read_input_tokens: string | null; cache_write_input_tokens: string | null; cache_write_default_input_tokens: string | null; cache_write_5m_input_tokens: string | null; cache_write_1h_input_tokens: string | null };
 export type CostComponents = { uncached_input_microusd: string; cache_read_microusd: string; cache_write_default_microusd: string; cache_write_5m_microusd: string; cache_write_1h_microusd: string; output_microusd: string };
@@ -262,8 +263,25 @@ export function canReconcile(cost: Cost): boolean {
 export function residencyError(value: string): string | undefined {
   return /^[a-z0-9][a-z0-9._-]{0,63}$/.test(value) ? undefined : "Use 1–64 lowercase letters, digits, dots, underscores or hyphens; start with a letter or digit.";
 }
-export function passiveHealth(health: DeploymentRouting["health"]): string {
-  if (!health.last_observed_at) return "Unknown · no recorded observation";
-  if (health.open_until && Date.parse(health.open_until) > Date.now()) return "Cooldown · passive observation";
-  return `${health.consecutive_failures} consecutive observed failures`;
+/** A route with no observation for this long reads as stale (`routing::HEALTH_STALE_AFTER_SECONDS`). */
+export const HEALTH_STALE_AFTER_MINUTES = 10;
+export type RouteHealthView = {
+  /** The route's state in words, read at a glance (never colour alone). */
+  state: string;
+  /** The time that state ends, with its label: the cooldown, or the probe's slot. */
+  until: { label: string; value: string } | null;
+  /** The backoff the openings so far imply, when there were any. */
+  backoff: string | null;
+};
+/** A route's health as the gateway computed it at `as_of`: no client clock is involved. */
+export function routeHealth(health: RouteHealth): RouteHealthView {
+  const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? "" : "s"}`;
+  const backoff = health.reopen_count > 0 ? `Opened ${plural(health.reopen_count, "time")} since its last complete success; each opening doubles the next cooldown, up to 300 seconds (or the cooldown, if longer).` : null;
+  if (health.circuit === "open") return { state: "Cooling down · left out of routing", until: health.cooling_until ? { label: "Cooling until", value: health.cooling_until } : null, backoff };
+  if (health.circuit === "half_open") return health.probe_in_progress
+    ? { state: "Half-open · one request is testing it", until: health.probe_until ? { label: "Test ends by", value: health.probe_until } : null, backoff }
+    : { state: "Half-open · waiting for a request to test it", until: null, backoff };
+  if (health.observation === "none") return { state: "Unknown · no traffic observed yet", until: null, backoff };
+  if (health.observation === "stale") return { state: `Unknown lately · no traffic observed for over ${HEALTH_STALE_AFTER_MINUTES} minutes`, until: null, backoff };
+  return { state: health.consecutive_failures > 0 ? `Closed · ${plural(health.consecutive_failures, "consecutive observed failure")}` : "Closed · no recent failures", until: null, backoff };
 }

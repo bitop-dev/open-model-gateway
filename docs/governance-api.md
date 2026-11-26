@@ -273,7 +273,7 @@ If a meter with prompt-size tiers has an unknown base or tier rate, the draft st
 {"strategy":"priority","max_attempts":1,"allow_ambiguous_failover":false,"required_residency":null}
 ```
 
-`GET/PUT /platform/deployments/{deployment}/routing`: GET `{routing:...,health:{consecutive_failures,open_until,last_observed_at,circuit,cooling_until,probe_in_progress,probe_until,reopen_count,observation,as_of}}` (the health fields are described in [routing](routing.md#management-health)); PUT inner fields:
+`GET/PUT /platform/deployments/{deployment}/routing`: GET `{routing:...,health:{consecutive_failures,open_until,last_observed_at,circuit,cooling_until,probe_in_progress,probe_until,reopen_count,observation,as_of}}` (the health fields are described in [routing](routing.md#management-health): the circuit and probe as they are at `as_of`, and `observation` `stale` once a route has had no observation for 600 s, a fixed window); PUT inner fields:
 
 ```json
 {"priority":0,"weight":1,"residency":null,"failure_threshold":3,"cooldown_seconds":30}
