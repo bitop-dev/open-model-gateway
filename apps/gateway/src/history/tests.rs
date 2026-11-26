@@ -452,7 +452,7 @@ async fn concurrent_admissions_lock_no_parent_rows(pool: PgPool) {
     assert!(report.consistent(), "{report:#?}");
 }
 
-/// Guardrail decisions (0094) lock no authority row either: overlapping
+/// Guardrail decisions (0095) lock no authority row either: overlapping
 /// event inserts, held open, and a burst through the engine's writer leave
 /// every workspace and key tuple's `t_xmax` unchanged; a key of another
 /// workspace is still refused (23503).

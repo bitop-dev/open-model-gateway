@@ -133,7 +133,7 @@ const ENTERPRISE_RELATIONS: &[&str] = &[
     // 0092 guardrails
     "guardrail_rule_sets",
     "guardrail_rules",
-    // 0094 guardrail decisions (its month partitions: PARTITIONED_RELATIONS)
+    // 0095 guardrail decisions (its month partitions: PARTITIONED_RELATIONS)
     "guardrail_events",
     "installation_settings",
     // 0011 alerts

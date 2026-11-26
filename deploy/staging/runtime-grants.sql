@@ -234,7 +234,7 @@ GRANT SELECT ON public.guardrail_rule_sets,public.guardrail_rules TO gateway_run
 GRANT INSERT(id,layer,kind,workspace_id,local_only,updated_by),UPDATE(revision,local_only,updated_by),DELETE ON public.guardrail_rule_sets TO gateway_runtime;
 GRANT INSERT(id,rule_set_id,position,tightens_rule_id,name,protection,detector_kind,detector_ref,categories,input_action,redact_scope,output_mode,threshold,on_error,timeout_ms,workloads,uninspectable,patterns),DELETE ON public.guardrail_rules TO gateway_runtime;
 GRANT EXECUTE ON FUNCTION public.guardrail_patterns_valid(text[]) TO gateway_runtime;
--- Guardrail decisions (0094): appended by the engine, read by Logs; never
+-- Guardrail decisions (0095): appended by the engine, read by Logs; never
 -- changed or removed (append-only history, archived by the owner).
 GRANT SELECT,INSERT(id,root_request_id,workspace_id,api_key_id,operation,model,streamed,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,tightened,omitted) ON public.guardrail_events TO gateway_runtime;
 -- Installation spend rules (0026) edit their period and reference amount.

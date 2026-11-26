@@ -1208,7 +1208,7 @@ BEGIN
   DELETE FROM guardrail_rules WHERE rule_set_id=go;
   DELETE FROM guardrail_rule_sets WHERE id=go;
  END;
- -- Guardrail decisions (0094): appended as runtime, never changed, removed or
+ -- Guardrail decisions (0095): appended as runtime, never changed, removed or
  -- back-dated, and scoped to the key's own workspace.
  INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count)
   VALUES(gen_random_uuid(),gen_random_uuid(),ws,k,'chat_completions','probe-model','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','secret','blocked',1);
