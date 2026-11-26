@@ -221,3 +221,85 @@ async fn a_drained_route_takes_no_new_attempt_and_stays_listed(pool: PgPool) {
     assert!(served);
     assert_eq!(hits.load(Ordering::SeqCst), 2);
 }
+
+/// Two routes; the first drained after this replica read its health (as
+/// another replica's planning may still see it for up to `HEALTH_TTL`). The
+/// plan names the first, admission refuses it, and the second serves the
+/// request as its one attempt: nothing reaches the drained route.
+#[dbtest::test]
+async fn a_route_drained_after_the_plan_is_passed_over_and_the_next_serves(pool: PgPool) {
+    let mut f = fixture(pool.clone()).await;
+    let token = issue_key(&mut f).await;
+    sqlx::query("UPDATE deployments SET enabled=false WHERE model_id=$1")
+        .bind(f.model)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let (mock_base, _mock) = serve(upstream(hits.clone())).await;
+    let first = add_deployment(&f, "openai", "env:OMG_DRAIN_TEST_KEY", None, "first", 0).await;
+    let second = add_deployment(&f, "openai", "env:OMG_DRAIN_TEST_KEY", None, "second", 1).await;
+    for (deployment, priority) in [(first, 0), (second, 1)] {
+        sqlx::query("INSERT INTO deployment_routing(deployment_id,priority) VALUES($1,$2)")
+            .bind(deployment)
+            .bind(priority)
+            .execute(&f.store.pool)
+            .await
+            .unwrap();
+    }
+    let store = Store::new(f.store.pool.clone());
+    store.caches.versions.enable();
+    let mut registry = ProviderRegistry::default();
+    registry
+        .register(Arc::new(OpenAiAdapter::for_test(
+            Arc::new(Resolves),
+            format!("{mock_base}/v1"),
+        )))
+        .unwrap();
+    let engine = Engine::new(Arc::new(store.clone()), registry, EngineLimits::default()).unwrap();
+    let (base, _server) = serve(crate::http::router_with_engine(store.clone(), None, engine)).await;
+    // Health of both read before the drain, still fresh on this replica.
+    let fresh = |id| {
+        (
+            id,
+            crate::cache::HealthEntry {
+                loaded: std::time::Instant::now() + Duration::from_secs(3600),
+                open_until: None,
+                consecutive_failures: 0,
+                observed_age: Some(Duration::ZERO),
+                probe_until: None,
+                reopen_count: 0,
+                drained: false,
+                drain_until: None,
+            },
+        )
+    };
+    store.caches.store_health(vec![fresh(first), fresh(second)]);
+    sqlx::query("UPDATE deployments SET drain_reason='maintenance', drained_by=(SELECT id FROM users LIMIT 1), drained_at=clock_timestamp() WHERE id=$1")
+        .bind(first)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let response = http
+        .post(format!("{base}/v1/chat/completions"))
+        .bearer_auth(&token)
+        .json(&json!({"model":"company/smart","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let attempts: Vec<(uuid::Uuid, i32)> = sqlx::query_as(
+        "SELECT deployment_id, attempt_number FROM inference_executions WHERE deployment_id = ANY($1)",
+    )
+    .bind(vec![first, second])
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        attempts,
+        vec![(second, 1)],
+        "one attempt, on the second route"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "one upstream call");
+}

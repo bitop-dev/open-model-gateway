@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { markup } from "../lib/test-fixtures";
-import { drainUntil, drainView, type Drain } from "../lib/governance";
+import { drainEndDefault, drainRequestUntil, drainUntil, drainView, type Drain } from "../lib/governance";
 import { ConnectionDrainPanel, RouteDrain, connectionDrainPath, deploymentDrainPath } from "./route-drain";
 import { ActionProvider } from "./ui";
 
@@ -23,6 +23,16 @@ describe("a drain in words (#49)", () => {
     const ended = drainView(drain({ until: "2026-11-26T11:00:00Z", state: "ended" }));
     expect(ended.state).toBe("Drain ended · takes requests again");
     expect(ended.facts[0]).toEqual({ label: "Ended at", value: "2026-11-26T11:00:00Z", time: true });
+  });
+  it("keeps a time-limited drain's end when it is edited, unless another end is chosen", () => {
+    const limited = drain({ until: "2026-11-26T12:00:00Z" });
+    expect(drainEndDefault(limited)).toBe("keep");
+    expect(drainEndDefault(drain())).toBe("none");
+    expect(drainEndDefault(null)).toBe("none");
+    expect(drainEndDefault(drain({ until: "2026-11-26T09:00:00Z", state: "ended" }))).toBe("none");
+    expect(drainRequestUntil("keep", "", limited, "2026-11-26T10:00:00Z")).toBe("2026-11-26T12:00:00Z");
+    expect(drainRequestUntil("hours", "3", limited, "2026-11-26T10:00:00Z")).toBe("2026-11-26T13:00:00.000Z");
+    expect(drainRequestUntil("none", "3", limited, "2026-11-26T10:00:00Z")).toBeNull();
   });
   it("times a drain from the gateway's clock", () => {
     expect(drainUntil("2026-11-26T10:00:00Z", "")).toBeNull();

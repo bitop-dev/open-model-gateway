@@ -148,13 +148,22 @@ impl Jobs {
 
     #[cfg_attr(not(test), expect(clippy::too_many_lines, reason = "#499"))]
     async fn submit_native(&self, job: JobRow, fence: BatchFence) -> JobResult<()> {
+        // Too late to submit with the full completion window left (its route
+        // was drained, or unreachable, until now): it ends at zero, unsent.
+        match held(&fence, fence.expire_submission(&self.store).await)? {
+            None => return Ok(()),
+            Some(Some(ended)) => return self.settle_unsent(&ended).await,
+            Some(None) => {}
+        }
+        // The route before the claim: the one submission is claimed only for
+        // a route that serves now (not drained: `claim_submit`).
+        let (target, adapter) = self.target(&job).await?;
         if held(&fence, fence.claim_submit(&self.store).await)? != Some(true) {
             return Ok(());
         }
         let files = self.files()?.clone();
         let endpoint = job.endpoint().ok_or(InferenceError::Storage)?;
         let work = job.work_file_id.ok_or(InferenceError::Storage)?;
-        let (target, adapter) = self.target(&job).await?;
         let (tx, mut rx) =
             tokio::sync::mpsc::channel::<Result<axum::body::Bytes, InferenceError>>(8);
         let records: ByteStream = Box::pin(async_stream::stream! {
@@ -312,6 +321,19 @@ impl Jobs {
         )
         .await?;
         self.discard_work_file(&job).await;
+        Ok(())
+    }
+
+    /// A native batch ended before anything was submitted: its reservation
+    /// is settled at a known zero (as a never-submitted cancellation is).
+    async fn settle_unsent(&self, job: &JobRow) -> JobResult<()> {
+        count_finished(true, JobState::Failed);
+        let elapsed = (UtcInstant::now() - job.created_at)
+            .whole_milliseconds()
+            .max(0) as u64;
+        crate::governance::batch::close_batch(&self.store, job.execution_id, elapsed, true).await?;
+        store::mark_settled(&self.store, job.id).await?;
+        self.discard_work_file(job).await;
         Ok(())
     }
 

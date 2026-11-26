@@ -329,3 +329,15 @@ export function drainUntil(asOf: string, hours: string): string | null {
   if (!hours.trim()) return null;
   return new Date(Date.parse(asOf) + Number(hours) * 3_600_000).toISOString();
 }
+/** How a drain's end is chosen in its dialog: keep the current end, a number of hours from now, or none. */
+export type DrainEnd = "keep" | "hours" | "none";
+/** The choice a drain dialog starts with: an active drain keeps its end (with or without one); a new drain has none until chosen. */
+export function drainEndDefault(drain: Drain | null): DrainEnd {
+  return drain?.state === "active" && drain.until ? "keep" : "none";
+}
+/** The `until` a drain dialog sends: the kept end, `hours` from the gateway's `asOf`, or none. */
+export function drainRequestUntil(choice: string, hours: string, current: Drain | null, asOf: string): string | null {
+  if (choice === "keep") return current?.until ?? null;
+  if (choice === "hours") return drainUntil(asOf, hours);
+  return null;
+}

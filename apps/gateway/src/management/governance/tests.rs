@@ -660,6 +660,21 @@ mod db {
                 Some("drain_reason_invalid"),
             ),
             (
+                json!({"reason":"\u{3164}","until":null}),
+                400,
+                Some("drain_reason_invalid"),
+            ),
+            (
+                json!({"reason":"ok\u{E0041}x","until":null}),
+                400,
+                Some("drain_reason_invalid"),
+            ),
+            (
+                json!({"reason":"ok\u{FE0F}","until":null}),
+                400,
+                Some("drain_reason_invalid"),
+            ),
+            (
                 json!({"reason":"ok","until":"2000-01-01T00:00:00Z"}),
                 400,
                 Some("drain_until_invalid"),
@@ -746,7 +761,18 @@ mod db {
         );
         assert_eq!(actions[0].1["drain_reason"], reason);
         assert_eq!(actions[1].1["drain_reason"], "Back on Thursday");
-        assert!(actions[1].1["drain_until"].is_string());
+        let audited_until: bool =
+            sqlx::query_scalar("SELECT ($1::text)::timestamptz = ($2::text)::timestamptz")
+                .bind(actions[1].1["drain_until"].as_str())
+                .bind(&later)
+                .fetch_one(&f.store.pool)
+                .await
+                .unwrap();
+        assert!(
+            audited_until,
+            "the audited until is the one set: {:?}",
+            actions[1].1
+        );
         assert_eq!(actions[2].1["drain_reason"], "Back on Thursday");
         // A connection drain takes out each enabled route on it.
         let connection: Uuid =

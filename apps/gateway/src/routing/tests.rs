@@ -174,6 +174,16 @@ fn drained_routes_are_skipped_and_reported_only_when_nothing_else_serves() {
         order_candidates(&p, vec![drained(1, Some(5.0)), open], [0; 32], true),
         Err(InferenceError::RouteCoolingDown(5))
     );
+    // One route both drained (10 s) and open (300 s): it returns at the later.
+    let both = Candidate {
+        circuit_open: true,
+        cooldown_remaining_seconds: 300,
+        ..drained(4, Some(10.0))
+    };
+    assert_eq!(
+        order_candidates(&p, vec![both], [0; 32], true),
+        Err(InferenceError::RouteDrained(Some(300)))
+    );
 }
 #[test]
 fn cooling_route_outside_required_residency_is_not_a_retry_hint() {

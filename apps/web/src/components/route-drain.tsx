@@ -1,6 +1,6 @@
 import { api } from "../lib/api";
 import { detailTime } from "../lib/format";
-import { DRAIN_REASON_MAX, drainUntil, drainView, type ConnectionDrain, type DeploymentDrain, type Drain } from "../lib/governance";
+import { DRAIN_REASON_MAX, drainEndDefault, drainRequestUntil, drainView, type ConnectionDrain, type DeploymentDrain, type Drain } from "../lib/governance";
 import { Button, ErrorNotice, useAction, useApi } from "./ui";
 import { DescriptionList } from "./ui/description-list/description-list";
 import { Inline } from "./ui/layout/layout";
@@ -24,12 +24,13 @@ function DrainActions({ path, name, drain, asOf, noun }: { path: string; name: s
     successNotice: active ? "Drain changed." : `${noun[0].toUpperCase()}${noun.slice(1)} drained.`,
     fields: [
       { name: "reason", label: "Reason", type: "textarea", required: true, maxLength: DRAIN_REASON_MAX, value: active ? drain.reason : "", help: "Shown to admins and auditors and kept in the audit log; never shown to API clients." },
-      { name: "hours", label: "Ends after (hours)", type: "number", min: 1, max: 8784, value: "", help: "Leave empty to drain until someone ends it." },
+      { name: "end", label: "Ends", type: "select", required: true, value: drainEndDefault(drain), options: [...(active && drain.until ? [{ value: "keep", label: `Keep the current end (${detailTime(drain.until)})` }] : []), { value: "hours", label: "After a number of hours" }, { value: "none", label: "No end: until someone ends it" }] },
+      { name: "hours", label: "Ends after (hours)", type: "number", min: 1, max: 8784, value: "", requiredWhen: values => values.end === "hours", visibleWhen: values => values.end === "hours", help: "Counted from when you save." },
     ],
     // `until` is measured from the gateway's clock at submit, not at page load.
     run: async (values, signal) => {
-      const now = values.hours?.trim() ? (await api<{ as_of: string }>(path, { signal })).as_of : asOf;
-      return api(path, { method: "PUT", body: { reason: values.reason, until: drainUntil(now, values.hours ?? "") }, signal });
+      const now = values.end === "hours" ? (await api<{ as_of: string }>(path, { signal })).as_of : asOf;
+      return api(path, { method: "PUT", body: { reason: values.reason, until: drainRequestUntil(values.end ?? "none", values.hours ?? "", drain, now) }, signal });
     },
   });
   const end = () => ask({ title: `End drain · ${name}`, description: `The ${noun} takes new requests again at once.`, submitLabel: "End drain", successNotice: "Drain ended.", run: (_, signal) => api(path, { method: "DELETE", signal }) });

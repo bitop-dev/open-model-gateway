@@ -570,7 +570,17 @@ fn eligible_candidates(
     let drain_retry = candidates
         .iter()
         .filter(|c| c.drained)
-        .filter_map(|c| drain::retry_after(c.drain_ends_in))
+        // A drained route returns when its drain ends and, if its circuit is
+        // open too, its cooldown has passed: the later of the two.
+        .filter_map(|c| {
+            drain::retry_after(c.drain_ends_in.map(|ends| {
+                if c.circuit_open {
+                    ends.max(f64::from(c.cooldown_remaining_seconds))
+                } else {
+                    ends
+                }
+            }))
+        })
         .min();
     candidates.retain(|c| !c.drained);
     // Routes in cooldown are skipped, and for a probing caller a half-open

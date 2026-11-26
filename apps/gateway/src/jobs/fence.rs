@@ -47,6 +47,10 @@ use super::{
 };
 use crate::store::Store;
 
+/// The error code of a native batch ended because it could not be submitted
+/// in time ([`BatchFence::expire_submission`]).
+pub(crate) const SUBMISSION_EXPIRED: &str = "submission_expired";
+
 /// What a runner holds for one claim of a batch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BatchFence {
@@ -487,10 +491,12 @@ impl BatchFence {
     /// Claim the native batch's one submission. Not while its route is
     /// drained (`routing::drain`): the job stays queued and is polled again at
     /// its next poll; a submission claimed before the drain committed is in
-    /// flight and proceeds.
+    /// flight and proceeds. Never once less than its full completion window
+    /// is left before its poll deadline: its results could not be collected
+    /// ([`Self::expire_submission`] ends it instead).
     pub(crate) async fn claim_submit(&self, store: &Store) -> FenceResult<bool> {
         let sql = format!(
-            "UPDATE async_jobs SET submit_started_at=clock_timestamp() WHERE id=$1 AND runner_id=$2 AND runner_epoch=$3 AND submit_started_at IS NULL AND upstream_id IS NULL AND cancel_requested_at IS NULL AND state='queued' AND NOT EXISTS(SELECT 1 FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id WHERE d.id=async_jobs.deployment_id AND {})",
+            "UPDATE async_jobs SET submit_started_at=clock_timestamp() WHERE id=$1 AND runner_id=$2 AND runner_epoch=$3 AND submit_started_at IS NULL AND upstream_id IS NULL AND cancel_requested_at IS NULL AND state='queued' AND clock_timestamp()+make_interval(hours=>coalesce(completion_window_hours,24)::int)<=poll_deadline_at AND NOT EXISTS(SELECT 1 FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id WHERE d.id=async_jobs.deployment_id AND {})",
             crate::routing::drain::ROUTE_DRAINED
         );
         let claimed = self
@@ -572,6 +578,53 @@ impl BatchFence {
     /// lock: an id that a slow submitter recorded after this claim read the
     /// batch means the batch is submitted and is polled, not interrupted.
     /// `None` when nothing was recorded.
+    /// End a native batch that was never submitted and can no longer be with
+    /// its full completion window left before its poll deadline (its route was
+    /// drained, or could not be reached, until then): `failed` with
+    /// `submission_expired`. Nothing was sent; the caller settles it at zero.
+    /// `None` when it is not such a batch (submitted, claimed for submission,
+    /// cancelled, finished, or still in time).
+    pub(crate) async fn expire_submission(&self, store: &Store) -> FenceResult<Option<JobRow>> {
+        let mut tx = self.begin(store, Hold::Update).await?;
+        let locked = lock_batch_for_finish(&mut tx, self.job)
+            .await
+            .map_err(finish_error)?;
+        let late: bool = sqlx::query_scalar(
+            "SELECT clock_timestamp()+make_interval(hours=>coalesce(completion_window_hours,24)::int)>poll_deadline_at FROM async_jobs WHERE id=$1",
+        )
+        .bind(self.job)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(job_storage)?;
+        if !late
+            || locked.upstream_id.is_some()
+            || locked.submit_started_at.is_some()
+            || locked.cancel_requested_at.is_some()
+            || locked.state != "queued"
+        {
+            tx.commit().await.map_err(job_storage)?;
+            return Ok(None);
+        }
+        let row = finish_locked_batch(
+            &mut tx,
+            locked,
+            &Finished {
+                state: super::JobState::Failed,
+                error_code: Some(SUBMISSION_EXPIRED),
+                output_file: None,
+                error_file: None,
+                counts: None,
+            },
+        )
+        .await
+        .map_err(finish_error)?;
+        tx.commit().await.map_err(|e| {
+            job_storage(e);
+            FenceError::Unknown
+        })?;
+        Ok(Some(row))
+    }
+
     pub(crate) async fn interrupt_submission(
         &self,
         store: &Store,

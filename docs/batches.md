@@ -54,7 +54,7 @@ Valid lines are copied to the batch's **private copy**: an encrypted file withou
 - **Anthropic** (native, chat-like endpoints): one streamed `POST /v1/messages/batches` body, then `GET …/results` when `processing_status` is `ended`, then `DELETE` of the batch.
 - **Models set up as "Batch"** (protocol `batches`, from 0016) run Chat Completions natively only.
 
-A native batch is created first and submitted by the [poller](async-jobs.md#poller). The submission is claimed once; one that is interrupted (for example by a restart) is never repeated, because the provider may have received it. That batch fails with `submission_interrupted` and keeps its hold for reconciliation.
+A native batch is created first and submitted by the [poller](async-jobs.md#poller). The submission is claimed once; one that is interrupted (for example by a restart) is never repeated, because the provider may have received it. That batch fails with `submission_interrupted` and keeps its hold for reconciliation. A batch whose route is drained (#49) is not submitted while the drain applies; it is submitted only while its full completion window is still left before its poll deadline, so its results can be collected. Past that it fails with `submission_expired`: nothing was sent, and its reservation is settled at zero. A batch whose route does not serve at its poll (disabled, say) is not claimed for submission and ends the same way.
 
 ## Execution of gateway-run batches
 

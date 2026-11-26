@@ -51,8 +51,9 @@ fn reason(raw: &str) -> Result<String, ApiError> {
 
 /// A character a reason may not hold: a control character, or one that is
 /// invisible or reorders or breaks the text where it is shown (format
-/// characters such as zero-width spaces and bidirectional controls, and the
-/// line and paragraph separators).
+/// characters such as zero-width spaces and bidirectional controls, the line
+/// and paragraph separators, blank fillers, variation selectors and tag
+/// characters).
 fn hidden(c: char) -> bool {
     c.is_control()
         || matches!(
@@ -65,6 +66,19 @@ fn hidden(c: char) -> bool {
                 | '\u{2060}'..='\u{206F}'
                 | '\u{FEFF}'
                 | '\u{FFF9}'..='\u{FFFB}'
+                // Blank fillers that read as nothing, variation selectors and
+                // tag characters.
+                | '\u{034F}'
+                | '\u{115F}'
+                | '\u{1160}'
+                | '\u{17B4}'
+                | '\u{17B5}'
+                | '\u{2800}'
+                | '\u{3164}'
+                | '\u{FFA0}'
+                | '\u{FE00}'..='\u{FE0F}'
+                | '\u{E0000}'..='\u{E007F}'
+                | '\u{E0100}'..='\u{E01EF}'
         )
 }
 

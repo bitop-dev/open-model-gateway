@@ -27,6 +27,7 @@ test("an admin drains a route and its connection and reads the drain in words", 
     await section.getByRole("button", { name: "Drain route…", exact: true }).click();
     const dialog = page.getByRole("dialog");
     await dialog.getByLabel("Reason").fill("Replacing the GPU node <b>now</b>");
+    await dialog.getByRole("combobox", { name: /^Ends/ }).selectOption("hours");
     await dialog.getByLabel(/Ends after/).fill("2");
     await dialog.getByRole("button", { name: "Drain route", exact: true }).click();
     await expect(dialog).toBeHidden();
@@ -39,6 +40,15 @@ test("an admin drains a route and its connection and reads the drain in words", 
     const read = await (await api(page, "GET", `/platform/deployments/${deployment}/drain`)).json();
     expect(read.drain).toMatchObject({ reason: "Replacing the GPU node <b>now</b>", state: "active" });
     expect(read.drain.until).toBeTruthy();
+    // Fixing the reason of a time-limited drain keeps its end.
+    await section.getByRole("button", { name: "Change drain…", exact: true }).click();
+    const change = page.getByRole("dialog");
+    await expect(change.getByRole("combobox", { name: /^Ends/ })).toHaveValue("keep");
+    await change.getByLabel("Reason").fill("Replacing the GPU node, rack 4");
+    await change.getByRole("button", { name: "Save drain", exact: true }).click();
+    await expect(change).toBeHidden();
+    const changed = await (await api(page, "GET", `/platform/deployments/${deployment}/drain`)).json();
+    expect(changed.drain).toMatchObject({ reason: "Replacing the GPU node, rack 4", until: read.drain.until });
     await section.getByRole("button", { name: "End drain", exact: true }).click();
     await page.getByRole("dialog").getByRole("button", { name: "End drain", exact: true }).click();
     await expect(section.getByText("Not drained", { exact: true })).toBeVisible();
