@@ -54,6 +54,9 @@ jiff = { version = "=1.0.1", default-features = false, features = ["std", "tzdb-
 jiff-tzdb = "1"
 # SMTP delivery (invitations, alerts): rustls, async, one connection per message (no pool).
 lettre = { version = "=0.11.24", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"] }
+# The large image input body check reads Content-Type as Axum's Json
+# extractor does; the version Axum already locks.
+mime = "=0.3.17"
 percent-encoding = "2"
 # The already-locked reqwest transport's typed EOF/closed-connection errors;
 # never classify webhook retryability by attacker-controlled error text.

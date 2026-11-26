@@ -47,8 +47,9 @@ Four native shapes, distinct schemas, each generated from source:
 * The code vocabulary is generated from `InferenceError::code` over a compile-time exhaustive variant list (adding a variant breaks the build until it is listed), the types from the real renderers (`protocols::batch_line_error`), and the job codes from a `syn` scan of the `JobError::{Conflict,Invalid,Forbidden}` literals under `src/jobs`. A reviewed table (`errors::OPENAI_TRANSPORT`) adds the transport-only types and codes, each checked to still occur in its source file.
 * `/v1/messages` errors follow Anthropic's shape and carry **no gateway machine code** (coordinator decision 5): `unsupported_capability`, `budget_exceeded` and the rest cannot be told apart there except by their message. The outer transport layer also rewrites 405 and 413 on that path into Anthropic's shape (`http.rs` `request_context`, `protocols/messages.rs` `http_error`); 401, 405 and 413 are pinned as Anthropic-shaped transport responses, and authentication/body caps are proven on the real stack.
 * The management `ErrorEnvelope` is refused by name and by reference, and an operation may only use the envelope family of its protocol.
-* A declared `Content-Length` over a body cap is refused before any handler by the body-limit layer with the plain text `length limit exceeded` (`text/plain`, 413); a streamed oversized body is refused by the handler with its JSON error. Both are documented on every body-bearing route (except `/v1/messages`, whose 413 is always Anthropic-shaped).
-* Headers: `x-request-id` (UUID) and `Cache-Control: no-store` on every response; `WWW-Authenticate: Bearer` on every 401; `x-should-retry: false` on permanent refusals; `Retry-After` when every route of a model is cooling down.
+* A declared `Content-Length` over a body cap is refused before any handler by the body-limit layer with the plain text `length limit exceeded` (`text/plain`, 413); a streamed oversized body is refused by the handler with its JSON error. Both are documented on every body-bearing route except `/v1/messages`, whose 413 is always Anthropic-shaped, and Chat Completions and Responses, whose 413 is always JSON (below).
+* Headers: `x-request-id` (UUID) and `Cache-Control: no-store` on every response; `WWW-Authenticate: Bearer` on every 401; `x-should-retry: false` on permanent refusals; `Retry-After` when every route of a model is cooling down, and (`1`) when the image input buffer of Chat Completions and Responses is full.
+* Chat Completions and Responses answer every oversized body in JSON, never plain text: the image input layer (`http.rs` `image_input_body`, `inference::image_buffer`) refuses a declared length over `GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT` or the replica's buffer before reading it (413 `payload_too_large`), holds an undeclared body to 2 MiB as it streams (413), refuses a large body with more than 2 MiB outside its images' data URLs (413), a stalled large body (408 `request_timeout`) and a full buffer (503 `image_input_busy`, `Retry-After: 1`). `errors::OPENAI_TRANSPORT` lists `request_timeout` and `image_input_busy`; the real renderers and the real stack are validated against both routes (`errors_tests.rs`, `fixtures_tests.rs` `inference_openapi_generation_image_input_transport`).
 * Every OpenAI-shaped route that reads a request body uses the shared streamed-body 413 envelope (`/v1/files` has its own upload errors; the realtime routes ignore the body): `type: invalid_request_error`, `code: payload_too_large`, message "Request body too large" (#432, #438).
 
 ## Wire validation, coverage and vectors
@@ -70,6 +71,8 @@ Limits are runtime configuration; the artifact states the defaults and names the
 | Operation | Limit | Default | Environment variable |
 | --- | --- | --- | --- |
 | `POST /v1/embeddings` | request body | 2 MiB, fixed | none (`http.rs`) |
+| `POST /v1/chat/completions`, `POST /v1/responses` | request body with inline images (declared length) | 20 MiB, at most 2 MiB outside image data | `GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT` (2 MiB to 141,907,772 bytes) |
+| `POST /v1/chat/completions`, `POST /v1/responses` | in-flight large bodies per replica | 48 MiB | `GATEWAY_IMAGE_INPUT_BUFFER_BYTES` |
 | `POST /v1/rerank` | request body | 2 MiB | `GATEWAY_MAX_BODY_BYTES_RERANK` (1 KiB to 64 MiB) |
 | `POST /v1/systemone` | request body | 2 MiB | `GATEWAY_MAX_BODY_BYTES_SYSTEMONE` |
 | `POST /v1/images/generations` | request body | 2 MiB | `GATEWAY_MAX_BODY_BYTES_IMAGES` |
@@ -132,8 +135,10 @@ extensions are part of this contract, **not covered by SDK generation**:
 | Realtime message/frame | 1 MiB | `GATEWAY_REALTIME_MAX_MESSAGE_BYTES` |
 | Realtime event rate | 50/second | `GATEWAY_REALTIME_MAX_EVENTS_PER_SECOND` |
 
-The root limit for the core Chat/Responses/Messages, embeddings/models group
-and Realtime is fixed at 2 MiB (no environment variable). Media/workload
+The root limit for Messages, the embeddings/models group and Realtime is
+fixed at 2 MiB (no environment variable). Chat Completions and Responses
+keep that 2 MiB text limit and may exceed it only with inline images, within
+the image input cap above (docs/protocol-matrix.md "Image input"). Media/workload
 routes use the named caps above; job/file reads also have route-specific
 body-limit layers.
 A declared Content-Length over the applicable route limit yields plain text

@@ -69,6 +69,7 @@ impl ProviderAdapter for OpenAiAdapter {
             text_chat: true,
             streaming: true,
             tools: true,
+            image_input: true,
         }
     }
 
@@ -290,7 +291,11 @@ impl ProviderAdapter for OpenAiAdapter {
             .client
             .post(format!("{}/chat/completions", self.base))
             .header(header::AUTHORIZATION, authorization)
-            .json(&encode_chat(&target.upstream_model, &request))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(super::image_body::json_body(
+                &encode_chat(&target.upstream_model, &request),
+                &request,
+            )?)
             .send()
             .await
             .map_err(transport_error)?;
@@ -359,15 +364,16 @@ fn check_status(status: StatusCode) -> Result<()> {
 pub(super) use chat_controls::{encode_chat, json_schema_format};
 
 pub(super) fn encode(model: &str, request: &ChatRequest) -> Value {
+    let mut images = 0;
     let messages: Vec<Value> = request
         .messages
         .iter()
         .map(|message| {
-            let mut value = json!({"role": message.role, "content": message.content});
+            let mut value = json!({"role": message.role, "content": super::image_body::chat_content(message.content.as_ref(), &mut images)});
             if message.role == Role::Tool && message.tool_result_is_error {
                 value["content"] = json!(format!(
                     "[tool_error]\n{}",
-                    message.content.as_deref().unwrap_or("")
+                    message.content.as_ref().and_then(Content::text).unwrap_or("")
                 ));
             }
             if let Some(id) = &message.tool_call_id {

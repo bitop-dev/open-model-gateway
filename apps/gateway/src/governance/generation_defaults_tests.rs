@@ -165,6 +165,7 @@ impl ProviderAdapter for Recording {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            image_input: false,
             text_chat: true,
             streaming: true,
             tools: true,
@@ -343,6 +344,7 @@ impl ProviderAdapter for CeilingSensitive {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            image_input: false,
             text_chat: true,
             streaming: false,
             tools: false,

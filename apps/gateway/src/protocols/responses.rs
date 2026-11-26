@@ -88,7 +88,7 @@ pub(super) fn name(name: &str) -> bool {
 pub(super) fn message(role: Role, text: String) -> Message {
     Message {
         role,
-        content: Some(text),
+        content: Some(Content::Text(text)),
         tool_calls: vec![],
         tool_call_id: None,
         tool_result_is_error: false,
@@ -142,29 +142,39 @@ fn item_metadata(item: &Value, nullable: bool) -> Result<()> {
 }
 /// The `input`: a user text, or 1 to 4096 items.
 fn input_messages(input: Value, messages: &mut Vec<Message>) -> Result<()> {
+    let mut images = super::image_input::Images::default();
     match input {
         Value::String(text) => messages.push(message(Role::User, text)),
         Value::Array(items) if !items.is_empty() && items.len() <= 4096 => {
             for item in items {
-                input_item(&item, messages)?;
+                input_item(item, messages, &mut images)?;
             }
         }
         _ => return Err(InferenceError::InvalidRequest),
     }
     Ok(())
 }
-/// One input item, by its type.
-fn input_item(item: &Value, messages: &mut Vec<Message>) -> Result<()> {
+/// One input item, by its type (owned, so an image's data URL moves into
+/// the request without a copy).
+fn input_item(
+    item: Value,
+    messages: &mut Vec<Message>,
+    images: &mut super::image_input::Images,
+) -> Result<()> {
     match item["type"].as_str() {
-        None | Some("message") => message_item(item, messages),
-        Some("function_call") => function_call_item(item, messages),
-        Some("function_call_output") => function_call_output_item(item, messages),
+        None | Some("message") => message_item(item, messages, images),
+        Some("function_call") => function_call_item(&item, messages),
+        Some("function_call_output") => function_call_output_item(&item, messages),
         _ => Err(InferenceError::InvalidRequest),
     }
 }
-fn message_item(item: &Value, messages: &mut Vec<Message>) -> Result<()> {
-    fields(item, &["type", "role", "content", "id", "status"])?;
-    item_metadata(item, false)?;
+fn message_item(
+    mut item: Value,
+    messages: &mut Vec<Message>,
+    images: &mut super::image_input::Images,
+) -> Result<()> {
+    fields(&item, &["type", "role", "content", "id", "status"])?;
+    item_metadata(&item, false)?;
     if item
         .get("type")
         .is_some_and(|v| v.as_str() != Some("message"))
@@ -178,40 +188,87 @@ fn message_item(item: &Value, messages: &mut Vec<Message>) -> Result<()> {
         Some("developer") => Role::Developer,
         _ => return Err(InferenceError::InvalidRequest),
     };
-    let text = message_text(role, &item["content"])?;
-    messages.push(message(role, text));
+    let content = message_content(role, item["content"].take(), images)?;
+    messages.push(Message {
+        role,
+        content: Some(content),
+        tool_calls: vec![],
+        tool_call_id: None,
+        tool_result_is_error: false,
+    });
     Ok(())
 }
-/// A message's text: a string, or a non-empty list of text parts (assistant
-/// messages may echo `output_text` parts without annotations).
-fn message_text(role: Role, content: &Value) -> Result<String> {
-    Ok(match content {
-        Value::String(s) => s.clone(),
-        Value::Array(parts) if !parts.is_empty() => {
-            let mut text = String::new();
-            for part in parts {
-                if role == Role::Assistant && part["type"] == "output_text" {
-                    fields(part, &["type", "text", "annotations"])?;
-                    if part
-                        .get("annotations")
-                        .is_some_and(|v| v.as_array().is_none_or(|a| !a.is_empty()))
-                    {
-                        return Err(InferenceError::InvalidRequest);
-                    }
-                } else {
-                    fields(part, &["type", "text"])?;
-                }
-                if part["type"] != "input_text"
-                    && !(role == Role::Assistant && part["type"] == "output_text")
-                {
-                    return Err(InferenceError::InvalidRequest);
-                }
-                text.push_str(&string(&part["text"])?);
-            }
-            text
-        }
+/// A message's content: a string, or a non-empty list of parts (assistant
+/// messages may echo `output_text` parts without annotations). Text parts
+/// join into one text; content with an `input_image` (user messages only)
+/// keeps its ordered parts.
+fn message_content(
+    role: Role,
+    content: Value,
+    images: &mut super::image_input::Images,
+) -> Result<Content> {
+    let parts = match content {
+        Value::String(s) => return Ok(Content::Text(s)),
+        Value::Array(parts) if !parts.is_empty() => parts,
         _ => return Err(InferenceError::InvalidRequest),
-    })
+    };
+    let mut out: Vec<Part> = Vec::new();
+    for mut part in parts {
+        if part["type"] == "input_image" {
+            if role != Role::User {
+                return Err(InferenceError::InvalidField("input.content.input_image"));
+            }
+            fields(&part, &["type", "image_url", "file_id", "detail"])?;
+            if part.get("file_id").is_some() {
+                return Err(InferenceError::InvalidField("input.content.file_id"));
+            }
+            let detail = match part.get("detail") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(d)) => Some(d.clone()),
+                Some(_) => return Err(InferenceError::InvalidField("input.content.detail")),
+            };
+            let Value::String(url) = part["image_url"].take() else {
+                return Err(InferenceError::InvalidField("input.content.image_url"));
+            };
+            out.push(Part::Image(images.take(
+                url,
+                detail.as_deref(),
+                "input.content.image_url",
+            )?));
+            continue;
+        }
+        if part["type"] == "input_file" {
+            return Err(InferenceError::InvalidField("input.content.input_file"));
+        }
+        if role == Role::Assistant && part["type"] == "output_text" {
+            fields(&part, &["type", "text", "annotations"])?;
+            if part
+                .get("annotations")
+                .is_some_and(|v| v.as_array().is_none_or(|a| !a.is_empty()))
+            {
+                return Err(InferenceError::InvalidRequest);
+            }
+        } else {
+            fields(&part, &["type", "text"])?;
+        }
+        if part["type"] != "input_text"
+            && !(role == Role::Assistant && part["type"] == "output_text")
+        {
+            return Err(InferenceError::InvalidRequest);
+        }
+        let text = string(&part["text"])?;
+        match out.last_mut() {
+            Some(Part::Text(previous)) => previous.push_str(&text),
+            _ => out.push(Part::Text(text)),
+        }
+    }
+    if let [Part::Text(_)] = out.as_slice() {
+        let Some(Part::Text(text)) = out.pop() else {
+            unreachable!("one text part")
+        };
+        return Ok(Content::Text(text));
+    }
+    Ok(Content::Parts(out))
 }
 fn function_call_item(item: &Value, messages: &mut Vec<Message>) -> Result<()> {
     fields(
@@ -246,7 +303,7 @@ fn function_call_output_item(item: &Value, messages: &mut Vec<Message>) -> Resul
     }
     messages.push(Message {
         role: Role::Tool,
-        content: Some(string(&item["output"])?),
+        content: Some(Content::Text(string(&item["output"])?)),
         tool_calls: vec![],
         tool_call_id: Some(id),
         tool_result_is_error: false,
@@ -317,6 +374,7 @@ pub async fn handle(
     Extension(engine): Extension<Engine>,
     Extension(principal): Extension<Principal>,
     Extension(request_id): Extension<RequestId>,
+    large: Option<Extension<crate::inference::image_buffer::LargeBody>>,
     input: std::result::Result<Json<Request>, JsonRejection>,
 ) -> Response {
     let wire = match input {
@@ -334,6 +392,11 @@ pub async fn handle(
         Ok(v) => v,
         Err(e) => return error_response(e),
     };
+    // Only image data may take a body past the shared text limit.
+    if large.is_some_and(|Extension(large)| !large.allows(&request)) {
+        crate::metrics::METRICS.image_input_refused("too_large");
+        return super::payload_too_large();
+    }
     let model = request.model.clone();
     let id = format!("resp_{}", request_id.0.simple());
     let created = SystemTime::now()
@@ -356,7 +419,13 @@ pub(crate) fn batch_request(body: Value) -> Result<ChatRequest> {
     if wire.stream || !client::valid_openai_metadata(wire.metadata.as_ref()) {
         return Err(InferenceError::InvalidRequest);
     }
-    wire.normalize()
+    let request = wire.normalize()?;
+    // Batch files are not under the image buffer budget: image input is for
+    // interactive requests only.
+    if request.has_images() {
+        return Err(InferenceError::InvalidField("input.content.input_image"));
+    }
+    Ok(request)
 }
 /// `/v1/batches` line result body (a completed `response` object).
 pub(crate) fn batch_response(

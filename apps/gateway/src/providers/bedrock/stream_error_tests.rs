@@ -484,6 +484,7 @@ impl crate::providers::ProviderAdapter for EndsInRejection {
     }
     fn capabilities(&self) -> crate::inference::types::Capabilities {
         crate::inference::types::Capabilities {
+            image_input: false,
             text_chat: true,
             streaming: true,
             tools: true,

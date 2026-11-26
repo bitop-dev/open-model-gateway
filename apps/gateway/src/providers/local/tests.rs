@@ -73,6 +73,7 @@ impl Mock {
     }
     fn target(&self, profile: Profile) -> Deployment {
         Deployment {
+            image_input: false,
             id: uuid::Uuid::new_v4(),
             provider: profile.id().into(),
             upstream_model: "private".into(),
@@ -359,6 +360,7 @@ async fn preadmission_checks_and_execute_defense_need_no_connection_or_handler()
     ] {
         let adapter = LocalAdapter::new(profile, resolver.clone(), approvals.clone());
         let target = Deployment {
+            image_input: false,
             id: uuid::Uuid::new_v4(),
             provider: profile.id().into(),
             upstream_model: "private".into(),
@@ -607,4 +609,40 @@ async fn error_tool_sdk_sglang(pool: sqlx::PgPool) {
 #[dbtest::test]
 async fn error_tool_sdk_ollama(pool: sqlx::PgPool) {
     error_tool_sdk_profile(pool, Profile::Ollama).await;
+}
+
+#[tokio::test]
+async fn inline_images_reach_every_local_profile_as_image_url_parts() {
+    use super::super::contract::{IMAGE_URL, image_request};
+    for profile in [
+        Profile::Vllm,
+        Profile::Sglang,
+        Profile::Ollama,
+        Profile::OpenAiCompatible,
+    ] {
+        let mock = Mock::new(200, false).await;
+        let adapter = mock.adapter(profile, Arc::new(Resolver(AtomicUsize::new(0))));
+        assert!(adapter.capabilities().image_input);
+        adapter
+            .execute(&mock.target(profile), image_request(false))
+            .await
+            .unwrap();
+        let captured = mock.capture.lock().unwrap();
+        assert_eq!(
+            captured[0].0["content-type"],
+            "application/json",
+            "{}",
+            profile.id()
+        );
+        assert_eq!(
+            captured[0].2["messages"][0]["content"],
+            json!([
+                {"type":"text","text":"what is"},
+                {"type":"image_url","image_url":{"url":IMAGE_URL,"detail":"low"}},
+                {"type":"text","text":"this?"}
+            ]),
+            "{}",
+            profile.id()
+        );
+    }
 }

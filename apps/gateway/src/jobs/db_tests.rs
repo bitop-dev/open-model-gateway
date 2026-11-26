@@ -63,6 +63,7 @@ impl ProviderAdapter for Fake {
     }
     fn capabilities(&self) -> crate::inference::types::Capabilities {
         crate::inference::types::Capabilities {
+            image_input: false,
             text_chat: true,
             streaming: false,
             tools: false,
@@ -1740,6 +1741,7 @@ async fn the_default_keyed_create_refuses_an_idempotent_declaration() {
         }
         fn capabilities(&self) -> crate::inference::types::Capabilities {
             crate::inference::types::Capabilities {
+                image_input: false,
                 text_chat: false,
                 streaming: false,
                 tools: false,
@@ -1764,6 +1766,7 @@ async fn the_default_keyed_create_refuses_an_idempotent_declaration() {
         }
     }
     let target = Deployment {
+        image_input: false,
         id: Uuid::new_v4(),
         provider: "openai".into(),
         upstream_model: "m".into(),

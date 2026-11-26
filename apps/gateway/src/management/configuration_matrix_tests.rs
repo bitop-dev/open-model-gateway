@@ -288,7 +288,7 @@ async fn every_json_management_write_rejects_unknown_fields_after_valid_control(
         "POST",
         format!("{platform}/deployments"),
         &f.admin,
-        json!({"model_id":model_id,"provider_connection_id":connection,"upstream_model":"matrix-new","enabled":false})
+        json!({"model_id":model_id,"provider_connection_id":connection,"upstream_model":"matrix-new","enabled":false,"image_input":true})
     );
     case!(
         "deployment_configuration::preview",
@@ -327,11 +327,11 @@ async fn every_json_management_write_rejects_unknown_fields_after_valid_control(
         json!({"action":"disable","idempotency_key":"matrix-bulk","items":[{"id":Uuid::new_v4(),"expected_revision":"1"}]})
     );
     case!(
-        "resources::update_deployment",
+        "deployment_image_input::update_deployment",
         "PATCH",
         format!("{platform}/deployments/{deployment}"),
         &f.admin,
-        json!({"enabled":true})
+        json!({"enabled":true,"image_input":true})
     );
     case!(
         "setup::model_setup",

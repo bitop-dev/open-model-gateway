@@ -26,6 +26,7 @@ fn adapter(mock: &Mock) -> OpenRouterAdapter {
 }
 fn target() -> Deployment {
     Deployment {
+        image_input: false,
         id: uuid::Uuid::new_v4(),
         provider: "openrouter".into(),
         upstream_model: "black-forest-labs/flux-3-image".into(),

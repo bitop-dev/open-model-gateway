@@ -171,6 +171,7 @@ pub(crate) fn populated_registry() -> &'static Metrics {
     m.guardrail_decision("input", "pattern", "secret", "blocked");
     m.guardrail_detector_seconds("pattern", std::time::Duration::from_millis(1));
     m.guardrail_unscanned("rate_limited");
+    m.image_input_refused("busy");
     m.upstream_connection_lost("local");
     m.upstream_connection_opened("local");
     m.audit_export_delivery("delivered");

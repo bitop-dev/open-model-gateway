@@ -658,7 +658,7 @@ impl Store {
             return Err(InferenceError::Unauthenticated);
         };
         let deployments = sqlx::query_as::<_, Deployment>(r#"
-            SELECT d.id,p.provider,d.upstream_model,p.credential_ref,p.endpoint,p.region,m.supported_protocols
+            SELECT d.id,p.provider,d.upstream_model,p.credential_ref,p.endpoint,p.region,m.supported_protocols,d.image_input
             FROM models m JOIN deployments d ON d.model_id=m.id
             JOIN provider_connections p ON p.id=d.provider_connection_id
             WHERE m.public_name=$2 AND workspace_model_allowed($1,m.id) AND d.enabled AND p.enabled

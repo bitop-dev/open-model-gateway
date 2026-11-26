@@ -222,6 +222,10 @@ fn inference_openapi_documents_every_status_the_renderers_produce() {
         if path == "/v1/messages" {
             expected.insert(405);
         }
+        // A large image input body that stalls (`protocols::body_timeout`).
+        if ["/v1/chat/completions", "/v1/responses"].contains(&path) {
+            expected.insert(408);
+        }
         assert_eq!(
             documented, expected,
             "{path}: statuses differ from the renderers"
@@ -489,6 +493,50 @@ async fn inference_openapi_media_jobs_realtime_renderer_statuses_and_envelopes()
                     &bytes,
                 )
                 .unwrap_or_else(|e| panic!("renderer {method} {path}: {e:#}"));
+            }
+        }
+    }
+}
+
+/// The large-body refusals of the image input routes, from their real
+/// renderers: each is documented on both routes, in the OpenAI envelope, with
+/// its machine code; the full buffer's Retry-After is a documented header.
+#[tokio::test]
+async fn inference_openapi_image_input_refusals_match_their_renderers() {
+    let doc = generated();
+    for path in ["/v1/chat/completions", "/v1/responses"] {
+        for (response, code) in [
+            (
+                crate::protocols::image_input_too_large(),
+                "payload_too_large",
+            ),
+            (crate::protocols::image_input_busy(), "image_input_busy"),
+            (crate::protocols::body_timeout(), "request_timeout"),
+        ] {
+            let (parts, body) = response.into_parts();
+            let bytes = to_bytes(body, 65536).await.unwrap();
+            r::validate_body(&doc, "POST", path, parts.status, &bytes)
+                .unwrap_or_else(|e| panic!("{path} {code}: {e:#}"));
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"]["code"], code);
+            assert_eq!(
+                parts.headers.contains_key("retry-after"),
+                code == "image_input_busy"
+            );
+            if let Some(retry) = parts.headers.get("retry-after") {
+                let declared = &doc["paths"][path]["post"]["responses"][parts.status.as_str()]["headers"]
+                    ["retry-after"];
+                assert_eq!(
+                    declared,
+                    &json!({"$ref":"#/components/headers/RetryAfter"}),
+                    "{path}: undocumented Retry-After"
+                );
+                validate_value(
+                    &doc,
+                    &doc["components"]["headers"]["RetryAfter"]["schema"],
+                    &json!(retry.to_str().unwrap()),
+                )
+                .unwrap();
             }
         }
     }

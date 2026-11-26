@@ -2416,6 +2416,7 @@ mod jobs_fake {
         }
         fn capabilities(&self) -> Capabilities {
             Capabilities {
+                image_input: false,
                 text_chat: true,
                 streaming: false,
                 tools: false,

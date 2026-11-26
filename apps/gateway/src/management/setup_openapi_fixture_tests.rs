@@ -3151,36 +3151,79 @@ async fn slice3_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
         .await;
     }
     body_set(&mut j, a, "POST", "/api/v1/platform/deployments", "/api/v1/platform/deployments", json!({"model_id":vmodel,"provider_connection_id":vprov,"upstream_model":"vector/upstream","enabled":false}), &["route_unsupported_capability"]).await;
-    body_set(
-        &mut j,
-        a,
-        "POST",
-        "/api/v1/platform/deployments",
-        "/api/v1/platform/deployments",
-        json!([vmodel, vprov, "vector/upstream-positional", false]),
-        &["route_unsupported_capability"],
-    )
-    .await;
-    body_set(
-        &mut j,
-        a,
-        "PATCH",
-        "/api/v1/platform/deployments/{id}",
-        &format!("/api/v1/platform/deployments/{vdep}"),
-        json!({"enabled":true}),
-        &[],
-    )
-    .await;
-    body_set(
-        &mut j,
-        a,
-        "PATCH",
-        "/api/v1/platform/deployments/{id}",
-        &format!("/api/v1/platform/deployments/{vdep}"),
-        json!([true]),
-        &[],
-    )
-    .await;
+    // The image-input opt-in is optional in both wire forms: the object omits
+    // it and the positional form stops after `enabled` (serde's default), so
+    // the seed supplies it as the fifth positional item and the walk reaches
+    // the array's item bound.
+    body_set(&mut j, a, "POST", "/api/v1/platform/deployments", "/api/v1/platform/deployments", json!({"model_id":vmodel,"provider_connection_id":vprov,"upstream_model":"vector/upstream-image","enabled":false,"image_input":true}), &["route_unsupported_capability"]).await;
+    {
+        let (client, root) = (j.client.clone(), j.base.clone());
+        http_vectors::body_vectors_seeded(
+            &mut j.observed,
+            "POST",
+            "/api/v1/platform/deployments",
+            json!([vmodel, vprov, "vector/upstream-positional", false]),
+            &[("/4", json!(true))],
+            async |body: Value| {
+                judged(
+                    send(
+                        &client,
+                        &root,
+                        Some(a),
+                        "POST",
+                        "/api/v1/platform/deployments",
+                        Some(body),
+                    )
+                    .await,
+                    &["route_unsupported_capability"],
+                )
+            },
+        )
+        .await;
+    }
+    // Each shape of the route PATCH: enablement alone, the image-input opt-in
+    // alone and with enablement, in both wire forms (the seed supplies the
+    // omitted second positional item). A body that sets neither field is
+    // accepted by the schema and refused by the handler (400).
+    let neither = |b: &Value| match b {
+        Value::Object(m) => ["enabled", "image_input"]
+            .iter()
+            .all(|k| m.get(*k).is_none_or(Value::is_null)),
+        Value::Array(items) => items.iter().all(Value::is_null),
+        _ => false,
+    };
+    let patch_dep = format!("/api/v1/platform/deployments/{vdep}");
+    for (body, seeds) in [
+        (json!({"enabled":true}), vec![]),
+        (json!({"enabled":true,"image_input":true}), vec![]),
+        (json!({"image_input":false}), vec![]),
+        (json!([true]), vec![("/1", json!(true))]),
+        (json!([null, false]), vec![]),
+    ] {
+        let (client, root) = (j.client.clone(), j.base.clone());
+        http_vectors::body_vectors_seeded(
+            &mut j.observed,
+            "PATCH",
+            "/api/v1/platform/deployments/{id}",
+            body,
+            &seeds,
+            async |body: Value| {
+                let schema_valid =
+                    schema_accepts("PATCH", "/api/v1/platform/deployments/{id}", &body);
+                let captured = send(
+                    &client,
+                    &root,
+                    Some(a),
+                    "PATCH",
+                    &patch_dep,
+                    Some(body.clone()),
+                )
+                .await;
+                judged_when(captured, schema_valid, &body, (&neither, &[]))
+            },
+        )
+        .await;
+    }
     // A zero input ceiling is valid only when every input-family meter is not applicable.
     body_set_when(
         &mut j,

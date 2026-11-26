@@ -288,6 +288,7 @@ mod tests {
         }
         fn capabilities(&self) -> crate::inference::types::Capabilities {
             crate::inference::types::Capabilities {
+                image_input: false,
                 text_chat: false,
                 streaming: false,
                 tools: false,
@@ -318,6 +319,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_normalized_numbers_cannot_be_formatted_but_keep_usage() {
         let target = Deployment {
+            image_input: false,
             id: uuid::Uuid::new_v4(),
             provider: "nonfinite_fixture".into(),
             upstream_model: "private".into(),

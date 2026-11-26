@@ -17,7 +17,7 @@
         }
       },
       "RetryAfter": {
-        "description": "Seconds to wait; only a cooling-down route sends it.",
+        "description": "Seconds to wait: sent when every route of the model is cooling down and, on Chat Completions and Responses, when this replica's image input buffer is full (1).",
         "required": false,
         "schema": {
           "pattern": "^[1-9][0-9]*$",
@@ -891,6 +891,110 @@
         ],
         "type": "object"
       },
+      "GenChatContentParts": {
+        "description": "Content parts of a user message: text and inline images. Parts of type file or input_audio are refused with 400 naming the field.",
+        "items": {
+          "oneOf": [
+            {
+              "$ref": "#/components/schemas/GenChatTextPart"
+            },
+            {
+              "$ref": "#/components/schemas/GenChatImagePart"
+            }
+          ]
+        },
+        "maxItems": 256,
+        "minItems": 1,
+        "type": "array"
+      },
+      "GenChatImagePart": {
+        "description": "An inline image, on user messages only (400 naming messages.content.image_url elsewhere). The request goes only to routes whose adapter carries images and whose deployment allows image_input; with none left it is refused with 501 unsupported_capability before admission.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "file": {
+                "description": "Accepted only as null. A part that carries a file is refused with 400 naming messages.content.file, whatever its type.",
+                "type": "null"
+              },
+              "image_url": {
+                "$ref": "#/components/schemas/GenChatImageUrl"
+              },
+              "input_audio": {
+                "description": "Accepted only as null. A part that carries input_audio is refused with 400 naming messages.content.input_audio, whatever its type.",
+                "type": "null"
+              },
+              "text": {
+                "type": "null"
+              },
+              "type": {
+                "const": "image_url"
+              }
+            },
+            "required": [
+              "type",
+              "image_url"
+            ],
+            "type": "object"
+          },
+          {
+            "items": false,
+            "maxItems": 5,
+            "minItems": 5,
+            "prefixItems": [
+              {
+                "const": "image_url"
+              },
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GenChatImageUrl"
+              },
+              {
+                "type": "null"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "type": "array"
+          }
+        ]
+      },
+      "GenChatImageUrl": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "detail": {
+                "$ref": "#/components/schemas/GenImageDetail"
+              },
+              "url": {
+                "$ref": "#/components/schemas/GenImageDataUrl"
+              }
+            },
+            "required": [
+              "url"
+            ],
+            "type": "object"
+          },
+          {
+            "items": false,
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "$ref": "#/components/schemas/GenImageDataUrl"
+              },
+              {
+                "$ref": "#/components/schemas/GenImageDetail"
+              }
+            ],
+            "type": "array"
+          }
+        ]
+      },
       "GenChatMessage": {
         "oneOf": [
           {
@@ -910,7 +1014,14 @@
                 "then": {
                   "properties": {
                     "content": {
-                      "type": "string"
+                      "oneOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "$ref": "#/components/schemas/GenChatTextParts"
+                        }
+                      ]
                     },
                     "tool_call_id": {
                       "minLength": 1,
@@ -932,8 +1043,7 @@
                     "role": {
                       "enum": [
                         "system",
-                        "developer",
-                        "user"
+                        "developer"
                       ]
                     }
                   },
@@ -944,7 +1054,14 @@
                 "then": {
                   "properties": {
                     "content": {
-                      "type": "string"
+                      "oneOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "$ref": "#/components/schemas/GenChatTextParts"
+                        }
+                      ]
                     },
                     "refusal": false,
                     "tool_calls": {
@@ -965,6 +1082,9 @@
                   },
                   {
                     "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/GenChatTextParts"
                   }
                 ]
               },
@@ -975,7 +1095,6 @@
                 "enum": [
                   "system",
                   "developer",
-                  "user",
                   "assistant",
                   "tool"
                 ],
@@ -1020,6 +1139,9 @@
                   },
                   {
                     "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/GenChatTextParts"
                   }
                 ]
               },
@@ -1047,13 +1169,19 @@
               {
                 "enum": [
                   "system",
-                  "developer",
-                  "user"
+                  "developer"
                 ],
                 "type": "string"
               },
               {
-                "type": "string"
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "$ref": "#/components/schemas/GenChatTextParts"
+                  }
+                ]
               },
               {
                 "const": []
@@ -1073,7 +1201,14 @@
                 "const": "tool"
               },
               {
-                "type": "string"
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "$ref": "#/components/schemas/GenChatTextParts"
+                  }
+                ]
               },
               {
                 "const": []
@@ -1084,8 +1219,129 @@
               }
             ],
             "type": "array"
+          },
+          {
+            "items": false,
+            "maxItems": 4,
+            "minItems": 4,
+            "prefixItems": [
+              {
+                "const": "user"
+              },
+              {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "$ref": "#/components/schemas/GenChatContentParts"
+                  }
+                ]
+              },
+              {
+                "const": []
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "type": "array"
+          },
+          {
+            "additionalProperties": false,
+            "description": "A user message: the only role whose content may carry inline images.",
+            "properties": {
+              "content": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "$ref": "#/components/schemas/GenChatContentParts"
+                  }
+                ]
+              },
+              "role": {
+                "const": "user"
+              },
+              "tool_call_id": {
+                "type": "null"
+              },
+              "tool_calls": {
+                "const": []
+              }
+            },
+            "required": [
+              "role",
+              "content"
+            ],
+            "type": "object"
           }
         ]
+      },
+      "GenChatTextPart": {
+        "description": "A text part. Adjacent text parts join into one text.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "file": {
+                "description": "Accepted only as null. A part that carries a file is refused with 400 naming messages.content.file, whatever its type.",
+                "type": "null"
+              },
+              "image_url": {
+                "type": "null"
+              },
+              "input_audio": {
+                "description": "Accepted only as null. A part that carries input_audio is refused with 400 naming messages.content.input_audio, whatever its type.",
+                "type": "null"
+              },
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "const": "text"
+              }
+            },
+            "required": [
+              "type",
+              "text"
+            ],
+            "type": "object"
+          },
+          {
+            "items": false,
+            "maxItems": 5,
+            "minItems": 5,
+            "prefixItems": [
+              {
+                "const": "text"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              },
+              {
+                "type": "null"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "type": "array"
+          }
+        ]
+      },
+      "GenChatTextParts": {
+        "description": "Content parts of a message other than a user message: text only.",
+        "items": {
+          "$ref": "#/components/schemas/GenChatTextPart"
+        },
+        "maxItems": 256,
+        "minItems": 1,
+        "type": "array"
       },
       "GenChatTool": {
         "oneOf": [
@@ -1281,6 +1537,29 @@
           "source"
         ],
         "type": "object"
+      },
+      "GenImageDataUrl": {
+        "description": "An inline image: a base64 data URL with exactly this prefix (no parameters, lowercase scheme) and strict padded base64. Remote http(s) URLs and every other URL are refused (400): the gateway never fetches a caller's URL. Handler semantic validation is additional: the decoded bytes must start with the declared type's signature (PNG, JPEG, RIFF....WEBP, GIF87a/GIF89a), decode to at most 5 MiB (the base64 data at most 6990508 bytes, checked before decoding), and a request carries at most 20 images in all; any violation is 400 naming the field.",
+        "pattern": "^data:image/(png|jpeg|webp|gif);base64,([A-Za-z0-9+/]{4})*([A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=|[A-Za-z0-9+/]{4})$",
+        "type": "string",
+        "x-omg-max-decoded-bytes": 5242880,
+        "x-omg-max-encoded-bytes": 6990508
+      },
+      "GenImageDetail": {
+        "description": "OpenAI's optional detail level, carried to the provider's wire; null is the same as absent.",
+        "oneOf": [
+          {
+            "enum": [
+              "auto",
+              "low",
+              "high"
+            ],
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
       },
       "GenMessagesEventContentBlockDelta": {
         "additionalProperties": false,
@@ -2399,8 +2678,71 @@
           }
         ]
       },
+      "GenResponseInputImage": {
+        "additionalProperties": false,
+        "description": "An inline image, on user messages only (400 naming input.content.input_image elsewhere). A file_id is refused with 400 naming input.content.file_id, an input_file part with 400 naming input.content.input_file. The request goes only to routes whose adapter carries images and whose deployment allows image_input; with none left it is refused with 501 unsupported_capability before admission.",
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/GenImageDetail"
+          },
+          "image_url": {
+            "$ref": "#/components/schemas/GenImageDataUrl"
+          },
+          "type": {
+            "const": "input_image"
+          }
+        },
+        "required": [
+          "type",
+          "image_url"
+        ],
+        "type": "object"
+      },
       "GenResponseInputMessage": {
         "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "role": {
+                  "enum": [
+                    "assistant",
+                    "system",
+                    "developer"
+                  ]
+                }
+              },
+              "required": [
+                "role"
+              ]
+            },
+            "then": {
+              "properties": {
+                "content": {
+                  "oneOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "items": {
+                        "oneOf": [
+                          {
+                            "$ref": "#/components/schemas/GenResponseInputText"
+                          },
+                          {
+                            "$ref": "#/components/schemas/GenResponseOutputText"
+                          }
+                        ]
+                      },
+                      "minItems": 1,
+                      "type": "array"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        ],
         "properties": {
           "content": {
             "oneOf": [
@@ -2411,39 +2753,13 @@
                 "items": {
                   "oneOf": [
                     {
-                      "additionalProperties": false,
-                      "properties": {
-                        "text": {
-                          "type": "string"
-                        },
-                        "type": {
-                          "const": "input_text"
-                        }
-                      },
-                      "required": [
-                        "type",
-                        "text"
-                      ],
-                      "type": "object"
+                      "$ref": "#/components/schemas/GenResponseInputText"
                     },
                     {
-                      "additionalProperties": false,
-                      "properties": {
-                        "annotations": {
-                          "const": []
-                        },
-                        "text": {
-                          "type": "string"
-                        },
-                        "type": {
-                          "const": "output_text"
-                        }
-                      },
-                      "required": [
-                        "type",
-                        "text"
-                      ],
-                      "type": "object"
+                      "$ref": "#/components/schemas/GenResponseOutputText"
+                    },
+                    {
+                      "$ref": "#/components/schemas/GenResponseInputImage"
                     }
                   ]
                 },
@@ -2479,6 +2795,42 @@
         "required": [
           "role",
           "content"
+        ],
+        "type": "object"
+      },
+      "GenResponseInputText": {
+        "additionalProperties": false,
+        "properties": {
+          "text": {
+            "type": "string"
+          },
+          "type": {
+            "const": "input_text"
+          }
+        },
+        "required": [
+          "type",
+          "text"
+        ],
+        "type": "object"
+      },
+      "GenResponseOutputText": {
+        "additionalProperties": false,
+        "description": "Assistant messages only (an echo of earlier output, without annotations); generation-normalization refuses it on other roles.",
+        "properties": {
+          "annotations": {
+            "const": []
+          },
+          "text": {
+            "type": "string"
+          },
+          "type": {
+            "const": "output_text"
+          }
+        },
+        "required": [
+          "type",
+          "text"
         ],
         "type": "object"
       },
@@ -3320,6 +3672,7 @@
           "guardrail_not_supported",
           "guardrail_rate_limited",
           "guardrail_unavailable",
+          "image_input_busy",
           "invalid_request_error",
           "invalid_upstream_response",
           "job_limit_exceeded",
@@ -3331,6 +3684,7 @@
           "price_unbounded",
           "provider_configuration_error",
           "rate_limit_error",
+          "request_timeout",
           "scope_busy",
           "timeout_error",
           "token_reservation_exceeds_limit",
@@ -4798,7 +5152,7 @@
         "type": "object"
       },
       "post_v1_chat_completionsRequest": {
-        "description": "JSON Schema validates structure. x-omg-request-constraints additionally enforces serde integer wire representation, UTF-8 byte limits, token alias equality, role/content rules, tool-name uniqueness and conditional field rules; provider-specific capability refusals are listed separately. No store or conversation persistence. The semantic extension also enforces the 2 MiB serialized JSON body cap and image encoding, signature, decoded-size and aggregate image-count rules.",
+        "description": "JSON Schema validates structure. x-omg-request-constraints additionally enforces serde integer wire representation, UTF-8 byte limits, token alias equality, role/content rules, tool-name uniqueness and conditional field rules; provider-specific capability refusals are listed separately. No store or conversation persistence. The semantic extension also enforces the body caps (2 MiB serialized JSON, or up to 20 MiB with at most 2 MiB outside image data URLs) and the image data URL, signature, decoded-size, role and aggregate image-count rules.",
         "oneOf": [
           {
             "additionalProperties": false,
@@ -6933,7 +7287,7 @@
         "type": "object"
       },
       "post_v1_responsesRequest": {
-        "description": "JSON Schema validates structure. x-omg-request-constraints additionally enforces serde integer wire representation, UTF-8 byte limits, token alias equality, role/content rules, tool-name uniqueness and conditional field rules; provider-specific capability refusals are listed separately. No store or conversation persistence. The semantic extension also enforces the 2 MiB serialized JSON body cap and image encoding, signature, decoded-size and aggregate image-count rules.",
+        "description": "JSON Schema validates structure. x-omg-request-constraints additionally enforces serde integer wire representation, UTF-8 byte limits, token alias equality, role/content rules, tool-name uniqueness and conditional field rules; provider-specific capability refusals are listed separately. No store or conversation persistence. The semantic extension also enforces the body caps (2 MiB serialized JSON, or up to 20 MiB with at most 2 MiB outside image data URLs) and the image data URL, signature, decoded-size, role and aggregate image-count rules.",
         "oneOf": [
           {
             "additionalProperties": false,
@@ -8612,7 +8966,7 @@
     },
     "/v1/chat/completions": {
       "post": {
-        "description": "Real gateway text/function generation frontend. Admission checks live key, workspace, model and provider capabilities. Default root body cap is fixed 2097152 bytes: declared Content-Length above it is rejected before decoding; Messages uses Anthropic errors, other routes plain text. Unknown fields are 400 invalid_request_error. Usage counters are emitted only when known; Messages message_start input_tokens:0 is a compatibility placeholder, never accounting. Native-only fields and translated-route refusals are described below.",
+        "description": "Real gateway text/function generation frontend. Admission checks live key, workspace, model and provider capabilities. The body cap is 2097152 bytes. A body with inline images may exceed it only when it declares its Content-Length, is at most GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT (default 20971520 bytes), fits this replica's image input buffer (GATEWAY_IMAGE_INPUT_BUFFER_BYTES), arrives without a pause of more than 10 s and within 120 s, and has at most 2097152 bytes outside its images' data URLs. Authentication and the length checks run before any body byte is read. Every refusal is an OpenAI-shaped JSON error, never plain text: 413 payload_too_large, 408 request_timeout, 503 image_input_busy with Retry-After. Unknown fields are 400 invalid_request_error. Usage counters are emitted only when known; Messages message_start input_tokens:0 is a compatibility placeholder, never accounting. Native-only fields and translated-route refusals are described below.",
         "operationId": "post_v1_chat_completions",
         "parameters": [],
         "requestBody": {
@@ -8708,8 +9062,41 @@
           "404": {
             "$ref": "#/components/responses/OpenAiNotFound"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorEnvelope"
+                }
+              }
+            },
+            "description": "A body over 2 MiB stopped arriving: a pause of more than 10 s, under 128 KiB/s on average from its start (after a 128 KiB allowance; a pause counts against it), or more than 180 s in all (invalid_request_error, code request_timeout). Its share of the image input buffer is back; nothing was admitted or sent.",
+            "headers": {
+              "cache-control": {
+                "$ref": "#/components/headers/NoStore"
+              },
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
           "413": {
-            "$ref": "#/components/responses/OpenAiPayloadTooLarge"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorEnvelope"
+                }
+              }
+            },
+            "description": "The body is too large (invalid_request_error, code payload_too_large), always as JSON: a declared Content-Length over GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT or over this replica's whole image input buffer (refused before any body byte is read), a body without a declared length that streams past 2 MiB, or a large body with more than 2 MiB outside its images' data URLs (text cannot ride an image past the text limit).",
+            "headers": {
+              "cache-control": {
+                "$ref": "#/components/headers/NoStore"
+              },
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
           },
           "429": {
             "$ref": "#/components/responses/OpenAiTooManyRequests"
@@ -8721,7 +9108,28 @@
             "$ref": "#/components/responses/OpenAiBadGateway"
           },
           "503": {
-            "$ref": "#/components/responses/OpenAiUnavailable"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorEnvelope"
+                }
+              }
+            },
+            "description": "Authentication, catalog or accounting storage unavailable, provider configuration unavailable, an unbounded price, or every route cooling down (Retry-After); or, for a declared body over 2 MiB, this replica's image input buffer is full (server_error, code image_input_busy, Retry-After: 1): nothing was read, admitted or sent.",
+            "headers": {
+              "cache-control": {
+                "$ref": "#/components/headers/NoStore"
+              },
+              "retry-after": {
+                "$ref": "#/components/headers/RetryAfter"
+              },
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "x-should-retry": {
+                "$ref": "#/components/headers/ShouldRetryFalse"
+              }
+            }
           },
           "504": {
             "$ref": "#/components/responses/OpenAiGatewayTimeout"
@@ -8742,7 +9150,38 @@
           "body_bytes": {
             "default": 2097152,
             "env": null,
-            "source": "Fixed root RequestBodyLimitLayer in apps/gateway/src/http.rs"
+            "source": "Text limit of the image input routes (inference/image_buffer.rs TEXT_BODY_BYTES): an undeclared body, and everything outside image data"
+          },
+          "image_input_body_bytes": {
+            "default": 20971520,
+            "env": "GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT",
+            "source": "inference/image_buffer.rs ImageInputLimits::body_bytes (2 MiB to MAX_BODY_BYTES, 141907772 bytes); a declared Content-Length only"
+          },
+          "image_input_body_idle_seconds": {
+            "default": 10,
+            "env": null,
+            "source": "inference/image_buffer.rs BODY_IDLE"
+          },
+          "image_input_body_min_rate_bytes_per_second": {
+            "default": 131072,
+            "env": null,
+            "source": "inference/image_buffer.rs BODY_MIN_RATE: the slowest average from the start, after BODY_RATE_ALLOWANCE"
+          },
+          "image_input_body_total_seconds": {
+            "default": 180,
+            "env": null,
+            "source": "inference/image_buffer.rs BODY_TOTAL"
+          },
+          "image_input_buffer_bytes": {
+            "default": 50331648,
+            "env": "GATEWAY_IMAGE_INPUT_BUFFER_BYTES",
+            "source": "inference/image_buffer.rs DEFAULT_BUFFER_BYTES: in-flight large bodies per replica, each taking its declared length in whole MiB until its response ends"
+          },
+          "images": {
+            "decoded_bytes_per_image": 5242880,
+            "encoded_bytes_per_image": 6990508,
+            "maximum": 20,
+            "scope": "All images of the request combined (protocols/image_input.rs MAX_IMAGES, MAX_DECODED_BYTES). At most 256 content parts per message."
           }
         },
         "x-omg-protocol-profiles": [
@@ -8769,10 +9208,34 @@
             "trigger": "unequal non-null max_tokens and max_completion_tokens, n other than 1, non-null refusal or unsupported message/tool shape"
           },
           {
+            "code": "invalid_request_error",
+            "envelope": "OpenAiErrorEnvelope",
+            "status": 400,
+            "trigger": "an image_url that is not a PNG/JPEG/WebP/GIF base64 data URL whose bytes match its type (remote URLs included), over 5 MiB decoded, past 20 images, or outside a user message; a part carrying file or input_audio; the message names the messages.content field"
+          },
+          {
+            "code": "request_timeout",
+            "envelope": "OpenAiErrorEnvelope",
+            "status": 408,
+            "trigger": "a body over 2 MiB paused more than 10 s, arrived under 128 KiB/s on average (after a 128 KiB allowance), or took more than 180 s"
+          },
+          {
+            "code": "payload_too_large",
+            "envelope": "OpenAiErrorEnvelope",
+            "status": 413,
+            "trigger": "declared length over the image input cap or the replica's buffer, an undeclared body past 2 MiB, or more than 2 MiB outside image data"
+          },
+          {
+            "code": "image_input_busy",
+            "envelope": "OpenAiErrorEnvelope",
+            "status": 503,
+            "trigger": "the replica's image input buffer is full for a declared body over 2 MiB; Retry-After: 1"
+          },
+          {
             "code": "unsupported_capability",
             "envelope": "OpenAiErrorEnvelope",
             "status": 501,
-            "trigger": "no configured deployment supports requested capability"
+            "trigger": "no configured deployment supports requested capability, including an image when no route's adapter carries images or no deployment allows image_input"
           }
         ],
         "x-omg-request-constraints": "generation-normalization",
@@ -11244,7 +11707,7 @@
     },
     "/v1/responses": {
       "post": {
-        "description": "Real gateway text/function generation frontend. Admission checks live key, workspace, model and provider capabilities. Default root body cap is fixed 2097152 bytes: declared Content-Length above it is rejected before decoding; Messages uses Anthropic errors, other routes plain text. Unknown fields are 400 invalid_request_error. Usage counters are emitted only when known; Messages message_start input_tokens:0 is a compatibility placeholder, never accounting. Native-only fields and translated-route refusals are described below.",
+        "description": "Real gateway text/function generation frontend. Admission checks live key, workspace, model and provider capabilities. The body cap is 2097152 bytes. A body with inline images may exceed it only when it declares its Content-Length, is at most GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT (default 20971520 bytes), fits this replica's image input buffer (GATEWAY_IMAGE_INPUT_BUFFER_BYTES), arrives without a pause of more than 10 s and within 120 s, and has at most 2097152 bytes outside its images' data URLs. Authentication and the length checks run before any body byte is read. Every refusal is an OpenAI-shaped JSON error, never plain text: 413 payload_too_large, 408 request_timeout, 503 image_input_busy with Retry-After. Unknown fields are 400 invalid_request_error. Usage counters are emitted only when known; Messages message_start input_tokens:0 is a compatibility placeholder, never accounting. Native-only fields and translated-route refusals are described below.",
         "operationId": "post_v1_responses",
         "parameters": [],
         "requestBody": {
@@ -11382,8 +11845,41 @@
           "404": {
             "$ref": "#/components/responses/OpenAiNotFound"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorEnvelope"
+                }
+              }
+            },
+            "description": "A body over 2 MiB stopped arriving: a pause of more than 10 s, under 128 KiB/s on average from its start (after a 128 KiB allowance; a pause counts against it), or more than 180 s in all (invalid_request_error, code request_timeout). Its share of the image input buffer is back; nothing was admitted or sent.",
+            "headers": {
+              "cache-control": {
+                "$ref": "#/components/headers/NoStore"
+              },
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
           "413": {
-            "$ref": "#/components/responses/OpenAiPayloadTooLarge"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorEnvelope"
+                }
+              }
+            },
+            "description": "The body is too large (invalid_request_error, code payload_too_large), always as JSON: a declared Content-Length over GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT or over this replica's whole image input buffer (refused before any body byte is read), a body without a declared length that streams past 2 MiB, or a large body with more than 2 MiB outside its images' data URLs (text cannot ride an image past the text limit).",
+            "headers": {
+              "cache-control": {
+                "$ref": "#/components/headers/NoStore"
+              },
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
           },
           "429": {
             "$ref": "#/components/responses/OpenAiTooManyRequests"
@@ -11395,7 +11891,28 @@
             "$ref": "#/components/responses/OpenAiBadGateway"
           },
           "503": {
-            "$ref": "#/components/responses/OpenAiUnavailable"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorEnvelope"
+                }
+              }
+            },
+            "description": "Authentication, catalog or accounting storage unavailable, provider configuration unavailable, an unbounded price, or every route cooling down (Retry-After); or, for a declared body over 2 MiB, this replica's image input buffer is full (server_error, code image_input_busy, Retry-After: 1): nothing was read, admitted or sent.",
+            "headers": {
+              "cache-control": {
+                "$ref": "#/components/headers/NoStore"
+              },
+              "retry-after": {
+                "$ref": "#/components/headers/RetryAfter"
+              },
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "x-should-retry": {
+                "$ref": "#/components/headers/ShouldRetryFalse"
+              }
+            }
           },
           "504": {
             "$ref": "#/components/responses/OpenAiGatewayTimeout"
@@ -11416,7 +11933,38 @@
           "body_bytes": {
             "default": 2097152,
             "env": null,
-            "source": "Fixed root RequestBodyLimitLayer in apps/gateway/src/http.rs"
+            "source": "Text limit of the image input routes (inference/image_buffer.rs TEXT_BODY_BYTES): an undeclared body, and everything outside image data"
+          },
+          "image_input_body_bytes": {
+            "default": 20971520,
+            "env": "GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT",
+            "source": "inference/image_buffer.rs ImageInputLimits::body_bytes (2 MiB to MAX_BODY_BYTES, 141907772 bytes); a declared Content-Length only"
+          },
+          "image_input_body_idle_seconds": {
+            "default": 10,
+            "env": null,
+            "source": "inference/image_buffer.rs BODY_IDLE"
+          },
+          "image_input_body_min_rate_bytes_per_second": {
+            "default": 131072,
+            "env": null,
+            "source": "inference/image_buffer.rs BODY_MIN_RATE: the slowest average from the start, after BODY_RATE_ALLOWANCE"
+          },
+          "image_input_body_total_seconds": {
+            "default": 180,
+            "env": null,
+            "source": "inference/image_buffer.rs BODY_TOTAL"
+          },
+          "image_input_buffer_bytes": {
+            "default": 50331648,
+            "env": "GATEWAY_IMAGE_INPUT_BUFFER_BYTES",
+            "source": "inference/image_buffer.rs DEFAULT_BUFFER_BYTES: in-flight large bodies per replica, each taking its declared length in whole MiB until its response ends"
+          },
+          "images": {
+            "decoded_bytes_per_image": 5242880,
+            "encoded_bytes_per_image": 6990508,
+            "maximum": 20,
+            "scope": "All images of the request combined (protocols/image_input.rs MAX_IMAGES, MAX_DECODED_BYTES)."
           },
           "output_buffer_bytes": {
             "default": 4194304,
@@ -11441,10 +11989,34 @@
             "trigger": "store:true, previous_response_id, non-text format or unsupported input item"
           },
           {
+            "code": "invalid_request_error",
+            "envelope": "OpenAiErrorEnvelope",
+            "status": 400,
+            "trigger": "an input_image whose image_url is not a PNG/JPEG/WebP/GIF base64 data URL whose bytes match its type (remote URLs included), over 5 MiB decoded, past 20 images, or outside a user message; a file_id or an input_file part; the message names the input.content field"
+          },
+          {
+            "code": "request_timeout",
+            "envelope": "OpenAiErrorEnvelope",
+            "status": 408,
+            "trigger": "a body over 2 MiB paused more than 10 s, arrived under 128 KiB/s on average (after a 128 KiB allowance), or took more than 180 s"
+          },
+          {
+            "code": "payload_too_large",
+            "envelope": "OpenAiErrorEnvelope",
+            "status": 413,
+            "trigger": "declared length over the image input cap or the replica's buffer, an undeclared body past 2 MiB, or more than 2 MiB outside image data"
+          },
+          {
+            "code": "image_input_busy",
+            "envelope": "OpenAiErrorEnvelope",
+            "status": 503,
+            "trigger": "the replica's image input buffer is full for a declared body over 2 MiB; Retry-After: 1"
+          },
+          {
             "code": "unsupported_capability",
             "envelope": "OpenAiErrorEnvelope",
             "status": 501,
-            "trigger": "no configured deployment supports requested capability"
+            "trigger": "no configured deployment supports requested capability, including an image when no route's adapter carries images or no deployment allows image_input"
           }
         ],
         "x-omg-request-constraints": "generation-normalization",

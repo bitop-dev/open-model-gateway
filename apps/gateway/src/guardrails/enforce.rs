@@ -418,8 +418,10 @@ fn mark_refused(decision: &mut Decision) {
 /// deferred tools, earlier thinking, `anthropic-beta` values). A value present in
 /// several forms counts once. Consecutive system messages, and a native
 /// message's text blocks, are also read joined, so text split across blocks
-/// is found. Images, audio, and documents that are not plain text cannot be
-/// read.
+/// is found, and so are a message's text parts. Images (image parts of
+/// Chat Completions and Responses messages, native image blocks), audio, and
+/// documents that are not plain text cannot be read: the request is
+/// uninspectable.
 pub fn chat_inspection(request: &ChatRequest) -> Inspection<'_> {
     let mut input = Inspection::default();
     let mut system = Vec::new();
@@ -429,11 +431,33 @@ pub fn chat_inspection(request: &ChatRequest) -> Inspection<'_> {
             Role::Tool => Part::ToolResult,
             Role::User | Role::Assistant => Part::Content,
         };
-        if let Some(text) = &m.content {
-            input.push(text, part);
-            if part == Part::System {
-                system.push(text.as_str());
+        match &m.content {
+            Some(crate::inference::types::Content::Text(text)) => {
+                input.push(text, part);
+                if part == Part::System {
+                    system.push(text.as_str());
+                }
             }
+            Some(crate::inference::types::Content::Parts(parts)) => {
+                // Text parts are read alone and joined (text split across
+                // parts is found); an image cannot be read, so the request is
+                // uninspectable. Nothing of an image is read, kept or shown.
+                let mut texts = Vec::new();
+                for p in parts {
+                    match p {
+                        crate::inference::types::Part::Text(text) => {
+                            input.push(text, part);
+                            texts.push(text.as_str());
+                            if part == Part::System {
+                                system.push(text.as_str());
+                            }
+                        }
+                        crate::inference::types::Part::Image(_) => input.uninspectable = true,
+                    }
+                }
+                join(&mut input, &mut texts, part);
+            }
+            None => {}
         }
         if part != Part::System {
             join(&mut input, &mut system, Part::System);

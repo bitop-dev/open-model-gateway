@@ -103,6 +103,7 @@ impl Mock {
 }
 fn target(model: &str) -> Deployment {
     Deployment {
+        image_input: false,
         id: uuid::Uuid::new_v4(),
         provider: "openai".into(),
         upstream_model: model.into(),
@@ -326,6 +327,18 @@ fn chat_request() -> BatchRequest {
         max_output_tokens: Some(16),
         stream: false,
     })
+}
+
+#[test]
+fn a_native_line_never_carries_an_image_or_its_placeholder() {
+    let t = target("gpt-x");
+    let line = BatchRequest::Chat(crate::providers::contract::image_request(false));
+    for endpoint in [BatchEndpoint::ChatCompletions, BatchEndpoint::Responses] {
+        assert_eq!(
+            encode_native_line(&t, endpoint, "l0", &line).err(),
+            Some(InferenceError::InvalidField("image"))
+        );
+    }
 }
 
 #[test]

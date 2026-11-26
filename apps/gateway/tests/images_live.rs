@@ -21,6 +21,7 @@ use open_model_gateway::{
 
 fn target(provider: &str, model: &str, key: &str) -> Deployment {
     Deployment {
+        image_input: false,
         id: uuid::Uuid::new_v4(),
         provider: provider.into(),
         upstream_model: model.into(),

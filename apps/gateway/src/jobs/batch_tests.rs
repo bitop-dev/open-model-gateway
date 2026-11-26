@@ -148,7 +148,12 @@ impl Fake {
     /// ungated-admission tests can flip `permissive` around a single judged
     /// call instead of only before or after every call).
     fn judge(&self, request: &ChatRequest) -> Result<(), InferenceError> {
-        match request.messages[0].content.as_deref().unwrap_or_default() {
+        match request.messages[0]
+            .content
+            .as_ref()
+            .and_then(crate::inference::types::Content::text)
+            .unwrap_or_default()
+        {
             "strict-tool" => Err(InferenceError::Unsupported),
             "bad-tool-args" => Err(InferenceError::InvalidRequest),
             // #238 multi-route tests: every provider refuses, but not with
@@ -218,6 +223,7 @@ impl ProviderAdapter for Fake {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            image_input: false,
             text_chat: true,
             streaming: false,
             tools: self.script.lock().unwrap().accept_tools,
@@ -267,7 +273,12 @@ impl ProviderAdapter for Fake {
         _: &Deployment,
         request: ChatRequest,
     ) -> Result<ProviderOutput, InferenceError> {
-        let text = request.messages[0].content.clone().unwrap_or_default();
+        let text = request.messages[0]
+            .content
+            .as_ref()
+            .and_then(crate::inference::types::Content::text)
+            .unwrap_or_default()
+            .to_owned();
         {
             let mut script = self.script.lock().unwrap();
             script.executed.push(text.clone());
@@ -387,7 +398,12 @@ impl ProviderAdapter for Fake {
             return Err(error);
         }
         let text = match request {
-            BatchRequest::Chat(r) => r.messages[0].content.clone().unwrap_or_default(),
+            BatchRequest::Chat(r) => r.messages[0]
+                .content
+                .as_ref()
+                .and_then(crate::inference::types::Content::text)
+                .unwrap_or_default()
+                .to_owned(),
             BatchRequest::Embeddings(r) => r.input.join(","),
         };
         if text == "unencodable" {

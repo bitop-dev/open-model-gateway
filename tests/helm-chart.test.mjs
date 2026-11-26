@@ -1060,3 +1060,49 @@ test("the OIDC issuer's private CA is mounted for GATEWAY_OIDC_CA_FILE from one 
     /exactly one of secretName or configMapName/,
   );
 });
+
+// The image input buffer's worst case in a gateway container, from the
+// rendered chart and the gateway's own bounds (docs/operations.md "Image
+// input memory"): a running process and the whole buffer at the measured
+// worst-case copy count. Text bodies are not bounded by any buffer, so the check keeps
+// this within half the container's memory limit, leaving the rest to them.
+function imageMemory(rendered) {
+  const source = readFileSync(join(root, "apps/gateway/src/inference/image_buffer.rs"), "utf8");
+  const mib = (pattern, what) => {
+    const match = source.match(pattern);
+    assert.ok(match, `${what} not found`);
+    return Number(match[1]);
+  };
+  const deployments = docsOfKind(rendered, "Deployment").filter((d) => /^\s+app\.kubernetes\.io\/component: gateway$/m.test(d));
+  assert.equal(deployments.length, 1, "one gateway Deployment");
+  const [deployment] = deployments;
+  const limit = deployment.match(/^\s+limits:\n(?:\s+cpu: [^\n]+\n)?\s+memory: (\d+)(Mi|Gi)$/m);
+  assert.ok(limit, "gateway memory limit");
+  const limitMiB = Number(limit[1]) * (limit[2] === "Gi" ? 1024 : 1);
+  const configMaps = docsOfKind(rendered, "ConfigMap").join("\n");
+  const setting = (key, fallback) => {
+    const own = [...deployment.matchAll(new RegExp(`-\\s+name: ${key}\\n\\s+value(From)?: "?(\\d*)"?$`, "gm"))].at(-1);
+    if (own) {
+      assert.ok(!own[1], `${key} comes from a reference the chart cannot read`);
+      return Number(own[2]);
+    }
+    const mapped = configMaps.match(new RegExp(`^  ${key}: "?(\\d+)"?$`, "m"));
+    return mapped ? Number(mapped[1]) : fallback;
+  };
+  const MIB = 1024 * 1024;
+  const factor = mib(/pub const WORST_COPIES: usize = (\d+);/, "worst-case copies");
+  const baseline = mib(/pub const BASELINE_BYTES: usize = (\d+) \* MIB;/, "baseline");
+  const budget = setting("GATEWAY_IMAGE_INPUT_BUFFER_BYTES",
+    mib(/pub const DEFAULT_BUFFER_BYTES: usize = (\d+) \* MIB;/, "default budget") * MIB) / MIB;
+  return { limitMiB, worstMiB: baseline + budget * factor };
+}
+
+test("the image input buffer's worst case stays within half the gateway's memory limit", () => {
+  for (const [name, args] of Object.entries(profiles)) {
+    const { limitMiB, worstMiB } = imageMemory(helmTemplate(args));
+    assert.ok(worstMiB * 2 <= limitMiB, `${name}: the image input buffer may hold ${worstMiB} MiB; the limit is ${limitMiB} MiB`);
+  }
+  // A larger buffer set on the chart no longer fits the default limit.
+  const larger = imageMemory(helmTemplate([...profiles["external-db"], "--set-string", `gateway.env.GATEWAY_IMAGE_INPUT_BUFFER_BYTES=${200 * 1024 * 1024}`]));
+  assert.ok(larger.worstMiB * 2 > larger.limitMiB, `${larger.worstMiB} MiB`);
+});

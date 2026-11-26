@@ -49,7 +49,7 @@ use uuid::Uuid;
 use super::{
     Engine,
     error::InferenceError,
-    types::{ApiProtocol, ChatRequest},
+    types::{ApiProtocol, ChatRequest, Content},
 };
 use crate::auth::Principal;
 
@@ -104,7 +104,7 @@ pub struct TokenCount {
 /// Thinking history is not counted, because translated routes remove it.
 pub fn estimate(request: &ChatRequest) -> u64 {
     let messages = request.messages.iter().map(|m| {
-        m.content.as_ref().map_or(0, String::len)
+        m.content.as_ref().map_or(0, Content::text_len)
             + m.tool_call_id.as_ref().map_or(0, String::len)
             + m.tool_calls
                 .iter()

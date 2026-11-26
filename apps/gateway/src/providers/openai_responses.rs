@@ -29,7 +29,11 @@ pub(super) async fn execute(
         .client
         .post(format!("{}/responses", adapter.base))
         .header(reqwest::header::AUTHORIZATION, auth)
-        .json(&encode(&target.upstream_model, &request))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(super::image_body::json_body(
+            &encode(&target.upstream_model, &request),
+            &request,
+        )?)
         .send()
         .await
         .map_err(send_error(crate::egress::UpstreamClient::Openai))?;
@@ -57,14 +61,38 @@ pub(super) async fn execute(
         },
     )))
 }
+/// Responses message content: a string, or `input_text`/`input_image`
+/// parts whose images are placeholders the body splices (`image_body`).
+fn content(content: &Content, images: &mut usize) -> Value {
+    match content {
+        Content::Text(text) => json!(text),
+        Content::Parts(parts) => Value::Array(
+            parts
+                .iter()
+                .map(|part| match part {
+                    Part::Text(text) => json!({"type":"input_text","text":text}),
+                    Part::Image(image) => {
+                        let mut value = json!({"type":"input_image","image_url":super::image_body::placeholder(*images)});
+                        *images += 1;
+                        if let Some(detail) = image.detail() {
+                            value["detail"] = json!(detail.as_str());
+                        }
+                        value
+                    }
+                })
+                .collect(),
+        ),
+    }
+}
 fn encode(model: &str, request: &ChatRequest) -> Value {
     let mut input = vec![];
+    let mut images = 0;
     for message in &request.messages {
         if message.role == Role::Tool {
-            input.push(json!({"type":"function_call_output","call_id":message.tool_call_id,"output":message.content.as_deref().unwrap_or("")}));
+            input.push(json!({"type":"function_call_output","call_id":message.tool_call_id,"output":message.content.as_ref().and_then(Content::text).unwrap_or("")}));
         } else {
-            if let Some(text) = &message.content {
-                input.push(json!({"role":message.role,"content":text}));
+            if let Some(c) = &message.content {
+                input.push(json!({"role":message.role,"content":content(c, &mut images)}));
             }
             for call in &message.tool_calls {
                 input.push(json!({"type":"function_call","call_id":call.id,"name":call.name,"arguments":call.arguments}));

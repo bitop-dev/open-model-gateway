@@ -167,6 +167,7 @@ impl ProviderAdapter for BedrockAdapter {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            image_input: false,
             text_chat: true,
             streaming: true,
             tools: true,
@@ -435,7 +436,7 @@ impl Turns {
     fn push(&mut self, message: &Message) -> Result<()> {
         self.size = self
             .size
-            .checked_add(message.content.as_ref().map_or(0, String::len))
+            .checked_add(message.content.as_ref().map_or(0, Content::text_len))
             .ok_or_else(invalid)?;
         if self.size > OUTPUT_LIMIT {
             return Err(invalid());
@@ -481,10 +482,12 @@ impl Turns {
         let text = message
             .content
             .as_ref()
+            .map(Content::require_text)
+            .transpose()?
             .filter(|s| !s.is_empty())
             .ok_or_else(invalid)?;
         self.system
-            .push(aws::SystemContentBlock::Text(text.clone()));
+            .push(aws::SystemContentBlock::Text(text.to_owned()));
         Ok(())
     }
 
@@ -496,11 +499,15 @@ impl Turns {
         }
         // Canonical tool result content is a string. Preserve it verbatim, including JSON
         // strings; parsing/re-emitting would alter its semantics. Tool-use input is JSON.
-        let text = message.content.as_ref().ok_or_else(invalid)?;
+        let text = message
+            .content
+            .as_ref()
+            .ok_or_else(invalid)?
+            .require_text()?;
         content.push(aws::ContentBlock::ToolResult(
             aws::ToolResultBlock::builder()
                 .tool_use_id(id)
-                .content(aws::ToolResultContentBlock::Text(text.clone()))
+                .content(aws::ToolResultContentBlock::Text(text.to_owned()))
                 // Bedrock evaluates status support for the selected model or profile.
                 .set_status(
                     message
@@ -515,10 +522,14 @@ impl Turns {
 
     fn text_and_calls(&mut self, message: &Message) -> Result<Vec<aws::ContentBlock>> {
         let mut content = Vec::new();
-        if let Some(text) = &message.content
+        if let Some(text) = message
+            .content
+            .as_ref()
+            .map(Content::require_text)
+            .transpose()?
             && !text.is_empty()
         {
-            content.push(aws::ContentBlock::Text(text.clone()));
+            content.push(aws::ContentBlock::Text(text.to_owned()));
         }
         if message.tool_calls.len() > MAX_TOOLS {
             return Err(invalid());

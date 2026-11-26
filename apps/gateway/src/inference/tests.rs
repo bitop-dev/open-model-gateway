@@ -240,6 +240,7 @@ impl ProviderAdapter for Adapter {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            image_input: false,
             text_chat: true,
             streaming: true,
             tools: false,
@@ -361,6 +362,7 @@ fn principal() -> Principal {
 fn fixture(mode: Mode, limits: EngineLimits) -> (Engine, Arc<MemoryRepository>, Arc<Adapter>) {
     let repository = Arc::new(MemoryRepository::default());
     repository.deployments.lock().unwrap().push(Deployment {
+        image_input: false,
         id: Uuid::new_v4(),
         provider: "future_vendor".into(),
         upstream_model: "private-model".into(),
@@ -442,6 +444,7 @@ impl ProviderAdapter for EmbeddingAdapter {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            image_input: false,
             text_chat: false,
             streaming: false,
             tools: false,

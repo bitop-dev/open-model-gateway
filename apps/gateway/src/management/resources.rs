@@ -38,22 +38,18 @@ fn management_openapi_slice3_resource_request_vectors() {
     vectors::<DeploymentInput>(
         "POST",
         "/api/v1/platform/deployments",
-        json!({"model_id":nil,"provider_connection_id":nil,"upstream_model":"contract","enabled":true}),
+        json!({"model_id":nil,"provider_connection_id":nil,"upstream_model":"contract","enabled":true,"image_input":true}),
     );
-    for path in [
+    vectors::<super::deployment_image_input::DeploymentUpdate>(
+        "PATCH",
         "/api/v1/platform/deployments/{id}",
+        json!({"enabled":true,"image_input":true}),
+    );
+    vectors::<Enabled>(
+        "POST",
         "/api/v1/platform/deployments/{id}/configuration/preview",
-    ] {
-        vectors::<Enabled>(
-            if path.ends_with("preview") {
-                "POST"
-            } else {
-                "PATCH"
-            },
-            path,
-            json!({"enabled":true}),
-        );
-    }
+        json!({"enabled":true}),
+    );
 }
 
 /// The catalog advisory lock precedes the single installation lock everywhere.
@@ -687,6 +683,7 @@ pub(crate) async fn audit(
                     | "email_changed"
                     | "oidc_link_changed"
                     | "version"
+                    | "image_input"
             ) && (v.is_boolean()
                 || v.is_number()
                 || v.as_str().is_some_and(|s| {
@@ -726,7 +723,7 @@ pub(super) fn platform_routes() -> Router<Store> {
         .route(
             "/api/v1/platform/deployments/{id}",
             get(super::models_ux::deployment_detail)
-                .patch(update_deployment)
+                .patch(super::deployment_image_input::update_deployment)
                 .delete(delete_deployment),
         )
         .route(
@@ -875,7 +872,7 @@ async fn deployments(
         offset: p.offset,
     }
     .bounds()?;
-    let data:Vec<Value>=sqlx::query_scalar("SELECT jsonb_build_object('id',d.id,'model_id',d.model_id,'model_public_name',m.public_name,'provider_connection_id',d.provider_connection_id,'provider_name',p.name,'upstream_model',d.upstream_model,'enabled',d.enabled) FROM deployments d JOIN models m ON m.id=d.model_id JOIN provider_connections p ON p.id=d.provider_connection_id WHERE ($3::text IS NULL OR strpos(lower(d.upstream_model),lower($3))>0) AND ($4::boolean IS NULL OR d.enabled=$4) AND ($5::uuid IS NULL OR d.model_id=$5) AND ($6::uuid IS NULL OR d.provider_connection_id=$6) ORDER BY d.created_at,d.id LIMIT $1 OFFSET $2").bind(l).bind(o).bind(search(p.q.as_deref())?).bind(p.enabled).bind(p.model_id).bind(p.provider_connection_id).fetch_all(&mut *tx).await?;
+    let data:Vec<Value>=sqlx::query_scalar("SELECT jsonb_build_object('id',d.id,'model_id',d.model_id,'model_public_name',m.public_name,'provider_connection_id',d.provider_connection_id,'provider_name',p.name,'upstream_model',d.upstream_model,'enabled',d.enabled,'image_input',d.image_input) FROM deployments d JOIN models m ON m.id=d.model_id JOIN provider_connections p ON p.id=d.provider_connection_id WHERE ($3::text IS NULL OR strpos(lower(d.upstream_model),lower($3))>0) AND ($4::boolean IS NULL OR d.enabled=$4) AND ($5::uuid IS NULL OR d.model_id=$5) AND ($6::uuid IS NULL OR d.provider_connection_id=$6) ORDER BY d.created_at,d.id LIMIT $1 OFFSET $2").bind(l).bind(o).bind(search(p.q.as_deref())?).bind(p.enabled).bind(p.model_id).bind(p.provider_connection_id).fetch_all(&mut *tx).await?;
     tx.commit().await?;
     Ok(Json(json!({"data":data})))
 }
@@ -1164,7 +1161,7 @@ pub(super) async fn insert_model(
 pub(super) struct Enabled {
     pub(super) enabled: bool,
 }
-async fn toggle(
+pub(super) async fn toggle(
     s: Store,
     u: ManagementPrincipal,
     id: Uuid,
@@ -1303,14 +1300,6 @@ async fn delete_deployment(
 ) -> DetailedResult {
     toggle(s, u, id, Enabled { enabled: false }, "deployments").await
 }
-async fn update_deployment(
-    State(s): State<Store>,
-    Extension(u): Extension<ManagementPrincipal>,
-    Path(id): Path<Uuid>,
-    Json(b): Json<Enabled>,
-) -> DetailedResult {
-    toggle(s, u, id, b, "deployments").await
-}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct DeploymentInput {
@@ -1318,6 +1307,9 @@ pub(super) struct DeploymentInput {
     pub(super) provider_connection_id: Uuid,
     pub(super) upstream_model: String,
     pub(super) enabled: bool,
+    /// Inline image input on this route (0094; default off).
+    #[serde(default)]
+    pub(super) image_input: bool,
 }
 async fn create_deployment(
     State(s): State<Store>,
@@ -1372,8 +1364,22 @@ pub(super) async fn insert_deployment(
     }
     configuration_actor(tx, u).await?;
     let id = Uuid::new_v4();
-    sqlx::query("INSERT INTO deployments(id,model_id,provider_connection_id,upstream_model,enabled) VALUES($1,$2,$3,$4,$5)").bind(id).bind(b.model_id).bind(b.provider_connection_id).bind(b.upstream_model).bind(b.enabled).execute(&mut **tx).await?;
-    // The deployment trigger atomically records creation, revision and audit.
+    sqlx::query("INSERT INTO deployments(id,model_id,provider_connection_id,upstream_model,enabled,image_input) VALUES($1,$2,$3,$4,$5,$6)").bind(id).bind(b.model_id).bind(b.provider_connection_id).bind(b.upstream_model).bind(b.enabled).bind(b.image_input).execute(&mut **tx).await?;
+    // The deployment trigger atomically records creation, revision and audit
+    // of enablement; an image-input opt-in at creation is audited like a
+    // later change of it.
+    if b.image_input {
+        audit(
+            tx,
+            u,
+            None,
+            "deployment.image_input_changed",
+            "deployment",
+            Some(id),
+            json!({"image_input": true}),
+        )
+        .await?;
+    }
     Ok(id)
 }
 /// Audit actions recorded as a side effect of a person signing in (not changes they made).

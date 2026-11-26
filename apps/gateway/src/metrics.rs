@@ -255,6 +255,7 @@ pub struct Metrics {
     key_issuance_refused: Family<L2, Counter>,
     egress_denied: Family<L1, Counter>,
     guardrails: GuardrailMetrics,
+    image_input: ImageInputFamilies,
     upstream_connection_lost: Family<L1, Counter>,
     upstream_connections_opened: Family<L1, Counter>,
     job_lease_renewals: Family<L1, Counter>,
@@ -289,6 +290,14 @@ pub struct Metrics {
     providers: Mutex<HashSet<String>>,
     models: Mutex<HashSet<String>>,
     reservations_refreshed: Mutex<Option<Instant>>,
+}
+
+/// The image input buffer's gauges and its refusals by reason.
+#[derive(Default)]
+struct ImageInputFamilies {
+    in_use: Gauge,
+    size: Gauge,
+    refusals: Family<L1, Counter>,
 }
 
 pub static METRICS: LazyLock<Metrics> = LazyLock::new(Metrics::new);

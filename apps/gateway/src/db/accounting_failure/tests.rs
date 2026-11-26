@@ -505,6 +505,7 @@ async fn a_failed_route_lookup_is_recorded_at_its_own_stage() {
         user_id: None,
     };
     let candidate = crate::inference::types::Deployment {
+        image_input: false,
         id: uuid::Uuid::new_v4(),
         provider: "openai".into(),
         upstream_model: "upstream".into(),

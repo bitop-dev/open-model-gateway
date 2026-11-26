@@ -96,6 +96,7 @@ impl Metrics {
             key_issuance_refused: Family::default(),
             egress_denied: Family::default(),
             guardrails: GuardrailMetrics::new(),
+            image_input: ImageInputFamilies::default(),
             upstream_connection_lost: every_client(),
             upstream_connections_opened: every_client(),
             job_lease_renewals: renewal_outcomes(),
@@ -441,6 +442,21 @@ impl Metrics {
 
     /// Egress, authentication throttling, configuration polling, leases and background runs.
     fn register_operations(&self, registry: &mut Registry) {
+        registry.register(
+            "image_input_buffer_in_use_bytes",
+            "Bytes of this replica's image input buffer held by large request bodies right now (each body's declared length, rounded up to whole MiB)",
+            self.image_input.in_use.clone(),
+        );
+        registry.register(
+            "image_input_buffer_bytes",
+            "Configured size of this replica's image input buffer (GATEWAY_IMAGE_INPUT_BUFFER_BYTES, in whole MiB)",
+            self.image_input.size.clone(),
+        );
+        registry.register(
+            "image_input_refusals",
+            "Large image input bodies refused, by reason (busy: the buffer is spent, 503; too_large: over the route cap or the buffer, longer than declared, or more than 2 MiB outside image data, 413; timeout: the body stopped arriving, 408)",
+            self.image_input.refusals.clone(),
+        );
         registry.register(
             "egress_denied",
             "Outbound connections refused by the egress policy, by purpose (provider, oidc, storage, catalog, smtp, audit)",

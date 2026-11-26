@@ -55,6 +55,7 @@ impl SecretResolver for Resolver {
 }
 fn target() -> Deployment {
     Deployment {
+        image_input: false,
         id: uuid::Uuid::new_v4(),
         provider: "openai".into(),
         upstream_model: "private".into(),
@@ -544,4 +545,24 @@ async fn rejected_terminal_takes_accounting_from_the_original_frame() {
     assert_eq!(observed.output_tokens, Some(2));
     assert_eq!(observed.billing.unwrap().cache_read_input_tokens, Some(1));
     assert_eq!(observed.reported_model.unwrap().as_str(), "wire-model");
+}
+
+#[tokio::test]
+async fn inline_images_reach_the_responses_wire_as_input_image_parts() {
+    use super::super::contract::{IMAGE_URL, image_request};
+    let mock = Mock::new(200, None).await;
+    mock.adapter
+        .execute_protocol(&target(), image_request(false), ApiProtocol::Responses)
+        .await
+        .unwrap();
+    let captured = mock.capture.lock().unwrap();
+    assert_eq!(captured[0].0["content-type"], "application/json");
+    assert_eq!(
+        captured[0].2["input"][0]["content"],
+        json!([
+            {"type":"input_text","text":"what is"},
+            {"type":"input_image","image_url":IMAGE_URL,"detail":"low"},
+            {"type":"input_text","text":"this?"}
+        ])
+    );
 }

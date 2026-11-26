@@ -123,6 +123,13 @@ pub(super) const OPENAI_TRANSPORT: &[(&str, &str, &str)] = &[
         "payload_too_large",
         "src/protocols/mod.rs",
     ),
+    // The image input routes' large-body refusals (`inference::image_buffer`).
+    (
+        "invalid_request_error",
+        "request_timeout",
+        "src/protocols/mod.rs",
+    ),
+    ("server_error", "image_input_busy", "src/protocols/mod.rs"),
 ];
 /// Anthropic `error.type` values rendered outside `error_body`.
 pub(super) const ANTHROPIC_TRANSPORT: &[(&str, &str)] = &[
@@ -340,7 +347,7 @@ pub(super) fn components() -> Result<Value> {
         "RequestId":{"description":"The gateway's request ID (UUIDv7), also the attempt ID of a root request.","required":true,"schema":{"type":"string","format":"uuid"}},
         "NoStore":{"description":"Everything is uncacheable.","required":true,"schema":{"const":"no-store"}},
         "ShouldRetryFalse":{"description":"Permanent refusals (unsupported capability, budget, price or token-reservation denials) tell SDKs not to retry.","required":false,"schema":{"const":"false"}},
-        "RetryAfter":{"description":"Seconds to wait; only a cooling-down route sends it.","required":false,"schema":{"type":"string","pattern":"^[1-9][0-9]*$"}},
+        "RetryAfter":{"description":"Seconds to wait: sent when every route of the model is cooling down and, on Chat Completions and Responses, when this replica's image input buffer is full (1).","required":false,"schema":{"type":"string","pattern":"^[1-9][0-9]*$"}},
         "WwwAuthenticate":{"description":"Always `Bearer` on a 401.","required":true,"schema":{"const":"Bearer"}}
     });
     let header = |names: &[&str]| -> Value {

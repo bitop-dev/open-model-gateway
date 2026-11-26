@@ -864,6 +864,7 @@ impl crate::providers::ProviderAdapter for IdleRealtime {
     }
     fn capabilities(&self) -> crate::inference::types::Capabilities {
         crate::inference::types::Capabilities {
+            image_input: false,
             text_chat: false,
             streaming: false,
             tools: false,

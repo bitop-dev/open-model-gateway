@@ -113,7 +113,13 @@ fn own_snapshots_are_stateless_followup_input() {
         input.push(json!({"role":"user","content":"continue"}));
         let normalized = parse(json!({"model":"m","input":input})).unwrap();
         assert_eq!(normalized.messages.len(), 5);
-        assert_eq!(normalized.messages[1].content, response.content);
+        assert_eq!(
+            normalized.messages[1]
+                .content
+                .as_ref()
+                .and_then(Content::text),
+            response.content.as_deref()
+        );
         assert_eq!(normalized.messages[2].tool_calls.len(), 1);
         let call = &normalized.messages[2].tool_calls[0];
         assert_eq!(call.id, response.tool_calls[0].id);
@@ -123,7 +129,13 @@ fn own_snapshots_are_stateless_followup_input() {
             normalized.messages[3].tool_call_id.as_deref(),
             Some("semantic-call")
         );
-        assert_eq!(normalized.messages[4].content.as_deref(), Some("continue"));
+        assert_eq!(
+            normalized.messages[4]
+                .content
+                .as_ref()
+                .and_then(crate::inference::types::Content::text),
+            Some("continue")
+        );
         assert_eq!(normalized.max_output_tokens, None);
     }
 }
@@ -149,7 +161,13 @@ fn supported_item_metadata_and_empty_annotations() {
                 }
                 let r = parse(json!({"model":"m","input":[item.clone()]})).unwrap();
                 match item["type"].as_str().unwrap() {
-                    "message" => assert_eq!(r.messages[0].content.as_deref(), Some("a世界")),
+                    "message" => assert_eq!(
+                        r.messages[0]
+                            .content
+                            .as_ref()
+                            .and_then(crate::inference::types::Content::text),
+                        Some("a世界")
+                    ),
                     "function_call" => {
                         assert_eq!(r.messages[0].tool_calls[0].id, "c");
                         assert_eq!(r.messages[0].tool_calls[0].arguments, "{ \"x\": 1 }");
@@ -558,4 +576,77 @@ async fn mid_stream_failure_after_deltas_never_completes() {
     assert!(b.contains("event: error"));
     assert!(!b.contains("event: response.completed"));
     assert!(!b.contains("event: response.output_text.done"));
+}
+
+const PNG_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==";
+fn input(content: Value, role: &str) -> Result<ChatRequest> {
+    parse(json!({"model":"m","input":[{"role":role,"content":content}]}))
+}
+#[test]
+fn input_images_keep_their_order_and_detail() {
+    let request = input(
+        json!([
+            {"type":"input_text","text":"a"},
+            {"type":"input_text","text":"b"},
+            {"type":"input_image","image_url":PNG_URL,"detail":"low"},
+            {"type":"input_text","text":"c"}
+        ]),
+        "user",
+    )
+    .unwrap();
+    let Some(Content::Parts(parts)) = &request.messages[0].content else {
+        panic!("parts")
+    };
+    assert_eq!(parts.len(), 3);
+    assert!(matches!(&parts[0], Part::Text(t) if t == "ab"));
+    let Part::Image(image) = &parts[1] else {
+        panic!("image")
+    };
+    assert_eq!(image.data_url(), PNG_URL);
+    assert_eq!(image.detail(), Some(ImageDetail::Low));
+    assert!(matches!(&parts[2], Part::Text(t) if t == "c"));
+    // Text-only content is one text, as before.
+    let text = input(json!([{"type":"input_text","text":"x"}]), "user").unwrap();
+    assert_eq!(
+        text.messages[0].content.as_ref().and_then(Content::text),
+        Some("x")
+    );
+}
+#[test]
+fn file_and_remote_images_and_images_outside_user_messages_are_refused_by_name() {
+    let refused = |content: Value, role: &str| input(content, role).err();
+    assert_eq!(
+        refused(json!([{"type":"input_image","file_id":"file-1"}]), "user"),
+        Some(InferenceError::InvalidField("input.content.file_id"))
+    );
+    assert_eq!(
+        refused(
+            json!([{"type":"input_image","image_url":"https://example.invalid/a.png"}]),
+            "user"
+        ),
+        Some(InferenceError::InvalidField("input.content.image_url"))
+    );
+    assert_eq!(
+        refused(json!([{"type":"input_file","file_id":"file-1"}]), "user"),
+        Some(InferenceError::InvalidField("input.content.input_file"))
+    );
+    assert_eq!(
+        refused(
+            json!([{"type":"input_image","image_url":PNG_URL}]),
+            "assistant"
+        ),
+        Some(InferenceError::InvalidField("input.content.input_image"))
+    );
+    assert_eq!(
+        refused(
+            json!([{"type":"input_image","image_url":PNG_URL,"detail":"ultra"}]),
+            "user"
+        ),
+        Some(InferenceError::InvalidField("input.content.image_url"))
+    );
+    assert!(
+        batch_request(json!({"model":"m","input":[{"role":"user","content":[
+            {"type":"input_image","image_url":PNG_URL}]}]}))
+        .is_err()
+    );
 }
