@@ -42,6 +42,7 @@ impl InferenceRepository for Repo {
         Ok(routes
             .into_iter()
             .map(|id| Deployment {
+                image_input: false,
                 id,
                 provider: "fake".into(),
                 upstream_model: "upstream".into(),
@@ -145,6 +146,7 @@ impl ProviderAdapter for Fake {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            image_input: false,
             text_chat: false,
             streaming: false,
             tools: false,

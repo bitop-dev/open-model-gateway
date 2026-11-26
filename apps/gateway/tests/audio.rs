@@ -48,6 +48,7 @@ impl ProviderAdapter for Fixture {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            image_input: false,
             text_chat: false,
             streaming: false,
             tools: false,

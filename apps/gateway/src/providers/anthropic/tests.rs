@@ -14,6 +14,7 @@ impl SecretResolver for Resolver {
 }
 pub(super) fn target() -> Deployment {
     Deployment {
+        image_input: false,
         id: uuid::Uuid::new_v4(),
         provider: "anthropic".into(),
         upstream_model: "private-model".into(),
@@ -668,4 +669,10 @@ async fn empty_signature_sdk_anthropic_is_refused_before_admission(pool: sqlx::P
     .await;
     assert_eq!(attempts, 0);
     assert!(mock.capture.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn images_are_refused_before_anything_is_sent() {
+    let adapter = AnthropicAdapter::for_test(Arc::new(Resolver), "http://127.0.0.1:9/v1".into());
+    super::super::contract::assert_images_refused(&adapter, &target()).await;
 }

@@ -163,6 +163,7 @@ impl ProviderAdapter for Adapter {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            image_input: false,
             text_chat: true,
             streaming: true,
             tools: false,
@@ -194,6 +195,7 @@ impl ProviderAdapter for Adapter {
 
 fn deployment() -> Deployment {
     Deployment {
+        image_input: false,
         id: Uuid::new_v4(),
         provider: "mock".into(),
         upstream_model: "private-model".into(),

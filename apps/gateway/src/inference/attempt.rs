@@ -219,11 +219,15 @@ impl Engine {
         let mut refused = Vec::new();
         let mut verdicts: std::collections::HashMap<String, Result<(), InferenceError>> =
             std::collections::HashMap::new();
+        // An image goes only to a route whose operator allows image input
+        // (0094), before the route plan, so failover never lands it elsewhere.
+        let images = request.has_images();
         for deployment in deployments {
             if !deployment
                 .supported_protocols
                 .iter()
                 .any(|p| p == protocol.as_str())
+                || (images && !deployment.image_input)
             {
                 continue;
             }

@@ -3,6 +3,7 @@ pub mod batches;
 pub mod chat_completions;
 pub mod embeddings;
 pub mod files;
+pub mod image_input;
 pub mod images;
 pub mod messages;
 pub mod realtime;
@@ -11,6 +12,8 @@ pub mod responses;
 pub mod systemone;
 pub mod videos;
 
+#[cfg(all(test, feature = "integration-tests"))]
+mod image_input_http_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod nullable_tests;
 #[cfg(all(test, feature = "integration-tests"))]
@@ -97,7 +100,64 @@ fn workload_error(error: InferenceError, validation_status: StatusCode) -> Respo
     }
     response
 }
-fn payload_too_large() -> Response {
+/// A body larger than the image input route allows, or than this replica's
+/// whole image input buffer: nothing of it was read.
+pub(crate) fn image_input_too_large() -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        axum::Json(serde_json::json!({"error":{"message":"Request body too large for image input on this gateway","type":"invalid_request_error","code":"payload_too_large","param":null}})),
+    )
+        .into_response()
+}
+/// The replica's image input buffer is spent for now: nothing was read,
+/// admitted or sent (`inference::image_buffer`).
+pub(crate) fn image_input_busy() -> Response {
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        axum::Json(serde_json::json!({"error":{"message":"The gateway is buffering as many large image requests as it can; nothing was read or sent. Retry after the indicated delay","type":"server_error","code":"image_input_busy","param":null}})),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from(crate::inference::image_buffer::BUSY_RETRY_SECONDS),
+    );
+    response
+}
+/// A large image input body that stopped arriving in time
+/// (`inference::image_buffer::BODY_IDLE`/`BODY_TOTAL`): its share of the
+/// buffer is back and nothing was admitted or sent.
+pub(crate) fn body_timeout() -> Response {
+    (
+        StatusCode::REQUEST_TIMEOUT,
+        axum::Json(serde_json::json!({"error":{"message":"The request body did not arrive in time","type":"invalid_request_error","code":"request_timeout","param":null}})),
+    )
+        .into_response()
+}
+/// The answer to a large image input body whose read failed before any
+/// handler ran: the read deadline is 408, a body past its declared length
+/// 413, and anything else (the client went away mid-body) 400.
+pub(crate) fn large_body_read_failed(error: &(dyn std::error::Error + 'static)) -> Response {
+    if crate::inference::image_buffer::is_body_deadline(error) {
+        return body_timeout();
+    }
+    let mut current = Some(error);
+    while let Some(e) = current {
+        if e.is::<http_body_util::LengthLimitError>() {
+            return payload_too_large();
+        }
+        current = e.source();
+    }
+    invalid_request()
+}
+/// 400 `invalid_request_error`, as the Chat and Responses handlers answer a
+/// body they cannot read as JSON.
+pub(crate) fn invalid_request() -> Response {
+    error_with_body(
+        InferenceError::InvalidRequest,
+        openai_error_body(InferenceError::InvalidRequest),
+    )
+}
+pub(crate) fn payload_too_large() -> Response {
     (
         StatusCode::PAYLOAD_TOO_LARGE,
         axum::Json(serde_json::json!({"error":{"message":"Request body too large","type":"invalid_request_error","code":"payload_too_large","param":null}})),

@@ -246,7 +246,13 @@ fn empty_successful_tool_result_defaults_are_absent_only() {
             let r = parse(request(block)).unwrap();
             assert_eq!(r.messages[0].tool_calls[0].id, "call-ping");
             assert_eq!(r.messages[1].tool_call_id.as_deref(), Some("call-ping"));
-            assert_eq!(r.messages[1].content.as_deref(), Some(""));
+            assert_eq!(
+                r.messages[1]
+                    .content
+                    .as_ref()
+                    .and_then(crate::inference::types::Content::text),
+                Some("")
+            );
             assert!(r.messages[1].role == Role::Tool);
             assert!(!r.messages[1].tool_result_is_error);
         }

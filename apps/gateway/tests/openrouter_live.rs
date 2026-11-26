@@ -18,6 +18,7 @@ use serde_json::json;
 
 fn target(model: &str) -> Deployment {
     Deployment {
+        image_input: false,
         id: uuid::Uuid::new_v4(),
         provider: "openrouter".into(),
         upstream_model: model.into(),

@@ -89,6 +89,7 @@ impl ProviderAdapter for AnthropicAdapter {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            image_input: false,
             text_chat: true,
             streaming: true,
             tools: true,
@@ -234,10 +235,16 @@ fn check_supported(request: &ChatRequest) -> Result<()> {
 fn content_blocks(message: &Message) -> Result<Vec<Value>> {
     let mut content = vec![];
     if message.role == Role::Tool {
-        content.push(json!({"type":"tool_result","tool_use_id":message.tool_call_id,"content":message.content}));
+        let text = message
+            .content
+            .as_ref()
+            .map(Content::require_text)
+            .transpose()?;
+        content
+            .push(json!({"type":"tool_result","tool_use_id":message.tool_call_id,"content":text}));
     } else {
         if let Some(text) = &message.content {
-            content.push(json!({"type":"text","text":text}));
+            content.push(json!({"type":"text","text":text.require_text()?}));
         }
         for call in &message.tool_calls {
             let input: Value = serde_json::from_str(&call.arguments)
@@ -261,7 +268,7 @@ fn system_and_messages(request: &ChatRequest) -> Result<(Vec<Value>, Vec<Value>)
                 return Err(InferenceError::Unsupported);
             }
             if let Some(text) = &message.content {
-                system.push(json!({"type":"text","text":text}));
+                system.push(json!({"type":"text","text":text.require_text()?}));
             }
             continue;
         }

@@ -135,7 +135,7 @@ GRANT UPDATE(revoked_at,disabled_at) ON public.api_keys TO gateway_runtime;
 -- profile, name and region are immutable.
 GRANT UPDATE(enabled,credential_ref,endpoint) ON public.provider_connections TO gateway_runtime;
 GRANT UPDATE(public_name,display_name,description,enabled,supported_protocols) ON public.models TO gateway_runtime;
-GRANT UPDATE(enabled) ON public.deployments TO gateway_runtime;
+GRANT UPDATE(enabled,image_input) ON public.deployments TO gateway_runtime;
 -- #49 (0096): an operator drain is set, changed and cleared by the
 -- management path (Platform Admin, under the exclusive catalog lock); the
 -- inference path only reads it. Column grants only: nothing else of a

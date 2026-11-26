@@ -51,6 +51,7 @@ impl ProviderAdapter for Never {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            image_input: false,
             text_chat: true,
             streaming: true,
             tools: true,

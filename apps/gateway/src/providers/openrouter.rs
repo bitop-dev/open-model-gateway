@@ -236,13 +236,14 @@ impl OpenRouterAdapter {
         path: &str,
         body: &Value,
     ) -> Result<reqwest::Response> {
+        let body = serde_json::to_vec(body).map_err(|_| InferenceError::InvalidRequest)?;
         self.post_inner(target, path, body, false).await
     }
     async fn post_inner(
         &self,
         target: &Deployment,
         path: &str,
-        body: &Value,
+        body: Vec<u8>,
         messages: bool,
     ) -> Result<reqwest::Response> {
         if target.provider != self.id()
@@ -264,7 +265,8 @@ impl OpenRouterAdapter {
             .client
             .post(format!("{}{path}", self.base))
             .header(header::AUTHORIZATION, auth)
-            .json(body);
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body);
         if let Some(referer) = &self.config.http_referer {
             builder = builder.header("HTTP-Referer", referer.clone());
         }
@@ -437,6 +439,7 @@ impl ProviderAdapter for OpenRouterAdapter {
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            image_input: true,
             text_chat: true,
             streaming: true,
             tools: true,
@@ -510,11 +513,12 @@ impl ProviderAdapter for OpenRouterAdapter {
         body["usage"] = json!({"include": true});
         messages_controls(&mut body, &request);
         require_parameters(&mut body, &request);
+        let body = super::image_body::json_body(&body, &request)?;
         let response = self
             .post_inner(
                 target,
                 "/chat/completions",
-                &body,
+                body,
                 request.messages_options.is_some(),
             )
             .await?;

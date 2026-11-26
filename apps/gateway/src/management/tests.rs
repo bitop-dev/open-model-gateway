@@ -54,6 +54,8 @@ mod deployment_bulk_tests;
 mod deployment_history_atomicity_tests;
 #[path = "deployment_history_tests.rs"]
 mod deployment_history_tests;
+#[path = "deployment_image_input_tests.rs"]
+mod deployment_image_input_tests;
 #[path = "deployment_preview_tests.rs"]
 mod deployment_preview_tests;
 #[path = "deployment_restore_tests.rs"]

@@ -16,6 +16,9 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tracing::Instrument;
 use uuid::Uuid;
 
+mod image_body_scan;
+mod read_deadline;
+
 use crate::{
     auth::Principal,
     identity::IdentityState,
@@ -72,6 +75,7 @@ fn build_router(
     identity: Option<IdentityState>,
 ) -> Router {
     let inference = inference_routes(&store);
+    let image_input = image_input_routes(&store, &engine);
     let workloads = workload_routes(&store, &engine);
     let jobs = job_routes(&store);
 
@@ -101,6 +105,7 @@ fn build_router(
         }
     })
     .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024))
+    .merge(image_input)
     .merge(workloads)
     .merge(jobs)
     .merge(uploads)
@@ -114,8 +119,6 @@ fn build_router(
 fn inference_routes(store: &Store) -> Router<Store> {
     Router::new()
         .route("/v1/models", get(models))
-        .route("/v1/chat/completions", post(chat_completions::handle))
-        .route("/v1/responses", post(responses::handle))
         .route("/v1/messages", post(messages::handle))
         .route("/v1/messages/count_tokens", post(messages::count_tokens))
         .route("/v1/embeddings", post(embeddings::handle))
@@ -130,6 +133,149 @@ fn inference_routes(store: &Store) -> Router<Store> {
             store.clone(),
             authenticate_engine,
         ))
+}
+
+/// Chat Completions and Responses, whose inline images may take a body past
+/// the shared 2 MiB limit within the replica's image input budget
+/// (`inference::image_buffer`). Authentication, then the client labels, run
+/// before the budget is consulted and before any body byte is read.
+fn image_input_routes(store: &Store, engine: &Engine) -> Router<Store> {
+    let limits = engine.limits().image_input;
+    let buffer = (
+        crate::inference::image_buffer::ImageBuffer::new(limits),
+        engine.limits().request_timeout,
+    );
+    Router::new()
+        .route("/v1/chat/completions", post(chat_completions::handle))
+        .route("/v1/responses", post(responses::handle))
+        .layer(DefaultBodyLimit::max(limits.body_bytes))
+        .route_layer(middleware::from_fn_with_state(buffer, image_input_body))
+        .route_layer(middleware::from_fn(client_labels))
+        .route_layer(middleware::from_fn_with_state(
+            store.clone(),
+            authenticate_engine,
+        ))
+}
+
+/// Holds a request's body to what the image input budget allows
+/// (`inference::image_buffer`): the shared text limit, or its declared
+/// length with its share of the budget, kept until the response body ends.
+async fn image_input_body(
+    State((buffer, request_timeout)): State<(
+        crate::inference::image_buffer::ImageBuffer,
+        Duration,
+    )>,
+    request: Request,
+    next: Next,
+) -> Response {
+    use crate::inference::image_buffer::{Admission, LargeBody, TEXT_BODY_BYTES};
+    use crate::metrics::METRICS;
+    let length = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    let (mut parts, body) = request.into_parts();
+    match buffer.admit(length) {
+        Admission::Text => {
+            let body = axum::body::Body::new(http_body_util::Limited::new(body, TEXT_BODY_BYTES));
+            next.run(Request::from_parts(parts, body)).await
+        }
+        Admission::TooLarge => {
+            METRICS.image_input_refused("too_large");
+            crate::protocols::image_input_too_large()
+        }
+        Admission::Busy => {
+            METRICS.image_input_refused("busy");
+            crate::protocols::image_input_busy()
+        }
+        // Refused as the handler's JSON extractor would refuse it, before a
+        // body that could never be parsed is read and holds its share.
+        Admission::Large(_) if !json_content_type(&parts.headers) => {
+            crate::protocols::invalid_request()
+        }
+        Admission::Large(permit) => {
+            parts.extensions.insert(LargeBody(permit.length));
+            let limits = buffer.limits();
+            // At the latest once the request can no longer be running (its
+            // body, the engine's timeout and settlement), the share is back,
+            // whether or not anyone still reads the response.
+            permit.release_after(
+                limits.body_total + request_timeout + crate::inference::SETTLEMENT_DEADLINE,
+            );
+            // The body is read in full under its deadlines, and what parsing
+            // could turn into structure is measured before any parser runs
+            // (`image_body_scan`): only image data may take it past the text
+            // limit. The handler then parses these same bytes, uncopied.
+            let body = axum::body::Body::new(read_deadline::ReadDeadline::new(
+                axum::body::Body::new(http_body_util::Limited::new(body, permit.length)),
+                limits,
+            ));
+            let bytes = match http_body_util::BodyExt::collect(body).await {
+                Ok(collected) => collected.to_bytes(),
+                Err(error) => {
+                    let response = crate::protocols::large_body_read_failed(&error);
+                    match response.status() {
+                        StatusCode::REQUEST_TIMEOUT => METRICS.image_input_refused("timeout"),
+                        StatusCode::PAYLOAD_TOO_LARGE => METRICS.image_input_refused("too_large"),
+                        _ => {}
+                    }
+                    return response;
+                }
+            };
+            if image_body_scan::outside_images(&bytes) > TEXT_BODY_BYTES {
+                METRICS.image_input_refused("too_large");
+                return crate::protocols::payload_too_large();
+            }
+            let body = axum::body::Body::from(bytes);
+            next.run(Request::from_parts(parts, body))
+                .await
+                .map(|body| {
+                    axum::body::Body::new(Holding {
+                        body,
+                        _permit: permit,
+                    })
+                })
+        }
+    }
+}
+
+/// Whether `Content-Type` is JSON exactly as Axum 0.8's `Json` extractor
+/// decides it (`axum::json::json_content_type`, not exported): a parsed
+/// `application/json`, or an `application/*` type with a `json` suffix.
+fn json_content_type(headers: &HeaderMap) -> bool {
+    let Some(mime) = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<mime::Mime>().ok())
+    else {
+        return false;
+    };
+    mime.type_() == "application"
+        && (mime.subtype() == "json" || mime.suffix().is_some_and(|name| name == "json"))
+}
+
+/// A response body that keeps its request's share of the image input budget
+/// until it ends or is dropped.
+struct Holding {
+    body: axum::body::Body,
+    _permit: crate::inference::image_buffer::BufferPermit,
+}
+impl http_body::Body for Holding {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.get_mut().body).poll_frame(cx)
+    }
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
+    }
 }
 
 /// The non-generation workloads, each with its own configured body cap.
@@ -510,6 +656,41 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use sqlx::postgres::PgPoolOptions;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn a_large_body_content_type_is_judged_as_axum_json_judges_it() {
+        use axum::extract::FromRequest;
+        for value in [
+            "application/json",
+            "application/json; charset=utf-8",
+            "APPLICATION/JSON",
+            "application/vnd.api+json",
+            "application/json+xml",
+            "application/jsonx",
+            "application/json ; charset=utf-8",
+            "application/json;;",
+            "application/json; charset",
+            "application/json; =x",
+            "application/a+json; x",
+            "application/+json",
+            "application/a@+json",
+            "text/json",
+            "text/plain",
+            "",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(value).unwrap());
+            let request = Request::builder()
+                .header(header::CONTENT_TYPE, value)
+                .body(Body::from("{}"))
+                .unwrap();
+            let axum_accepts = axum::Json::<serde_json::Value>::from_request(request, &())
+                .await
+                .is_ok();
+            assert_eq!(json_content_type(&headers), axum_accepts, "{value:?}");
+        }
+        assert!(!json_content_type(&HeaderMap::new()));
+    }
 
     fn app() -> Router {
         let pool = PgPoolOptions::new()

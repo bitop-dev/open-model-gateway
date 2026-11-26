@@ -120,6 +120,7 @@ impl Mock {
 
 fn target(model: &str) -> Deployment {
     Deployment {
+        image_input: false,
         id: uuid::Uuid::new_v4(),
         provider: "openrouter".into(),
         upstream_model: model.into(),
@@ -1603,4 +1604,27 @@ async fn refusal_sdk_openrouter(pool: sqlx::PgPool) {
             true
         );
     }
+}
+
+#[tokio::test]
+async fn inline_images_reach_the_openrouter_wire_as_image_url_parts() {
+    use super::super::contract::{IMAGE_URL, image_request};
+    let mock = Mock::json(glm_complete()).await;
+    let adapter = mock.adapter();
+    assert!(adapter.capabilities().image_input);
+    adapter
+        .execute(&target("vendor/vision"), image_request(false))
+        .await
+        .unwrap();
+    let (headers, path, body) = mock.last();
+    assert_eq!(path, "/api/v1/chat/completions");
+    assert_eq!(headers["content-type"], "application/json");
+    assert_eq!(
+        body["messages"][0]["content"],
+        json!([
+            {"type":"text","text":"what is"},
+            {"type":"image_url","image_url":{"url":IMAGE_URL,"detail":"low"}},
+            {"type":"text","text":"this?"}
+        ])
+    );
 }
