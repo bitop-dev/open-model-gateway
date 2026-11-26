@@ -159,7 +159,8 @@ impl Metrics {
     }
 
     /// Large image input bodies refused so far for one reason (tests).
-    pub fn image_input_refusal_count(&self, reason: &str) -> u64 {
+    #[cfg(all(test, feature = "integration-tests"))]
+    pub(crate) fn image_input_refusal_count(&self, reason: &str) -> u64 {
         self.image_input
             .refusals
             .get_or_create(&[("reason", reason.to_owned())])

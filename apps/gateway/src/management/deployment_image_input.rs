@@ -1,5 +1,5 @@
 //! A route's PATCH: its enablement, through the typed enablement operation
-//! (revision and history, 0067), and its image-input opt-in (0095, #24),
+//! (revision and history, 0067), and its image-input opt-in (0094, #24),
 //! which is audited but is not enablement.
 use super::*;
 use resources::{
@@ -8,7 +8,7 @@ use resources::{
 };
 
 /// A route's update: its enablement (with its revision and history, 0067),
-/// its image-input opt-in (0095), or both, in one transaction.
+/// its image-input opt-in (0094), or both, in one transaction.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct DeploymentUpdate {

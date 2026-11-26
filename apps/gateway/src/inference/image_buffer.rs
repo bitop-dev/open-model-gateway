@@ -76,6 +76,18 @@ pub const BODY_RATE_ALLOWANCE: usize = 128 * 1024;
 /// The longest a large body may take to arrive.
 pub const BODY_TOTAL: Duration = Duration::from_secs(180);
 
+/// The longest image data URL prefix (`data:image/jpeg;base64,`, and WebP's).
+pub const LONGEST_IMAGE_PREFIX: usize = 23;
+/// The largest body the pre-parse bound can pass (`http::image_body_scan`):
+/// [`TEXT_BODY_BYTES`] outside image data plus the request's
+/// [`MAX_IMAGES`](crate::protocols::image_input::MAX_IMAGES) image URLs at
+/// their longest, unescaped. A route cap above this could only admit bodies
+/// that are read in full and then refused, so the setting stops here
+/// (141,907,772 bytes, about 135.3 MiB).
+pub const MAX_BODY_BYTES: usize = TEXT_BODY_BYTES
+    + crate::protocols::image_input::MAX_IMAGES
+        * (LONGEST_IMAGE_PREFIX + crate::protocols::image_input::MAX_BASE64_BYTES);
+
 /// The default budget. The buffer is a hard bound on large bodies only: at
 /// [`WORST_COPIES`] copies its worst case with a [`BASELINE_BYTES`] process
 /// (100 + 48 × 5 = 340 MiB) stays within half the chart's 1 GiB memory
@@ -107,8 +119,11 @@ impl ImageInputLimits {
             ..Self::default()
         };
         ensure!(
-            (TEXT_BODY_BYTES..=256 * MIB).contains(&limits.body_bytes),
-            "GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT must be between 2 MiB and 256 MiB"
+            (TEXT_BODY_BYTES..=MAX_BODY_BYTES).contains(&limits.body_bytes),
+            "GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT must be between {TEXT_BODY_BYTES} (2 MiB) and \
+             {MAX_BODY_BYTES} bytes (2 MiB outside image data and {} images at their limit; \
+             no larger body can pass)",
+            crate::protocols::image_input::MAX_IMAGES
         );
         ensure!(
             limits.buffer_bytes <= 64 * 1024 * MIB,
@@ -301,12 +316,15 @@ pub(crate) static ROUTER_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::con
 mod tests {
     use super::*;
 
+    /// A buffer on its own gauges: the process-wide ones belong to the
+    /// router tests, which assert them exactly.
     fn buffer(buffer_mib: usize) -> ImageBuffer {
-        ImageBuffer::new(ImageInputLimits {
+        let limits = ImageInputLimits {
             body_bytes: 20 * MIB,
             buffer_bytes: buffer_mib * MIB,
             ..ImageInputLimits::default()
-        })
+        };
+        ImageBuffer::with_gauges(limits, Gauge::default(), &Gauge::default())
     }
 
     #[test]
@@ -439,6 +457,24 @@ mod tests {
         ])
         .unwrap();
         assert_eq!((set.body_bytes, set.buffer_bytes), (8 * MIB, 0));
+        // The route cap stops at the largest body the pre-parse bound passes.
+        assert_eq!(MAX_BODY_BYTES, 141_907_772);
+        let most = MAX_BODY_BYTES.to_string();
+        let set = limits(&[("GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT", most.as_str())]).unwrap();
+        assert_eq!(set.body_bytes, MAX_BODY_BYTES);
+        let over = (MAX_BODY_BYTES + 1).to_string();
+        let error = limits(&[("GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT", over.as_str())])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("141907772 bytes"), "{error}");
+        assert!(limits(&[("GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT", "268435456")]).is_err());
+        assert_eq!(
+            crate::inference::types::ImageType::ALL
+                .into_iter()
+                .map(|t| t.data_url_prefix().len())
+                .max(),
+            Some(LONGEST_IMAGE_PREFIX)
+        );
         for bad in [
             ("GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT", "1"),
             ("GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT", "20MiB"),

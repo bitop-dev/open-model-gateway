@@ -588,7 +588,7 @@ pub struct Deployment {
     pub region: Option<String>,
     #[sqlx(default)]
     pub supported_protocols: Vec<String>,
-    /// The operator allows inline image input on this route (0095); only
+    /// The operator allows inline image input on this route (0094); only
     /// for an upstream model that bills image input as input tokens.
     #[sqlx(default)]
     pub image_input: bool,

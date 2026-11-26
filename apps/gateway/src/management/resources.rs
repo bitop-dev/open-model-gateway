@@ -1307,7 +1307,7 @@ pub(super) struct DeploymentInput {
     pub(super) provider_connection_id: Uuid,
     pub(super) upstream_model: String,
     pub(super) enabled: bool,
-    /// Inline image input on this route (0095; default off).
+    /// Inline image input on this route (0094; default off).
     #[serde(default)]
     pub(super) image_input: bool,
 }

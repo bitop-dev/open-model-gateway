@@ -9102,7 +9102,7 @@
           "image_input_body_bytes": {
             "default": 20971520,
             "env": "GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT",
-            "source": "inference/image_buffer.rs ImageInputLimits::body_bytes (2 MiB to 256 MiB); a declared Content-Length only"
+            "source": "inference/image_buffer.rs ImageInputLimits::body_bytes (2 MiB to MAX_BODY_BYTES, 141907772 bytes); a declared Content-Length only"
           },
           "image_input_body_idle_seconds": {
             "default": 10,
@@ -11885,7 +11885,7 @@
           "image_input_body_bytes": {
             "default": 20971520,
             "env": "GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT",
-            "source": "inference/image_buffer.rs ImageInputLimits::body_bytes (2 MiB to 256 MiB); a declared Content-Length only"
+            "source": "inference/image_buffer.rs ImageInputLimits::body_bytes (2 MiB to MAX_BODY_BYTES, 141907772 bytes); a declared Content-Length only"
           },
           "image_input_body_idle_seconds": {
             "default": 10,

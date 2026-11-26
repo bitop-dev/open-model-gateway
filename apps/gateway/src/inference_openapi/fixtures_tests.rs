@@ -1118,6 +1118,8 @@ async fn count_tokens_fixtures(app: &axum::Router, key: &str, fixtures: &mut Fix
 
 #[dbtest::test]
 async fn inference_openapi_generation_refusals_and_beta_headers(pool: PgPool) {
+    // Its large bodies to the image input routes move the buffer metrics.
+    let _counters = crate::inference::image_buffer::ROUTER_TESTS.lock().await;
     let (app, keys) = generation_gateway(&pool).await;
     let key = keys.personal_key.token;
     for (path, body, status) in [

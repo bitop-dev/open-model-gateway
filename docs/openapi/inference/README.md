@@ -71,7 +71,7 @@ Limits are runtime configuration; the artifact states the defaults and names the
 | Operation | Limit | Default | Environment variable |
 | --- | --- | --- | --- |
 | `POST /v1/embeddings` | request body | 2 MiB, fixed | none (`http.rs`) |
-| `POST /v1/chat/completions`, `POST /v1/responses` | request body with inline images (declared length) | 20 MiB, at most 2 MiB outside image data | `GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT` (2 to 256 MiB) |
+| `POST /v1/chat/completions`, `POST /v1/responses` | request body with inline images (declared length) | 20 MiB, at most 2 MiB outside image data | `GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT` (2 MiB to 141,907,772 bytes) |
 | `POST /v1/chat/completions`, `POST /v1/responses` | in-flight large bodies per replica | 48 MiB | `GATEWAY_IMAGE_INPUT_BUFFER_BYTES` |
 | `POST /v1/rerank` | request body | 2 MiB | `GATEWAY_MAX_BODY_BYTES_RERANK` (1 KiB to 64 MiB) |
 | `POST /v1/systemone` | request body | 2 MiB | `GATEWAY_MAX_BODY_BYTES_SYSTEMONE` |

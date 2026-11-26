@@ -627,6 +627,12 @@ async fn a_trickled_large_body_is_cut_by_the_rate_floor(pool: PgPool) {
     assert_eq!(executions(&w).await, 0);
 }
 
+/// Bytes of the process's image input buffers in use. Exact while the
+/// World's lock keeps the other tests that send large bodies out.
+fn in_use() -> i64 {
+    crate::metrics::METRICS.image_input_buffer().0.get()
+}
+
 /// `item` repeated, comma-separated, to about `bytes`.
 fn repeated(item: &str, bytes: usize) -> String {
     vec![item; bytes / (item.len() + 1)].join(",")
@@ -709,6 +715,7 @@ async fn structure_past_the_text_limit_is_refused_before_any_parse(pool: PgPool)
             assert_eq!(value["error"]["code"], "payload_too_large");
             assert_eq!(pulled, body.len());
             assert_eq!(METRICS.image_input_refusal_count("too_large"), before + 1);
+            assert_eq!(in_use(), 0, "the share is back after the 413");
         }
     }
     assert_eq!(executions(&w).await, 0);
@@ -729,6 +736,31 @@ async fn structure_past_the_text_limit_is_refused_before_any_parse(pool: PgPool)
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(pulled.load(Ordering::SeqCst), 0);
+    drop(response);
+    assert_eq!(in_use(), 0, "the share is back after the 400");
+    // A body that fails mid-read (the client went away): 400, share back.
+    let body = serde_json::to_vec(&chat_body(&png_url(2 * MIB + MIB / 4, "q"), false)).unwrap();
+    let first = Bytes::copy_from_slice(&body[..body.len() / 2]);
+    let broken = Body::from_stream(futures_util::stream::iter([
+        Ok::<_, std::io::Error>(first),
+        Err(std::io::Error::other("connection reset")),
+    ]));
+    let response = w
+        .router
+        .clone()
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::CONTENT_LENGTH, body.len())
+                .header(header::AUTHORIZATION, format!("Bearer {}", w.token))
+                .body(broken)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    drop(response);
+    assert_eq!(in_use(), 0, "the share is back after a failed read");
     // A large image request passes, also with every `/` escaped as JSON
     // allows (`\/`, as some encoders write it).
     let image = serde_json::to_vec(&chat_body(&png_url(4 * MIB, "l"), false)).unwrap();
@@ -815,4 +847,6 @@ async fn every_large_body_refusal_is_counted_by_reason(pool: PgPool) {
         .unwrap();
     assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
     assert_eq!(count("timeout"), timeouts + 1);
+    drop(response);
+    assert_eq!(in_use(), 0, "the share is back after the 408");
 }

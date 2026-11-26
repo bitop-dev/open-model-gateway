@@ -230,9 +230,10 @@ mod tests {
             let body = format!("[\"{literal}\"]");
             assert_eq!(outside_images(body.as_bytes()), body.len(), "{literal}");
         }
-        // An unterminated string and a trailing backslash end the walk.
-        for body in [r#"["data:image/png"#, "[\"data:image/png\\"] {
-            assert!(outside_images(body.as_bytes()) <= body.len());
+        // An unterminated string and a trailing backslash end the walk, and
+        // neither is an image URL, so the whole body counts.
+        for body in [r#"["data:image/png"#, "[\"data:image/png;base64,AA\\"] {
+            assert_eq!(outside_images(body.as_bytes()), body.len(), "{body}");
         }
     }
 
@@ -276,5 +277,20 @@ mod tests {
             "data:image/png;base64,{}",
             "A".repeat(MAX_BASE64_BYTES)
         )));
+    }
+
+    #[test]
+    fn the_route_cap_is_the_largest_body_the_bound_can_pass() {
+        use crate::inference::image_buffer::{MAX_BODY_BYTES, TEXT_BODY_BYTES};
+        // Twenty JPEG URLs at their base64 limit, quoted and comma-separated
+        // in an array, padded with whitespace to the cap: exactly the text
+        // limit is left outside them.
+        let url = format!("data:image/jpeg;base64,{}", "A".repeat(MAX_BASE64_BYTES));
+        let items = vec![format!("\"{url}\""); MAX_IMAGES].join(",");
+        let mut body = format!("[{items}]").into_bytes();
+        body.resize(MAX_BODY_BYTES, b' ');
+        assert_eq!(outside_images(&body), TEXT_BODY_BYTES);
+        body.push(b' ');
+        assert_eq!(outside_images(&body), TEXT_BODY_BYTES + 1);
     }
 }
