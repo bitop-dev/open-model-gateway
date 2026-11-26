@@ -519,5 +519,5 @@ async fn only_an_unexpired_held_slot_is_renewed_for_the_send(pool: PgPool) {
             .await
             .unwrap()
     );
-    assert_eq!(circuit(&f, deployment.id).await.2, false);
+    assert!(!circuit(&f, deployment.id).await.2);
 }
