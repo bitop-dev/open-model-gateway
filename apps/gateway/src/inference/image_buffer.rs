@@ -43,8 +43,8 @@ pub struct ImageInputLimits {
     pub body_idle: Duration,
     /// A large body's longest time to arrive in full ([`BODY_TOTAL`]).
     pub body_total: Duration,
-    /// A large body's slowest average rate after its first `body_idle`
-    /// ([`BODY_MIN_RATE`], bytes per second).
+    /// A large body's slowest average rate, from its start and after
+    /// [`BODY_RATE_ALLOWANCE`] ([`BODY_MIN_RATE`], bytes per second).
     pub body_min_rate: usize,
 }
 
@@ -67,7 +67,7 @@ impl Default for ImageInputLimits {
 /// bandwidth, not a trickle.
 pub const BODY_IDLE: Duration = Duration::from_secs(10);
 /// About 1 Mbit/s from the start (after [`BODY_RATE_ALLOWANCE`]): a 20 MiB
-/// body may take 160 s.
+/// body may take 161 s.
 pub const BODY_MIN_RATE: usize = 128 * 1024;
 /// Bytes the rate floor forgives (one second at [`BODY_MIN_RATE`]), so a
 /// body's first bytes may arrive just after its headers.
@@ -179,7 +179,15 @@ impl BufferPermit {
             tokio::time::sleep(after).await;
             drop(slot.lock().unwrap_or_else(|e| e.into_inner()).take());
         });
-        *self.timer.lock().unwrap_or_else(|e| e.into_inner()) = Some(timer);
+        // A later call replaces the limit; the earlier timer must not outlive it.
+        if let Some(earlier) = self
+            .timer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(timer)
+        {
+            earlier.abort();
+        }
     }
 }
 impl Drop for BufferPermit {
@@ -307,6 +315,24 @@ mod tests {
         assert_eq!(b.available_mib(), 4, "returned though the permit is alive");
         drop(permit);
         assert_eq!(b.available_mib(), 4, "never returned twice");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_permit_ends_its_hold_timers() {
+        let b = buffer(4);
+        let Admission::Large(permit) = b.admit(Some(3 * MIB as u64)) else {
+            panic!("admitted")
+        };
+        let slot = Arc::downgrade(&permit.slot);
+        // Each timer task holds the slot; a replaced timer is ended too.
+        permit.release_after(Duration::from_secs(3600));
+        permit.release_after(Duration::from_secs(3600));
+        tokio::task::yield_now().await;
+        assert_eq!(slot.strong_count(), 2, "the replaced timer ended");
+        drop(permit);
+        assert_eq!(b.available_mib(), 4);
+        tokio::task::yield_now().await;
+        assert_eq!(slot.strong_count(), 0, "no timer task outlives its permit");
     }
 
     #[test]

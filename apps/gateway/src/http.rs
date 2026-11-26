@@ -16,6 +16,8 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tracing::Instrument;
 use uuid::Uuid;
 
+mod read_deadline;
+
 use crate::{
     auth::Principal,
     identity::IdentityState,
@@ -188,19 +190,10 @@ async fn image_input_body(
             permit.release_after(
                 limits.body_total + request_timeout + crate::inference::SETTLEMENT_DEADLINE,
             );
-            let body = axum::body::Body::new(ReadDeadline {
-                body: axum::body::Body::new(http_body_util::Limited::new(body, permit.length)),
+            let body = axum::body::Body::new(read_deadline::ReadDeadline::new(
+                axum::body::Body::new(http_body_util::Limited::new(body, permit.length)),
                 limits,
-                started: tokio::time::Instant::now(),
-                received: 0,
-                idle: Box::pin(tokio::time::sleep(limits.body_idle.min(
-                    Duration::from_secs_f64(
-                        crate::inference::image_buffer::BODY_RATE_ALLOWANCE as f64
-                            / limits.body_min_rate.max(1) as f64,
-                    ),
-                ))),
-                total: Box::pin(tokio::time::sleep(limits.body_total)),
-            });
+            ));
             next.run(Request::from_parts(parts, body))
                 .await
                 .map(|body| {
@@ -210,91 +203,6 @@ async fn image_input_body(
                     })
                 })
         }
-    }
-}
-
-/// A large request body that must keep arriving
-/// (`inference::image_buffer::BODY_IDLE`, `BODY_MIN_RATE`, `BODY_TOTAL`):
-/// a pause longer than `body_idle` between frames, an average below
-/// `body_min_rate` once `body_idle` has passed, or `body_total` in all fails
-/// its read with [`crate::inference::image_buffer::BodyDeadline`], which
-/// ends the request and returns its share of the budget. The total and the
-/// rate are checked before the inner body is polled, so a stream of frames
-/// cannot postpone them.
-struct ReadDeadline {
-    body: axum::body::Body,
-    limits: crate::inference::image_buffer::ImageInputLimits,
-    started: tokio::time::Instant,
-    received: usize,
-    idle: std::pin::Pin<Box<tokio::time::Sleep>>,
-    total: std::pin::Pin<Box<tokio::time::Sleep>>,
-}
-impl ReadDeadline {
-    /// The floor counts from the start: the bytes received, plus a
-    /// [`crate::inference::image_buffer::BODY_RATE_ALLOWANCE`], must cover
-    /// `body_min_rate` × the time elapsed.
-    fn too_slow(&self) -> bool {
-        let owed = self.started.elapsed().as_secs_f64() * self.limits.body_min_rate as f64;
-        ((self.received + crate::inference::image_buffer::BODY_RATE_ALLOWANCE) as f64) < owed
-    }
-    /// When the floor would be broken with no further byte.
-    fn floor_at(&self) -> tokio::time::Instant {
-        let covered = (self.received + crate::inference::image_buffer::BODY_RATE_ALLOWANCE) as f64
-            / self.limits.body_min_rate.max(1) as f64;
-        self.started + Duration::from_secs_f64(covered.min(86_400.0))
-    }
-    fn expired(&mut self, cx: &mut std::task::Context<'_>) -> bool {
-        use std::future::Future;
-        self.total.as_mut().poll(cx).is_ready() || self.too_slow()
-    }
-}
-impl http_body::Body for ReadDeadline {
-    type Data = axum::body::Bytes;
-    type Error = axum::Error;
-    fn poll_frame(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        use std::future::Future;
-        let this = self.get_mut();
-        let deadline = || {
-            std::task::Poll::Ready(Some(Err(axum::Error::new(
-                crate::inference::image_buffer::BodyDeadline,
-            ))))
-        };
-        if this.expired(cx) {
-            return deadline();
-        }
-        if let std::task::Poll::Ready(frame) = std::pin::Pin::new(&mut this.body).poll_frame(cx) {
-            if let Some(Ok(data)) = frame
-                .as_ref()
-                .map(|f| f.as_ref().map(http_body::Frame::data_ref))
-            {
-                this.received += data.map_or(0, axum::body::Bytes::len);
-            }
-            // The next wake: the idle bound or the moment the floor breaks.
-            let next = (tokio::time::Instant::now() + this.limits.body_idle).min(this.floor_at());
-            this.idle.as_mut().reset(next);
-            return std::task::Poll::Ready(frame);
-        }
-        if this.idle.as_mut().poll(cx).is_ready() {
-            if this.expired(cx) || this.started.elapsed() >= this.limits.body_idle {
-                return deadline();
-            }
-            // Woken by the idle bound reset earlier than the floor: re-arm.
-            let next = (tokio::time::Instant::now() + this.limits.body_idle).min(this.floor_at());
-            this.idle.as_mut().reset(next);
-            if this.idle.as_mut().poll(cx).is_ready() {
-                return deadline();
-            }
-        }
-        std::task::Poll::Pending
-    }
-    fn is_end_stream(&self) -> bool {
-        self.body.is_end_stream()
-    }
-    fn size_hint(&self) -> http_body::SizeHint {
-        self.body.size_hint()
     }
 }
 

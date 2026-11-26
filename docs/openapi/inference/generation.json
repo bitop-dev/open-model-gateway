@@ -102,7 +102,7 @@
             "$ref": "#/components/responses/OpenAiNotFound"
           },
           "408": {
-            "description": "A body over 2 MiB stopped arriving: a pause of more than 10 s, under 128 KiB/s on average from its start (after a 128 KiB allowance), or more than 180 s in all (invalid_request_error, code request_timeout). Its share of the image input buffer is back; nothing was admitted or sent.",
+            "description": "A body over 2 MiB stopped arriving: a pause of more than 10 s, under 128 KiB/s on average from its start (after a 128 KiB allowance; a pause counts against it), or more than 180 s in all (invalid_request_error, code request_timeout). Its share of the image input buffer is back; nothing was admitted or sent.",
             "headers": {
               "x-request-id": {
                 "$ref": "#/components/headers/RequestId"
@@ -406,7 +406,7 @@
             "$ref": "#/components/responses/OpenAiNotFound"
           },
           "408": {
-            "description": "A body over 2 MiB stopped arriving: a pause of more than 10 s, under 128 KiB/s on average from its start (after a 128 KiB allowance), or more than 180 s in all (invalid_request_error, code request_timeout). Its share of the image input buffer is back; nothing was admitted or sent.",
+            "description": "A body over 2 MiB stopped arriving: a pause of more than 10 s, under 128 KiB/s on average from its start (after a 128 KiB allowance; a pause counts against it), or more than 180 s in all (invalid_request_error, code request_timeout). Its share of the image input buffer is back; nothing was admitted or sent.",
             "headers": {
               "x-request-id": {
                 "$ref": "#/components/headers/RequestId"
