@@ -13,6 +13,8 @@ Current inference routes share key authentication, global public model aliases, 
 | `ollama` | Compatible Chat subset | No | Translated via Chat | Native `/api/embed`, no dimensions | No | `/v1/systemone` (v0.35.0+) |
 | `openrouter` | Compatible Chat subset (stream/non-stream) | No | Translated via Chat | String input; client float/base64; fixed native widths only | Native `/rerank` | Native `/systemone` |
 
+**Guardrails.** No route inspects request or response text yet. Guardrail policies can be stored and composed ([guardrails design](guardrails-design.md), #840), but no rule monitors or blocks anything until phase 1's detector and engine step land.
+
 ### Speech routes
 
 | Adapter | Transcriptions `/v1/audio/transcriptions` | Speech `/v1/audio/speech` |

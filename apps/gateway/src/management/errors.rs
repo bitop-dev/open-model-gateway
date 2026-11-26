@@ -49,6 +49,19 @@ pub(super) const REASONS: &[(&str, &str)] = &[
         "report_schedule_limit_reached",
     ),
     (alerts::KIND_FIXED, "alert_rule_kind_fixed"),
+    (
+        guardrails::DETECTOR_UNAVAILABLE,
+        "guardrail_detector_unavailable",
+    ),
+    (
+        guardrails::EGRESS_NOT_ALLOWED,
+        "guardrail_egress_not_allowed",
+    ),
+    (guardrails::PATTERN_INVALID, "guardrail_pattern_invalid"),
+    (
+        guardrails::LOOSEN_NOT_ALLOWED,
+        "guardrail_loosen_not_allowed",
+    ),
     (INSTALLATION_LIMITS_REMOVED, "installation_limits_removed"),
     (PRECONDITION_FAILED, "precondition_failed"),
 ];

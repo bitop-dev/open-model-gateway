@@ -81,6 +81,10 @@ rustls = { version = "=0.23.46", default-features = false, features = ["ring", "
 webpki-roots = "=1.0.12"
 # Audit export over syslog/TLS (#107): the same ring-backed rustls, no new TLS stack.
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
+# Guardrail pattern detector (#840): linear-time matching, no backtracking;
+# patterns compile under fixed size limits (guardrails/patterns.rs). Also the
+# dev-only SQL tokenizer of the UUID binding policy.
+regex = "=1.13.1"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["limit", "fs"] }
 tracing = "0.1"
@@ -91,7 +95,6 @@ uuid = { version = "1", features = ["v4", "v7", "serde"] }
 # Inspect the raw HTTP response retained in AssumeRole credential errors.
 aws-sdk-sts = { version = "1", default-features = false }
 # Tokenize literal SQL for the UUID binding policy.
-regex = "1"
 regex-syntax = "0.8"
 # Offline OpenAPI 3.1/Draft 2020-12 gates only (#81); no fetchers or schema-generator macros.
 jsonschema = { version = "=0.61.2", default-features = false }
