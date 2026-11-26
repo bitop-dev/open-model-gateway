@@ -722,11 +722,12 @@ async fn written(pool: &PgPool) -> (i64, i64, i64, i64, i64, i64) {
     .unwrap()
 }
 
-/// An admission whose scope rows are held past `ADMISSION_LOCK_WAIT` ends as `ScopeBusy` once the bound
-/// elapses, with nothing written: no execution, reservation, hold, in-flight
-/// or minute count. Its transaction rolled back, so no pooled session keeps
-/// the bound, and the key's per-minute rate allowance is unspent: the next
-/// admission of the minute (one per minute here) succeeds.
+/// An admission whose scope rows are held past `ADMISSION_LOCK_WAIT` ends
+/// as `ScopeBusy` once the bound elapses, with nothing written: no
+/// execution, reservation, hold, in-flight or minute count. Its transaction
+/// rolled back, so no pooled session keeps the bound, and the key's
+/// per-minute rate allowance is unspent: the next admission of the minute
+/// (one per minute here) succeeds.
 #[dbtest::test]
 async fn an_admission_past_its_lock_bound_is_shed_and_leaves_nothing(pool: PgPool) {
     let f = fixture(pool.clone()).await;

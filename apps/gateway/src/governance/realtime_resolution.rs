@@ -34,10 +34,10 @@ pub enum Resolved {
 /// - `Unauthenticated`: the actor's admin token was revoked meanwhile.
 ///
 /// Lock order (`governance::locks`): the shared catalog lock and the actor's
-/// workspace and user authority, then the session's reservation row, then the response row, then the
-/// session's totals rows. Two resolutions of one session therefore serialize
-/// on its reservation row: the second sees what the first wrote, and exactly
-/// one settles the session.
+/// workspace and user authority, then the session's reservation row, then
+/// the response row, then the session's totals rows. Two resolutions of one
+/// session therefore serialize on its reservation row: the second sees what
+/// the first wrote, and exactly one settles the session.
 pub async fn resolve_response(
     store: &Store,
     workspace: Uuid,

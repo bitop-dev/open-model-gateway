@@ -116,8 +116,8 @@ async fn revalidate_token(tx: &mut Tx<'_>, actor: ReconcilingActor) -> Result<()
 }
 /// The start of an operator's reconciliation transaction: the shared catalog
 /// lock and the actor's authority (workspace, user) held until commit, then
-/// the admin-token liveness check. Callers lock the reservation row next, then its totals
-/// rows (the canonical order, `governance::locks`).
+/// the admin-token liveness check. Callers lock the reservation row next,
+/// then its totals rows (the canonical order, `governance::locks`).
 pub(super) async fn operator_tx(
     store: &Store,
     workspace: Uuid,
