@@ -220,6 +220,47 @@ async fn record(
     Ok(())
 }
 
+/// A route with no observation for this long is reported `stale`: it may
+/// simply have had no traffic, so a closed circuit says nothing current
+/// about it. Far above the 30 s a healthy route's observation may lag.
+pub const HEALTH_STALE_AFTER_SECONDS: i32 = 600;
+
+/// The operator's view of a deployment's health (`h`: its `deployment_health`
+/// row, absent for a route that never failed), as one JSON object computed at
+/// the read's statement time (`as_of`). Sanitized: no endpoint, credential
+/// reference, payload or raw error text, and not the probe's holder (an
+/// execution id) or epoch.
+///
+/// - `circuit`: `closed`, `open` (cooling until `cooling_until`) or
+///   `half_open` (the cooldown passed; one request decides).
+/// - `probe_in_progress`: a request holds the half-open route's unexpired
+///   probe slot, which ends at `probe_until` at the latest.
+/// - `reopen_count`: openings since the route last served a complete
+///   success (each doubles the next cooldown, capped).
+/// - `observation`: `none` (never observed), `stale` (not observed for
+///   [`HEALTH_STALE_AFTER_SECONDS`]) or `current`.
+/// - `consecutive_failures`, `open_until` (as stored: past once half-open)
+///   and `last_observed_at`, as before.
+pub(crate) static HEALTH_VIEW_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "jsonb_build_object(
+            'consecutive_failures',coalesce(h.consecutive_failures,0),
+            'open_until',h.open_until,
+            'last_observed_at',h.last_observed_at,
+            'circuit',CASE WHEN h.open_until IS NULL THEN 'closed'
+                           WHEN h.open_until > statement_timestamp() THEN 'open'
+                           ELSE 'half_open' END,
+            'cooling_until',CASE WHEN h.open_until > statement_timestamp() THEN h.open_until END,
+            'probe_in_progress',coalesce(h.open_until <= statement_timestamp() AND h.probe_until > statement_timestamp(),false),
+            'probe_until',CASE WHEN h.open_until <= statement_timestamp() AND h.probe_until > statement_timestamp() THEN h.probe_until END,
+            'reopen_count',coalesce(h.reopen_count,0),
+            'observation',CASE WHEN h.last_observed_at IS NULL THEN 'none'
+                               WHEN h.last_observed_at < statement_timestamp() - make_interval(secs => {HEALTH_STALE_AFTER_SECONDS}) THEN 'stale'
+                               ELSE 'current' END,
+            'as_of',statement_timestamp())"
+    )
+});
+
 /// Sanitized operator view: no endpoint, credential reference, model payload,
 /// upstream response, or raw error text. Missing observations remain explicitly unknown.
 #[derive(Clone, Debug, Serialize, sqlx::FromRow)]

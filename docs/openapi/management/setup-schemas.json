@@ -10370,12 +10370,75 @@
                   "type": "null"
                 }
               ]
+            },
+            "circuit": {
+              "type": "string",
+              "enum": [
+                "closed",
+                "open",
+                "half_open"
+              ],
+              "description": "The circuit at `as_of`: `open` while cooling down, `half_open` once the cooldown has passed (one request decides)."
+            },
+            "cooling_until": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "While `open`: when the cooldown ends. Otherwise null."
+            },
+            "probe_in_progress": {
+              "type": "boolean",
+              "description": "A request holds the half-open route's unexpired probe slot."
+            },
+            "probe_until": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "While a probe is in progress: when its slot ends at the latest. Otherwise null."
+            },
+            "reopen_count": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Openings since the route last served a complete success; each doubles the next cooldown, capped."
+            },
+            "observation": {
+              "type": "string",
+              "enum": [
+                "none",
+                "stale",
+                "current"
+              ],
+              "description": "`none`: never observed; `stale`: not observed for 600 s (the route may have had no traffic); `current` otherwise."
+            },
+            "as_of": {
+              "type": "string",
+              "format": "date-time",
+              "description": "The time the states above were computed."
             }
           },
           "required": [
             "consecutive_failures",
             "open_until",
-            "last_observed_at"
+            "last_observed_at",
+            "circuit",
+            "cooling_until",
+            "probe_in_progress",
+            "probe_until",
+            "reopen_count",
+            "observation",
+            "as_of"
           ],
           "additionalProperties": false
         }

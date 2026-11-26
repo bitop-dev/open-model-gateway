@@ -499,6 +499,107 @@ mod db {
             2
         );
     }
+    /// A deployment's health as the operator reads it (#49): the circuit and
+    /// its probe as they are at the read, the openings since the last
+    /// complete success, and whether there is a recent observation. The
+    /// probe's holder (an execution id) is never part of it.
+    #[dbtest::test]
+    async fn deployment_health_reports_the_circuit_as_it_is_now(pool: PgPool) {
+        let f = fixture(pool).await;
+        let p = format!("/api/v1/platform/deployments/{}/routing", f.deployment);
+        let health = || async {
+            let (status, v) = call(&f, &user(f.owner, true), "GET", &p, Value::Null).await;
+            assert_eq!(status, StatusCode::OK);
+            v["health"].clone()
+        };
+        let (db, deployment) = (f.store.pool.clone(), f.deployment);
+        let row = |sql: &'static str| {
+            let db = db.clone();
+            async move {
+                sqlx::query(sql)
+                    .bind(deployment)
+                    .execute(&db)
+                    .await
+                    .unwrap();
+            }
+        };
+        let states = |h: &Value| {
+            (
+                h["circuit"].as_str().unwrap().to_owned(),
+                h["probe_in_progress"].as_bool().unwrap(),
+                h["observation"].as_str().unwrap().to_owned(),
+                h["reopen_count"].as_i64().unwrap(),
+                h["cooling_until"].is_null(),
+                h["probe_until"].is_null(),
+            )
+        };
+        let owned = |c: &str, probe: bool, o: &str, r: i64, cooling: bool, until: bool| {
+            (c.to_owned(), probe, o.to_owned(), r, cooling, until)
+        };
+        // Never observed: closed, and nothing is known about it.
+        let h = health().await;
+        assert_eq!(states(&h), owned("closed", false, "none", 0, true, true));
+        assert!(h["as_of"].is_string());
+        // Open: cooling until `open_until`.
+        row("INSERT INTO deployment_health(deployment_id,consecutive_failures,open_until,last_observed_at,reopen_count) VALUES($1,3,clock_timestamp()+interval '60 seconds',clock_timestamp(),2)").await;
+        let h = health().await;
+        assert_eq!(states(&h), owned("open", false, "current", 2, false, true));
+        assert_eq!(h["cooling_until"], h["open_until"]);
+        // Half-open, no probe.
+        row("UPDATE deployment_health SET open_until=clock_timestamp()-interval '1 second' WHERE deployment_id=$1").await;
+        assert_eq!(
+            states(&health().await),
+            owned("half_open", false, "current", 2, true, true)
+        );
+        // A probe in progress: its slot's end is shown, its holder is not.
+        row("UPDATE deployment_health SET probe_holder=gen_random_uuid(), probe_until=clock_timestamp()+interval '60 seconds', probe_epoch=probe_epoch+1 WHERE deployment_id=$1").await;
+        let h = health().await;
+        assert_eq!(
+            states(&h),
+            owned("half_open", true, "current", 2, true, false)
+        );
+        let holder: Uuid =
+            sqlx::query_scalar("SELECT probe_holder FROM deployment_health WHERE deployment_id=$1")
+                .bind(f.deployment)
+                .fetch_one(&f.store.pool)
+                .await
+                .unwrap();
+        assert!(!h.to_string().contains(&holder.to_string()));
+        let stored: Value = sqlx::query_scalar(
+            "SELECT to_jsonb(probe_until) FROM deployment_health WHERE deployment_id=$1",
+        )
+        .bind(f.deployment)
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+        assert_eq!(h["probe_until"], stored, "the slot's own end");
+        assert!(h.get("probe_holder").is_none() && h.get("probe_epoch").is_none());
+        // Its slot expired with nobody claiming it again: no probe in progress.
+        row("UPDATE deployment_health SET probe_until=clock_timestamp()-interval '1 second' WHERE deployment_id=$1").await;
+        assert_eq!(
+            states(&health().await),
+            owned("half_open", false, "current", 2, true, true)
+        );
+        // Closed again, but not observed for longer than the stale window.
+        row("UPDATE deployment_health SET consecutive_failures=0, open_until=NULL, probe_holder=NULL, probe_until=NULL, reopen_count=0, last_observed_at=clock_timestamp()-interval '11 minutes' WHERE deployment_id=$1").await;
+        assert_eq!(
+            states(&health().await),
+            owned("closed", false, "stale", 0, true, true)
+        );
+        // An Auditor reads the same view.
+        sqlx::query("UPDATE platform_role_grants SET role='auditor' WHERE user_id=$1")
+            .bind(f.other)
+            .execute(&f.store.pool)
+            .await
+            .unwrap();
+        let mut auditor = user(f.other, false);
+        auditor.platform_auditor = true;
+        let (status, v) = call(&f, &auditor, "GET", &p, Value::Null).await;
+        assert_eq!(
+            (status, v["health"]["observation"].as_str()),
+            (StatusCode::OK, Some("stale"))
+        );
+    }
     #[dbtest::test]
     async fn monthly_member_scope_unknown_is_not_zero_and_csv_formula_safe(pool: PgPool) {
         let f = fixture(pool).await;
