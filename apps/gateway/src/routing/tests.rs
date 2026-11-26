@@ -335,15 +335,44 @@ mod database {
             .await
             .is_ok()
         );
-        record_result(
+        // Half-open: only the probe decides (`probe_tests`). Its failure reopens.
+        let ProbeClaim::Claimed(epoch) = claim_probe(
+            &f.store,
+            deployment.id,
+            Uuid::new_v4(),
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap() else {
+            panic!("the half-open route's probe")
+        };
+        record_probe_result(
             &f.store,
             deployment.id,
             Some(InferenceError::UpstreamUnavailable),
+            epoch,
         )
         .await
         .unwrap();
         assert!(health(&f.store, deployment.id).await.unwrap().circuit_open);
-        record_result(&f.store, deployment.id, None).await.unwrap();
+        // The next probe's success closes it.
+        sqlx::query("UPDATE deployment_health SET open_until=now()-interval '1 second'")
+            .execute(&f.store.pool)
+            .await
+            .unwrap();
+        let ProbeClaim::Claimed(epoch) = claim_probe(
+            &f.store,
+            deployment.id,
+            Uuid::new_v4(),
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap() else {
+            panic!("the half-open route's probe")
+        };
+        record_probe_result(&f.store, deployment.id, None, epoch)
+            .await
+            .unwrap();
         let h = health(&f.store, deployment.id).await.unwrap();
         assert_eq!(h.consecutive_failures, 0);
         assert!(h.open_until.is_none());
@@ -373,6 +402,14 @@ mod database {
             .await
             .unwrap()
             .remove(0);
+        // A threshold the failures stay below: a closed circuit counts every one.
+        sqlx::query(
+            "INSERT INTO deployment_routing(deployment_id,failure_threshold) VALUES($1,100)",
+        )
+        .bind(deployment.id)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
         let results = futures_util::future::join_all(
             (0..24).map(|_| record_result(&f.store, deployment.id, Some(InferenceError::Busy))),
         )

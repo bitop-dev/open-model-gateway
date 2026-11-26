@@ -63,10 +63,22 @@ impl LineRepository {
                 .insert(execution, (deployment, epoch));
         }
     }
+    /// The attempt ended. A probe slot it claimed and the engine did not end
+    /// (the line stopped before its attempt was made) is freed in the
+    /// background; for one the engine ended this is a fenced no-op.
     pub(super) fn unpin(&self, execution: Uuid) {
         self.pins.lock().expect("pins").remove(&execution);
         self.claimed.lock().expect("claimed").remove(&execution);
-        self.probes.lock().expect("probes").remove(&execution);
+        let probe = self.probes.lock().expect("probes").remove(&execution);
+        if let Some((route, epoch)) = probe
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let store = self.store.clone();
+            runtime.spawn(async move {
+                let release = crate::routing::release_probe(&store, route, epoch);
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(250), release).await;
+            });
+        }
     }
     /// Whether the scheduler actually claimed route capacity for `execution`
     /// at dispatch - never merely whether it carries a routing/pricing plan
@@ -313,6 +325,22 @@ impl InferenceRepository for LineRepository {
         error: Option<InferenceError>,
     ) -> Result<(), InferenceError> {
         self.store.route_result(deployment, error).await
+    }
+    async fn route_probe_result(
+        &self,
+        deployment: Uuid,
+        error: Option<InferenceError>,
+        epoch: i64,
+    ) -> Result<(), InferenceError> {
+        self.store
+            .route_probe_result(deployment, error, epoch)
+            .await
+    }
+    async fn route_state(
+        &self,
+        deployment: Uuid,
+    ) -> Result<crate::routing::RouteState, InferenceError> {
+        self.store.route_state(deployment).await
     }
     async fn route_probe_claim(
         &self,

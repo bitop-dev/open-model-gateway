@@ -206,7 +206,7 @@ impl RouteInputs {
             &self.policy,
             self.subset(ids),
             weighted_order_seed(principal, model, request_id),
-            true,
+            false,
         )
     }
 
@@ -218,7 +218,7 @@ impl RouteInputs {
             .cloned()
             .collect();
         matches!(
-            eligible_candidates(&self.policy, candidates, true),
+            eligible_candidates(&self.policy, candidates, false),
             Err(InferenceError::RouteCoolingDown(_))
         )
     }
@@ -232,7 +232,7 @@ impl RouteInputs {
         request_id: Uuid,
         ids: &HashSet<Uuid>,
     ) -> Result<Uuid, InferenceError> {
-        let candidates = eligible_candidates(&self.policy, self.subset(ids), true)?;
+        let candidates = eligible_candidates(&self.policy, self.subset(ids), false)?;
         let index = if self.policy.strategy == "weighted" {
             let mut rng = StdRng::from_seed(weighted_order_seed(principal, model, request_id));
             weighted_index(&candidates, &mut rng)?
@@ -314,7 +314,7 @@ async fn cached_inputs(
     model: &str,
     ids: &[Uuid],
 ) -> Result<(RoutingPolicy, Vec<Candidate>), InferenceError> {
-    use crate::cache::{HealthEntry, Lookup, RouteSnapshot};
+    use crate::cache::{Lookup, RouteSnapshot};
     let caches = &store.caches;
     let key = (principal.workspace_id, model.to_owned());
     let snapshot = match caches.routes.get(&caches.versions, &key) {
@@ -362,47 +362,7 @@ async fn cached_inputs(
         .collect();
     let (mut health, missing) = caches.health(&eligible);
     if !missing.is_empty() {
-        let loaded = std::time::Instant::now();
-        // (deployment, failures, seconds until the circuit closes, seconds
-        // since the last observation, seconds the probe slot is held, openings)
-        type HealthRow = (Uuid, i32, Option<f64>, Option<f64>, Option<f64>, i32);
-        let rows: Vec<HealthRow> = sqlx::query_as(
-            "SELECT deployment_id,consecutive_failures,EXTRACT(EPOCH FROM open_until-clock_timestamp())::float8,EXTRACT(EPOCH FROM clock_timestamp()-last_observed_at)::float8,EXTRACT(EPOCH FROM probe_until-clock_timestamp())::float8,reopen_count FROM deployment_health WHERE deployment_id=ANY($1)",
-        )
-        .bind(&missing)
-        .fetch_all(&store.pool)
-        .await
-        .map_err(route_lookup_storage)?;
-        let mut fresh: Vec<(Uuid, HealthEntry)> = missing
-            .iter()
-            .map(|id| {
-                (
-                    *id,
-                    HealthEntry {
-                        loaded,
-                        open_until: None,
-                        consecutive_failures: 0,
-                        observed_age: None,
-                        probe_until: None,
-                        reopen_count: 0,
-                    },
-                )
-            })
-            .collect();
-        for (id, failures, open_for, observed, probe_for, reopens) in rows {
-            if let Some(entry) = fresh.iter_mut().find(|(d, _)| *d == id) {
-                entry.1.consecutive_failures = failures;
-                // An expired circuit is kept, as of the load (half-open).
-                entry.1.open_until = open_for
-                    .map(|s| loaded + std::time::Duration::from_secs_f64(s.clamp(0.0, 86_400.0)));
-                entry.1.probe_until = probe_for
-                    .filter(|s| *s > 0.0)
-                    .map(|s| loaded + std::time::Duration::from_secs_f64(s.min(86_400.0)));
-                entry.1.reopen_count = reopens;
-                entry.1.observed_age =
-                    observed.map(|s| std::time::Duration::from_secs_f64(s.clamp(0.0, 1e9)));
-            }
-        }
+        let fresh = load_health(store, &missing).await?;
         health.extend(fresh.iter().copied());
         caches.store_health(fresh);
     }
@@ -434,6 +394,92 @@ async fn cached_inputs(
         })
         .collect();
     Ok((snapshot.policy.clone().unwrap_or_default(), rows))
+}
+
+/// Passive health of `ids` as read now, for the caches: an id without a row
+/// is a route that never failed.
+async fn load_health(
+    store: &Store,
+    ids: &[Uuid],
+) -> Result<Vec<(Uuid, crate::cache::HealthEntry)>, InferenceError> {
+    use crate::cache::HealthEntry;
+    let loaded = std::time::Instant::now();
+    // (deployment, failures, seconds until the circuit closes, seconds
+    // since the last observation, seconds the probe slot is held, openings)
+    type HealthRow = (Uuid, i32, Option<f64>, Option<f64>, Option<f64>, i32);
+    let rows: Vec<HealthRow> = sqlx::query_as(
+        "SELECT deployment_id,consecutive_failures,EXTRACT(EPOCH FROM open_until-clock_timestamp())::float8,EXTRACT(EPOCH FROM clock_timestamp()-last_observed_at)::float8,EXTRACT(EPOCH FROM probe_until-clock_timestamp())::float8,reopen_count FROM deployment_health WHERE deployment_id=ANY($1)",
+    )
+    .bind(ids)
+    .fetch_all(&store.pool)
+    .await
+    .map_err(route_lookup_storage)?;
+    let mut fresh: Vec<(Uuid, HealthEntry)> = ids
+        .iter()
+        .map(|id| {
+            (
+                *id,
+                HealthEntry {
+                    loaded,
+                    open_until: None,
+                    consecutive_failures: 0,
+                    observed_age: None,
+                    probe_until: None,
+                    reopen_count: 0,
+                },
+            )
+        })
+        .collect();
+    for (id, failures, open_for, observed, probe_for, reopens) in rows {
+        if let Some(entry) = fresh.iter_mut().find(|(d, _)| *d == id) {
+            entry.1.consecutive_failures = failures;
+            // An expired circuit is kept, as of the load (half-open).
+            entry.1.open_until = open_for
+                .map(|s| loaded + std::time::Duration::from_secs_f64(s.clamp(0.0, 86_400.0)));
+            entry.1.probe_until = probe_for
+                .filter(|s| *s > 0.0)
+                .map(|s| loaded + std::time::Duration::from_secs_f64(s.min(86_400.0)));
+            entry.1.reopen_count = reopens;
+            entry.1.observed_age =
+                observed.map(|s| std::time::Duration::from_secs_f64(s.clamp(0.0, 1e9)));
+        }
+    }
+    Ok(fresh)
+}
+
+/// A route's circuit as it is now (through the caches, at most
+/// `HEALTH_TTL` old across replicas; this replica's own writes are seen at
+/// once): what a request about to send on a route planned earlier must
+/// respect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteState {
+    Closed,
+    /// The cooldown has passed: the route is used only as its probe.
+    HalfOpen,
+    /// Open for about this many more seconds.
+    Open(u32),
+}
+
+pub async fn route_state(store: &Store, deployment: Uuid) -> Result<RouteState, InferenceError> {
+    let entry = match store.caches.health_entry(deployment) {
+        Some(entry) => entry,
+        None => {
+            let fresh = load_health(store, &[deployment]).await?;
+            let entry = fresh[0].1;
+            if store.caches.enabled() {
+                store.caches.store_health(fresh);
+            }
+            entry
+        }
+    };
+    let now = std::time::Instant::now();
+    Ok(match entry.open_until {
+        None => RouteState::Closed,
+        Some(until) if until > now => {
+            RouteState::Open((until - now).as_secs_f64().ceil().clamp(1.0, 86_400.0) as u32)
+        }
+        Some(_) => RouteState::HalfOpen,
+    })
 }
 
 fn validate_ids(ids: &[Uuid]) -> Result<(), InferenceError> {
@@ -625,10 +671,77 @@ const OBSERVED_REFRESH_SECONDS: i32 = 30;
 /// circuit) and was observed within the last 30 s writes nothing: the health
 /// state would not change, so the per-success upsert of one hot row per
 /// deployment is skipped. Failures and recoveries always write.
+///
+/// While the circuit is open or half-open only its probe decides
+/// ([`record_probe_result`]): any other result (an attempt admitted before it
+/// opened, a realtime session, a probe whose slot ended) changes nothing.
 pub async fn record_result(
     store: &Store,
     deployment: Uuid,
     error: Option<InferenceError>,
+) -> Result<(), InferenceError> {
+    record(store, deployment, error, None).await
+}
+
+/// [`record_result`] of the request that holds the probe slot under `epoch`:
+/// it decides a half-open circuit (a success closes it, a counted failure
+/// reopens it). A slot that ended (its expiry, a newer claim) decides nothing.
+pub async fn record_probe_result(
+    store: &Store,
+    deployment: Uuid,
+    error: Option<InferenceError>,
+    epoch: i64,
+) -> Result<(), InferenceError> {
+    record(store, deployment, error, Some(epoch)).await
+}
+
+/// A result may change the circuit: it is closed, or this is its probe.
+const AUTHORITY: &str = "(h.open_until IS NULL OR ($3::bigint IS NOT NULL AND h.probe_epoch=$3 AND h.probe_holder IS NOT NULL))";
+/// A failure that reaches the threshold while the circuit is closed or
+/// half-open opens it (one statement time for every column).
+const OPENING: &str = "($2 AND h.consecutive_failures::bigint+1 >= (SELECT threshold FROM policy) AND (h.open_until IS NULL OR h.open_until <= statement_timestamp()))";
+
+static RECORD_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        r#"WITH policy AS (
+            SELECT COALESCE(p.failure_threshold,3) AS threshold,
+                   COALESCE(p.cooldown_seconds,30) AS cooldown
+            FROM deployments d LEFT JOIN deployment_routing p
+              ON p.deployment_id=d.id
+            WHERE d.id=$1
+        )
+        INSERT INTO deployment_health AS h
+            (deployment_id, consecutive_failures, open_until, last_observed_at, reopen_count)
+        SELECT $1, CASE WHEN $2 THEN 1 ELSE 0 END,
+            CASE WHEN $2 AND threshold <= 1 THEN clock_timestamp() + make_interval(secs => cooldown) ELSE NULL END,
+            clock_timestamp(), CASE WHEN $2 AND threshold <= 1 THEN 1 ELSE 0 END FROM policy
+        ON CONFLICT (deployment_id) DO UPDATE SET
+            consecutive_failures=CASE
+                WHEN NOT {AUTHORITY} THEN h.consecutive_failures
+                WHEN $2 THEN LEAST(h.consecutive_failures::bigint+1,2147483647)::integer ELSE 0 END,
+            open_until=CASE
+                WHEN NOT {AUTHORITY} THEN h.open_until
+                WHEN NOT $2 THEN NULL
+                WHEN {OPENING} THEN clock_timestamp() + make_interval(secs => (SELECT LEAST(
+                    cooldown::double precision * power(2, LEAST(h.reopen_count, 20)),
+                    GREATEST(300, cooldown)) FROM policy))
+                ELSE h.open_until END,
+            reopen_count=CASE
+                WHEN NOT {AUTHORITY} THEN h.reopen_count
+                WHEN NOT $2 THEN 0
+                WHEN {OPENING} THEN LEAST(h.reopen_count::bigint+1,2147483647)::integer
+                ELSE h.reopen_count END,
+            probe_holder=CASE WHEN {AUTHORITY} AND (NOT $2 OR {OPENING}) THEN NULL ELSE h.probe_holder END,
+            probe_until=CASE WHEN {AUTHORITY} AND (NOT $2 OR {OPENING}) THEN NULL ELSE h.probe_until END,
+            last_observed_at=clock_timestamp()"#
+    )
+});
+
+async fn record(
+    store: &Store,
+    deployment: Uuid,
+    error: Option<InferenceError>,
+    probe: Option<i64>,
 ) -> Result<(), InferenceError> {
     if !affects_health(error) {
         return Ok(());
@@ -693,52 +806,18 @@ pub async fn record_result(
             _ => {}
         }
     }
-    // A failure that reaches the threshold while the circuit is closed or
-    // half-open opens it, for the deployment's cooldown doubled once per
-    // earlier opening, capped at 300 s (or the cooldown, if longer); it ends
-    // any probe slot. One that arrives while the circuit is open changes
-    // nothing more. A success closes the circuit, frees the slot and forgets
-    // the openings.
-    let result = sqlx::query(
-        r#"WITH policy AS (
-            SELECT COALESCE(p.failure_threshold,3) AS threshold,
-                   COALESCE(p.cooldown_seconds,30) AS cooldown
-            FROM deployments d LEFT JOIN deployment_routing p
-              ON p.deployment_id=d.id
-            WHERE d.id=$1
-        )
-        INSERT INTO deployment_health AS h
-            (deployment_id, consecutive_failures, open_until, last_observed_at, reopen_count)
-        SELECT $1, CASE WHEN $2 THEN 1 ELSE 0 END,
-            CASE WHEN $2 AND threshold <= 1 THEN clock_timestamp() + make_interval(secs => cooldown) ELSE NULL END,
-            clock_timestamp(), CASE WHEN $2 AND threshold <= 1 THEN 1 ELSE 0 END FROM policy
-        ON CONFLICT (deployment_id) DO UPDATE SET
-            consecutive_failures=CASE WHEN $2 THEN LEAST(h.consecutive_failures::bigint+1,2147483647)::integer ELSE 0 END,
-            open_until=CASE
-                WHEN NOT $2 THEN NULL
-                WHEN h.consecutive_failures::bigint+1 >= (SELECT threshold FROM policy)
-                     AND (h.open_until IS NULL OR h.open_until <= clock_timestamp())
-                    THEN clock_timestamp() + make_interval(secs => (SELECT LEAST(
-                        cooldown::double precision * power(2, LEAST(h.reopen_count, 20)),
-                        GREATEST(300, cooldown)) FROM policy))
-                ELSE h.open_until END,
-            reopen_count=CASE
-                WHEN NOT $2 THEN 0
-                WHEN h.consecutive_failures::bigint+1 >= (SELECT threshold FROM policy)
-                     AND (h.open_until IS NULL OR h.open_until <= clock_timestamp())
-                    THEN LEAST(h.reopen_count::bigint+1,2147483647)::integer
-                ELSE h.reopen_count END,
-            probe_holder=CASE
-                WHEN NOT $2 OR (h.consecutive_failures::bigint+1 >= (SELECT threshold FROM policy)
-                     AND (h.open_until IS NULL OR h.open_until <= clock_timestamp())) THEN NULL
-                ELSE h.probe_holder END,
-            probe_until=CASE
-                WHEN NOT $2 OR (h.consecutive_failures::bigint+1 >= (SELECT threshold FROM policy)
-                     AND (h.open_until IS NULL OR h.open_until <= clock_timestamp())) THEN NULL
-                ELSE h.probe_until END,
-            last_observed_at=clock_timestamp()"#,
-    ).bind(deployment).bind(error.is_some()).execute(&store.pool)
-        .await.map_err(|_| InferenceError::Storage)?;
+    // A success closes the circuit, frees the slot and forgets the openings;
+    // a counted failure at the threshold opens it for the deployment's
+    // cooldown doubled once per earlier opening, capped at 300 s (or the
+    // cooldown, if longer), and ends any probe slot. Neither applies without
+    // the authority to change the circuit.
+    let result = sqlx::query(RECORD_SQL.as_str())
+        .bind(deployment)
+        .bind(error.is_some())
+        .bind(probe)
+        .execute(&store.pool)
+        .await
+        .map_err(|_| InferenceError::Storage)?;
     store.caches.forget_health(deployment);
     if result.rows_affected() != 1 {
         return Err(InferenceError::ModelUnavailable);

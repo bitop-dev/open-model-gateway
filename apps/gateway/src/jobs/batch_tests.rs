@@ -267,6 +267,9 @@ impl ProviderAdapter for Fake {
         _: &Deployment,
         request: ChatRequest,
     ) -> Result<ProviderOutput, InferenceError> {
+        // This fake stands for an upstream call: as a real adapter's request
+        // builder would, it marks the attempt as possibly sent.
+        crate::inference::dispatch::started();
         let text = request.messages[0].content.clone().unwrap_or_default();
         {
             let mut script = self.script.lock().unwrap();
@@ -302,6 +305,20 @@ impl ProviderAdapter for Fake {
                 usage: usage(10, 5),
             })),
             "fail" => Err(InferenceError::UpstreamUnavailable),
+            // Fails its first execution only (a provider that recovers).
+            "fail-once"
+                if self
+                    .script
+                    .lock()
+                    .unwrap()
+                    .executed
+                    .iter()
+                    .filter(|t| *t == "fail-once")
+                    .count()
+                    == 1 =>
+            {
+                Err(InferenceError::UpstreamUnavailable)
+            }
             "busy" => Err(InferenceError::Busy),
             "slow" => {
                 tokio::time::sleep(Duration::from_millis(300)).await;

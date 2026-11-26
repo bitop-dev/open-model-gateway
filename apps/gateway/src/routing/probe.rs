@@ -30,8 +30,8 @@ pub async fn claim_probe(
 ) -> Result<ProbeClaim, InferenceError> {
     let claimed: Option<i64> = sqlx::query_scalar(
         "UPDATE deployment_health SET probe_holder=$2, probe_until=clock_timestamp()+make_interval(secs => $3), probe_epoch=probe_epoch+1
-         WHERE deployment_id=$1 AND open_until <= clock_timestamp()
-           AND (probe_until IS NULL OR probe_until <= clock_timestamp())
+         WHERE deployment_id=$1 AND open_until <= statement_timestamp()
+           AND (probe_until IS NULL OR probe_until <= statement_timestamp())
          RETURNING probe_epoch",
     )
     .bind(deployment)

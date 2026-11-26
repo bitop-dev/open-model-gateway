@@ -36,6 +36,10 @@ struct MemoryRepository {
     health: Mutex<Vec<Option<InferenceError>>>,
     /// What a probe claim answers (`None`: the route is closed).
     probe_claim: Mutex<Option<crate::routing::ProbeClaim>>,
+    /// Each route's circuit as `route_state` reports it (absent: closed).
+    route_states: Mutex<std::collections::HashMap<Uuid, crate::routing::RouteState>>,
+    /// The first-content close fails.
+    fail_close: AtomicBool,
     /// Probe calls in order: "claim <route>", "close <epoch>", "release <epoch>",
     /// and "health" for each health write.
     probe_log: Mutex<Vec<String>>,
@@ -83,9 +87,11 @@ impl InferenceRepository for MemoryRepository {
         _: Uuid,
         hold: std::time::Duration,
     ) -> Result<crate::routing::ProbeClaim, InferenceError> {
-        assert_eq!(
-            hold,
-            EngineLimits::default().request_timeout + SETTLEMENT_DEADLINE
+        // The slot is held at most for the request's remaining time and the
+        // settlement deadline.
+        assert!(
+            hold > SETTLEMENT_DEADLINE
+                && hold <= EngineLimits::default().request_timeout + SETTLEMENT_DEADLINE
         );
         self.probe_log
             .lock()
@@ -102,7 +108,22 @@ impl InferenceRepository for MemoryRepository {
             .lock()
             .unwrap()
             .push(format!("close {epoch}"));
+        if self.fail_close.load(Ordering::SeqCst) {
+            return Err(InferenceError::Storage);
+        }
         Ok(())
+    }
+    async fn route_state(
+        &self,
+        deployment: Uuid,
+    ) -> Result<crate::routing::RouteState, InferenceError> {
+        Ok(self
+            .route_states
+            .lock()
+            .unwrap()
+            .get(&deployment)
+            .copied()
+            .unwrap_or(crate::routing::RouteState::Closed))
     }
     async fn route_probe_release(&self, _: Uuid, epoch: i64) -> Result<(), InferenceError> {
         self.probe_log
@@ -1601,5 +1622,61 @@ async fn a_probe_dropped_before_its_admission_ends_frees_the_slot() {
     assert_eq!(
         probe_log(&repository, 2).await,
         [format!("claim {route}"), "release 7".into()]
+    );
+}
+
+/// A failover attempt takes its route as it is now: the second route's
+/// circuit opened after the plan was made, so nothing is sent there, and
+/// the request ends with the first attempt's own error.
+#[tokio::test]
+async fn a_failover_route_whose_circuit_opened_since_the_plan_is_not_used() {
+    let (engine, repo, backup) = failover_fixture(Mode::Throttled, false, false);
+    let second = repo.deployments.lock().unwrap()[1].id;
+    repo.route_states
+        .lock()
+        .unwrap()
+        .insert(second, crate::routing::RouteState::Open(30));
+    let root = Uuid::new_v4();
+    assert_eq!(
+        engine
+            .execute(principal(), request(false), root)
+            .await
+            .err(),
+        Some(InferenceError::Busy)
+    );
+    assert_eq!(backup.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(*repo.attempts.lock().unwrap(), vec![(root, 1)]);
+}
+
+/// The probe's first-content close fails; the client then drops the
+/// stream: the slot is still freed (the epoch is kept until it ends).
+#[tokio::test]
+async fn a_probe_whose_close_failed_is_still_freed_when_dropped() {
+    use crate::routing::ProbeClaim;
+    let (engine, repository, _) = fixture(Mode::LateContent, EngineLimits::default());
+    let route = probing(&repository, ProbeClaim::Claimed(7));
+    repository.fail_close.store(true, Ordering::SeqCst);
+    let ProviderOutput::Stream(mut output) = engine
+        .execute(principal(), request(true), Uuid::new_v4())
+        .await
+        .unwrap()
+    else {
+        panic!("expected stream")
+    };
+    for _ in 0..3 {
+        output.next().await.unwrap().unwrap();
+    }
+    assert_eq!(
+        probe_log(&repository, 2).await,
+        [format!("claim {route}"), "close 7".into()]
+    );
+    drop(output);
+    assert_eq!(
+        probe_log(&repository, 3).await,
+        [
+            format!("claim {route}"),
+            "close 7".into(),
+            "release 7".into()
+        ]
     );
 }

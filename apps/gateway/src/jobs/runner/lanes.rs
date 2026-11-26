@@ -16,9 +16,7 @@ pub(super) struct Pin {
 
 /// Outcome of planning a waiting line's route.
 pub(super) enum Planned {
-    /// The route, and whether it is half-open: the line must hold its probe
-    /// slot to use it.
-    Route(Deployment, bool),
+    Route(Deployment),
     /// Every route serving the line is cooling down, or planning hit a
     /// transient storage/timeout failure: wait and plan again, do not fail.
     CoolingDown,
@@ -34,8 +32,6 @@ pub(super) struct Head {
     pub(super) request: Option<BatchRequest>,
     pub(super) plan: Option<lines::LinePlan>,
     pub(super) route: Option<Deployment>,
-    /// `route` is half-open (`Planned::Route`).
-    pub(super) probe: bool,
     /// Planned while every route was cooling down.
     pub(super) cooling: bool,
     pub(super) planned: Option<Instant>,
@@ -125,7 +121,6 @@ impl Lane {
                     request,
                     plan,
                     route: None,
-                    probe: false,
                     cooling: false,
                     planned: None,
                 });

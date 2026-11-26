@@ -415,7 +415,7 @@ impl Engine {
             .as_secs()
             .min(i64::MAX as u64 - 5) as i64
             + 5;
-        let (mut attempt, mut cooling) = (0usize, None);
+        let (mut attempt, mut cooling, mut failed_over) = (0usize, None, None);
         for id in &plan.deployment_ids {
             if attempt == plan.max_attempts {
                 break;
@@ -433,7 +433,10 @@ impl Engine {
             } else {
                 Uuid::now_v7()
             };
-            let Some(probe) = self.usable(&plan, *id, request_id, &mut cooling).await else {
+            let Some(probe) = self
+                .usable(&plan, *id, request_id, deadline, attempt > 0, &mut cooling)
+                .await?
+            else {
                 continue;
             };
             let started = Instant::now();
@@ -539,13 +542,14 @@ impl Engine {
                                 && crate::routing::may_fail_over_unsent(&plan, error)))
                     {
                         attempt += 1;
+                        failed_over = Some(error);
                         continue;
                     }
                     return Err(error);
                 }
             }
         }
-        Err(super::exhausted(cooling, attempt))
+        Err(super::exhausted(cooling, attempt, failed_over))
     }
 }
 

@@ -48,6 +48,17 @@ async fn circuit(
 
 const HOLD: Duration = Duration::from_secs(60);
 
+/// Claim the half-open route's probe slot; its epoch.
+async fn claimed(f: &crate::governance::tests::db::Fixture, deployment: Uuid) -> i64 {
+    match claim_probe(&f.store, deployment, Uuid::new_v4(), HOLD)
+        .await
+        .unwrap()
+    {
+        ProbeClaim::Claimed(epoch) => epoch,
+        other => panic!("not claimed: {other:?}"),
+    }
+}
+
 #[dbtest::test]
 async fn an_expired_cooldown_admits_one_probe_across_replicas(pool: PgPool) {
     let f = fixture(pool).await;
@@ -128,21 +139,17 @@ async fn a_failed_probe_reopens_for_a_doubled_cooldown_up_to_the_cap(pool: PgPoo
     assert_eq!(circuit(&f, deployment.id).await, (Some(60), 1, false));
     for (open, reopens) in [(120, 2), (240, 3), (300, 4), (300, 5)] {
         expire(&f, deployment.id).await;
-        assert!(matches!(
-            claim_probe(&f.store, deployment.id, Uuid::new_v4(), HOLD)
-                .await
-                .unwrap(),
-            ProbeClaim::Claimed(_)
-        ));
+        let epoch = claimed(&f, deployment.id).await;
         assert!(circuit(&f, deployment.id).await.2);
-        record_result(
+        record_probe_result(
             &f.store,
             deployment.id,
             Some(InferenceError::UpstreamUnavailable),
+            epoch,
         )
         .await
         .unwrap();
-        // The failure reopened the circuit and ended the slot.
+        // The probe's failure reopened the circuit and ended the slot.
         assert_eq!(
             circuit(&f, deployment.id).await,
             (Some(open), reopens, false)
@@ -160,33 +167,89 @@ async fn a_failed_probe_reopens_for_a_doubled_cooldown_up_to_the_cap(pool: PgPoo
         .await
         .unwrap();
     expire(&f, deployment.id).await;
-    assert!(matches!(
-        claim_probe(&f.store, deployment.id, Uuid::new_v4(), HOLD)
-            .await
-            .unwrap(),
-        ProbeClaim::Claimed(_)
-    ));
-    record_result(&f.store, deployment.id, Some(InferenceError::Busy))
+    let epoch = claimed(&f, deployment.id).await;
+    record_probe_result(&f.store, deployment.id, Some(InferenceError::Busy), epoch)
         .await
         .unwrap();
     assert_eq!(circuit(&f, deployment.id).await, (Some(600), 6, false));
-    // A failure never closes it, and a stale slot's writes change nothing.
-    let h = health(&f.store, deployment.id).await.unwrap();
-    assert!(h.circuit_open);
+    assert!(health(&f.store, deployment.id).await.unwrap().circuit_open);
 }
 
+/// Only the probe decides an open or half-open circuit: a result without
+/// its current epoch (an attempt admitted before the circuit opened, a
+/// realtime session, a probe whose slot ended) changes nothing, success or
+/// failure, and leaves the probe's slot alone.
+#[dbtest::test]
+async fn only_the_current_probe_decides_an_open_circuit(pool: PgPool) {
+    let f = fixture(pool).await;
+    let deployment = opened(&f, 60).await;
+    // Open: a late success does not close it.
+    record_result(&f.store, deployment.id, None).await.unwrap();
+    assert_eq!(circuit(&f, deployment.id).await, (Some(60), 1, false));
+    // Half-open with a probe running: neither a late success nor a late
+    // failure decides, and the slot stays the probe's.
+    expire(&f, deployment.id).await;
+    let stale = claimed(&f, deployment.id).await;
+    release_probe(&f.store, deployment.id, stale).await.unwrap();
+    let epoch = claimed(&f, deployment.id).await;
+    for result in [None, Some(InferenceError::UpstreamUnavailable)] {
+        record_result(&f.store, deployment.id, result)
+            .await
+            .unwrap();
+        record_probe_result(&f.store, deployment.id, result, stale)
+            .await
+            .unwrap();
+        let (open, reopens, held) = circuit(&f, deployment.id).await;
+        assert!(
+            open.is_some_and(|s| s <= 0) && reopens == 1 && held,
+            "{open:?} {reopens} {held}"
+        );
+    }
+    // The probe's own success decides.
+    record_probe_result(&f.store, deployment.id, None, epoch)
+        .await
+        .unwrap();
+    assert_eq!(circuit(&f, deployment.id).await, (None, 0, false));
+    // Closed again, ordinary results count as before.
+    record_result(&f.store, deployment.id, Some(InferenceError::Busy))
+        .await
+        .unwrap();
+    assert_eq!(circuit(&f, deployment.id).await, (Some(60), 1, false));
+}
+
+/// The route's state as a request about to send sees it.
+#[dbtest::test]
+async fn route_state_reads_the_circuit_now(pool: PgPool) {
+    let f = fixture(pool).await;
+    let deployment = f
+        .store
+        .deployments(&f.principal, "company/smart")
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        route_state(&f.store, deployment.id).await.unwrap(),
+        RouteState::Closed
+    );
+    let deployment = opened(&f, 60).await;
+    assert!(
+        matches!(route_state(&f.store, deployment.id).await.unwrap(), RouteState::Open(s) if (1..=60).contains(&s))
+    );
+    expire(&f, deployment.id).await;
+    assert_eq!(
+        route_state(&f.store, deployment.id).await.unwrap(),
+        RouteState::HalfOpen
+    );
+}
 #[dbtest::test]
 async fn a_successful_probe_closes_and_forgets_the_openings(pool: PgPool) {
     let f = fixture(pool).await;
     let deployment = opened(&f, 60).await;
     expire(&f, deployment.id).await;
-    assert!(matches!(
-        claim_probe(&f.store, deployment.id, Uuid::new_v4(), HOLD)
-            .await
-            .unwrap(),
-        ProbeClaim::Claimed(_)
-    ));
-    record_result(&f.store, deployment.id, None).await.unwrap();
+    let epoch = claimed(&f, deployment.id).await;
+    record_probe_result(&f.store, deployment.id, None, epoch)
+        .await
+        .unwrap();
     assert_eq!(circuit(&f, deployment.id).await, (None, 0, false));
     let only = std::slice::from_ref(&deployment);
     let planned = plan_probing(
@@ -210,7 +273,6 @@ async fn a_successful_probe_closes_and_forgets_the_openings(pool: PgPool) {
         ProbeClaim::Closed
     );
 }
-
 #[dbtest::test]
 async fn a_streams_first_content_closes_but_only_a_complete_success_forgets(pool: PgPool) {
     let f = fixture(pool).await;
@@ -313,8 +375,9 @@ async fn a_probe_slot_ends_without_a_decision(pool: PgPool) {
             .open_until
             .is_some()
     );
-    // A claim on a route whose circuit reopened meanwhile is busy, not claimed.
-    record_result(&f.store, deployment.id, Some(InferenceError::Busy))
+    // A claim on a route whose circuit reopened meanwhile (the probe failed)
+    // is busy, not claimed.
+    record_probe_result(&f.store, deployment.id, Some(InferenceError::Busy), next)
         .await
         .unwrap();
     assert!(

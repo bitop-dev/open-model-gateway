@@ -134,8 +134,10 @@ impl Runner {
         if let Some(epoch) = probe
             && !matches!(claimed, Ok(Claim::Claimed))
         {
-            // No capacity for the line: its probe slot is freed for another request.
-            let _ = self.jobs.store.route_probe_release(route, epoch).await;
+            // No capacity for the line: its probe slot is freed for another
+            // request (bounded; otherwise it ends at its expiry).
+            let release = crate::routing::release_probe(&self.jobs.store, route, epoch);
+            let _ = tokio::time::timeout(Duration::from_millis(250), release).await;
         }
         match claimed {
             Ok(Claim::Claimed) => {
@@ -163,34 +165,43 @@ impl Runner {
         Ok(started)
     }
 
-    /// A half-open route: the line runs only as its probe. The probe slot
-    /// it claimed (`Some(None)` when the route needs none), or `None`: a slot
-    /// another request holds is a route cooling down, waited out as one is
-    /// (the line is planned again after `REPLAN`; nothing is claimed, sent
-    /// or retried).
+    /// The route as it is now, before the line claims its capacity (the
+    /// plan may be up to `REPLAN` old): `Some(None)` when its circuit is
+    /// closed; once half-open the line runs only as its probe
+    /// (`Some(Some(epoch))`). `None` while the circuit is open or another
+    /// request holds the probe: the line waits as for a cooldown (planned
+    /// again after `REPLAN`; nothing is claimed, sent or retried).
     async fn line_probe(
         &self,
         run: &Dispatch<'_>,
         head: &mut Head,
         route: Uuid,
     ) -> Option<Option<i64>> {
-        if !head.probe {
-            return Some(None);
-        }
-        match self
-            .jobs
-            .store
-            .route_probe_claim(route, head.execution, run.line.probe_hold())
-            .await
-        {
-            Ok(crate::routing::ProbeClaim::Claimed(epoch)) => Some(Some(epoch)),
-            Ok(crate::routing::ProbeClaim::Closed) => Some(None),
-            Ok(crate::routing::ProbeClaim::Busy(_)) | Err(_) => {
-                head.cooling = true;
-                head.planned = Some(Instant::now());
-                None
+        use crate::routing::{ProbeClaim, RouteState};
+        let store = &self.jobs.store;
+        let usable = match crate::routing::route_state(store, route).await {
+            Ok(RouteState::Closed) => Some(None),
+            Ok(RouteState::HalfOpen) => {
+                match crate::routing::claim_probe(
+                    store,
+                    route,
+                    head.execution,
+                    run.line.probe_hold(),
+                )
+                .await
+                {
+                    Ok(ProbeClaim::Claimed(epoch)) => Some(Some(epoch)),
+                    Ok(ProbeClaim::Closed) => Some(None),
+                    Ok(ProbeClaim::Busy(_)) | Err(_) => None,
+                }
             }
+            Ok(RouteState::Open(_)) | Err(_) => None,
+        };
+        if usable.is_none() {
+            head.cooling = true;
+            head.planned = Some(Instant::now());
         }
+        usable
     }
 
     /// Plan the head line's route again when it was never planned or its
@@ -199,7 +210,7 @@ impl Runner {
         // The seed matches admission's estimate. The eligible routes still
         // come from the scheduler's live checks on every replan.
         if head.planned.is_none_or(|t| t.elapsed() >= REPLAN) {
-            (head.route, head.probe, head.cooling) = match &head.request {
+            (head.route, head.cooling) = match &head.request {
                 Some(request) => {
                     match self
                         .plan_route(
@@ -211,12 +222,12 @@ impl Runner {
                         )
                         .await
                     {
-                        Planned::Route(d, probe) => (Some(d), probe, false),
-                        Planned::CoolingDown => (None, false, true),
-                        Planned::Nothing => (None, false, false),
+                        Planned::Route(d) => (Some(d), false),
+                        Planned::CoolingDown => (None, true),
+                        Planned::Nothing => (None, false),
                     }
                 }
-                None => (None, false, false),
+                None => (None, false),
             };
             head.planned = Some(Instant::now());
         }

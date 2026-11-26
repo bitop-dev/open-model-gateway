@@ -158,7 +158,7 @@ impl Engine {
                         || (guard.telemetry.nothing_sent
                             && crate::routing::may_fail_over_unsent(plan, error)));
                 if failing_over {
-                    return AttemptEnd::Failover(telemetry);
+                    return AttemptEnd::Failover(telemetry, error);
                 }
                 if let Err(settlement_error) = settled {
                     telemetry.finish(telemetry::Outcome::Error, Some(settlement_error));
@@ -306,7 +306,8 @@ pub(super) struct RequestScope<'a> {
     reason = "returned by value once per attempt, like the Result it wraps; boxing would allocate per request"
 )]
 pub(super) enum AttemptEnd {
-    Failover(RequestTelemetry),
+    /// The attempt failed with this error and the next route may be tried.
+    Failover(RequestTelemetry, InferenceError),
     Return(Result<ProviderOutput, InferenceError>),
 }
 

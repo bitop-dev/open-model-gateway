@@ -248,6 +248,23 @@ pub trait InferenceRepository: Send + Sync {
     ) -> Result<(), InferenceError> {
         Ok(())
     }
+    /// `routing::record_probe_result`: the result of the attempt that holds
+    /// the probe slot under `epoch`.
+    async fn route_probe_result(
+        &self,
+        deployment: Uuid,
+        error: Option<InferenceError>,
+        _epoch: i64,
+    ) -> Result<(), InferenceError> {
+        self.route_result(deployment, error).await
+    }
+    /// `routing::route_state`: the route's circuit now.
+    async fn route_state(
+        &self,
+        _deployment: Uuid,
+    ) -> Result<crate::routing::RouteState, InferenceError> {
+        Ok(crate::routing::RouteState::Closed)
+    }
     /// `routing::claim_probe`.
     async fn route_probe_claim(
         &self,
@@ -473,6 +490,20 @@ impl InferenceRepository for Store {
         error: Option<InferenceError>,
     ) -> Result<(), InferenceError> {
         crate::routing::record_result(self, deployment, error).await
+    }
+    async fn route_probe_result(
+        &self,
+        deployment: Uuid,
+        error: Option<InferenceError>,
+        epoch: i64,
+    ) -> Result<(), InferenceError> {
+        crate::routing::record_probe_result(self, deployment, error, epoch).await
+    }
+    async fn route_state(
+        &self,
+        deployment: Uuid,
+    ) -> Result<crate::routing::RouteState, InferenceError> {
+        crate::routing::route_state(self, deployment).await
     }
     async fn route_probe_claim(
         &self,

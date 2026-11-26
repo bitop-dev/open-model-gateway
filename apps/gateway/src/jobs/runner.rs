@@ -585,7 +585,7 @@ impl Runner {
             .plan_route_inner(principal, endpoint, request, execution, planned_deployment)
             .await
         {
-            Ok(Some((d, probe))) => Planned::Route(d, probe),
+            Ok(Some(d)) => Planned::Route(d),
             Err(InferenceError::RouteCoolingDown(_)) => Planned::CoolingDown,
             // A transient planning failure is not "no route serves this line":
             // wait and plan again instead of dispatching it ungated, because an
@@ -603,7 +603,7 @@ impl Runner {
         request: &BatchRequest,
         execution: Uuid,
         planned_deployment: Option<Uuid>,
-    ) -> Result<Option<(Deployment, bool)>, InferenceError> {
+    ) -> Result<Option<Deployment>, InferenceError> {
         let protocol = endpoint.protocol();
         let model = request.model();
         let store = &self.jobs.store;
@@ -670,18 +670,17 @@ impl Runner {
         } else {
             candidates
         };
-        // A line records health, so it may be a half-open route's probe.
+        // A line records health, so it may be a half-open route's probe: a
+        // route whose probe another request holds is left out of the plan.
+        // Whether the line must claim the probe is decided when it is
+        // dispatched (`Runner::line_probe`), not from this plan.
         let plan = store
             .route_plan_probing(principal, model, &candidates, execution)
             .await?;
         let Some(first) = plan.deployment_ids.first() else {
             return Ok(None);
         };
-        let probe = plan.probes.contains(first);
-        Ok(candidates
-            .into_iter()
-            .find(|d| d.id == *first)
-            .map(|d| (d, probe)))
+        Ok(candidates.into_iter().find(|d| d.id == *first))
     }
 }
 

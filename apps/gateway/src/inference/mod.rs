@@ -115,23 +115,35 @@ impl Engine {
     pub(crate) fn probe_hold(&self) -> Duration {
         self.limits.request_timeout + SETTLEMENT_DEADLINE
     }
-    /// [`route_use`] for this engine's attempts: the probe slot it holds for
-    /// `id`, or `None` (the wait noted in `cooling`) while another request
-    /// holds it.
+    /// [`route_use`] for this engine's attempts, within the request's
+    /// deadline: the probe slot it holds for `id` (held at most until the
+    /// deadline and the settlement deadline), or `None` (the wait noted in
+    /// `cooling`) while the route cannot be used. `live` for an attempt after
+    /// the first, whose plan is no longer fresh.
     async fn usable(
         &self,
         plan: &crate::routing::RoutePlan,
         id: Uuid,
         holder: Uuid,
+        deadline: tokio::time::Instant,
+        live: bool,
         cooling: &mut Option<u32>,
-    ) -> Option<Option<ProbeTicket>> {
-        match route_use(&self.repository, plan, id, holder, self.probe_hold()).await {
+    ) -> Result<Option<Option<ProbeTicket>>, InferenceError> {
+        let hold =
+            deadline.saturating_duration_since(tokio::time::Instant::now()) + SETTLEMENT_DEADLINE;
+        let used = timeout_at(
+            deadline,
+            route_use(&self.repository, plan, id, holder, hold, live),
+        )
+        .await
+        .map_err(|_| InferenceError::Timeout)?;
+        Ok(match used {
             RouteUse::Go(probe) => Some(probe),
             RouteUse::Busy(seconds) => {
                 *cooling = Some(cooling.map_or(seconds, |c| c.min(seconds)));
                 None
             }
-        }
+        })
     }
     pub fn new(
         repository: Arc<dyn InferenceRepository>,
@@ -278,7 +290,7 @@ impl Engine {
             protocol,
             streamed,
         };
-        let (mut attempt, mut cooling) = (0, None);
+        let (mut attempt, mut cooling, mut failed_over) = (0, None, None);
         for id in &plan.deployment_ids {
             if attempt == plan.max_attempts {
                 break;
@@ -308,19 +320,30 @@ impl Engine {
                     return Err(InferenceError::Configuration);
                 }
             };
-            let Some(probe) = self.usable(&plan, *id, request_id, &mut cooling).await else {
-                continue;
+            let probe = match self
+                .usable(&plan, *id, request_id, deadline, attempt > 0, &mut cooling)
+                .await
+            {
+                Ok(Some(probe)) => probe,
+                Ok(None) => continue,
+                Err(error) => {
+                    telemetry.finish(telemetry::Outcome::Error, Some(error));
+                    return Err(error);
+                }
             };
             telemetry = match self
                 .attempt(&scope, telemetry, attempt, deployment, adapter, probe)
                 .await
             {
-                AttemptEnd::Failover(telemetry) => telemetry,
+                AttemptEnd::Failover(telemetry, error) => {
+                    failed_over = Some(error);
+                    telemetry
+                }
                 AttemptEnd::Return(result) => return result,
             };
             attempt += 1;
         }
-        let error = exhausted(cooling, attempt);
+        let error = exhausted(cooling, attempt, failed_over);
         telemetry.finish(telemetry::Outcome::Error, Some(error));
         Err(error)
     }
@@ -429,11 +452,18 @@ pub(crate) enum RouteUse {
     Busy(u32),
 }
 
-/// The error of a request whose plan ran out: the routes left were other
-/// requests' probes and none was attempted (cooling down), or attempts ran out.
-pub(crate) fn exhausted(cooling: Option<u32>, attempts: usize) -> InferenceError {
-    match cooling {
-        Some(seconds) if attempts == 0 => InferenceError::RouteCoolingDown(seconds),
+/// The error of a request whose plan ran out: the routes left could not be
+/// used and none was attempted (cooling down), or the attempts ran out.
+pub(crate) fn exhausted(
+    cooling: Option<u32>,
+    attempts: usize,
+    failed_over: Option<InferenceError>,
+) -> InferenceError {
+    match (cooling, failed_over) {
+        (Some(seconds), _) if attempts == 0 => InferenceError::RouteCoolingDown(seconds),
+        // The last attempt failed over to routes none of which could be used:
+        // its own error stands.
+        (_, Some(error)) => error,
         _ => InferenceError::Busy,
     }
 }
@@ -448,8 +478,9 @@ pub(crate) async fn route_use(
     id: Uuid,
     holder: Uuid,
     hold: Duration,
+    live: bool,
 ) -> RouteUse {
-    use crate::routing::ProbeClaim;
+    use crate::routing::{ProbeClaim, RouteState};
     let ticket = |epoch| ProbeTicket {
         repository: repository.clone(),
         deployment: id,
@@ -461,7 +492,19 @@ pub(crate) async fn route_use(
     {
         return RouteUse::Go(Some(ticket(epoch)));
     }
-    if !plan.probes.contains(&id) {
+    // A route planned earlier in the request (a failover attempt) is taken
+    // as it is now: its circuit may have opened or passed its cooldown since.
+    let half_open = if live {
+        match repository.route_state(id).await {
+            Ok(RouteState::Closed) => false,
+            Ok(RouteState::HalfOpen) => true,
+            Ok(RouteState::Open(seconds)) => return RouteUse::Busy(seconds),
+            Err(_) => return RouteUse::Busy(1),
+        }
+    } else {
+        plan.probes.contains(&id)
+    };
+    if !half_open {
         return RouteUse::Go(None);
     }
     match repository.route_probe_claim(id, holder, hold).await {
@@ -595,7 +638,11 @@ impl ExecutionGuard {
             && (text.is_some_and(|t| !t.is_empty()) || !tool_calls.is_empty())
         {
             self.telemetry.time_to_first_token_ms = Some(millis(self.dispatched.elapsed()));
-            if let Some(epoch) = self.probe.take() {
+            if let Some(epoch) = self.probe
+                && self.probe_closing.is_none()
+            {
+                // The epoch stays: `finish` or `Drop` still frees a slot the
+                // close did not end (a fenced no-op once it did).
                 self.probe_closing = self.end_probe(epoch, true);
             }
         }
@@ -645,16 +692,24 @@ impl ExecutionGuard {
             let _ = closing.await;
         }
         // Health is advisory; a failed health write never discards a durably accounted response.
+        // An attempt that sent nothing is no evidence about the provider.
+        // The probe's result is recorded as the probe's (it decides).
+        let (repository, deployment, probe) =
+            (self.repository.clone(), self.deployment_id, self.probe);
+        let write = async move {
+            match probe {
+                Some(epoch) => {
+                    repository
+                        .route_probe_result(deployment, error, epoch)
+                        .await
+                }
+                None => repository.route_result(deployment, error).await,
+            }
+        };
         if self.health_observation
             && outcome != Outcome::Cancelled
-            && !matches!(
-                timeout(
-                    Duration::from_millis(250),
-                    self.repository.route_result(self.deployment_id, error)
-                )
-                .await,
-                Ok(Ok(()))
-            )
+            && !self.telemetry.nothing_sent
+            && !matches!(timeout(Duration::from_millis(250), write).await, Ok(Ok(())))
         {
             tracing::warn!(execution_id=%self.id, trace_id = self.log_trace_id.as_ref().map(LogTraceId::as_str), "routing health update failed");
         }
