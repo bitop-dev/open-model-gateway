@@ -79,7 +79,6 @@ pub struct EngineLimits {
     /// Token counts this process runs at once, from a pool separate from
     /// generation's `max_concurrent` (`count`).
     pub count_concurrency: usize,
-    /// Body cap and in-flight budget of the image input routes (`image_buffer`).
     pub image_input: image_buffer::ImageInputLimits,
 }
 impl Default for EngineLimits {
