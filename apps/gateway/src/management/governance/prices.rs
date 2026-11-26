@@ -418,7 +418,17 @@ pub(super) async fn deployment_routing(
     Path(id): Path<Uuid>,
 ) -> ApiResult {
     let mut tx = resources::catalog_tx(&s, &u, false).await?;
-    let v:Value=sqlx::query_scalar("SELECT jsonb_build_object('routing',jsonb_build_object('priority',coalesce(r.priority,0),'weight',coalesce(r.weight,1),'residency',r.residency,'failure_threshold',coalesce(r.failure_threshold,3),'cooldown_seconds',coalesce(r.cooldown_seconds,30)),'health',jsonb_build_object('consecutive_failures',coalesce(h.consecutive_failures,0),'open_until',h.open_until,'last_observed_at',h.last_observed_at)) FROM deployments d LEFT JOIN deployment_routing r ON r.deployment_id=d.id LEFT JOIN deployment_health h ON h.deployment_id=d.id WHERE d.id=$1").bind(id).fetch_optional(&mut *tx).await?.ok_or_else(missing)?;
+    // The health view is `routing::HEALTH_VIEW_SQL` (sanitized; computed at
+    // this statement's time).
+    let sql = format!(
+        "SELECT jsonb_build_object('routing',jsonb_build_object('priority',coalesce(r.priority,0),'weight',coalesce(r.weight,1),'residency',r.residency,'failure_threshold',coalesce(r.failure_threshold,3),'cooldown_seconds',coalesce(r.cooldown_seconds,30)),'health',{}) FROM deployments d LEFT JOIN deployment_routing r ON r.deployment_id=d.id LEFT JOIN deployment_health h ON h.deployment_id=d.id WHERE d.id=$1",
+        crate::routing::HEALTH_VIEW_SQL.as_str()
+    );
+    let v: Value = sqlx::query_scalar(&sql)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(missing)?;
     tx.commit().await?;
     Ok(Json(v))
 }
