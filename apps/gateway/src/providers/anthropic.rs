@@ -75,8 +75,10 @@ impl AnthropicAdapter {
                 outbound = outbound.header("anthropic-beta", beta);
             }
         }
+        // Images are spliced into the serialized body, not the value.
         outbound
-            .json(payload)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(super::image_body::json_body_base64(payload, request)?)
             .send()
             .await
             .map_err(send_error(crate::egress::UpstreamClient::Anthropic))
@@ -89,7 +91,7 @@ impl ProviderAdapter for AnthropicAdapter {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
-            image_input: false,
+            image_input: true,
             text_chat: true,
             streaming: true,
             tools: true,
@@ -231,8 +233,10 @@ fn check_supported(request: &ChatRequest) -> Result<()> {
     }
     Ok(())
 }
-/// The content blocks of one non-system message: a tool result, or text then tool calls.
-fn content_blocks(message: &Message) -> Result<Vec<Value>> {
+/// The content blocks of one non-system message: a tool result, or text
+/// (and images, numbered in message order for the body's splice) then tool
+/// calls.
+fn content_blocks(message: &Message, images: &mut usize) -> Result<Vec<Value>> {
     let mut content = vec![];
     if message.role == Role::Tool {
         let text = message
@@ -243,8 +247,12 @@ fn content_blocks(message: &Message) -> Result<Vec<Value>> {
         content
             .push(json!({"type":"tool_result","tool_use_id":message.tool_call_id,"content":text}));
     } else {
-        if let Some(text) = &message.content {
-            content.push(json!({"type":"text","text":text.require_text()?}));
+        match &message.content {
+            Some(Content::Parts(parts)) => {
+                content.extend(super::image_body::messages_blocks(parts, images));
+            }
+            Some(text) => content.push(json!({"type":"text","text":text.require_text()?})),
+            None => {}
         }
         for call in &message.tool_calls {
             let input: Value = serde_json::from_str(&call.arguments)
@@ -262,6 +270,7 @@ fn system_and_messages(request: &ChatRequest) -> Result<(Vec<Value>, Vec<Value>)
     let mut system = vec![];
     let mut messages = vec![];
     let mut conversation = false;
+    let mut images = 0;
     for message in &request.messages {
         if matches!(message.role, Role::System | Role::Developer) {
             if conversation || !message.tool_calls.is_empty() {
@@ -273,7 +282,7 @@ fn system_and_messages(request: &ChatRequest) -> Result<(Vec<Value>, Vec<Value>)
             continue;
         }
         conversation = true;
-        let content = content_blocks(message)?;
+        let content = content_blocks(message, &mut images)?;
         messages.push(json!({"role":if message.role == Role::Assistant { "assistant" } else { "user" },"content":content}));
     }
     Ok((system, messages))
@@ -348,9 +357,22 @@ fn set_tool_choice(value: &mut Value, request: &ChatRequest) {
         };
     }
 }
+/// Anthropic's limits for inline images (Claude API vision documentation):
+/// 10 MB of base64 per image, 100 images and 128 MB per request, 8000 px per
+/// side. The gateway's own bounds (`protocols::image_input`) are tighter
+/// except for the side, which the image's header states.
+const IMAGE_LIMITS: super::image_body::ImageLimits = super::image_body::ImageLimits {
+    per_image: usize::MAX,
+    per_image_base64: 10_000_000,
+    count: 100,
+    side: 8000,
+    request_bytes: 128_000_000,
+    detail: false,
+};
 fn encode(model: &str, request: &ChatRequest) -> Result<Value> {
     super::messages::validate(request, super::messages::ProviderClass::Anthropic)?;
     check_supported(request)?;
+    super::image_body::check_limits(request, &IMAGE_LIMITS)?;
     let (system, messages) = system_and_messages(request)?;
     let mut value = json!({"model":model,"messages":messages,"max_tokens":request.max_output_tokens.unwrap_or(1024),"stream":request.stream});
     if !system.is_empty() {

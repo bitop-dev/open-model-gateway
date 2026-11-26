@@ -461,8 +461,13 @@ pub const IMAGE_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==";
 /// A user turn of text, an inline image (detail `low`) and more text, as the
 /// Chat Completions and Responses parsers produce it.
 pub fn image_request(stream: bool) -> ChatRequest {
+    image_request_with(stream, Some("low"))
+}
+
+/// [`image_request`] with another `detail` hint, or none.
+pub fn image_request_with(stream: bool, detail: Option<&str>) -> ChatRequest {
     let image = crate::protocols::image_input::Images::default()
-        .take(IMAGE_URL.into(), Some("low"), "image")
+        .take(IMAGE_URL.into(), detail, "image")
         .expect("the fixture image is valid");
     ChatRequest {
         messages_options: None,
@@ -483,26 +488,5 @@ pub fn image_request(stream: bool) -> ChatRequest {
         temperature: None,
         max_output_tokens: Some(16),
         stream,
-    }
-}
-
-/// An adapter whose wire carries no images (`Capabilities::image_input`
-/// false) refuses an image request at the capability check, so the engine
-/// skips its routes before admission, and, executed anyway, in its encoder
-/// with `InvalidField("image")` before any request is built: `target` points
-/// at an address nothing listens on, so a request that was sent would fail
-/// with a transport error instead.
-pub async fn assert_images_refused(adapter: &dyn ProviderAdapter, target: &Deployment) {
-    assert!(!adapter.capabilities().image_input);
-    for stream in [false, true] {
-        let request = image_request(stream);
-        assert!(!adapter.supports_chat_request(&request), "capability check");
-        assert_eq!(
-            adapter.execute(target, request).await.err(),
-            Some(crate::inference::error::InferenceError::InvalidField(
-                "image"
-            )),
-            "encoder backstop (stream {stream})"
-        );
     }
 }

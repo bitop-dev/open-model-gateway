@@ -122,6 +122,24 @@ pub fn estimate(request: &ChatRequest) -> u64 {
     bytes.div_ceil(4)
 }
 
+/// The gateway estimate as a count. The estimate counts text only, so a
+/// request with an image (inline or a native Messages block) is refused
+/// with the field named rather than given a number that leaves it out; only
+/// a provider's own counter counts images.
+pub(crate) fn estimated(request: &ChatRequest) -> Result<TokenCount, InferenceError> {
+    let native = request
+        .messages_options
+        .as_ref()
+        .is_some_and(|o| !o.images.is_empty());
+    if request.has_images() || native {
+        return Err(InferenceError::InvalidField("image"));
+    }
+    Ok(TokenCount {
+        input_tokens: estimate(request),
+        source: TokenCountSource::Estimate,
+    })
+}
+
 /// Fixed-window admission of counts per key (an API key, or a provider
 /// connection credential) in this process.
 pub(crate) struct Limiter<K> {
@@ -354,10 +372,7 @@ impl Engine {
             .get(&deployment.provider)
             .ok_or(InferenceError::Configuration)?;
         if !adapter.counts_input_tokens() {
-            return Ok(TokenCount {
-                input_tokens: estimate(&request),
-                source: TokenCountSource::Estimate,
-            });
+            return Ok(estimated(&request)?);
         }
         // Checked only now, so a refused or estimated count never spends the
         // connection's window.
@@ -376,10 +391,7 @@ impl Engine {
                 input_tokens,
                 source: TokenCountSource::Provider,
             },
-            None => TokenCount {
-                input_tokens: estimate(&request),
-                source: TokenCountSource::Estimate,
-            },
+            None => estimated(&request)?,
         })
     }
 }

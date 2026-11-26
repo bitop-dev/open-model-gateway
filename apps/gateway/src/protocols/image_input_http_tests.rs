@@ -70,6 +70,10 @@ fn chat_body(url: &str, stream: bool) -> Value {
 #[derive(Default)]
 struct Upstream {
     bodies: Mutex<Vec<Value>>,
+    /// The path of each body, in the same order.
+    paths: Mutex<Vec<String>>,
+    /// Paths answered 429 (`Busy`: failover needs no ambiguity opt-in).
+    failing: Mutex<Vec<&'static str>>,
     release: tokio::sync::Notify,
     hold: std::sync::atomic::AtomicBool,
 }
@@ -81,6 +85,21 @@ fn upstream(state: Arc<Upstream>) -> Router {
             let value: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
             let stream = value["stream"] == true;
             state.bodies.lock().unwrap().push(value);
+            state.paths.lock().unwrap().push(uri.path().to_owned());
+            if state.failing.lock().unwrap().iter().any(|p| uri.path().ends_with(p)) {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("x-amzn-errortype", "ThrottlingException")],
+                    axum::Json(json!({"error":{"type":"rate_limit_error","message":"slow down"},"message":"slow down"})),
+                )
+                    .into_response();
+            }
+            if uri.path().ends_with("/messages") {
+                return axum::Json(json!({"id":"msg_1","type":"message","role":"assistant","model":"private","content":[{"type":"text","text":"a cat"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":2}})).into_response();
+            }
+            if uri.path().ends_with("/converse") {
+                return axum::Json(json!({"output":{"message":{"role":"assistant","content":[{"text":"a cat"}]}},"stopReason":"end_turn","usage":{"inputTokens":5,"outputTokens":2,"totalTokens":7},"metrics":{"latencyMs":2}})).into_response();
+            }
             if uri.path().ends_with("/responses") {
                 return axum::Json(json!({"id":"r","object":"response","model":"private","status":"completed","output":[{"id":"m","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"a cat","annotations":[]}]}],"usage":{"input_tokens":5,"output_tokens":2}})).into_response();
             }
@@ -112,6 +131,25 @@ struct World {
 }
 
 async fn world(pool: PgPool, limits: ImageInputLimits, priced: bool) -> World {
+    world_for(pool, limits, priced, "openai").await
+}
+
+/// A world whose first route is on `provider` (`openai`, `anthropic` or
+/// `bedrock`); every adapter is registered against the same mock upstream,
+/// which answers each wire by its path.
+async fn world_for(pool: PgPool, limits: ImageInputLimits, priced: bool, provider: &str) -> World {
+    world_at(pool, limits, priced, provider, None).await
+}
+
+/// [`world_for`] with the adapters sent to `upstream` instead of the
+/// in-process mock.
+async fn world_at(
+    pool: PgPool,
+    limits: ImageInputLimits,
+    priced: bool,
+    provider: &str,
+    base: Option<String>,
+) -> World {
     let counters = crate::inference::image_buffer::ROUTER_TESTS.lock().await;
     let mut f = fixture(pool).await;
     let token = issue_key(&mut f).await;
@@ -126,17 +164,27 @@ async fn world(pool: PgPool, limits: ImageInputLimits, priced: bool) -> World {
         .unwrap();
     let state = Arc::new(Upstream::default());
     let (mock_base, mock) = serve(upstream(state.clone())).await;
-    let deployment = if priced {
-        add_deployment(&f, "openai", "env:OMG_IMAGE_TEST_KEY", None, "private", 0).await
-    } else {
-        add_unpriced_deployment(&f, "openai", "env:OMG_IMAGE_TEST_KEY", None, "private", 0).await
-    };
+    let deployment = route(&f, provider, 0, priced).await;
+    let mock_base = base.unwrap_or(mock_base);
     let mut registry = ProviderRegistry::default();
     registry
         .register(Arc::new(OpenAiAdapter::for_test(
             Arc::new(Resolves),
             format!("{mock_base}/v1"),
         )))
+        .unwrap();
+    registry
+        .register(Arc::new(
+            crate::providers::anthropic::AnthropicAdapter::for_test(
+                Arc::new(Resolves),
+                format!("{mock_base}/v1"),
+            ),
+        ))
+        .unwrap();
+    registry
+        .register(Arc::new(
+            crate::providers::bedrock::BedrockAdapter::for_test(&mock_base),
+        ))
         .unwrap();
     let engine = Engine::new(
         Arc::new(f.store.clone()),
@@ -156,6 +204,19 @@ async fn world(pool: PgPool, limits: ImageInputLimits, priced: bool) -> World {
         upstream: state,
         _servers: vec![mock],
         _counters: counters,
+    }
+}
+
+/// A route of the fixture's model on `provider`, in routing `order`.
+async fn route(f: &Fixture, provider: &str, order: i64, priced: bool) -> Uuid {
+    let (credential, region) = match provider {
+        "bedrock" => ("aws:default", Some("us-east-1")),
+        _ => ("env:OMG_IMAGE_TEST_KEY", None),
+    };
+    if priced {
+        add_deployment(f, provider, credential, region, "private", order).await
+    } else {
+        add_unpriced_deployment(f, provider, credential, region, "private", order).await
     }
 }
 
@@ -504,6 +565,12 @@ async fn an_image_reaches_no_log_table_metric_or_error_body(pool: PgPool) {
             .to_string()
             .contains(&data)
     );
+    assert_nowhere(&w, &data, &capture).await;
+}
+
+/// `data` (an image's base64) is in no table (partitions included), metric
+/// or captured log line.
+async fn assert_nowhere(w: &World, data: &str, capture: &crate::log_capture_test::Capture) {
     // Every table, partitions included.
     let tables: Vec<String> = sqlx::query_scalar(
         "SELECT format('%I.%I',n.nspname,c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p') ORDER BY 1",
@@ -849,4 +916,257 @@ async fn every_large_body_refusal_is_counted_by_reason(pool: PgPool) {
     assert_eq!(count("timeout"), timeouts + 1);
     drop(response);
     assert_eq!(in_use(), 0, "the share is back after the 408");
+}
+
+#[dbtest::test]
+async fn images_reach_anthropic_routes_as_base64_image_blocks(pool: PgPool) {
+    images_reach_their_routes(pool, "anthropic").await;
+}
+
+#[dbtest::test]
+async fn images_reach_bedrock_routes_as_converse_image_blocks(pool: PgPool) {
+    images_reach_their_routes(pool, "bedrock").await;
+}
+
+async fn images_reach_their_routes(pool: PgPool, provider: &str) {
+    {
+        let w = world_for(pool, ImageInputLimits::default(), true, provider).await;
+        let url = png_url(64, "z");
+        let data = url.split_once(',').unwrap().1.to_owned();
+        let body = serde_json::to_vec(&chat_body(&url, false)).unwrap();
+        // Without the deployment's opt-in the route is skipped.
+        let (status, _, value, _) = send(
+            &w,
+            "/v1/chat/completions",
+            Some(&w.token),
+            body.clone(),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{provider}: {value}");
+        allow_images(&w, true).await;
+        let (status, _, value, _) =
+            send(&w, "/v1/chat/completions", Some(&w.token), body, true).await;
+        assert_eq!(status, StatusCode::OK, "{provider}: {value}");
+        let sent = w.upstream.bodies.lock().unwrap().last().unwrap().clone();
+        let image = match provider {
+            "anthropic" => {
+                json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":data}})
+            }
+            _ => json!({"image":{"format":"png","source":{"bytes":data}}}),
+        };
+        assert_eq!(sent["messages"][0]["content"][1], image, "{provider}");
+        // These profiles serve no Responses, with or without images.
+        for input in [
+            json!("hi"),
+            json!([{"role":"user","content":[{"type":"input_image","image_url":url}]}]),
+        ] {
+            let responses = json!({"model":"company/smart","max_output_tokens":16,"input":input});
+            let (status, _, _, _) = send(
+                &w,
+                "/v1/responses",
+                Some(&w.token),
+                serde_json::to_vec(&responses).unwrap(),
+                true,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{provider}");
+        }
+        // `detail` other than `auto` has no place on these wires: refused.
+        let mut low = chat_body(&url, false);
+        low["messages"][0]["content"][1]["image_url"]["detail"] = json!("low");
+        let (status, _, value, _) = send(
+            &w,
+            "/v1/chat/completions",
+            Some(&w.token),
+            serde_json::to_vec(&low).unwrap(),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{provider}: {value}");
+        assert_eq!(executions(&w).await, 1, "{provider}");
+    }
+}
+
+#[dbtest::test]
+async fn an_image_reaches_no_log_table_metric_or_error_body_on_anthropic(pool: PgPool) {
+    canary_on(pool, "anthropic").await;
+}
+
+#[dbtest::test]
+async fn an_image_reaches_no_log_table_metric_or_error_body_on_bedrock(pool: PgPool) {
+    canary_on(pool, "bedrock").await;
+}
+
+/// Served, refused before admission (a mismatched type, a `detail` the wire
+/// cannot carry) and refused by the upstream: the bytes reach the upstream
+/// body and nothing else.
+async fn canary_on(pool: PgPool, provider: &'static str) {
+    let capture = crate::log_capture_test::Capture::start();
+    let w = world_for(pool, ImageInputLimits::default(), true, provider).await;
+    allow_images(&w, true).await;
+    let url = png_url(4096, "QwImageCanaryQ");
+    let data = url.split_once(',').unwrap().1.to_owned();
+    let mut low = chat_body(&url, false);
+    low["messages"][0]["content"][1]["image_url"]["detail"] = json!("high");
+    let mut answers = String::new();
+    for (body, want) in [
+        (chat_body(&url, false), StatusCode::OK),
+        (
+            chat_body(&url.replace("image/png", "image/jpeg"), false),
+            StatusCode::BAD_REQUEST,
+        ),
+        (low, StatusCode::BAD_REQUEST),
+    ] {
+        let (status, _, value, _) = send(
+            &w,
+            "/v1/chat/completions",
+            Some(&w.token),
+            serde_json::to_vec(&body).unwrap(),
+            true,
+        )
+        .await;
+        assert_eq!(status, want, "{provider}: {value}");
+        answers.push_str(&value.to_string());
+    }
+    w.upstream
+        .failing
+        .lock()
+        .unwrap()
+        .push(if provider == "anthropic" {
+            "/messages"
+        } else {
+            "/converse"
+        });
+    let (status, _, value, _) = send(
+        &w,
+        "/v1/chat/completions",
+        Some(&w.token),
+        serde_json::to_vec(&chat_body(&url, false)).unwrap(),
+        true,
+    )
+    .await;
+    assert!(!status.is_success(), "{provider}: {status} {value}");
+    answers.push_str(&value.to_string());
+    assert!(!answers.contains(&data[40..80]) && !answers.contains("ImageCanary"));
+    assert!(
+        w.upstream.bodies.lock().unwrap()[0]
+            .to_string()
+            .contains(&data[40..80])
+    );
+    assert_nowhere(&w, &data, &capture).await;
+}
+
+#[dbtest::test]
+async fn an_image_fails_over_from_openai_to_anthropic_under_the_route_policy(pool: PgPool) {
+    failover(pool, "openai", "anthropic").await;
+}
+
+#[dbtest::test]
+async fn an_image_fails_over_from_bedrock_to_openai_under_the_route_policy(pool: PgPool) {
+    failover(pool, "bedrock", "openai").await;
+}
+
+/// The first route answers 429 (`Busy`, before any content); with two
+/// attempts allowed by the model's routing policy and both routes in one
+/// residency, the image is served by the second, each attempt in its own
+/// wire's form.
+async fn failover(pool: PgPool, first: &'static str, second: &'static str) {
+    let w = world_for(pool, ImageInputLimits::default(), true, first).await;
+    let backup = route(&w.f, second, 1, true).await;
+    sqlx::query("UPDATE deployments SET image_input=true WHERE id = ANY($1)")
+        .bind(vec![w.deployment, backup])
+        .execute(&w.f.store.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO routing_policies(model_id,max_attempts,allow_ambiguous_failover) VALUES($1,2,false)")
+        .bind(w.f.model)
+        .execute(&w.f.store.pool)
+        .await
+        .unwrap();
+    // Failover stays within one declared residency.
+    for (deployment, priority) in [(w.deployment, 0), (backup, 1)] {
+        sqlx::query(
+            "INSERT INTO deployment_routing(deployment_id,priority,residency) VALUES($1,$2,'us')",
+        )
+        .bind(deployment)
+        .bind(priority)
+        .execute(&w.f.store.pool)
+        .await
+        .unwrap();
+    }
+    let path = |provider: &str| match provider {
+        "openai" => "/chat/completions",
+        "anthropic" => "/messages",
+        _ => "/converse",
+    };
+    w.upstream.failing.lock().unwrap().push(path(first));
+    let body = serde_json::to_vec(&chat_body(&png_url(64, "f"), false)).unwrap();
+    let (status, _, value, _) = send(&w, "/v1/chat/completions", Some(&w.token), body, true).await;
+    let paths = w.upstream.paths.lock().unwrap().clone();
+    assert_eq!(status, StatusCode::OK, "{value} {paths:?}");
+    let bodies = w.upstream.bodies.lock().unwrap().clone();
+    assert_eq!(paths.len(), 2, "{paths:?}");
+    assert!(
+        paths[0].ends_with(path(first)) && paths[1].ends_with(path(second)),
+        "{paths:?}"
+    );
+    // Each attempt carried the image in its own wire's form.
+    for (path, body) in paths.iter().zip(&bodies) {
+        let content = &body["messages"][0]["content"][1];
+        let carried = if path.ends_with("/chat/completions") {
+            content["type"] == "image_url"
+        } else if path.ends_with("/messages") {
+            content["type"] == "image"
+        } else {
+            content.get("image").is_some()
+        };
+        assert!(carried, "{path}: {content}");
+    }
+    assert_eq!(executions(&w).await, 2);
+}
+
+/// The peak memory of large image requests on each adapter (docs/operations.md
+/// "Image input memory"). Serves this router on a loopback port, against the
+/// upstream the caller names, until a stop file appears: the client and the
+/// upstream are other processes, so this process holds only the gateway.
+#[dbtest::test]
+#[ignore = "manual measurement: docs/operations.md \"Image input memory\""]
+async fn image_memory_harness(pool: PgPool) {
+    let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is required"));
+    let dir = std::path::PathBuf::from(var("OMG_MEASURE_DIR"));
+    let limits = ImageInputLimits {
+        buffer_bytes: std::env::var("OMG_MEASURE_BUFFER_BYTES")
+            .map_or(ImageInputLimits::default().buffer_bytes, |v| {
+                v.parse().unwrap()
+            }),
+        ..ImageInputLimits::default()
+    };
+    let w = world_at(
+        pool,
+        limits,
+        true,
+        &var("OMG_MEASURE_PROVIDER"),
+        Some(var("OMG_MEASURE_UPSTREAM")),
+    )
+    .await;
+    allow_images(&w, true).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let ready = json!({"port": port, "pid": std::process::id(), "token": w.token});
+    std::fs::write(dir.join("ready.json"), ready.to_string()).unwrap();
+    let stop = dir.join("stop");
+    axum::serve(
+        listener,
+        w.router
+            .clone()
+            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        while !stop.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .unwrap();
 }

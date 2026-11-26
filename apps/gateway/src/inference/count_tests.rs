@@ -60,6 +60,32 @@ fn the_estimate_is_input_bytes_divided_by_four_rounded_up() {
 }
 
 #[test]
+fn an_estimate_is_never_given_for_a_request_with_images() {
+    let text = request(vec![text(Role::User, "abcd")], vec![]);
+    let count = estimated(&text).unwrap();
+    assert_eq!(
+        (count.input_tokens, count.source),
+        (1, TokenCountSource::Estimate)
+    );
+    // An inline image: the estimate would leave it out.
+    let inline = crate::providers::contract::image_request_with(false, None);
+    assert_eq!(
+        estimated(&inline).err(),
+        Some(InferenceError::InvalidField("image"))
+    );
+    // A native Messages image block likewise.
+    let mut native = text.clone();
+    native.messages_options = Some(Box::new(crate::inference::types::MessagesOptions {
+        images: vec![serde_json::json!({"type":"image"})],
+        ..Default::default()
+    }));
+    assert_eq!(
+        estimated(&native).err(),
+        Some(InferenceError::InvalidField("image"))
+    );
+}
+
+#[test]
 fn the_limiter_admits_a_fixed_number_per_key_and_minute() {
     let limiter = Limiter::default();
     let (key, other) = (Uuid::new_v4(), Uuid::new_v4());

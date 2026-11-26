@@ -12,6 +12,10 @@ use std::time::Duration;
 
 // Includes JSON envelope / event framing overhead, not just normalized model output.
 pub(super) const WIRE_LIMIT: usize = 8 * 1024 * 1024;
+/// The largest request body sent: Bedrock's 20 MB request size, which
+/// encoding holds images and text to (`images::LIMITS`), plus the 4 MiB the
+/// rest of a request may take (`OUTPUT_LIMIT`) and its JSON envelope.
+const REQUEST_LIMIT: usize = 26 * 1024 * 1024;
 
 #[derive(Clone)]
 struct Connector {
@@ -29,18 +33,32 @@ fn failure() -> ConnectorError {
         None,
     )
 }
+/// The request's signed body. It is one in-memory buffer, and taking it
+/// moves that buffer into the outgoing request without a copy (a body with
+/// images can be most of `REQUEST_LIMIT`).
+async fn signed_body(request: &mut HttpRequest) -> Result<bytes::Bytes, ConnectorError> {
+    let body = request.take_body();
+    if body.bytes().is_none() {
+        return Err(failure());
+    }
+    let bytes = http_body_util::BodyExt::collect(body)
+        .await
+        .map_err(|_| failure())?
+        .to_bytes();
+    if bytes.len() > REQUEST_LIMIT {
+        return Err(failure());
+    }
+    Ok(bytes)
+}
 impl HttpConnector for Connector {
-    fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+    fn call(&self, mut request: HttpRequest) -> HttpConnectorFuture {
         let client = self.client.clone();
         let streaming_read = self.streaming_read;
         HttpConnectorFuture::new(async move {
             let method =
                 reqwest::Method::from_bytes(request.method().as_bytes()).map_err(|_| failure())?;
-            let bytes = request.body().bytes().ok_or_else(failure)?;
-            if bytes.len() > WIRE_LIMIT {
-                return Err(failure());
-            }
-            let mut builder = client.request(method, request.uri()).body(bytes.to_vec());
+            let bytes = signed_body(&mut request).await?;
+            let mut builder = client.request(method, request.uri()).body(bytes);
             for (name, value) in request.headers().iter() {
                 let mut value =
                     reqwest::header::HeaderValue::from_str(value).map_err(|_| failure())?;

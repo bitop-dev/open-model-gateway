@@ -1265,7 +1265,147 @@ async fn structured_output_sdk_bedrock_model_refusal(pool: sqlx::PgPool) {
 }
 
 #[tokio::test]
-async fn images_are_refused_before_anything_is_sent() {
+async fn inline_images_reach_converse_as_image_blocks_of_their_bytes() {
+    use super::super::contract::{IMAGE_URL, image_request_with};
+    let data = IMAGE_URL.split_once(',').unwrap().1;
+    let blocks = json!([
+        {"text":"what is"},
+        {"image":{"format":"png","source":{"bytes":data}}},
+        {"text":"this?"}
+    ]);
+    for stream in [false, true] {
+        let mock = Mock::serve(complete(false), wire(events(false)), 200).await;
+        let adapter = mock.adapter();
+        assert!(adapter.capabilities().image_input);
+        let request = image_request_with(stream, None);
+        assert!(adapter.supports_chat_request(&request));
+        adapter.validate_chat_request(&request).unwrap();
+        drop(adapter.execute(&target(), request).await.unwrap());
+        let captured = mock.requests.lock().unwrap();
+        assert_eq!(
+            captured[0].body["messages"][0]["content"], blocks,
+            "stream {stream}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn images_converse_cannot_carry_are_refused_before_anything_is_sent() {
+    use super::super::contract::image_request_with;
+    // Nothing listens at the target, so a request that was sent would fail
+    // with a transport error instead of the named field.
     let adapter = BedrockAdapter::for_test("http://127.0.0.1:9");
-    super::super::contract::assert_images_refused(&adapter, &target()).await;
+    for detail in ["low", "high"] {
+        let request = image_request_with(false, Some(detail));
+        assert_eq!(
+            adapter.validate_chat_request(&request).err(),
+            Some(InferenceError::InvalidField("detail"))
+        );
+        assert_eq!(
+            adapter.execute(&target(), request).await.err(),
+            Some(InferenceError::InvalidField("detail"))
+        );
+    }
+}
+
+/// An image's bytes reach no log line, even with every target at TRACE:
+/// the SDK as locked writes a request's body nowhere (its "transmitting
+/// request" event shows a boxed body, `aws_sigv4` redacts it unless
+/// `LOG_SIGNABLE_BODY=true`), and the process's log policy
+/// (`log_policy::allowed`, installed by `main` beside `RUST_LOG`) never
+/// enables TRACE from the `aws_*` crates, where those events live.
+#[tokio::test]
+async fn an_image_reaches_no_log_line_whatever_rust_log_enables() {
+    use base64::Engine as _;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::{EnvFilter, fmt::MakeWriter, layer::SubscriberExt as _};
+    #[derive(Clone, Default)]
+    struct Lines(Arc<StdMutex<Vec<u8>>>);
+    impl std::io::Write for Lines {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> MakeWriter<'a> for Lines {
+        type Writer = Lines;
+        fn make_writer(&'a self) -> Lines {
+            self.clone()
+        }
+    }
+    let capture = |policy: bool| {
+        let lines = Lines::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(lines.clone())
+            .with_ansi(false)
+            .with_env_filter(EnvFilter::new("trace"))
+            .finish()
+            .with(tracing_subscriber::filter::filter_fn(move |m| {
+                !policy || crate::log_policy::allowed(m)
+            }));
+        (lines, subscriber)
+    };
+    let text = |lines: &Lines| String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    while bytes.len() < 4096 {
+        bytes.extend_from_slice(b"QwImageCanaryQ");
+    }
+    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let canary = &data[40..80];
+    let image = crate::protocols::image_input::Images::default()
+        .take(format!("data:image/png;base64,{data}"), None, "image")
+        .unwrap();
+    let mut request = super::super::contract::image_request_with(false, None);
+    request.messages[0].content = Some(Content::Parts(vec![
+        Part::Text("what is this?".into()),
+        Part::Image(image),
+    ]));
+    // Served, and refused by the upstream, with and without the policy.
+    for status in [200, 400] {
+        for policy in [false, true] {
+            let mock = Mock::serve(complete(false), wire(events(false)), status).await;
+            let (lines, subscriber) = capture(policy);
+            let (adapter, deployment) = (mock.adapter(), target());
+            let result = adapter
+                .execute(&deployment, request.clone())
+                .with_subscriber(subscriber)
+                .await;
+            assert_eq!(result.is_ok(), status == 200, "status {status}");
+            if let Err(error) = &result {
+                assert!(!format!("{error:?}{error}").contains(canary));
+            }
+            assert!(
+                mock.requests.lock().unwrap()[0]
+                    .body
+                    .to_string()
+                    .contains(canary)
+            );
+            let logged = text(&lines);
+            // The capture was live: the SDK's TRACE events without the
+            // policy, its DEBUG events with it.
+            assert_eq!(logged.contains("transmitting request"), !policy);
+            assert!(logged.contains("beginning attempt"), "policy {policy}");
+            assert!(
+                !logged.contains(canary) && !logged.contains("ImageCanary"),
+                "status {status} policy {policy}"
+            );
+        }
+    }
+    // Those events live at TRACE under the SDK's targets, which the policy
+    // never enables: an event there carrying the bytes is dropped with the
+    // policy and written without it; DEBUG under the same target is kept.
+    for policy in [false, true] {
+        let (lines, subscriber) = capture(policy);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::trace!(target: "aws_sigv4::http_request::sign", body = canary, "signing request");
+            tracing::trace!(target: "aws_smithy_runtime::client::orchestrator", body = canary, "transmitting request");
+            tracing::debug!(target: "aws_smithy_runtime::client::orchestrator", "beginning attempt");
+        });
+        let logged = text(&lines);
+        assert_eq!(logged.contains(canary), !policy, "policy {policy}");
+        assert!(logged.contains("beginning attempt"));
+    }
 }

@@ -27,6 +27,8 @@ use complete::*;
 #[cfg(test)]
 #[path = "bedrock/encode_property_tests.rs"]
 mod encode_property_tests;
+#[path = "bedrock/images.rs"]
+mod images;
 #[path = "bedrock/stream.rs"]
 mod stream;
 #[cfg(test)]
@@ -167,7 +169,7 @@ impl ProviderAdapter for BedrockAdapter {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
-            image_input: false,
+            image_input: true,
             text_chat: true,
             streaming: true,
             tools: true,
@@ -184,7 +186,7 @@ impl ProviderAdapter for BedrockAdapter {
     /// actually reject, and this never resolves credentials or touches the
     /// network (`execute` only calls `encode` before any of that).
     fn validate_chat_request(&self, request: &ChatRequest) -> Result<()> {
-        encode(request).map(|_| ())
+        encode_with(request, false).map(|_| ())
     }
     async fn execute(&self, target: &Deployment, request: ChatRequest) -> Result<ProviderOutput> {
         let plan = auth::Plan::new(target, &self.policy).ok_or(InferenceError::Configuration)?;
@@ -252,8 +254,14 @@ struct Input {
 }
 
 fn encode(request: &ChatRequest) -> Result<Input> {
+    encode_with(request, true)
+}
+
+/// The Converse input; with `decode` false (validation) images keep no bytes.
+fn encode_with(request: &ChatRequest, decode: bool) -> Result<Input> {
     super::messages::validate(request, super::messages::ProviderClass::Bedrock)?;
     check_request(request)?;
+    super::image_body::check_limits(request, &images::LIMITS)?;
     let mut size = 0usize;
     let (names, tools) = tool_specs(request, &mut size)?;
     let choice = tool_choice(request, &names, tools.is_empty())?;
@@ -265,6 +273,7 @@ fn encode(request: &ChatRequest) -> Result<Input> {
         pending: BTreeSet::new(),
         seen_ids: BTreeSet::new(),
         size,
+        decode,
     };
     for message in &request.messages {
         turns.push(message)?;
@@ -430,6 +439,8 @@ struct Turns {
     pending: BTreeSet<String>,
     seen_ids: BTreeSet<String>,
     size: usize,
+    /// Images carry their bytes (`false` only for validation).
+    decode: bool,
 }
 
 impl Turns {
@@ -522,7 +533,9 @@ impl Turns {
 
     fn text_and_calls(&mut self, message: &Message) -> Result<Vec<aws::ContentBlock>> {
         let mut content = Vec::new();
-        if let Some(text) = message
+        if let Some(Content::Parts(parts)) = &message.content {
+            content.extend(images::blocks(parts, self.decode)?);
+        } else if let Some(text) = message
             .content
             .as_ref()
             .map(Content::require_text)

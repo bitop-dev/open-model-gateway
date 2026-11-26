@@ -295,6 +295,7 @@ pub struct ImageInput {
     media_type: ImageType,
     detail: Option<ImageDetail>,
     decoded_bytes: usize,
+    dimensions: Option<(u32, u32)>,
 }
 impl ImageInput {
     /// Only the protocol parsers construct one, after validating `url`.
@@ -303,13 +304,19 @@ impl ImageInput {
         media_type: ImageType,
         detail: Option<ImageDetail>,
         decoded_bytes: usize,
+        dimensions: Option<(u32, u32)>,
     ) -> Self {
         Self {
             url: std::sync::Arc::new(url),
             media_type,
             detail,
             decoded_bytes,
+            dimensions,
         }
+    }
+    /// Width and height in pixels, when the image's header states them.
+    pub fn dimensions(&self) -> Option<(u32, u32)> {
+        self.dimensions
     }
     pub fn media_type(&self) -> ImageType {
         self.media_type

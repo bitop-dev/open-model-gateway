@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use open_model_gateway::{config::Config, providers::secrets::EnvSecrets, store::Store};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 mod commands;
 
@@ -352,6 +352,8 @@ async fn wait_for_database(config: &Config, schema: bool, timeout_seconds: u64) 
 const DEFAULT_LOG_FILTER: &str = "open_model_gateway=info";
 
 async fn run(cli: Cli, process_start_unix_nano: u64) -> Result<()> {
+    // `log_policy::allowed` holds whatever `RUST_LOG` enables: the AWS
+    // SDK's request bodies (prompts, images) never reach the log.
     tracing_subscriber::fmt()
         .json()
         .with_writer(std::io::stderr)
@@ -359,6 +361,10 @@ async fn run(cli: Cli, process_start_unix_nano: u64) -> Result<()> {
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER)),
         )
+        .finish()
+        .with(tracing_subscriber::filter::filter_fn(
+            open_model_gateway::log_policy::allowed,
+        ))
         .init();
     let config = Config::from_env()?;
     if matches!(cli.command, Some(Command::BootstrapDemo { .. }))
