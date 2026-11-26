@@ -362,6 +362,7 @@ impl ProviderAdapter for Fake {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            image_input: false,
             text_chat: false,
             streaming: false,
             tools: false,
@@ -454,6 +455,7 @@ fn setup(
 ) -> (Engine, Arc<Repo>, Arc<Fake>) {
     let repo = Arc::new(Repo::default());
     repo.deployments.lock().unwrap().push(Deployment {
+        image_input: false,
         id: Uuid::new_v4(),
         provider: "fake".into(),
         upstream_model: "m".into(),

@@ -372,9 +372,14 @@ fn content_block(
         Some("text") => {
             object(block, &["type", "text", "cache_control"], "text")?;
             cache(block, options)?;
-            turn.content
-                .get_or_insert_with(String::new)
-                .push_str(&string(&block["text"])?);
+            match turn
+                .content
+                .get_or_insert_with(|| Content::Text(String::new()))
+            {
+                Content::Text(text) => text.push_str(&string(&block["text"])?),
+                // A native turn's images stay in the validated envelope.
+                Content::Parts(_) => return Err(InferenceError::InvalidRequest),
+            }
         }
         Some("image") => image(block, options)?,
         Some("thinking") if role == Role::Assistant => {
@@ -454,12 +459,15 @@ fn tool_result(
     // Canonical tool results each carry one correlation id.
     // Keep any preceding user text in its original order;
     // adapters retain their normal correlation validation.
-    if let Some(text) = turn.content.take() {
-        messages.push(message(turn.role, text));
+    if let Some(content) = turn.content.take() {
+        messages.push(Message {
+            content: Some(content),
+            ..message(turn.role, String::new())
+        });
     }
     messages.push(Message {
         role: Role::Tool,
-        content: Some(content),
+        content: Some(Content::Text(content)),
         tool_call_id: Some(id),
         tool_result_is_error: is_error,
         tool_calls: vec![],

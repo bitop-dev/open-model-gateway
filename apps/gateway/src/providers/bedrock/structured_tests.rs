@@ -300,7 +300,7 @@ fn the_output_schema_counts_toward_the_request_size_bound() {
     let content = base
         .messages
         .iter()
-        .map(|m| m.content.as_ref().map_or(0, String::len))
+        .map(|m| m.content.as_ref().map_or(0, Content::text_len))
         .sum::<usize>();
     let schema_of = |len: usize| {
         let empty = serde_json::to_string(&json!({"type":"object","description":""}))

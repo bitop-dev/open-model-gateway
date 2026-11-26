@@ -41,6 +41,7 @@ impl ProviderAdapter for Adapter {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            image_input: false,
             text_chat: true,
             streaming: false,
             tools: false,
@@ -679,6 +680,7 @@ impl ProviderAdapter for GenerationAdapter {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            image_input: false,
             text_chat: true,
             streaming: true,
             tools: true,
@@ -691,10 +693,12 @@ impl ProviderAdapter for GenerationAdapter {
         )
     }
     fn validate_chat_request(&self, request: &ChatRequest) -> Result<(), InferenceError> {
-        let translated = request
-            .messages
-            .iter()
-            .any(|m| m.content.as_deref() == Some("translated"));
+        let translated = request.messages.iter().any(|m| {
+            m.content
+                .as_ref()
+                .and_then(crate::inference::types::Content::text)
+                == Some("translated")
+        });
         crate::providers::messages::validate(
             request,
             if translated {
@@ -717,7 +721,11 @@ impl ProviderAdapter for GenerationAdapter {
         let mode = request
             .messages
             .last()
-            .and_then(|m| m.content.as_deref())
+            .and_then(|m| {
+                m.content
+                    .as_ref()
+                    .and_then(crate::inference::types::Content::text)
+            })
             .unwrap_or("tools");
         let tools = matches!(mode, "tools" | "both" | "native");
         let content = (mode != "tools").then(|| "hello".to_owned());

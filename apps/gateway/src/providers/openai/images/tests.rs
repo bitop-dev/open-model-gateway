@@ -28,6 +28,7 @@ fn adapter(mock: &Mock) -> OpenAiAdapter {
 }
 fn target() -> Deployment {
     Deployment {
+        image_input: false,
         id: uuid::Uuid::new_v4(),
         provider: "openai".into(),
         upstream_model: "gpt-image-1-mini".into(),

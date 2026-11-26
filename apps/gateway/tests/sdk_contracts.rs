@@ -18,6 +18,7 @@ impl ProviderAdapter for Fixture {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            image_input: false,
             text_chat: true,
             streaming: true,
             tools: true,
@@ -46,14 +47,24 @@ impl ProviderAdapter for Fixture {
             .is_some_and(|m| m.role == Role::Tool)
         {
             text = "Tool result received";
-        } else if request.messages[0].content.as_deref() == Some("call ping") {
+        } else if request.messages[0]
+            .content
+            .as_ref()
+            .and_then(open_model_gateway::inference::types::Content::text)
+            == Some("call ping")
+        {
             text = "Calling ping";
             calls.push(ToolCall {
                 id: "ping-call".into(),
                 name: "ping".into(),
                 arguments: "{}".into(),
             });
-        } else if request.messages[0].content.as_deref() == Some("call weather") {
+        } else if request.messages[0]
+            .content
+            .as_ref()
+            .and_then(open_model_gateway::inference::types::Content::text)
+            == Some("call weather")
+        {
             text = "Checking weather";
             calls.push(ToolCall {
                 id: "semantic-call".into(),
@@ -224,7 +235,13 @@ async fn real_client_sdks_accept_all_three_protocols(pool: sqlx::PgPool) {
         let result = r.messages.last().unwrap();
         assert!(result.role == Role::Tool);
         assert_eq!(result.tool_call_id.as_deref(), Some("ping-call"));
-        assert_eq!(result.content.as_deref(), Some(""));
+        assert_eq!(
+            result
+                .content
+                .as_ref()
+                .and_then(open_model_gateway::inference::types::Content::text),
+            Some("")
+        );
     }
     let explicit_schema = serde_json::json!({"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false});
     for (i, strict) in [(28, false), (29, true)] {
@@ -232,7 +249,13 @@ async fn real_client_sdks_accept_all_three_protocols(pool: sqlx::PgPool) {
         assert_eq!(recorded[i].tools[0].strict, Some(strict));
     }
     assert_eq!(
-        recorded[30].messages.last().unwrap().content.as_deref(),
+        recorded[30]
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .as_ref()
+            .and_then(open_model_gateway::inference::types::Content::text),
         Some("ok")
     );
     for (index, streaming) in [
@@ -250,17 +273,47 @@ async fn real_client_sdks_accept_all_three_protocols(pool: sqlx::PgPool) {
         let r = &recorded[index];
         assert_eq!(r.messages.len(), 3);
         assert!(r.messages[0].role == Role::User);
-        assert_eq!(r.messages[0].content.as_deref(), Some("hello"));
+        assert_eq!(
+            r.messages[0]
+                .content
+                .as_ref()
+                .and_then(open_model_gateway::inference::types::Content::text),
+            Some("hello")
+        );
         assert!(r.messages[1].role == Role::Assistant);
-        assert_eq!(r.messages[1].content.as_deref(), Some("Hello from fixture"));
-        assert_eq!(r.messages[2].content.as_deref(), Some("continue"));
+        assert_eq!(
+            r.messages[1]
+                .content
+                .as_ref()
+                .and_then(open_model_gateway::inference::types::Content::text),
+            Some("Hello from fixture")
+        );
+        assert_eq!(
+            r.messages[2]
+                .content
+                .as_ref()
+                .and_then(open_model_gateway::inference::types::Content::text),
+            Some("continue")
+        );
     }
     for index in [13, 15] {
         let r = &recorded[index];
         assert_eq!(r.messages.len(), 4);
-        assert_eq!(r.messages[0].content.as_deref(), Some("call weather"));
+        assert_eq!(
+            r.messages[0]
+                .content
+                .as_ref()
+                .and_then(open_model_gateway::inference::types::Content::text),
+            Some("call weather")
+        );
         assert!(r.messages[1].role == Role::Assistant);
-        assert_eq!(r.messages[1].content.as_deref(), Some("Checking weather"));
+        assert_eq!(
+            r.messages[1]
+                .content
+                .as_ref()
+                .and_then(open_model_gateway::inference::types::Content::text),
+            Some("Checking weather")
+        );
         assert!(r.messages[2].role == Role::Assistant);
         let call = &r.messages[2].tool_calls[0];
         assert_eq!(call.id, "semantic-call");
@@ -268,12 +321,24 @@ async fn real_client_sdks_accept_all_three_protocols(pool: sqlx::PgPool) {
         assert_eq!(call.arguments, "{ \"city\": \"東京\" }");
         assert!(r.messages[3].role == Role::Tool);
         assert_eq!(r.messages[3].tool_call_id.as_deref(), Some("semantic-call"));
-        assert_eq!(r.messages[3].content.as_deref(), Some("sun"));
+        assert_eq!(
+            r.messages[3]
+                .content
+                .as_ref()
+                .and_then(open_model_gateway::inference::types::Content::text),
+            Some("sun")
+        );
     }
     for r in &recorded[37..39] {
         let result = r.messages.last().unwrap();
         assert!(result.tool_result_is_error);
-        assert_eq!(result.content.as_deref(), Some(""));
+        assert_eq!(
+            result
+                .content
+                .as_ref()
+                .and_then(open_model_gateway::inference::types::Content::text),
+            Some("")
+        );
         assert_eq!(result.tool_call_id.as_deref(), Some("ping-call"));
     }
     let attempts: (i64, i64) = sqlx::query_as("SELECT count(*),count(*) FILTER(WHERE state='succeeded') FROM inference_executions WHERE workload_kind='generation'").fetch_one(&pool).await.unwrap();

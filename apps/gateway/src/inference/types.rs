@@ -179,6 +179,14 @@ pub struct MessagesOptions {
     pub stop_sequences: Option<Vec<String>>,
 }
 impl ChatRequest {
+    /// Whether any message carries an image part.
+    pub fn has_images(&self) -> bool {
+        self.messages.iter().any(|m| {
+            m.content
+                .as_ref()
+                .is_some_and(|c| c.images().next().is_some())
+        })
+    }
     pub fn response_limit(&self) -> usize {
         if self.messages_options.is_some() {
             16 * 1024 * 1024
@@ -201,11 +209,188 @@ pub enum Role {
 #[derive(Clone)]
 pub struct Message {
     pub role: Role,
-    pub content: Option<String>,
+    pub content: Option<Content>,
     pub tool_calls: Vec<ToolCall>,
     pub tool_call_id: Option<String>,
     /// Failure of this correlated tool result; never inferred from result text.
     pub tool_result_is_error: bool,
+}
+
+/// A message's content: its text, or, when it carries an image, its ordered
+/// parts. Every reader handles both: an adapter maps a part or refuses the
+/// request, never drops one.
+#[derive(Clone)]
+pub enum Content {
+    Text(String),
+    Parts(Vec<Part>),
+}
+impl Content {
+    /// The text of text-only content; `None` for content with parts, which
+    /// the caller must carry or refuse.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::Parts(_) => None,
+        }
+    }
+    /// The text of a wire that carries no images: content with an image is
+    /// refused (`InvalidField("image")`), never sent without it. Encoders of
+    /// adapters without `Capabilities::image_input` use it as a backstop to
+    /// the capability check before admission.
+    pub fn require_text(&self) -> Result<&str, InferenceError> {
+        self.text().ok_or(InferenceError::InvalidField("image"))
+    }
+    /// The images of this content, in order.
+    pub fn images(&self) -> impl Iterator<Item = &ImageInput> {
+        let parts = match self {
+            Self::Text(_) => &[][..],
+            Self::Parts(parts) => parts.as_slice(),
+        };
+        parts.iter().filter_map(|part| match part {
+            Part::Image(image) => Some(image),
+            Part::Text(_) => None,
+        })
+    }
+    /// Bytes of text, for size bounds and estimates (images excluded).
+    pub fn text_len(&self) -> usize {
+        match self {
+            Self::Text(text) => text.len(),
+            Self::Parts(parts) => parts
+                .iter()
+                .map(|part| match part {
+                    Part::Text(text) => text.len(),
+                    Part::Image(_) => 0,
+                })
+                .sum(),
+        }
+    }
+}
+impl From<String> for Content {
+    fn from(text: String) -> Self {
+        Self::Text(text)
+    }
+}
+impl From<&str> for Content {
+    fn from(text: &str) -> Self {
+        Self::Text(text.to_owned())
+    }
+}
+
+#[derive(Clone)]
+pub enum Part {
+    Text(String),
+    Image(ImageInput),
+}
+
+/// An inline image a client sent, validated once at parse time (declared
+/// type, magic bytes, decoded size). It derives neither `Debug` nor
+/// `Serialize` and implements no `Display` (a source rule keeps it so): its
+/// bytes reach only the upstream request body an adapter builds, never a
+/// log, error body, table or metric. Clones share the one buffer.
+#[derive(Clone)]
+pub struct ImageInput {
+    /// The validated data URL, `data:<media type>;base64,<data>`, exactly as
+    /// received (moved out of the parsed request, not copied).
+    url: std::sync::Arc<String>,
+    media_type: ImageType,
+    detail: Option<ImageDetail>,
+    decoded_bytes: usize,
+}
+impl ImageInput {
+    /// Only the protocol parsers construct one, after validating `url`.
+    pub(crate) fn new(
+        url: String,
+        media_type: ImageType,
+        detail: Option<ImageDetail>,
+        decoded_bytes: usize,
+    ) -> Self {
+        Self {
+            url: std::sync::Arc::new(url),
+            media_type,
+            detail,
+            decoded_bytes,
+        }
+    }
+    pub fn media_type(&self) -> ImageType {
+        self.media_type
+    }
+    /// The client's `detail` hint, carried to wires that accept it.
+    pub fn detail(&self) -> Option<ImageDetail> {
+        self.detail
+    }
+    pub fn decoded_bytes(&self) -> usize {
+        self.decoded_bytes
+    }
+    /// The data URL, for a wire that takes one.
+    pub fn data_url(&self) -> &str {
+        &self.url
+    }
+    /// The base64 data alone, for a wire with a separate media type.
+    pub fn base64(&self) -> &str {
+        let prefix = self.media_type.data_url_prefix().len();
+        &self.url[prefix..]
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ImageType {
+    Png,
+    Jpeg,
+    Webp,
+    Gif,
+}
+impl ImageType {
+    pub const ALL: [Self; 4] = [Self::Png, Self::Jpeg, Self::Webp, Self::Gif];
+    pub fn mime(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+            Self::Webp => "image/webp",
+            Self::Gif => "image/gif",
+        }
+    }
+    pub fn data_url_prefix(self) -> &'static str {
+        match self {
+            Self::Png => "data:image/png;base64,",
+            Self::Jpeg => "data:image/jpeg;base64,",
+            Self::Webp => "data:image/webp;base64,",
+            Self::Gif => "data:image/gif;base64,",
+        }
+    }
+    /// Whether `bytes` start with this type's signature.
+    pub fn matches(self, bytes: &[u8]) -> bool {
+        match self {
+            Self::Png => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+            Self::Jpeg => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+            Self::Gif => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+            Self::Webp => bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"),
+        }
+    }
+}
+
+/// OpenAI's image `detail` hint.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ImageDetail {
+    Auto,
+    Low,
+    High,
+}
+impl ImageDetail {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "low" => Some(Self::Low),
+            "high" => Some(Self::High),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Low => "low",
+            Self::High => "high",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -376,6 +561,10 @@ pub struct Deployment {
     pub region: Option<String>,
     #[sqlx(default)]
     pub supported_protocols: Vec<String>,
+    /// The operator allows inline image input on this route (0095); only
+    /// for an upstream model that bills image input as input tokens.
+    #[sqlx(default)]
+    pub image_input: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -383,12 +572,16 @@ pub struct Capabilities {
     pub text_chat: bool,
     pub streaming: bool,
     pub tools: bool,
+    /// The adapter's wire carries inline images (`Part::Image`); a
+    /// deployment must also allow them (`Deployment::image_input`).
+    pub image_input: bool,
 }
 
 impl Capabilities {
     pub fn supports(self, request: &ChatRequest) -> bool {
         self.text_chat
             && (!request.stream || self.streaming)
+            && (!request.has_images() || self.image_input)
             && ((request.tools.is_empty()
                 && request.tool_choice.is_none()
                 && request

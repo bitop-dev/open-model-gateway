@@ -53,7 +53,7 @@ struct StreamOptions {
 #[serde(deny_unknown_fields)]
 struct WireMessage {
     role: Role,
-    content: Option<String>,
+    content: Option<super::image_input::WireContent>,
     #[serde(default)]
     tool_calls: Vec<WireToolCall>,
     tool_call_id: Option<String>,
@@ -118,8 +118,57 @@ fn function_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+/// A message's content. Text parts join into one text (as Responses input
+/// parts do); content with an image keeps its ordered parts, on user
+/// messages only.
+fn content(
+    role: Role,
+    wire: super::image_input::WireContent,
+    images: &mut super::image_input::Images,
+) -> Result<Content, InferenceError> {
+    use super::image_input::WireContent;
+    let parts = match wire {
+        WireContent::Text(text) => return Ok(Content::Text(text)),
+        WireContent::Parts(parts) if !parts.is_empty() => parts,
+        WireContent::Parts(_) => return Err(InferenceError::InvalidRequest),
+    };
+    let mut out = Vec::with_capacity(parts.len());
+    for part in parts {
+        out.push(match (part.kind.as_str(), part.text, part.image_url) {
+            ("text", Some(text), None) => Part::Text(text),
+            ("image_url", None, Some(image)) if role == Role::User => Part::Image(images.take(
+                image.url,
+                image.detail.as_deref(),
+                "messages.content.image_url",
+            )?),
+            ("image_url", _, _) => {
+                return Err(InferenceError::InvalidField("messages.content.image_url"));
+            }
+            ("file", _, _) => return Err(InferenceError::InvalidField("messages.content.file")),
+            ("input_audio", _, _) => {
+                return Err(InferenceError::InvalidField("messages.content.input_audio"));
+            }
+            _ => return Err(InferenceError::InvalidRequest),
+        });
+    }
+    if out.iter().all(|p| matches!(p, Part::Text(_))) {
+        return Ok(Content::Text(
+            out.into_iter()
+                .map(|p| match p {
+                    Part::Text(text) => text,
+                    Part::Image(_) => unreachable!("all parts are text"),
+                })
+                .collect(),
+        ));
+    }
+    Ok(Content::Parts(out))
+}
+
 /// One wire message: role rules, then its tool calls.
-fn message(message: WireMessage) -> Result<Message, InferenceError> {
+fn message(
+    message: WireMessage,
+    images: &mut super::image_input::Images,
+) -> Result<Message, InferenceError> {
     let invalid = InferenceError::InvalidRequest;
     if message.role != Role::Assistant && matches!(message.refusal, NoRefusal::Null) {
         return Err(invalid);
@@ -157,9 +206,14 @@ fn message(message: WireMessage) -> Result<Message, InferenceError> {
             })
         })
         .collect::<Result<_, _>>()?;
+    let role = message.role;
+    let content = message
+        .content
+        .map(|wire| content(role, wire, images))
+        .transpose()?;
     Ok(Message {
-        role: message.role,
-        content: message.content,
+        role,
+        content,
         tool_calls,
         tool_call_id: message.tool_call_id,
         tool_result_is_error: false,
@@ -256,8 +310,9 @@ impl Request {
         // One maximum for the upstream request and the admission reservation.
         let max_output_tokens = self.max_completion_tokens.or(self.max_tokens);
         let mut messages = Vec::with_capacity(self.messages.len());
+        let mut images = super::image_input::Images::default();
         for wire in self.messages {
-            messages.push(message(wire)?);
+            messages.push(message(wire, &mut images)?);
         }
         let mut names = std::collections::BTreeSet::new();
         let tools = function_tools(self.tools, &mut names)?;
@@ -279,6 +334,7 @@ pub async fn handle(
     Extension(engine): Extension<Engine>,
     Extension(principal): Extension<Principal>,
     Extension(request_id): Extension<RequestId>,
+    large: Option<Extension<crate::inference::image_buffer::LargeBody>>,
     input: Result<Json<Request>, JsonRejection>,
 ) -> Response {
     let wire = match input {
@@ -303,6 +359,10 @@ pub async fn handle(
         Ok(request) => request,
         Err(error) => return error_response(error),
     };
+    // Only images may take a body past the shared text limit.
+    if large.is_some() && !request.has_images() {
+        return super::payload_too_large();
+    }
     let model = request.model.clone();
     let id = format!("chatcmpl-{}", request_id.0.simple());
     let created = SystemTime::now()
@@ -400,7 +460,13 @@ pub(crate) fn batch_request(body: Value) -> Result<ChatRequest, InferenceError> 
     if wire.stream || !client::valid_openai_metadata(wire.metadata.as_ref()) {
         return Err(InferenceError::InvalidRequest);
     }
-    wire.normalize()
+    let request = wire.normalize()?;
+    // Batch files are not under the image buffer budget: image input is for
+    // interactive requests only.
+    if request.has_images() {
+        return Err(InferenceError::InvalidField("messages.content.image_url"));
+    }
+    Ok(request)
 }
 /// `/v1/batches` line result body.
 pub(crate) fn batch_response(id: &str, created: u64, model: &str, response: ChatResponse) -> Value {
@@ -491,7 +557,10 @@ mod tests {
         let mut value = base.clone();
         value["messages"][0]["refusal"] = Value::Null;
         assert_eq!(
-            parse(value.clone()).unwrap().messages[0].content.as_deref(),
+            parse(value.clone()).unwrap().messages[0]
+                .content
+                .as_ref()
+                .and_then(crate::inference::types::Content::text),
             Some("hello")
         );
         assert!(batch_request(value).is_ok());
@@ -631,7 +700,81 @@ mod tests {
                 .extend(extra.as_object().unwrap().clone());
             assert!(parse(request).is_err());
         }
-        assert!(parse(json!({"model":"test","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]})).is_err());
+    }
+    const PNG_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==";
+    fn user(content: Value) -> Result<ChatRequest, InferenceError> {
+        parse(json!({"model":"m","messages":[{"role":"user","content":content}]}))
+    }
+    #[test]
+    fn text_parts_join_into_one_text() {
+        let request = user(json!([{"type":"text","text":"a"},{"type":"text","text":"b"}])).unwrap();
+        let content = request.messages[0].content.as_ref().unwrap();
+        assert_eq!(content.text(), Some("ab"));
+        assert!(!request.has_images());
+        assert!(user(json!([])).is_err());
+    }
+    #[test]
+    fn image_parts_keep_their_order_and_detail() {
+        let request = user(json!([
+            {"type":"text","text":"what is"},
+            {"type":"image_url","image_url":{"url":PNG_URL,"detail":"high"}},
+            {"type":"text","text":"this?"}
+        ]))
+        .unwrap();
+        assert!(request.has_images());
+        let Some(Content::Parts(parts)) = &request.messages[0].content else {
+            panic!("parts")
+        };
+        assert!(matches!(&parts[0], Part::Text(t) if t == "what is"));
+        let Part::Image(image) = &parts[1] else {
+            panic!("image")
+        };
+        assert_eq!(image.data_url(), PNG_URL);
+        assert_eq!(image.detail(), Some(ImageDetail::High));
+        assert!(matches!(&parts[2], Part::Text(t) if t == "this?"));
+    }
+    #[test]
+    fn remote_and_file_images_and_images_outside_user_messages_are_refused_by_name() {
+        let field = |content: Value, role: &str| {
+            parse(json!({"model":"m","messages":[{"role":role,"content":content}]})).err()
+        };
+        let image = |url: &str| json!([{"type":"image_url","image_url":{"url":url}}]);
+        let named = Some(InferenceError::InvalidField("messages.content.image_url"));
+        assert_eq!(field(image("https://example.invalid/a.png"), "user"), named);
+        assert_eq!(
+            field(
+                image("data:image/jpeg;base64,iVBORw0KGgoAAAANSUhEUg=="),
+                "user"
+            ),
+            named
+        );
+        for role in ["system", "developer", "assistant"] {
+            assert_eq!(field(image(PNG_URL), role), named, "{role}");
+        }
+        assert_eq!(
+            field(json!([{"type":"file","file":{"file_id":"file-1"}}]), "user"),
+            Some(InferenceError::InvalidField("messages.content.file"))
+        );
+        assert_eq!(
+            field(
+                json!([{"type":"input_audio","input_audio":{"data":"","format":"wav"}}]),
+                "user"
+            ),
+            Some(InferenceError::InvalidField("messages.content.input_audio"))
+        );
+        let many: Vec<Value> = (0..21)
+            .map(|_| json!({"type":"image_url","image_url":{"url":PNG_URL}}))
+            .collect();
+        assert_eq!(field(Value::Array(many), "user"), named);
+    }
+    #[test]
+    fn batch_lines_refuse_images() {
+        let line = json!({"model":"m","messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":PNG_URL}}]}]});
+        assert_eq!(
+            batch_request(line).err(),
+            Some(InferenceError::InvalidField("messages.content.image_url"))
+        );
     }
     #[test]
     fn missing_usage_is_not_fabricated_as_zero() {

@@ -26,6 +26,7 @@ struct Repo {
 impl InferenceRepository for Repo {
     async fn deployments(&self, _: &Principal, _: &str) -> Result<Vec<Deployment>, InferenceError> {
         Ok(vec![Deployment {
+            image_input: false,
             id: Uuid::nil(),
             provider: "fake".into(),
             upstream_model: "upstream".into(),
@@ -103,6 +104,7 @@ impl ProviderAdapter for Fake {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            image_input: false,
             text_chat: false,
             streaming: false,
             tools: false,

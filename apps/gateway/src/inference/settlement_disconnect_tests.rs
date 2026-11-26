@@ -51,6 +51,7 @@ impl ProviderAdapter for Upstream {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            image_input: false,
             text_chat: true,
             streaming: true,
             tools: true,

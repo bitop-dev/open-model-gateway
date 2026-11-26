@@ -184,6 +184,7 @@ impl ProviderAdapter for LocalAdapter {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            image_input: true,
             text_chat: true,
             streaming: true,
             tools: true,
@@ -222,7 +223,8 @@ impl ProviderAdapter for LocalAdapter {
         let (client, base) = self.connection(target)?;
         let response = self
             .authenticated_post(client, format!("{base}/chat/completions"), target)?
-            .json(&payload)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(super::image_body::json_body(&payload, &request)?)
             .send()
             .await
             .map_err(framing::send_error(crate::egress::UpstreamClient::Local))?;

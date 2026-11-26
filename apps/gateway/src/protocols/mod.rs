@@ -3,6 +3,7 @@ pub mod batches;
 pub mod chat_completions;
 pub mod embeddings;
 pub mod files;
+pub mod image_input;
 pub mod images;
 pub mod messages;
 pub mod realtime;
@@ -11,6 +12,8 @@ pub mod responses;
 pub mod systemone;
 pub mod videos;
 
+#[cfg(all(test, feature = "integration-tests"))]
+mod image_input_http_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod nullable_tests;
 #[cfg(all(test, feature = "integration-tests"))]
@@ -94,6 +97,29 @@ fn workload_error(error: InferenceError, validation_status: StatusCode) -> Respo
         InferenceError::InvalidRequest => *response.status_mut() = validation_status,
         _ => {}
     }
+    response
+}
+/// A body larger than the image input route allows, or than this replica's
+/// whole image input buffer: nothing of it was read.
+pub(crate) fn image_input_too_large() -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        axum::Json(serde_json::json!({"error":{"message":"Request body too large for image input on this gateway","type":"invalid_request_error","code":"payload_too_large","param":null}})),
+    )
+        .into_response()
+}
+/// The replica's image input buffer is spent for now: nothing was read,
+/// admitted or sent (`inference::image_buffer`).
+pub(crate) fn image_input_busy() -> Response {
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        axum::Json(serde_json::json!({"error":{"message":"The gateway is buffering as many large image requests as it can; nothing was read or sent. Retry after the indicated delay","type":"server_error","code":"image_input_busy","param":null}})),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from(crate::inference::image_buffer::BUSY_RETRY_SECONDS),
+    );
     response
 }
 fn payload_too_large() -> Response {

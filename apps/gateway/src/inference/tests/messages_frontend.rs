@@ -53,6 +53,7 @@ fn frontend(url: String) -> (Router, Arc<MemoryRepository>) {
 fn frontend_adapter(adapter: Arc<dyn ProviderAdapter>) -> (Router, Arc<MemoryRepository>) {
     let repository = Arc::new(MemoryRepository::default());
     repository.deployments.lock().unwrap().push(Deployment {
+        image_input: false,
         id: Uuid::new_v4(),
         provider: adapter.id().into(),
         upstream_model: "private".into(),

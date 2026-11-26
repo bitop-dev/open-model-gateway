@@ -135,7 +135,7 @@ GRANT UPDATE(revoked_at,disabled_at) ON public.api_keys TO gateway_runtime;
 -- profile, name and region are immutable.
 GRANT UPDATE(enabled,credential_ref,endpoint) ON public.provider_connections TO gateway_runtime;
 GRANT UPDATE(public_name,display_name,description,enabled,supported_protocols) ON public.models TO gateway_runtime;
-GRANT UPDATE(enabled) ON public.deployments TO gateway_runtime;
+GRANT UPDATE(enabled,image_input) ON public.deployments TO gateway_runtime;
 GRANT UPDATE(name,description) ON public.catalogs TO gateway_runtime;
 -- Row locking requires at least one UPDATE column. Grants themselves are
 -- retired/reinserted through catalog operations, not silently source-rewritten.

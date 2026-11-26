@@ -72,6 +72,7 @@ fn build_router(
     identity: Option<IdentityState>,
 ) -> Router {
     let inference = inference_routes(&store);
+    let image_input = image_input_routes(&store, &engine);
     let workloads = workload_routes(&store, &engine);
     let jobs = job_routes(&store);
 
@@ -101,6 +102,7 @@ fn build_router(
         }
     })
     .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024))
+    .merge(image_input)
     .merge(workloads)
     .merge(jobs)
     .merge(uploads)
@@ -114,8 +116,6 @@ fn build_router(
 fn inference_routes(store: &Store) -> Router<Store> {
     Router::new()
         .route("/v1/models", get(models))
-        .route("/v1/chat/completions", post(chat_completions::handle))
-        .route("/v1/responses", post(responses::handle))
         .route("/v1/messages", post(messages::handle))
         .route("/v1/messages/count_tokens", post(messages::count_tokens))
         .route("/v1/embeddings", post(embeddings::handle))
@@ -130,6 +130,85 @@ fn inference_routes(store: &Store) -> Router<Store> {
             store.clone(),
             authenticate_engine,
         ))
+}
+
+/// Chat Completions and Responses, whose inline images may take a body past
+/// the shared 2 MiB limit within the replica's image input budget
+/// (`inference::image_buffer`). Authentication, then the client labels, run
+/// before the budget is consulted and before any body byte is read.
+fn image_input_routes(store: &Store, engine: &Engine) -> Router<Store> {
+    let limits = engine.limits().image_input;
+    let buffer = crate::inference::image_buffer::ImageBuffer::new(limits);
+    Router::new()
+        .route("/v1/chat/completions", post(chat_completions::handle))
+        .route("/v1/responses", post(responses::handle))
+        .layer(DefaultBodyLimit::max(limits.body_bytes))
+        .route_layer(middleware::from_fn_with_state(buffer, image_input_body))
+        .route_layer(middleware::from_fn(client_labels))
+        .route_layer(middleware::from_fn_with_state(
+            store.clone(),
+            authenticate_engine,
+        ))
+}
+
+/// Holds a request's body to what the image input budget allows
+/// (`inference::image_buffer`): the shared text limit, or its declared
+/// length with its share of the budget, kept until the response body ends.
+async fn image_input_body(
+    State(buffer): State<crate::inference::image_buffer::ImageBuffer>,
+    request: Request,
+    next: Next,
+) -> Response {
+    use crate::inference::image_buffer::{Admission, LargeBody, TEXT_BODY_BYTES};
+    let length = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    let (mut parts, body) = request.into_parts();
+    match buffer.admit(length) {
+        Admission::Text => {
+            let body = axum::body::Body::new(http_body_util::Limited::new(body, TEXT_BODY_BYTES));
+            next.run(Request::from_parts(parts, body)).await
+        }
+        Admission::TooLarge => crate::protocols::image_input_too_large(),
+        Admission::Busy => crate::protocols::image_input_busy(),
+        Admission::Large(permit) => {
+            parts.extensions.insert(LargeBody);
+            let body = axum::body::Body::new(http_body_util::Limited::new(body, permit.length));
+            next.run(Request::from_parts(parts, body))
+                .await
+                .map(|body| {
+                    axum::body::Body::new(Holding {
+                        body,
+                        _permit: permit,
+                    })
+                })
+        }
+    }
+}
+
+/// A response body that keeps its request's share of the image input budget
+/// until it ends or is dropped.
+struct Holding {
+    body: axum::body::Body,
+    _permit: crate::inference::image_buffer::BufferPermit,
+}
+impl http_body::Body for Holding {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.get_mut().body).poll_frame(cx)
+    }
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
+    }
 }
 
 /// The non-generation workloads, each with its own configured body cap.
