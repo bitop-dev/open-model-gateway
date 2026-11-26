@@ -191,7 +191,6 @@ metrics/jobs.rs :: impl Metrics::set_batch_route_lines :: family :: self . batch
 metrics/jobs.rs :: impl Metrics::set_batch_workers :: family :: self . batch_workers . get_or_create (& [("state" , "busy" . to_owned ())])
 metrics/jobs.rs :: impl Metrics::set_batch_workers :: family :: self . batch_workers . get_or_create (& [("state" , "capacity" . to_owned ())])
 metrics/operations.rs :: impl Metrics::image_input_refused :: family :: self . image_input . refusals . get_or_create (& [("reason" , reason . to_owned ())])
-metrics/operations.rs :: impl Metrics::image_input_refusal_count :: family :: self . image_input . refusals . get_or_create (& [("reason" , reason . to_owned ())])
 metrics/operations.rs :: impl Metrics::audit_export_delivery :: family :: self . audit_export_deliveries . get_or_create (& [("outcome" , outcome . to_owned ())])
 metrics/operations.rs :: impl Metrics::audit_export_skipped :: family :: self . audit_export_deliveries . get_or_create (& [("outcome" , "skipped" . to_owned ())])
 metrics/operations.rs :: impl Metrics::auth_throttled :: family :: self . auth_throttled . get_or_create (& [("endpoint" , endpoint . to_owned ()) , ("reason" , reason . to_owned ())])
