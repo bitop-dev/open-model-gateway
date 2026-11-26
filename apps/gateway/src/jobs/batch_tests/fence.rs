@@ -388,9 +388,13 @@ async fn a_planning_failure_after_a_takeover_delays_the_line_one_replan(pool: Pg
     jobs.store.pool = replacement_pool.clone();
     let owner = start_replacement(&w, &job, jobs);
     // The replacement runner's planning read, waiting for the lock: cancel it.
+    // It is the replacement pool's statement that the holder of the only lock
+    // here (on `deployment_health`) blocks; its text is not matched, because
+    // `pg_stat_activity` keeps only the first `track_activity_query_size`
+    // bytes of a query, and the planning query names the table late.
     let planning: i32 = tokio::time::timeout(REACH, async {
         loop {
-            if let Some(pid) = sqlx::query_scalar("SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND application_name=$2 AND $1=ANY(pg_blocking_pids(pid)) AND query LIKE '%deployment_health%'")
+            if let Some(pid) = sqlx::query_scalar("SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND application_name=$2 AND $1=ANY(pg_blocking_pids(pid))")
                 .bind(holder).bind(REPLACEMENT).fetch_optional(db).await.unwrap() {
                 return pid;
             }
