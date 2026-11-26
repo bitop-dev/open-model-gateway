@@ -110,6 +110,41 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// How long a half-open route's probe slot is held at most: the
+    /// request's own timeout and its settlement deadline.
+    pub(crate) fn probe_hold(&self) -> Duration {
+        self.limits.request_timeout + SETTLEMENT_DEADLINE
+    }
+    /// [`route_use`] for this engine's attempts, within the request's
+    /// deadline: the probe slot it holds for `id` (held at most until the
+    /// deadline and the settlement deadline), or `None` (the wait noted in
+    /// `cooling`) while the route cannot be used. `live` for an attempt after
+    /// the first, whose plan is no longer fresh.
+    async fn usable(
+        &self,
+        plan: &crate::routing::RoutePlan,
+        id: Uuid,
+        holder: Uuid,
+        deadline: tokio::time::Instant,
+        live: bool,
+        cooling: &mut Option<u32>,
+    ) -> Result<Option<Option<ProbeTicket>>, InferenceError> {
+        let hold =
+            deadline.saturating_duration_since(tokio::time::Instant::now()) + SETTLEMENT_DEADLINE;
+        let used = timeout_at(
+            deadline,
+            route_use(&self.repository, plan, id, holder, hold, live),
+        )
+        .await
+        .map_err(|_| InferenceError::Timeout)?;
+        Ok(match used {
+            RouteUse::Go(probe) => Some(probe),
+            RouteUse::Busy(seconds) => {
+                *cooling = Some(cooling.map_or(seconds, |c| c.min(seconds)));
+                None
+            }
+        })
+    }
     pub fn new(
         repository: Arc<dyn InferenceRepository>,
         registry: ProviderRegistry,
@@ -235,7 +270,7 @@ impl Engine {
         let plan = timeout_at(
             deadline,
             self.repository
-                .route_plan(&principal, &request.model, &candidates, request_id),
+                .route_plan_probing(&principal, &request.model, &candidates, request_id),
         )
         .await
         .map_err(|_| InferenceError::Timeout)??;
@@ -255,47 +290,63 @@ impl Engine {
             protocol,
             streamed,
         };
-        for (attempt, id) in plan
-            .deployment_ids
-            .iter()
-            .take(plan.max_attempts)
-            .enumerate()
-        {
-            let deployment = match candidates.iter().find(|d| d.id == *id) {
-                Some(deployment) => deployment,
-                None => {
-                    // An early return must still finish telemetry
-                    // explicitly, exactly like every other terminal path of
-                    // an attempt (`Engine::attempt`), so Drop never
-                    // mislabels a real denial `cancelled` with no
-                    // `error.type`.
-                    telemetry.finish(
-                        telemetry::Outcome::Error,
-                        Some(InferenceError::Configuration),
-                    );
-                    return Err(InferenceError::Configuration);
-                }
+        let (mut attempt, mut cooling, mut failed_over) = (0, None, None);
+        for id in &plan.deployment_ids {
+            if attempt == plan.max_attempts {
+                break;
+            }
+            // An early return must still finish telemetry explicitly,
+            // exactly like every other terminal path of an attempt
+            // (`Engine::attempt`), so Drop never mislabels a real denial
+            // `cancelled` with no `error.type`.
+            let route = match self.route_of(&candidates, *id) {
+                Ok(route) => self
+                    .usable(&plan, *id, request_id, deadline, attempt > 0, &mut cooling)
+                    .await
+                    .map(|probe| probe.map(|probe| (route, probe))),
+                Err(error) => Err(error),
             };
-            let adapter = match self.registry.get(&deployment.provider) {
-                Some(adapter) => adapter,
-                None => {
-                    telemetry.finish(
-                        telemetry::Outcome::Error,
-                        Some(InferenceError::Configuration),
-                    );
-                    return Err(InferenceError::Configuration);
+            let (deployment, adapter, probe) = match route {
+                Ok(Some(((deployment, adapter), probe))) => (deployment, adapter, probe),
+                Ok(None) => continue,
+                Err(error) => {
+                    telemetry.finish(telemetry::Outcome::Error, Some(error));
+                    return Err(error);
                 }
             };
             telemetry = match self
-                .attempt(&scope, telemetry, attempt, deployment, adapter)
+                .attempt(&scope, telemetry, attempt, deployment, adapter, probe)
                 .await
             {
-                AttemptEnd::Failover(telemetry) => telemetry,
+                AttemptEnd::Failover(telemetry, error) => {
+                    failed_over = Some(error);
+                    telemetry
+                }
                 AttemptEnd::Return(result) => return result,
             };
+            attempt += 1;
         }
-        telemetry.finish(telemetry::Outcome::Error, Some(InferenceError::Busy));
-        Err(InferenceError::Busy)
+        let error = exhausted(cooling, attempt, failed_over);
+        telemetry.finish(telemetry::Outcome::Error, Some(error));
+        Err(error)
+    }
+
+    /// A planned route and its adapter; a plan naming a route that is not a
+    /// candidate, or a provider with no adapter, is a configuration error.
+    fn route_of<'a>(
+        &self,
+        candidates: &'a [Deployment],
+        id: Uuid,
+    ) -> Result<(&'a Deployment, Arc<dyn crate::providers::ProviderAdapter>), InferenceError> {
+        let deployment = candidates
+            .iter()
+            .find(|d| d.id == id)
+            .ok_or(InferenceError::Configuration)?;
+        let adapter = self
+            .registry
+            .get(&deployment.provider)
+            .ok_or(InferenceError::Configuration)?;
+        Ok((deployment, adapter))
     }
 }
 
@@ -392,6 +443,161 @@ async fn settle_attempt(
 /// How long a settlement may take: the one the request waits for and the
 /// detached one of a cancelled request alike.
 pub(crate) const SETTLEMENT_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Whether an attempt may use a planned route now.
+pub(crate) enum RouteUse {
+    /// Yes; holding the route's probe slot, if it is half-open.
+    Go(Option<ProbeTicket>),
+    /// No: another request holds the half-open route's probe slot (or the
+    /// circuit opened again) for about this many seconds. Nothing was sent.
+    Busy(u32),
+}
+
+/// The error of a request whose plan ran out: the routes left could not be
+/// used and none was attempted (cooling down), or the attempts ran out.
+pub(crate) fn exhausted(
+    cooling: Option<u32>,
+    attempts: usize,
+    failed_over: Option<InferenceError>,
+) -> InferenceError {
+    match (cooling, failed_over) {
+        (Some(seconds), _) if attempts == 0 => InferenceError::RouteCoolingDown(seconds),
+        // The last attempt failed over to routes none of which could be used:
+        // its own error stands.
+        (_, Some(error)) => error,
+        _ => InferenceError::Busy,
+    }
+}
+
+/// A half-open route of the plan is used only by the request that claims its
+/// probe slot, for at most `hold` (the request's timeout and settlement
+/// deadline); every other route as before. A claim that cannot be made
+/// (storage) is treated as busy: the route is not used unclaimed.
+pub(crate) async fn route_use(
+    repository: &Arc<dyn InferenceRepository>,
+    plan: &crate::routing::RoutePlan,
+    id: Uuid,
+    holder: Uuid,
+    hold: Duration,
+    live: bool,
+) -> RouteUse {
+    use crate::routing::{ProbeClaim, RouteState};
+    let ticket = |epoch| ProbeTicket {
+        repository: repository.clone(),
+        deployment: id,
+        holder,
+        epoch: Some(epoch),
+    };
+    // A slot the caller claimed before a wait (a batch line, before its
+    // route capacity) is renewed for this request's own bound; one that
+    // ended meanwhile is no longer the caller's, and the route is not used.
+    if let Some((held, epoch)) = plan.held_probe
+        && held == id
+    {
+        return match repository.route_probe_renew(id, epoch, hold).await {
+            Ok(true) => RouteUse::Go(Some(ticket(epoch))),
+            Ok(false) => RouteUse::Busy(1),
+            // Not known to be lost: the dropped ticket frees it (fenced).
+            Err(_) => {
+                drop(ticket(epoch));
+                RouteUse::Busy(1)
+            }
+        };
+    }
+    // A route planned earlier in the request (a failover attempt) is taken
+    // as it is now: its circuit may have opened or passed its cooldown since.
+    let half_open = if live {
+        match repository.route_state(id).await {
+            Ok(RouteState::Closed) => false,
+            Ok(RouteState::HalfOpen) => true,
+            Ok(RouteState::Open(seconds)) => return RouteUse::Busy(seconds),
+            Err(_) => return RouteUse::Busy(1),
+        }
+    } else {
+        plan.probes.contains(&id)
+    };
+    if !half_open {
+        return RouteUse::Go(None);
+    }
+    match repository.route_probe_claim(id, holder, hold).await {
+        Ok(ProbeClaim::Claimed(epoch)) => RouteUse::Go(Some(ticket(epoch))),
+        Ok(ProbeClaim::Closed) => RouteUse::Go(None),
+        Ok(ProbeClaim::Busy(seconds)) => RouteUse::Busy(seconds),
+        Err(_) => RouteUse::Busy(1),
+    }
+}
+
+/// A probe slot an attempt holds before its `ExecutionGuard` owns it. If the
+/// attempt ends first (refused at admission, or the request dropped while it
+/// was admitted), dropping the ticket frees the slot for the next request;
+/// the guard takes the epoch over once it exists ([`Self::into_epoch`]).
+pub(crate) struct ProbeTicket {
+    repository: Arc<dyn InferenceRepository>,
+    deployment: Uuid,
+    holder: Uuid,
+    epoch: Option<i64>,
+}
+impl ProbeTicket {
+    /// A slot claimed outside the engine (a batch line, at dispatch) that its
+    /// claimer frees if it ends before the engine takes it over.
+    pub(crate) fn held(
+        repository: Arc<dyn InferenceRepository>,
+        deployment: Uuid,
+        holder: Uuid,
+        epoch: i64,
+    ) -> Self {
+        Self {
+            repository,
+            deployment,
+            holder,
+            epoch: Some(epoch),
+        }
+    }
+    /// The slot's epoch, now the guard's to end.
+    pub(crate) fn into_epoch(mut self) -> Option<i64> {
+        self.epoch.take()
+    }
+}
+impl Drop for ProbeTicket {
+    fn drop(&mut self) {
+        if let Some(epoch) = self.epoch.take() {
+            let _ = end_probe_in_background(
+                self.repository.clone(),
+                self.deployment,
+                epoch,
+                false,
+                self.holder,
+            );
+        }
+    }
+}
+
+/// End a probe slot in the background, bounded like the advisory health
+/// write: close the circuit (a stream's first content) or free the slot.
+/// Both are fenced by `epoch`, so a slot that ended otherwise (a decision,
+/// its expiry, a newer claim) is left alone; a write that never lands leaves
+/// the slot to end at its expiry.
+fn end_probe_in_background(
+    repository: Arc<dyn InferenceRepository>,
+    deployment: Uuid,
+    epoch: i64,
+    close: bool,
+    execution_id: Uuid,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let runtime = tokio::runtime::Handle::try_current().ok()?;
+    Some(runtime.spawn(async move {
+        let write = async {
+            if close {
+                repository.route_probe_close(deployment, epoch).await
+            } else {
+                repository.route_probe_release(deployment, epoch).await
+            }
+        };
+        if !matches!(timeout(Duration::from_millis(250), write).await, Ok(Ok(()))) {
+            tracing::warn!(execution_id = %execution_id, "routing probe update failed");
+        }
+    }))
+}
 struct ExecutionGuard {
     repository: Arc<dyn InferenceRepository>,
     id: Uuid,
@@ -403,6 +609,12 @@ struct ExecutionGuard {
     telemetry: AttemptTelemetry,
     finished: bool,
     health_observation: bool,
+    /// The epoch of the half-open route's probe slot this attempt holds
+    /// (`routing::claim_probe`); `None` once freed or when it holds none.
+    probe: Option<i64>,
+    /// The background close of the probe's circuit at its first content: the
+    /// health write waits for it, so a later failure is an ordinary one.
+    probe_closing: Option<tokio::task::JoinHandle<()>>,
     _permit: SharedPermit,
     /// The request's correlation id (#98), for the reconciliation log lines
     /// below only: `Some` only once a shared-workspace admission has
@@ -436,6 +648,8 @@ impl ExecutionGuard {
             telemetry: AttemptTelemetry::default(),
             finished: false,
             health_observation: true,
+            probe: None,
+            probe_closing: None,
             _permit: permit,
             log_trace_id,
             #[cfg(test)]
@@ -443,12 +657,32 @@ impl ExecutionGuard {
         }
     }
     /// Streams: the first delta carrying text or a tool call sets time to first token.
+    /// It is also a probe's first content: the route is serving, so its circuit
+    /// closes at once (`routing::close_probe`). An event without content (a
+    /// role, a start or a keep-alive) does neither.
     fn first_token(&mut self, text: Option<&str>, tool_calls: &[types::ToolCallDelta]) {
         if self.telemetry.time_to_first_token_ms.is_none()
             && (text.is_some_and(|t| !t.is_empty()) || !tool_calls.is_empty())
         {
             self.telemetry.time_to_first_token_ms = Some(millis(self.dispatched.elapsed()));
+            if let Some(epoch) = self.probe
+                && self.probe_closing.is_none()
+            {
+                // The epoch stays: `finish` or `Drop` still frees a slot the
+                // close did not end (a fenced no-op once it did).
+                self.probe_closing = self.end_probe(epoch, true);
+            }
         }
+    }
+    /// End this attempt's probe slot (`end_probe_in_background`).
+    fn end_probe(&self, epoch: i64, close: bool) -> Option<tokio::task::JoinHandle<()>> {
+        end_probe_in_background(
+            self.repository.clone(),
+            self.deployment_id,
+            epoch,
+            close,
+            self.id,
+        )
     }
     /// Telemetry as of now: generation time ends when the attempt finishes.
     fn telemetry_now(&self) -> AttemptTelemetry {
@@ -479,25 +713,44 @@ impl ExecutionGuard {
         // only owner of this attempt's accounting, and `Drop` never settles it.
         self.finished = true;
         let result = self.settle_to_completion(outcome, error, phases).await;
+        // The probe's circuit closed at its first content before this result
+        // is recorded (bounded: the close is).
+        if let Some(closing) = self.probe_closing.take() {
+            let _ = closing.await;
+        }
         // Health is advisory; a failed health write never discards a durably accounted response.
+        // The probe's result is recorded as the probe's (it decides).
+        let (repository, deployment, probe) =
+            (self.repository.clone(), self.deployment_id, self.probe);
+        let write = async move {
+            match probe {
+                Some(epoch) => {
+                    repository
+                        .route_probe_result(deployment, error, epoch)
+                        .await
+                }
+                None => repository.route_result(deployment, error).await,
+            }
+        };
         if self.health_observation
             && outcome != Outcome::Cancelled
-            && !matches!(
-                timeout(
-                    Duration::from_millis(250),
-                    self.repository.route_result(self.deployment_id, error)
-                )
-                .await,
-                Ok(Ok(()))
-            )
+            && !matches!(timeout(Duration::from_millis(250), write).await, Ok(Ok(())))
         {
             tracing::warn!(execution_id=%self.id, trace_id = self.log_trace_id.as_ref().map(LogTraceId::as_str), "routing health update failed");
+        }
+        // A probe the health write decided has no slot left; one it did not
+        // decide (no health signal, cancelled, or a write that failed) frees it.
+        if let Some(epoch) = self.probe.take() {
+            let _ = self.end_probe(epoch, false);
         }
         result
     }
 }
 impl Drop for ExecutionGuard {
     fn drop(&mut self) {
+        if let Some(epoch) = self.probe.take() {
+            let _ = self.end_probe(epoch, false);
+        }
         if self.finished {
             return;
         }
@@ -546,6 +799,8 @@ impl Drop for ExecutionGuard {
 pub(crate) mod admission_validation_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod count_db_tests;
+#[cfg(all(test, feature = "integration-tests"))]
+mod probe_e2e_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod settlement_disconnect_tests;
 #[cfg(all(test, feature = "integration-tests"))]

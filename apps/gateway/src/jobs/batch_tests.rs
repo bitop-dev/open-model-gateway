@@ -302,6 +302,20 @@ impl ProviderAdapter for Fake {
                 usage: usage(10, 5),
             })),
             "fail" => Err(InferenceError::UpstreamUnavailable),
+            // Fails its first execution only (a provider that recovers).
+            "fail-once"
+                if self
+                    .script
+                    .lock()
+                    .unwrap()
+                    .executed
+                    .iter()
+                    .filter(|t| *t == "fail-once")
+                    .count()
+                    == 1 =>
+            {
+                Err(InferenceError::UpstreamUnavailable)
+            }
             "busy" => Err(InferenceError::Busy),
             "slow" => {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -3432,6 +3446,7 @@ mod http_support;
 mod poller;
 mod poller_concurrency;
 mod poller_http;
+mod probe;
 
 /// A gateway-run batch line retries a clean 200-wrapped rate limit under its
 /// retry policy, as it retries an HTTP 429 (#665), and never retries the same

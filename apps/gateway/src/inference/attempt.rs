@@ -79,6 +79,7 @@ impl Engine {
         attempt: usize,
         deployment: &Deployment,
         adapter: Arc<dyn crate::providers::ProviderAdapter>,
+        probe: Option<super::ProbeTicket>,
     ) -> AttemptEnd {
         let RequestScope {
             request,
@@ -90,11 +91,7 @@ impl Engine {
             streamed,
             ..
         } = *scope;
-        let execution_id = if attempt == 0 {
-            request_id
-        } else {
-            Uuid::now_v7()
-        };
+        let execution_id = execution_for(attempt, request_id);
         let attempt_started = Instant::now();
         let attempt_wall_start = telemetry.active().then(telemetry::now_unix_nanos);
         let admission = match self
@@ -117,6 +114,7 @@ impl Engine {
                 // attempt - so, like every other terminal return in this
                 // function, telemetry must be finished explicitly here
                 // rather than left for Drop to mislabel `cancelled`.
+                // A probe slot it held is freed as `probe` drops.
                 telemetry.finish(telemetry::Outcome::Error, Some(error));
                 return AttemptEnd::Return(Err(error));
             }
@@ -136,6 +134,7 @@ impl Engine {
             permit.clone(),
             log_trace_id,
         );
+        guard.probe = probe.and_then(super::ProbeTicket::into_epoch);
         let output = call_upstream(
             &mut guard, &*adapter, deployment, request, &admission, deadline, protocol,
         )
@@ -159,7 +158,7 @@ impl Engine {
                         || (guard.telemetry.nothing_sent
                             && crate::routing::may_fail_over_unsent(plan, error)));
                 if failing_over {
-                    return AttemptEnd::Failover(telemetry);
+                    return AttemptEnd::Failover(telemetry, error);
                 }
                 if let Err(settlement_error) = settled {
                     telemetry.finish(telemetry::Outcome::Error, Some(settlement_error));
@@ -307,7 +306,8 @@ pub(super) struct RequestScope<'a> {
     reason = "returned by value once per attempt, like the Result it wraps; boxing would allocate per request"
 )]
 pub(super) enum AttemptEnd {
-    Failover(RequestTelemetry),
+    /// The attempt failed with this error and the next route may be tried.
+    Failover(RequestTelemetry, InferenceError),
     Return(Result<ProviderOutput, InferenceError>),
 }
 
@@ -638,4 +638,13 @@ fn report_unsettled(id: Uuid, trace: Option<LogTraceId>) {
         finalizer: crate::ops_log::Finalizer::GenerationFinish,
         trace,
     });
+}
+
+/// An attempt's execution id: the first attempt's is the request's own.
+fn execution_for(attempt: usize, request_id: Uuid) -> Uuid {
+    if attempt == 0 {
+        request_id
+    } else {
+        Uuid::now_v7()
+    }
 }

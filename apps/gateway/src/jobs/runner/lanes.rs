@@ -9,6 +9,9 @@ pub(super) struct Pin {
     /// vLLM `priority` hint (route setting), sent on this line only.
     pub(super) priority: Option<i32>,
     pub(super) max_concurrency: i32,
+    /// The half-open route's probe slot this line claimed before its route
+    /// capacity (`routing::claim_probe`), by epoch.
+    pub(super) probe: Option<i64>,
 }
 
 /// Outcome of planning a waiting line's route.
