@@ -115,10 +115,18 @@ fn every_builtin_rule_matches_its_shape_inside_prose() {
             assert!(found(&d, &around) >= 1, "{name} in {around}");
         }
         assert_eq!(
-            found(&d, &format!("Zx9{value}_Q")),
+            found(&d, &format!("Zx9aB3dE5{value}_Q")),
             0,
             "{name} inside base64url"
         );
+        // An escape or one glued character does not hide it.
+        for glued in [
+            format!("\\n{value}"),
+            format!("%20{value}%22"),
+            format!("x{value}x"),
+        ] {
+            assert!(found(&d, &glued) >= 1, "{name} in {glued}");
+        }
     }
 }
 
@@ -182,6 +190,19 @@ fn random_base64url_data_matches_nothing() {
         .collect();
     let blob = format!("{}hf_{}{}", &blob[..500_000], alnum(36), &blob[500_000..]);
     assert_eq!(found(&d, &blob), 0);
+}
+
+#[test]
+fn a_hostile_custom_pattern_scans_in_linear_time() {
+    // `find_iter` is quadratic for this pattern on this text; the custom scan
+    // is not.
+    let custom = PatternDetector::new(&[Category::Custom], &["[a-z]+X|a".to_owned()]).unwrap();
+    let text = "a".repeat(2 << 20);
+    let mut input = Inspection::default();
+    input.push(&text, Part::Content);
+    let started = std::time::Instant::now();
+    assert_eq!(custom.custom_findings(&input).0.len(), MAX_FINDINGS);
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
 }
 
 #[test]

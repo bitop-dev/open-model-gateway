@@ -212,7 +212,10 @@ fn native_envelopes_are_read_and_images_are_not() {
     let read = texts(&input);
     assert!(read.iter().any(|t| t.contains(&k)));
     assert!(read.contains(&"plain notes"));
-    assert!(read.contains(&"opaque-signature"), "a client may send a signature: it is read");
+    assert!(
+        read.contains(&"opaque-signature"),
+        "a client may send a signature: it is read"
+    );
     assert!(!input.uninspectable);
     let image = json!({"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo"}}]});
     let mut input = Inspection::default();

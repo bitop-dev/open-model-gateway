@@ -11,8 +11,22 @@ pub const DFA_LIMIT: usize = 1 << 20;
 /// How deeply a pattern may nest (the crate's default is 250).
 pub const NEST_LIMIT: u32 = 64;
 
-/// Compile one custom pattern within the limits.
+/// Compile one custom pattern within the limits. The byte limit is checked
+/// before anything parses the pattern, so parsing is bounded too.
 pub fn compile(pattern: &str) -> Option<Regex> {
+    // PostgreSQL text cannot hold NUL, so such a pattern is never storable.
+    if pattern.is_empty()
+        || pattern.len() > super::policy::MAX_PATTERN_BYTES
+        || pattern.contains('\0')
+    {
+        return None;
+    }
+    let regex = RegexBuilder::new(pattern)
+        .size_limit(COMPILED_LIMIT)
+        .dfa_size_limit(DFA_LIMIT)
+        .nest_limit(NEST_LIMIT)
+        .build()
+        .ok()?;
     // A pattern that can match the empty string matches at every position:
     // it finds nothing and costs a scan of every byte, so it is refused.
     let empty = regex_syntax::ParserBuilder::new()
@@ -23,22 +37,7 @@ pub fn compile(pattern: &str) -> Option<Regex> {
         .properties()
         .minimum_len()
         == Some(0);
-    if empty {
-        return None;
-    }
-    // PostgreSQL text cannot hold NUL, so such a pattern is never storable.
-    if pattern.is_empty()
-        || pattern.len() > super::policy::MAX_PATTERN_BYTES
-        || pattern.contains('\0')
-    {
-        return None;
-    }
-    RegexBuilder::new(pattern)
-        .size_limit(COMPILED_LIMIT)
-        .dfa_size_limit(DFA_LIMIT)
-        .nest_limit(NEST_LIMIT)
-        .build()
-        .ok()
+    (!empty).then_some(regex)
 }
 
 /// Whether a pattern compiles within the limits (the save-time check).
@@ -90,6 +89,8 @@ mod tests {
         assert!(!valid("(unclosed"));
         assert!(!valid(&"a".repeat(513)));
         assert!(!valid("a\0b"), "NUL is not storable");
+        // Refused by length before anything parses it.
+        assert!(!valid(&"\\w".repeat(100_000)));
         for empty in ["x?", "(?:)", "\\b", "a*", "(?m)^", "a|"] {
             assert!(!valid(empty), "{empty} can match the empty string");
         }

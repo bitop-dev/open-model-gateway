@@ -142,8 +142,10 @@ impl Store {
     }
 }
 
-/// Inputs above this many bytes are scanned off the async workers.
+/// Inputs above this many bytes are scanned off the async workers, at most
+/// `SCANS` at a time per replica.
 const LARGE_INPUT: usize = 64 * 1024;
+static SCANS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
 
 /// The facts of a request the guardrail step records.
 pub(crate) struct Guarded<'a> {
@@ -233,11 +235,17 @@ impl super::Engine {
             // A large input is scanned on the blocking pool (the patterns run
             // in linear time, but over megabytes and many rules).
             Some(input) if input.len() > LARGE_INPUT => {
+                // A slot moves into the scan, so it is held until the scan
+                // ends even when the request is dropped.
+                let slot = SCANS.acquire().await.map_err(|_| InferenceError::Busy)?;
                 let owned = input.into_owned();
                 let policy = Arc::clone(&policy);
-                tokio::task::spawn_blocking(move || policy.decide(workload, Some(&owned)))
-                    .await
-                    .map_err(|_| InferenceError::Storage)?
+                tokio::task::spawn_blocking(move || {
+                    let _slot = slot;
+                    policy.decide(workload, Some(&owned))
+                })
+                .await
+                .map_err(|_| InferenceError::Storage)?
             }
             input => policy.decide(workload, input.as_ref()),
         };

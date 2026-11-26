@@ -4,10 +4,10 @@
 //!
 //! The built-in rules match credentials by their documented shape: a fixed
 //! prefix or structure, so ordinary code, UUIDs, hashes and base64 data do not
-//! match. A match counts only when it is not glued to a base64url character
-//! (letter, digit, `_` or `-`) on either side: inside an encoded blob it is
-//! data, not a credential, while quotes, spaces, `=` or `:` around one do not
-//! hide it. A PEM private key is matched on its `BEGIN` line, which is enough to
+//! match. A match counts unless it is glued to a run of eight or more
+//! base64url characters (letters, digits, `_`, `-`) on either side: inside an
+//! encoded blob it is data, not a credential. Quotes, spaces, `=`, `:` and
+//! escapes such as `\n` or `%20` around one do not hide it. A PEM private key is matched on its `BEGIN` line, which is enough to
 //! refuse it and keeps the match short.
 use std::sync::LazyLock;
 
@@ -86,10 +86,23 @@ pub const MAX_FINDINGS: usize = 10_000;
 fn encoded(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
 }
+/// A run of this many base64url characters next to a match makes it part of
+/// an encoded blob.
+const BLOB_RUN: usize = 8;
 /// Whether `span` of `text` stands apart from base64url data around it.
 fn standalone(text: &[u8], span: std::ops::Range<usize>) -> bool {
-    let before = span.start.checked_sub(1).and_then(|i| text.get(i));
-    !before.is_some_and(|b| encoded(*b)) && !text.get(span.end).is_some_and(|b| encoded(*b))
+    let before = text[..span.start]
+        .iter()
+        .rev()
+        .take(BLOB_RUN)
+        .take_while(|b| encoded(**b))
+        .count();
+    let after = text[span.end..]
+        .iter()
+        .take(BLOB_RUN)
+        .take_while(|b| encoded(**b))
+        .count();
+    before < BLOB_RUN && after < BLOB_RUN
 }
 
 /// Every match of the built-in secret shapes (shared by every rule that has
@@ -152,25 +165,49 @@ impl PatternDetector {
     pub fn secrets(&self) -> bool {
         self.secrets
     }
-    /// Matches of the rule's custom patterns; empty matches never count.
+    /// Matches of the rule's custom patterns, in time linear in the text
+    /// (a custom pattern is an administrator's, so its cost is bounded
+    /// whatever it is): each step finds the earliest end of a match, which
+    /// scans no further than that end, then the match's start within the text
+    /// just scanned. Patterns that can match the empty string are refused at
+    /// save; an empty match here never counts.
     pub fn custom_findings(&self, input: &Inspection<'_>) -> Findings {
         let mut found = Vec::new();
         for (index, segment) in input.segments.iter().enumerate() {
+            let text: &str = &segment.text;
             for pattern in &self.custom {
-                for m in pattern.find_iter(&segment.text).filter(|m| !m.is_empty()) {
+                let mut at = 0;
+                while at < text.len() {
+                    let Some(end) = pattern.shortest_match_at(text, at) else {
+                        break;
+                    };
+                    let span = pattern
+                        .find_at(&text[..end], at)
+                        .map_or(at..end, |m| m.range());
                     if found.len() == MAX_FINDINGS {
                         return Findings(found);
                     }
-                    found.push(Finding {
-                        category: Category::Custom,
-                        segment: index,
-                        span: m.range(),
-                    });
+                    if !span.is_empty() {
+                        found.push(Finding {
+                            category: Category::Custom,
+                            segment: index,
+                            span,
+                        });
+                    }
+                    at = if end > at { end } else { next_char(text, at) };
                 }
             }
         }
         Findings(found)
     }
+}
+
+/// The byte offset after the character at `at`.
+fn next_char(text: &str, at: usize) -> usize {
+    text[at..]
+        .chars()
+        .next()
+        .map_or(text.len(), |c| at + c.len_utf8())
 }
 
 #[async_trait]
