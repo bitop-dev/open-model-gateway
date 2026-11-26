@@ -188,6 +188,7 @@ async fn only_shed_requests_are_resent_and_only_when_asked() {
     let mut c = config(vec![gateway], "http://127.0.0.1:9");
     c.mock_url = None;
     c.rate = 20.0;
+    c.duration_s = 1.0;
     c.warmup_s = 0.0;
     c.stream_ratio = 0.0;
     // 20 requests: 5 shed once, 5 failing with accounting_unavailable.

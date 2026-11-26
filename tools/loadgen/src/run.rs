@@ -68,7 +68,9 @@ pub struct RunConfig {
     pub reader_days: u32,
     /// How often a request shed before admission (`503 scope_busy`, nothing
     /// written) is sent again after its `Retry-After`, with the same nonce;
-    /// 0 (the CLI's setting) never resends. Its record is the last attempt's.
+    /// 0 (the CLI's setting) never resends. Its record is the last attempt's
+    /// (lag: the first attempt's). It keeps its in-flight slot while it
+    /// waits, so later arrivals can become `client_saturated`.
     #[serde(default)]
     pub retry_shed: u32,
 }
@@ -98,6 +100,9 @@ pub struct RequestRecord {
     pub retry_after_s: Option<u64>,
     /// Earlier attempts of this request shed with `scope_busy` and resent.
     pub shed_retries: u32,
+    /// The gateway's request ids of every attempt shed with `scope_busy`
+    /// (the resent ones and a last one): none may have an execution.
+    pub shed_request_ids: Vec<Uuid>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -286,6 +291,7 @@ async fn execute(
         lag_us: micros(sent.saturating_duration_since(request.scheduled)),
         retry_after_s: None,
         shed_retries: 0,
+        shed_request_ids: Vec::new(),
     };
     let body = json!({
         "model": &*model,
@@ -509,6 +515,7 @@ pub async fn run(config: RunConfig) -> anyhow::Result<Report> {
                 lag_us: 0,
                 retry_after_s: None,
                 shed_retries: 0,
+                shed_request_ids: Vec::new(),
             });
             continue;
         }
@@ -528,6 +535,8 @@ pub async fn run(config: RunConfig) -> anyhow::Result<Report> {
         let retry_shed = config.retry_shed;
         set.spawn(async move {
             let mut retries = 0;
+            let mut shed_ids = Vec::new();
+            let mut first_lag = None;
             let record = loop {
                 let mut record = execute(
                     client.clone(),
@@ -537,9 +546,16 @@ pub async fn run(config: RunConfig) -> anyhow::Result<Report> {
                     timeout,
                 )
                 .await;
-                record.shed_retries = retries;
+                // The generator's lag is the first attempt's; a resent
+                // request's latency still runs from its schedule.
+                record.lag_us = *first_lag.get_or_insert(record.lag_us);
                 let shed =
                     record.status == 503 && record.error_code.as_deref() == Some("scope_busy");
+                if shed {
+                    shed_ids.extend(record.request_id);
+                }
+                record.shed_retries = retries;
+                record.shed_request_ids.clone_from(&shed_ids);
                 if !shed || retries >= retry_shed {
                     break record;
                 }

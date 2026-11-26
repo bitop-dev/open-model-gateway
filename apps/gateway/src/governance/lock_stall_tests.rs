@@ -477,7 +477,8 @@ async fn burst(h: &Harness, key: &str, n: usize) -> (Vec<Duration>, (i64, i64, i
 }
 
 /// A measured burst, never asserted: the latencies of the requests that
-/// succeeded, and how many did not, by outcome (`scope_busy`,
+/// succeeded (the printed quantiles and `latency_over_admission_bound` are
+/// theirs), and how many did not, by outcome (`scope_busy`,
 /// `accounting_unavailable` or the HTTP status). Their accounting is still
 /// checked afterwards ([`assert_exact`]).
 async fn measured_burst(
@@ -511,6 +512,9 @@ async fn measured_burst(
 /// in-flight counters back to zero, and `budget verify` and `history verify`
 /// clean. `others` are further gateways on the same database: their replicas'
 /// gates must have drained too, and their upstream calls count with `h`'s.
+/// Every request has been answered, so every gate permit is back: a
+/// settlement past its deadline (`accounting_unavailable`) was dropped with
+/// its permit and its transaction, which never commits, before that answer.
 /// Returns (settled, unknown).
 async fn assert_exact(h: &Harness, others: &[&Harness]) -> (i64, i64) {
     // The settlement gate drained: every permit is back.
