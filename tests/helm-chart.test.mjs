@@ -1064,7 +1064,7 @@ test("the OIDC issuer's private CA is mounted for GATEWAY_OIDC_CA_FILE from one 
 // The image input buffer's worst case in a gateway container, from the
 // rendered chart and the gateway's own bounds (docs/operations.md "Image
 // input memory"): a running process and the whole buffer at the measured
-// copy factor. Text bodies are not bounded by any buffer, so the check keeps
+// worst-case copy count. Text bodies are not bounded by any buffer, so the check keeps
 // this within half the container's memory limit, leaving the rest to them.
 function imageMemory(rendered) {
   const source = readFileSync(join(root, "apps/gateway/src/inference/image_buffer.rs"), "utf8");
@@ -1090,7 +1090,7 @@ function imageMemory(rendered) {
     return mapped ? Number(mapped[1]) : fallback;
   };
   const MIB = 1024 * 1024;
-  const factor = mib(/pub const COPY_FACTOR: usize = (\d+);/, "copy factor");
+  const factor = mib(/pub const WORST_COPIES: usize = (\d+);/, "worst-case copies");
   const baseline = mib(/pub const BASELINE_BYTES: usize = (\d+) \* MIB;/, "baseline");
   const budget = setting("GATEWAY_IMAGE_INPUT_BUFFER_BYTES",
     mib(/pub const DEFAULT_BUFFER_BYTES: usize = (\d+) \* MIB;/, "default budget") * MIB) / MIB;

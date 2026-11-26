@@ -1397,6 +1397,7 @@ async fn inference_openapi_generation_image_input_transport(pool: PgPool) {
             buffer_bytes: 8 * MIB,
             body_idle: std::time::Duration::from_millis(300),
             body_total: std::time::Duration::from_secs(5),
+            body_min_rate: crate::inference::image_buffer::BODY_MIN_RATE,
         },
     )
     .await;

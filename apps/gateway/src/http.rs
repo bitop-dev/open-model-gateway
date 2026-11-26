@@ -138,7 +138,10 @@ fn inference_routes(store: &Store) -> Router<Store> {
 /// before the budget is consulted and before any body byte is read.
 fn image_input_routes(store: &Store, engine: &Engine) -> Router<Store> {
     let limits = engine.limits().image_input;
-    let buffer = crate::inference::image_buffer::ImageBuffer::new(limits);
+    let buffer = (
+        crate::inference::image_buffer::ImageBuffer::new(limits),
+        engine.limits().request_timeout,
+    );
     Router::new()
         .route("/v1/chat/completions", post(chat_completions::handle))
         .route("/v1/responses", post(responses::handle))
@@ -155,7 +158,10 @@ fn image_input_routes(store: &Store, engine: &Engine) -> Router<Store> {
 /// (`inference::image_buffer`): the shared text limit, or its declared
 /// length with its share of the budget, kept until the response body ends.
 async fn image_input_body(
-    State(buffer): State<crate::inference::image_buffer::ImageBuffer>,
+    State((buffer, request_timeout)): State<(
+        crate::inference::image_buffer::ImageBuffer,
+        Duration,
+    )>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -176,9 +182,17 @@ async fn image_input_body(
         Admission::Large(permit) => {
             parts.extensions.insert(LargeBody(permit.length));
             let limits = buffer.limits();
+            // At the latest once the request can no longer be running (its
+            // body, the engine's timeout and settlement), the share is back,
+            // whether or not anyone still reads the response.
+            permit.release_after(
+                limits.body_total + request_timeout + crate::inference::SETTLEMENT_DEADLINE,
+            );
             let body = axum::body::Body::new(ReadDeadline {
                 body: axum::body::Body::new(http_body_util::Limited::new(body, permit.length)),
-                idle_after: limits.body_idle,
+                limits,
+                started: tokio::time::Instant::now(),
+                received: 0,
                 idle: Box::pin(tokio::time::sleep(limits.body_idle)),
                 total: Box::pin(tokio::time::sleep(limits.body_total)),
             });
@@ -194,15 +208,33 @@ async fn image_input_body(
     }
 }
 
-/// A large request body that must keep arriving: a pause longer than
-/// `idle_after` between frames, or `total` in all, fails its read with
-/// [`crate::inference::image_buffer::BodyDeadline`], which ends the request
-/// and returns its share of the budget.
+/// A large request body that must keep arriving
+/// (`inference::image_buffer::BODY_IDLE`, `BODY_MIN_RATE`, `BODY_TOTAL`):
+/// a pause longer than `body_idle` between frames, an average below
+/// `body_min_rate` once `body_idle` has passed, or `body_total` in all fails
+/// its read with [`crate::inference::image_buffer::BodyDeadline`], which
+/// ends the request and returns its share of the budget. The total and the
+/// rate are checked before the inner body is polled, so a stream of frames
+/// cannot postpone them.
 struct ReadDeadline {
     body: axum::body::Body,
-    idle_after: Duration,
+    limits: crate::inference::image_buffer::ImageInputLimits,
+    started: tokio::time::Instant,
+    received: usize,
     idle: std::pin::Pin<Box<tokio::time::Sleep>>,
     total: std::pin::Pin<Box<tokio::time::Sleep>>,
+}
+impl ReadDeadline {
+    fn too_slow(&self) -> bool {
+        let Some(rated) = self.started.elapsed().checked_sub(self.limits.body_idle) else {
+            return false;
+        };
+        (self.received as f64) < rated.as_secs_f64() * self.limits.body_min_rate as f64
+    }
+    fn expired(&mut self, cx: &mut std::task::Context<'_>) -> bool {
+        use std::future::Future;
+        self.total.as_mut().poll(cx).is_ready() || self.too_slow()
+    }
 }
 impl http_body::Body for ReadDeadline {
     type Data = axum::body::Bytes;
@@ -213,15 +245,27 @@ impl http_body::Body for ReadDeadline {
     ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         use std::future::Future;
         let this = self.get_mut();
+        let deadline = || {
+            std::task::Poll::Ready(Some(Err(axum::Error::new(
+                crate::inference::image_buffer::BodyDeadline,
+            ))))
+        };
+        if this.expired(cx) {
+            return deadline();
+        }
         if let std::task::Poll::Ready(frame) = std::pin::Pin::new(&mut this.body).poll_frame(cx) {
-            let next = tokio::time::Instant::now() + this.idle_after;
+            if let Some(Ok(data)) = frame
+                .as_ref()
+                .map(|f| f.as_ref().map(http_body::Frame::data_ref))
+            {
+                this.received += data.map_or(0, axum::body::Bytes::len);
+            }
+            let next = tokio::time::Instant::now() + this.limits.body_idle;
             this.idle.as_mut().reset(next);
             return std::task::Poll::Ready(frame);
         }
-        if this.idle.as_mut().poll(cx).is_ready() || this.total.as_mut().poll(cx).is_ready() {
-            return std::task::Poll::Ready(Some(Err(axum::Error::new(
-                crate::inference::image_buffer::BodyDeadline,
-            ))));
+        if this.idle.as_mut().poll(cx).is_ready() {
+            return deadline();
         }
         std::task::Poll::Pending
     }

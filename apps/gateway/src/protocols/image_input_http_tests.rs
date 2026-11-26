@@ -536,6 +536,7 @@ async fn a_stalled_large_body_times_out_and_returns_its_share(pool: PgPool) {
             buffer_bytes: 4 * MIB,
             body_idle: std::time::Duration::from_millis(300),
             body_total: std::time::Duration::from_secs(5),
+            body_min_rate: crate::inference::image_buffer::BODY_MIN_RATE,
         },
         true,
     )
@@ -571,4 +572,53 @@ async fn a_stalled_large_body_times_out_and_returns_its_share(pool: PgPool) {
     // Its share is back: a full large body is admitted at once.
     let (status, _, value, _) = send(&w, "/v1/chat/completions", Some(&w.token), body, true).await;
     assert_eq!(status, StatusCode::OK, "{value}");
+}
+
+#[dbtest::test]
+async fn a_trickled_large_body_is_cut_by_the_rate_floor(pool: PgPool) {
+    let w = world(
+        pool,
+        ImageInputLimits {
+            body_bytes: 8 * MIB,
+            buffer_bytes: 4 * MIB,
+            body_idle: std::time::Duration::from_millis(300),
+            body_total: std::time::Duration::from_secs(30),
+            body_min_rate: 64 * 1024,
+        },
+        true,
+    )
+    .await;
+    allow_images(&w, true).await;
+    let body = serde_json::to_vec(&chat_body(&png_url(2 * MIB + MIB / 4, "t"), false)).unwrap();
+    let declared = body.len();
+    // Ten bytes every 50 ms: never idle, far below the floor.
+    let trickle = Body::from_stream(
+        futures_util::stream::iter(
+            body.chunks(10)
+                .map(Bytes::copy_from_slice)
+                .collect::<Vec<_>>(),
+        )
+        .then(|chunk| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok::<_, std::convert::Infallible>(chunk)
+        }),
+    );
+    let started = std::time::Instant::now();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        w.router.clone().oneshot(
+            Request::post("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::CONTENT_LENGTH, declared)
+                .header(header::AUTHORIZATION, format!("Bearer {}", w.token))
+                .body(trickle)
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("the rate floor ends the request")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert_eq!(executions(&w).await, 0);
 }

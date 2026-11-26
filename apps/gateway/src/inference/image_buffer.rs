@@ -20,9 +20,14 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 pub const TEXT_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// The budget's unit: a large body takes its length in whole MiB.
 pub const MIB: usize = 1024 * 1024;
-/// The largest number of copies of a large body's bytes in memory at once
+/// The largest number of copies of an image's bytes in memory at once
 /// (measured; docs/operations.md "Image input memory").
 pub const COPY_FACTOR: usize = 3;
+/// The largest number of copies of any byte of a large body: the text it
+/// may carry beside its images (at most [`TEXT_BODY_BYTES`]) is copied by
+/// the parse, each attempt, the upstream value, its serialization and the
+/// spliced body. The buffer's worst case counts every byte at this.
+pub const WORST_COPIES: usize = 5;
 /// `Retry-After` of a request refused because the budget is spent.
 pub const BUSY_RETRY_SECONDS: u32 = 1;
 
@@ -38,6 +43,9 @@ pub struct ImageInputLimits {
     pub body_idle: Duration,
     /// A large body's longest time to arrive in full ([`BODY_TOTAL`]).
     pub body_total: Duration,
+    /// A large body's slowest average rate after its first `body_idle`
+    /// ([`BODY_MIN_RATE`], bytes per second).
+    pub body_min_rate: usize,
 }
 
 impl Default for ImageInputLimits {
@@ -47,20 +55,25 @@ impl Default for ImageInputLimits {
             buffer_bytes: DEFAULT_BUFFER_BYTES,
             body_idle: BODY_IDLE,
             body_total: BODY_TOTAL,
+            body_min_rate: BODY_MIN_RATE,
         }
     }
 }
 
 /// A large body holds its share of the budget only while it keeps arriving:
-/// past this pause between frames, or [`BODY_TOTAL`] in all, its read fails
-/// (408) and the share goes back.
+/// past this pause between frames, below [`BODY_MIN_RATE`] on average once
+/// this much time has passed, or past [`BODY_TOTAL`] in all, its read fails
+/// (408) and the share goes back. So holding a share costs a client upload
+/// bandwidth, not a trickle.
 pub const BODY_IDLE: Duration = Duration::from_secs(10);
-/// The default request timeout: a 20 MiB body needs about 1.4 Mbit/s.
-pub const BODY_TOTAL: Duration = Duration::from_secs(120);
+/// About 1 Mbit/s: a 20 MiB body may take 10 + 160 s.
+pub const BODY_MIN_RATE: usize = 128 * 1024;
+/// The longest a large body may take to arrive.
+pub const BODY_TOTAL: Duration = Duration::from_secs(180);
 
 /// The default budget. The buffer is a hard bound on large bodies only: at
-/// [`COPY_FACTOR`] copies its worst case with a [`BASELINE_BYTES`] process
-/// (100 + 48 × 3 = 244 MiB) stays within half the chart's 1 GiB memory
+/// [`WORST_COPIES`] copies its worst case with a [`BASELINE_BYTES`] process
+/// (100 + 48 × 5 = 340 MiB) stays within half the chart's 1 GiB memory
 /// limit, leaving the rest for text bodies, which no buffer bounds
 /// (docs/operations.md "Image input memory"; tests/helm-chart.test.mjs).
 pub const DEFAULT_BUFFER_BYTES: usize = 48 * MIB;
@@ -145,11 +158,28 @@ impl LargeBody {
     }
 }
 
-/// A large body's share of the budget, returned when it is dropped.
+/// A large body's share of the budget, returned when it is dropped or, at
+/// the latest, when [`BufferPermit::release_after`]'s time has passed (a
+/// response nobody reads must not keep it).
 pub struct BufferPermit {
-    _permit: OwnedSemaphorePermit,
+    slot: Arc<std::sync::Mutex<Option<OwnedSemaphorePermit>>>,
     /// The declared length the body is held to.
     pub length: usize,
+}
+impl BufferPermit {
+    /// Returns the share after `after` even if this value is still alive.
+    pub fn release_after(&self, after: Duration) {
+        let slot = self.slot.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            drop(slot.lock().unwrap_or_else(|e| e.into_inner()).take());
+        });
+    }
+}
+impl Drop for BufferPermit {
+    fn drop(&mut self) {
+        drop(self.slot.lock().unwrap_or_else(|e| e.into_inner()).take());
+    }
 }
 
 /// What a request may send, decided from its headers before any body byte.
@@ -207,7 +237,7 @@ impl ImageBuffer {
         };
         match self.permits.clone().try_acquire_many_owned(count) {
             Ok(permit) => Admission::Large(BufferPermit {
-                _permit: permit,
+                slot: Arc::new(std::sync::Mutex::new(Some(permit))),
                 length,
             }),
             Err(_) => Admission::Busy,
@@ -253,6 +283,20 @@ mod tests {
         assert!(matches!(b.admit(Some(3 * MIB as u64)), Admission::Large(_)));
         drop(second);
         assert_eq!(b.available_mib(), 6);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_share_returns_at_its_hold_limit_even_while_its_permit_lives() {
+        let b = buffer(4);
+        let Admission::Large(permit) = b.admit(Some(3 * MIB as u64)) else {
+            panic!("admitted")
+        };
+        permit.release_after(Duration::from_secs(5));
+        assert_eq!(b.available_mib(), 1);
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert_eq!(b.available_mib(), 4, "returned though the permit is alive");
+        drop(permit);
+        assert_eq!(b.available_mib(), 4, "never returned twice");
     }
 
     #[test]

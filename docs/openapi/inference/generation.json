@@ -102,7 +102,7 @@
             "$ref": "#/components/responses/OpenAiNotFound"
           },
           "408": {
-            "description": "A body over 2 MiB stopped arriving: a pause of more than 10 s, or more than 120 s in all (invalid_request_error, code request_timeout). Its share of the image input buffer is back; nothing was admitted or sent.",
+            "description": "A body over 2 MiB stopped arriving: a pause of more than 10 s, under 128 KiB/s on average after its first 10 s, or more than 180 s in all (invalid_request_error, code request_timeout). Its share of the image input buffer is back; nothing was admitted or sent.",
             "headers": {
               "x-request-id": {
                 "$ref": "#/components/headers/RequestId"
@@ -200,7 +200,7 @@
             "status": 408,
             "envelope": "OpenAiErrorEnvelope",
             "code": "request_timeout",
-            "trigger": "a body over 2 MiB paused more than 10 s or took more than 120 s"
+            "trigger": "a body over 2 MiB paused more than 10 s, arrived under 128 KiB/s after its first 10 s, or took more than 180 s"
           },
           {
             "status": 413,
@@ -244,9 +244,14 @@
             "source": "inference/image_buffer.rs BODY_IDLE"
           },
           "image_input_body_total_seconds": {
-            "default": 120,
+            "default": 180,
             "env": null,
             "source": "inference/image_buffer.rs BODY_TOTAL"
+          },
+          "image_input_body_min_rate_bytes_per_second": {
+            "default": 131072,
+            "env": null,
+            "source": "inference/image_buffer.rs BODY_MIN_RATE: the slowest average once the first BODY_IDLE has passed"
           },
           "images": {
             "maximum": 20,
@@ -401,7 +406,7 @@
             "$ref": "#/components/responses/OpenAiNotFound"
           },
           "408": {
-            "description": "A body over 2 MiB stopped arriving: a pause of more than 10 s, or more than 120 s in all (invalid_request_error, code request_timeout). Its share of the image input buffer is back; nothing was admitted or sent.",
+            "description": "A body over 2 MiB stopped arriving: a pause of more than 10 s, under 128 KiB/s on average after its first 10 s, or more than 180 s in all (invalid_request_error, code request_timeout). Its share of the image input buffer is back; nothing was admitted or sent.",
             "headers": {
               "x-request-id": {
                 "$ref": "#/components/headers/RequestId"
@@ -499,7 +504,7 @@
             "status": 408,
             "envelope": "OpenAiErrorEnvelope",
             "code": "request_timeout",
-            "trigger": "a body over 2 MiB paused more than 10 s or took more than 120 s"
+            "trigger": "a body over 2 MiB paused more than 10 s, arrived under 128 KiB/s after its first 10 s, or took more than 180 s"
           },
           {
             "status": 413,
@@ -548,9 +553,14 @@
             "source": "inference/image_buffer.rs BODY_IDLE"
           },
           "image_input_body_total_seconds": {
-            "default": 120,
+            "default": 180,
             "env": null,
             "source": "inference/image_buffer.rs BODY_TOTAL"
+          },
+          "image_input_body_min_rate_bytes_per_second": {
+            "default": 131072,
+            "env": null,
+            "source": "inference/image_buffer.rs BODY_MIN_RATE: the slowest average once the first BODY_IDLE has passed"
           },
           "images": {
             "maximum": 20,
