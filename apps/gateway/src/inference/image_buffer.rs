@@ -78,12 +78,15 @@ pub const BODY_TOTAL: Duration = Duration::from_secs(180);
 
 /// The longest image data URL prefix (`data:image/jpeg;base64,`, and WebP's).
 pub const LONGEST_IMAGE_PREFIX: usize = 23;
-/// The largest body the pre-parse bound can pass (`http::image_body_scan`):
+/// The route cap's ceiling (141,907,772 bytes, about 135.3 MiB):
 /// [`TEXT_BODY_BYTES`] outside image data plus the request's
 /// [`MAX_IMAGES`](crate::protocols::image_input::MAX_IMAGES) image URLs at
-/// their longest, unescaped. A route cap above this could only admit bodies
-/// that are read in full and then refused, so the setting stops here
-/// (141,907,772 bytes, about 135.3 MiB).
+/// their longest, unescaped, which is the largest body of plain image URLs
+/// the pre-parse bound (`http::image_body_scan`) can pass. JSON escapes make
+/// a URL longer without making the parsed image larger (`\/` is two bytes
+/// for one character), so a body whose URLs are escaped can pass the bound
+/// above this, and the cap refuses it instead; escaping every `/`, as some
+/// encoders do, adds about a sixty-fourth of the base64.
 pub const MAX_BODY_BYTES: usize = TEXT_BODY_BYTES
     + crate::protocols::image_input::MAX_IMAGES
         * (LONGEST_IMAGE_PREFIX + crate::protocols::image_input::MAX_BASE64_BYTES);
@@ -121,8 +124,8 @@ impl ImageInputLimits {
         ensure!(
             (TEXT_BODY_BYTES..=MAX_BODY_BYTES).contains(&limits.body_bytes),
             "GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT must be between {TEXT_BODY_BYTES} (2 MiB) and \
-             {MAX_BODY_BYTES} bytes (2 MiB outside image data and {} images at their limit; \
-             no larger body can pass)",
+             {MAX_BODY_BYTES} bytes (2 MiB outside image data and {} unescaped image URLs at \
+             their limit, the largest such body the image bound can pass)",
             crate::protocols::image_input::MAX_IMAGES
         );
         ensure!(
