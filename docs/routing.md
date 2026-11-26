@@ -65,7 +65,21 @@ When a circuit's cooldown has passed, the route is **half-open**: traffic does n
 
 **Statements on a healthy route.** A route whose circuit never opened costs what it did for an interactive or workload request's first attempt: no probe statement and no additional read. A failover attempt, a batch line's dispatch and each batch attempt's send read the route's circuit as it is then (`route_state`): through the per-replica health cache, at most one read per route per second and replica, or one `SELECT` each with `GATEWAY_CONFIG_CACHE=off`.
 
-Management health includes failure count, nullable last observation and cooldown timestamps. No row/observation means unknown, not healthy. A closed circuit means eligible, not verified uptime; an expired one is half-open. No external probes or provider response bodies appear in these views.
+### Management health
+
+`GET /api/v1/platform/deployments/{deployment}/routing` (Platform Admins and Auditors) reports `health`, computed when it is read (`as_of`, the database's statement time):
+
+| Field | Meaning |
+| --- | --- |
+| `circuit` | `closed`; `open` while the route cools down; `half_open` once the cooldown has passed and one request decides |
+| `cooling_until` | While `open`: when the cooldown ends. Otherwise `null` |
+| `probe_in_progress` | `true` while a request holds the half-open route's unexpired probe slot |
+| `probe_until` | While a probe is in progress: when its slot ends at the latest. Otherwise `null` |
+| `reopen_count` | Openings since the route last served a complete success; each doubles the next cooldown, capped |
+| `observation` | `none` (never observed), `stale` (no observation for 600 s: the route may simply have had no traffic) or `current` |
+| `consecutive_failures`, `open_until`, `last_observed_at` | As stored; `open_until` stays in the past once the circuit is half-open |
+
+No row or observation means unknown, not healthy. A closed circuit means eligible, not verified uptime. The view is sanitized: no endpoint, credential reference, payload or raw error text, and not the probe's holder (an execution id) or its epoch. No external probes or provider response bodies appear in it.
 
 ## Cancellation and evidence
 

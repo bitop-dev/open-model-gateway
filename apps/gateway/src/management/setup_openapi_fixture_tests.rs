@@ -1535,6 +1535,31 @@ async fn slice3_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
         None,
     )
     .await;
+    // The cooldown passes (written: the fixture does not wait 30 s) and a
+    // request claims the half-open route's probe slot.
+    sqlx::query("UPDATE deployment_health SET open_until=clock_timestamp()-interval '1 second' WHERE deployment_id=$1")
+        .bind(deployment)
+        .execute(&f.s.pool)
+        .await
+        .unwrap();
+    f.s.caches.forget_health(deployment);
+    assert!(matches!(
+        crate::routing::claim_probe(
+            &f.s,
+            deployment,
+            Uuid::new_v4(),
+            std::time::Duration::from_secs(60)
+        )
+        .await
+        .unwrap(),
+        crate::routing::ProbeClaim::Claimed(_)
+    ));
+    j.request(
+        "GET",
+        &format!("/api/v1/platform/deployments/{deployment}/routing"),
+        None,
+    )
+    .await;
     j.request("PUT", &format!("/api/v1/platform/deployments/{deployment}/batch-scheduling"), Some(json!({"max_concurrency":3,"yield_live_threshold":5,"window":{"timezone":"UTC","days":["mon","fri"],"start":"23:00","end":"06:00"}}))).await;
     // A vLLM-compatible route: defaults, then a priority and window, then
     // server-load gates (written by the production writer: the metrics URL needs

@@ -15,10 +15,11 @@
  * micro-USD per unit; unknown stays unknown (amber), never $0.
  */
 import { useEffect, useState, type ReactNode } from "react";
+import { detailTime } from "../lib/format";
 import { useQueries } from "@tanstack/react-query";
 import { Activity, CircleDollarSign, FileCode2, Layers, LayoutDashboard, Library, Pencil, Plus, Route as RouteIcon, ShieldQuestion, Split, History } from "lucide-react";
 import { api, platformPath, type Catalog, type Deployment, type Model, type ModelProtocol, type Provider, type ServerPolicy, type Session } from "../lib/api";
-import { deploymentRoutingBody, formatMicroUsd, modelRoutingBody, passiveHealth, type DeploymentRouting, type ModelRouting, type Price, type WorkloadKind } from "../lib/governance";
+import { deploymentRoutingBody, formatMicroUsd, modelRoutingBody, routeHealth, useHealthRefresh, type DeploymentRouting, type ModelRouting, type Price, type WorkloadKind } from "../lib/governance";
 import { HEADLINE_METERS, METER_SPECS, basePrice, cheapestPrice, countNoun, formatAudio, priceItems, priceTokenCeilings, unitFor, workloadLabels, workloadOf, type BasePrice } from "../lib/pricing";
 import { formatCount } from "../lib/reports";
 import { inferenceEndpoint, InferenceBaseField, InferenceEndpointField } from "../components/inference-base-url";
@@ -369,7 +370,7 @@ export function RoutePage({ session, route: d, path, tab }: { session: Session; 
       <StatTile label="Connection" value={d.provider_name ?? null} hint={d.connection_enabled === false ? "Connection disabled · route can't serve" : d.region ? `Region ${d.region}` : d.connection_enabled ? "Connection enabled" : undefined} />
       <RoutePriceTile price={price} meters={meters} />
       <StatTile label="Context ceilings" value={price ? ceilingText([price]) : null} />
-      <StatTile label="Priority / weight" value={routing.data ? `${routing.data.routing.priority} / ${routing.data.routing.weight}` : routing.isPending ? "…" : null} hint={routing.data ? passiveHealth(routing.data.health) : undefined} />
+      <StatTile label="Priority / weight" value={routing.data ? `${routing.data.routing.priority} / ${routing.data.routing.weight}` : routing.isPending ? "…" : null} hint={routing.data ? routeHealth(routing.data.health).state : undefined} />
       <StatTile label="Data policy" value={<DataPolicyBadge policy={policy.policy} label={policy.label} size="md" />} hint={policy.detail} />
     </StatTileGrid>
     <DeploymentConfigurationTabs key={d.id} id={d.id} tab={tab} restore={writable ? { record: d, name: d.upstream_model } : undefined}>
@@ -411,8 +412,13 @@ function RouteFeatures({ route, workload }: { route: RouteDetail; workload: Work
   return <DescriptionList items={facts} dividers />;
 }
 function RouteRouting({ query }: { query: ReturnType<typeof useApi<DeploymentRouting>> }) {
+  useHealthRefresh(query.data?.health, query.refetch);
   if (query.isPending) return <p role="status">Loading routing…</p>;
   if (query.isError) return <ErrorNotice error={query.error} retry={() => void query.refetch()} />;
   const { routing, health } = query.data;
-  return <DescriptionList dividers items={[...deploymentRoutingFields(routing).map(f => ({ label: f.label, value: fieldDisplay(f, f.value) })), { label: "Health check (from real traffic)", value: passiveHealth(health) }, { label: "Last observed", value: health.last_observed_at ? <DateTime value={health.last_observed_at} /> : "Unknown" }, { label: "Cooldown until", value: health.open_until ? <DateTime value={health.open_until} /> : "No recorded cooldown" }]} />;
+  const view = routeHealth(health);
+  return <Stack gap={3}>
+    <DescriptionList dividers items={[...deploymentRoutingFields(routing).map(f => ({ label: f.label, value: fieldDisplay(f, f.value) })), { label: "Health (from real traffic)", value: view.state }, ...(view.until ? [{ label: view.until.label, value: <DateTime value={view.until.value} now={health.as_of} /> }] : []), ...(view.backoff ? [{ label: "Backoff", value: view.backoff }] : []), { label: "Last observed", value: health.last_observed_at ? <DateTime value={health.last_observed_at} now={health.as_of} /> : "Never" }, { label: "As of", value: detailTime(health.as_of) }]} />
+    <p className={m.unknown}>Health observations do not establish current upstream readiness.</p>
+  </Stack>;
 }

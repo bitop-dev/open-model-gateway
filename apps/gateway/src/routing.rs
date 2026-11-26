@@ -648,10 +648,12 @@ pub fn may_fail_over_unsent(plan: &RoutePlan, error: InferenceError) -> bool {
 }
 
 mod health;
+pub(crate) use health::HEALTH_VIEW_SQL;
 #[cfg(test)]
 use health::affects_health;
 pub use health::{
-    RouteHealth, health, record_probe_result, record_result, record_unclaimed_result,
+    HEALTH_STALE_AFTER_SECONDS, RouteHealth, health, record_probe_result, record_result,
+    record_unclaimed_result,
 };
 mod probe;
 pub use probe::{

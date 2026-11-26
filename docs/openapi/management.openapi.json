@@ -48081,8 +48081,34 @@
           "health": {
             "additionalProperties": false,
             "properties": {
+              "as_of": {
+                "description": "The time the states above were computed.",
+                "format": "date-time",
+                "type": "string"
+              },
+              "circuit": {
+                "description": "The circuit at `as_of`: `open` while cooling down, `half_open` once the cooldown has passed (one request decides).",
+                "enum": [
+                  "closed",
+                  "open",
+                  "half_open"
+                ],
+                "type": "string"
+              },
               "consecutive_failures": {
                 "type": "integer"
+              },
+              "cooling_until": {
+                "anyOf": [
+                  {
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "While `open`: when the cooldown ends. Otherwise null."
               },
               "last_observed_at": {
                 "anyOf": [
@@ -48095,6 +48121,15 @@
                   }
                 ]
               },
+              "observation": {
+                "description": "`none`: never observed; `stale`: not observed for 600 s (the route may have had no traffic); `current` otherwise.",
+                "enum": [
+                  "none",
+                  "stale",
+                  "current"
+                ],
+                "type": "string"
+              },
               "open_until": {
                 "anyOf": [
                   {
@@ -48105,12 +48140,40 @@
                     "type": "null"
                   }
                 ]
+              },
+              "probe_in_progress": {
+                "description": "A request holds the half-open route's unexpired probe slot.",
+                "type": "boolean"
+              },
+              "probe_until": {
+                "anyOf": [
+                  {
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "While a probe is in progress: when its slot ends at the latest. Otherwise null."
+              },
+              "reopen_count": {
+                "description": "Openings since the route last served a complete success; each doubles the next cooldown, capped.",
+                "minimum": 0,
+                "type": "integer"
               }
             },
             "required": [
               "consecutive_failures",
               "open_until",
-              "last_observed_at"
+              "last_observed_at",
+              "circuit",
+              "cooling_until",
+              "probe_in_progress",
+              "probe_until",
+              "reopen_count",
+              "observation",
+              "as_of"
             ],
             "type": "object"
           },
