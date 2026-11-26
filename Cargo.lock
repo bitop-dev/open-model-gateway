@@ -2599,6 +2599,7 @@ dependencies = [
  "jsonschema",
  "lettre",
  "libc",
+ "mime",
  "openidconnect",
  "percent-encoding",
  "proc-macro2",

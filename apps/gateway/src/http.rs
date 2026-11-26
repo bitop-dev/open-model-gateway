@@ -240,23 +240,19 @@ async fn image_input_body(
     }
 }
 
-/// Whether `Content-Type` is JSON as Axum's `Json` extractor accepts it:
-/// `application/json` or an `application/*+json` type, parameters aside.
+/// Whether `Content-Type` is JSON exactly as Axum 0.8's `Json` extractor
+/// decides it (`axum::json::json_content_type`, not exported): a parsed
+/// `application/json`, or an `application/*` type with a `json` suffix.
 fn json_content_type(headers: &HeaderMap) -> bool {
-    let Some(value) = headers
+    let Some(mime) = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<mime::Mime>().ok())
     else {
         return false;
     };
-    let essence = value
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-    essence == "application/json"
-        || (essence.starts_with("application/") && essence.ends_with("+json"))
+    mime.type_() == "application"
+        && (mime.subtype() == "json" || mime.suffix().is_some_and(|name| name == "json"))
 }
 
 /// A response body that keeps its request's share of the image input budget
@@ -660,6 +656,41 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use sqlx::postgres::PgPoolOptions;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn a_large_body_content_type_is_judged_as_axum_json_judges_it() {
+        use axum::extract::FromRequest;
+        for value in [
+            "application/json",
+            "application/json; charset=utf-8",
+            "APPLICATION/JSON",
+            "application/vnd.api+json",
+            "application/json+xml",
+            "application/jsonx",
+            "application/json ; charset=utf-8",
+            "application/json;;",
+            "application/json; charset",
+            "application/json; =x",
+            "application/a+json; x",
+            "application/+json",
+            "application/a@+json",
+            "text/json",
+            "text/plain",
+            "",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(value).unwrap());
+            let request = Request::builder()
+                .header(header::CONTENT_TYPE, value)
+                .body(Body::from("{}"))
+                .unwrap();
+            let axum_accepts = axum::Json::<serde_json::Value>::from_request(request, &())
+                .await
+                .is_ok();
+            assert_eq!(json_content_type(&headers), axum_accepts, "{value:?}");
+        }
+        assert!(!json_content_type(&HeaderMap::new()));
+    }
 
     fn app() -> Router {
         let pool = PgPoolOptions::new()

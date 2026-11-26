@@ -37,7 +37,13 @@ pub(super) fn outside_images(body: &[u8]) -> usize {
         let start = at + open + 1;
         let end = string_end(body, start);
         let literal = &body[start..end];
-        if is_image_url(literal) {
+        // An image is always a value; a key is structure, which parsers copy
+        // more often than a value (the error path keeps each key on it).
+        let key = body[(end + 1).min(body.len())..]
+            .iter()
+            .find(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+            == Some(&b':');
+        if !key && is_image_url(literal) {
             // Keep the longest: replace the shortest held so far.
             let (shortest, held) = longest
                 .iter_mut()
@@ -228,6 +234,20 @@ mod tests {
         for body in [r#"["data:image/png"#, "[\"data:image/png\\"] {
             assert!(outside_images(body.as_bytes()) <= body.len());
         }
+    }
+
+    #[test]
+    fn an_image_url_as_a_key_counts_in_full() {
+        let url = image(1000);
+        for body in [
+            format!(r#"{{"input":{{"{url}":{{"{url}" :1}}}}}}"#),
+            format!("{{\"{url}\"\n\t :1}}"),
+        ] {
+            assert_eq!(outside_images(body.as_bytes()), body.len(), "{body}");
+        }
+        // The same string as a value is set aside.
+        let body = format!(r#"{{"k":"{url}","x":1}}"#);
+        assert_eq!(outside_images(body.as_bytes()), body.len() - url.len());
     }
 
     #[test]
