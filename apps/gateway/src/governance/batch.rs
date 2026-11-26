@@ -644,16 +644,38 @@ async fn admit_line_unobserved(
 
 /// Settle a batch reservation at zero: a gateway-run batch's envelope when
 /// the batch ends (the part of the ceiling no line used is released), or a
-/// native batch cancelled before anything was submitted (`cancelled`).
+/// native batch that ended before anything was submitted (cancelled, or its
+/// submission expired); `end` is how its execution reads.
 /// Callers guarantee no upstream work is covered by it. Idempotent; a
 /// reservation that is no longer pending (lease reconciled) keeps its hold.
 pub async fn close_batch(
     store: &Store,
     envelope: Uuid,
     elapsed_ms: u64,
-    cancelled: bool,
+    end: EnvelopeEnd,
 ) -> Result<bool, InferenceError> {
-    Ok(close(store, envelope, elapsed_ms, cancelled, None).await? == Closed::Settled)
+    Ok(close(store, envelope, elapsed_ms, end, None).await? == Closed::Settled)
+}
+
+/// How a batch envelope's execution ends when it is closed at zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvelopeEnd {
+    /// Its lines ran (a gateway-run batch's runner closes it).
+    Succeeded,
+    /// The client cancelled it before anything was sent.
+    Cancelled,
+    /// It ended before anything was sent, without a client's cancellation
+    /// (a native batch whose submission expired).
+    Failed,
+}
+impl EnvelopeEnd {
+    fn state(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 /// [`close_batch`] for a gateway-run batch's runner: only while it still holds
@@ -664,7 +686,14 @@ pub(crate) async fn close_gateway_batch(
     elapsed_ms: u64,
     fence: &BatchFence,
 ) -> Result<Closed, InferenceError> {
-    close(store, envelope, elapsed_ms, false, Some(fence)).await
+    close(
+        store,
+        envelope,
+        elapsed_ms,
+        EnvelopeEnd::Succeeded,
+        Some(fence),
+    )
+    .await
 }
 
 /// What closing a batch envelope did.
@@ -681,20 +710,20 @@ async fn close(
     store: &Store,
     envelope: Uuid,
     elapsed_ms: u64,
-    cancelled: bool,
+    end: EnvelopeEnd,
     fence: Option<&BatchFence>,
 ) -> Result<Closed, InferenceError> {
     let _queued = gate(&store.lock_gates.settlement).await;
     locks::retry_deadlocks!(
         "settlement",
-        close_batch_once(store, envelope, elapsed_ms, cancelled, fence).await
+        close_batch_once(store, envelope, elapsed_ms, end, fence).await
     )
 }
 async fn close_batch_once(
     store: &Store,
     envelope: Uuid,
     elapsed_ms: u64,
-    cancelled: bool,
+    end: EnvelopeEnd,
     fence: Option<&BatchFence>,
 ) -> Result<Closed, InferenceError> {
     let mut tx = crate::db::begin(&store.pool).await.map_err(begin_storage)?;
@@ -736,10 +765,10 @@ async fn close_batch_once(
         tx.commit().await.map_err(storage)?;
         return Ok(Closed::NotPending);
     }
-    let changed = sqlx::query("UPDATE inference_executions SET state=$3,input_tokens=0,output_tokens=0,elapsed_ms=$2,completed_at=clock_timestamp(),finish_reason=CASE WHEN $3='cancelled' THEN 'cancelled' ELSE 'stop' END WHERE id=$1 AND state='started' AND workload_kind='batches'")
+    let changed = sqlx::query("UPDATE inference_executions SET state=$3,input_tokens=0,output_tokens=0,elapsed_ms=$2,completed_at=clock_timestamp(),finish_reason=CASE $3 WHEN 'cancelled' THEN 'cancelled' WHEN 'failed' THEN 'error' ELSE 'stop' END WHERE id=$1 AND state='started' AND workload_kind='batches'")
         .bind(envelope)
         .bind(elapsed_ms.min(i64::MAX as u64) as i64)
-        .bind(if cancelled { "cancelled" } else { "succeeded" })
+        .bind(end.state())
         .execute(&mut *tx)
         .await
         .map_err(storage)?

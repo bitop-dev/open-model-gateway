@@ -76,7 +76,11 @@ fn hidden(c: char) -> bool {
                 | '\u{2800}'
                 | '\u{3164}'
                 | '\u{FFA0}'
-                | '\u{FE00}'..='\u{FE0F}'
+                // U+FE0E and U+FE0F choose text or emoji presentation and
+                // cannot hide text ("⚠️" carries U+FE0F): they are allowed.
+                | '\u{FE00}'..='\u{FE0D}'
+                | '\u{180B}'..='\u{180D}'
+                | '\u{180F}'
                 | '\u{E0000}'..='\u{E007F}'
                 | '\u{E0100}'..='\u{E01EF}'
         )

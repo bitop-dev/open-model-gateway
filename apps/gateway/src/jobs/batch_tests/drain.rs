@@ -171,11 +171,23 @@ async fn too_late(w: &World, job: &JobRow) {
 }
 
 /// The batch ended `failed` with `submission_expired` and nothing sent: its
-/// reservation is settled at a known zero, with its ledger entry, and the
-/// job is settled.
+/// reservation is settled at a known zero, with its ledger entry, its
+/// execution reads failed, and the job is settled.
 async fn ended_unsent(w: &World, job: &JobRow) {
+    settled_unsent(w, job, "failed", Some("submission_expired"), "failed").await;
+}
+
+/// The batch ended `state` (`error`) with nothing sent: settled at a known
+/// zero, its execution `execution`.
+async fn settled_unsent(
+    w: &World,
+    job: &JobRow,
+    state: &str,
+    error: Option<&str>,
+    execution: &str,
+) {
     assert!(w.openai.script.lock().unwrap().submitted.is_empty());
-    let (state, error, settled, started): (String, Option<String>, bool, bool) = sqlx::query_as(
+    let (got, code, settled, started): (String, Option<String>, bool, bool) = sqlx::query_as(
         "SELECT state, error_code, settled_at IS NOT NULL, submit_started_at IS NOT NULL FROM async_jobs WHERE id=$1",
     )
     .bind(job.id)
@@ -183,9 +195,15 @@ async fn ended_unsent(w: &World, job: &JobRow) {
     .await
     .unwrap();
     assert_eq!(
-        (state.as_str(), error.as_deref(), settled, started),
-        ("failed", Some("submission_expired"), true, false)
+        (got.as_str(), code.as_deref(), settled, started),
+        (state, error, true, false)
     );
+    let ran: String = sqlx::query_scalar("SELECT state FROM inference_executions WHERE id=$1")
+        .bind(job.execution_id)
+        .fetch_one(&w.f.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(ran, execution);
     let (reservation, _, actual, _) = reservation(&w.f, job.execution_id).await;
     assert_eq!((reservation.as_str(), actual), ("settled", Some(0)));
     let ledger: Vec<(String, Option<i64>)> = sqlx::query_as(
@@ -280,4 +298,165 @@ async fn an_unsubmitted_native_batch_past_its_deadline_still_ends(pool: PgPool) 
         .unwrap();
     w.poll().await;
     ended_unsent(&w, &job).await;
+}
+
+/// Move the batch's poll deadline to `offset` (SQL interval text) after its
+/// completion window plus the 1-hour collection margin from now.
+async fn deadline_at_margin(w: &World, job: &JobRow, offset: &str) {
+    sqlx::query(&format!("UPDATE async_jobs SET poll_deadline_at=now()+make_interval(hours=>coalesce(completion_window_hours,24)::int+1)+interval '{offset}' WHERE id=$1"))
+        .bind(job.id)
+        .execute(&w.f.store.pool)
+        .await
+        .unwrap();
+}
+
+/// The submit window's edge: with its completion window and the collection
+/// margin still left (five minutes to spare) the batch is submitted; with
+/// five minutes fewer it ends unsent.
+#[dbtest::test]
+async fn a_native_batch_is_submitted_only_with_its_window_and_margin_left(pool: PgPool) {
+    let w = world(pool, true, false, 2).await;
+    let in_time = native(&w).await;
+    deadline_at_margin(&w, &in_time, "5 minutes").await;
+    w.poll().await;
+    assert_eq!(
+        w.openai.script.lock().unwrap().submitted.len(),
+        1,
+        "submitted in time"
+    );
+    w.openai.script.lock().unwrap().submitted.clear();
+    let late = native(&w).await;
+    deadline_at_margin(&w, &late, "-5 minutes").await;
+    w.poll().await;
+    ended_unsent(&w, &late).await;
+}
+
+/// The expiry committed but its zero settlement did not (the process
+/// stopped in between): the next poll settles it at zero. The same for a
+/// batch cancelled before submission whose settlement did not complete.
+#[dbtest::test]
+async fn an_unsent_batch_whose_settlement_did_not_complete_is_settled_at_its_next_poll(
+    pool: PgPool,
+) {
+    let w = world(pool, true, false, 2).await;
+    for (state, error, execution) in [
+        ("failed", Some("submission_expired"), "failed"),
+        ("cancelled", None, "cancelled"),
+    ] {
+        let job = native(&w).await;
+        // What `expire_submission` (or the cancellation) commits, without
+        // the settlement that follows it.
+        sqlx::query("UPDATE async_jobs SET state=$2, upstream_status=$2, error_code=$3, completed_at=clock_timestamp(), cancel_requested_at=CASE WHEN $2='cancelled' THEN clock_timestamp() END WHERE id=$1")
+            .bind(job.id)
+            .bind(state)
+            .bind(error)
+            .execute(&w.f.store.pool)
+            .await
+            .unwrap();
+        let (pending, _, _, _) = reservation(&w.f, job.execution_id).await;
+        assert_eq!(pending, "pending");
+        w.poll().await;
+        settled_unsent(&w, &job, state, error, execution).await;
+    }
+}
+
+/// A batch whose submission was claimed (it may have reached the provider)
+/// and has no provider id is never ended `submission_expired` nor settled at
+/// zero, in time or late, before or past its poll deadline: it is left to
+/// `submission_interrupted`, which keeps its hold.
+#[dbtest::test]
+async fn a_claimed_submission_is_never_expired_or_settled_at_zero(pool: PgPool) {
+    let w = world(pool, true, false, 2).await;
+    let job = native(&w).await;
+    sqlx::query("UPDATE async_jobs SET submit_started_at=clock_timestamp() WHERE id=$1")
+        .bind(job.id)
+        .execute(&w.f.store.pool)
+        .await
+        .unwrap();
+    for deadline in ["now()+interval '30 minutes'", "now()-interval '1 minute'"] {
+        sqlx::query(&format!(
+            "UPDATE async_jobs SET poll_deadline_at={deadline} WHERE id=$1"
+        ))
+        .bind(job.id)
+        .execute(&w.f.store.pool)
+        .await
+        .unwrap();
+        w.poll().await;
+        let (state, error, settled): (String, Option<String>, bool) = sqlx::query_as(
+            "SELECT state, error_code, settled_at IS NOT NULL FROM async_jobs WHERE id=$1",
+        )
+        .bind(job.id)
+        .fetch_one(&w.f.store.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (state.as_str(), error, settled),
+            ("queued", None, false),
+            "{deadline}"
+        );
+        let (reservation, _, actual, _) = reservation(&w.f, job.execution_id).await;
+        assert_eq!(
+            (reservation.as_str(), actual),
+            ("pending", None),
+            "{deadline}"
+        );
+    }
+    assert!(w.openai.script.lock().unwrap().submitted.is_empty());
+}
+
+/// A job's route is chosen as the routes are now: with health this replica
+/// read before the first route was drained (planning still names it), the
+/// job takes the second route; with every route drained it is temporarily
+/// unavailable (503 `model_temporarily_unavailable`).
+#[dbtest::test]
+async fn a_job_route_drained_after_the_plan_is_passed_over(pool: PgPool) {
+    let w = world(pool, false, false, 1).await;
+    let second = second_claude_route(&w).await;
+    let first = w.claude_deployment;
+    w.f.store.caches.versions.enable();
+    let fresh = |id| {
+        (
+            id,
+            crate::cache::HealthEntry {
+                loaded: std::time::Instant::now() + std::time::Duration::from_secs(3600),
+                open_until: None,
+                consecutive_failures: 0,
+                observed_age: Some(std::time::Duration::ZERO),
+                probe_until: None,
+                reopen_count: 0,
+                drained: false,
+                drain_until: None,
+            },
+        )
+    };
+    let select = || {
+        w.jobs.select(
+            &w.f.principal,
+            "company/claude",
+            ApiProtocol::ChatCompletions,
+            Uuid::new_v4(),
+            |_, _| true,
+        )
+    };
+    assert_eq!(select().await.unwrap().0.id, first, "the first route leads");
+    w.f.store
+        .caches
+        .store_health(vec![fresh(first), fresh(second)]);
+    sqlx::query("UPDATE deployments SET drain_reason='maintenance', drained_by=(SELECT id FROM users LIMIT 1), drained_at=clock_timestamp() WHERE id=$1")
+        .bind(first)
+        .execute(&w.f.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(select().await.unwrap().0.id, second);
+    w.f.store
+        .caches
+        .store_health(vec![fresh(first), fresh(second)]);
+    sqlx::query("UPDATE deployments SET drain_reason='maintenance', drained_by=(SELECT id FROM users LIMIT 1), drained_at=clock_timestamp() WHERE id=$1")
+        .bind(second)
+        .execute(&w.f.store.pool)
+        .await
+        .unwrap();
+    let error = select().await.err().unwrap();
+    assert_eq!(error, InferenceError::RouteDrained(None));
+    assert_eq!(error.code(), "model_temporarily_unavailable");
 }

@@ -377,7 +377,7 @@ impl Jobs {
                         &self.store,
                         job.execution_id,
                         elapsed,
-                        true,
+                        crate::governance::batch::EnvelopeEnd::Cancelled,
                     )
                     .await?;
                     store::mark_settled(&self.store, job.id).await?;

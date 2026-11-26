@@ -97,6 +97,15 @@ impl Jobs {
         lost: &AtomicBool,
     ) -> JobResult<()> {
         if job.upstream_id.is_none() {
+            // Ended before anything was claimed for submission (cancelled, or
+            // its submission expired) and its zero settlement did not complete
+            // (the process stopped in between, or the settlement failed).
+            if job.submit_started_at.is_none()
+                && job.job_state().is_terminal()
+                && job.settled_at.is_none()
+            {
+                return self.settle_unsent(&job).await;
+            }
             return match job.submit_started_at {
                 None if job.cancel_requested_at.is_none() => self.submit_native(job, fence).await,
                 None => Ok(()),
@@ -152,7 +161,10 @@ impl Jobs {
         // was drained, or unreachable, until now): it ends at zero, unsent.
         match held(&fence, fence.expire_submission(&self.store).await)? {
             None => return Ok(()),
-            Some(Some(ended)) => return self.settle_unsent(&ended).await,
+            Some(Some(ended)) => {
+                count_finished(true, JobState::Failed);
+                return self.settle_unsent(&ended).await;
+            }
             Some(None) => {}
         }
         // The route before the claim: the one submission is claimed only for
@@ -324,14 +336,21 @@ impl Jobs {
         Ok(())
     }
 
-    /// A native batch ended before anything was submitted: its reservation
-    /// is settled at a known zero (as a never-submitted cancellation is).
+    /// A native batch that ended before anything was claimed for submission:
+    /// its reservation is settled at a known zero and the job marked settled.
+    /// Its execution reads as the job ended: cancelled by its client, or
+    /// failed (its submission expired). Idempotent: a reservation no longer
+    /// pending is left as it is, and a settled job is not settled again.
     async fn settle_unsent(&self, job: &JobRow) -> JobResult<()> {
-        count_finished(true, JobState::Failed);
+        let end = if job.job_state() == JobState::Cancelled {
+            crate::governance::batch::EnvelopeEnd::Cancelled
+        } else {
+            crate::governance::batch::EnvelopeEnd::Failed
+        };
         let elapsed = (UtcInstant::now() - job.created_at)
             .whole_milliseconds()
             .max(0) as u64;
-        crate::governance::batch::close_batch(&self.store, job.execution_id, elapsed, true).await?;
+        crate::governance::batch::close_batch(&self.store, job.execution_id, elapsed, end).await?;
         store::mark_settled(&self.store, job.id).await?;
         self.discard_work_file(job).await;
         Ok(())

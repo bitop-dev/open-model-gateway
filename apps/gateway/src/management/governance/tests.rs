@@ -670,7 +670,12 @@ mod db {
                 Some("drain_reason_invalid"),
             ),
             (
-                json!({"reason":"ok\u{FE0F}","until":null}),
+                json!({"reason":"ok\u{FE01}","until":null}),
+                400,
+                Some("drain_reason_invalid"),
+            ),
+            (
+                json!({"reason":"ok\u{180B}","until":null}),
                 400,
                 Some("drain_reason_invalid"),
             ),
@@ -690,7 +695,8 @@ mod db {
             assert_eq!(v["error"]["reason"].as_str(), reason, "{body}");
         }
         assert!(audits().await.is_empty());
-        let reason = "Replacing the node: \"=HYPERLINK(1)\" <b>soon</b>";
+        // An emoji's presentation selector (U+FE0F in "⚠️") is allowed.
+        let reason = "⚠️ Replacing the node: \"=HYPERLINK(1)\" <b>soon</b>";
         assert_eq!(
             call(
                 &f,

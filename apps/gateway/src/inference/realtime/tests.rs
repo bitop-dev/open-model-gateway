@@ -21,19 +21,51 @@ struct Repo {
     settlement_events: StdMutex<Vec<&'static str>>,
     admitted: AtomicUsize,
     finished: StdMutex<Vec<(Uuid, Outcome, Option<InferenceError>)>>,
+    /// Routes of the model (default: one, `Uuid::nil()`), in plan order.
+    routes: StdMutex<Vec<Uuid>>,
+    /// The plan's attempts and failover policy (default: one attempt).
+    plan: StdMutex<Option<(usize, bool)>>,
+    /// Routes admission refuses as drained (`routing::drain`).
+    drained: StdMutex<Vec<Uuid>>,
+    /// Routes admitted, in order.
+    admitted_routes: StdMutex<Vec<Uuid>>,
 }
 #[async_trait]
 impl InferenceRepository for Repo {
     async fn deployments(&self, _: &Principal, _: &str) -> Result<Vec<Deployment>, InferenceError> {
-        Ok(vec![Deployment {
-            id: Uuid::nil(),
-            provider: "fake".into(),
-            upstream_model: "upstream".into(),
-            credential_ref: "env:X".into(),
-            endpoint: None,
-            region: None,
-            supported_protocols: vec!["realtime".into()],
-        }])
+        let routes = self.routes.lock().unwrap().clone();
+        let routes = if routes.is_empty() {
+            vec![Uuid::nil()]
+        } else {
+            routes
+        };
+        Ok(routes
+            .into_iter()
+            .map(|id| Deployment {
+                id,
+                provider: "fake".into(),
+                upstream_model: "upstream".into(),
+                credential_ref: "env:X".into(),
+                endpoint: None,
+                region: None,
+                supported_protocols: vec!["realtime".into()],
+            })
+            .collect())
+    }
+    async fn route_plan(
+        &self,
+        _: &Principal,
+        _: &str,
+        candidates: &[Deployment],
+        _: Uuid,
+    ) -> Result<crate::routing::RoutePlan, InferenceError> {
+        let (max_attempts, allow_ambiguous_failover) =
+            self.plan.lock().unwrap().unwrap_or((1, false));
+        Ok(crate::routing::RoutePlan {
+            max_attempts,
+            allow_ambiguous_failover,
+            ..crate::routing::RoutePlan::single(candidates.iter().map(|d| d.id).collect())
+        })
     }
     /// A fixed list: there is no cache to bypass.
     async fn live_candidates(
@@ -43,8 +75,15 @@ impl InferenceRepository for Repo {
     ) -> Result<Vec<Deployment>, InferenceError> {
         self.deployments(principal, model).await
     }
-    async fn start(&self, _: &ExecutionStart) -> Result<(), InferenceError> {
+    async fn start(&self, record: &ExecutionStart) -> Result<(), InferenceError> {
+        if self.drained.lock().unwrap().contains(&record.deployment_id) {
+            return Err(InferenceError::RouteDrained(None));
+        }
         self.admitted.fetch_add(1, Ordering::SeqCst);
+        self.admitted_routes
+            .lock()
+            .unwrap()
+            .push(record.deployment_id);
         Ok(())
     }
     async fn realtime_settle_response(
@@ -96,6 +135,9 @@ struct Fake {
     fail: Option<InferenceError>,
     dropped: Arc<AtomicBool>,
 }
+/// Routes on which [`Fake`] fails to connect, whatever its `fail`.
+static FAIL_ROUTES: std::sync::LazyLock<StdMutex<Vec<Uuid>>> =
+    std::sync::LazyLock::new(StdMutex::default);
 #[async_trait]
 impl ProviderAdapter for Fake {
     fn id(&self) -> &'static str {
@@ -120,12 +162,15 @@ impl ProviderAdapter for Fake {
     }
     async fn connect_realtime(
         &self,
-        _: &Deployment,
+        deployment: &Deployment,
         setup: &RealtimeSetup,
     ) -> Result<RealtimeUpstream, InferenceError> {
         assert_eq!(setup.window_output_tokens, 512);
         if let Some(error) = self.fail {
             return Err(error);
+        }
+        if FAIL_ROUTES.lock().unwrap().contains(&deployment.id) {
+            return Err(InferenceError::UpstreamUnavailable);
         }
         let signal = Signal(self.dropped.clone());
         Ok(RealtimeUpstream {
@@ -291,4 +336,75 @@ async fn final_write_waits_for_cancelled_response_settlement() {
         repo.finished.lock().unwrap().as_slice(),
         [(id, Outcome::Cancelled, None)]
     );
+}
+
+/// The first planned route was drained after the plan was read (another
+/// replica's health cache): admission refuses it, and the session opens on
+/// the second route as its one attempt.
+#[tokio::test]
+async fn a_session_passes_over_a_route_drained_at_admission() {
+    let repo = Arc::new(Repo::default());
+    let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+    *repo.routes.lock().unwrap() = vec![first, second];
+    repo.drained.lock().unwrap().push(first);
+    let dropped = Arc::new(AtomicBool::new(false));
+    let e = engine(
+        repo.clone(),
+        Fake {
+            realtime: true,
+            fail: None,
+            dropped,
+        },
+    );
+    let session = e
+        .open_realtime(principal(), "company/voice", Uuid::new_v4())
+        .await
+        .expect("opens on the second route");
+    assert_eq!(*repo.admitted_routes.lock().unwrap(), vec![second]);
+    drop(session);
+    // Every route drained: temporarily unavailable, never a generic Busy.
+    let repo = Arc::new(Repo::default());
+    *repo.routes.lock().unwrap() = vec![first, second];
+    repo.drained.lock().unwrap().extend([first, second]);
+    let e = engine(
+        repo.clone(),
+        Fake {
+            realtime: true,
+            fail: None,
+            dropped: Arc::new(AtomicBool::new(false)),
+        },
+    );
+    assert_eq!(
+        e.open_realtime(principal(), "company/voice", Uuid::new_v4())
+            .await
+            .err(),
+        Some(InferenceError::RouteDrained(None))
+    );
+}
+
+/// The first attempt fails over; the only route left is refused as drained:
+/// the request ends with the first attempt's own error, not a generic Busy.
+#[tokio::test]
+async fn a_failover_onto_a_drained_route_keeps_the_first_attempts_error() {
+    let repo = Arc::new(Repo::default());
+    let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+    *repo.routes.lock().unwrap() = vec![first, second];
+    *repo.plan.lock().unwrap() = Some((2, true));
+    repo.drained.lock().unwrap().push(second);
+    FAIL_ROUTES.lock().unwrap().push(first);
+    let e = engine(
+        repo.clone(),
+        Fake {
+            realtime: true,
+            fail: None,
+            dropped: Arc::new(AtomicBool::new(false)),
+        },
+    );
+    assert_eq!(
+        e.open_realtime(principal(), "company/voice", Uuid::new_v4())
+            .await
+            .err(),
+        Some(InferenceError::UpstreamUnavailable)
+    );
+    assert_eq!(*repo.admitted_routes.lock().unwrap(), vec![first]);
 }

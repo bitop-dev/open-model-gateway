@@ -612,7 +612,7 @@ impl Engine {
         if !(1..=3).contains(&plan.max_attempts) {
             return Err(InferenceError::Configuration);
         }
-        let (mut attempt, mut passed) = (0usize, super::Passed::default());
+        let (mut attempt, mut passed, mut failed_over) = (0usize, super::Passed::default(), None);
         for id in &plan.deployment_ids {
             if attempt == plan.max_attempts {
                 break;
@@ -729,13 +729,14 @@ impl Engine {
                         && crate::routing::may_failover(&plan, error)
                     {
                         attempt += 1;
+                        failed_over = Some(error);
                         continue;
                     }
                     return Err(error);
                 }
             }
         }
-        Err(super::exhausted(passed, attempt, None))
+        Err(super::exhausted(passed, attempt, failed_over))
     }
 }
 
