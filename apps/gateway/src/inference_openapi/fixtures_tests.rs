@@ -721,6 +721,23 @@ impl ProviderAdapter for GenerationAdapter {
             Err(InferenceError::Unsupported)
         }
     }
+    /// Counts as Anthropic does for a request with an image (the provider's
+    /// own counter), and declines otherwise, so the gateway estimates text:
+    /// an estimate never counts a request with an image (`count::estimated`).
+    fn counts_input_tokens(&self) -> bool {
+        true
+    }
+    async fn count_input_tokens(
+        &self,
+        _target: &Deployment,
+        request: &ChatRequest,
+    ) -> Result<Option<u64>, InferenceError> {
+        let native = request
+            .messages_options
+            .as_ref()
+            .is_some_and(|o| !o.images.is_empty());
+        Ok((native || request.has_images()).then_some(1))
+    }
     async fn execute(
         &self,
         _: &Deployment,
@@ -1097,9 +1114,16 @@ async fn count_tokens_fixtures(app: &axum::Router, key: &str, fixtures: &mut Fix
         )
         .await;
         assert_eq!(captured.status, StatusCode::OK, "count fixture status");
+        // A body with an image is counted by the provider; text alone is
+        // the gateway's estimate.
+        let image = body.to_string().contains(r#""type":"image""#);
         assert_eq!(
             captured.headers["x-omg-token-count"],
-            "estimate; method=utf8-bytes-div-4"
+            if image {
+                "provider"
+            } else {
+                "estimate; method=utf8-bytes-div-4"
+            }
         );
         fixtures.observe(&captured);
         let send = async |body: Value| {
