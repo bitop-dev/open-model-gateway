@@ -720,6 +720,8 @@ pub(crate) mod admission_validation_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod count_db_tests;
 #[cfg(all(test, feature = "integration-tests"))]
+mod probe_e2e_tests;
+#[cfg(all(test, feature = "integration-tests"))]
 mod settlement_disconnect_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod steering_tests;
