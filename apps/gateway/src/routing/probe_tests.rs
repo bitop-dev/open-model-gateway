@@ -458,3 +458,66 @@ async fn a_healthy_route_makes_no_probe_statement(pool: PgPool) {
     );
     assert_eq!(probe_calls().await, 0);
 }
+
+/// A batch line claims its route's slot before it waits for capacity; at
+/// send time the engine renews the slot for its own deadline. Only the
+/// holder of an unexpired slot renews it: a claim that expired meanwhile,
+/// or was superseded by a newer probe, is lost, and the line sends nothing.
+#[dbtest::test]
+async fn only_an_unexpired_held_slot_is_renewed_for_the_send(pool: PgPool) {
+    let f = fixture(pool).await;
+    let deployment = opened(&f, 60).await;
+    expire(&f, deployment.id).await;
+    let held = match claim_probe(
+        &f.store,
+        deployment.id,
+        Uuid::new_v4(),
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap()
+    {
+        ProbeClaim::Claimed(epoch) => epoch,
+        other => panic!("not claimed: {other:?}"),
+    };
+    assert!(
+        renew_probe(&f.store, deployment.id, held, HOLD)
+            .await
+            .unwrap()
+    );
+    let until: i64 = sqlx::query_scalar(
+        "SELECT round(EXTRACT(EPOCH FROM probe_until-clock_timestamp()))::int8 FROM deployment_health WHERE deployment_id=$1",
+    )
+    .bind(deployment.id)
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(until, 60, "rebased on the send's own hold");
+    // Expired before the send: lost, and the slot is not revived.
+    sqlx::query("UPDATE deployment_health SET probe_until=clock_timestamp()-interval '1 millisecond' WHERE deployment_id=$1")
+        .bind(deployment.id)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    assert!(
+        !renew_probe(&f.store, deployment.id, held, HOLD)
+            .await
+            .unwrap()
+    );
+    // Superseded: a newer probe holds the slot; the old epoch cannot extend it.
+    let newer = claimed(&f, deployment.id).await;
+    assert!(newer > held);
+    assert!(
+        !renew_probe(&f.store, deployment.id, held, HOLD)
+            .await
+            .unwrap()
+    );
+    // Released: nothing to renew.
+    release_probe(&f.store, deployment.id, newer).await.unwrap();
+    assert!(
+        !renew_probe(&f.store, deployment.id, newer, HOLD)
+            .await
+            .unwrap()
+    );
+    assert_eq!(circuit(&f, deployment.id).await.2, false);
+}

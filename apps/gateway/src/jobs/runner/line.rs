@@ -284,13 +284,19 @@ impl LineRun {
                     if e == InferenceError::Busy && pin.is_some() {
                         self.state.rate_limited();
                     }
-                    let retryable = matches!(
-                        e,
-                        InferenceError::Busy
-                            | InferenceError::ScopeBusy
-                            | InferenceError::UpstreamUnavailable
-                            | InferenceError::Timeout
-                    );
+                    // A probe slot claimed at dispatch and lost before the
+                    // send (`routing::renew_probe`) sent nothing: the retry
+                    // waits on the route's circuit (`route_gate`).
+                    let lost_probe = matches!(e, InferenceError::RouteCoolingDown(_))
+                        && pin.is_some_and(|pin| pin.probe.is_some());
+                    let retryable = lost_probe
+                        || matches!(
+                            e,
+                            InferenceError::Busy
+                                | InferenceError::ScopeBusy
+                                | InferenceError::UpstreamUnavailable
+                                | InferenceError::Timeout
+                        );
                     if retryable
                         && attempt <= self.job.retry_limit
                         && !self.state.should_stop(&self.job)

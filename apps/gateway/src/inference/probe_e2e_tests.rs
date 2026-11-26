@@ -200,3 +200,81 @@ async fn after_a_cooldown_one_request_across_replicas_decides(pool: PgPool) {
     }
     assert_eq!(hits.load(Ordering::SeqCst), 5);
 }
+
+/// Every statement on the probe slot runs as the runtime role under its
+/// column grants (`deploy/staging/runtime-grants.sql`): the claim, the
+/// renewal of a slot claimed before a wait, the first-content close, the
+/// release, and a decision fenced by the probe's epoch.
+#[dbtest::test]
+async fn the_runtime_role_can_run_every_probe_statement(pool: PgPool) {
+    use crate::routing::{ProbeClaim, claim_probe, close_probe, release_probe, renew_probe};
+    let f = fixture(pool.clone()).await;
+    let deployment = add_deployment(&f, "openai", "env:OMG_PROBE_TEST_KEY", None, "m", 0).await;
+    sqlx::query("INSERT INTO deployment_routing(deployment_id,failure_threshold,cooldown_seconds) VALUES($1,1,60)")
+        .bind(deployment).execute(&f.store.pool).await.unwrap();
+    sqlx::raw_sql(include_str!("../../tests/common/ensure_runtime_role.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    f.store.apply_runtime_grants().await.unwrap();
+    let runtime = sqlx::postgres::PgPoolOptions::new()
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::Executor::execute(conn, "SET ROLE gateway_runtime").await?;
+                Ok(())
+            })
+        })
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let store = Store::new(runtime);
+    let hold = Duration::from_secs(60);
+    let expire = || async {
+        // As the owner: the test moves the clock, not the runtime.
+        sqlx::query("UPDATE deployment_health SET open_until=clock_timestamp()-interval '1 millisecond' WHERE deployment_id=$1")
+            .bind(deployment).execute(&f.store.pool).await.unwrap();
+        store.caches.forget_health(deployment);
+    };
+    let claim = || async {
+        match claim_probe(&store, deployment, uuid::Uuid::new_v4(), hold).await {
+            Ok(ProbeClaim::Claimed(epoch)) => epoch,
+            other => panic!("not claimed: {other:?}"),
+        }
+    };
+    crate::routing::record_result(&store, deployment, Some(super::error::InferenceError::Busy))
+        .await
+        .expect("open the circuit");
+    expire().await;
+    let first = claim().await;
+    assert!(
+        renew_probe(&store, deployment, first, hold)
+            .await
+            .expect("renew")
+    );
+    release_probe(&store, deployment, first)
+        .await
+        .expect("release");
+    let second = claim().await;
+    crate::routing::record_probe_result(
+        &store,
+        deployment,
+        Some(super::error::InferenceError::UpstreamUnavailable),
+        second,
+    )
+    .await
+    .expect("a failed probe reopens");
+    expire().await;
+    let third = claim().await;
+    close_probe(&store, deployment, third).await.expect("close");
+    crate::routing::record_probe_result(&store, deployment, None, third)
+        .await
+        .expect("a complete success");
+    let (open, reopens, held): (bool, i32, bool) = sqlx::query_as(
+        "SELECT open_until IS NOT NULL, reopen_count, probe_holder IS NOT NULL FROM deployment_health WHERE deployment_id=$1",
+    )
+    .bind(deployment)
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    assert_eq!((open, reopens, held), (false, 0, false));
+}

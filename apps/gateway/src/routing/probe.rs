@@ -59,6 +59,34 @@ pub async fn claim_probe(
     })
 }
 
+/// A slot claimed earlier (a batch line claims before it waits for route
+/// capacity) is renewed when its request is sent, for that request's own
+/// bound from now. `false`: the slot is no longer this request's (it
+/// expired, was released, or a newer probe holds it), and the request must
+/// not be sent as the probe.
+pub async fn renew_probe(
+    store: &Store,
+    deployment: Uuid,
+    epoch: i64,
+    hold: std::time::Duration,
+) -> Result<bool, InferenceError> {
+    let renewed = sqlx::query(
+        "UPDATE deployment_health SET probe_until=clock_timestamp()+make_interval(secs => $3)
+         WHERE deployment_id=$1 AND probe_epoch=$2 AND probe_holder IS NOT NULL
+           AND probe_until > statement_timestamp()",
+    )
+    .bind(deployment)
+    .bind(epoch)
+    .bind(hold.as_secs_f64())
+    .execute(&store.pool)
+    .await
+    .map_err(|_| InferenceError::Storage)?
+    .rows_affected()
+        == 1;
+    store.caches.forget_health(deployment);
+    Ok(renewed)
+}
+
 /// The probe's stream delivered its first content: the route is serving, so
 /// the circuit closes and the slot is freed at once; the openings are
 /// forgotten only by a complete success (`record_result`). Nothing changes

@@ -360,4 +360,12 @@ impl InferenceRepository for LineRepository {
     ) -> Result<(), InferenceError> {
         self.store.route_probe_release(deployment, epoch).await
     }
+    async fn route_probe_renew(
+        &self,
+        deployment: Uuid,
+        epoch: i64,
+        hold: std::time::Duration,
+    ) -> Result<bool, InferenceError> {
+        self.store.route_probe_renew(deployment, epoch, hold).await
+    }
 }

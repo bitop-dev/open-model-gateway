@@ -295,36 +295,19 @@ impl Engine {
             if attempt == plan.max_attempts {
                 break;
             }
-            let deployment = match candidates.iter().find(|d| d.id == *id) {
-                Some(deployment) => deployment,
-                None => {
-                    // An early return must still finish telemetry
-                    // explicitly, exactly like every other terminal path of
-                    // an attempt (`Engine::attempt`), so Drop never
-                    // mislabels a real denial `cancelled` with no
-                    // `error.type`.
-                    telemetry.finish(
-                        telemetry::Outcome::Error,
-                        Some(InferenceError::Configuration),
-                    );
-                    return Err(InferenceError::Configuration);
-                }
+            // An early return must still finish telemetry explicitly,
+            // exactly like every other terminal path of an attempt
+            // (`Engine::attempt`), so Drop never mislabels a real denial
+            // `cancelled` with no `error.type`.
+            let route = match self.route_of(&candidates, *id) {
+                Ok(route) => self
+                    .usable(&plan, *id, request_id, deadline, attempt > 0, &mut cooling)
+                    .await
+                    .map(|probe| probe.map(|probe| (route, probe))),
+                Err(error) => Err(error),
             };
-            let adapter = match self.registry.get(&deployment.provider) {
-                Some(adapter) => adapter,
-                None => {
-                    telemetry.finish(
-                        telemetry::Outcome::Error,
-                        Some(InferenceError::Configuration),
-                    );
-                    return Err(InferenceError::Configuration);
-                }
-            };
-            let probe = match self
-                .usable(&plan, *id, request_id, deadline, attempt > 0, &mut cooling)
-                .await
-            {
-                Ok(Some(probe)) => probe,
+            let (deployment, adapter, probe) = match route {
+                Ok(Some(((deployment, adapter), probe))) => (deployment, adapter, probe),
                 Ok(None) => continue,
                 Err(error) => {
                     telemetry.finish(telemetry::Outcome::Error, Some(error));
@@ -346,6 +329,24 @@ impl Engine {
         let error = exhausted(cooling, attempt, failed_over);
         telemetry.finish(telemetry::Outcome::Error, Some(error));
         Err(error)
+    }
+
+    /// A planned route and its adapter; a plan naming a route that is not a
+    /// candidate, or a provider with no adapter, is a configuration error.
+    fn route_of<'a>(
+        &self,
+        candidates: &'a [Deployment],
+        id: Uuid,
+    ) -> Result<(&'a Deployment, Arc<dyn crate::providers::ProviderAdapter>), InferenceError> {
+        let deployment = candidates
+            .iter()
+            .find(|d| d.id == id)
+            .ok_or(InferenceError::Configuration)?;
+        let adapter = self
+            .registry
+            .get(&deployment.provider)
+            .ok_or(InferenceError::Configuration)?;
+        Ok((deployment, adapter))
     }
 }
 
@@ -487,10 +488,21 @@ pub(crate) async fn route_use(
         holder,
         epoch: Some(epoch),
     };
+    // A slot the caller claimed before a wait (a batch line, before its
+    // route capacity) is renewed for this request's own bound; one that
+    // ended meanwhile is no longer the caller's, and the route is not used.
     if let Some((held, epoch)) = plan.held_probe
         && held == id
     {
-        return RouteUse::Go(Some(ticket(epoch)));
+        return match repository.route_probe_renew(id, epoch, hold).await {
+            Ok(true) => RouteUse::Go(Some(ticket(epoch))),
+            Ok(false) => RouteUse::Busy(1),
+            // Not known to be lost: the dropped ticket frees it (fenced).
+            Err(_) => {
+                drop(ticket(epoch));
+                RouteUse::Busy(1)
+            }
+        };
     }
     // A route planned earlier in the request (a failover attempt) is taken
     // as it is now: its circuit may have opened or passed its cooldown since.

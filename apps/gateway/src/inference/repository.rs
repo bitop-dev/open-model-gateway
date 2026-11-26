@@ -290,6 +290,15 @@ pub trait InferenceRepository: Send + Sync {
     ) -> Result<(), InferenceError> {
         Ok(())
     }
+    /// `routing::renew_probe`.
+    async fn route_probe_renew(
+        &self,
+        _deployment: Uuid,
+        _epoch: i64,
+        _hold: std::time::Duration,
+    ) -> Result<bool, InferenceError> {
+        Ok(true)
+    }
     // Realtime sessions (`inference::realtime`, `governance::realtime`).
     /// Per-response output window: `cap`, lowered to the latest price's
     /// output ceiling.
@@ -522,6 +531,14 @@ impl InferenceRepository for Store {
         epoch: i64,
     ) -> Result<(), InferenceError> {
         crate::routing::release_probe(self, deployment, epoch).await
+    }
+    async fn route_probe_renew(
+        &self,
+        deployment: Uuid,
+        epoch: i64,
+        hold: std::time::Duration,
+    ) -> Result<bool, InferenceError> {
+        crate::routing::renew_probe(self, deployment, epoch, hold).await
     }
     async fn realtime_window_output(
         &self,

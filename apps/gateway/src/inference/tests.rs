@@ -40,6 +40,8 @@ struct MemoryRepository {
     route_states: Mutex<std::collections::HashMap<Uuid, crate::routing::RouteState>>,
     /// The first-content close fails.
     fail_close: AtomicBool,
+    /// A held probe slot was lost before the send (expired or superseded).
+    renew_lost: AtomicBool,
     /// Probe calls in order: "claim <route>", "close <epoch>", "release <epoch>",
     /// and "health" for each health write.
     probe_log: Mutex<Vec<String>>,
@@ -112,6 +114,18 @@ impl InferenceRepository for MemoryRepository {
             return Err(InferenceError::Storage);
         }
         Ok(())
+    }
+    async fn route_probe_renew(
+        &self,
+        _: Uuid,
+        epoch: i64,
+        _: std::time::Duration,
+    ) -> Result<bool, InferenceError> {
+        self.probe_log
+            .lock()
+            .unwrap()
+            .push(format!("renew {epoch}"));
+        Ok(!self.renew_lost.load(Ordering::SeqCst))
     }
     async fn route_state(
         &self,
@@ -1679,4 +1693,40 @@ async fn a_probe_whose_close_failed_is_still_freed_when_dropped() {
             "release 7".into()
         ]
     );
+}
+
+/// A batch line's slot, claimed before its capacity wait, is renewed at
+/// send time for the engine's own deadline; if it was lost meanwhile
+/// (expired, or a newer probe holds it), nothing is sent and the route is
+/// cooling down. The lost slot is not released: it is no longer this
+/// request's.
+#[tokio::test]
+async fn a_held_probe_lost_before_the_send_sends_nothing() {
+    let (engine, repository, adapter) = fixture(Mode::Complete, EngineLimits::default());
+    let route = repository.deployments.lock().unwrap()[0].id;
+    *repository.plan.lock().unwrap() = Some(crate::routing::RoutePlan {
+        held_probe: Some((route, 7)),
+        ..crate::routing::RoutePlan::single(vec![route])
+    });
+    repository.renew_lost.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        engine
+            .execute(principal(), request(false), Uuid::new_v4())
+            .await,
+        Err(InferenceError::RouteCoolingDown(_))
+    ));
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 0);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(*repository.probe_log.lock().unwrap(), ["renew 7"]);
+    // Renewed: the request is the probe and ends its slot as usual.
+    repository.renew_lost.store(false, Ordering::SeqCst);
+    repository.probe_log.lock().unwrap().clear();
+    assert!(
+        engine
+            .execute(principal(), request(false), Uuid::new_v4())
+            .await
+            .is_ok()
+    );
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(probe_log(&repository, 3).await[0], "renew 7");
 }
