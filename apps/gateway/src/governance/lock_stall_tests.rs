@@ -223,7 +223,6 @@ async fn harness(
         .await
         .unwrap();
     let store = Store::new(runtime.clone()).with_admission_lock_wait(admission_lock_wait);
-    assert_eq!(store.admission_mode(), locks::AdmissionMode::Scoped);
     let calls = Arc::new(AtomicUsize::new(0));
     let counted = calls.clone();
     let upstream = Router::new().fallback(move |Json(_): Json<Value>| {
@@ -473,7 +472,7 @@ async fn burst(h: &Harness, key: &str, n: usize) -> (Vec<Duration>, (i64, i64, i
 /// clean. Returns (settled, unknown).
 async fn assert_exact(h: &Harness) -> (i64, i64) {
     // The settlement gate drained: every permit is back.
-    let expected = LockGates::for_pool(POOL_SIZE, locks::AdmissionMode::Scoped)
+    let expected = LockGates::for_pool(POOL_SIZE)
         .settlement
         .available_permits();
     for (store, _, _) in &h.replicas {

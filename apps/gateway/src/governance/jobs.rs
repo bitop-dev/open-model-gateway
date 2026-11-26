@@ -15,11 +15,10 @@ use gateway_datetime_compat::UtcInstant;
 /// the attempt as a known zero.
 ///
 /// Lock order: the reservation row first (the lease statement), then the
-/// counter rows the job row's trigger changes (`insert`). Global mode:
-/// serialized on the installation lock like every other change to live
-/// leases. Scoped: the lease change touches no totals or counter row (the
-/// triggers see a zero delta), and an admission that already treated the
-/// lease as expired linearizes before the extension.
+/// counter rows the job row's trigger changes (`insert`). The lease change
+/// touches no totals or counter row (the triggers see a zero delta), and an
+/// admission that already treated the lease as expired linearizes before the
+/// extension.
 pub(crate) async fn accept_job<T>(
     store: &Store,
     execution: Uuid,
@@ -30,19 +29,6 @@ pub(crate) async fn accept_job<T>(
     let mut tx = crate::db::begin(&store.pool)
         .await
         .map_err(record_storage)?;
-    if !scoped(store) {
-        // The same global settlement prefix as every change to live leases.
-        sqlx::query("SELECT pg_advisory_xact_lock_shared(72419502)")
-            .execute(&mut *tx)
-            .await
-            .map_err(record_storage)?;
-        sqlx::query_scalar::<_, Uuid>(
-            "SELECT id FROM installation WHERE singleton FOR NO KEY UPDATE",
-        )
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(record_storage)?;
-    }
     let extended = sqlx::query("UPDATE governance_reservations SET lease_expires_at=greatest(lease_expires_at,$2) WHERE execution_id=$1 AND state='pending'")
         .bind(execution)
         .bind(until)

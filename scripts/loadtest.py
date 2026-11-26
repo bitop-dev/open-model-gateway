@@ -275,7 +275,6 @@ def cmd_gateways(stack, args):
         "OMG_LOADTEST_DB_PORT": "5432" if via_direct else "6432",
         "OMG_LOADTEST_POOL": str(args.pool),
         "OMG_LOADTEST_MAX_CONCURRENT": str(args.max_concurrent),
-        "OMG_LOADTEST_ADMISSION_MODE": args.admission_mode,
         "OMG_LOADTEST_CONFIG_CACHE": getattr(args, "config_cache", "on"),
     })
     if args.prepared == "off":
@@ -288,7 +287,6 @@ def cmd_gateways(stack, args):
     stack.compose("up", "-d", "--force-recreate", "--wait", *active)
     settings = {"replicas": args.replicas, "via": args.via, "pool": args.pool,
                 "max_concurrent": args.max_concurrent, "pgbouncer_prepared": args.prepared,
-                "admission_mode": args.admission_mode,
                 "config_cache": getattr(args, "config_cache", "on"),
                 "commit_delay": os.environ.get("OMG_LOADTEST_COMMIT_DELAY", "0")}
     (stack.state / "gateways.json").write_text(json.dumps(settings))
@@ -546,7 +544,7 @@ def cmd_baseline(stack, args):
             for via in ("pgbouncer", "direct"):
                 cmd_gateways(stack, argparse.Namespace(replicas=replicas, via=via, pool=args.pool,
                                                        max_concurrent=args.max_concurrent, prepared="on",
-                                                       admission_mode="scoped", config_cache="on"))
+                                                       config_cache="on"))
                 for rate in rates:
                     run_args = argparse.Namespace(
                         label=f"{tag}-{replicas}r-{via}-{rate:g}", rate=rate, duration=args.duration,
@@ -586,8 +584,6 @@ def main(argv=None):
     gw.add_argument("--via", choices=("pgbouncer", "direct"), default="pgbouncer")
     gw.add_argument("--pool", type=int, default=10)
     gw.add_argument("--max-concurrent", type=int, default=128)
-    gw.add_argument("--admission-mode", choices=("scoped", "global"), default="scoped",
-                    help="GATEWAY_ADMISSION_MODE of the replicas (global: the former installation lock)")
     gw.add_argument("--config-cache", choices=("on", "off"), default="on",
                     help="GATEWAY_CONFIG_CACHE of the replicas (off: every pre-admission read is live)")
     gw.add_argument("--prepared", choices=("on", "off"), default="on",

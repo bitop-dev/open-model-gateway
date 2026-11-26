@@ -33,9 +33,6 @@ pub struct Config {
     /// replaying WAL further behind than this is skipped for the primary.
     pub reporting_max_lag: Duration,
     pub shutdown_drain: Duration, // GATEWAY_SHUTDOWN_DRAIN_SECONDS (`crate::drain::window_from_env`)
-    /// `GATEWAY_ADMISSION_MODE` selects scoped locks (the default) or
-    /// serialization on the installation row (`global`). See `governance::locks`.
-    pub admission_mode: crate::governance::locks::AdmissionMode,
     /// `GATEWAY_LISTEN_DATABASE_URL` (default `DATABASE_URL`): the session
     /// connection that LISTENs for configuration changes (`crate::notify`).
     /// LISTEN needs a session, so behind a transaction-mode PgBouncer point it
@@ -464,7 +461,8 @@ impl Config {
         let reporting_database_url =
             optional_postgres_url_from_env("GATEWAY_REPORTING_DATABASE_URL")?;
         let reporting_max_lag = reporting_max_lag_from_env()?;
-        let admission_mode = crate::governance::locks::AdmissionMode::from_env()?;
+        // Unset or `scoped` only (`governance::locks::check_admission_mode`).
+        crate::governance::locks::admission_mode_from_env()?;
         let listen_database_url = optional_postgres_url_from_env("GATEWAY_LISTEN_DATABASE_URL")?;
         let config_cache = config_cache_from_env()?;
         Ok(Self {
@@ -484,7 +482,6 @@ impl Config {
             reporting_database_url,
             reporting_max_lag,
             shutdown_drain: crate::drain::window_from_env()?,
-            admission_mode,
             listen_database_url,
             config_cache,
             traces,

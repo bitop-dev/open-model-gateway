@@ -146,15 +146,7 @@ fn sql_rule(sql: &str, helper: bool) -> Option<&'static str> {
     None
 }
 
-const INSTALLATION: &str = "SELECT id FROM installation WHERE singleton FOR NO KEY UPDATE";
 const ROW_LOCKS: &[(&str, &str)] = &[
-    ("governance::installation_lock", INSTALLATION),
-    // #132: a global-mode admission's installation row, its wait bounded by
-    // the transaction-local lock_timeout the statement restores once held.
-    (
-        "governance::installation_lock_bounded",
-        "SELECT set_config('lock_timeout',$1,true) FROM (SELECT id FROM installation WHERE singleton FOR NO KEY UPDATE) i",
-    ),
     (
         "governance::batch::admit_line_unobserved",
         "SELECT r.state,r.held_microusd,r.api_key_id,r.admitted_at FROM governance_reservations r JOIN async_jobs j ON j.execution_id=r.execution_id WHERE r.execution_id=$1 AND r.workspace_id=$2 AND j.id=$3 AND j.batch_mode='gateway' FOR UPDATE OF r",
@@ -296,16 +288,6 @@ impl<'ast> Visit<'ast> for Scan<'_> {
     }
 
     fn visit_ident(&mut self, ident: &'ast syn::Ident) {
-        if self.authority()
-            && matches!(
-                ident.unraw().to_string().as_str(),
-                "ADMISSION_SQL" | "UNLOCKED" | "lock"
-            )
-        {
-            self.findings.push(format!(
-                "auth.rs: unexpected use of {ident} in authority query"
-            ));
-        }
         if !self.helper() && ident.unraw() == "PgAdvisoryLock" {
             self.findings.push(format!(
                 "{}:{}: PgAdvisoryLock outside governance::locks",
@@ -321,61 +303,7 @@ impl<'ast> Visit<'ast> for Scan<'_> {
         self.check(literal);
     }
 
-    fn visit_expr_if(&mut self, branch: &'ast syn::ExprIf) {
-        let condition = &branch.cond;
-        // Each suffix belongs exclusively to the global-mode arm.
-        let suffixes = [
-            ("governance::catalog_share", " FOR SHARE OF d,p,m"),
-            (
-                "governance::reconcile::operator_authorized",
-                " FOR SHARE OF u,w",
-            ),
-        ];
-        if let Some((item, _)) = suffixes.into_iter().find(|(item, suffix)| {
-            self.at(item)
-                && branch.to_token_stream().to_string()
-                    == quote!(if scoped(store) { "" } else { #suffix }).to_string()
-        }) {
-            self.used.insert(item);
-            return;
-        }
-        // The job record (before the provider call) maps storage errors to the job stage.
-        const ITEM: &str = "governance::jobs::accept_job";
-        if self.at(ITEM)
-            && condition.to_token_stream().to_string() == quote!(!scoped(store)).to_string()
-            && let [first, second, rest @ ..] = branch.then_branch.stmts.as_slice()
-            && first.to_token_stream().to_string()
-                == quote!(
-                    sqlx::query("SELECT pg_advisory_xact_lock_shared(72419502)")
-                        .execute(&mut *tx).await.map_err(record_storage)?;
-                )
-                .to_string()
-            && second.to_token_stream().to_string()
-                == quote!(
-                    sqlx::query_scalar::<_, Uuid>(#INSTALLATION,)
-                        .fetch_one(&mut *tx).await.map_err(record_storage)?;
-                )
-                .to_string()
-        {
-            self.used.insert(ITEM);
-            for stmt in rest {
-                self.visit_stmt(stmt);
-            }
-            if let Some((_, other)) = &branch.else_branch {
-                self.visit_expr(other);
-            }
-            return;
-        }
-        visit::visit_expr_if(self, branch);
-    }
-
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
-        if self.authority()
-            && auth_query::selection(call)
-            && self.used.insert(auth_query::SELECTION)
-        {
-            return;
-        }
         // The singleton catalog fence uses the separate one-bigint key space.
         const ITEM: &str = "governance::catalog_lock";
         if self.at(ITEM)
@@ -597,7 +525,7 @@ fn planted_lock_sql_is_refused() {
 }
 
 #[test]
-fn macros_helpers_and_global_branches() {
+fn macros_helpers_and_removed_exceptions() {
     let cases = [
         (
             "governance/settlement.rs",
@@ -645,19 +573,25 @@ fn macros_helpers_and_global_branches() {
             r#"mod nested { fn f() { q!("select omg_lock_scopes($1,$2,$3)"); } }"#,
             1,
         ),
+        // The removed global mode's statements have no exception any more.
         (
             "governance.rs",
-            r#"fn catalog_share() { if !scoped(store) { "" } else { " FOR SHARE OF d,p,m" } }"#,
+            r#"fn catalog_share() { if scoped(store) { "" } else { " FOR SHARE OF d,p,m" } }"#,
             1,
         ),
         (
             "governance/reconcile.rs",
-            r#"fn operator_authorized() { format!("{}", if scoped(store) { "" } else { " FOR SHARE OF u,w" }); q!(" FOR SHARE OF u,w"); }"#,
+            r#"fn operator_authorized() { format!("{}", if scoped(store) { "" } else { " FOR SHARE OF u,w" }); }"#,
             1,
         ),
         (
             "governance/jobs.rs",
             r#"fn accept_job() { sqlx::query("SELECT pg_advisory_xact_lock_shared(72419502)"); }"#,
+            1,
+        ),
+        (
+            "governance.rs",
+            r#"fn installation_lock() { sqlx::query_scalar("SELECT id FROM installation WHERE singleton FOR NO KEY UPDATE"); }"#,
             1,
         ),
         (
@@ -679,7 +613,8 @@ fn macros_helpers_and_global_branches() {
 
 #[test]
 fn catalog_exception_belongs_to_one_root_item_per_file() {
-    let root = r#"fn catalog_share() { if scoped(store) { "" } else { " FOR SHARE OF d,p,m" } }"#;
+    let root =
+        r#"fn catalog_lock() { sqlx::query("SELECT pg_advisory_xact_lock_shared(72419502)"); }"#;
     for (rust, expected) in [
         (root.to_owned(), 0),
         (format!("mod inner {{ {root} }}"), 1),
