@@ -44,6 +44,8 @@ pub(super) async fn update_deployment(
                 .await?;
                 change.apply(&mut tx).await?;
             } else {
+                // Without an enablement change, `DeploymentChange::prepare`
+                // (which checks it) does not run: check live authority here.
                 require_platform_admin(&platform_role_snapshot(&mut tx, u.user_id()).await?)?;
             }
             set_image_input(&mut tx, &u, id, image_input).await?;

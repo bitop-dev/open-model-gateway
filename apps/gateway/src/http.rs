@@ -174,8 +174,14 @@ async fn image_input_body(
         Admission::TooLarge => crate::protocols::image_input_too_large(),
         Admission::Busy => crate::protocols::image_input_busy(),
         Admission::Large(permit) => {
-            parts.extensions.insert(LargeBody);
-            let body = axum::body::Body::new(http_body_util::Limited::new(body, permit.length));
+            parts.extensions.insert(LargeBody(permit.length));
+            let limits = buffer.limits();
+            let body = axum::body::Body::new(ReadDeadline {
+                body: axum::body::Body::new(http_body_util::Limited::new(body, permit.length)),
+                idle_after: limits.body_idle,
+                idle: Box::pin(tokio::time::sleep(limits.body_idle)),
+                total: Box::pin(tokio::time::sleep(limits.body_total)),
+            });
             next.run(Request::from_parts(parts, body))
                 .await
                 .map(|body| {
@@ -185,6 +191,45 @@ async fn image_input_body(
                     })
                 })
         }
+    }
+}
+
+/// A large request body that must keep arriving: a pause longer than
+/// `idle_after` between frames, or `total` in all, fails its read with
+/// [`crate::inference::image_buffer::BodyDeadline`], which ends the request
+/// and returns its share of the budget.
+struct ReadDeadline {
+    body: axum::body::Body,
+    idle_after: Duration,
+    idle: std::pin::Pin<Box<tokio::time::Sleep>>,
+    total: std::pin::Pin<Box<tokio::time::Sleep>>,
+}
+impl http_body::Body for ReadDeadline {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        use std::future::Future;
+        let this = self.get_mut();
+        if let std::task::Poll::Ready(frame) = std::pin::Pin::new(&mut this.body).poll_frame(cx) {
+            let next = tokio::time::Instant::now() + this.idle_after;
+            this.idle.as_mut().reset(next);
+            return std::task::Poll::Ready(frame);
+        }
+        if this.idle.as_mut().poll(cx).is_ready() || this.total.as_mut().poll(cx).is_ready() {
+            return std::task::Poll::Ready(Some(Err(axum::Error::new(
+                crate::inference::image_buffer::BodyDeadline,
+            ))));
+        }
+        std::task::Poll::Pending
+    }
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
     }
 }
 

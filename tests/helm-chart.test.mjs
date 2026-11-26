@@ -1061,11 +1061,12 @@ test("the OIDC issuer's private CA is mounted for GATEWAY_OIDC_CA_FILE from one 
   );
 });
 
-// The worst-case memory of a gateway container's request bodies, from the
-// rendered chart and the gateway's own bounds (docs/operations.md "Image input
-// memory"): the baseline, every concurrent request with a text-limit body,
-// and the image input budget, each body at the measured copy factor.
-function bodyMemory(rendered) {
+// The image input buffer's worst case in a gateway container, from the
+// rendered chart and the gateway's own bounds (docs/operations.md "Image
+// input memory"): a running process and the whole buffer at the measured
+// copy factor. Text bodies are not bounded by any buffer, so the check keeps
+// this within half the container's memory limit, leaving the rest to them.
+function imageMemory(rendered) {
   const source = readFileSync(join(root, "apps/gateway/src/inference/image_buffer.rs"), "utf8");
   const mib = (pattern, what) => {
     const match = source.match(pattern);
@@ -1090,20 +1091,18 @@ function bodyMemory(rendered) {
   };
   const MIB = 1024 * 1024;
   const factor = mib(/pub const COPY_FACTOR: usize = (\d+);/, "copy factor");
-  const text = mib(/pub const TEXT_BODY_BYTES: usize = (\d+) \* 1024 \* 1024;/, "text body limit");
   const baseline = mib(/pub const BASELINE_BYTES: usize = (\d+) \* MIB;/, "baseline");
   const budget = setting("GATEWAY_IMAGE_INPUT_BUFFER_BYTES",
     mib(/pub const DEFAULT_BUFFER_BYTES: usize = (\d+) \* MIB;/, "default budget") * MIB) / MIB;
-  const concurrent = setting("GATEWAY_MAX_CONCURRENT_REQUESTS", 128);
-  return { limitMiB, worstMiB: baseline + concurrent * text * factor + budget * factor };
+  return { limitMiB, worstMiB: baseline + budget * factor };
 }
 
-test("the image input budget and text traffic fit the gateway's memory limit", () => {
+test("the image input buffer's worst case stays within half the gateway's memory limit", () => {
   for (const [name, args] of Object.entries(profiles)) {
-    const { limitMiB, worstMiB } = bodyMemory(helmTemplate(args));
-    assert.ok(worstMiB <= limitMiB, `${name}: request bodies may hold ${worstMiB} MiB; the limit is ${limitMiB} MiB`);
+    const { limitMiB, worstMiB } = imageMemory(helmTemplate(args));
+    assert.ok(worstMiB * 2 <= limitMiB, `${name}: the image input buffer may hold ${worstMiB} MiB; the limit is ${limitMiB} MiB`);
   }
-  // A larger budget set on the chart no longer fits the default limit.
-  const larger = bodyMemory(helmTemplate([...profiles["external-db"], "--set-string", `gateway.env.GATEWAY_IMAGE_INPUT_BUFFER_BYTES=${96 * 1024 * 1024}`]));
-  assert.ok(larger.worstMiB > larger.limitMiB, `${larger.worstMiB} MiB`);
+  // A larger buffer set on the chart no longer fits the default limit.
+  const larger = imageMemory(helmTemplate([...profiles["external-db"], "--set-string", `gateway.env.GATEWAY_IMAGE_INPUT_BUFFER_BYTES=${200 * 1024 * 1024}`]));
+  assert.ok(larger.worstMiB * 2 > larger.limitMiB, `${larger.worstMiB} MiB`);
 });

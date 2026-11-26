@@ -74,6 +74,9 @@ pub(crate) fn json_body(value: &Value, request: &ChatRequest) -> Result<Vec<u8>,
     }
     let extra: usize = images.iter().map(|i| i.data_url().len()).sum();
     let mut out = Vec::with_capacity(json.len() + extra);
+    // Encoders number placeholders in message order and serialization keeps
+    // that order, so each marker is found after the previous one; a body in
+    // another order fails the search and is refused, never misspliced.
     let mut rest = &json[..];
     for (index, image) in images.iter().enumerate() {
         let marker = format!("\"{}\"", placeholder(index));

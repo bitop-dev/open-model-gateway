@@ -1365,7 +1365,21 @@ pub(super) async fn insert_deployment(
     configuration_actor(tx, u).await?;
     let id = Uuid::new_v4();
     sqlx::query("INSERT INTO deployments(id,model_id,provider_connection_id,upstream_model,enabled,image_input) VALUES($1,$2,$3,$4,$5,$6)").bind(id).bind(b.model_id).bind(b.provider_connection_id).bind(b.upstream_model).bind(b.enabled).bind(b.image_input).execute(&mut **tx).await?;
-    // The deployment trigger atomically records creation, revision and audit.
+    // The deployment trigger atomically records creation, revision and audit
+    // of enablement; an image-input opt-in at creation is audited like a
+    // later change of it.
+    if b.image_input {
+        audit(
+            tx,
+            u,
+            None,
+            "deployment.image_input_changed",
+            "deployment",
+            Some(id),
+            json!({"image_input": true}),
+        )
+        .await?;
+    }
     Ok(id)
 }
 /// Audit actions recorded as a side effect of a person signing in (not changes they made).

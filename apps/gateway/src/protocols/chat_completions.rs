@@ -132,9 +132,17 @@ fn content(
         WireContent::Parts(parts) if !parts.is_empty() => parts,
         WireContent::Parts(_) => return Err(InferenceError::InvalidRequest),
     };
-    let mut out = Vec::with_capacity(parts.len());
+    let mut out: Vec<Part> = Vec::with_capacity(parts.len());
     for part in parts {
-        out.push(match (part.kind.as_str(), part.text, part.image_url) {
+        // A file or audio reference is refused by name, whatever the part's
+        // type, never dropped beside it.
+        if part.file.is_some() {
+            return Err(InferenceError::InvalidField("messages.content.file"));
+        }
+        if part.input_audio.is_some() {
+            return Err(InferenceError::InvalidField("messages.content.input_audio"));
+        }
+        let next = match (part.kind.as_str(), part.text, part.image_url) {
             ("text", Some(text), None) => Part::Text(text),
             ("image_url", None, Some(image)) if role == Role::User => Part::Image(images.take(
                 image.url,
@@ -149,17 +157,18 @@ fn content(
                 return Err(InferenceError::InvalidField("messages.content.input_audio"));
             }
             _ => return Err(InferenceError::InvalidRequest),
-        });
+        };
+        // Adjacent text parts join (as Responses input parts do).
+        match (out.last_mut(), next) {
+            (Some(Part::Text(previous)), Part::Text(text)) => previous.push_str(&text),
+            (_, next) => out.push(next),
+        }
     }
-    if out.iter().all(|p| matches!(p, Part::Text(_))) {
-        return Ok(Content::Text(
-            out.into_iter()
-                .map(|p| match p {
-                    Part::Text(text) => text,
-                    Part::Image(_) => unreachable!("all parts are text"),
-                })
-                .collect(),
-        ));
+    if let [Part::Text(_)] = out.as_slice() {
+        let Some(Part::Text(text)) = out.pop() else {
+            unreachable!("one text part")
+        };
+        return Ok(Content::Text(text));
     }
     Ok(Content::Parts(out))
 }
@@ -342,6 +351,7 @@ pub async fn handle(
         Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
             return super::payload_too_large();
         }
+        Err(rejection) if super::hit_body_deadline(&rejection) => return super::body_timeout(),
         Err(_) => return error_response(InferenceError::InvalidRequest),
     };
     if !client::valid_openai_metadata(wire.metadata.as_ref()) {
@@ -359,8 +369,8 @@ pub async fn handle(
         Ok(request) => request,
         Err(error) => return error_response(error),
     };
-    // Only images may take a body past the shared text limit.
-    if large.is_some() && !request.has_images() {
+    // Only image data may take a body past the shared text limit.
+    if large.is_some_and(|Extension(large)| !large.allows(&request)) {
         return super::payload_too_large();
     }
     let model = request.model.clone();
@@ -711,6 +721,12 @@ mod tests {
         let content = request.messages[0].content.as_ref().unwrap();
         assert_eq!(content.text(), Some("ab"));
         assert!(!request.has_images());
+        // Adjacent text parts join around an image too.
+        let mixed = user(json!([{"type":"text","text":"a"},{"type":"text","text":"b"},{"type":"image_url","image_url":{"url":PNG_URL}}])).unwrap();
+        let Some(Content::Parts(parts)) = &mixed.messages[0].content else {
+            panic!("parts")
+        };
+        assert!(matches!(&parts[..], [Part::Text(t), Part::Image(_)] if t == "ab"));
         assert!(user(json!([])).is_err());
     }
     #[test]
@@ -754,6 +770,21 @@ mod tests {
         assert_eq!(
             field(json!([{"type":"file","file":{"file_id":"file-1"}}]), "user"),
             Some(InferenceError::InvalidField("messages.content.file"))
+        );
+        // A reference beside another part's type is refused, never dropped.
+        assert_eq!(
+            field(
+                json!([{"type":"text","text":"hi","file":{"file_id":"file-1"}}]),
+                "user"
+            ),
+            Some(InferenceError::InvalidField("messages.content.file"))
+        );
+        assert_eq!(
+            field(
+                json!([{"type":"image_url","image_url":{"url":PNG_URL},"input_audio":{}}]),
+                "user"
+            ),
+            Some(InferenceError::InvalidField("messages.content.input_audio"))
         );
         assert_eq!(
             field(

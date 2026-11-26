@@ -54,6 +54,16 @@ async fn a_route_s_image_input_is_set_at_creation_and_by_patch(pool: PgPool) {
     assert_eq!(status, StatusCode::OK, "{body}");
     let on = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
     assert_eq!(state(&pool, on).await, (true, true, 1, 1));
+    let created: Vec<Value> = sqlx::query_scalar("SELECT metadata FROM audit_events WHERE resource_id=$1 AND action='deployment.image_input_changed'")
+        .bind(on)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        created,
+        [json!({"image_input":true})],
+        "an opt-in at creation is audited"
+    );
 
     let path = format!("/api/v1/platform/deployments/{off}");
     // The opt-in alone: no enablement revision or history.

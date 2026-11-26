@@ -16,6 +16,7 @@ use axum::{
     response::IntoResponse,
 };
 use base64::Engine as _;
+use futures_util::StreamExt as _;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
@@ -268,6 +269,7 @@ async fn authentication_and_the_budget_run_before_any_body_byte_is_read(pool: Pg
         ImageInputLimits {
             body_bytes: 8 * MIB,
             buffer_bytes: 4 * MIB,
+            ..ImageInputLimits::default()
         },
         true,
     )
@@ -320,6 +322,18 @@ async fn authentication_and_the_budget_run_before_any_body_byte_is_read(pool: Pg
     .await;
     assert_eq!(status, StatusCode::OK, "{value}");
     assert_eq!(pulled, three_mib.len());
+    // One small image cannot carry text past the text limit.
+    let riding = json!({"model":"company/smart","max_tokens":16,"messages":[{"role":"user","content":[
+        {"type":"text","text":"x".repeat(3 * MIB)},{"type":"image_url","image_url":{"url":png_url(64, "r")}}]}]});
+    let (status, _, value, _) = send(
+        &w,
+        "/v1/chat/completions",
+        Some(&w.token),
+        serde_json::to_vec(&riding).unwrap(),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{value}");
     // A large text-only body is still refused (after parsing).
     let text = json!({"model":"company/smart","max_tokens":16,"messages":[{"role":"user","content":"x".repeat(3 * MIB)}]});
     let (status, _, value, _) = send(
@@ -341,6 +355,7 @@ async fn a_large_body_keeps_its_share_until_its_streamed_response_ends(pool: PgP
         ImageInputLimits {
             body_bytes: 8 * MIB,
             buffer_bytes: 4 * MIB,
+            ..ImageInputLimits::default()
         },
         true,
     )
@@ -510,4 +525,50 @@ async fn an_image_reaches_no_log_table_metric_or_error_body(pool: PgPool) {
     let logs = capture.text();
     assert!(!logs.is_empty());
     assert!(!logs.contains(&data[40..80]) && !logs.contains("ImageCanary"));
+}
+
+#[dbtest::test]
+async fn a_stalled_large_body_times_out_and_returns_its_share(pool: PgPool) {
+    let w = world(
+        pool,
+        ImageInputLimits {
+            body_bytes: 8 * MIB,
+            buffer_bytes: 4 * MIB,
+            body_idle: std::time::Duration::from_millis(300),
+            body_total: std::time::Duration::from_secs(5),
+        },
+        true,
+    )
+    .await;
+    allow_images(&w, true).await;
+    let body = serde_json::to_vec(&chat_body(&png_url(2 * MIB + MIB / 4, "s"), false)).unwrap();
+    // The first half arrives, then nothing more.
+    let (first, _) = body.split_at(body.len() / 2);
+    let first = Bytes::copy_from_slice(first);
+    let stalled = Body::from_stream(
+        futures_util::stream::once(async move { Ok::<_, std::convert::Infallible>(first) })
+            .chain(futures_util::stream::pending()),
+    );
+    let started = std::time::Instant::now();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        w.router.clone().oneshot(
+            Request::post("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::CONTENT_LENGTH, body.len())
+                .header(header::AUTHORIZATION, format!("Bearer {}", w.token))
+                .body(stalled)
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("the idle deadline ends the request")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    drop(response);
+    assert_eq!(executions(&w).await, 0);
+    // Its share is back: a full large body is admitted at once.
+    let (status, _, value, _) = send(&w, "/v1/chat/completions", Some(&w.token), body, true).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
 }

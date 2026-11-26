@@ -11,7 +11,7 @@
 //! nothing is read; a body larger than the whole budget is refused outright.
 //! So at most `buffer_bytes` of large bodies are in flight per replica, each
 //! held in memory by at most [`COPY_FACTOR`] copies (docs/operations.md).
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -26,13 +26,18 @@ pub const COPY_FACTOR: usize = 3;
 /// `Retry-After` of a request refused because the budget is spent.
 pub const BUSY_RETRY_SECONDS: u32 = 1;
 
-/// `GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT` and `GATEWAY_IMAGE_INPUT_BUFFER_BYTES`.
+/// `GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT` and `GATEWAY_IMAGE_INPUT_BUFFER_BYTES`,
+/// and the read deadlines of a large body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImageInputLimits {
     /// The largest body one request may send.
     pub body_bytes: usize,
     /// In-flight large-body bytes per replica.
     pub buffer_bytes: usize,
+    /// A large body's longest pause between frames ([`BODY_IDLE`]).
+    pub body_idle: Duration,
+    /// A large body's longest time to arrive in full ([`BODY_TOTAL`]).
+    pub body_total: Duration,
 }
 
 impl Default for ImageInputLimits {
@@ -40,14 +45,23 @@ impl Default for ImageInputLimits {
         Self {
             body_bytes: 20 * MIB,
             buffer_bytes: DEFAULT_BUFFER_BYTES,
+            body_idle: BODY_IDLE,
+            body_total: BODY_TOTAL,
         }
     }
 }
 
-/// The default budget. In the chart's 1 GiB memory limit it fits beside a
-/// [`BASELINE_BYTES`] process and the most text traffic can hold (every one
-/// of `GATEWAY_MAX_CONCURRENT_REQUESTS` with a [`TEXT_BODY_BYTES`] body at
-/// [`COPY_FACTOR`] copies): 100 + 128 × 2 × 3 + 48 × 3 = 1012 MiB
+/// A large body holds its share of the budget only while it keeps arriving:
+/// past this pause between frames, or [`BODY_TOTAL`] in all, its read fails
+/// (408) and the share goes back.
+pub const BODY_IDLE: Duration = Duration::from_secs(10);
+/// The default request timeout: a 20 MiB body needs about 1.4 Mbit/s.
+pub const BODY_TOTAL: Duration = Duration::from_secs(120);
+
+/// The default budget. The buffer is a hard bound on large bodies only: at
+/// [`COPY_FACTOR`] copies its worst case with a [`BASELINE_BYTES`] process
+/// (100 + 48 × 3 = 244 MiB) stays within half the chart's 1 GiB memory
+/// limit, leaving the rest for text bodies, which no buffer bounds
 /// (docs/operations.md "Image input memory"; tests/helm-chart.test.mjs).
 pub const DEFAULT_BUFFER_BYTES: usize = 48 * MIB;
 /// Memory a running replica holds before any request body (measured warm
@@ -72,6 +86,7 @@ impl ImageInputLimits {
                 "GATEWAY_IMAGE_INPUT_BUFFER_BYTES",
                 Self::default().buffer_bytes,
             )?,
+            ..Self::default()
         };
         ensure!(
             (TEXT_BODY_BYTES..=256 * MIB).contains(&limits.body_bytes),
@@ -85,10 +100,50 @@ impl ImageInputLimits {
     }
 }
 
-/// Marks a request whose declared body is above [`TEXT_BODY_BYTES`]: a
-/// handler refuses it (413) unless it carries an image.
+/// The error of a large body that stopped arriving in time
+/// ([`ImageInputLimits::body_idle`], [`ImageInputLimits::body_total`]).
+#[derive(Debug)]
+pub struct BodyDeadline;
+impl std::fmt::Display for BodyDeadline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("request body read deadline")
+    }
+}
+impl std::error::Error for BodyDeadline {}
+
+/// Whether `error`, or an error it wraps, is a [`BodyDeadline`].
+pub fn is_body_deadline(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(e) = current {
+        if e.is::<BodyDeadline>() {
+            return true;
+        }
+        current = e.source();
+    }
+    false
+}
+
+/// Marks a request whose declared body is above [`TEXT_BODY_BYTES`]: its
+/// declared length. Only image data may take a body past the text limit: a
+/// handler refuses it (413) when the bytes outside its images' data URLs
+/// exceed [`TEXT_BODY_BYTES`] (text is copied more often than an image,
+/// which [`COPY_FACTOR`] assumes).
 #[derive(Clone, Copy)]
-pub struct LargeBody;
+pub struct LargeBody(pub usize);
+impl LargeBody {
+    /// Whether this body is within the text limit once `request`'s image
+    /// data is set aside.
+    pub fn allows(self, request: &crate::inference::types::ChatRequest) -> bool {
+        let images: usize = request
+            .messages
+            .iter()
+            .filter_map(|m| m.content.as_ref())
+            .flat_map(crate::inference::types::Content::images)
+            .map(|image| image.data_url().len())
+            .sum();
+        images > 0 && self.0.saturating_sub(images) <= TEXT_BODY_BYTES
+    }
+}
 
 /// A large body's share of the budget, returned when it is dropped.
 pub struct BufferPermit {
@@ -168,6 +223,7 @@ mod tests {
         ImageBuffer::new(ImageInputLimits {
             body_bytes: 20 * MIB,
             buffer_bytes: buffer_mib * MIB,
+            ..ImageInputLimits::default()
         })
     }
 

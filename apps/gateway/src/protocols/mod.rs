@@ -122,6 +122,20 @@ pub(crate) fn image_input_busy() -> Response {
     );
     response
 }
+/// A large image input body that stopped arriving in time
+/// (`inference::image_buffer::BODY_IDLE`/`BODY_TOTAL`): its share of the
+/// buffer is back and nothing was admitted or sent.
+pub(crate) fn body_timeout() -> Response {
+    (
+        StatusCode::REQUEST_TIMEOUT,
+        axum::Json(serde_json::json!({"error":{"message":"The request body did not arrive in time","type":"invalid_request_error","code":"request_timeout","param":null}})),
+    )
+        .into_response()
+}
+/// The rejection of a JSON body whose read hit the large-body deadline.
+pub(crate) fn hit_body_deadline(rejection: &axum::extract::rejection::JsonRejection) -> bool {
+    crate::inference::image_buffer::is_body_deadline(rejection)
+}
 fn payload_too_large() -> Response {
     (
         StatusCode::PAYLOAD_TOO_LARGE,
