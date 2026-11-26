@@ -119,7 +119,7 @@ export const auditActionLabels: Record<string, string> = {
   "price.created": "Published price",
   "provider.created": "Added connection", "provider.updated": "Changed connection",
   "role.granted": "Granted platform role", "role.revoked": "Revoked platform role",
-  "routing.deployment_updated": "Changed route settings", "routing.model_updated": "Changed model routing",
+  "routing.deployment_updated": "Changed route settings", "routing.model_updated": "Changed model routing", "routing.drain_set": "Drained", "routing.drain_changed": "Changed drain", "routing.drain_cleared": "Ended drain",
   "scim.user.created": "Provisioned user (SCIM)", "scim.user.updated": "Changed user (SCIM)", "scim.user.deactivated": "Deactivated user (SCIM)", "scim.user.reactivated": "Reactivated user (SCIM)",
   "scim.group.created": "Added group (SCIM)", "scim.group.updated": "Changed group (SCIM)", "scim.group.deleted": "Deleted group (SCIM)",
   "scim.last_admin_protected": "Kept last admin (SCIM change refused)",
