@@ -107,6 +107,43 @@ impl Store {
     }
 }
 
+/// The facts of a request the guardrail step records.
+pub(super) struct Guarded<'a> {
+    pub(super) request_id: Uuid,
+    pub(super) operation: &'static str,
+    pub(super) model: &'a str,
+    pub(super) streamed: bool,
+    pub(super) workload: Workload,
+}
+
+impl super::Engine {
+    /// The guardrail step of a generation request, within its deadline.
+    pub(super) async fn guard_chat(
+        &self,
+        principal: &Principal,
+        request: &super::types::ChatRequest,
+        request_id: Uuid,
+        protocol: super::types::ApiProtocol,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), InferenceError> {
+        let facts = Guarded {
+            request_id,
+            operation: operation(protocol),
+            model: &request.model,
+            streamed: request.stream,
+            workload: Workload::Generation,
+        };
+        tokio::time::timeout_at(
+            deadline,
+            self.guard_input(principal, facts, || {
+                Some(crate::guardrails::enforce::chat_inspection(request))
+            }),
+        )
+        .await
+        .map_err(|_| InferenceError::Timeout)?
+    }
+}
+
 /// `guardrail_events.operation` of a generation protocol.
 pub(super) fn operation(protocol: super::types::ApiProtocol) -> &'static str {
     use super::types::ApiProtocol;
@@ -126,13 +163,16 @@ impl super::Engine {
     pub(super) async fn guard_input<'a>(
         &self,
         principal: &Principal,
-        request_id: Uuid,
-        operation: &'static str,
-        model: &str,
-        streamed: bool,
-        workload: Workload,
+        request: Guarded<'_>,
         input: impl FnOnce() -> Option<Inspection<'a>>,
     ) -> Result<(), InferenceError> {
+        let Guarded {
+            request_id,
+            operation,
+            model,
+            streamed,
+            workload,
+        } = request;
         let policy = self.repository.guardrails(principal.workspace_id).await?;
         if !policy.applies_to(workload) {
             return Ok(());

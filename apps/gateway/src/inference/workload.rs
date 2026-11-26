@@ -418,11 +418,13 @@ impl Engine {
             deadline,
             self.guard_input(
                 &principal,
-                request_id,
-                W::GUARDRAIL.as_str(),
-                request.model(),
-                W::STREAMED,
-                W::GUARDRAIL,
+                super::guardrails::Guarded {
+                    request_id,
+                    operation: W::GUARDRAIL.as_str(),
+                    model: request.model(),
+                    streamed: W::STREAMED,
+                    workload: W::GUARDRAIL,
+                },
                 || request.inspection(),
             ),
         )

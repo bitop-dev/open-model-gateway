@@ -235,25 +235,10 @@ impl Engine {
         }
         // Guardrails, once per root request, before the route plan and any
         // admission: a refused input reserves nothing and reaches no provider.
-        let guarded = timeout_at(
-            deadline,
-            self.guard_input(
-                &principal,
-                request_id,
-                guardrails::operation(protocol),
-                &request.model,
-                request.stream,
-                crate::guardrails::policy::Workload::Generation,
-                || Some(crate::guardrails::enforce::chat_inspection(&request)),
-            ),
-        )
-        .await
-        .map_err(|_| InferenceError::Timeout)
-        .and_then(|result| result);
-        if let Err(error) = guarded {
-            telemetry.finish(telemetry::Outcome::Error, Some(error));
-            return Err(error);
-        }
+        let checked = self.guard_chat(&principal, &request, request_id, protocol, deadline);
+        checked
+            .await
+            .inspect_err(|&e| telemetry.finish(telemetry::Outcome::Error, Some(e)))?;
         let plan = timeout_at(
             deadline,
             self.repository

@@ -22,7 +22,7 @@ pub(super) async fn load(
     tx: &mut Transaction<'_, Postgres>,
     scope: Scope<'_>,
 ) -> std::result::Result<Option<RuleSet>, ApiError> {
-    Ok(stored::load(&mut **tx, scope).await??)
+    Ok(stored::load(tx, scope).await??)
 }
 
 /// A workspace's kind and its platform layer: the override if one exists,
