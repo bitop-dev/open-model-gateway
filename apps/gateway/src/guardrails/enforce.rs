@@ -143,6 +143,13 @@ impl Policy {
 /// The time a request's custom patterns may take in all (tests run with a
 /// long one, so a stalled runner never turns into a refusal; the budget's
 /// own behaviour is tested with step budgets).
+/// Tests: rules whose next decisions have their custom-pattern budget spent
+/// at once, and how many (the real-path tests run with a long budget).
+#[cfg(test)]
+pub static SPEND_BUDGET: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<Uuid, u32>>,
+> = std::sync::LazyLock::new(Default::default);
+
 pub const CUSTOM_BUDGET: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_secs(60)
 } else {
@@ -304,7 +311,24 @@ impl Policy {
     /// workload carries no text a detector can read), within the request's
     /// custom-pattern budget.
     pub fn decide(&self, workload: Workload, input: Option<&Inspection<'_>>) -> Decision {
+        #[cfg(test)]
+        if self.spend_budget_now() {
+            return self.decide_with(workload, input, &Budget::steps(0));
+        }
         self.decide_with(workload, input, &Budget::time(CUSTOM_BUDGET))
+    }
+    /// Tests: whether this decision's budget is spent at once
+    /// ([`SPEND_BUDGET`], counted down per decision of a listed rule).
+    #[cfg(test)]
+    fn spend_budget_now(&self) -> bool {
+        let mut spend = SPEND_BUDGET.lock().unwrap();
+        self.rules.iter().any(|r| match spend.get_mut(&r.id) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                true
+            }
+            _ => false,
+        })
     }
     /// As [`Policy::decide`], within `budget`.
     pub fn decide_with(

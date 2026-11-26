@@ -141,13 +141,17 @@ fn label(run: &[u8], before: bool) -> bool {
 fn glued(run: &[u8], before: bool) -> bool {
     run.len() >= BLOB_RUN && !(run.len() <= LABEL_MAX && label(run, before))
 }
-/// Shapes whose match ends in its own delimiter (a PEM header's trailing
-/// `-----`): what follows is the key's body, never glue.
-const DELIMITED_AFTER: &[&str] = &["private_key"];
+/// Shapes whose match starts and ends in its own delimiter (a PEM header's
+/// leading and trailing `-----`): what is glued on either side (a label, the
+/// key's body) never makes it data.
+const DELIMITED: &[&str] = &["private_key"];
 
-/// Whether `span` of `text` stands apart from base64url data around it (only
-/// before it when `delimited` says the match ends in its own delimiter).
+/// Whether `span` of `text` stands apart from base64url data around it
+/// (always, when `delimited` says the match carries its own delimiters).
 fn standalone(text: &[u8], span: std::ops::Range<usize>, delimited: bool) -> bool {
+    if delimited {
+        return true;
+    }
     let start = span.start
         - text[..span.start]
             .iter()
@@ -161,7 +165,7 @@ fn standalone(text: &[u8], span: std::ops::Range<usize>, delimited: bool) -> boo
             .take(LABEL_MAX + 1)
             .take_while(|b| encoded(**b))
             .count();
-    !glued(&text[start..span.start], true) && (delimited || !glued(&text[span.end..end], false))
+    !glued(&text[start..span.start], true) && !glued(&text[span.end..end], false)
 }
 
 /// Every match of the built-in secret shapes (shared by every rule that has
@@ -174,7 +178,7 @@ pub fn builtin(input: &Inspection<'_>) -> Findings {
                 standalone(
                     segment.text.as_bytes(),
                     m.range(),
-                    DELIMITED_AFTER.contains(&BUILTIN[i].0),
+                    DELIMITED.contains(&BUILTIN[i].0),
                 )
             }) {
                 if found.len() == MAX_FINDINGS {

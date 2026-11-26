@@ -618,3 +618,33 @@ fn every_option_string_a_messages_request_forwards_is_read() {
         assert!(found(&chat_inspection(&r)));
     }
 }
+
+#[test]
+fn text_parts_are_read_alone_and_joined_and_an_image_part_is_uninspectable() {
+    use crate::inference::types::{Content, ImageInput, ImageType, Part as ContentPart};
+    let k = key();
+    let (head, tail) = k.split_at(20);
+    let mut m = said(Role::User, "x");
+    m.content = Some(Content::Parts(vec![
+        ContentPart::Text(head.to_owned()),
+        ContentPart::Image(ImageInput::new(
+            "data:image/png;base64,iVBORw0KGgo=".into(),
+            ImageType::Png,
+            None,
+            8,
+        )),
+        ContentPart::Text(tail.to_owned()),
+    ]));
+    let r = request(vec![m], Vec::new(), MessagesOptions::default());
+    let input = chat_inspection(&r);
+    assert!(input.uninspectable, "an image cannot be read");
+    assert!(
+        texts(&input).contains(&k.as_str()),
+        "the split secret is read joined"
+    );
+    assert!(
+        texts(&input).iter().all(|t| !t.contains("iVBOR")),
+        "nothing of the image is read"
+    );
+    assert!(found(&input));
+}

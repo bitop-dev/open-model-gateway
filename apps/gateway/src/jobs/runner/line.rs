@@ -240,7 +240,13 @@ impl LineRun {
         let mut attempt: i16 = 1;
         loop {
             let result = self
-                .execute(line.request.clone(), execution, pin, line.plan)
+                .execute(
+                    line.request.clone(),
+                    execution,
+                    pin,
+                    line.plan,
+                    workers.spent_left(),
+                )
                 .await;
             if let Some(slot) = slot.take() {
                 let _ = slot.into_epoch();
@@ -253,16 +259,9 @@ impl LineRun {
                     return;
                 }
                 Err(e) if e.is_budget_denial() => {
-                    // Admission refused: the line never ran. The batch stops.
-                    self.state.budget.store(true, Ordering::SeqCst);
-                    if self
-                        .finished_error(n, execution, None, Some("budget_exceeded"))
-                        .await
-                    {
-                        let value = lines::not_run_line(&line.custom_id, NotRun::BudgetExceeded);
-                        self.emit_error(&records, n, execution, value).await;
-                    }
-                    return;
+                    return self
+                        .stop_for_budget(n, execution, &line.custom_id, &records)
+                        .await;
                 }
                 Err(e) if self.rescan_later(e, &mut pin, &mut workers).await => {}
                 Err(e) => {
@@ -278,14 +277,7 @@ impl LineRun {
                     // another request or lost): nothing was sent, and the
                     // attempt is retried after its backoff like a failed one.
                     let cooling = matches!(e, InferenceError::RouteCoolingDown(_)) && pin.is_some();
-                    let retryable = cooling
-                        || matches!(
-                            e,
-                            InferenceError::Busy
-                                | InferenceError::ScopeBusy
-                                | InferenceError::UpstreamUnavailable
-                                | InferenceError::Timeout
-                        );
+                    let retryable = cooling || retryable(e);
                     if retryable
                         && attempt <= self.job.retry_limit
                         && !self.state.should_stop(&self.job)
@@ -319,6 +311,25 @@ impl LineRun {
                     return;
                 }
             }
+        }
+    }
+
+    /// Admission refused the line for its budget: it never ran, and the
+    /// batch stops.
+    async fn stop_for_budget(
+        &self,
+        n: i32,
+        execution: Uuid,
+        custom_id: &str,
+        records: &mpsc::Sender<Record>,
+    ) {
+        self.state.budget.store(true, Ordering::SeqCst);
+        if self
+            .finished_error(n, execution, None, Some("budget_exceeded"))
+            .await
+        {
+            let value = lines::not_run_line(custom_id, NotRun::BudgetExceeded);
+            self.emit_error(records, n, execution, value).await;
         }
     }
 
@@ -503,6 +514,7 @@ impl LineRun {
         execution: Uuid,
         pin: Option<Pin>,
         plan: Option<lines::LinePlan>,
+        spent_retried: bool,
     ) -> Result<BatchResponse, InferenceError> {
         if let Some(deployment) = plan.map(|p| p.deployment).or(pin.map(|p| p.deployment)) {
             // `pin.is_some()` is the scheduler's own route-capacity claim
@@ -535,7 +547,12 @@ impl LineRun {
         {
             r.max_output_tokens = Some(plan.output);
         }
-        let attempt = self.execute_attempt(request, execution);
+        // A spent budget this try meets is tried again (and so not recorded)
+        // while the line has spent-budget tries left.
+        let attempt = crate::inference::guardrails::with_spent_retried(
+            spent_retried,
+            self.execute_attempt(request, execution),
+        );
         let result = match pin.and_then(|p| p.priority.map(|priority| (p.deployment, priority))) {
             Some((deployment, priority)) => {
                 crate::inference::scheduling::with_priority(deployment, priority, attempt).await
@@ -573,9 +590,24 @@ impl LineRun {
 /// Tries of a line the guardrail step could not inspect now, of one whose
 /// custom-pattern budget ran out, and the longest wait between two
 /// (seconds): about a minute in all, without the line's worker permits.
-const GUARDRAIL_TRIES: u32 = 10;
+/// (Tests: 2 free tries, 1 s apart, so a test reaches the ordinary retries.)
+const GUARDRAIL_TRIES: u32 = if cfg!(test) { 2 } else { 10 };
 const SPENT_TRIES: u32 = 2;
-const GUARDRAIL_RETRY_CAP: u32 = 8;
+const GUARDRAIL_RETRY_CAP: u32 = if cfg!(test) { 1 } else { 8 };
+
+/// Failures a line retries with its ordinary retries (`omg_retries`). A line
+/// nothing could be scanned for, after its free tries, spends them like a
+/// busy scope.
+fn retryable(e: InferenceError) -> bool {
+    rescan_cause(e) == Some(Rescan::Busy)
+        || matches!(
+            e,
+            InferenceError::Busy
+                | InferenceError::ScopeBusy
+                | InferenceError::UpstreamUnavailable
+                | InferenceError::Timeout
+        )
+}
 
 /// Why a guardrail refusal of a line may be tried again.
 #[derive(Debug, PartialEq, Eq)]
@@ -625,6 +657,10 @@ impl Workers {
             pool: Arc::clone(process.semaphore()),
             process: Some(process),
         }
+    }
+    /// Whether a spent budget would be tried again.
+    fn spent_left(&self) -> bool {
+        self.spent < SPENT_TRIES
     }
     /// The process permit again; `false` if the pool closed.
     async fn reacquire(&mut self) -> bool {

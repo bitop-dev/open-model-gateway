@@ -422,6 +422,17 @@ impl super::Engine {
             }
             input => timed(|| policy.decide(workload, input.as_ref())),
         };
+        // A gateway-run batch line whose budget ran out is tried again by
+        // the runner: this try's decisions are not recorded, so Logs and the
+        // totals show only the try that answered (the line's last try, or
+        // the one that ran), never a refusal of a request that then ran.
+        if let Some(refusal) = decision
+            .refusal
+            .filter(|r| r.kind == RefusalKind::Unavailable && r.scanned && spent_retried())
+        {
+            count(&decision);
+            return Err(InferenceError::Guardrail(refusal));
+        }
         let (events, omitted) = rows(&decision);
         // Taken before the insert, so a request dropped during it counts too.
         let unadmitted =
@@ -479,6 +490,22 @@ impl Drop for Unadmitted {
             RECORDED.note(key, limits::now());
         }
     }
+}
+
+tokio::task_local! {
+    /// Set by the batch runner around a line's try: a refusal for a spent
+    /// budget will be tried again, so its decisions are not recorded.
+    static SPENT_RETRIED: bool;
+}
+/// Run `try_line` with [`SPENT_RETRIED`] set to `retried`.
+pub(crate) async fn with_spent_retried<F: std::future::Future>(
+    retried: bool,
+    try_line: F,
+) -> F::Output {
+    SPENT_RETRIED.scope(retried, try_line).await
+}
+fn spent_retried() -> bool {
+    SPENT_RETRIED.try_with(|r| *r).unwrap_or(false)
 }
 
 /// Run a decision, timing only the scan (never a slot wait).

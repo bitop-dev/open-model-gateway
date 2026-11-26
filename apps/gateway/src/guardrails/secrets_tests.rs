@@ -142,8 +142,9 @@ fn every_builtin_rule_matches_its_shape_in_prose_punctuation_and_escapes() {
             assert!(found(&around) >= 1, "{name} in {around}");
         }
         // A labelled AWS secret key carries a keyword, `=` and quotes that
-        // encoded data never has, and absorbs the identifier before it.
-        if name == "aws_secret_access_key" {
+        // encoded data never has, and absorbs the identifier before it; a PEM
+        // header carries its own delimiters and spaces.
+        if name == "aws_secret_access_key" || name == "private_key" {
             continue;
         }
         assert_eq!(
@@ -194,8 +195,10 @@ fn a_pem_header_glued_to_its_body_is_found() {
     ] {
         assert!(found(&text) >= 1, "{}", &text[..24]);
     }
-    // Glued data before the header still makes it data.
-    assert_eq!(found(&format!("Zx9aB3dE5gH7jK{}{body}", header("RSA"))), 0);
+    // The header's leading dashes are its delimiter too: data glued before
+    // it does not hide it either.
+    assert!(found(&format!("privatekey{}{body}", header("RSA"))) >= 1);
+    assert!(found(&format!("Zx9aB3dE5gH7jK{}{body}", header("RSA"))) >= 1);
 }
 
 #[test]

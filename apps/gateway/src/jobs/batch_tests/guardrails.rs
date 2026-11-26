@@ -379,3 +379,173 @@ async fn a_line_that_meets_a_full_scan_pool_is_retried_and_succeeds(pool: PgPool
         "{out:?}"
     );
 }
+
+/// A custom-pattern block rule of the principal's kind; its id.
+async fn custom_rule(f: &crate::governance::tests::db::Fixture) -> Uuid {
+    let kind: String = sqlx::query_scalar("SELECT kind FROM workspaces WHERE id=$1")
+        .bind(f.principal.workspace_id)
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    let (set, rule) = (Uuid::now_v7(), Uuid::now_v7());
+    let mut tx = f.store.pool.begin().await.unwrap();
+    sqlx::query("INSERT INTO guardrail_rule_sets(id,layer,kind,local_only,updated_by) VALUES($1,'type_default',$2,false,$3)")
+        .bind(set).bind(&kind).bind(f.owner).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable,patterns) VALUES($1,$2,0,'Ids','custom','pattern','{custom}','block','user_text','off','fail_closed','{generation}','deny',ARRAY['ACME-[0-9]{4}'])")
+        .bind(rule).bind(set).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    rule
+}
+
+/// A line whose budget ran out on a try that is tried again records nothing
+/// for that try: once a later try runs, its request shows no refusal.
+#[dbtest::test]
+async fn a_retried_spent_try_records_nothing_and_the_line_runs(pool: PgPool) {
+    let w = world_with(pool, false, false, 1, None).await;
+    let f = &w.f;
+    let rule = custom_rule(f).await;
+    crate::guardrails::enforce::SPEND_BUDGET
+        .lock()
+        .unwrap()
+        .insert(rule, 1);
+    let file = w
+        .upload(
+            &f.principal,
+            &[chat_line("clean", "company/smart", "hello")],
+        )
+        .await;
+    let job = w
+        .create(f.principal, &file, BatchEndpoint::ChatCompletions, None)
+        .await
+        .unwrap();
+    let _ = Runner::new(w.jobs.clone()).run_next().await;
+    let job = w.reload(&job).await;
+    let line: (String, i16) =
+        sqlx::query_as("SELECT state,attempts FROM batch_lines WHERE job_id=$1")
+            .bind(job.id)
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(line, ("succeeded".into(), 1));
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM guardrail_events")
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows, 0,
+        "the spent try wrote nothing; the try that ran found nothing"
+    );
+    assert_eq!(
+        crate::guardrails::enforce::SPEND_BUDGET.lock().unwrap()[&rule],
+        0,
+        "the first try was spent"
+    );
+}
+
+/// A line whose budget runs out on every try fails with
+/// `guardrail_unavailable`, and only its last try's decisions are recorded.
+#[dbtest::test]
+async fn a_line_spent_on_every_try_records_its_last_try_only(pool: PgPool) {
+    let w = world_with(pool, false, false, 1, None).await;
+    let f = &w.f;
+    let rule = custom_rule(f).await;
+    crate::guardrails::enforce::SPEND_BUDGET
+        .lock()
+        .unwrap()
+        .insert(rule, 10);
+    let file = w
+        .upload(
+            &f.principal,
+            &[chat_line("clean", "company/smart", "hello")],
+        )
+        .await;
+    let job = w
+        .create(f.principal, &file, BatchEndpoint::ChatCompletions, None)
+        .await
+        .unwrap();
+    let _ = Runner::new(w.jobs.clone()).run_next().await;
+    let job = w.reload(&job).await;
+    let line: (String, Option<String>) =
+        sqlx::query_as("SELECT state,error_code FROM batch_lines WHERE job_id=$1")
+            .bind(job.id)
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        line,
+        ("failed".into(), Some("guardrail_unavailable".into()))
+    );
+    let rows: Vec<(String, bool)> = sqlx::query_as("SELECT action,refused FROM guardrail_events")
+        .fetch_all(&f.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, [("detector_failed".into(), true)], "one try recorded");
+    assert_eq!(
+        crate::guardrails::enforce::SPEND_BUDGET.lock().unwrap()[&rule],
+        7,
+        "three tries in all"
+    );
+}
+
+/// A line that never gets a scan slot during its free tries spends one of
+/// its ordinary retries (`omg_retries`) before it fails, and succeeds once a
+/// slot is free.
+#[dbtest::test]
+async fn a_line_without_a_slot_spends_its_ordinary_retries_after_its_free_tries(pool: PgPool) {
+    let w = world_with(pool, false, false, 1, None).await;
+    let f = &w.f;
+    custom_rule(f).await;
+    let file = w
+        .upload(
+            &f.principal,
+            &[chat_line("clean", "company/smart", "hello")],
+        )
+        .await;
+    let job = w
+        .create(
+            f.principal,
+            &file,
+            BatchEndpoint::ChatCompletions,
+            Some(json!({"omg_retries":"1"})),
+        )
+        .await
+        .unwrap();
+    // The workspace's share is held until the line's second attempt starts.
+    let slots = &crate::guardrails::limits::SHARED_SCANS;
+    let ws = f.principal.workspace_id;
+    let mut held = Vec::new();
+    for _ in 0..crate::guardrails::limits::SHARE {
+        held.push(slots.acquire(ws).await.unwrap());
+    }
+    let pool = f.store.pool.clone();
+    let job_id = job.id;
+    let release = tokio::spawn(async move {
+        loop {
+            let attempts: Option<i16> =
+                sqlx::query_scalar("SELECT attempts FROM batch_lines WHERE job_id=$1")
+                    .bind(job_id)
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap();
+            if attempts == Some(2) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        drop(held);
+    });
+    let _ = Runner::new(w.jobs.clone()).run_next().await;
+    release.await.unwrap();
+    let job = w.reload(&job).await;
+    let line: (String, i16) =
+        sqlx::query_as("SELECT state,attempts FROM batch_lines WHERE job_id=$1")
+            .bind(job.id)
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        line,
+        ("succeeded".into(), 2),
+        "its free tries, then one ordinary retry"
+    );
+}

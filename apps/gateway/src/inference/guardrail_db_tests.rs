@@ -387,3 +387,109 @@ async fn a_token_count_is_inspected_before_it_reaches_the_provider(pool: PgPool)
         "nothing was sent to count"
     );
 }
+
+/// A one-pixel PNG as a data URL (an image the gateway accepts).
+const PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+fn chat_with_image(text: &str) -> Value {
+    json!({"model":"company/smart","messages":[{"role":"user","content":[
+        {"type":"text","text":text},{"type":"image_url","image_url":{"url":PNG}}]}]})
+}
+async fn images_on(w: &World) {
+    sqlx::query("UPDATE deployments SET image_input=true")
+        .execute(&w.f.store.pool)
+        .await
+        .unwrap();
+}
+
+/// An image part cannot be inspected: a blocking rule refuses the request
+/// (`guardrail_not_supported`) before anything is admitted or sent, on Chat
+/// Completions and Responses; the text beside the image is still read, so a
+/// secret there is a finding, which answers.
+#[dbtest::test]
+async fn an_image_is_refused_by_a_blocking_rule_and_the_text_beside_it_is_read(pool: PgPool) {
+    let w = world(pool, "'chat_completions','responses'").await;
+    images_on(&w).await;
+    let (set, rule) = type_default(&w, "block", "{secret}", &[]).await;
+    let before = snapshot(&w.f.store.pool).await;
+    let guardrail = json!({"policy_id": set, "rule_id": rule, "stage": "input", "category": "secret", "detector": "pattern"});
+    let (status, retry, body) =
+        send(&w, "/v1/chat/completions", chat_with_image("what is this?")).await;
+    assert_eq!(
+        (status, retry.as_deref()),
+        (StatusCode::BAD_REQUEST, Some("false")),
+        "{body}"
+    );
+    assert_eq!(body["error"]["code"], "guardrail_not_supported");
+    assert_eq!(body["error"]["guardrail"], guardrail);
+    let responses = json!({"model":"company/smart","max_output_tokens":16,"input":[{"role":"user","content":[
+        {"type":"input_text","text":"what is this?"},{"type":"input_image","image_url":PNG}]}]});
+    let (status, _, body) = send(&w, "/v1/responses", responses).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "guardrail_not_supported");
+    // A secret in the text beside an image is found: the block answers.
+    let (status, _, body) = send(
+        &w,
+        "/v1/chat/completions",
+        chat_with_image(&format!("deploy with {}", secret())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "guardrail_input_blocked");
+    assert!(
+        !body.to_string().contains("iVBOR"),
+        "the image is never echoed"
+    );
+    // Nothing reached a provider or was reserved.
+    assert_eq!(w.hits.load(Ordering::SeqCst), 0);
+    assert_eq!(snapshot(&w.f.store.pool).await, before);
+    let refused: Vec<(String, String)> = sqlx::query_as(
+        "SELECT operation,action FROM guardrail_events WHERE refused ORDER BY created_at,id",
+    )
+    .fetch_all(&w.f.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        refused,
+        [
+            ("chat_completions".into(), "skipped".into()),
+            ("responses".into(), "skipped".into()),
+            ("chat_completions".into(), "blocked".into()),
+        ]
+    );
+}
+
+/// Under a rule that does not block, an image passes and the rule records
+/// `skipped` (it could not read the request); a secret beside the image is
+/// still found and recorded `monitored`.
+#[dbtest::test]
+async fn an_image_under_a_monitor_rule_passes_and_is_recorded_skipped(pool: PgPool) {
+    let w = world(pool, "'chat_completions'").await;
+    images_on(&w).await;
+    type_default(&w, "monitor", "{secret}", &[]).await;
+    let (status, _, body) =
+        send(&w, "/v1/chat/completions", chat_with_image("what is this?")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        events(&w).await,
+        [(
+            "chat_completions".into(),
+            "skipped".into(),
+            "secret".into(),
+            1
+        )]
+    );
+    let (status, _, body) = send(
+        &w,
+        "/v1/chat/completions",
+        chat_with_image(&format!("deploy with {}", secret())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut last: Vec<(String, i32)> = events(&w).await[1..]
+        .iter()
+        .map(|e| (e.1.clone(), e.3))
+        .collect();
+    last.sort();
+    assert_eq!(last, [("monitored".into(), 1), ("skipped".into(), 1)]);
+    assert_eq!(w.hits.load(Ordering::SeqCst), 2);
+}
