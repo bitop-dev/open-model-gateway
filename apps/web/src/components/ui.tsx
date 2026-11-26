@@ -41,7 +41,7 @@ export function Empty({ title = "Nothing here yet", children, titleAs = "h3" }: 
 export function Badge({ children, tone = "neutral" }: { children: ReactNode; tone?: "neutral" | "good" | "bad" }) { return <BitopBadge tone={tone === "good" ? "success" : tone === "bad" ? "danger" : "neutral"}>{children}</BitopBadge>; }
 export function Status({ enabled }: { enabled: boolean }) { return <Badge tone={enabled ? "good" : "neutral"}>{enabled ? "Enabled" : "Disabled"}</Badge>; }
 /** Relative time for tables ("3 hours ago") with the detail format in its tooltip ("Oct 8, 2026, 2:30 AM EDT", lib/format). */
-export function DateTime({ value }: { value?: string | null }) { return <Time value={value} format="relative" fallback="—" title={value ? detailTime(value) : undefined} />; }
+export function DateTime({ value, now }: { value?: string | null; /** Reference time for "in 2 minutes"/"3 hours ago" instead of the browser's clock (no refresh timer). */ now?: string }) { return <Time value={value} format="relative" now={now} fallback="—" title={value ? detailTime(value) : undefined} />; }
 export function Id({ value }: { value?: string | null }) { return value ? <code className={s.secondary} title={value}>{value}</code> : <span className={s.secondary}>—</span>; }
 const HeadingLevel = createContext<"h1" | "h2">("h1");
 export function SectionHeadings({ children }: { children: ReactNode }) { return <HeadingLevel.Provider value="h2">{children}</HeadingLevel.Provider>; }

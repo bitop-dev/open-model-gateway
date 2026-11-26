@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import type { Field, Values } from "./forms";
 import type { WorkspaceKind } from "./api";
 
@@ -273,6 +274,26 @@ export type RouteHealthView = {
   /** The backoff the openings so far imply, when there were any. */
   backoff: string | null;
 };
+/**
+ * How long after this view was read its state changes on its own (the
+ * cooldown ends, or the probe's slot does), from the gateway's own times
+ * only: the browser's clock may be skewed. `null` when nothing is due.
+ */
+export function healthRefreshDelay(health: RouteHealth): number | null {
+  const until = health.circuit === "open" ? health.cooling_until : health.probe_in_progress ? health.probe_until : null;
+  if (!until) return null;
+  const delay = Date.parse(until) - Date.parse(health.as_of);
+  return Number.isFinite(delay) ? Math.max(delay, 0) + 1_000 : null;
+}
+/** Read the health view again once its state changes on its own ({@link healthRefreshDelay}). */
+export function useHealthRefresh(health: RouteHealth | undefined, refetch: () => unknown) {
+  const delay = health ? healthRefreshDelay(health) : null;
+  useEffect(() => {
+    if (delay === null) return;
+    const timer = setTimeout(() => void refetch(), delay);
+    return () => clearTimeout(timer);
+  }, [delay, health?.as_of, refetch]);
+}
 /** A route's health as the gateway computed it at `as_of`: no client clock is involved. */
 export function routeHealth(health: RouteHealth): RouteHealthView {
   const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? "" : "s"}`;
@@ -282,6 +303,6 @@ export function routeHealth(health: RouteHealth): RouteHealthView {
     ? { state: "Half-open · one request is testing it", until: health.probe_until ? { label: "Test ends by", value: health.probe_until } : null, backoff }
     : { state: "Half-open · waiting for a request to test it", until: null, backoff };
   if (health.observation === "none") return { state: "Unknown · no traffic observed yet", until: null, backoff };
-  if (health.observation === "stale") return { state: `Unknown lately · no traffic observed for over ${HEALTH_STALE_AFTER_MINUTES} minutes`, until: null, backoff };
+  if (health.observation === "stale") return { state: `Unknown lately · no traffic observed for over ${HEALTH_STALE_AFTER_MINUTES} minutes${health.consecutive_failures > 0 ? ` · ${plural(health.consecutive_failures, "consecutive observed failure")} before that` : ""}`, until: null, backoff };
   return { state: health.consecutive_failures > 0 ? `Closed · ${plural(health.consecutive_failures, "consecutive observed failure")}` : "Closed · no recent failures", until: null, backoff };
 }

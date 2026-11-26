@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { budgetTightenError, effectivePolicy, periodNests, canReconcile, deploymentRoutingBody, dollarsToMicroUsd, formatMicroUsd, formatUsd, integerField, microUsdError, microUsdToDollars, modelRoutingBody, routeHealth, type RouteHealth, policyBody, policyFields, priceBody, priceFields, residencyError, priceLinesText, scalarRate, type Cost, type Policy, type Price } from "./governance";
+import { budgetTightenError, effectivePolicy, periodNests, canReconcile, deploymentRoutingBody, dollarsToMicroUsd, formatMicroUsd, formatUsd, integerField, microUsdError, microUsdToDollars, modelRoutingBody, routeHealth, healthRefreshDelay, type RouteHealth, policyBody, policyFields, priceBody, priceFields, residencyError, priceLinesText, scalarRate, type Cost, type Policy, type Price } from "./governance";
 import { validateFields } from "./forms";
 
 const cacheDefaults = { cache_read_status: "unknown", cache_write_status: "unknown", cache_write_5m_status: "unknown", cache_write_1h_status: "unknown" };
@@ -180,6 +180,7 @@ describe("exact micro-USD and governance forms", () => {
     it("never reads an unobserved or stale route as healthy", () => {
       expect(routeHealth(health({ last_observed_at: null, observation: "none" }))).toEqual({ state: "Unknown · no traffic observed yet", until: null, backoff: null });
       expect(routeHealth(health({ observation: "stale" })).state).toBe("Unknown lately · no traffic observed for over 10 minutes");
+      expect(routeHealth(health({ observation: "stale", consecutive_failures: 2 })).state).toBe("Unknown lately · no traffic observed for over 10 minutes · 2 consecutive observed failures before that");
       expect(routeHealth(health({})).state).toBe("Closed · no recent failures");
       expect(routeHealth(health({ consecutive_failures: 1 })).state).toBe("Closed · 1 consecutive observed failure");
       expect(routeHealth(health({ consecutive_failures: 2 })).state).toBe("Closed · 2 consecutive observed failures");
@@ -194,6 +195,14 @@ describe("exact micro-USD and governance forms", () => {
     it("tells a half-open route waiting for a test from one being tested", () => {
       expect(routeHealth(health({ circuit: "half_open", open_until: "2026-11-26T10:00:30Z", reopen_count: 1 }))).toMatchObject({ state: "Half-open · waiting for a request to test it", until: null });
       expect(routeHealth(health({ circuit: "half_open", open_until: "2026-11-26T10:00:30Z", probe_in_progress: true, probe_until: "2026-11-26T10:02:33Z", reopen_count: 1 }))).toMatchObject({ state: "Half-open · one request is testing it", until: { label: "Test ends by", value: "2026-11-26T10:02:33Z" } });
+    });
+    it("reads the view again when its state ends, timed by the gateway's clock", () => {
+      expect(healthRefreshDelay(health({}))).toBeNull();
+      expect(healthRefreshDelay(health({ circuit: "half_open", open_until: "2026-11-26T10:00:30Z" }))).toBeNull();
+      expect(healthRefreshDelay(health({ circuit: "open", cooling_until: "2026-11-26T10:01:41Z" }))).toBe(61_000);
+      expect(healthRefreshDelay(health({ circuit: "half_open", probe_in_progress: true, probe_until: "2026-11-26T10:00:51Z" }))).toBe(11_000);
+      // Already due when read (the view was computed just before it ended): soon, not never.
+      expect(healthRefreshDelay(health({ circuit: "open", cooling_until: "2026-11-26T10:00:40Z" }))).toBe(1_000);
     });
     it("takes the circuit from the gateway, not the browser's clock", () => {
       // A past `cooling_until` the gateway still called open stays open: the view is as of `as_of`.

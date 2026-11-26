@@ -565,6 +565,14 @@ mod db {
                 .await
                 .unwrap();
         assert!(!h.to_string().contains(&holder.to_string()));
+        let stored: Value = sqlx::query_scalar(
+            "SELECT to_jsonb(probe_until) FROM deployment_health WHERE deployment_id=$1",
+        )
+        .bind(f.deployment)
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+        assert_eq!(h["probe_until"], stored, "the slot's own end");
         assert!(h.get("probe_holder").is_none() && h.get("probe_epoch").is_none());
         // Its slot expired with nobody claiming it again: no probe in progress.
         row("UPDATE deployment_health SET probe_until=clock_timestamp()-interval '1 second' WHERE deployment_id=$1").await;

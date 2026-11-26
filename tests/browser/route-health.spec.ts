@@ -18,7 +18,7 @@ async function create(page: Page, path: string, body: unknown) {
 const later = (seconds: number) => new Date(Date.now() + seconds * 1000).toISOString();
 
 const states: { name: string; health: Record<string, unknown>; shows: string[] }[] = [
-  { name: "never observed", health: {}, shows: ["Unknown · no traffic observed yet", "Never"] },
+  { name: "never observed", health: {}, shows: ["Unknown · no traffic observed yet"] },
   { name: "stale", health: { last_observed_at: later(-1200), observation: "stale" }, shows: ["Unknown lately · no traffic observed for over 10 minutes"] },
   { name: "closed", health: { last_observed_at: later(-5), observation: "current", consecutive_failures: 1 }, shows: ["Closed · 1 consecutive observed failure"] },
   { name: "cooling down", health: { last_observed_at: later(-5), observation: "current", consecutive_failures: 3, circuit: "open", open_until: later(120), cooling_until: later(120), reopen_count: 2 }, shows: ["Cooling down · left out of routing", "Cooling until", "Backoff", "Opened 2 times since its last complete success"] },
@@ -50,6 +50,7 @@ test("a route's health reads its circuit, probe and observation in words", async
       for (const text of state.shows) await expect(section.getByText(text, { exact: false }).first(), `${state.name}: ${text}`).toBeVisible();
       await expect(section.getByText("Health observations do not establish current upstream readiness.")).toBeVisible();
       await expect(section.getByText("As of", { exact: true })).toBeVisible();
+      if (state.name === "never observed") await expect(section.getByText("Never", { exact: true })).toBeVisible();
       // The summary tile names the same state.
       await expect(page.getByRole("group", { name: "Route summary" }).getByText(state.shows[0], { exact: false })).toBeVisible();
     }
