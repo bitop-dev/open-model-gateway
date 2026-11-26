@@ -330,6 +330,18 @@ fn chat_request() -> BatchRequest {
 }
 
 #[test]
+fn a_native_line_never_carries_an_image_or_its_placeholder() {
+    let t = target("gpt-x");
+    let line = BatchRequest::Chat(crate::providers::contract::image_request(false));
+    for endpoint in [BatchEndpoint::ChatCompletions, BatchEndpoint::Responses] {
+        assert_eq!(
+            encode_native_line(&t, endpoint, "l0", &line).err(),
+            Some(InferenceError::InvalidField("image"))
+        );
+    }
+}
+
+#[test]
 fn native_lines_use_gateway_ids_and_the_upstream_model() {
     let t = target("gpt-x");
     let chat: Value = serde_json::from_slice(

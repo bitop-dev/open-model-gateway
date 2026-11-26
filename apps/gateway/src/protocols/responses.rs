@@ -212,7 +212,7 @@ fn message_content(
         Value::Array(parts) if !parts.is_empty() => parts,
         _ => return Err(InferenceError::InvalidRequest),
     };
-    let mut out: Vec<Part> = Vec::with_capacity(parts.len());
+    let mut out: Vec<Part> = Vec::new();
     for mut part in parts {
         if part["type"] == "input_image" {
             if role != Role::User {
@@ -394,6 +394,7 @@ pub async fn handle(
     };
     // Only image data may take a body past the shared text limit.
     if large.is_some_and(|Extension(large)| !large.allows(&request)) {
+        crate::metrics::METRICS.image_input_refused("too_large");
         return super::payload_too_large();
     }
     let model = request.model.clone();
@@ -674,8 +675,6 @@ fn error_response(e: InferenceError) -> Response {
 fn rejection(e: JsonRejection) -> Response {
     if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
         super::payload_too_large()
-    } else if super::hit_body_deadline(&e) {
-        super::body_timeout()
     } else {
         error_response(InferenceError::InvalidRequest)
     }

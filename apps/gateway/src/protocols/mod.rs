@@ -132,11 +132,26 @@ pub(crate) fn body_timeout() -> Response {
     )
         .into_response()
 }
-/// The rejection of a JSON body whose read hit the large-body deadline.
-pub(crate) fn hit_body_deadline(rejection: &axum::extract::rejection::JsonRejection) -> bool {
-    crate::inference::image_buffer::is_body_deadline(rejection)
+/// The answer to a large image input body whose read failed before any
+/// handler ran: the read deadline is 408, a body past its declared length
+/// 413, and anything else (the client went away mid-body) 400.
+pub(crate) fn large_body_read_failed(error: &(dyn std::error::Error + 'static)) -> Response {
+    if crate::inference::image_buffer::is_body_deadline(error) {
+        return body_timeout();
+    }
+    let mut current = Some(error);
+    while let Some(e) = current {
+        if e.is::<http_body_util::LengthLimitError>() {
+            return payload_too_large();
+        }
+        current = e.source();
+    }
+    error_with_body(
+        InferenceError::InvalidRequest,
+        openai_error_body(InferenceError::InvalidRequest),
+    )
 }
-fn payload_too_large() -> Response {
+pub(crate) fn payload_too_large() -> Response {
     (
         StatusCode::PAYLOAD_TOO_LARGE,
         axum::Json(serde_json::json!({"error":{"message":"Request body too large","type":"invalid_request_error","code":"payload_too_large","param":null}})),

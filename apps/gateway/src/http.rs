@@ -16,6 +16,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tracing::Instrument;
 use uuid::Uuid;
 
+mod image_body_scan;
 mod read_deadline;
 
 use crate::{
@@ -168,6 +169,7 @@ async fn image_input_body(
     next: Next,
 ) -> Response {
     use crate::inference::image_buffer::{Admission, LargeBody, TEXT_BODY_BYTES};
+    use crate::metrics::METRICS;
     let length = request
         .headers()
         .get(header::CONTENT_LENGTH)
@@ -179,8 +181,14 @@ async fn image_input_body(
             let body = axum::body::Body::new(http_body_util::Limited::new(body, TEXT_BODY_BYTES));
             next.run(Request::from_parts(parts, body)).await
         }
-        Admission::TooLarge => crate::protocols::image_input_too_large(),
-        Admission::Busy => crate::protocols::image_input_busy(),
+        Admission::TooLarge => {
+            METRICS.image_input_refused("too_large");
+            crate::protocols::image_input_too_large()
+        }
+        Admission::Busy => {
+            METRICS.image_input_refused("busy");
+            crate::protocols::image_input_busy()
+        }
         Admission::Large(permit) => {
             parts.extensions.insert(LargeBody(permit.length));
             let limits = buffer.limits();
@@ -190,10 +198,31 @@ async fn image_input_body(
             permit.release_after(
                 limits.body_total + request_timeout + crate::inference::SETTLEMENT_DEADLINE,
             );
+            // The body is read in full under its deadlines, and what parsing
+            // could turn into structure is measured before any parser runs
+            // (`image_body_scan`): only image data may take it past the text
+            // limit. The handler then parses these same bytes, uncopied.
             let body = axum::body::Body::new(read_deadline::ReadDeadline::new(
                 axum::body::Body::new(http_body_util::Limited::new(body, permit.length)),
                 limits,
             ));
+            let bytes = match http_body_util::BodyExt::collect(body).await {
+                Ok(collected) => collected.to_bytes(),
+                Err(error) => {
+                    let response = crate::protocols::large_body_read_failed(&error);
+                    match response.status() {
+                        StatusCode::REQUEST_TIMEOUT => METRICS.image_input_refused("timeout"),
+                        StatusCode::PAYLOAD_TOO_LARGE => METRICS.image_input_refused("too_large"),
+                        _ => {}
+                    }
+                    return response;
+                }
+            };
+            if image_body_scan::outside_images(&bytes) > TEXT_BODY_BYTES {
+                METRICS.image_input_refused("too_large");
+                return crate::protocols::payload_too_large();
+            }
+            let body = axum::body::Body::from(bytes);
             next.run(Request::from_parts(parts, body))
                 .await
                 .map(|body| {

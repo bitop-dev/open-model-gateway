@@ -132,7 +132,7 @@ fn content(
         WireContent::Parts(parts) if !parts.is_empty() => parts,
         WireContent::Parts(_) => return Err(InferenceError::InvalidRequest),
     };
-    let mut out: Vec<Part> = Vec::with_capacity(parts.len());
+    let mut out: Vec<Part> = Vec::new();
     for part in parts {
         // A file or audio reference is refused by name, whatever the part's
         // type, never dropped beside it.
@@ -318,7 +318,7 @@ impl Request {
         self.check_bounds()?;
         // One maximum for the upstream request and the admission reservation.
         let max_output_tokens = self.max_completion_tokens.or(self.max_tokens);
-        let mut messages = Vec::with_capacity(self.messages.len());
+        let mut messages = Vec::new();
         let mut images = super::image_input::Images::default();
         for wire in self.messages {
             messages.push(message(wire, &mut images)?);
@@ -351,7 +351,6 @@ pub async fn handle(
         Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
             return super::payload_too_large();
         }
-        Err(rejection) if super::hit_body_deadline(&rejection) => return super::body_timeout(),
         Err(_) => return error_response(InferenceError::InvalidRequest),
     };
     if !client::valid_openai_metadata(wire.metadata.as_ref()) {
@@ -371,6 +370,7 @@ pub async fn handle(
     };
     // Only image data may take a body past the shared text limit.
     if large.is_some_and(|Extension(large)| !large.allows(&request)) {
+        crate::metrics::METRICS.image_input_refused("too_large");
         return super::payload_too_large();
     }
     let model = request.model.clone();

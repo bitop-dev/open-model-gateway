@@ -141,6 +141,31 @@ impl Metrics {
         self.audit_export_oldest.set(oldest_seconds);
     }
 
+    /// The image input buffer's in-use gauge and its configured size
+    /// (`inference::image_buffer::ImageBuffer`).
+    pub(crate) fn image_input_buffer(&self) -> (Gauge, Gauge) {
+        (
+            self.image_input.in_use.clone(),
+            self.image_input.size.clone(),
+        )
+    }
+
+    /// One large image input body refused: `busy`, `too_large` or `timeout`.
+    pub(crate) fn image_input_refused(&self, reason: &'static str) {
+        self.image_input
+            .refusals
+            .get_or_create(&[("reason", reason.to_owned())])
+            .inc();
+    }
+
+    /// Large image input bodies refused so far for one reason (tests).
+    pub fn image_input_refusal_count(&self, reason: &str) -> u64 {
+        self.image_input
+            .refusals
+            .get_or_create(&[("reason", reason.to_owned())])
+            .get()
+    }
+
     pub(crate) fn egress_denied(&self, purpose: &'static str) {
         self.egress_denied
             .get_or_create(&[("purpose", purpose.to_owned())])

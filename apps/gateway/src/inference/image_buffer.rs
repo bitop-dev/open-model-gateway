@@ -14,6 +14,7 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, ensure};
+use prometheus_client::metrics::gauge::Gauge;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Bodies up to this size are the shared text limit, outside the budget.
@@ -166,7 +167,7 @@ impl LargeBody {
 /// the latest, when [`BufferPermit::release_after`]'s time has passed (a
 /// response nobody reads must not keep it).
 pub struct BufferPermit {
-    slot: Arc<std::sync::Mutex<Option<OwnedSemaphorePermit>>>,
+    slot: Arc<std::sync::Mutex<Option<Share>>>,
     timer: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The declared length the body is held to.
     pub length: usize,
@@ -188,6 +189,18 @@ impl BufferPermit {
         {
             earlier.abort();
         }
+    }
+}
+/// A taken share: its permits, and its bytes on the in-use gauge until it
+/// is returned (on drop, whichever of the permit and its timer returns it).
+struct Share {
+    _permit: OwnedSemaphorePermit,
+    bytes: i64,
+    in_use: Gauge,
+}
+impl Drop for Share {
+    fn drop(&mut self) {
+        self.in_use.dec_by(self.bytes);
     }
 }
 impl Drop for BufferPermit {
@@ -217,15 +230,23 @@ pub struct ImageBuffer {
     permits: Arc<Semaphore>,
     total_mib: usize,
     limits: ImageInputLimits,
+    in_use: Gauge,
 }
 
 impl ImageBuffer {
+    /// The replica's buffer, reported on `gateway_image_input_buffer_*`.
     pub fn new(limits: ImageInputLimits) -> Self {
+        let (in_use, size) = crate::metrics::METRICS.image_input_buffer();
+        Self::with_gauges(limits, in_use, &size)
+    }
+    fn with_gauges(limits: ImageInputLimits, in_use: Gauge, size: &Gauge) -> Self {
         let total_mib = limits.buffer_bytes / MIB;
+        size.set(i64::try_from(total_mib * MIB).unwrap_or(i64::MAX));
         Self {
             permits: Arc::new(Semaphore::new(total_mib)),
             total_mib,
             limits,
+            in_use,
         }
     }
     pub fn limits(&self) -> ImageInputLimits {
@@ -254,7 +275,15 @@ impl ImageBuffer {
         };
         match self.permits.clone().try_acquire_many_owned(count) {
             Ok(permit) => Admission::Large(BufferPermit {
-                slot: Arc::new(std::sync::Mutex::new(Some(permit))),
+                slot: Arc::new(std::sync::Mutex::new(Some({
+                    let bytes = i64::try_from(mib * MIB).unwrap_or(i64::MAX);
+                    self.in_use.inc_by(bytes);
+                    Share {
+                        _permit: permit,
+                        bytes,
+                        in_use: self.in_use.clone(),
+                    }
+                }))),
                 timer: std::sync::Mutex::new(None),
                 length,
             }),
@@ -315,6 +344,35 @@ mod tests {
         assert_eq!(b.available_mib(), 4, "returned though the permit is alive");
         drop(permit);
         assert_eq!(b.available_mib(), 4, "never returned twice");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_in_use_gauge_follows_each_share_back_to_zero() {
+        let (in_use, size) = (Gauge::default(), Gauge::default());
+        let limits = ImageInputLimits {
+            buffer_bytes: 8 * MIB,
+            ..ImageInputLimits::default()
+        };
+        let b = ImageBuffer::with_gauges(limits, in_use.clone(), &size);
+        assert_eq!(size.get(), 8 * MIB as i64);
+        let take = |length: usize| match b.admit(Some(length as u64)) {
+            Admission::Large(permit) => permit,
+            _ => panic!("admitted"),
+        };
+        // Declared lengths, rounded up to whole MiB.
+        let dropped = take(3 * MIB);
+        let timed = take(2 * MIB + 1);
+        assert_eq!(in_use.get(), 6 * MIB as i64);
+        assert!(matches!(b.admit(Some(3 * MIB as u64)), Admission::Busy));
+        assert_eq!(in_use.get(), 6 * MIB as i64, "a refusal takes nothing");
+        drop(dropped);
+        assert_eq!(in_use.get(), 3 * MIB as i64);
+        // Returned by its hold limit, then dropped: counted off once.
+        timed.release_after(Duration::from_secs(5));
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert_eq!(in_use.get(), 0);
+        drop(timed);
+        assert_eq!(in_use.get(), 0);
     }
 
     #[tokio::test(start_paused = true)]

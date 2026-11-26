@@ -334,7 +334,7 @@ async fn authentication_and_the_budget_run_before_any_body_byte_is_read(pool: Pg
     )
     .await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{value}");
-    // A large text-only body is still refused (after parsing).
+    // A large text-only body is still refused, before any parse.
     let text = json!({"model":"company/smart","max_tokens":16,"messages":[{"role":"user","content":"x".repeat(3 * MIB)}]});
     let (status, _, value, _) = send(
         &w,
@@ -622,4 +622,168 @@ async fn a_trickled_large_body_is_cut_by_the_rate_floor(pool: PgPool) {
     // The 128 KiB allowance lasts 2 s at this floor of 64 KiB/s.
     assert!(started.elapsed() < std::time::Duration::from_secs(4));
     assert_eq!(executions(&w).await, 0);
+}
+
+/// `item` repeated, comma-separated, to about `bytes`.
+fn repeated(item: &str, bytes: usize) -> String {
+    vec![item; bytes / (item.len() + 1)].join(",")
+}
+
+#[dbtest::test]
+async fn structure_past_the_text_limit_is_refused_before_any_parse(pool: PgPool) {
+    use crate::metrics::METRICS;
+    let w = world(
+        pool,
+        ImageInputLimits {
+            body_bytes: 8 * MIB,
+            buffer_bytes: 8 * MIB,
+            ..ImageInputLimits::default()
+        },
+        true,
+    )
+    .await;
+    allow_images(&w, true).await;
+    let size = 3 * MIB;
+    let chat = |tail: String| {
+        format!(
+            r#"{{"model":"company/smart","messages":[{{"role":"user","content":"hi"}}],{tail}}}"#
+        )
+    };
+    // Bodies a parse would turn into trees many times their size.
+    let hostile = [
+        (
+            "/v1/responses",
+            format!(
+                r#"{{"model":"company/smart","input":[{}]}}"#,
+                repeated(r#"{"a":0}"#, size)
+            ),
+        ),
+        (
+            "/v1/chat/completions",
+            chat(format!(r#""tool_choice":[{}]"#, repeated("0", size))),
+        ),
+        (
+            "/v1/chat/completions",
+            format!(
+                r#"{{"model":"company/smart","messages":[{}]}}"#,
+                repeated(r#"{"role":"user"}"#, size)
+            ),
+        ),
+        // Image-looking strings outside any image: at most twenty are set
+        // aside, so thousands of small ones do not lift the bound.
+        (
+            "/v1/chat/completions",
+            chat(format!(
+                r#""tool_choice":[{}]"#,
+                repeated(r#""data:image/png;base64,AAAA""#, size)
+            )),
+        ),
+    ];
+    for (path, body) in hostile {
+        // With a trailing byte the body is not JSON: a parse would answer
+        // 400, so a 413 shows the bound refused it before any parser ran.
+        for tail in ["", "x"] {
+            let body = format!("{body}{tail}").into_bytes();
+            assert!(body.len() > size - 64 && body.len() <= 4 * MIB);
+            let before = METRICS.image_input_refusal_count("too_large");
+            let (status, _, value, pulled) =
+                send(&w, path, Some(&w.token), body.clone(), true).await;
+            assert_eq!(
+                status,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "{path}{tail}: {value}"
+            );
+            assert_eq!(value["error"]["code"], "payload_too_large");
+            assert_eq!(pulled, body.len());
+            assert!(METRICS.image_input_refusal_count("too_large") > before);
+        }
+    }
+    assert_eq!(executions(&w).await, 0);
+    assert!(w.upstream.bodies.lock().unwrap().is_empty());
+    // A large image request passes, also with every `/` escaped as JSON
+    // allows (`\/`, as some encoders write it).
+    let image = serde_json::to_vec(&chat_body(&png_url(4 * MIB, "l"), false)).unwrap();
+    assert!(image.len() > 5 * MIB);
+    let escaped = String::from_utf8(image.clone())
+        .unwrap()
+        .replace('/', "\\/")
+        .into_bytes();
+    for body in [image, escaped] {
+        let (status, _, value, _) =
+            send(&w, "/v1/chat/completions", Some(&w.token), body, true).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+    }
+    assert_eq!(executions(&w).await, 2);
+}
+
+#[dbtest::test]
+async fn every_large_body_refusal_is_counted_by_reason(pool: PgPool) {
+    use crate::metrics::METRICS;
+    let w = world(
+        pool,
+        ImageInputLimits {
+            body_bytes: 8 * MIB,
+            buffer_bytes: 4 * MIB,
+            body_idle: std::time::Duration::from_secs(2),
+            body_total: std::time::Duration::from_secs(10),
+            body_min_rate: crate::inference::image_buffer::BODY_MIN_RATE,
+        },
+        true,
+    )
+    .await;
+    allow_images(&w, true).await;
+    let count = |reason| METRICS.image_input_refusal_count(reason);
+    // too_large: over the route cap, from the header alone.
+    let before = count("too_large");
+    let (status, _, _, _) = send(
+        &w,
+        "/v1/chat/completions",
+        Some(&w.token),
+        vec![b' '; 9 * MIB],
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(count("too_large") > before);
+    // A stalled body holds 3 of the 4 MiB until its idle bound.
+    let body = serde_json::to_vec(&chat_body(&png_url(2 * MIB + MIB / 4, "c"), false)).unwrap();
+    let first = Bytes::copy_from_slice(&body[..body.len() / 2]);
+    let stalled = Body::from_stream(
+        futures_util::stream::once(async move { Ok::<_, std::convert::Infallible>(first) })
+            .chain(futures_util::stream::pending()),
+    );
+    let (timeouts, busy) = (count("timeout"), count("busy"));
+    let held = tokio::spawn(
+        w.router.clone().oneshot(
+            Request::post("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::CONTENT_LENGTH, body.len())
+                .header(header::AUTHORIZATION, format!("Bearer {}", w.token))
+                .body(stalled)
+                .unwrap(),
+        ),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // busy: the rest of the buffer is too small for a second one.
+    let (status, retry, _, pulled) = send(
+        &w,
+        "/v1/chat/completions",
+        Some(&w.token),
+        body.clone(),
+        true,
+    )
+    .await;
+    assert_eq!(
+        (status, retry.as_deref(), pulled),
+        (StatusCode::SERVICE_UNAVAILABLE, Some("1"), 0)
+    );
+    assert!(count("busy") > busy);
+    // timeout: the stalled body reaches its idle bound.
+    let response = tokio::time::timeout(std::time::Duration::from_secs(8), held)
+        .await
+        .expect("the idle bound ends it")
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    assert!(count("timeout") > timeouts);
 }
