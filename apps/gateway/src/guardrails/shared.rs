@@ -87,6 +87,10 @@ pub async fn detectors(effective: &[EffectiveRule]) -> Result<HashMap<Uuid, Comp
         };
         let set = e.rule_set_id;
         let cell = cell((set, e.revision, e.id));
+        if let Some(compiled) = cell.get() {
+            out.insert(e.id, compiled.clone());
+            continue;
+        }
         let compiled = tokio::spawn(async move {
             cell.get_or_try_init(|| async move {
                 let wait = deadline.saturating_duration_since(tokio::time::Instant::now());

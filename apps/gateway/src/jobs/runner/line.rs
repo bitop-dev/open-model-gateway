@@ -198,11 +198,15 @@ impl LineRun {
     /// Run a claimed line (its `batch_lines` row exists) on its pinned route.
     pub(super) async fn run(
         &self,
-        n: i32,
-        raw: Vec<u8>,
-        mut execution: Uuid,
+        Head {
+            n,
+            raw,
+            mut execution,
+            ..
+        }: Head,
         mut pin: Option<Pin>,
         records: mpsc::Sender<Record>,
+        mut workers: Workers,
     ) {
         // The probe slot dispatch claimed for this line is freed if the line
         // ends before its attempt reaches the engine (an unparseable line, or
@@ -233,7 +237,7 @@ impl LineRun {
             }
         };
         let model = line.request.model().to_owned();
-        let (mut attempt, mut unscanned): (i16, u32) = (1, 0);
+        let mut attempt: i16 = 1;
         loop {
             let result = self
                 .execute(line.request.clone(), execution, pin, line.plan)
@@ -260,7 +264,7 @@ impl LineRun {
                     }
                     return;
                 }
-                Err(e) if self.rescan_later(e, &mut unscanned, &mut pin).await => {}
+                Err(e) if self.rescan_later(e, &mut pin, &mut workers).await => {}
                 Err(e) => {
                     // Busy from an ungated refusal (`LineRepository::refuse_ungated`)
                     // never reached a provider: only a
@@ -326,20 +330,29 @@ impl LineRun {
     async fn rescan_later(
         &self,
         e: InferenceError,
-        tries: &mut u32,
         pin: &mut Option<Pin>,
+        workers: &mut Workers,
     ) -> bool {
-        if !guardrail_busy(e) || *tries >= GUARDRAIL_TRIES || self.state.should_stop(&self.job) {
+        let tries = &mut workers.rescans;
+        let limit = match rescan_cause(e) {
+            Some(Rescan::Busy) => GUARDRAIL_TRIES,
+            Some(Rescan::Spent) => SPENT_TRIES,
+            None => return false,
+        };
+        if *tries >= limit || self.state.should_stop(&self.job) {
             return false;
         }
         let seconds = e.retry_after_seconds().unwrap_or(1) << (*tries).min(5);
         *tries += 1;
+        // The worker permits go back while the line waits: a waiting line
+        // never keeps other lines (of any batch) from running.
+        workers.held = None;
         tokio::time::sleep(std::time::Duration::from_secs(
             seconds.min(GUARDRAIL_RETRY_CAP).into(),
         ))
         .await;
         // A batch stopped meanwhile (cancelled, expired, lost) runs nothing more.
-        if self.state.should_stop(&self.job) {
+        if self.state.should_stop(&self.job) || !workers.reacquire().await {
             return false;
         }
         // The dispatch's probe slot was the first try's.
@@ -549,25 +562,73 @@ impl LineRun {
     }
 }
 
-/// Tries of a line the guardrail step could not inspect now, and the
-/// longest wait between two (seconds): about a minute in all, during which
-/// the line keeps its worker.
+/// Tries of a line the guardrail step could not inspect now, of one whose
+/// custom-pattern budget ran out, and the longest wait between two
+/// (seconds): about a minute in all, without the line's worker permits.
 const GUARDRAIL_TRIES: u32 = 10;
+const SPENT_TRIES: u32 = 2;
 const GUARDRAIL_RETRY_CAP: u32 = 8;
 
-/// A guardrail refusal that says nothing about the line: the step could not
-/// run now (no scan or compile slot was free, the policy was not loaded). A
-/// spent custom-pattern budget is the line's own input and is not retried.
-fn guardrail_busy(e: InferenceError) -> bool {
-    matches!(
-        e,
-        InferenceError::GuardrailUnavailable
-            | InferenceError::Guardrail(crate::guardrails::enforce::Refusal {
-                kind: crate::guardrails::enforce::RefusalKind::Unavailable,
-                scanned: false,
-                ..
-            })
-    )
+/// Why a guardrail refusal of a line may be tried again.
+#[derive(Debug, PartialEq, Eq)]
+enum Rescan {
+    /// Nothing could be scanned now (no scan or compile slot, the policy not
+    /// loaded): the refusal says nothing about the line, and wrote no row.
+    Busy,
+    /// The custom-pattern budget ran out: a wall-clock budget, which a busy
+    /// replica can exhaust too, so a line gets two more tries (each writes
+    /// its decisions again).
+    Spent,
+}
+fn rescan_cause(e: InferenceError) -> Option<Rescan> {
+    use crate::guardrails::enforce::{Refusal, RefusalKind};
+    match e {
+        InferenceError::GuardrailUnavailable => Some(Rescan::Busy),
+        InferenceError::Guardrail(Refusal {
+            kind: RefusalKind::Unavailable,
+            scanned,
+            ..
+        }) => Some(if scanned { Rescan::Spent } else { Rescan::Busy }),
+        _ => None,
+    }
+}
+
+/// A line's per-batch and process worker permits, given back while the line
+/// waits to be inspected again, and how often it was.
+pub(super) struct Workers {
+    rescans: u32,
+    held: Option<(
+        tokio::sync::OwnedSemaphorePermit,
+        tokio::sync::OwnedSemaphorePermit,
+    )>,
+    per_batch: Arc<tokio::sync::Semaphore>,
+    pool: Arc<tokio::sync::Semaphore>,
+}
+impl Workers {
+    pub(super) fn new(
+        permits: (
+            tokio::sync::OwnedSemaphorePermit,
+            tokio::sync::OwnedSemaphorePermit,
+        ),
+    ) -> Self {
+        Self {
+            rescans: 0,
+            per_batch: Arc::clone(permits.0.semaphore()),
+            pool: Arc::clone(permits.1.semaphore()),
+            held: Some(permits),
+        }
+    }
+    /// Both permits again, in dispatch's order; `false` if closed.
+    async fn reacquire(&mut self) -> bool {
+        let Ok(local) = Arc::clone(&self.per_batch).acquire_owned().await else {
+            return false;
+        };
+        let Ok(global) = Arc::clone(&self.pool).acquire_owned().await else {
+            return false;
+        };
+        self.held = Some((local, global));
+        true
+    }
 }
 
 #[cfg(test)]
@@ -588,14 +649,21 @@ mod guardrail_busy_tests {
     }
 
     #[test]
-    fn only_a_refusal_that_scanned_nothing_is_retried() {
-        assert!(guardrail_busy(refusal(RefusalKind::Unavailable, false)));
-        assert!(guardrail_busy(InferenceError::GuardrailUnavailable));
-        // A spent budget is the line's own input; a block or a detector
+    fn only_a_refusal_that_could_not_finish_is_tried_again() {
+        let busy = |e| rescan_cause(e) == Some(Rescan::Busy);
+        assert!(busy(refusal(RefusalKind::Unavailable, false)));
+        assert!(busy(InferenceError::GuardrailUnavailable));
+        // A spent (wall-clock) budget gets a few tries; a block or a detector
         // failure is a decision.
-        assert!(!guardrail_busy(refusal(RefusalKind::Unavailable, true)));
-        assert!(!guardrail_busy(refusal(RefusalKind::InputBlocked, true)));
-        assert!(!guardrail_busy(refusal(RefusalKind::DetectorFailed, false)));
-        assert!(!guardrail_busy(InferenceError::GuardrailThrottled(5)));
+        assert_eq!(
+            rescan_cause(refusal(RefusalKind::Unavailable, true)),
+            Some(Rescan::Spent)
+        );
+        assert_eq!(rescan_cause(refusal(RefusalKind::InputBlocked, true)), None);
+        assert_eq!(
+            rescan_cause(refusal(RefusalKind::DetectorFailed, false)),
+            None
+        );
+        assert_eq!(rescan_cause(InferenceError::GuardrailThrottled(5)), None);
     }
 }

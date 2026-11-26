@@ -27,7 +27,7 @@ pub(super) enum Planned {
 /// The next line of a lane, read and planned.
 pub(super) struct Head {
     pub(super) n: i32,
-    raw: Vec<u8>,
+    pub(super) raw: Vec<u8>,
     pub(super) execution: Uuid,
     pub(super) request: Option<BatchRequest>,
     pub(super) plan: Option<lines::LinePlan>,
@@ -196,8 +196,7 @@ pub(super) fn spawn_line(
 ) {
     let (line, records) = (line.clone(), records.clone());
     tasks.spawn(async move {
-        let _permits = permits;
-        line.run(head.n, head.raw, head.execution, pin, records)
+        line.run(head, pin, records, super::line::Workers::new(permits))
             .await;
     });
 }
