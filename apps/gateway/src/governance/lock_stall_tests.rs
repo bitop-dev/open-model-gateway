@@ -93,6 +93,7 @@ impl Drop for Harness {
 }
 
 /// What the scenario needs from the test runtime's setup.
+#[derive(Clone)]
 struct Setup {
     options: sqlx::postgres::PgConnectOptions,
     user: Uuid,
@@ -535,6 +536,7 @@ async fn cold_buckets(setup: Setup) {
     // what is compared. It therefore does not show whether the production
     // bound would shed a burst; how many requests took longer than that
     // bound is printed per burst instead, a measurement of the runner.
+    let again = setup.clone();
     let h = harness(setup, 0, 1, GUARD).await;
     commit_latency(&h.owner).await;
     // A discarded first burst on a scope of its own: the first burst of a
@@ -605,6 +607,24 @@ async fn cold_buckets(setup: Setup) {
         ((BURST + 1 + 2 * ROUNDS * BURST) as i64, 0),
         "every burst request settled"
     );
+    // A measurement, never asserted: a new gateway on the same database (its
+    // own pool, store and engine, as a restarted replica on a direct
+    // connection), its first burst and a later one, each on a scope of its
+    // own. A new backend's first executions plan and run slower, inside the
+    // section where one scope's admissions serialize, so the first burst is
+    // slower; how many requests took longer than the production bound is
+    // printed with it.
+    let fresh = harness(again, 0, 1, GUARD).await;
+    for label in ["new_gateway_first", "new_gateway_later"] {
+        let (_, key) = new_scope(&fresh).await;
+        let (mut latencies, _) = burst(&fresh, &key, BURST).await;
+        eprintln!(
+            "lock_stall cold_bucket round={label} requests={BURST} p50_ms={} max_ms={} latency_over_admission_bound={}",
+            ms(quantile(&mut latencies, 0.5)),
+            ms(quantile(&mut latencies, 1.0)),
+            over_bound(&latencies)
+        );
+    }
 }
 
 /// Requests of a burst whose whole latency exceeded the production admission

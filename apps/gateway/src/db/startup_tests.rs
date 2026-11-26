@@ -225,15 +225,27 @@ async fn serve_opens_every_connection_of_its_pool_before_listening(pool: PgPool)
 
 /// The cached failure reaches some of the pool's connections (one of two
 /// Pooler instances): the whole open is tried again, keeping those already
-/// open, until every connection is open. Every connection that reaches the
-/// pooler is one it refused or one the pool keeps: `connections + refused`
-/// in all (a fresh pool per attempt would open the kept ones again).
+/// open, until every connection is open.
+///
+/// Refused at login, a connection never enters the pool, so nothing else
+/// opens one: every connection that reaches the pooler is one it refused or
+/// one the pool keeps, `connections + refused` in all (a fresh pool per
+/// attempt would open the kept ones again), which is what shows the open
+/// keeps the connections that answered. Refused at its first query, the
+/// connection was in the pool, and sqlx also opens a replacement for it in
+/// the background (the pool's minimum is its maximum), as the next attempt
+/// may: how many are opened then depends on timing, so the count is a lower
+/// bound (each refused connection was replaced) and the pool ends whole.
 async fn waited_out_until_whole(pool: &PgPool, connections: u32, refused: usize, refuse: Refuse) {
     let (result, seen, elapsed) =
         through_front_refusing(pool, connections, refused, CACHED, WINDOW, refuse).await;
     let serving = result.expect("the whole pool opened once the pooler forwards");
     all_open_and_idle(&serving, connections).await;
-    assert_eq!(seen, connections as usize + refused, "connections opened");
+    let kept = connections as usize + refused;
+    match refuse {
+        Refuse::AtLogin => assert_eq!(seen, kept, "connections opened"),
+        Refuse::AtFirstQuery => assert!(seen >= kept, "connections opened: {seen}"),
+    }
     assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");
     let one: i32 = sqlx::query_scalar("SELECT 1")
         .fetch_one(&serving)

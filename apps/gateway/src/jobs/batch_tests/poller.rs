@@ -121,8 +121,7 @@ async fn a_poller_that_lost_its_claim_writes_nothing_and_removes_its_result_file
     };
     held.entered.notified().await;
     // A stalls past its lease: poller B takes the batch over and collects it.
-    lapse(&w, &job).await;
-    assert_eq!(w.jobs.poll_once().await.unwrap(), 1);
+    assert_eq!(poll_taking_over(&w, &job).await, 1);
     let collected = w.reload(&job).await;
     assert_eq!(collected.state, "completed");
     assert!(collected.settled_at.is_some());
@@ -173,9 +172,8 @@ async fn a_poller_that_lost_its_claim_never_overwrites_newer_progress(pool: PgPo
         tokio::spawn(async move { jobs.poll_once().await })
     };
     held.entered.notified().await;
-    lapse(&w, &job).await;
     // B takes the batch over and records two.
-    assert_eq!(w.jobs.poll_once().await.unwrap(), 1);
+    assert_eq!(poll_taking_over(&w, &job).await, 1);
     assert_eq!(w.reload(&job).await.request_completed, Some(2));
     held.release.notify_one();
     a.await.unwrap().unwrap();
@@ -201,6 +199,31 @@ async fn take_over(w: &World, job: &JobRow, owner: Uuid) -> BatchFence {
         }
     }
     panic!("the batch was never taken over");
+}
+
+/// Another poller takes the batch over through a whole poll pass, as the
+/// poller loop does: the holder (still running) renews on its own schedule
+/// and a claim skips a job row another transaction holds, so the lease is
+/// lapsed before each pass, and a pass is repeated only while it did not
+/// claim the batch (its claim epoch is unchanged). A pass that claimed it
+/// and still refreshed nothing is returned as it is. The jobs that pass
+/// refreshed.
+async fn poll_taking_over(w: &World, job: &JobRow) -> usize {
+    let epoch = || {
+        sqlx::query_scalar::<_, i64>("SELECT runner_epoch FROM async_jobs WHERE id=$1")
+            .bind(job.id)
+            .fetch_one(&w.f.store.pool)
+    };
+    for _ in 0..50 {
+        lapse(w, job).await;
+        let before = epoch().await.unwrap();
+        let polled = w.jobs.poll_once().await.unwrap();
+        if polled > 0 || epoch().await.unwrap() != before {
+            return polled;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    0
 }
 
 /// The claim columns of the job row (timestamps as text, compared exactly).
@@ -336,8 +359,7 @@ async fn a_terminal_unsettled_batch_is_collected_again_without_new_links(pool: P
     assert_eq!(linked.len(), 2);
     // A's lease lapses: B collects the batch again, keeps A's links,
     // deletes its own result files and settles.
-    lapse(&w, &job).await;
-    assert_eq!(w.jobs.poll_once().await.unwrap(), 1);
+    assert_eq!(poll_taking_over(&w, &job).await, 1);
     let second = w.reload(&job).await;
     assert_eq!(
         (second.output_file_id, second.error_file_id),
@@ -474,6 +496,8 @@ async fn a_submission_that_fails_after_its_claim_ended_writes_and_settles_nothin
     // The poller that holds the batch ends it interrupted after the grace,
     // with the hold kept as unknown cost.
     w.jobs.submit_grace = TimeDelta::minutes(0);
+    // Nothing renews here (the first poller has returned, the holder is a
+    // bare claim): one pass must take the batch.
     lapse(&w, &job).await;
     assert_eq!(w.jobs.poll_once().await.unwrap(), 1);
     let ended = w.reload(&job).await;
@@ -513,8 +537,7 @@ async fn a_collected_batch_is_counted_once_however_often_it_is_collected(pool: P
         tokio::spawn(async move { jobs.poll_once().await })
     };
     w.jobs.settle_hold.reached().await;
-    lapse(&w, &job).await;
-    assert_eq!(w.jobs.poll_once().await.unwrap(), 1);
+    assert_eq!(poll_taking_over(&w, &job).await, 1);
     w.jobs.settle_hold.release();
     a.await.unwrap().unwrap();
     assert!(w.reload(&job).await.settled_at.is_some());
@@ -547,8 +570,7 @@ async fn a_finished_batch_with_aggregate_usage_settles_without_a_second_download
     };
     w.jobs.settle_hold.reached().await;
     let downloads = count(&w.openai.calls(), "results");
-    lapse(&w, &job).await;
-    assert_eq!(w.jobs.poll_once().await.unwrap(), 1);
+    assert_eq!(poll_taking_over(&w, &job).await, 1);
     assert_eq!(
         count(&w.openai.calls(), "results"),
         downloads,
@@ -585,8 +607,7 @@ async fn a_late_accepted_submission_is_counted_not_recorded_on_an_ended_batch(po
     held.entered.notified().await;
     // A's lease lapses while its submission is in flight; B ends the batch
     // as interrupted (the grace has passed) and settles it.
-    lapse(&w, &job).await;
-    w.jobs.poll_once().await.unwrap();
+    assert_eq!(poll_taking_over(&w, &job).await, 1);
     let ended = w.reload(&job).await;
     assert_eq!(
         (ended.state.as_str(), ended.error_code.as_deref()),
