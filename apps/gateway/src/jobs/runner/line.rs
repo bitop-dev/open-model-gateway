@@ -18,6 +18,20 @@ pub(super) enum Stop {
     Lost,
 }
 
+/// How a line the stop left unrun is reported (also a line its batch stopped
+/// while it waited to be inspected again).
+impl From<Stop> for NotRun {
+    fn from(stop: Stop) -> Self {
+        match stop {
+            Stop::Cancelled => NotRun::Cancelled,
+            Stop::Expired => NotRun::Expired,
+            Stop::Budget => NotRun::BudgetExceeded,
+            Stop::HoldUnavailable => NotRun::HoldUnavailable,
+            Stop::Lost => NotRun::Failed,
+        }
+    }
+}
+
 pub(super) struct RunState {
     /// This run's claim of the batch; every write it makes carries it.
     pub(super) fence: BatchFence,
@@ -387,7 +401,12 @@ impl LineRun {
             Some(Rescan::Spent) => (&mut workers.spent, SPENT_TRIES),
             None => return false,
         };
-        if *tries >= limit || self.state.should_stop(&self.job) {
+        // A batch that stopped meanwhile reports the line as not run.
+        if let Some(stop) = self.state.stop_reason(&self.job) {
+            workers.stopped = Some(NotRun::from(stop));
+            return true;
+        }
+        if *tries >= limit {
             return false;
         }
         let seconds = e.retry_after_seconds().unwrap_or(1) << (*tries).min(5);
@@ -404,23 +423,14 @@ impl LineRun {
         // A batch stopped during the wait, or while the line waited for its
         // worker, runs nothing more (cancelled, expired, its budget spent,
         // lost): the line is reported as not run.
-        let stopped = |runner: &Self| {
-            runner
-                .state
-                .stop_reason(&runner.job)
-                .map(|stop| match stop {
-                    Stop::Cancelled => NotRun::Cancelled,
-                    Stop::Expired => NotRun::Expired,
-                    Stop::Budget => NotRun::BudgetExceeded,
-                    Stop::HoldUnavailable => NotRun::HoldUnavailable,
-                    Stop::Lost => NotRun::Failed,
-                })
-        };
-        workers.stopped = stopped(self);
-        if workers.stopped.is_none() && workers.reacquire().await {
-            workers.stopped = stopped(self);
-        } else if workers.stopped.is_none() {
-            workers.stopped = Some(NotRun::Failed);
+        workers.stopped = self.state.stop_reason(&self.job).map(NotRun::from);
+        if workers.stopped.is_none() {
+            // The pools are never closed; were one, the line would fail with
+            // its guardrail error, as before the wait.
+            if !workers.reacquire().await {
+                return false;
+            }
+            workers.stopped = self.state.stop_reason(&self.job).map(NotRun::from);
         }
         if workers.stopped.is_some() {
             return true;
