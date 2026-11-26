@@ -38,6 +38,9 @@ gateway_history_partition_months_ahead gauge table System
 gateway_history_verify_findings gauge - System
 gateway_http_request_duration_seconds histogram method,route Traffic
 gateway_http_requests counter method,route,status Traffic
+gateway_image_input_buffer_bytes gauge - System
+gateway_image_input_buffer_in_use_bytes gauge - System
+gateway_image_input_refusals counter reason Traffic
 gateway_inference_attempt_errors counter code,provider Traffic
 gateway_inference_attempts counter model,outcome,provider Traffic
 gateway_inference_tokens counter direction,model,provider Traffic

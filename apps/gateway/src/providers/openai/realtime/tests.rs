@@ -17,6 +17,7 @@ impl SecretResolver for Resolver {
 }
 fn target() -> Deployment {
     Deployment {
+        image_input: false,
         id: uuid::Uuid::new_v4(),
         provider: "openai".into(),
         upstream_model: UPSTREAM_MODEL.into(),

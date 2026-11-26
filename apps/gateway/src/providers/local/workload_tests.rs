@@ -83,6 +83,7 @@ impl Mock {
     }
     fn target(&self, profile: Profile, protocol: &str) -> Deployment {
         Deployment {
+            image_input: false,
             id: uuid::Uuid::new_v4(),
             provider: profile.id().into(),
             upstream_model: "private".into(),
@@ -596,6 +597,7 @@ async fn dropping_rerank_or_systemone_cancels_the_upstream_body() {
             Arc::new(ApprovedEndpoints::for_test(&base)),
         ));
         let target = Deployment {
+            image_input: false,
             id: uuid::Uuid::new_v4(),
             provider: "openai_compatible".into(),
             upstream_model: "private".into(),

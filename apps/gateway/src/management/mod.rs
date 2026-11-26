@@ -17,6 +17,7 @@ mod compare;
 mod deployment_bulk;
 mod deployment_configuration;
 mod deployment_history;
+mod deployment_image_input;
 mod directory;
 mod errors;
 mod files;

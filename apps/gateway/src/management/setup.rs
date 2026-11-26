@@ -68,6 +68,7 @@ async fn model_setup(
             provider_connection_id: b.route.provider_connection_id,
             upstream_model: b.route.upstream_model,
             enabled: b.route.enabled,
+            image_input: false,
         },
     )
     .await?;

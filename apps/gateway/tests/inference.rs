@@ -45,6 +45,7 @@ impl ProviderAdapter for FixtureAdapter {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            image_input: false,
             text_chat: true,
             streaming: true,
             tools: true,
@@ -180,11 +181,12 @@ impl ProviderAdapter for FixtureAdapter {
         open_model_gateway::inference::dispatch::started();
         self.calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(target.upstream_model, "private-upstream-id");
-        if request
-            .messages
-            .iter()
-            .any(|m| m.content.as_deref() == Some("wait-for-price"))
-        {
+        if request.messages.iter().any(|m| {
+            m.content
+                .as_ref()
+                .and_then(open_model_gateway::inference::types::Content::text)
+                == Some("wait-for-price")
+        }) {
             self.started.notify_one();
             self.release.notified().await;
         }

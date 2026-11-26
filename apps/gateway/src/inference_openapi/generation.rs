@@ -17,13 +17,25 @@ pub(super) const CANCELLATION_TESTS: &[(&str, &str)] = &[
     ),
 ];
 
+/// The generation routes whose inline images may take a body past the
+/// shared text limit (`http.rs` `image_input_routes`).
+pub(super) const IMAGE_INPUT_PATHS: &[&str] = &["/v1/chat/completions", "/v1/responses"];
+
 pub(super) fn validate_request(
     document: &serde_json::Value,
     path: &str,
     body: &serde_json::Value,
 ) -> anyhow::Result<()> {
+    use crate::inference::image_buffer::{ImageInputLimits, LargeBody, TEXT_BODY_BYTES};
+    // A body past the text limit is accepted only on the image input routes,
+    // within their default cap, and only for image data (`image_input_body`
+    // in http.rs, then `LargeBody::allows` in the handler).
+    let bytes = serde_json::to_vec(body)?.len();
+    let large = bytes > TEXT_BODY_BYTES;
     anyhow::ensure!(
-        serde_json::to_vec(body)?.len() <= 2 * 1024 * 1024,
+        !large
+            || (IMAGE_INPUT_PATHS.contains(&path)
+                && bytes <= ImageInputLimits::default().body_bytes),
         "generation JSON body cap"
     );
     let schema = &document["paths"][path]["post"]["x-omg-request-schema"];
@@ -45,7 +57,11 @@ pub(super) fn validate_request(
         }
         _ => anyhow::bail!("unknown generation route"),
     };
-    parsed.map_err(|_| anyhow::anyhow!("generation request semantic constraint"))?;
+    let parsed = parsed.map_err(|_| anyhow::anyhow!("generation request semantic constraint"))?;
+    anyhow::ensure!(
+        !large || LargeBody(bytes).allows(&parsed),
+        "generation JSON body cap outside image data"
+    );
     if !super::generator::ANTHROPIC_PATHS.contains(&path) {
         let metadata = body.get("metadata").or_else(|| body.get(11));
         let metadata = metadata

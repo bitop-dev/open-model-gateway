@@ -133,10 +133,18 @@ fn spec() -> impl Strategy<Value = Spec> {
         )
 }
 
+/// Appends to a text message's content.
+fn push_text(message: &mut Message, text: &str) {
+    match message.content.as_mut() {
+        Some(Content::Text(content)) => content.push_str(text),
+        _ => panic!("a text message"),
+    }
+}
+
 fn msg(role: Role, content: Option<String>) -> Message {
     Message {
         role,
-        content,
+        content: content.map(Content::Text),
         tool_calls: vec![],
         tool_call_id: None,
         tool_result_is_error: false,
@@ -255,12 +263,22 @@ fn expected_messages(request: &ChatRequest) -> Vec<(bool, Vec<Block>)> {
         let blocks = if m.role == Role::Tool {
             vec![Block::Result {
                 id: m.tool_call_id.clone().unwrap(),
-                text: m.content.clone().unwrap(),
+                text: m
+                    .content
+                    .as_ref()
+                    .and_then(Content::text)
+                    .unwrap()
+                    .to_owned(),
             }]
         } else {
             let mut b = vec![];
-            if let Some(t) = m.content.as_ref().filter(|t| !t.is_empty()) {
-                b.push(Block::Text(t.clone()));
+            if let Some(t) = m
+                .content
+                .as_ref()
+                .and_then(Content::text)
+                .filter(|t| !t.is_empty())
+            {
+                b.push(Block::Text(t.to_owned()));
             }
             for c in &m.tool_calls {
                 b.push(Block::Use {
@@ -340,7 +358,13 @@ fn check_carried(request: &ChatRequest, input: &Input) -> std::result::Result<()
         .messages
         .iter()
         .filter(|m| m.role == Role::System)
-        .map(|m| m.content.clone().unwrap())
+        .map(|m| {
+            m.content
+                .as_ref()
+                .and_then(Content::text)
+                .unwrap()
+                .to_owned()
+        })
         .collect();
     let got: Option<Vec<String>> = input.system.as_ref().map(|s| {
         s.iter()
@@ -849,8 +873,8 @@ fn edit_request(r: &mut ChatRequest, e: &Edit) {
         Edit::Content(i, kind, text) if !r.messages.is_empty() => {
             r.messages[i % n].content = match kind {
                 0 => None,
-                1 => Some(String::new()),
-                _ => Some(text.clone()),
+                1 => Some(Content::Text(String::new())),
+                _ => Some(Content::Text(text.clone())),
             };
         }
         Edit::ToolCallId(i, id) if !r.messages.is_empty() => {
@@ -964,7 +988,7 @@ fn counted_size(r: &ChatRequest) -> usize {
     r.messages
         .iter()
         .map(|m| {
-            m.content.as_ref().map_or(0, String::len)
+            m.content.as_ref().map_or(0, Content::text_len)
                 + m.tool_calls
                     .iter()
                     .map(|c| c.arguments.len())
@@ -1009,12 +1033,12 @@ proptest! {
         let size = counted_size(&r);
         prop_assert!(size <= OUTPUT_LIMIT);
         let first_user = r.messages.iter().position(|m| m.role == Role::User).unwrap();
-        r.messages[first_user].content.as_mut().unwrap().push_str(&"x".repeat(OUTPUT_LIMIT - size));
+        push_text(&mut r.messages[first_user], &"x".repeat(OUTPUT_LIMIT - size));
         match encode(&r) {
             Ok(input) => check_carried(&r, &input)?,
             Err(e) => prop_assert!(false, "refused at exactly the limit: {e:?}"),
         }
-        r.messages[first_user].content.as_mut().unwrap().push('x');
+        push_text(&mut r.messages[first_user], "x");
         prop_assert_eq!(encode(&r).err(), Some(InferenceError::InvalidRequest));
     }
 }
@@ -1109,10 +1133,10 @@ fn the_limits_are_inclusive_and_never_truncate() {
     assert_eq!(encode(&r).err(), Some(InferenceError::InvalidRequest));
 
     let mut r = build(&spec_min());
-    r.messages[0].content = Some("x".repeat(OUTPUT_LIMIT));
+    r.messages[0].content = Some(Content::Text("x".repeat(OUTPUT_LIMIT)));
     let input = encode(&r).expect("exactly the output limit");
     check_carried(&r, &input).unwrap();
-    r.messages[0].content = Some("x".repeat(OUTPUT_LIMIT + 1));
+    r.messages[0].content = Some(Content::Text("x".repeat(OUTPUT_LIMIT + 1)));
     assert_eq!(encode(&r).err(), Some(InferenceError::InvalidRequest));
 
     let mut r = build(&spec_min());

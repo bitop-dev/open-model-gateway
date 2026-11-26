@@ -659,6 +659,9 @@ fn inference_limits_from_env() -> Result<crate::inference::EngineLimits> {
             crate::inference::count::COUNT_CONCURRENCY as u32,
             1_024,
         )? as usize,
+        image_input: crate::inference::image_buffer::ImageInputLimits::from_lookup(|name| {
+            std::env::var(name).ok()
+        })?,
     })
 }
 

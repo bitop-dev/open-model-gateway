@@ -63,6 +63,7 @@ async fn mock(replies: Vec<(u16, &'static str, Vec<u8>)>) -> Mock {
 }
 fn target() -> Deployment {
     Deployment {
+        image_input: false,
         id: uuid::Uuid::new_v4(),
         provider: "anthropic".into(),
         upstream_model: "claude-private".into(),

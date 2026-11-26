@@ -29,6 +29,7 @@ pub(crate) mod embeddings;
 mod envelope_class_tests;
 mod error_envelope;
 pub(crate) mod framing;
+pub(crate) mod image_body;
 pub(crate) mod images;
 pub mod local;
 pub(crate) mod messages;

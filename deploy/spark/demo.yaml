@@ -90,6 +90,9 @@ spec:
             - {name: GATEWAY_OIDC_GROUPS_CLAIM, value: groups}
             - {name: GATEWAY_SECRET_ENV_ALLOWLIST, value: ""}
             - {name: GATEWAY_LOCAL_UPSTREAMS, value: '[{"endpoint":"http://127.0.0.1:19091/v1","addresses":["127.0.0.1"]}]'}
+            # A 512 MiB container: a quarter of the default image input buffer
+            # (docs/operations.md "Image input memory").
+            - {name: GATEWAY_IMAGE_INPUT_BUFFER_BYTES, value: "12582912"}
           # The listener is loopback-only, so kubelet cannot probe it over the pod IP.
           startupProbe:
             exec: {command: [/usr/local/bin/open-model-gateway, healthcheck, --timeout, 3s]}

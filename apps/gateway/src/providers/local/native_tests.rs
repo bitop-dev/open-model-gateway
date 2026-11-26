@@ -18,6 +18,7 @@ fn request() -> EmbeddingRequest {
 }
 fn target(base: String) -> Deployment {
     Deployment {
+        image_input: false,
         id: uuid::Uuid::new_v4(),
         provider: "ollama".into(),
         upstream_model: "private".into(),

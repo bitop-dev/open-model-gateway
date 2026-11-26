@@ -112,6 +112,7 @@ impl Mock {
 
 fn target() -> Deployment {
     Deployment {
+        image_input: false,
         id: uuid::Uuid::new_v4(),
         provider: "openai".into(),
         upstream_model: "private-upstream-model".into(),
@@ -1387,4 +1388,30 @@ fn a_refusal_overrides_the_finish_reason_and_is_not_read_from_local_servers() {
         assert_eq!(response.finish_reason, FinishReason::Length);
         assert_eq!(response.content.as_deref(), Some("answer"));
     }
+}
+
+#[tokio::test]
+async fn inline_images_reach_the_chat_wire_as_image_url_parts() {
+    use super::super::contract::{IMAGE_URL, image_request};
+    let mock = Mock::json(complete()).await;
+    let adapter = mock.adapter();
+    assert!(adapter.capabilities().image_input);
+    assert!(adapter.supports_chat_request(&image_request(false)));
+    adapter
+        .execute(&target(), image_request(false))
+        .await
+        .unwrap();
+    let captured = mock.requests.lock().unwrap();
+    assert_eq!(
+        captured[0].headers[header::CONTENT_TYPE],
+        "application/json"
+    );
+    assert_eq!(
+        captured[0].body["messages"][0]["content"],
+        json!([
+            {"type":"text","text":"what is"},
+            {"type":"image_url","image_url":{"url":IMAGE_URL,"detail":"low"}},
+            {"type":"text","text":"this?"}
+        ])
+    );
 }

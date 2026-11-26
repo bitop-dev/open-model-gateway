@@ -83,6 +83,7 @@ impl ProviderAdapter for Fake {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            image_input: false,
             text_chat: false,
             streaming: false,
             tools: false,
@@ -119,6 +120,7 @@ impl ProviderAdapter for Fake {
 }
 fn deployment(protocol: &str) -> Deployment {
     Deployment {
+        image_input: false,
         id: Uuid::new_v4(),
         provider: "fake".into(),
         upstream_model: "m".into(),

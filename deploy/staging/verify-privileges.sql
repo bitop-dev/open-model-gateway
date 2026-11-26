@@ -550,6 +550,10 @@ BEGIN
  UPDATE deployments SET enabled=true WHERE id=d;
  UPDATE deployments SET enabled=true WHERE id=d;
  IF (SELECT revision FROM deployments WHERE id=d)<>2 OR (SELECT count(*) FROM configuration_changes WHERE deployment_id=d)<>2 THEN RAISE EXCEPTION 'deployment change/no-op history incorrect'; END IF;
+ -- #24: the route's image-input opt-in is not enablement: no revision, no history.
+ UPDATE deployments SET image_input=true WHERE id=d;
+ IF NOT (SELECT image_input FROM deployments WHERE id=d) OR (SELECT revision FROM deployments WHERE id=d)<>2 OR (SELECT count(*) FROM configuration_changes WHERE deployment_id=d)<>2 THEN RAISE EXCEPTION 'image input change touched enablement history'; END IF;
+ UPDATE deployments SET image_input=false WHERE id=d;
  IF NOT EXISTS(SELECT FROM configuration_changes c JOIN audit_events a ON (a.id,a.created_at)=(c.audit_event_id,c.audit_created_at) WHERE c.deployment_id=d AND c.revision=2 AND NOT c.before_enabled AND c.after_enabled) THEN RAISE EXCEPTION 'history audit identity or values missing'; END IF;
  changed := gen_random_uuid();
  BEGIN INSERT INTO configuration_changes(id,created_at,audit_event_id,audit_created_at,target_kind,deployment_id,schema_version,before_enabled,after_enabled,revision) VALUES(changed,now(),changed,now(),'deployment',d,1,false,true,3); RAISE EXCEPTION 'orphan history allowed'; EXCEPTION WHEN foreign_key_violation THEN NULL; END;

@@ -41,6 +41,7 @@ impl ProviderAdapter for Adapter {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            image_input: false,
             text_chat: true,
             streaming: false,
             tools: false,
@@ -362,7 +363,8 @@ pub(super) fn request(
     }
 }
 
-/// An oversized body: declared (the body-limit layer answers, no handler runs)
+/// A body over 2 MiB: declared (on a route under the shared limit the
+/// body-limit layer answers, no handler runs; the image input routes read it)
 /// or streamed without a length (the handler's own extractor answers).
 fn oversized(path: &str, key: &str, streamed: bool) -> Request<Body> {
     let chunk = Bytes::from(vec![b'x'; 1 << 20]);
@@ -378,12 +380,19 @@ fn oversized(path: &str, key: &str, streamed: bool) -> Request<Body> {
             .body(Body::from_stream(futures_util::stream::iter(chunks)))
             .unwrap()
     } else {
-        let size = 2 * 1024 * 1024 + 1;
-        builder
-            .header("content-length", size)
-            .body(Body::from(vec![b'x'; size]))
-            .unwrap()
+        declared(path, key, 2 * 1024 * 1024 + 1)
     }
+}
+/// A non-JSON body of `size` bytes with its declared length.
+fn declared(path: &str, key: &str, size: usize) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .header("content-length", size)
+        .body(Body::from(vec![b'x'; size]))
+        .unwrap()
 }
 
 #[dbtest::test]
@@ -679,6 +688,7 @@ impl ProviderAdapter for GenerationAdapter {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            image_input: true,
             text_chat: true,
             streaming: true,
             tools: true,
@@ -691,10 +701,12 @@ impl ProviderAdapter for GenerationAdapter {
         )
     }
     fn validate_chat_request(&self, request: &ChatRequest) -> Result<(), InferenceError> {
-        let translated = request
-            .messages
-            .iter()
-            .any(|m| m.content.as_deref() == Some("translated"));
+        let translated = request.messages.iter().any(|m| {
+            m.content
+                .as_ref()
+                .and_then(crate::inference::types::Content::text)
+                == Some("translated")
+        });
         crate::providers::messages::validate(
             request,
             if translated {
@@ -717,7 +729,11 @@ impl ProviderAdapter for GenerationAdapter {
         let mode = request
             .messages
             .last()
-            .and_then(|m| m.content.as_deref())
+            .and_then(|m| {
+                m.content
+                    .as_ref()
+                    .and_then(crate::inference::types::Content::text)
+            })
             .unwrap_or("tools");
         let tools = matches!(mode, "tools" | "both" | "native");
         let content = (mode != "tools").then(|| "hello".to_owned());
@@ -829,6 +845,18 @@ impl ProviderAdapter for GenerationAdapter {
 }
 
 async fn generation_gateway(pool: &PgPool) -> (axum::Router, DevelopmentKeys) {
+    generation_gateway_with(
+        pool,
+        crate::inference::image_buffer::ImageInputLimits::default(),
+    )
+    .await
+}
+/// The generation fixture gateway: its routes take inline images (the
+/// adapter carries them and every deployment allows `image_input`).
+async fn generation_gateway_with(
+    pool: &PgPool,
+    image_input: crate::inference::image_buffer::ImageInputLimits,
+) -> (axum::Router, DevelopmentKeys) {
     let store = Store::new(pool.clone());
     let keys = bootstrap::seed(&store, Environment::Development)
         .await
@@ -838,10 +866,12 @@ async fn generation_gateway(pool: &PgPool) -> (axum::Router, DevelopmentKeys) {
         .execute(pool)
         .await
         .unwrap();
-    sqlx::query("UPDATE deployments SET enabled=true, upstream_model='private-upstream-id'")
-        .execute(pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE deployments SET enabled=true, upstream_model='private-upstream-id', image_input=true",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
     sqlx::query(
         "UPDATE models SET supported_protocols=ARRAY['chat_completions','responses','messages']",
     )
@@ -856,6 +886,7 @@ async fn generation_gateway(pool: &PgPool) -> (axum::Router, DevelopmentKeys) {
     // The vector journeys send many token counts with one key.
     let limits = EngineLimits {
         counts_per_key_per_minute: u32::MAX,
+        image_input,
         ..EngineLimits::default()
     };
     let engine = Engine::new(Arc::new(store.clone()), registry, limits).unwrap();
@@ -1000,8 +1031,13 @@ async fn generation_real_handler_fixtures(pool: PgPool, shard: usize) -> Fixture
                     .unwrap();
                 probe(generation_capture(path, &body, response).await)
             };
+            let owned = image_url_candidates(&valid);
+            let candidates: Vec<(&str, Value)> = owned
+                .iter()
+                .map(|(at, value)| (at.as_str(), value.clone()))
+                .collect();
             fixtures
-                .body_vectors("POST", path, valid, &[], &[], send)
+                .body_vectors("POST", path, valid, &[], &candidates, send)
                 .await;
         }
     }
@@ -1082,6 +1118,8 @@ async fn count_tokens_fixtures(app: &axum::Router, key: &str, fixtures: &mut Fix
 
 #[dbtest::test]
 async fn inference_openapi_generation_refusals_and_beta_headers(pool: PgPool) {
+    // Its large bodies to the image input routes move the buffer metrics.
+    let _counters = crate::inference::image_buffer::ROUTER_TESTS.lock().await;
     let (app, keys) = generation_gateway(&pool).await;
     let key = keys.personal_key.token;
     for (path, body, status) in [
@@ -1146,15 +1184,27 @@ async fn inference_openapi_generation_refusals_and_beta_headers(pool: PgPool) {
             StatusCode::UNAUTHORIZED,
             "generation authentication status"
         );
-        let mut req = oversized(path, &key, false);
-        req.headers_mut()
-            .insert("anthropic-version", "2023-06-01".parse().unwrap());
-        let captured = capture("POST", path, app.clone().oneshot(req).await.unwrap()).await;
-        assert_eq!(
-            captured.status,
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "generation declared body cap status"
-        );
+        // The image input routes read a declared body up to their image
+        // input cap and refuse it before any parse when more than 2 MiB of it
+        // is not image data (this one has none), and refuse one past the cap
+        // before reading it, as every other route does past 2 MiB.
+        let mut cases = vec![(oversized(path, &key, false), StatusCode::PAYLOAD_TOO_LARGE)];
+        if super::generation::IMAGE_INPUT_PATHS.contains(&path) {
+            let cap = crate::inference::image_buffer::ImageInputLimits::default().body_bytes;
+            cases = vec![
+                (oversized(path, &key, false), StatusCode::PAYLOAD_TOO_LARGE),
+                (declared(path, &key, cap + 1), StatusCode::PAYLOAD_TOO_LARGE),
+            ];
+        }
+        for (mut req, status) in cases {
+            req.headers_mut()
+                .insert("anthropic-version", "2023-06-01".parse().unwrap());
+            let captured = capture("POST", path, app.clone().oneshot(req).await.unwrap()).await;
+            assert_eq!(
+                captured.status, status,
+                "generation declared body cap status"
+            );
+        }
     }
     for (path, body) in super::generation_tests::integer_float_cases() {
         let captured = capture(
@@ -1258,6 +1308,225 @@ async fn inference_openapi_generation_large_message_boundaries(pool: PgPool) {
             }
         }
     }
+}
+
+/// Boundary candidates at every image data URL of `body`: the URL pattern has
+/// no length bound to derive (an image's bound is its decoded size, straddled
+/// in `inference_openapi_generation_image_input_transport`), so each location
+/// gets a valid image and the URLs one character either side of it, which
+/// the pattern refuses (base64 in whole quads), plus a remote URL and an
+/// empty payload.
+fn image_url_candidates(body: &Value) -> Vec<(String, Value)> {
+    fn walk(value: &Value, at: String, out: &mut Vec<(String, Value)>) {
+        match value {
+            Value::String(text) if text.starts_with("data:image/") => {
+                let valid = png_data_url(64);
+                for candidate in [
+                    valid.clone(),
+                    valid[..valid.len() - 1].to_owned(),
+                    format!("{valid}A"),
+                    "https://example.invalid/cat.png".to_owned(),
+                    "data:image/png;base64,".to_owned(),
+                ] {
+                    out.push((at.clone(), json!(candidate)));
+                }
+            }
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    walk(item, format!("{at}/{index}"), out);
+                }
+            }
+            Value::Object(fields) => {
+                for (name, item) in fields {
+                    let name = name.replace('~', "~0").replace('/', "~1");
+                    walk(item, format!("{at}/{name}"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(body, String::new(), &mut out);
+    out
+}
+
+/// A PNG data URL of `decoded` bytes: the signature, then zeros (the gateway
+/// checks the signature, not the picture).
+fn png_data_url(decoded: usize) -> String {
+    use base64::Engine as _;
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.resize(decoded, 0);
+    format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )
+}
+/// A user message with an image and `text`, then the adapter's mode text.
+fn generation_image_body(path: &str, url: &str, text: &str) -> Value {
+    if path == "/v1/chat/completions" {
+        json!({"model":"company/smart","messages":[
+            {"role":"user","content":[{"type":"image_url","image_url":{"url":url}},{"type":"text","text":text}]},
+            {"role":"user","content":"text"}]})
+    } else {
+        json!({"model":"company/smart","input":[
+            {"role":"user","content":[{"type":"input_image","image_url":url},{"type":"input_text","text":text}]},
+            {"role":"user","content":"text"}]})
+    }
+}
+/// `body` with its declared length, as a client that knows it sends it.
+fn with_length(path: &str, key: &str, body: Body, length: usize) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .header("content-length", length)
+        .body(body)
+        .unwrap()
+}
+
+/// The large-body transport of the image input routes on the real stack:
+/// every refusal (413, 408, 503 with Retry-After, 501 without an image
+/// route) and an admitted large image body, each validated against the
+/// artifact by `capture`.
+#[dbtest::test]
+async fn inference_openapi_generation_image_input_transport(pool: PgPool) {
+    use crate::inference::image_buffer::{ImageInputLimits, MIB};
+    let _counters = crate::inference::image_buffer::ROUTER_TESTS.lock().await;
+    use futures_util::StreamExt as _;
+    let (app, keys) = generation_gateway_with(
+        &pool,
+        ImageInputLimits {
+            body_bytes: 16 * MIB,
+            buffer_bytes: 8 * MIB,
+            body_idle: std::time::Duration::from_millis(300),
+            body_total: std::time::Duration::from_secs(5),
+            body_min_rate: crate::inference::image_buffer::BODY_MIN_RATE,
+        },
+    )
+    .await;
+    let key = keys.personal_key.token;
+    let large_url = png_data_url(2 * MIB + MIB / 4);
+    let code = |captured: &crate::management::openapi::responses::Captured| {
+        serde_json::from_slice::<Value>(&captured.bytes).unwrap()["error"]["code"].clone()
+    };
+    for path in super::generation::IMAGE_INPUT_PATHS {
+        let path: &str = path;
+        let send = async |request: Request<Body>| {
+            capture("POST", path, app.clone().oneshot(request).await.unwrap()).await
+        };
+        // A declared large body with an image is read in full and served.
+        let body = generation_image_body(path, &large_url, "what is this?");
+        let bytes = crate::management::openapi::http_vectors::wire_bytes(&body);
+        assert!(bytes.len() > 2 * MIB && bytes.len() <= 4 * MIB);
+        let served = generation_capture(
+            path,
+            &body,
+            app.clone()
+                .oneshot(with_length(
+                    path,
+                    &key,
+                    Body::from(bytes.clone()),
+                    bytes.len(),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(served.status, StatusCode::OK, "large image body status");
+        // The decoded-size straddle of one image (`x-omg-max-decoded-bytes`).
+        let max = crate::protocols::image_input::MAX_DECODED_BYTES;
+        for (decoded, status) in [(max, StatusCode::OK), (max + 1, StatusCode::BAD_REQUEST)] {
+            let body = generation_image_body(path, &png_data_url(decoded), "what is this?");
+            assert_eq!(
+                super::generation::validate_request(r::artifact(), path, &body).is_ok(),
+                status == StatusCode::OK,
+                "decoded-size contract verdict"
+            );
+            let bytes = crate::management::openapi::http_vectors::wire_bytes(&body);
+            let length = bytes.len();
+            let captured = generation_capture(
+                path,
+                &body,
+                app.clone()
+                    .oneshot(with_length(path, &key, Body::from(bytes), length))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(captured.status, status, "decoded-size status");
+        }
+        // Over the route cap or the whole buffer: refused before reading.
+        for size in [17 * MIB, 9 * MIB] {
+            let refused = send(declared(path, &key, size)).await;
+            assert_eq!(refused.status, StatusCode::PAYLOAD_TOO_LARGE, "{size}");
+            assert_eq!(code(&refused), "payload_too_large");
+        }
+        // An undeclared length is held to the text limit as it streams.
+        let refused = send(oversized(path, &key, true)).await;
+        assert_eq!(refused.status, StatusCode::PAYLOAD_TOO_LARGE);
+        // Text past the text limit, alone or beside a small image.
+        for body in [
+            generation_body(path, &"x".repeat(3 * MIB), false),
+            generation_image_body(path, &png_data_url(64), &"x".repeat(3 * MIB)),
+        ] {
+            assert!(
+                super::generation::validate_request(r::artifact(), path, &body).is_err(),
+                "contract accepted text past the text limit"
+            );
+            let bytes = crate::management::openapi::http_vectors::wire_bytes(&body);
+            let length = bytes.len();
+            let refused = send(with_length(path, &key, Body::from(bytes), length)).await;
+            assert_eq!(refused.status, StatusCode::PAYLOAD_TOO_LARGE);
+            assert_eq!(code(&refused), "payload_too_large");
+        }
+        // A stalled large body holds the buffer until its idle deadline: a
+        // second large body finds it full (503), the stalled one ends 408.
+        let pulled = Arc::new(tokio::sync::Notify::new());
+        let signal = pulled.clone();
+        let first = Bytes::copy_from_slice(&bytes[..bytes.len() / 2]);
+        let stalled = Body::from_stream(
+            futures_util::stream::once(async move {
+                signal.notify_one();
+                Ok::<_, std::convert::Infallible>(first)
+            })
+            .chain(futures_util::stream::pending()),
+        );
+        let pending =
+            tokio::spawn(
+                app.clone()
+                    .oneshot(with_length(path, &key, stalled, bytes.len())),
+            );
+        pulled.notified().await;
+        let busy = send(declared(path, &key, 5 * MIB)).await;
+        assert_eq!(busy.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(busy.headers["retry-after"], "1");
+        assert_eq!(code(&busy), "image_input_busy");
+        let timed_out = capture("POST", path, pending.await.unwrap().unwrap()).await;
+        assert_eq!(timed_out.status, StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(code(&timed_out), "request_timeout");
+        // No route allows images: refused before admission.
+        sqlx::query("UPDATE deployments SET image_input=false")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let body = generation_image_body(path, &png_data_url(64), "what is this?");
+        let refused = send(generation_http(path, &key, &body)).await;
+        assert_eq!(refused.status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(code(&refused), "unsupported_capability");
+        sqlx::query("UPDATE deployments SET image_input=true")
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM inference_executions")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        4,
+        "only the admitted large image bodies execute"
+    );
 }
 
 fn generation_positional(path: &str, body: &Value) -> Value {
@@ -1502,7 +1771,60 @@ fn generation_full_requests(path: &str) -> Vec<Value> {
         cases.push(nested.clone());
         cases.push(generation_positional(path, &nested));
     }
+    if let Some(parts) = generation_image_request(path, &full) {
+        let nested = generation_nested_positional(path, parts.clone());
+        cases.push(generation_positional(path, &parts));
+        cases.push(generation_positional(path, &nested));
+        cases.push(parts);
+        cases.push(nested);
+    }
     cases
+}
+
+/// `full` with content parts and inline images (#24): every part form on
+/// every role that takes parts, images on a user message only. The last
+/// message keeps the adapter's mode text.
+fn generation_image_request(path: &str, full: &Value) -> Option<Value> {
+    let url = format!("data:image/png;base64,{PNG_1X1}");
+    let mut parts = full.clone();
+    match path {
+        "/v1/chat/completions" => {
+            let messages = &mut parts["messages"];
+            messages[0]["content"] = json!([{"type":"text","text":"instructions"}]);
+            messages[1]["content"] = json!([
+                ["text", "instruc", null, null, null],
+                {"type":"text","text":"tions","image_url":null,"file":null,"input_audio":null}
+            ]);
+            messages[2]["content"] = json!([
+                {"type":"text","text":"what is"},
+                {"type":"image_url","image_url":{"url":url,"detail":"low"},"text":null,"file":null,"input_audio":null},
+                ["image_url", null, [url, null], null, null],
+                {"type":"image_url","image_url":[url, "high"]},
+                {"type":"image_url","image_url":{"url":url,"detail":null}},
+                ["text", "this?", null, null, null]
+            ]);
+            messages[2]["tool_calls"] = json!([]);
+            messages[2]["tool_call_id"] = Value::Null;
+            messages[4]["content"] = json!([{"type":"text","text":"result"}]);
+            messages[5]["content"] =
+                json!([{"type":"text","text":"bo"},{"type":"text","text":"th"}]);
+        }
+        "/v1/responses" => {
+            let input = parts["input"].as_array_mut().unwrap();
+            input[5]["content"] = json!([
+                {"type":"input_text","text":"what is"},
+                {"type":"input_image","image_url":url,"detail":"high"},
+                {"type":"input_image","image_url":url,"detail":null},
+                {"type":"input_image","image_url":url}
+            ]);
+            input.insert(
+                0,
+                json!({"type":"message","role":"developer","content":[{"type":"input_text","text":"instructions"}]}),
+            );
+        }
+        _ => return None,
+    }
+    Some(parts)
 }
 
 fn generation_nested_positional(path: &str, mut full: Value) -> Value {

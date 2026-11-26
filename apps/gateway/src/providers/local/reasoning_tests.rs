@@ -49,6 +49,7 @@ async fn serve(complete: Value, frames: Vec<Value>) -> (String, tokio::task::Joi
 
 fn target(profile: Profile, base: &str) -> Deployment {
     Deployment {
+        image_input: false,
         id: uuid::Uuid::new_v4(),
         provider: profile.id().into(),
         upstream_model: "qwen".into(),

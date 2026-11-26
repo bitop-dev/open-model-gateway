@@ -206,6 +206,7 @@ impl Mock {
 }
 fn target() -> Deployment {
     Deployment {
+        image_input: false,
         id: uuid::Uuid::new_v4(),
         provider: "bedrock".into(),
         upstream_model: "test-model".into(),
@@ -827,7 +828,7 @@ fn validates_semantics_without_silent_loss() {
     req.messages[1].tool_call_id = Some("orphan".into());
     check(req);
     let mut req = request();
-    req.messages[1].content = Some("x".repeat(OUTPUT_LIMIT + 1));
+    req.messages[1].content = Some("x".repeat(OUTPUT_LIMIT + 1).into());
     check(req);
     let mut req = request();
     req.tools.push(tool());
@@ -1261,4 +1262,10 @@ async fn structured_output_sdk_bedrock_model_refusal(pool: sqlx::PgPool) {
     .await;
     assert_eq!(attempts, 2);
     assert_eq!(mock.requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn images_are_refused_before_anything_is_sent() {
+    let adapter = BedrockAdapter::for_test("http://127.0.0.1:9");
+    super::super::contract::assert_images_refused(&adapter, &target()).await;
 }

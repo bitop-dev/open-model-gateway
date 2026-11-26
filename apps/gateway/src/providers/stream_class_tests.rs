@@ -190,6 +190,7 @@ impl Kind {
     }
     pub(crate) fn target(self, upstream: &str) -> Deployment {
         Deployment {
+            image_input: false,
             id: uuid::Uuid::new_v4(),
             provider: self.provider().into(),
             upstream_model: "private-model".into(),

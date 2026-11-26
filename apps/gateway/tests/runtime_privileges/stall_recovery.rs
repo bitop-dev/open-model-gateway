@@ -64,6 +64,7 @@ impl ProviderAdapter for MockAdapter {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            image_input: false,
             text_chat: true,
             streaming: true,
             tools: false,

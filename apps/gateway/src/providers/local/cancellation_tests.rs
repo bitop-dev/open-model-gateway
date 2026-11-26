@@ -52,6 +52,7 @@ async fn pending_local_embeddings_and_chat_stream_drop_cancel_http_body() {
             Arc::new(ApprovedEndpoints::for_test(&base)),
         ));
         let target = Deployment {
+            image_input: false,
             id: uuid::Uuid::new_v4(),
             provider: "ollama".into(),
             upstream_model: "private".into(),

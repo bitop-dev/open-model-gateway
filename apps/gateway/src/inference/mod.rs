@@ -8,6 +8,7 @@ mod embeddings;
 pub mod error;
 pub(crate) mod evidence;
 mod hand_off;
+pub mod image_buffer;
 pub mod images;
 pub mod realtime;
 pub mod repository;
@@ -78,6 +79,7 @@ pub struct EngineLimits {
     /// Token counts this process runs at once, from a pool separate from
     /// generation's `max_concurrent` (`count`).
     pub count_concurrency: usize,
+    pub image_input: image_buffer::ImageInputLimits,
 }
 impl Default for EngineLimits {
     fn default() -> Self {
@@ -89,6 +91,7 @@ impl Default for EngineLimits {
             counts_per_key_per_minute: count::COUNTS_PER_KEY_PER_MINUTE,
             counts_per_connection_per_minute: count::COUNTS_PER_CONNECTION_PER_MINUTE,
             count_concurrency: count::COUNT_CONCURRENCY,
+            image_input: image_buffer::ImageInputLimits::default(),
         }
     }
 }

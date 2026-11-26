@@ -36369,6 +36369,9 @@
             "format": "uuid",
             "type": "string"
           },
+          "image_input": {
+            "type": "boolean"
+          },
           "model_id": {
             "format": "uuid",
             "type": "string"
@@ -36448,6 +36451,7 @@
           "provider_name",
           "upstream_model",
           "enabled",
+          "image_input",
           "provider",
           "connection_enabled",
           "region",
@@ -36467,6 +36471,10 @@
             "additionalProperties": false,
             "properties": {
               "enabled": {
+                "type": "boolean"
+              },
+              "image_input": {
+                "description": "Inline image input on this route (#24; default false). Enable it only for an upstream model that bills image input as input tokens: the admission hold covers the price's input token limit, and a model that also charges per image cannot be priced.",
                 "type": "boolean"
               },
               "model_id": {
@@ -36495,7 +36503,7 @@
           },
           {
             "items": false,
-            "maxItems": 4,
+            "maxItems": 5,
             "minItems": 4,
             "prefixItems": [
               {
@@ -36512,6 +36520,9 @@
                 "minLength": 1,
                 "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\u0000-\\u001F\\u007F-\\u009F][^\\u0000-\\u001F\\u007F-\\u009F]*$",
                 "type": "string"
+              },
+              {
+                "type": "boolean"
               },
               {
                 "type": "boolean"
@@ -36623,6 +36634,9 @@
             "format": "uuid",
             "type": "string"
           },
+          "image_input": {
+            "type": "boolean"
+          },
           "model_id": {
             "format": "uuid",
             "type": "string"
@@ -36648,9 +36662,54 @@
           "provider_connection_id",
           "provider_name",
           "upstream_model",
-          "enabled"
+          "enabled",
+          "image_input"
         ],
         "type": "object"
+      },
+      "SetupDeploymentUpdate": {
+        "description": "Closed serde object or existing positional struct array in declared field order. Handler semantic validation is additional: at least one of `enabled` and `image_input` must be set; `enabled` changes the route's enablement (with its revision and history), `image_input` its image-input opt-in (#24).",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "image_input": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "required": [],
+            "type": "object"
+          },
+          {
+            "items": false,
+            "maxItems": 2,
+            "minItems": 0,
+            "prefixItems": [
+              {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            ],
+            "type": "array"
+          }
+        ]
       },
       "SetupDraftPriceLine": {
         "anyOf": [
@@ -52377,7 +52436,7 @@
         "$ref": "#/components/schemas/MoneyOk"
       },
       "patch_api_v1_platform_deployments_by_idRequest": {
-        "$ref": "#/components/schemas/SetupEnabled"
+        "$ref": "#/components/schemas/SetupDeploymentUpdate"
       },
       "patch_api_v1_platform_deployments_by_idResponse": {
         "$ref": "#/components/schemas/SetupOk"
