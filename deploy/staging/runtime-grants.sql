@@ -162,7 +162,7 @@ GRANT UPDATE(state,actual_microusd,free_price_resolved,batch_envelope_resolved,i
  ON public.governance_reservations TO gateway_runtime;
 GRANT UPDATE(strategy,max_attempts,allow_ambiguous_failover,required_residency) ON public.routing_policies TO gateway_runtime;
 GRANT UPDATE(priority,weight,residency,failure_threshold,cooldown_seconds) ON public.deployment_routing TO gateway_runtime;
--- #49 (0094): the probe slot and the reopen count are written by the
+-- #49 (0093): the probe slot and the reopen count are written by the
 -- runtime alongside the circuit (routing::record_result and the probe claim).
 GRANT UPDATE(consecutive_failures,open_until,last_observed_at,probe_holder,probe_until,probe_epoch,reopen_count) ON public.deployment_health TO gateway_runtime;
 -- #101 C (0058): reviewed, no grant changes. Existing alert_events
