@@ -381,6 +381,7 @@ impl Runner {
             },
             pins: Mutex::default(),
             claimed: Mutex::default(),
+            probes: Mutex::default(),
         });
         Arc::new(LineRun {
             store: store.clone(),
@@ -669,8 +670,12 @@ impl Runner {
         } else {
             candidates
         };
+        // A line records health, so it may be a half-open route's probe: a
+        // route whose probe another request holds is left out of the plan.
+        // Whether the line must claim the probe is decided when it is
+        // dispatched (`Runner::line_probe`), not from this plan.
         let plan = store
-            .route_plan(principal, model, &candidates, execution)
+            .route_plan_probing(principal, model, &candidates, execution)
             .await?;
         let Some(first) = plan.deployment_ids.first() else {
             return Ok(None);

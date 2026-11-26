@@ -432,8 +432,12 @@ impl Engine {
         .map_err(|_| InferenceError::Timeout)??;
         let plan = timeout_at(
             deadline,
-            self.repository
-                .route_plan(&principal, request.model(), &candidates, request_id),
+            self.repository.route_plan_probing(
+                &principal,
+                request.model(),
+                &candidates,
+                request_id,
+            ),
         )
         .await
         .map_err(|_| InferenceError::Timeout)??;
@@ -446,12 +450,11 @@ impl Engine {
             .as_secs()
             .min(i64::MAX as u64 - 5) as i64
             + 5;
-        for (attempt, id) in plan
-            .deployment_ids
-            .iter()
-            .take(plan.max_attempts)
-            .enumerate()
-        {
+        let (mut attempt, mut cooling, mut failed_over) = (0usize, None, None);
+        for id in &plan.deployment_ids {
+            if attempt == plan.max_attempts {
+                break;
+            }
             let target = candidates
                 .iter()
                 .find(|d| d.id == *id)
@@ -465,8 +468,14 @@ impl Engine {
             } else {
                 Uuid::now_v7()
             };
+            let Some(probe) = self
+                .usable(&plan, *id, request_id, deadline, attempt > 0, &mut cooling)
+                .await?
+            else {
+                continue;
+            };
             let started = Instant::now();
-            timeout_at(
+            let admitted = timeout_at(
                 deadline,
                 self.repository.admit_workload(
                     &ExecutionStart {
@@ -487,7 +496,10 @@ impl Engine {
                 ),
             )
             .await
-            .map_err(|_| InferenceError::Timeout)??;
+            .map_err(|_| InferenceError::Timeout)
+            .and_then(|admitted| admitted);
+            // A probe slot it held is freed as `probe` drops.
+            admitted?;
             // Non-generation workloads carry no trace correlation id.
             let mut guard = ExecutionGuard::new(
                 self.repository.clone(),
@@ -497,6 +509,7 @@ impl Engine {
                 permit.clone(),
                 None,
             );
+            guard.probe = probe.and_then(super::ProbeTicket::into_epoch);
             let evidence_ok =
                 |u: Usage| valid_usage(u) && (!input_only || u.output_tokens == Some(0));
             // As for generation (`attempt::call_upstream`): the dispatch scope
@@ -563,13 +576,15 @@ impl Engine {
                             || (guard.telemetry.nothing_sent
                                 && crate::routing::may_fail_over_unsent(&plan, error)))
                     {
+                        attempt += 1;
+                        failed_over = Some(error);
                         continue;
                     }
                     return Err(error);
                 }
             }
         }
-        Err(InferenceError::Busy)
+        Err(super::exhausted(cooling, attempt, failed_over))
     }
 }
 

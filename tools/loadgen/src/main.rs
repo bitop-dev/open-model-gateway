@@ -192,6 +192,7 @@ async fn main() -> anyhow::Result<()> {
                 label,
                 readers,
                 reader_days,
+                retry_shed: 0,
             })
             .await?;
             eprintln!("{}", report.headline());

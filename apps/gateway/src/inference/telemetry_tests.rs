@@ -591,6 +591,8 @@ async fn explicit_failover_produces_two_upstream_attempt_spans() {
         deployment_ids: vec![first.id, second.id],
         max_attempts: 2,
         allow_ambiguous_failover: false,
+        probes: Vec::new(),
+        held_probe: None,
     });
     let mut registry = ProviderRegistry::default();
     registry
@@ -867,6 +869,8 @@ async fn an_empty_route_plan_still_returns_busy_and_exports_nothing() {
         deployment_ids: vec![],
         max_attempts: 1,
         allow_ambiguous_failover: false,
+        probes: Vec::new(),
+        held_probe: None,
     });
     let mut registry = ProviderRegistry::default();
     registry
@@ -911,6 +915,8 @@ async fn an_empty_route_plan_still_records_its_root_span_before_dropping_it_inel
         deployment_ids: vec![],
         max_attempts: 1,
         allow_ambiguous_failover: false,
+        probes: Vec::new(),
+        held_probe: None,
     });
     let mut registry = ProviderRegistry::default();
     registry

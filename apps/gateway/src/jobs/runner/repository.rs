@@ -32,18 +32,67 @@ pub(super) struct LineRepository {
     /// dispatch (a `Pin` was passed to `LineRun::execute`), distinct from
     /// merely carrying a plan in `pins`.
     pub(super) claimed: Mutex<HashSet<Uuid>>,
+    /// The probe slot each attempt claimed before its route capacity:
+    /// (route, epoch). Its plan hands it to the engine (`held_probe`).
+    pub(super) probes: Mutex<HashMap<Uuid, (Uuid, i64)>>,
 }
 impl LineRepository {
+    /// A line's attempt on its pinned route, planned as the engine sends it.
+    /// An attempt that holds route capacity (`claimed`: a first attempt or a
+    /// retry) uses the probe slot the line claimed at dispatch (renewed at the
+    /// send), or else the route's circuit now: an open circuit sends nothing
+    /// (`RouteCoolingDown`), and a half-open one is used only as its probe
+    /// (the engine claims; another holder's slot sends nothing either).
+    ///
+    /// An ungated attempt (a line pinned by its creation-time plan that no
+    /// route could take at dispatch) is planned as before: admission refuses
+    /// it whatever the route's state (`gated`, #243), so it never reaches a
+    /// provider, and it neither claims a slot nor waits on a circuit.
+    async fn pinned_plan(
+        &self,
+        deployment: Uuid,
+        request_id: Uuid,
+    ) -> Result<crate::routing::RoutePlan, InferenceError> {
+        use crate::routing::{RoutePlan, RouteState};
+        if !self.gated(request_id) {
+            return Ok(RoutePlan::single(vec![deployment]));
+        }
+        // A slot is handed to the engine only for the route it was claimed
+        // on; one claimed on another route stays the line's, and `unpin`
+        // frees it on that route.
+        let held_probe = self
+            .probes
+            .lock()
+            .expect("probes")
+            .get(&request_id)
+            .copied()
+            .filter(|(route, _)| *route == deployment);
+        let probes = match held_probe {
+            Some(_) => Vec::new(),
+            None => match self.store.route_state(deployment).await? {
+                RouteState::Closed => Vec::new(),
+                RouteState::HalfOpen => vec![deployment],
+                RouteState::Open(seconds) => return Err(InferenceError::RouteCoolingDown(seconds)),
+            },
+        };
+        Ok(RoutePlan {
+            held_probe,
+            probes,
+            ..RoutePlan::single(vec![deployment])
+        })
+    }
     /// Record `execution`'s routing/pricing plan. `claimed` is `true` only
     /// when the scheduler itself claimed route capacity for this attempt at
     /// dispatch (`pin.is_some()` at the `LineRun::execute` call site), never
-    /// merely because a creation-time plan exists.
+    /// merely because a creation-time plan exists. `probe` is the slot the
+    /// line claimed at dispatch, with the route it was claimed on.
     pub(super) fn pin(
         &self,
         execution: Uuid,
         deployment: Uuid,
         price: Option<Uuid>,
         claimed: bool,
+        probe: Option<(Uuid, i64)>,
     ) {
         self.pins
             .lock()
@@ -52,10 +101,26 @@ impl LineRepository {
         if claimed {
             self.claimed.lock().expect("claimed").insert(execution);
         }
+        if let Some(probe) = probe {
+            self.probes.lock().expect("probes").insert(execution, probe);
+        }
     }
+    /// The attempt ended. A probe slot it claimed and the engine did not end
+    /// (the line stopped before its attempt was made) is freed in the
+    /// background; for one the engine ended this is a fenced no-op.
     pub(super) fn unpin(&self, execution: Uuid) {
         self.pins.lock().expect("pins").remove(&execution);
         self.claimed.lock().expect("claimed").remove(&execution);
+        let probe = self.probes.lock().expect("probes").remove(&execution);
+        if let Some((route, epoch)) = probe
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let store = self.store.clone();
+            runtime.spawn(async move {
+                let release = crate::routing::release_probe(&store, route, epoch);
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(250), release).await;
+            });
+        }
     }
     /// Whether the scheduler actually claimed route capacity for `execution`
     /// at dispatch - never merely whether it carries a routing/pricing plan
@@ -278,6 +343,38 @@ impl InferenceRepository for LineRepository {
             }
         }
     }
+    async fn route_plan_probing(
+        &self,
+        principal: &Principal,
+        model: &str,
+        candidates: &[Deployment],
+        request_id: Uuid,
+    ) -> Result<crate::routing::RoutePlan, InferenceError> {
+        let pinned = self
+            .pins
+            .lock()
+            .expect("pins")
+            .get(&request_id)
+            .map(|p| p.0);
+        match pinned {
+            Some(d) if candidates.iter().any(|c| c.id == d) => {
+                self.pinned_plan(d, request_id).await
+            }
+            Some(_) => Err(InferenceError::ModelUnavailable),
+            // An ungated attempt (admission refuses it, #243) never claims a
+            // probe slot: it is planned as a caller that decides nothing.
+            None if !self.gated(request_id) => {
+                self.store
+                    .route_plan(principal, model, candidates, request_id)
+                    .await
+            }
+            None => {
+                self.store
+                    .route_plan_probing(principal, model, candidates, request_id)
+                    .await
+            }
+        }
+    }
     async fn route_result(
         &self,
         deployment: Uuid,
@@ -285,4 +382,49 @@ impl InferenceRepository for LineRepository {
     ) -> Result<(), InferenceError> {
         self.store.route_result(deployment, error).await
     }
+    async fn route_probe_result(
+        &self,
+        deployment: Uuid,
+        error: Option<InferenceError>,
+        epoch: i64,
+    ) -> Result<(), InferenceError> {
+        self.store
+            .route_probe_result(deployment, error, epoch)
+            .await
+    }
+    async fn route_state(
+        &self,
+        deployment: Uuid,
+    ) -> Result<crate::routing::RouteState, InferenceError> {
+        self.store.route_state(deployment).await
+    }
+    async fn route_probe_claim(
+        &self,
+        deployment: Uuid,
+        holder: Uuid,
+        hold: std::time::Duration,
+    ) -> Result<crate::routing::ProbeClaim, InferenceError> {
+        self.store.route_probe_claim(deployment, holder, hold).await
+    }
+    async fn route_probe_close(&self, deployment: Uuid, epoch: i64) -> Result<(), InferenceError> {
+        self.store.route_probe_close(deployment, epoch).await
+    }
+    async fn route_probe_release(
+        &self,
+        deployment: Uuid,
+        epoch: i64,
+    ) -> Result<(), InferenceError> {
+        self.store.route_probe_release(deployment, epoch).await
+    }
+    async fn route_probe_renew(
+        &self,
+        deployment: Uuid,
+        epoch: i64,
+        hold: std::time::Duration,
+    ) -> Result<bool, InferenceError> {
+        self.store.route_probe_renew(deployment, epoch, hold).await
+    }
 }
+
+#[cfg(all(test, feature = "integration-tests"))]
+mod pinned_plan_tests;

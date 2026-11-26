@@ -397,8 +397,7 @@ async fn run(cli: Cli, process_start_unix_nano: u64) -> Result<()> {
     let store = Store::new(pool.clone())
         .with_secret_allowlists(provider_secrets.clone(), smtp_secrets)
         .with_alert_webhooks(config.alert_webhooks.clone())
-        .with_reporting(config.connect_reporting()?, config.reporting_max_lag)
-        .with_admission_mode(config.admission_mode);
+        .with_reporting(config.connect_reporting()?, config.reporting_max_lag);
     commands::dispatch(
         cli.command.unwrap_or(Command::Serve),
         config,
@@ -661,7 +660,6 @@ mod demo {
             reporting_database_url: None,
             reporting_max_lag: std::time::Duration::from_secs(30),
             shutdown_drain: std::time::Duration::from_secs(5),
-            admission_mode: Default::default(),
             listen_database_url: None,
             config_cache: true,
             traces: open_model_gateway::config::TraceConfig::from_lookup(

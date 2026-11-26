@@ -18,6 +18,8 @@ struct MemoryRepository {
     finish_calls: AtomicUsize,
     finished: tokio::sync::Notify,
     fail_start: AtomicBool,
+    /// `start` never returns (an admission stuck behind a lock).
+    hang_start: AtomicBool,
     fail_finish: AtomicBool,
     /// `finish` never returns (a write stuck behind a lock or a failover).
     hang_finish: AtomicBool,
@@ -34,6 +36,17 @@ struct MemoryRepository {
     health: Mutex<Vec<Option<InferenceError>>>,
     guardrails: Mutex<std::sync::Arc<crate::guardrails::enforce::Policy>>,
     guardrail_events: Mutex<Vec<crate::guardrails::enforce::Event>>,
+    /// What a probe claim answers (`None`: the route is closed).
+    probe_claim: Mutex<Option<crate::routing::ProbeClaim>>,
+    /// Each route's circuit as `route_state` reports it (absent: closed).
+    route_states: Mutex<std::collections::HashMap<Uuid, crate::routing::RouteState>>,
+    /// The first-content close fails.
+    fail_close: AtomicBool,
+    /// A held probe slot was lost before the send (expired or superseded).
+    renew_lost: AtomicBool,
+    /// Probe calls in order: "claim <route>", "close <epoch>", "release <epoch>",
+    /// and "health" for each health write.
+    probe_log: Mutex<Vec<String>>,
 }
 #[async_trait]
 impl InferenceRepository for MemoryRepository {
@@ -85,6 +98,70 @@ impl InferenceRepository for MemoryRepository {
             std::future::pending::<()>().await;
         }
         self.health.lock().unwrap().push(error);
+        self.probe_log.lock().unwrap().push("health".into());
+        Ok(())
+    }
+    async fn route_probe_claim(
+        &self,
+        deployment: Uuid,
+        _: Uuid,
+        hold: std::time::Duration,
+    ) -> Result<crate::routing::ProbeClaim, InferenceError> {
+        // The slot is held at most for the request's remaining time and the
+        // settlement deadline.
+        assert!(
+            hold > SETTLEMENT_DEADLINE
+                && hold <= EngineLimits::default().request_timeout + SETTLEMENT_DEADLINE
+        );
+        self.probe_log
+            .lock()
+            .unwrap()
+            .push(format!("claim {deployment}"));
+        Ok(self
+            .probe_claim
+            .lock()
+            .unwrap()
+            .unwrap_or(crate::routing::ProbeClaim::Closed))
+    }
+    async fn route_probe_close(&self, _: Uuid, epoch: i64) -> Result<(), InferenceError> {
+        self.probe_log
+            .lock()
+            .unwrap()
+            .push(format!("close {epoch}"));
+        if self.fail_close.load(Ordering::SeqCst) {
+            return Err(InferenceError::Storage);
+        }
+        Ok(())
+    }
+    async fn route_probe_renew(
+        &self,
+        _: Uuid,
+        epoch: i64,
+        _: std::time::Duration,
+    ) -> Result<bool, InferenceError> {
+        self.probe_log
+            .lock()
+            .unwrap()
+            .push(format!("renew {epoch}"));
+        Ok(!self.renew_lost.load(Ordering::SeqCst))
+    }
+    async fn route_state(
+        &self,
+        deployment: Uuid,
+    ) -> Result<crate::routing::RouteState, InferenceError> {
+        Ok(self
+            .route_states
+            .lock()
+            .unwrap()
+            .get(&deployment)
+            .copied()
+            .unwrap_or(crate::routing::RouteState::Closed))
+    }
+    async fn route_probe_release(&self, _: Uuid, epoch: i64) -> Result<(), InferenceError> {
+        self.probe_log
+            .lock()
+            .unwrap()
+            .push(format!("release {epoch}"));
         Ok(())
     }
     async fn start(&self, record: &ExecutionStart) -> Result<(), InferenceError> {
@@ -93,6 +170,9 @@ impl InferenceRepository for MemoryRepository {
             .unwrap()
             .push((record.root_request_id, record.attempt_number));
         self.starts.fetch_add(1, Ordering::SeqCst);
+        if self.hang_start.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         if self.fail_start.load(Ordering::SeqCst) {
             return Err(InferenceError::Storage);
         }
@@ -133,6 +213,10 @@ enum Mode {
     Throttled,
     InvalidBody,
     InvalidStream,
+    /// A delta without text, an empty one, then content and a complete end.
+    LateContent,
+    /// Content, then the upstream fails.
+    ContentThenError,
 }
 const OBSERVED: Usage = Usage {
     input_tokens: Some(9),
@@ -213,6 +297,35 @@ impl ProviderAdapter for Adapter {
                     ..Default::default()
                 })),
                 Ok(ChatEvent::Done),
+            ],
+            Mode::LateContent => vec![
+                Ok(ChatEvent::Delta {
+                    text: None,
+                    tool_calls: vec![],
+                }),
+                Ok(ChatEvent::Delta {
+                    text: Some(String::new()),
+                    tool_calls: vec![],
+                }),
+                Ok(ChatEvent::Delta {
+                    text: Some("hello".into()),
+                    tool_calls: vec![],
+                }),
+                Ok(ChatEvent::Finish(FinishReason::Stop)),
+                Ok(ChatEvent::Usage(Usage {
+                    input_tokens: Some(3),
+                    output_tokens: Some(1),
+                    billing: None,
+                    ..Default::default()
+                })),
+                Ok(ChatEvent::Done),
+            ],
+            Mode::ContentThenError => vec![
+                Ok(ChatEvent::Delta {
+                    text: Some("hello".into()),
+                    tool_calls: vec![],
+                }),
+                Err(InferenceError::UpstreamUnavailable),
             ],
             Mode::Truncated => vec![Ok(ChatEvent::Finish(FinishReason::Stop))],
             Mode::BadOrder => vec![Ok(ChatEvent::Done)],
@@ -516,6 +629,8 @@ fn failover_fixture(
         deployment_ids: deployments.iter().map(|d| d.id).collect(),
         max_attempts: 2,
         allow_ambiguous_failover: ambiguous,
+        probes: Vec::new(),
+        held_probe: None,
     });
     drop(deployments);
     (engine, repo, backup)
@@ -1312,4 +1427,348 @@ fn registry_rejects_duplicate_and_invalid_ids() {
             }))
             .is_err()
     );
+}
+
+/// A half-open route of the plan (#49): its probe slot answers `claim`.
+fn probing(repository: &MemoryRepository, claim: crate::routing::ProbeClaim) -> Uuid {
+    let id = repository.deployments.lock().unwrap()[0].id;
+    *repository.plan.lock().unwrap() = Some(crate::routing::RoutePlan {
+        probes: vec![id],
+        ..crate::routing::RoutePlan::single(vec![id])
+    });
+    *repository.probe_claim.lock().unwrap() = Some(claim);
+    id
+}
+
+/// The probe log once `expected` entries are in (the slot's close and
+/// release run in the background).
+async fn probe_log(repository: &MemoryRepository, expected: usize) -> Vec<String> {
+    for _ in 0..200 {
+        if repository.probe_log.lock().unwrap().len() >= expected {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    repository.probe_log.lock().unwrap().clone()
+}
+
+#[tokio::test]
+async fn a_streamed_probe_closes_the_circuit_at_its_first_content_and_not_before() {
+    use crate::routing::ProbeClaim;
+    let (engine, repository, _) = fixture(Mode::LateContent, EngineLimits::default());
+    let route = probing(&repository, ProbeClaim::Claimed(7));
+    let ProviderOutput::Stream(mut output) = engine
+        .execute(principal(), request(true), Uuid::new_v4())
+        .await
+        .unwrap()
+    else {
+        panic!("expected stream")
+    };
+    // A delta without text and an empty one are not content.
+    for _ in 0..2 {
+        output.next().await.unwrap().unwrap();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(probe_log(&repository, 1).await, [format!("claim {route}")]);
+    // The first content closes the circuit, before the stream ends.
+    output.next().await.unwrap().unwrap();
+    assert_eq!(
+        probe_log(&repository, 2).await,
+        [format!("claim {route}"), "close 7".into()]
+    );
+    // The complete end is the health write (a success); nothing is held any more.
+    while output.next().await.is_some() {}
+    assert_eq!(
+        probe_log(&repository, 3).await,
+        [format!("claim {route}"), "close 7".into(), "health".into()]
+    );
+    assert_eq!(*repository.health.lock().unwrap(), [None]);
+}
+
+#[tokio::test]
+async fn a_streamed_probe_that_fails_after_its_content_is_an_ordinary_failure() {
+    use crate::routing::ProbeClaim;
+    let (engine, repository, _) = fixture(Mode::ContentThenError, EngineLimits::default());
+    let route = probing(&repository, ProbeClaim::Claimed(7));
+    let ProviderOutput::Stream(output) = engine
+        .execute(principal(), request(true), Uuid::new_v4())
+        .await
+        .unwrap()
+    else {
+        panic!("expected stream")
+    };
+    let _: Vec<_> = output.collect().await;
+    assert_eq!(
+        probe_log(&repository, 3).await,
+        [format!("claim {route}"), "close 7".into(), "health".into()]
+    );
+    assert_eq!(
+        *repository.health.lock().unwrap(),
+        [Some(InferenceError::UpstreamUnavailable)]
+    );
+}
+
+#[tokio::test]
+async fn a_complete_probe_decides_by_its_result_then_frees_any_slot_left() {
+    use crate::routing::ProbeClaim;
+    for (mode, health) in [
+        (Mode::Complete, None),
+        (Mode::Error, Some(InferenceError::UpstreamUnavailable)),
+    ] {
+        let (engine, repository, _) = fixture(mode, EngineLimits::default());
+        let route = probing(&repository, ProbeClaim::Claimed(7));
+        let _ = engine
+            .execute(principal(), request(false), Uuid::new_v4())
+            .await;
+        // No early close: the result decides, then the slot is freed (a
+        // no-op for a slot the decision already ended).
+        assert_eq!(
+            probe_log(&repository, 3).await,
+            [
+                format!("claim {route}"),
+                "health".into(),
+                "release 7".into()
+            ]
+        );
+        assert_eq!(*repository.health.lock().unwrap(), [health]);
+    }
+}
+
+#[tokio::test]
+async fn a_probe_held_elsewhere_sends_nothing_and_reports_the_route_cooling_down() {
+    use crate::routing::ProbeClaim;
+    let (engine, repository, adapter) = fixture(Mode::Complete, EngineLimits::default());
+    let route = probing(&repository, ProbeClaim::Busy(12));
+    assert!(matches!(
+        engine
+            .execute(principal(), request(false), Uuid::new_v4())
+            .await,
+        Err(InferenceError::RouteCoolingDown(12))
+    ));
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        repository.starts.load(Ordering::SeqCst),
+        0,
+        "no reservation"
+    );
+    assert_eq!(probe_log(&repository, 1).await, [format!("claim {route}")]);
+}
+
+#[tokio::test]
+async fn a_probe_refused_at_admission_frees_its_slot() {
+    use crate::routing::ProbeClaim;
+    let (engine, repository, adapter) = fixture(Mode::Complete, EngineLimits::default());
+    let route = probing(&repository, ProbeClaim::Claimed(7));
+    repository.fail_start.store(true, Ordering::SeqCst);
+    assert!(
+        engine
+            .execute(principal(), request(false), Uuid::new_v4())
+            .await
+            .is_err()
+    );
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        probe_log(&repository, 2).await,
+        [format!("claim {route}"), "release 7".into()]
+    );
+}
+
+/// A route whose circuit never opened is not claimed: the engine adds no
+/// statement for it, for generation (complete and streamed) and for a
+/// workload (embeddings).
+#[tokio::test]
+async fn a_healthy_plan_makes_no_probe_call() {
+    let (mut engine, repository, _) = fixture(Mode::Complete, EngineLimits::default());
+    engine
+        .registry
+        .register(Arc::new(EmbeddingAdapter { malformed: false }))
+        .unwrap();
+    {
+        let mut targets = repository.deployments.lock().unwrap();
+        targets[0].provider = "embedding_mock".into();
+        targets[0].supported_protocols = vec!["embeddings".into()];
+    }
+    let embedding = EmbeddingRequest {
+        model: "public/alias".into(),
+        input: vec!["text".into()],
+        dimensions: Some(2),
+    };
+    engine
+        .execute_embeddings(principal(), embedding, Uuid::new_v4())
+        .await
+        .unwrap();
+    assert_eq!(probe_log(&repository, 1).await, ["health"]);
+    for stream in [false, true] {
+        let mode = if stream { Mode::Stream } else { Mode::Complete };
+        let (engine, repository, _) = fixture(mode, EngineLimits::default());
+        let output = engine
+            .execute(principal(), request(stream), Uuid::new_v4())
+            .await
+            .unwrap();
+        if let ProviderOutput::Stream(output) = output {
+            let _: Vec<_> = output.collect().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(*repository.probe_log.lock().unwrap(), ["health"]);
+    }
+}
+
+/// With the first route's probe held elsewhere, the next route serves the
+/// request as its first attempt (the busy route was not an attempt).
+#[tokio::test]
+async fn a_busy_probe_route_is_passed_over_without_spending_an_attempt() {
+    use crate::routing::ProbeClaim;
+    let (engine, repository, adapter) = fixture(Mode::Complete, EngineLimits::default());
+    let mut second = repository.deployments.lock().unwrap()[0].clone();
+    second.id = Uuid::new_v4();
+    repository.deployments.lock().unwrap().push(second.clone());
+    let first = probing(&repository, ProbeClaim::Busy(5));
+    *repository.plan.lock().unwrap() = Some(crate::routing::RoutePlan {
+        probes: vec![first],
+        ..crate::routing::RoutePlan::single(vec![first, second.id])
+    });
+    let request_id = Uuid::new_v4();
+    engine
+        .execute(principal(), request(false), request_id)
+        .await
+        .unwrap();
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(*repository.attempts.lock().unwrap(), [(request_id, 1)]);
+}
+
+/// The client drops the probe's stream before any content: the slot is
+/// freed without a decision, for the next request.
+#[tokio::test]
+async fn a_probe_dropped_by_its_client_frees_the_slot() {
+    use crate::routing::ProbeClaim;
+    let (engine, repository, _) = fixture(Mode::Pending, EngineLimits::default());
+    let route = probing(&repository, ProbeClaim::Claimed(7));
+    let output = engine
+        .execute(principal(), request(true), Uuid::new_v4())
+        .await
+        .unwrap();
+    drop(output);
+    assert_eq!(
+        probe_log(&repository, 2).await,
+        [format!("claim {route}"), "release 7".into()]
+    );
+    assert!(repository.health.lock().unwrap().is_empty(), "no decision");
+}
+
+/// The request is dropped while its admission is still pending, before any
+/// attempt guard exists: the slot it claimed is freed all the same.
+#[tokio::test]
+async fn a_probe_dropped_before_its_admission_ends_frees_the_slot() {
+    use crate::routing::ProbeClaim;
+    let (engine, repository, adapter) = fixture(Mode::Complete, EngineLimits::default());
+    let route = probing(&repository, ProbeClaim::Claimed(7));
+    repository.hang_start.store(true, Ordering::SeqCst);
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            engine.execute(principal(), request(false), Uuid::new_v4())
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        probe_log(&repository, 2).await,
+        [format!("claim {route}"), "release 7".into()]
+    );
+}
+
+/// A failover attempt takes its route as it is now: the second route's
+/// circuit opened after the plan was made, so nothing is sent there, and
+/// the request ends with the first attempt's own error.
+#[tokio::test]
+async fn a_failover_route_whose_circuit_opened_since_the_plan_is_not_used() {
+    // The first route fails with an ambiguous transport error, which this
+    // plan allows to fail over; the second route's circuit opened since.
+    let (engine, repo, backup) = failover_fixture(Mode::Error, false, true);
+    let second = repo.deployments.lock().unwrap()[1].id;
+    repo.route_states
+        .lock()
+        .unwrap()
+        .insert(second, crate::routing::RouteState::Open(30));
+    let root = Uuid::new_v4();
+    assert_eq!(
+        engine
+            .execute(principal(), request(false), root)
+            .await
+            .err(),
+        Some(InferenceError::UpstreamUnavailable),
+        "the first attempt's own error, not the generic Busy"
+    );
+    assert_eq!(backup.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(*repo.attempts.lock().unwrap(), vec![(root, 1)]);
+}
+
+/// The probe's first-content close fails; the client then drops the
+/// stream: the slot is still freed (the epoch is kept until it ends).
+#[tokio::test]
+async fn a_probe_whose_close_failed_is_still_freed_when_dropped() {
+    use crate::routing::ProbeClaim;
+    let (engine, repository, _) = fixture(Mode::LateContent, EngineLimits::default());
+    let route = probing(&repository, ProbeClaim::Claimed(7));
+    repository.fail_close.store(true, Ordering::SeqCst);
+    let ProviderOutput::Stream(mut output) = engine
+        .execute(principal(), request(true), Uuid::new_v4())
+        .await
+        .unwrap()
+    else {
+        panic!("expected stream")
+    };
+    for _ in 0..3 {
+        output.next().await.unwrap().unwrap();
+    }
+    assert_eq!(
+        probe_log(&repository, 2).await,
+        [format!("claim {route}"), "close 7".into()]
+    );
+    drop(output);
+    assert_eq!(
+        probe_log(&repository, 3).await,
+        [
+            format!("claim {route}"),
+            "close 7".into(),
+            "release 7".into()
+        ]
+    );
+}
+
+/// A batch line's slot, claimed before its capacity wait, is renewed at
+/// send time for the engine's own deadline; if it was lost meanwhile
+/// (expired, or a newer probe holds it), nothing is sent and the route is
+/// cooling down. The lost slot is not released: it is no longer this
+/// request's.
+#[tokio::test]
+async fn a_held_probe_lost_before_the_send_sends_nothing() {
+    let (engine, repository, adapter) = fixture(Mode::Complete, EngineLimits::default());
+    let route = repository.deployments.lock().unwrap()[0].id;
+    *repository.plan.lock().unwrap() = Some(crate::routing::RoutePlan {
+        held_probe: Some((route, 7)),
+        ..crate::routing::RoutePlan::single(vec![route])
+    });
+    repository.renew_lost.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        engine
+            .execute(principal(), request(false), Uuid::new_v4())
+            .await,
+        Err(InferenceError::RouteCoolingDown(_))
+    ));
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 0);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(*repository.probe_log.lock().unwrap(), ["renew 7"]);
+    // Renewed: the request is the probe and ends its slot as usual.
+    repository.renew_lost.store(false, Ordering::SeqCst);
+    repository.probe_log.lock().unwrap().clear();
+    assert!(
+        engine
+            .execute(principal(), request(false), Uuid::new_v4())
+            .await
+            .is_ok()
+    );
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(probe_log(&repository, 3).await[0], "renew 7");
 }

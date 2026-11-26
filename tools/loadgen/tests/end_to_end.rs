@@ -310,6 +310,12 @@ async fn scenario_main(options: PgConnectOptions) {
         label: Some("e2e".into()),
         readers: 8,
         reader_days: 31,
+        // This scenario proves exact settlement, not admission capacity: a
+        // request the 1.5 s admission bound sheds on a loaded host
+        // (`scope_busy`, nothing written) is resent after its Retry-After,
+        // so every request is eventually admitted, and still has to settle
+        // exactly once with one upstream call.
+        retry_shed: 10,
     })
     .await
     .unwrap();
@@ -399,6 +405,7 @@ async fn scenario_slow_management(options: PgConnectOptions) {
             label: Some(format!("slow-management-{attempt}")),
             readers: 8,
             reader_days: 7,
+            retry_shed: 0,
         })
         .await
         .unwrap();
@@ -457,6 +464,7 @@ async fn scenario_warmup(options: PgConnectOptions) {
         label: Some("warmup".into()),
         readers: 0,
         reader_days: 7,
+        retry_shed: 0,
     })
     .await
     .unwrap();

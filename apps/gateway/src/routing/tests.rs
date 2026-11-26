@@ -8,6 +8,8 @@ fn candidate(id: u128, priority: i32, weight: i32, residency: &str) -> Candidate
         operator_disabled: false,
         circuit_open: false,
         cooldown_remaining_seconds: 0,
+        half_open: false,
+        probe_held_seconds: 0,
     }
 }
 #[test]
@@ -20,6 +22,7 @@ fn defaults_preserve_first_available_and_never_retry() {
             candidate(1, 0, 900, "us"),
         ],
         [0; 32],
+        false,
     )
     .unwrap();
     assert_eq!(
@@ -38,6 +41,7 @@ fn priority_is_stable_and_lower_values_win() {
             candidate(3, -10, 1, "eu"),
         ],
         [0; 32],
+        false,
     )
     .unwrap();
     assert_eq!(
@@ -57,7 +61,8 @@ fn required_residency_fences_primary_even_when_preferred_route_is_cooling_down()
         order_candidates(
             &p,
             vec![first, candidate(2, 1, 1, "eu"), candidate(3, 2, 1, "us")],
-            [0; 32]
+            [0; 32],
+            false
         )
         .unwrap()
         .deployment_ids,
@@ -79,8 +84,11 @@ fn weighted_is_without_replacement_and_never_crosses_priority_tiers() {
     for seed in 0..1000u32 {
         let mut bytes = [0; 32];
         bytes[..4].copy_from_slice(&seed.to_le_bytes());
-        let plan = order_candidates(&p, input.clone(), bytes).unwrap();
-        assert_eq!(plan, order_candidates(&p, input.clone(), bytes).unwrap());
+        let plan = order_candidates(&p, input.clone(), bytes, false).unwrap();
+        assert_eq!(
+            plan,
+            order_candidates(&p, input.clone(), bytes, false).unwrap()
+        );
         assert_eq!(plan.deployment_ids.len(), 3);
         assert_eq!(plan.deployment_ids.iter().collect::<HashSet<_>>().len(), 3);
         assert_eq!(plan.deployment_ids[2], Uuid::from_u128(3));
@@ -98,7 +106,8 @@ fn disabled_and_open_routes_are_skipped_without_probes() {
         order_candidates(
             &RoutingPolicy::default(),
             vec![disabled.clone(), open.clone(), candidate(3, 1, 1, "us")],
-            [0; 32]
+            [0; 32],
+            false
         )
         .unwrap()
         .deployment_ids,
@@ -113,12 +122,13 @@ fn disabled_and_open_routes_are_skipped_without_probes() {
         order_candidates(
             &RoutingPolicy::default(),
             vec![disabled.clone(), later, open],
-            [0; 32]
+            [0; 32],
+            false
         ),
         Err(InferenceError::RouteCoolingDown(12))
     );
     assert_eq!(
-        order_candidates(&RoutingPolicy::default(), vec![disabled], [0; 32]),
+        order_candidates(&RoutingPolicy::default(), vec![disabled], [0; 32], false),
         Err(InferenceError::ModelUnavailable)
     );
 }
@@ -132,7 +142,7 @@ fn cooling_route_outside_required_residency_is_not_a_retry_hint() {
     eu.circuit_open = true;
     eu.cooldown_remaining_seconds = 5;
     assert_eq!(
-        order_candidates(&p, vec![eu], [0; 32]),
+        order_candidates(&p, vec![eu], [0; 32], false),
         Err(InferenceError::ModelUnavailable)
     );
 }
@@ -151,7 +161,8 @@ fn retries_require_exact_explicit_residency_of_first_selected_route() {
                 candidate(3, 2, 1, "eu"),
                 candidate(4, 3, 1, "us")
             ],
-            [0; 32]
+            [0; 32],
+            false
         )
         .unwrap()
         .deployment_ids,
@@ -165,7 +176,8 @@ fn retries_require_exact_explicit_residency_of_first_selected_route() {
                 candidate(2, 0, 1, "unspecified"),
                 candidate(3, 0, 1, "us")
             ],
-            [0; 32]
+            [0; 32],
+            false
         )
         .unwrap()
         .deployment_ids,
@@ -246,7 +258,8 @@ fn invalid_config_and_oversized_candidate_lists_are_rejected() {
         order_candidates(
             &RoutingPolicy::default(),
             vec![candidate(1, 0, 0, "us")],
-            [0; 32]
+            [0; 32],
+            false
         ),
         Err(InferenceError::Configuration)
     );
@@ -322,15 +335,44 @@ mod database {
             .await
             .is_ok()
         );
-        record_result(
+        // Half-open: only the probe decides (`probe_tests`). Its failure reopens.
+        let ProbeClaim::Claimed(epoch) = claim_probe(
+            &f.store,
+            deployment.id,
+            Uuid::new_v4(),
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap() else {
+            panic!("the half-open route's probe")
+        };
+        record_probe_result(
             &f.store,
             deployment.id,
             Some(InferenceError::UpstreamUnavailable),
+            epoch,
         )
         .await
         .unwrap();
         assert!(health(&f.store, deployment.id).await.unwrap().circuit_open);
-        record_result(&f.store, deployment.id, None).await.unwrap();
+        // The next probe's success closes it.
+        sqlx::query("UPDATE deployment_health SET open_until=now()-interval '1 second'")
+            .execute(&f.store.pool)
+            .await
+            .unwrap();
+        let ProbeClaim::Claimed(epoch) = claim_probe(
+            &f.store,
+            deployment.id,
+            Uuid::new_v4(),
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap() else {
+            panic!("the half-open route's probe")
+        };
+        record_probe_result(&f.store, deployment.id, None, epoch)
+            .await
+            .unwrap();
         let h = health(&f.store, deployment.id).await.unwrap();
         assert_eq!(h.consecutive_failures, 0);
         assert!(h.open_until.is_none());
@@ -360,6 +402,14 @@ mod database {
             .await
             .unwrap()
             .remove(0);
+        // A threshold the failures stay below: a closed circuit counts every one.
+        sqlx::query(
+            "INSERT INTO deployment_routing(deployment_id,failure_threshold) VALUES($1,100)",
+        )
+        .bind(deployment.id)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
         let results = futures_util::future::join_all(
             (0..24).map(|_| record_result(&f.store, deployment.id, Some(InferenceError::Busy))),
         )
@@ -415,6 +465,33 @@ mod database {
             .max_attempts,
             2
         );
+    }
+    /// At the default threshold (3) concurrent failures open the circuit
+    /// exactly once: one opening (`reopen_count` 1) for one default cooldown
+    /// (30 s), and the failures that land while it is open change nothing.
+    #[dbtest::test]
+    async fn concurrent_failures_at_the_default_threshold_open_the_circuit_once(pool: PgPool) {
+        let f = fixture(pool).await;
+        let deployment = f
+            .store
+            .deployments(&f.principal, "company/smart")
+            .await
+            .unwrap()
+            .remove(0);
+        let results = futures_util::future::join_all(
+            (0..24).map(|_| record_result(&f.store, deployment.id, Some(InferenceError::Busy))),
+        )
+        .await;
+        assert!(results.iter().all(Result::is_ok));
+        let (failures, reopens, cooldown): (i32, i32, bool) = sqlx::query_as(
+            "SELECT consecutive_failures, reopen_count, open_until BETWEEN last_observed_at AND clock_timestamp()+interval '30 seconds' FROM deployment_health WHERE deployment_id=$1",
+        )
+        .bind(deployment.id)
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+        assert_eq!((failures, reopens, cooldown), (3, 1, true));
+        assert!(health(&f.store, deployment.id).await.unwrap().circuit_open);
     }
     /// Successes on a healthy, recently observed route write nothing (no
     /// per-success hot-row update); failures, recoveries and a stale

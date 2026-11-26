@@ -1,7 +1,7 @@
 //! Durable per-attempt accounting. Lock order: [`locks`] (catalog lock, then
 //! scoped authority locks, then the reservation row, then totals/counter rows
-//! in primary-key order; `GATEWAY_ADMISSION_MODE=global` takes the former
-//! installation row lock after the catalog lock instead).
+//! in primary-key order). Admission and settlement never take the
+//! installation row.
 use crate::{
     billing::{
         self, BillingUsage, CachePricing, CacheRate, CostBreakdown, MeterUsage, MeterVariant,
@@ -70,15 +70,13 @@ mod proof {
 }
 pub(crate) use proof::SharedEligibilityCommitted;
 /// Bounded in-process queues in front of the governance transactions, one for
-/// admissions and one for settlements/reconciliation. In the global mode work
-/// under the installation lock is serialized anyway, so letting every
-/// concurrent request hold a pooled connection while it waits adds no
-/// throughput: it starves authentication, routing and settlement of
-/// connections (the load test saw 503s and unsettled streams at 200
-/// concurrent requests on a 10-connection pool). There each queue lets at
-/// most a quarter of the pool wait on the database lock. Scoped admissions of
-/// different scopes run in parallel, so up to half the pool may admit and
-/// three tenths settle; the rest stays free for authentication and routing.
+/// admissions and one for settlements/reconciliation. Letting every
+/// concurrent request hold a pooled connection while it waits for its locks
+/// starves authentication, routing and settlement of connections (the load
+/// test saw 503s and unsettled streams at 200 concurrent requests on a
+/// 10-connection pool). Admissions of different scopes run in parallel, so
+/// up to half the pool may admit and three tenths settle; the rest stays
+/// free for authentication and routing.
 /// Other callers wait here without a connection. Settlements never queue
 /// behind admissions in-process, so holds are released promptly.
 pub struct LockGates {
@@ -86,14 +84,11 @@ pub struct LockGates {
     settlement: tokio::sync::Semaphore,
 }
 impl LockGates {
-    pub(crate) fn for_pool(max_connections: u32, mode: locks::AdmissionMode) -> Self {
+    pub(crate) fn for_pool(max_connections: u32) -> Self {
         let pool = max_connections as usize;
-        let (admission, settlement) = match mode {
-            locks::AdmissionMode::Global => (pool / 4, pool / 4),
-            // In a 1,000/s single-replica load test with a quarter of the pool,
-            // settlements queued in process (2 permits of 10).
-            locks::AdmissionMode::Scoped => (pool / 2, pool * 3 / 10),
-        };
+        // In a 1,000/s single-replica load test with a quarter of the pool,
+        // settlements queued in process (2 permits of 10).
+        let (admission, settlement) = (pool / 2, pool * 3 / 10);
         Self {
             admission: tokio::sync::Semaphore::new(admission.max(1)),
             settlement: tokio::sync::Semaphore::new(settlement.max(1)),
@@ -141,41 +136,24 @@ async fn gate(semaphore: &tokio::sync::Semaphore) -> tokio::sync::SemaphorePermi
         .await
         .expect("installation lock gate is never closed")
 }
-/// The global-mode prefix: the shared catalog lock, then the installation row.
-async fn lock(tx: &mut Tx<'_>) -> Result<(), InferenceError> {
-    catalog_lock(tx).await?;
-    installation_lock(tx).await
-}
-fn scoped(store: &Store) -> bool {
-    store.admission_mode == locks::AdmissionMode::Scoped
-}
 /// Lock prefix of a new admission (or admission-like growth) of `principal`:
-/// scoped, the shared catalog and authority locks (`locks::admission`);
-/// global, the catalog lock and the installation row.
-/// Returns the scoped authority-lock wait (zero in the global mode), also
-/// observed as `gateway_scope_lock_wait_seconds{lock="authority"}`.
+/// the shared catalog and authority locks (`locks::admission`). Returns the
+/// authority-lock wait, also observed as
+/// `gateway_scope_lock_wait_seconds{lock="authority"}`.
 async fn admission_prefix(
-    store: &Store,
     tx: &mut Tx<'_>,
     principal: &crate::auth::Principal,
-    deadline: tokio::time::Instant,
 ) -> Result<std::time::Duration, InferenceError> {
-    if scoped(store) {
-        let wait = crate::metrics::METRICS.scope_lock_wait("authority", "admission");
-        locks::admission(tx, principal).await.map_err(storage)?;
-        Ok(wait.elapsed())
-    } else {
-        catalog_lock(tx).await?;
-        installation_lock_bounded(tx, remaining(deadline)).await?;
-        Ok(std::time::Duration::ZERO)
-    }
+    let wait = crate::metrics::METRICS.scope_lock_wait("authority", "admission");
+    locks::admission(tx, principal).await.map_err(storage)?;
+    Ok(wait.elapsed())
 }
 
 /// How long an admission waits, from when it starts queueing for the
 /// replica's admission gate, for that gate and the rows it must lock before
 /// it writes anything: its scope's totals and counter rows (`lock_rows` with
-/// counters), or in the global mode the installation row (each row lock
-/// wait gets what is left, at least [`ADMISSION_LOCK_FLOOR`]). Past it the
+/// counters; the row lock gets what is left, at least
+/// [`ADMISSION_LOCK_FLOOR`]). Past it the
 /// admission ends as [`InferenceError::ScopeBusy`] with nothing written. Its
 /// pool connection is waited for as before (the pool's acquire timeout):
 /// the gate already keeps admissions to their share of the pool, and an
@@ -203,9 +181,8 @@ fn shed_or_storage(error: sqlx::Error) -> InferenceError {
 /// no longer active: exactly the conditions under which live authentication
 /// refuses the key), in which case this replica's cached entries of the key
 /// are dropped at once. Model availability is checked separately
-/// (`ModelUnavailable`). Scoped admission reads without row locks (the
-/// shared authority locks exclude concurrent revocation); the global mode
-/// keeps its `FOR SHARE` row locks.
+/// (`ModelUnavailable`). It reads without row locks: the shared authority
+/// locks exclude concurrent revocation.
 /// Returns the key lineage and whether the admitting workspace is shared
 /// (`team`/`project`): the only source of trace-export eligibility
 /// (`admit_unobserved`'s commit branch), live-revalidated here under this
@@ -215,7 +192,7 @@ async fn authorize(
     tx: &mut Tx<'_>,
     principal: &crate::auth::Principal,
 ) -> Result<(Uuid, bool), InferenceError> {
-    match crate::auth::revalidate_admission_with(tx, principal, !scoped(store))
+    match crate::auth::revalidate_admission(tx, principal)
         .await
         .map_err(storage)?
     {
@@ -226,31 +203,16 @@ async fn authorize(
         }
     }
 }
-/// Settlement prefix: global, the catalog lock and the installation row;
-/// scoped, nothing (the reservation row lock taken by the next read
-/// serializes settlement, reconciliation and growth of one reservation).
-async fn settlement_prefix(store: &Store, tx: &mut Tx<'_>) -> Result<(), InferenceError> {
-    if scoped(store) {
-        Ok(())
-    } else {
-        lock(tx).await
-    }
-}
-/// Scoped mode: lock the totals rows (and for an `admission`, with its
-/// deadline, the minute and in-flight rows) the next writes change, in
-/// canonical order. A no-op in the global mode, where the installation row
-/// serializes everything. Returns the wait, observed as
+/// Lock the totals rows (and for an `admission`, with its deadline, the
+/// minute and in-flight rows) the next writes change, in canonical order.
+/// Returns the wait, observed as
 /// `gateway_scope_lock_wait_seconds{lock="rows"}` with path `admission`
 /// (counter rows: new consumption) or `settlement`.
 async fn lock_rows(
-    store: &Store,
     tx: &mut Tx<'_>,
     touches: &[locks::Touch],
     admission: Option<tokio::time::Instant>,
 ) -> Result<std::time::Duration, InferenceError> {
-    if !scoped(store) {
-        return Ok(std::time::Duration::ZERO);
-    }
     let path = if admission.is_some() {
         "admission"
     } else {
@@ -268,56 +230,11 @@ async fn lock_rows(
     }
     Ok(wait.elapsed())
 }
-/// The `FOR SHARE` clause of the global mode's catalog row reads (scoped
-/// admission relies on the shared catalog lock, which every catalog writer
-/// takes exclusively).
-fn catalog_share(store: &Store) -> &'static str {
-    if scoped(store) {
-        ""
-    } else {
-        " FOR SHARE OF d,p,m"
-    }
-}
 /// The shared catalog lock: catalog writers (deployments, providers, models,
 /// prices) hold it exclusively, so it fences catalog configuration.
 async fn catalog_lock(tx: &mut Tx<'_>) -> Result<(), InferenceError> {
     sqlx::query("SELECT pg_advisory_xact_lock_shared(72419502)")
         .execute(&mut **tx)
-        .await
-        .map_err(storage)?;
-    Ok(())
-}
-/// The installation row lock, taken after [`catalog_lock`], serializes
-/// management changes. Global-mode admission and settlement also take
-/// this lock when serializing with authorization, membership and policy
-/// changes. Scoped admission and settlement use scoped authority locks.
-/// Admission reads limit data from the workspace and key lineage policies,
-/// budget totals and counters.
-/// [`installation_lock`] for a global-mode admission: its wait is bounded by
-/// `bound` (a transaction-local `lock_timeout`, set by the first statement,
-/// which returns the previous value, read before it is set, and restored by
-/// the locking statement itself once it holds the row).
-async fn installation_lock_bounded(
-    tx: &mut Tx<'_>,
-    bound: std::time::Duration,
-) -> Result<(), InferenceError> {
-    let before: String = sqlx::query_scalar(
-        "WITH b AS MATERIALIZED (SELECT current_setting('lock_timeout') AS before),s AS MATERIALIZED (SELECT set_config('lock_timeout',$1,true) FROM b) SELECT b.before FROM b,s",
-    )
-    .bind(locks::lock_timeout(bound))
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(storage)?;
-    sqlx::query("SELECT set_config('lock_timeout',$1,true) FROM (SELECT id FROM installation WHERE singleton FOR NO KEY UPDATE) i")
-        .bind(before)
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(shed_or_storage)?;
-    Ok(())
-}
-async fn installation_lock(tx: &mut Tx<'_>) -> Result<(), InferenceError> {
-    sqlx::query_scalar::<_, Uuid>("SELECT id FROM installation WHERE singleton FOR NO KEY UPDATE")
-        .fetch_one(&mut **tx)
         .await
         .map_err(storage)?;
     Ok(())
@@ -334,7 +251,7 @@ mod admission;
 pub mod batch;
 /// Lease extension and bound preview for async jobs (`crate::jobs`).
 pub mod jobs;
-/// Canonical lock order, authority scope locks and the admission mode.
+/// Canonical lock order, authority scope locks and the admission setting.
 pub mod locks;
 /// Budget periods and the applicable policy and budget rows.
 mod policy;
@@ -372,10 +289,7 @@ use settlement::{
 pub use settlement::{finish, finish_with_telemetry};
 pub(crate) use settlement::{finish_accepted_job, validate_token_usage};
 #[allow(clippy::too_many_arguments)]
-#[cfg_attr(
-    not(test),
-    expect(clippy::too_many_lines, clippy::cognitive_complexity, reason = "#499")
-)]
+#[cfg_attr(not(test), expect(clippy::too_many_lines, reason = "#499"))]
 async fn admit_unobserved(
     store: &Store,
     record: &ExecutionStart,
@@ -403,47 +317,29 @@ async fn admit_unobserved(
     // append-only prices) changes only under the exclusive catalog lock, so
     // once it is held shared the latest price and the reservation bounds are
     // fixed for this transaction. Authorization, entitlement and policies
-    // change under the exclusive authority locks of their scope (scoped) or
-    // the installation lock (global), both held from here to commit. Bound
-    // errors are reported after the checks below, in the former order.
-    // Scoped: the latest price id is read with the deployment check below
-    // and its immutable row comes from the price cache (one round trip less).
-    let mut lock_wait = std::time::Duration::ZERO;
-    let read_price = if scoped(store) {
-        lock_wait += admission_prefix(store, &mut tx, &record.principal, deadline).await?;
-        timer.phase("locks");
-        // Scoped admission takes the shared catalog and authority locks
-        // together (locks::admission): one real boundary, named for its
-        // dominant role (authority locks of workspace type, workspace,
-        // user and key lineage).
-        crate::telemetry::mark_phase(crate::telemetry::SpanName::AdmissionAuthorityLocks);
-        None
-    } else {
-        catalog_lock(&mut tx).await?;
-        let price = latest_price(&mut tx, record.deployment_id).await?;
-        timer.phase("price");
-        crate::telemetry::mark_phase(crate::telemetry::SpanName::AdmissionCatalogLocks);
-        installation_lock_bounded(&mut tx, remaining(deadline)).await?;
-        timer.phase("locks");
-        crate::telemetry::mark_phase(crate::telemetry::SpanName::AdmissionAuthorityLocks);
-        Some(price)
-    };
+    // change under the exclusive authority locks of their scope, held from
+    // here to commit. Bound errors are reported after the checks below, in
+    // the former order. The latest price id is read with the deployment
+    // check below and its immutable row comes from the price cache (one
+    // round trip less).
+    let mut lock_wait = admission_prefix(&mut tx, &record.principal).await?;
+    timer.phase("locks");
+    // The shared catalog and authority locks are taken together
+    // (locks::admission): one real boundary, named for its dominant role
+    // (authority locks of workspace type, workspace, user and key lineage).
+    crate::telemetry::mark_phase(crate::telemetry::SpanName::AdmissionAuthorityLocks);
     let (lineage, shared) = authorize(store, &mut tx, &record.principal).await?;
     // The deployment check also reads the admission clock and the latest
     // price id (one round trip).
-    let row=sqlx::query(&format!("SELECT d.id,p.provider,d.upstream_model,p.credential_ref,p.endpoint,p.region,m.supported_protocols,clock_timestamp() AS admission_now,(SELECT x.id FROM deployment_prices x WHERE x.deployment_id=d.id ORDER BY x.created_at DESC,x.id DESC LIMIT 1) AS latest_price_id FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id JOIN models m ON m.id=d.model_id WHERE d.id=$2 AND m.public_name=$3 AND workspace_model_allowed($1,m.id) AND d.enabled AND p.enabled AND (NOT EXISTS(SELECT 1 FROM key_model_restrictions WHERE workspace_id=$1 AND governance_key_id=$4) OR EXISTS(SELECT 1 FROM key_model_selections WHERE workspace_id=$1 AND governance_key_id=$4 AND model_id=m.id)){}", catalog_share(store)))
+    let row=sqlx::query("SELECT d.id,p.provider,d.upstream_model,p.credential_ref,p.endpoint,p.region,m.supported_protocols,clock_timestamp() AS admission_now,(SELECT x.id FROM deployment_prices x WHERE x.deployment_id=d.id ORDER BY x.created_at DESC,x.id DESC LIMIT 1) AS latest_price_id FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id JOIN models m ON m.id=d.model_id WHERE d.id=$2 AND m.public_name=$3 AND workspace_model_allowed($1,m.id) AND d.enabled AND p.enabled AND (NOT EXISTS(SELECT 1 FROM key_model_restrictions WHERE workspace_id=$1 AND governance_key_id=$4) OR EXISTS(SELECT 1 FROM key_model_selections WHERE workspace_id=$1 AND governance_key_id=$4 AND model_id=m.id))")
         .bind(workspace).bind(record.deployment_id).bind(&record.model).bind(lineage).fetch_optional(&mut *tx).await.map_err(storage)?.ok_or(InferenceError::ModelUnavailable)?;
     let current = <Deployment as sqlx::FromRow<_>>::from_row(&row).map_err(storage)?;
     let database_now: UtcInstant = sqlx::Row::try_get(&row, "admission_now").map_err(storage)?;
-    let price = match read_price {
-        Some(price) => price,
-        None => {
-            match sqlx::Row::try_get::<Option<Uuid>, _>(&row, "latest_price_id").map_err(storage)? {
-                Some(id) => Some(price_version(&mut tx, id, record.deployment_id).await?),
-                None => None,
-            }
-        }
-    };
+    let price =
+        match sqlx::Row::try_get::<Option<Uuid>, _>(&row, "latest_price_id").map_err(storage)? {
+            Some(id) => Some(price_version(&mut tx, id, record.deployment_id).await?),
+            None => None,
+        };
     let admission = match workload.output {
         OutputReservation::Requested(requested) if workload.kind == WorkloadKind::Generation => {
             generation_bound(
@@ -520,10 +416,9 @@ async fn admit_unobserved(
     let job = matches!(workload.kind, WorkloadKind::Videos | WorkloadKind::Batches);
     timer.phase("read");
     crate::telemetry::mark_phase(crate::telemetry::SpanName::AdmissionRead);
-    // Scoped: hold this workspace's and lineage's totals and counter rows
-    // (the ones the write below changes) before reading them.
+    // Hold this workspace's and lineage's totals and counter rows (the ones
+    // the write below changes) before reading them.
     lock_wait += lock_rows(
-        store,
         &mut tx,
         &[locks::Touch {
             workspace,
@@ -591,7 +486,7 @@ async fn admit_unobserved(
     // Per-scope ceiling signal (`admission_ceiling` alerts): committed
     // interactive admissions (the ones `rate_minute_counters` counts) that
     // waited at least 10 ms for their scope locks.
-    if !job && scoped(store) {
+    if !job {
         pressure::record(now, workspace, lineage, lock_wait);
     }
     Ok(admission)

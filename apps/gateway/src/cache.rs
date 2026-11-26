@@ -177,11 +177,16 @@ pub struct RouteSnapshot {
 #[derive(Clone, Copy, Debug)]
 pub struct HealthEntry {
     pub loaded: Instant,
-    /// When the open circuit closes (local clock), if open.
+    /// When the open circuit closes (local clock), if it opened and has not
+    /// closed since; at or before `loaded` when its cooldown had passed.
     pub open_until: Option<Instant>,
     pub consecutive_failures: i32,
     /// Age of `last_observed_at` when loaded (`None`: never observed).
     pub observed_age: Option<Duration>,
+    /// When a held probe slot ends on its own (local clock), if held.
+    pub probe_until: Option<Instant>,
+    /// Openings since the route last served a complete success.
+    pub reopen_count: i32,
 }
 
 /// Health entries are reused for this long (cross-replica circuit changes

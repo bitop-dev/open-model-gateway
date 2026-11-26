@@ -38,10 +38,6 @@ pub struct Store {
     pub(crate) report_dispatch: std::sync::Arc<std::sync::Mutex<Option<ReportScanFrontier>>>,
     pub(crate) report_calendar_scan:
         std::sync::Arc<std::sync::Mutex<Option<crate::scheduled_reports::CalendarScanKey>>>,
-    /// Admission protocol (`GATEWAY_ADMISSION_MODE`, see
-    /// `governance::locks`): scoped locks (default) or the former
-    /// installation row lock.
-    pub(crate) admission_mode: crate::governance::locks::AdmissionMode,
     /// How long an admission waits for its gate and rows
     /// (`governance::ADMISSION_LOCK_WAIT`; only tests of other properties
     /// under deliberately extreme bursts lengthen it).
@@ -379,15 +375,7 @@ async fn preflight(connection: &mut PgConnection, initializing: bool) -> anyhow:
 
 impl Store {
     pub fn new(pool: PgPool) -> Self {
-        // Tests run under either protocol (`GATEWAY_ADMISSION_MODE`); serve
-        // sets the validated configuration with `with_admission_mode`.
-        #[cfg(any(test, feature = "integration-tests"))]
-        let mode = crate::governance::locks::AdmissionMode::from_env()
-            .expect("GATEWAY_ADMISSION_MODE must be scoped or global");
-        #[cfg(not(any(test, feature = "integration-tests")))]
-        let mode = crate::governance::locks::AdmissionMode::default();
-        let gates =
-            crate::governance::LockGates::for_pool(pool.options().get_max_connections(), mode);
+        let gates = crate::governance::LockGates::for_pool(pool.options().get_max_connections());
         Self {
             pool,
             provider_secrets: Default::default(),
@@ -397,7 +385,6 @@ impl Store {
             alert_dispatch: Default::default(),
             report_dispatch: Default::default(),
             report_calendar_scan: Default::default(),
-            admission_mode: mode,
             admission_lock_wait: crate::governance::ADMISSION_LOCK_WAIT,
             reporting: None,
             reporting_max_lag: std::time::Duration::from_secs(30),
@@ -437,20 +424,6 @@ impl Store {
         self.admission_lock_wait = wait;
         self
     }
-    /// Select the admission protocol (`GATEWAY_ADMISSION_MODE`).
-    pub fn with_admission_mode(mut self, mode: crate::governance::locks::AdmissionMode) -> Self {
-        let gates =
-            crate::governance::LockGates::for_pool(self.pool.options().get_max_connections(), mode);
-        self.lock_gates = std::sync::Arc::new(gates);
-        self.admission_mode = mode;
-        self
-    }
-
-    /// The admission protocol in use.
-    pub fn admission_mode(&self) -> crate::governance::locks::AdmissionMode {
-        self.admission_mode
-    }
-
     /// This replica's caches (`crate::cache`).
     pub fn caches(&self) -> &crate::cache::Caches {
         &self.caches

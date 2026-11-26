@@ -2,10 +2,7 @@
 //! parallelism across scopes, exact budgets under concurrency, revocation,
 //! membership, suspension, type-default and catalog changes racing admission,
 //! settlement versus reconciliation, and a deadlock-freedom fuzz of random
-//! admissions, settlements and management changes. Every test runs under the
-//! selected `GATEWAY_ADMISSION_MODE` (the suite runs both); assertions that
-//! differ between the modes say so.
-use super::locks::AdmissionMode;
+//! admissions, settlements and management changes.
 use super::*;
 use crate::{
     auth::{NewApiKey, Principal},
@@ -61,51 +58,32 @@ async fn verify_clean(pool: &PgPool, context: &str) {
     assert!(report.consistent(), "{context}: {report:#?}");
 }
 
-fn scoped(store: &Store) -> bool {
-    store.admission_mode() == AdmissionMode::Scoped
-}
-
-/// Hold workspace `p`'s admission locks and rows (scoped) or the installation
-/// row (global) in an open transaction, as a long admission would.
+/// Hold workspace `p`'s admission locks and rows in an open transaction, as
+/// a long admission would.
 async fn hold_admission(
     pool: &PgPool,
-    mode: AdmissionMode,
     p: &Principal,
 ) -> sqlx::Transaction<'static, sqlx::Postgres> {
     let mut tx = pool.begin().await.unwrap();
-    match mode {
-        AdmissionMode::Scoped => {
-            sqlx::query("SELECT * FROM omg_admission_locks($1,$2,$3)")
-                .bind(p.workspace_id)
-                .bind(p.user_id)
-                .bind(p.key_id)
-                .execute(&mut *tx)
-                .await
-                .unwrap();
-            sqlx::query("SELECT omg_lock_scope_rows($1,$2,ARRAY[clock_timestamp()],true)")
-                .bind(vec![p.workspace_id])
-                .bind(vec![p.key_id])
-                .execute(&mut *tx)
-                .await
-                .unwrap();
-        }
-        AdmissionMode::Global => {
-            sqlx::query("SELECT pg_advisory_xact_lock_shared(72419502)")
-                .execute(&mut *tx)
-                .await
-                .unwrap();
-            sqlx::query("SELECT lock_installation()")
-                .execute(&mut *tx)
-                .await
-                .unwrap();
-        }
-    }
+    sqlx::query("SELECT * FROM omg_admission_locks($1,$2,$3)")
+        .bind(p.workspace_id)
+        .bind(p.user_id)
+        .bind(p.key_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("SELECT omg_lock_scope_rows($1,$2,ARRAY[clock_timestamp()],true)")
+        .bind(vec![p.workspace_id])
+        .bind(vec![p.key_id])
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     tx
 }
 
 /// Two workspaces admit in parallel: while one workspace's admission holds
 /// its scope locks and rows, another workspace admits immediately; the same
-/// workspace waits. (Global mode: everything waits on the installation row.)
+/// workspace waits.
 #[dbtest::test]
 async fn two_workspaces_admit_in_parallel_without_waiting(pool: PgPool) {
     let f = fixture(pool.clone()).await;
@@ -118,15 +96,14 @@ async fn two_workspaces_admit_in_parallel_without_waiting(pool: PgPool) {
         Some(1_000_000),
     )
     .await;
-    let mode = f.store.admission_mode();
-    let held = hold_admission(&pool, mode, &f.principal).await;
+    let held = hold_admission(&pool, &f.principal).await;
     let req = request();
-    // Another workspace (the team) is not blocked in scoped mode.
+    // Another workspace (the team) is not blocked.
     let other = start_for(&f, f.team);
     let other_admission = admit(&f.store, &other, &req, 30);
     tokio::pin!(other_admission);
     let first = tokio::time::timeout(Duration::from_millis(500), &mut other_admission).await;
-    // The held workspace waits in both modes.
+    // The held workspace waits.
     let same = f.start();
     let same_admission = admit(&f.store, &same, &req, 30);
     tokio::pin!(same_admission);
@@ -136,26 +113,12 @@ async fn two_workspaces_admit_in_parallel_without_waiting(pool: PgPool) {
             .is_err(),
         "an admission of the held workspace must wait"
     );
-    match mode {
-        AdmissionMode::Scoped => assert_eq!(first.expect("other workspace waited"), Ok(())),
-        AdmissionMode::Global => assert!(first.is_err(), "global mode serializes"),
-    }
+    assert_eq!(first.expect("other workspace waited"), Ok(()));
     held.commit().await.unwrap();
-    if mode == AdmissionMode::Global {
-        let (a, b) = tokio::time::timeout(
-            Duration::from_secs(5),
-            futures::future::join(&mut same_admission, &mut other_admission),
-        )
+    tokio::time::timeout(Duration::from_secs(5), &mut same_admission)
         .await
+        .unwrap()
         .unwrap();
-        a.unwrap();
-        b.unwrap();
-    } else {
-        tokio::time::timeout(Duration::from_secs(5), &mut same_admission)
-            .await
-            .unwrap()
-            .unwrap();
-    }
     verify_clean(&pool, "parallel").await;
 }
 
@@ -714,14 +677,11 @@ fn audit_on() -> bool {
 
 /// Scoped admission takes no row lock on authority rows (no MultiXacts):
 /// while it holds its locks, a concurrent `FOR UPDATE` of the key, workspace
-/// and user rows does not wait. (Global mode keeps `FOR SHARE`.)
+/// and user rows does not wait.
 #[dbtest::test]
 async fn scoped_admission_takes_no_authority_row_locks(pool: PgPool) {
     let f = fixture(pool.clone()).await;
     f.price(1_000_000).await;
-    if !scoped(&f.store) {
-        return;
-    }
     // An admission paused inside its transaction: after its locks, before
     // commit (simulated by the same statements on one connection).
     let mut tx = pool.begin().await.unwrap();
@@ -733,7 +693,7 @@ async fn scoped_admission_takes_no_authority_row_locks(pool: PgPool) {
         .await
         .unwrap();
     assert!(
-        crate::auth::revalidate_admission_with(&mut tx, &f.principal, false)
+        crate::auth::revalidate_admission(&mut tx, &f.principal)
             .await
             .unwrap()
             .is_some()
@@ -762,21 +722,20 @@ async fn written(pool: &PgPool) -> (i64, i64, i64, i64, i64, i64) {
     .unwrap()
 }
 
-/// An admission whose scope rows (or, globally, the installation row) are
-/// held past `ADMISSION_LOCK_WAIT` ends as `ScopeBusy` once the bound
-/// elapses, with nothing written: no execution, reservation, hold, in-flight
-/// or minute count. Its transaction rolled back, so no pooled session keeps
-/// the bound, and the key's per-minute rate allowance is unspent: the next
-/// admission of the minute (one per minute here) succeeds.
+/// An admission whose scope rows are held past `ADMISSION_LOCK_WAIT` ends
+/// as `ScopeBusy` once the bound elapses, with nothing written: no
+/// execution, reservation, hold, in-flight or minute count. Its transaction
+/// rolled back, so no pooled session keeps the bound, and the key's
+/// per-minute rate allowance is unspent: the next admission of the minute
+/// (one per minute here) succeeds.
 #[dbtest::test]
 async fn an_admission_past_its_lock_bound_is_shed_and_leaves_nothing(pool: PgPool) {
     let f = fixture(pool.clone()).await;
     f.price(1_000_000).await;
     f.policy("workspace_local_policies", Some(1), None, None, None)
         .await;
-    let mode = f.store.admission_mode();
     let before = written(&pool).await;
-    let held = hold_admission(&pool, mode, &f.principal).await;
+    let held = hold_admission(&pool, &f.principal).await;
     let start = f.start();
     let waited = std::time::Instant::now();
     let shed = tokio::time::timeout(
@@ -826,16 +785,15 @@ async fn an_admission_past_its_lock_bound_is_shed_and_leaves_nothing(pool: PgPoo
     verify_clean(&pool, "shed").await;
 }
 
-/// The bound is the admission's alone: a settlement waits for held rows
-/// (or, globally, the installation row) as long as they are held.
+/// The bound is the admission's alone: a settlement waits for held rows as
+/// long as they are held.
 #[dbtest::test]
 async fn a_settlement_waits_past_the_admission_bound(pool: PgPool) {
     let f = fixture(pool.clone()).await;
     f.price(1_000_000).await;
-    let mode = f.store.admission_mode();
     let start = f.start();
     admit(&f.store, &start, &request(), 30).await.unwrap();
-    let held = hold_admission(&pool, mode, &f.principal).await;
+    let held = hold_admission(&pool, &f.principal).await;
     let record = done(start.id, Some(10), Some(5));
     let settle = finish(&f.store, &record);
     tokio::pin!(settle);
