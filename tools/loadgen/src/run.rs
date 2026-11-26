@@ -66,6 +66,11 @@ pub struct RunConfig {
     pub readers: usize,
     /// Report window of the readers, in days ending tomorrow (UTC).
     pub reader_days: u32,
+    /// How often a request shed before admission (`503 scope_busy`, nothing
+    /// written) is sent again after its `Retry-After`, with the same nonce;
+    /// 0 (the CLI's setting) never resends. Its record is the last attempt's.
+    #[serde(default)]
+    pub retry_shed: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -89,6 +94,10 @@ pub struct RequestRecord {
     pub ttfb_us: u64,
     /// Scheduled to sent.
     pub lag_us: u64,
+    /// `Retry-After` of a `503`, in seconds.
+    pub retry_after_s: Option<u64>,
+    /// Earlier attempts of this request shed with `scope_busy` and resent.
+    pub shed_retries: u32,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -100,6 +109,9 @@ pub struct Totals {
     pub incomplete: u64,
     pub by_status: BTreeMap<String, u64>,
     pub by_error_code: BTreeMap<String, u64>,
+    /// Attempts shed with `scope_busy` and resent ([`RunConfig::retry_shed`]);
+    /// not in `sent`, which counts requests.
+    pub shed_retries: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -238,6 +250,7 @@ fn micros(d: Duration) -> u64 {
     d.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
+#[derive(Clone)]
 struct Request {
     index: u64,
     nonce: String,
@@ -271,6 +284,8 @@ async fn execute(
         service_us: 0,
         ttfb_us: 0,
         lag_us: micros(sent.saturating_duration_since(request.scheduled)),
+        retry_after_s: None,
+        shed_retries: 0,
     };
     let body = json!({
         "model": &*model,
@@ -293,6 +308,10 @@ async fn execute(
             .and_then(|v| v.to_str().ok())
             .and_then(|v| Uuid::parse_str(v).ok());
         record.ttfb_us = micros(sent.elapsed());
+        record.retry_after_s = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()?.parse().ok());
         if status == 200 && request.stream {
             let mut chunks = response.bytes_stream();
             let mut window: Vec<u8> = Vec::new();
@@ -488,6 +507,8 @@ pub async fn run(config: RunConfig) -> anyhow::Result<Report> {
                 service_us: 0,
                 ttfb_us: 0,
                 lag_us: 0,
+                retry_after_s: None,
+                shed_retries: 0,
             });
             continue;
         }
@@ -504,8 +525,28 @@ pub async fn run(config: RunConfig) -> anyhow::Result<Report> {
         };
         let (client, model, in_flight) = (client.clone(), model.clone(), in_flight.clone());
         let max_tokens = config.max_tokens;
+        let retry_shed = config.retry_shed;
         set.spawn(async move {
-            let record = execute(client, request, model, max_tokens, timeout).await;
+            let mut retries = 0;
+            let record = loop {
+                let mut record = execute(
+                    client.clone(),
+                    request.clone(),
+                    model.clone(),
+                    max_tokens,
+                    timeout,
+                )
+                .await;
+                record.shed_retries = retries;
+                let shed =
+                    record.status == 503 && record.error_code.as_deref() == Some("scope_busy");
+                if !shed || retries >= retry_shed {
+                    break record;
+                }
+                retries += 1;
+                let wait = record.retry_after_s.unwrap_or(1).clamp(1, 30);
+                tokio::time::sleep(Duration::from_secs(wait)).await;
+            };
             in_flight.fetch_sub(1, Ordering::Relaxed);
             record
         });
@@ -599,6 +640,7 @@ fn summarize(
     let measured: Vec<&RequestRecord> = records.iter().filter(|r| !r.warmup).collect();
     totals.measured = measured.len() as u64;
     for r in records {
+        totals.shed_retries += u64::from(r.shed_retries);
         if r.error_code.as_deref() != Some("client_saturated") {
             totals.sent += 1;
         }
@@ -802,6 +844,12 @@ impl Report {
             self.latency_ms.stream.p99_ms,
             self.ttfb_ms.p50_ms,
         );
+        if self.totals.shed_retries > 0 {
+            out += &format!(
+                "\n  shed (scope_busy) and resent: {} attempts",
+                self.totals.shed_retries
+            );
+        }
         if let Some(o) = &self.gateway_overhead_ms {
             out += &format!(
                 "\n  gateway overhead ms p50/p95/p99 {:.1}/{:.1}/{:.1}",
@@ -867,6 +915,7 @@ mod tests {
             label: None,
             readers: 0,
             reader_days: 7,
+            retry_shed: 0,
         }
     }
 
