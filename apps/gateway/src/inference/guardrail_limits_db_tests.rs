@@ -355,29 +355,57 @@ async fn a_cached_policy_costs_no_statement_and_follows_every_change(pool: PgPoo
     assert!(loads.iter().all(|p| Arc::ptr_eq(p, &loads[0])));
 }
 
-/// Requests that wrote decision rows are bounded per key too: the step runs
+/// Requests that wrote decision rows and were not answered (refused by
+/// admission, failed or abandoned) are bounded per key too: the step runs
 /// before admission, so a key whose requests admission refuses could
-/// otherwise make the replica scan and write rows without bound.
+/// otherwise make the replica scan and write rows without bound. Answered
+/// monitored requests never count.
 #[dbtest::test]
-async fn a_key_whose_requests_keep_writing_rows_is_throttled_before_the_scan(pool: PgPool) {
+async fn a_key_whose_unadmitted_requests_keep_writing_rows_is_throttled(pool: PgPool) {
     let w = world(pool, "'chat_completions'").await;
     type_default(&w, "monitor", "{secret}", &[]).await;
     let key = w.f.principal.key_id;
     let monitored = bodies(&format!("use {}", secret()))[0].1.clone();
     for attempt in 0.. {
         let minute = limits::now() / 60;
-        for _ in 1..limits::RECORDED_PER_MINUTE {
+        let before = limits::RECORDED.counted(key, limits::now());
+        let (answered, _, _) = post(&w.base, &w.token, "/v1/chat/completions", &monitored).await;
+        let after_answered = limits::RECORDED.counted(key, limits::now());
+        // One request a minute: the next one is refused by admission.
+        sqlx::query("INSERT INTO key_policies(workspace_id,governance_key_id,requests_per_minute) VALUES($1,$2,1) ON CONFLICT DO NOTHING")
+            .bind(w.f.principal.workspace_id)
+            .bind(key)
+            .execute(&w.f.store.pool)
+            .await
+            .unwrap();
+        let (refused, _, _) = post(&w.base, &w.token, "/v1/chat/completions", &monitored).await;
+        let after_refused = limits::RECORDED.counted(key, limits::now());
+        for _ in after_refused..limits::RECORDED_PER_MINUTE {
             limits::RECORDED.note(key, limits::now());
         }
-        let (last, _, _) = post(&w.base, &w.token, "/v1/chat/completions", &monitored).await;
         let recorded = events(&w).await.len();
         let (status, headers, body) =
             post(&w.base, &w.token, "/v1/chat/completions", &monitored).await;
         if limits::now() / 60 != minute {
             assert!(attempt < 2, "the minute changed during every attempt");
+            sqlx::query("DELETE FROM key_policies WHERE governance_key_id=$1")
+                .bind(key)
+                .execute(&w.f.store.pool)
+                .await
+                .unwrap();
             continue;
         }
-        assert_eq!(last, 200, "the last recorded request within the bound runs");
+        assert_eq!(
+            (answered, after_answered),
+            (200, before),
+            "an answered request never counts"
+        );
+        assert_eq!(refused, 429, "admission refused the second request");
+        assert_eq!(
+            after_refused,
+            before + 1,
+            "the unadmitted request that wrote rows counts"
+        );
         assert_eq!(status, 429, "{body}");
         assert_eq!(error(&body)["code"], "guardrail_rate_limited");
         assert!(header(&headers, "retry-after").is_some());

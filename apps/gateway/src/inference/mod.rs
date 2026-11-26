@@ -271,7 +271,7 @@ impl Engine {
         // Guardrails, once per root request, before the route plan and any
         // admission: a refused input reserves nothing and reaches no provider.
         let checked = self.guard_chat(&principal, &request, request_id, protocol, deadline);
-        checked
+        let unanswered = checked
             .await
             .inspect_err(|&e| telemetry.finish(telemetry::Outcome::Error, Some(e)))?;
         let plan = timeout_at(
@@ -329,7 +329,7 @@ impl Engine {
                     failed_over = Some(error);
                     telemetry
                 }
-                AttemptEnd::Return(result) => return result,
+                AttemptEnd::Return(result) => return result.inspect(|_| unanswered.answered()),
             };
             attempt += 1;
         }

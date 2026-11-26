@@ -110,6 +110,12 @@ impl Policy {
     pub fn applies_to(&self, workload: Workload) -> bool {
         self.rules.iter().any(|r| r.workloads.contains(&workload))
     }
+    /// Whether `rule` is one this release runs (not a later release's).
+    pub fn runnable(&self, rule: Uuid) -> bool {
+        self.rules
+            .iter()
+            .any(|r| r.id == rule && r.detector.is_some())
+    }
     /// Whether any rule scans custom patterns.
     pub fn has_custom(&self) -> bool {
         self.rules.iter().any(|r| r.custom)

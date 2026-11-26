@@ -53,7 +53,21 @@ pub async fn in_slot<T: Send + 'static>(
     slots: &'static tokio::sync::Semaphore,
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Option<T> {
-    let slot = slots.acquire().await.ok()?;
+    in_slot_within(slots, None, work).await
+}
+
+/// As [`in_slot`], waiting at most `wait` for the slot (`None`: as long as
+/// it takes); the work itself always runs to its end.
+pub async fn in_slot_within<T: Send + 'static>(
+    slots: &'static tokio::sync::Semaphore,
+    wait: Option<std::time::Duration>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let slot = match wait {
+        Some(wait) => tokio::time::timeout(wait, slots.acquire()).await.ok()?,
+        None => slots.acquire().await,
+    }
+    .ok()?;
     tokio::task::spawn_blocking(move || {
         let _slot = slot;
         work()

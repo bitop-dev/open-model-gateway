@@ -414,7 +414,7 @@ impl Engine {
         }
         // Guardrails, before the route plan and any admission (as for
         // generation): a refused input reserves nothing.
-        timeout_at(
+        let unanswered = timeout_at(
             deadline,
             self.guard_input(
                 &principal,
@@ -555,6 +555,7 @@ impl Engine {
                         // free-rejection rule out; the flag is for a streamed
                         // workload that attaches without them.
                         guard.telemetry.stream_returned = true;
+                        unanswered.answered();
                         return Ok(W::attach(
                             response,
                             StreamSettlement {
@@ -566,6 +567,7 @@ impl Engine {
                         ));
                     }
                     guard.finish(Outcome::Succeeded, None, None).await?;
+                    unanswered.answered();
                     return Ok(response);
                 }
                 Err(error) => {

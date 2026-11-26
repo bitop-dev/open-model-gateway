@@ -179,7 +179,10 @@ fn a_label_before_or_after_a_token_does_not_hide_it() {
         "api_key_1_",
         "__secret_",
         "DeployKey_",
-        "prodDeployToken-",
+        "ProdDeployToken-",
+        "K8S_DEPLOY_",
+        "OAUTH2TOKEN_",
+        "s3bucket-",
     ];
     for token in &tokens {
         for label in before {
@@ -193,6 +196,7 @@ fn a_label_before_or_after_a_token_does_not_hide_it() {
             "_Prod_Key",
             "-1",
             "__",
+            "_k8s_prod",
         ] {
             assert!(found(&format!("{token}{label}")) >= 1, "{token}{label}");
         }
@@ -205,6 +209,13 @@ fn a_label_before_or_after_a_token_does_not_hide_it() {
         0,
         "letters and digits mixed is data"
     );
+    // camelCase is code, not a label: a loose token shape inside an
+    // identifier stays data.
+    let identifier = format!(
+        "ta{}_live_streamingResponseHandlerFactory_forUnitTests",
+        "sk"
+    );
+    assert_eq!(found(&identifier), 0, "{identifier}");
     // A labelled AWS secret key behind any identifier.
     let secret = alnum(40);
     for line in [

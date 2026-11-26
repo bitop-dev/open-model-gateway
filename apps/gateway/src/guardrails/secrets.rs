@@ -104,11 +104,23 @@ fn encoded(b: u8) -> bool {
 /// an encoded blob, unless the run is a label of at most `LABEL_MAX` bytes.
 const BLOB_RUN: usize = 8;
 const LABEL_MAX: usize = 32;
-/// A word of a label: letters, then digits (`token`, `KEY`, `deployKey`,
-/// `v2`, `1`; empty between two separators). Random base64url mixes them.
+/// A word of a label: letters of one case with digits anywhere (`token`,
+/// `KEY`, `k8s`, `OAUTH2TOKEN`, `v2`), PascalCase words then digits
+/// (`DeployKey`, `Prod1`), digits alone, or empty between two separators.
+/// camelCase (`forUnitTests`, common in code) and random mixes (`aB3dE5`)
+/// are not label words.
 fn word(w: &[u8]) -> bool {
-    let letters = w.iter().take_while(|b| b.is_ascii_alphabetic()).count();
-    w[letters..].iter().all(u8::is_ascii_digit)
+    let one_case = |f: fn(&u8) -> bool| w.iter().all(|b| f(b) || b.is_ascii_digit());
+    let pascal = || {
+        let letters = w.iter().take_while(|b| b.is_ascii_alphabetic()).count();
+        let (alpha, digits) = w.split_at(letters);
+        alpha.first().is_some_and(u8::is_ascii_uppercase)
+            && alpha
+                .windows(2)
+                .all(|p| !(p[0].is_ascii_uppercase() && p[1].is_ascii_uppercase()))
+            && digits.iter().all(u8::is_ascii_digit)
+    };
+    one_case(u8::is_ascii_lowercase) || one_case(u8::is_ascii_uppercase) || pascal()
 }
 /// Snake or kebab case words with the separator against the token.
 fn label(run: &[u8], before: bool) -> bool {

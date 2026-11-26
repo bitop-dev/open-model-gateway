@@ -138,12 +138,28 @@ impl Store {
             }
             policy
         };
-        let mut conn = self.pool.acquire().await.map_err(route_lookup_storage)?;
-        let heads = stored::workspace_heads(&mut conn, workspace)
-            .await
-            .map_err(route_lookup_storage)?;
+        let read_heads = async || {
+            let mut conn = self.pool.acquire().await.map_err(route_lookup_storage)?;
+            let heads = stored::workspace_heads(&mut conn, workspace)
+                .await
+                .map_err(route_lookup_storage)?;
+            Ok::<_, InferenceError>((conn, heads))
+        };
+        let (mut conn, mut heads) = read_heads().await?;
         if let Some(entry) = stale.filter(|e| e.heads == heads) {
             return Ok(keep(entry));
+        }
+        if load.is_none() {
+            // Unconfirmed: the heads were read without the lock, so read them
+            // again under it; compiles then run one at a time, each from the
+            // heads current when it started, and the last one stored is the
+            // latest.
+            drop(conn);
+            let _ = load.insert(Load::enter(workspace).await);
+            (conn, heads) = read_heads().await?;
+            if let Some(entry) = cache.peek(&workspace).filter(|e| e.heads == heads) {
+                return Ok(Arc::clone(&entry.policy));
+            }
         }
         let Ok((platform, local)) = stored::layers_of(&mut conn, heads.clone())
             .await
@@ -153,13 +169,6 @@ impl Store {
             return Err(InferenceError::GuardrailUnavailable);
         };
         drop(conn);
-        if load.is_none() {
-            let _ = load.insert(Load::enter(workspace).await);
-            // Compiled from the same heads while this one waited.
-            if let Some(entry) = cache.peek(&workspace).filter(|e| e.heads == heads) {
-                return Ok(Arc::clone(&entry.policy));
-            }
-        }
         let effective = compose(platform.as_ref(), local.as_ref());
         let patterns = |set: &Option<crate::guardrails::policy::RuleSet>| {
             set.iter().flat_map(|s| &s.rules).any(|r| {
@@ -178,13 +187,12 @@ impl Store {
             None
         };
         let policy = match slots {
-            Some(slots) => tokio::time::timeout(
-                limits::WAIT,
-                crate::guardrails::patterns::in_slot(slots, move || Policy::compile(&effective)),
-            )
-            .await
-            .ok()
-            .flatten(),
+            Some(slots) => {
+                crate::guardrails::patterns::in_slot_within(slots, Some(limits::WAIT), move || {
+                    Policy::compile(&effective)
+                })
+                .await
+            }
             None => Some(Policy::compile(&effective)),
         }
         .ok_or(InferenceError::GuardrailUnavailable)?;
@@ -338,7 +346,7 @@ impl super::Engine {
         request_id: Uuid,
         protocol: super::types::ApiProtocol,
         deadline: tokio::time::Instant,
-    ) -> Result<(), InferenceError> {
+    ) -> Result<Unanswered, InferenceError> {
         let facts = Guarded {
             request_id,
             operation: operation(protocol),
@@ -357,15 +365,16 @@ impl super::Engine {
     }
 
     /// Inspect a request's input under its workspace's policy. `Ok` lets it
-    /// continue; a refusal is an `InferenceError::Guardrail*`. The text is
-    /// collected only when a rule applies to `workload`, and dropped when the
-    /// decision is made.
+    /// continue, with the [`Unanswered`] mark the caller clears once the
+    /// request is answered; a refusal is an `InferenceError::Guardrail*`. The
+    /// text is collected only when a rule applies to `workload`, and dropped
+    /// when the decision is made.
     pub(super) async fn guard_input<'a>(
         &self,
         principal: &Principal,
         request: Guarded<'_>,
         input: impl FnOnce() -> Option<Inspection<'a>>,
-    ) -> Result<(), InferenceError> {
+    ) -> Result<Unanswered, InferenceError> {
         let Guarded {
             request_id,
             operation,
@@ -375,7 +384,7 @@ impl super::Engine {
         } = request;
         let policy = self.repository.guardrails(principal.workspace_id).await?;
         if !policy.applies_to(workload) {
-            return Ok(());
+            return Ok(Unanswered(None));
         }
         throttled(principal)?;
         let input = input();
@@ -401,7 +410,7 @@ impl super::Engine {
                         .map_err(|_| InferenceError::GuardrailUnavailable)?
                     }
                     Err(limits::NoSlot) => {
-                        let decision = policy.unavailable(workload);
+                        let mut decision = policy.unavailable(workload);
                         // Busy, like an admission `Busy`: nothing was scanned,
                         // so the refusal writes no row and does not count
                         // toward the key's refusal bound (a saturated replica
@@ -413,6 +422,11 @@ impl super::Engine {
                             count(&decision);
                             return Err(InferenceError::Guardrail(refusal));
                         }
+                        // Refused anyway by a rule this release cannot run
+                        // (fail-closed), or let through by fail-open ones:
+                        // only their decisions are recorded, never one for a
+                        // rule that was not scanned.
+                        decision.events.retain(|e| !policy.runnable(e.rule_id));
                         decision
                     }
                 }
@@ -420,6 +434,8 @@ impl super::Engine {
             input => timed(|| policy.decide(workload, input.as_ref())),
         };
         let (events, omitted) = rows(&decision);
+        // Taken before the insert, so a request dropped during it counts too.
+        let unanswered = Unanswered((!events.is_empty()).then_some(principal.key_id));
         if !events.is_empty() {
             self.repository
                 .record_guardrails(&GuardrailRecord {
@@ -432,9 +448,31 @@ impl super::Engine {
                     omitted,
                 })
                 .await?;
-            RECORDED.note(principal.key_id, limits::now());
         }
-        verdict(principal, &decision)
+        verdict(principal, &decision)?;
+        Ok(unanswered)
+    }
+}
+
+/// A request whose guardrail decisions wrote rows and that was not answered
+/// yet. Dropped unanswered (refused by admission, failed, or abandoned), it
+/// counts toward its key's bound of recorded requests (`RECORDED`): the
+/// guardrail step runs before admission, so without it a key whose requests
+/// admission refuses could make the replica write rows without bound.
+/// Answered requests never count, so monitored traffic is never throttled.
+#[must_use]
+pub(super) struct Unanswered(Option<Uuid>);
+impl Unanswered {
+    /// The request was answered: it does not count.
+    pub(super) fn answered(mut self) {
+        self.0 = None;
+    }
+}
+impl Drop for Unanswered {
+    fn drop(&mut self) {
+        if let Some(key) = self.0 {
+            RECORDED.note(key, limits::now());
+        }
     }
 }
 
