@@ -61,13 +61,17 @@ impl Default for ImageInputLimits {
 }
 
 /// A large body holds its share of the budget only while it keeps arriving:
-/// past this pause between frames, below [`BODY_MIN_RATE`] on average once
-/// this much time has passed, or past [`BODY_TOTAL`] in all, its read fails
+/// past this pause between frames, below [`BODY_MIN_RATE`] on average from
+/// its start (less [`BODY_RATE_ALLOWANCE`]), or past [`BODY_TOTAL`] in all, its read fails
 /// (408) and the share goes back. So holding a share costs a client upload
 /// bandwidth, not a trickle.
 pub const BODY_IDLE: Duration = Duration::from_secs(10);
-/// About 1 Mbit/s: a 20 MiB body may take 10 + 160 s.
+/// About 1 Mbit/s from the start (after [`BODY_RATE_ALLOWANCE`]): a 20 MiB
+/// body may take 160 s.
 pub const BODY_MIN_RATE: usize = 128 * 1024;
+/// Bytes the rate floor forgives (one second at [`BODY_MIN_RATE`]), so a
+/// body's first bytes may arrive just after its headers.
+pub const BODY_RATE_ALLOWANCE: usize = 128 * 1024;
 /// The longest a large body may take to arrive.
 pub const BODY_TOTAL: Duration = Duration::from_secs(180);
 
@@ -163,6 +167,7 @@ impl LargeBody {
 /// response nobody reads must not keep it).
 pub struct BufferPermit {
     slot: Arc<std::sync::Mutex<Option<OwnedSemaphorePermit>>>,
+    timer: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The declared length the body is held to.
     pub length: usize,
 }
@@ -170,15 +175,19 @@ impl BufferPermit {
     /// Returns the share after `after` even if this value is still alive.
     pub fn release_after(&self, after: Duration) {
         let slot = self.slot.clone();
-        tokio::spawn(async move {
+        let timer = tokio::spawn(async move {
             tokio::time::sleep(after).await;
             drop(slot.lock().unwrap_or_else(|e| e.into_inner()).take());
         });
+        *self.timer.lock().unwrap_or_else(|e| e.into_inner()) = Some(timer);
     }
 }
 impl Drop for BufferPermit {
     fn drop(&mut self) {
         drop(self.slot.lock().unwrap_or_else(|e| e.into_inner()).take());
+        if let Some(timer) = self.timer.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            timer.abort();
+        }
     }
 }
 
@@ -238,6 +247,7 @@ impl ImageBuffer {
         match self.permits.clone().try_acquire_many_owned(count) {
             Ok(permit) => Admission::Large(BufferPermit {
                 slot: Arc::new(std::sync::Mutex::new(Some(permit))),
+                timer: std::sync::Mutex::new(None),
                 length,
             }),
             Err(_) => Admission::Busy,

@@ -619,6 +619,7 @@ async fn a_trickled_large_body_is_cut_by_the_rate_floor(pool: PgPool) {
     .expect("the rate floor ends the request")
     .unwrap();
     assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
-    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    // The 128 KiB allowance lasts 2 s at this floor of 64 KiB/s.
+    assert!(started.elapsed() < std::time::Duration::from_secs(4));
     assert_eq!(executions(&w).await, 0);
 }

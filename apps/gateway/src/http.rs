@@ -193,7 +193,12 @@ async fn image_input_body(
                 limits,
                 started: tokio::time::Instant::now(),
                 received: 0,
-                idle: Box::pin(tokio::time::sleep(limits.body_idle)),
+                idle: Box::pin(tokio::time::sleep(limits.body_idle.min(
+                    Duration::from_secs_f64(
+                        crate::inference::image_buffer::BODY_RATE_ALLOWANCE as f64
+                            / limits.body_min_rate.max(1) as f64,
+                    ),
+                ))),
                 total: Box::pin(tokio::time::sleep(limits.body_total)),
             });
             next.run(Request::from_parts(parts, body))
@@ -225,11 +230,18 @@ struct ReadDeadline {
     total: std::pin::Pin<Box<tokio::time::Sleep>>,
 }
 impl ReadDeadline {
+    /// The floor counts from the start: the bytes received, plus a
+    /// [`crate::inference::image_buffer::BODY_RATE_ALLOWANCE`], must cover
+    /// `body_min_rate` × the time elapsed.
     fn too_slow(&self) -> bool {
-        let Some(rated) = self.started.elapsed().checked_sub(self.limits.body_idle) else {
-            return false;
-        };
-        (self.received as f64) < rated.as_secs_f64() * self.limits.body_min_rate as f64
+        let owed = self.started.elapsed().as_secs_f64() * self.limits.body_min_rate as f64;
+        ((self.received + crate::inference::image_buffer::BODY_RATE_ALLOWANCE) as f64) < owed
+    }
+    /// When the floor would be broken with no further byte.
+    fn floor_at(&self) -> tokio::time::Instant {
+        let covered = (self.received + crate::inference::image_buffer::BODY_RATE_ALLOWANCE) as f64
+            / self.limits.body_min_rate.max(1) as f64;
+        self.started + Duration::from_secs_f64(covered.min(86_400.0))
     }
     fn expired(&mut self, cx: &mut std::task::Context<'_>) -> bool {
         use std::future::Future;
@@ -260,12 +272,21 @@ impl http_body::Body for ReadDeadline {
             {
                 this.received += data.map_or(0, axum::body::Bytes::len);
             }
-            let next = tokio::time::Instant::now() + this.limits.body_idle;
+            // The next wake: the idle bound or the moment the floor breaks.
+            let next = (tokio::time::Instant::now() + this.limits.body_idle).min(this.floor_at());
             this.idle.as_mut().reset(next);
             return std::task::Poll::Ready(frame);
         }
         if this.idle.as_mut().poll(cx).is_ready() {
-            return deadline();
+            if this.expired(cx) || this.started.elapsed() >= this.limits.body_idle {
+                return deadline();
+            }
+            // Woken by the idle bound reset earlier than the floor: re-arm.
+            let next = (tokio::time::Instant::now() + this.limits.body_idle).min(this.floor_at());
+            this.idle.as_mut().reset(next);
+            if this.idle.as_mut().poll(cx).is_ready() {
+                return deadline();
+            }
         }
         std::task::Poll::Pending
     }
