@@ -216,6 +216,11 @@ pub struct Refusal {
     pub rule_id: Uuid,
     pub category: Category,
     pub detector: DetectorKind,
+    /// Whether the request was scanned before it was refused: `false` when
+    /// no scan slot was free (an `Unavailable` that says nothing about the
+    /// input, so a batch line is tried again; a spent budget is the input's
+    /// own and is not). Not part of the error body.
+    pub scanned: bool,
 }
 impl Refusal {
     /// The `guardrail` object of an error body: the policy (rule set), the
@@ -275,6 +280,7 @@ fn refuse(d: &mut Decision, r: &CompiledRule, kind: RefusalKind, category: Categ
         rule_id: r.id,
         category,
         detector: r.kind,
+        scanned: true,
     };
     if d.refusal.is_none_or(|c| rank(kind) < rank(c.kind)) {
         d.refusal = Some(refusal);
@@ -377,6 +383,9 @@ impl Policy {
                 RefusalKind::DetectorFailed
             };
             failed(&mut decision, r, r.first(), kind);
+        }
+        if let Some(refusal) = &mut decision.refusal {
+            refusal.scanned = false;
         }
         mark_refused(&mut decision);
         decision

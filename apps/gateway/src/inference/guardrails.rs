@@ -402,7 +402,7 @@ impl super::Engine {
                         let mut decision = policy.unavailable(workload);
                         // Busy, like an admission `Busy`: nothing was scanned,
                         // so the refusal writes no row and does not count
-                        // toward the key's refusal bound (a saturated replica
+                        // toward the key's bound (a saturated replica
                         // never throttles clean traffic).
                         if let Some(refusal) = decision
                             .refusal

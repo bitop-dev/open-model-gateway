@@ -31,7 +31,7 @@ pub const BUILTIN: &[(&str, &str)] = &[
         // The identifier the keyword ends (`prodAwsSecretAccessKey`, AWS's
         // own JSON `SecretAccessKey`) is part of the match, so it never glues
         // the match to data.
-        r#"(?i:[a-z0-9_]*secret_?access_?key)["']?\s*[:=]\s*["']?[A-Za-z0-9/+]{40}"#,
+        r#"(?i:[a-z0-9_-]*secret[_-]?access[_-]?key)["']?\s*(?:=>|[:=])\s*["']?[A-Za-z0-9/+]{40}"#,
     ),
     (
         "github_token",
@@ -39,7 +39,10 @@ pub const BUILTIN: &[(&str, &str)] = &[
     ),
     ("github_fine_grained_token", r"github_pat_[A-Za-z0-9_]{82}"),
     ("gitlab_token", r"glpat-[A-Za-z0-9_\-]{20,}"),
-    ("slack_token", r"(?:xox[abposr]|xapp)-[A-Za-z0-9-]{10,250}"),
+    (
+        "slack_token",
+        r"xox[abposr]-[A-Za-z0-9-]{10,250}|xapp-[0-9]+-[A-Z0-9]+-[0-9]+-[A-Za-z0-9]{16,}",
+    ),
     (
         "slack_webhook",
         r"https://hooks\.slack\.com/services/T[A-Z0-9]{8,}/B[A-Z0-9]{8,}/[A-Za-z0-9]{24}",

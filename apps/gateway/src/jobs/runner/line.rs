@@ -318,12 +318,11 @@ impl LineRun {
         }
     }
 
-    /// The guardrail step could not inspect the line now (no scan slot, its
-    /// budget spent, its policy not loaded): nothing was admitted or sent, so
-    /// it is tried again after the error's delay, growing, without spending
-    /// an attempt (`true` once the wait is over). A line whose scan cannot
-    /// finish after `GUARDRAIL_TRIES` fails with that error: its input, not
-    /// the replica, is then the cause.
+    /// The guardrail step could not inspect the line now (no scan or compile
+    /// slot, its policy not loaded): nothing was admitted or sent, so it is
+    /// tried again after the error's delay, growing, without spending an
+    /// attempt (`true` once the wait is over and the batch still runs). A
+    /// line still refused after `GUARDRAIL_TRIES` fails with that error.
     async fn rescan_later(
         &self,
         e: InferenceError,
@@ -339,6 +338,10 @@ impl LineRun {
             seconds.min(GUARDRAIL_RETRY_CAP).into(),
         ))
         .await;
+        // A batch stopped meanwhile (cancelled, expired, lost) runs nothing more.
+        if self.state.should_stop(&self.job) {
+            return false;
+        }
         // The dispatch's probe slot was the first try's.
         *pin = pin.map(|pin| Pin { probe: None, ..pin });
         true
@@ -547,19 +550,52 @@ impl LineRun {
 }
 
 /// Tries of a line the guardrail step could not inspect now, and the
-/// longest wait between two (seconds): about three minutes in all.
+/// longest wait between two (seconds): about a minute in all, during which
+/// the line keeps its worker.
 const GUARDRAIL_TRIES: u32 = 10;
-const GUARDRAIL_RETRY_CAP: u32 = 30;
+const GUARDRAIL_RETRY_CAP: u32 = 8;
 
 /// A guardrail refusal that says nothing about the line: the step could not
-/// run now.
+/// run now (no scan or compile slot was free, the policy was not loaded). A
+/// spent custom-pattern budget is the line's own input and is not retried.
 fn guardrail_busy(e: InferenceError) -> bool {
     matches!(
         e,
         InferenceError::GuardrailUnavailable
             | InferenceError::Guardrail(crate::guardrails::enforce::Refusal {
                 kind: crate::guardrails::enforce::RefusalKind::Unavailable,
+                scanned: false,
                 ..
             })
     )
+}
+
+#[cfg(test)]
+mod guardrail_busy_tests {
+    use super::*;
+    use crate::guardrails::enforce::{Refusal, RefusalKind};
+    use crate::guardrails::policy::{Category, DetectorKind};
+
+    fn refusal(kind: RefusalKind, scanned: bool) -> InferenceError {
+        InferenceError::Guardrail(Refusal {
+            kind,
+            rule_set_id: Uuid::nil(),
+            rule_id: Uuid::nil(),
+            category: Category::Custom,
+            detector: DetectorKind::Pattern,
+            scanned,
+        })
+    }
+
+    #[test]
+    fn only_a_refusal_that_scanned_nothing_is_retried() {
+        assert!(guardrail_busy(refusal(RefusalKind::Unavailable, false)));
+        assert!(guardrail_busy(InferenceError::GuardrailUnavailable));
+        // A spent budget is the line's own input; a block or a detector
+        // failure is a decision.
+        assert!(!guardrail_busy(refusal(RefusalKind::Unavailable, true)));
+        assert!(!guardrail_busy(refusal(RefusalKind::InputBlocked, true)));
+        assert!(!guardrail_busy(refusal(RefusalKind::DetectorFailed, false)));
+        assert!(!guardrail_busy(InferenceError::GuardrailThrottled(5)));
+    }
 }

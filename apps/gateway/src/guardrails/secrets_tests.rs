@@ -162,6 +162,8 @@ fn every_builtin_rule_matches_its_shape_in_prose_punctuation_and_escapes() {
         format!("{}+Psycopg2://app:{}@db:5432/x", "PostgreSQL", alnum(12)),
         format!("{{\"Secret{}\": \"{}\"}}", "AccessKey", alnum(40)),
         format!("{}-1-A0{}-1234567890-{}", "xapp", rep('B', 9), hex(64)),
+        format!("aws-secret-{}-key: {}", "access", alnum(40)),
+        format!("'aws_secret_{}_key' => '{}'", "access", alnum(40)),
     ] {
         assert!(found(&value) >= 1, "{value}");
     }
@@ -172,6 +174,7 @@ fn every_builtin_rule_matches_its_shape_in_prose_punctuation_and_escapes() {
         format!("{{\"Secret{}\": \"{}\"}}", "Key", alnum(40)),
         format!("{{\"Secret{}\": \"{}\"}}", "AccessKey", alnum(20)),
         format!("{}-1", "xapp"),
+        format!("{}-electron-framework xapp-container-wrapper", "xapp"),
     ] {
         assert_eq!(found(&value), 0, "{value}");
     }

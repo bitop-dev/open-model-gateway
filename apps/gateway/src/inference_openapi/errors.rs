@@ -68,6 +68,7 @@ pub(super) fn all() -> Vec<InferenceError> {
             rule_id: uuid::Uuid::nil(),
             category: Category::Secret,
             detector: DetectorKind::Pattern,
+            scanned: true,
         }));
     }
     for scope in [LimitScope::Workspace, LimitScope::ApiKey] {

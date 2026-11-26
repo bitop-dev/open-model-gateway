@@ -31,13 +31,21 @@ const CAPACITY: usize = 4096;
 type Cell = Arc<OnceCell<Compiled>>;
 static SHARED: LazyLock<Mutex<HashMap<Key, Cell>>> = LazyLock::new(Default::default);
 
-/// The cell of `key`, evicting older revisions of its set.
+/// The cell of `key`, evicting older revisions of its set. A key older than
+/// one already kept (a load that read an earlier snapshot) gets a cell of
+/// its own that is not kept.
 fn cell(key: Key) -> Cell {
     let mut map = SHARED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(cell) = map.get(&key) {
         return Arc::clone(cell);
+    }
+    if map
+        .keys()
+        .any(|(set, revision, _)| *set == key.0 && *revision > key.1)
+    {
+        return Cell::default();
     }
     map.retain(|(set, revision, _), _| *set != key.0 || *revision >= key.1);
     if map.len() >= CAPACITY {
@@ -54,9 +62,12 @@ fn cell(key: Key) -> Cell {
 pub struct NoSlot;
 
 /// The compiled detectors of `effective`'s rules that have custom patterns,
-/// by rule id: compiled once per replica (in a compile slot, waiting at most
-/// [`WAIT`] for one), or reused.
+/// by rule id: compiled once per replica, or reused. The policy waits at
+/// most [`WAIT`] in all for compile slots. A compile runs in a task of its
+/// own, so it ends and is kept even when the request that started it is
+/// gone; a request waiting for another's compile waits for it to end.
 pub async fn detectors(effective: &[EffectiveRule]) -> Result<HashMap<Uuid, Compiled>, NoSlot> {
+    let deadline = tokio::time::Instant::now() + WAIT;
     let mut out = HashMap::new();
     for e in effective {
         let Some(rule) = &e.rule else { continue };
@@ -76,9 +87,10 @@ pub async fn detectors(effective: &[EffectiveRule]) -> Result<HashMap<Uuid, Comp
         };
         let set = e.rule_set_id;
         let cell = cell((set, e.revision, e.id));
-        let compiled = cell
-            .get_or_try_init(|| async move {
-                in_slot_within(slots, Some(WAIT), move || {
+        let compiled = tokio::spawn(async move {
+            cell.get_or_try_init(|| async move {
+                let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
+                in_slot_within(slots, Some(wait), move || {
                     #[cfg(test)]
                     counted(set);
                     PatternDetector::within(&categories, &patterns, limit).map(Arc::new)
@@ -86,8 +98,12 @@ pub async fn detectors(effective: &[EffectiveRule]) -> Result<HashMap<Uuid, Comp
                 .await
                 .ok_or(NoSlot)
             })
-            .await?;
-        out.insert(e.id, compiled.clone());
+            .await
+            .cloned()
+        })
+        .await
+        .map_err(|_| NoSlot)??;
+        out.insert(e.id, compiled);
     }
     Ok(out)
 }

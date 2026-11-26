@@ -71,6 +71,15 @@ async fn team_rule(w: &World, action: &str) {
         .bind(Uuid::now_v7()).bind(set).bind(action).execute(&mut *tx).await.unwrap();
     tx.commit().await.unwrap();
 }
+/// A new key of the principal's workspace: a run of the per-minute bound
+/// that crossed a minute boundary starts again with a key counted nowhere.
+async fn fresh_key(w: &World) -> (String, Uuid) {
+    let key = NewApiKey::generate().unwrap();
+    sqlx::query("INSERT INTO api_keys(id,workspace_id,issued_to_user_id,name,secret_hash) VALUES($1,$2,$3,'guardrail limits',$4)")
+        .bind(key.id).bind(w.f.principal.workspace_id).bind(w.f.owner).bind(key.digest.as_slice())
+        .execute(&w.f.store.pool).await.unwrap();
+    (key.token, key.id)
+}
 async fn team_token(w: &World) -> String {
     let key = NewApiKey::generate().unwrap();
     sqlx::query("INSERT INTO api_keys(id,workspace_id,issued_to_user_id,name,secret_hash) VALUES($1,$2,$3,'guardrail limits',$4)")
@@ -120,7 +129,7 @@ async fn no_scan_slot_is_a_retryable_503_and_other_workspaces_are_served(pool: P
         "only the team's requests reached the provider"
     );
     // A busy refusal scanned nothing: it writes no row and does not count
-    // toward the key's refusal bound.
+    // toward the key's bound.
     assert!(events(&w).await.is_empty());
     assert_eq!(RECORDED.counted(w.f.principal.key_id, limits::now()), 0);
     // With the slots free again the same request is inspected and passes.
@@ -180,18 +189,18 @@ async fn a_detector_failure_follows_on_error_on_every_protocol(pool: PgPool) {
 async fn refusals_count_toward_the_one_bound_and_a_throttled_request_is_counted(pool: PgPool) {
     let w = world(pool, "'chat_completions'").await;
     type_default(&w, "block", "{secret}", &[]).await;
-    let key = w.f.principal.key_id;
     let leak = bodies(&format!("use {}", secret()))[0].1.clone();
     // The bound counts per minute: a run that crosses a minute boundary
-    // starts again (at most twice).
+    // starts again with a new key (at most twice).
     for attempt in 0.. {
+        let (token, key) = fresh_key(&w).await;
         let minute = limits::now() / 60;
         for _ in 1..RECORDED_PER_MINUTE {
             RECORDED.note(key, limits::now());
         }
         let recorded = events(&w).await.len();
-        let (last, _, _) = post(&w.base, &w.token, "/v1/chat/completions", &leak).await;
-        let (status, headers, body) = post(&w.base, &w.token, "/v1/chat/completions", &leak).await;
+        let (last, _, _) = post(&w.base, &token, "/v1/chat/completions", &leak).await;
+        let (status, headers, body) = post(&w.base, &token, "/v1/chat/completions", &leak).await;
         if limits::now() / 60 != minute {
             assert!(attempt < 2, "the minute changed during every attempt");
             continue;
@@ -371,12 +380,12 @@ async fn a_cached_policy_costs_no_statement_and_follows_every_change(pool: PgPoo
 async fn a_key_whose_unadmitted_requests_keep_writing_rows_is_throttled(pool: PgPool) {
     let w = world(pool, "'chat_completions'").await;
     type_default(&w, "monitor", "{secret}", &[]).await;
-    let key = w.f.principal.key_id;
     let monitored = bodies(&format!("use {}", secret()))[0].1.clone();
     for attempt in 0.. {
+        let (token, key) = fresh_key(&w).await;
         let minute = limits::now() / 60;
         let before = RECORDED.counted(key, limits::now());
-        let (answered, _, _) = post(&w.base, &w.token, "/v1/chat/completions", &monitored).await;
+        let (answered, _, _) = post(&w.base, &token, "/v1/chat/completions", &monitored).await;
         let after_answered = RECORDED.counted(key, limits::now());
         // One request a minute: the next one is refused by admission.
         sqlx::query("INSERT INTO key_policies(workspace_id,governance_key_id,requests_per_minute) VALUES($1,$2,1) ON CONFLICT DO NOTHING")
@@ -385,21 +394,16 @@ async fn a_key_whose_unadmitted_requests_keep_writing_rows_is_throttled(pool: Pg
             .execute(&w.f.store.pool)
             .await
             .unwrap();
-        let (refused, _, _) = post(&w.base, &w.token, "/v1/chat/completions", &monitored).await;
+        let (refused, _, _) = post(&w.base, &token, "/v1/chat/completions", &monitored).await;
         let after_refused = RECORDED.counted(key, limits::now());
         for _ in after_refused..RECORDED_PER_MINUTE {
             RECORDED.note(key, limits::now());
         }
         let recorded = events(&w).await.len();
         let (status, headers, body) =
-            post(&w.base, &w.token, "/v1/chat/completions", &monitored).await;
+            post(&w.base, &token, "/v1/chat/completions", &monitored).await;
         if limits::now() / 60 != minute {
             assert!(attempt < 2, "the minute changed during every attempt");
-            sqlx::query("DELETE FROM key_policies WHERE governance_key_id=$1")
-                .bind(key)
-                .execute(&w.f.store.pool)
-                .await
-                .unwrap();
             continue;
         }
         assert_eq!(

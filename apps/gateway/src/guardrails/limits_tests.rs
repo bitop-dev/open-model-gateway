@@ -1,4 +1,4 @@
-//! Scan slots and the refusal limiter, on paused time (no wall-clock bound).
+//! Scan slots and the per-key limiter, on paused time (no wall-clock bound).
 use super::*;
 
 fn slots() -> Arc<ScanSlots> {

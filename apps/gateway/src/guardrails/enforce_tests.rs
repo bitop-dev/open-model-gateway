@@ -538,7 +538,23 @@ fn no_slot_is_unavailable_for_every_rule_and_a_detector_failure_follows_on_error
     let p = policy(vec![open.clone()]);
     let d = p.unavailable(Workload::Generation);
     assert_eq!(d.refusal.map(|r| r.kind), Some(RefusalKind::Unavailable));
+    assert_eq!(
+        d.refusal.map(|r| r.scanned),
+        Some(false),
+        "nothing was scanned"
+    );
     assert!(d.events[0].refused);
+    // A spent budget is the input's own: scanned.
+    let custom = policy(vec![rule(
+        &[Category::Custom],
+        &["zzzz"],
+        InputAction::Block,
+    )]);
+    let d = custom.decide_with(Workload::Generation, Some(&text("abc")), &Budget::steps(0));
+    assert_eq!(
+        d.refusal.map(|r| (r.kind, r.scanned)),
+        Some((RefusalKind::Unavailable, true))
+    );
     assert!(
         policy(vec![open.clone()])
             .unavailable(Workload::Rerank)
