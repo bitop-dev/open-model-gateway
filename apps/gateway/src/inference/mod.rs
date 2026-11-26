@@ -538,6 +538,21 @@ pub(crate) struct ProbeTicket {
     epoch: Option<i64>,
 }
 impl ProbeTicket {
+    /// A slot claimed outside the engine (a batch line, at dispatch) that its
+    /// claimer frees if it ends before the engine takes it over.
+    pub(crate) fn held(
+        repository: Arc<dyn InferenceRepository>,
+        deployment: Uuid,
+        holder: Uuid,
+        epoch: i64,
+    ) -> Self {
+        Self {
+            repository,
+            deployment,
+            holder,
+            epoch: Some(epoch),
+        }
+    }
     /// The slot's epoch, now the guard's to end.
     pub(crate) fn into_epoch(mut self) -> Option<i64> {
         self.epoch.take()
@@ -704,7 +719,6 @@ impl ExecutionGuard {
             let _ = closing.await;
         }
         // Health is advisory; a failed health write never discards a durably accounted response.
-        // An attempt that sent nothing is no evidence about the provider.
         // The probe's result is recorded as the probe's (it decides).
         let (repository, deployment, probe) =
             (self.repository.clone(), self.deployment_id, self.probe);
@@ -720,7 +734,6 @@ impl ExecutionGuard {
         };
         if self.health_observation
             && outcome != Outcome::Cancelled
-            && !self.telemetry.nothing_sent
             && !matches!(timeout(Duration::from_millis(250), write).await, Ok(Ok(())))
         {
             tracing::warn!(execution_id=%self.id, trace_id = self.log_trace_id.as_ref().map(LogTraceId::as_str), "routing health update failed");

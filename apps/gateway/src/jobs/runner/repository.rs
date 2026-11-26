@@ -37,6 +37,46 @@ pub(super) struct LineRepository {
     pub(super) probes: Mutex<HashMap<Uuid, (Uuid, i64)>>,
 }
 impl LineRepository {
+    /// A line's attempt on its pinned route, planned as the engine sends it.
+    /// An attempt that holds route capacity (`claimed`: a first attempt or a
+    /// retry) uses the probe slot the line claimed at dispatch (renewed at the
+    /// send), or else the route's circuit now: an open circuit sends nothing
+    /// (`RouteCoolingDown`), and a half-open one is used only as its probe
+    /// (the engine claims; another holder's slot sends nothing either).
+    ///
+    /// An ungated attempt (a line pinned by its creation-time plan that no
+    /// route could take at dispatch) is planned as before: admission refuses
+    /// it whatever the route's state (`gated`, #243), so it never reaches a
+    /// provider, and it neither claims a slot nor waits on a circuit.
+    async fn pinned_plan(
+        &self,
+        deployment: Uuid,
+        request_id: Uuid,
+    ) -> Result<crate::routing::RoutePlan, InferenceError> {
+        use crate::routing::{RoutePlan, RouteState};
+        if !self.gated(request_id) {
+            return Ok(RoutePlan::single(vec![deployment]));
+        }
+        let held_probe = self
+            .probes
+            .lock()
+            .expect("probes")
+            .get(&request_id)
+            .copied();
+        let probes = match held_probe {
+            Some(_) => Vec::new(),
+            None => match self.store.route_state(deployment).await? {
+                RouteState::Closed => Vec::new(),
+                RouteState::HalfOpen => vec![deployment],
+                RouteState::Open(seconds) => return Err(InferenceError::RouteCoolingDown(seconds)),
+            },
+        };
+        Ok(RoutePlan {
+            held_probe,
+            probes,
+            ..RoutePlan::single(vec![deployment])
+        })
+    }
     /// Record `execution`'s routing/pricing plan. `claimed` is `true` only
     /// when the scheduler itself claimed route capacity for this attempt at
     /// dispatch (`pin.is_some()` at the `LineRun::execute` call site), never
@@ -301,16 +341,9 @@ impl InferenceRepository for LineRepository {
             .get(&request_id)
             .map(|p| p.0);
         match pinned {
-            // The line's route, with the probe slot it claimed for it, if any.
-            Some(d) if candidates.iter().any(|c| c.id == d) => Ok(crate::routing::RoutePlan {
-                held_probe: self
-                    .probes
-                    .lock()
-                    .expect("probes")
-                    .get(&request_id)
-                    .copied(),
-                ..crate::routing::RoutePlan::single(vec![d])
-            }),
+            Some(d) if candidates.iter().any(|c| c.id == d) => {
+                self.pinned_plan(d, request_id).await
+            }
             Some(_) => Err(InferenceError::ModelUnavailable),
             None => {
                 self.store
@@ -369,3 +402,6 @@ impl InferenceRepository for LineRepository {
         self.store.route_probe_renew(deployment, epoch, hold).await
     }
 }
+
+#[cfg(all(test, feature = "integration-tests"))]
+mod pinned_plan_tests;

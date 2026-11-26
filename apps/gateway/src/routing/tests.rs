@@ -466,6 +466,33 @@ mod database {
             2
         );
     }
+    /// At the default threshold (3) concurrent failures open the circuit
+    /// exactly once: one opening (`reopen_count` 1) for one default cooldown
+    /// (30 s), and the failures that land while it is open change nothing.
+    #[dbtest::test]
+    async fn concurrent_failures_at_the_default_threshold_open_the_circuit_once(pool: PgPool) {
+        let f = fixture(pool).await;
+        let deployment = f
+            .store
+            .deployments(&f.principal, "company/smart")
+            .await
+            .unwrap()
+            .remove(0);
+        let results = futures_util::future::join_all(
+            (0..24).map(|_| record_result(&f.store, deployment.id, Some(InferenceError::Busy))),
+        )
+        .await;
+        assert!(results.iter().all(Result::is_ok));
+        let (failures, reopens, cooldown): (i32, i32, bool) = sqlx::query_as(
+            "SELECT consecutive_failures, reopen_count, open_until BETWEEN last_observed_at AND clock_timestamp()+interval '30 seconds' FROM deployment_health WHERE deployment_id=$1",
+        )
+        .bind(deployment.id)
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+        assert_eq!((failures, reopens, cooldown), (3, 1, true));
+        assert!(health(&f.store, deployment.id).await.unwrap().circuit_open);
+    }
     /// Successes on a healthy, recently observed route write nothing (no
     /// per-success hot-row update); failures, recoveries and a stale
     /// observation still write.

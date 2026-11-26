@@ -15,3 +15,4 @@ ALTER TABLE deployment_health
  ADD COLUMN probe_epoch bigint NOT NULL DEFAULT 0 CHECK (probe_epoch >= 0),
  ADD COLUMN reopen_count integer NOT NULL DEFAULT 0 CHECK (reopen_count >= 0),
  ADD CONSTRAINT deployment_health_probe_whole CHECK ((probe_holder IS NULL) = (probe_until IS NULL));
+RESET lock_timeout;

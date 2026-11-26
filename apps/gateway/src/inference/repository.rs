@@ -258,6 +258,15 @@ pub trait InferenceRepository: Send + Sync {
     ) -> Result<(), InferenceError> {
         self.route_result(deployment, error).await
     }
+    /// `routing::record_unclaimed_result`: the result of a kind that never
+    /// claims the probe slot (realtime sessions).
+    async fn route_unclaimed_result(
+        &self,
+        deployment: Uuid,
+        error: Option<InferenceError>,
+    ) -> Result<(), InferenceError> {
+        self.route_result(deployment, error).await
+    }
     /// `routing::route_state`: the route's circuit now.
     async fn route_state(
         &self,
@@ -507,6 +516,13 @@ impl InferenceRepository for Store {
         epoch: i64,
     ) -> Result<(), InferenceError> {
         crate::routing::record_probe_result(self, deployment, error, epoch).await
+    }
+    async fn route_unclaimed_result(
+        &self,
+        deployment: Uuid,
+        error: Option<InferenceError>,
+    ) -> Result<(), InferenceError> {
+        crate::routing::record_unclaimed_result(self, deployment, error).await
     }
     async fn route_state(
         &self,

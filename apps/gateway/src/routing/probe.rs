@@ -6,6 +6,13 @@ use uuid::Uuid;
 
 use crate::{inference::error::InferenceError, store::Store};
 
+/// The longest `Retry-After` (seconds) for a route whose probe slot another
+/// request holds: the slot can last the request timeout, but a probe usually
+/// ends in seconds, and a client told to wait out the whole slot would stay
+/// away long after the route recovered. An open circuit reports its own
+/// remaining cooldown.
+pub const PROBE_RETRY_AFTER_SECONDS: i32 = 5;
+
 /// The outcome of [`claim_probe`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProbeClaim {
@@ -46,10 +53,13 @@ pub async fn claim_probe(
     }
     let wait: Option<Option<i32>> = sqlx::query_scalar(
         "SELECT CASE WHEN open_until IS NULL THEN NULL
-                     ELSE LEAST(86400, GREATEST(1, CEIL(EXTRACT(EPOCH FROM GREATEST(open_until, probe_until) - clock_timestamp()))))::int END
+                     WHEN open_until > clock_timestamp()
+                     THEN LEAST(86400, GREATEST(1, CEIL(EXTRACT(EPOCH FROM open_until - clock_timestamp()))))::int
+                     ELSE LEAST($2, GREATEST(1, CEIL(EXTRACT(EPOCH FROM probe_until - clock_timestamp()))))::int END
          FROM deployment_health WHERE deployment_id=$1",
     )
     .bind(deployment)
+    .bind(PROBE_RETRY_AFTER_SECONDS)
     .fetch_optional(&store.pool)
     .await
     .map_err(|_| InferenceError::Storage)?;

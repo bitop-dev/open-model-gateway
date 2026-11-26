@@ -133,44 +133,12 @@ pub(super) struct LineRun {
     pub(super) state: Arc<RunState>,
 }
 enum Retry {
-    /// The retry's execution, and the probe slot it holds for its route.
-    Started(Uuid, Option<i64>),
+    Started(Uuid),
     ConfirmedFailure,
     Unconfirmed,
 }
 
 impl LineRun {
-    /// Wait while `route`'s circuit is open, as a line waits for a cooldown;
-    /// once it is half-open the retry runs only as its probe
-    /// (`Some(Some(epoch))`, claimed for `execution`). `None` when the batch
-    /// stops meanwhile.
-    async fn route_gate(&self, route: Uuid, execution: Uuid) -> Option<Option<i64>> {
-        use crate::routing::{ProbeClaim, RouteState};
-        while !self.state.should_stop(&self.job) {
-            let wait = match crate::routing::route_state(&self.store, route).await {
-                Ok(RouteState::Closed) => return Some(None),
-                Ok(RouteState::HalfOpen) => {
-                    match crate::routing::claim_probe(
-                        &self.store,
-                        route,
-                        execution,
-                        self.probe_hold(),
-                    )
-                    .await
-                    {
-                        Ok(ProbeClaim::Claimed(epoch)) => return Some(Some(epoch)),
-                        Ok(ProbeClaim::Closed) => return Some(None),
-                        Ok(ProbeClaim::Busy(seconds)) => seconds,
-                        Err(_) => 1,
-                    }
-                }
-                Ok(RouteState::Open(seconds)) => seconds,
-                Err(_) => 1,
-            };
-            tokio::time::sleep(Duration::from_secs(u64::from(wait)).min(POLL)).await;
-        }
-        None
-    }
     /// The probe slot bound of this run's lines (`Engine::probe_hold`).
     pub(super) fn probe_hold(&self) -> std::time::Duration {
         self.engine.probe_hold()
@@ -236,6 +204,19 @@ impl LineRun {
         mut pin: Option<Pin>,
         records: mpsc::Sender<Record>,
     ) {
+        // The probe slot dispatch claimed for this line is freed if the line
+        // ends before its attempt reaches the engine (an unparseable line, or
+        // the task aborted); from the attempt on, the engine and `unpin` end it.
+        let mut slot = pin.and_then(|pin| {
+            pin.probe.map(|epoch| {
+                crate::inference::ProbeTicket::held(
+                    self.repository.clone(),
+                    pin.deployment,
+                    execution,
+                    epoch,
+                )
+            })
+        });
         let line = match lines::parse_work_line(&raw, self.endpoint) {
             Ok(l) => l,
             Err(_) => {
@@ -257,6 +238,9 @@ impl LineRun {
             let result = self
                 .execute(line.request.clone(), execution, pin, line.plan)
                 .await;
+            if let Some(slot) = slot.take() {
+                let _ = slot.into_epoch();
+            }
             match result {
                 Ok(response) => {
                     self.state.succeeded();
@@ -284,12 +268,12 @@ impl LineRun {
                     if e == InferenceError::Busy && pin.is_some() {
                         self.state.rate_limited();
                     }
-                    // A probe slot claimed at dispatch and lost before the
-                    // send (`routing::renew_probe`) sent nothing: the retry
-                    // waits on the route's circuit (`route_gate`).
-                    let lost_probe = matches!(e, InferenceError::RouteCoolingDown(_))
-                        && pin.is_some_and(|pin| pin.probe.is_some());
-                    let retryable = lost_probe
+                    // The line's pinned route could not be used when it was
+                    // sent (its circuit open, or its probe slot held by
+                    // another request or lost): nothing was sent, and the
+                    // attempt is retried after its backoff like a failed one.
+                    let cooling = matches!(e, InferenceError::RouteCoolingDown(_)) && pin.is_some();
+                    let retryable = cooling
                         || matches!(
                             e,
                             InferenceError::Busy
@@ -305,10 +289,12 @@ impl LineRun {
                             .retry_failed_attempt(n, execution, attempt, pin, e)
                             .await
                         {
-                            Retry::Started(next, probe) => {
+                            Retry::Started(next) => {
                                 attempt += 1;
                                 execution = next;
-                                pin = pin.map(|pin| Pin { probe, ..pin });
+                                // The dispatch's probe slot was the first
+                                // attempt's; a retry claims its own.
+                                pin = pin.map(|pin| Pin { probe: None, ..pin });
                                 continue;
                             }
                             Retry::ConfirmedFailure => {
@@ -381,23 +367,13 @@ impl LineRun {
         let next = Uuid::now_v7();
         let route = pin.map(|pin| (pin.deployment, pin.max_concurrency));
         let mut recovered = None;
-        // The retry is sent on its pinned route only as that route is now:
-        // never while its circuit is open, and once half-open as its probe.
-        let probe = match pin {
-            Some(pin) => self.route_gate(pin.deployment, next).await,
-            None => Some(None),
-        };
-        let ticket = probe
-            .flatten()
-            .zip(pin)
-            .map(|(epoch, pin)| (pin.deployment, epoch));
-        while probe.is_some() && !self.state.should_stop(&self.job) {
+        while !self.state.should_stop(&self.job) {
             match self
                 .scheduler
                 .claim_retry(&self.state.fence, line, attempt, next, route)
                 .await
             {
-                Ok(RetryClaim::Started) => return Retry::Started(next, probe.flatten()),
+                Ok(RetryClaim::Started) => return Retry::Started(next),
                 Ok(RetryClaim::Full) => tokio::time::sleep(POLL).await,
                 Ok(claim @ (RetryClaim::Cancelled | RetryClaim::CancelledAfterCommit)) => {
                     self.state.cancel.store(true, Ordering::SeqCst);
@@ -417,11 +393,6 @@ impl LineRun {
                 }
                 Ok(RetryClaim::LineChanged) | Err(_) => break,
             }
-        }
-        if let Some((route, epoch)) = ticket {
-            // The retry was not started: its probe slot is freed for another request.
-            let release = crate::routing::release_probe(&self.store, route, epoch);
-            let _ = tokio::time::timeout(Duration::from_millis(250), release).await;
         }
         let counted = self
             .state

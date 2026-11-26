@@ -1,6 +1,7 @@
 //! A route's passive health (#49): each recorded provider result moves its
-//! circuit (closed, open for a cooldown, half-open), and while the circuit is
-//! open or half-open only the current probe's result decides.
+//! circuit (closed, open for a cooldown, half-open). While the circuit is open
+//! or half-open the probe's result decides, and on a half-open circuit with
+//! no unexpired slot a never-claiming kind's result (realtime) does too.
 use super::*;
 
 pub(super) fn affects_health(error: Option<InferenceError>) -> bool {
@@ -27,31 +28,63 @@ const OBSERVED_REFRESH_SECONDS: i32 = 30;
 /// state would not change, so the per-success upsert of one hot row per
 /// deployment is skipped. Failures and recoveries always write.
 ///
-/// While the circuit is open or half-open only its probe decides
-/// ([`record_probe_result`]): any other result (an attempt admitted before it
-/// opened, a realtime session, a probe whose slot ended) changes nothing.
+/// This is the result of a request of a kind that claims a half-open route's
+/// probe slot (generation, workloads, batch lines) but did not hold it: while
+/// the circuit is open or half-open it changes nothing (an attempt admitted
+/// before the circuit opened, a request that was passed the route as closed).
 pub async fn record_result(
     store: &Store,
     deployment: Uuid,
     error: Option<InferenceError>,
 ) -> Result<(), InferenceError> {
-    record(store, deployment, error, None).await
+    record(store, deployment, error, Recorder::Attempt).await
 }
 
-/// [`record_result`] of the request that holds the probe slot under `epoch`:
-/// it decides a half-open circuit (a success closes it, a counted failure
-/// reopens it). A slot that ended (its expiry, a newer claim) decides nothing.
+/// [`record_result`] of the request that claimed the probe slot under
+/// `epoch`: while that claim is the slot's latest and the slot has not been
+/// freed, it decides the open or half-open circuit (a success closes it, a
+/// counted failure reopens it, a failure below the threshold leaves it
+/// half-open) and frees the slot. A claim whose slot expired with nobody
+/// claiming it again still decides: it is the only request that was let
+/// through. A newer claim, or a slot already freed, leaves it nothing.
 pub async fn record_probe_result(
     store: &Store,
     deployment: Uuid,
     error: Option<InferenceError>,
     epoch: i64,
 ) -> Result<(), InferenceError> {
-    record(store, deployment, error, Some(epoch)).await
+    record(store, deployment, error, Recorder::Probe(epoch)).await
 }
 
-/// A result may change the circuit: it is closed, or this is its probe.
-const AUTHORITY: &str = "(h.open_until IS NULL OR ($3::bigint IS NOT NULL AND h.probe_epoch=$3 AND h.probe_holder IS NOT NULL))";
+/// [`record_result`] of a request of a kind that never claims the probe
+/// slot (realtime sessions): it reaches a half-open route as it reached an
+/// expired cooldown, so on a route only such kinds use, it is what keeps the
+/// breaker working. It decides a half-open circuit while no request holds an
+/// unexpired probe slot; it never changes an open circuit, and never a slot's
+/// holder's decision.
+pub async fn record_unclaimed_result(
+    store: &Store,
+    deployment: Uuid,
+    error: Option<InferenceError>,
+) -> Result<(), InferenceError> {
+    record(store, deployment, error, Recorder::Unclaimed).await
+}
+
+/// Whose result is recorded, which decides what it may change.
+#[derive(Clone, Copy)]
+enum Recorder {
+    Attempt,
+    Probe(i64),
+    Unclaimed,
+}
+
+/// A result may change the circuit: it is closed; or this is the probe's
+/// result, under the slot's latest claim while the slot is not freed; or it
+/// is a never-claiming kind's, on a half-open circuit with no unexpired slot.
+const AUTHORITY: &str = "(h.open_until IS NULL
+    OR ($3::bigint IS NOT NULL AND h.probe_epoch=$3 AND h.probe_holder IS NOT NULL)
+    OR ($4 AND h.open_until <= statement_timestamp()
+        AND (h.probe_holder IS NULL OR h.probe_until <= statement_timestamp())))";
 /// A failure that reaches the threshold while the circuit is closed or
 /// half-open opens it (one statement time for every column).
 const OPENING: &str = "($2 AND h.consecutive_failures::bigint+1 >= (SELECT threshold FROM policy) AND (h.open_until IS NULL OR h.open_until <= statement_timestamp()))";
@@ -86,8 +119,8 @@ static RECORD_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
                 WHEN NOT $2 THEN 0
                 WHEN {OPENING} THEN LEAST(h.reopen_count::bigint+1,2147483647)::integer
                 ELSE h.reopen_count END,
-            probe_holder=CASE WHEN {AUTHORITY} AND (NOT $2 OR {OPENING}) THEN NULL ELSE h.probe_holder END,
-            probe_until=CASE WHEN {AUTHORITY} AND (NOT $2 OR {OPENING}) THEN NULL ELSE h.probe_until END,
+            probe_holder=CASE WHEN {AUTHORITY} AND (NOT $2 OR {OPENING} OR h.open_until IS NOT NULL) THEN NULL ELSE h.probe_holder END,
+            probe_until=CASE WHEN {AUTHORITY} AND (NOT $2 OR {OPENING} OR h.open_until IS NOT NULL) THEN NULL ELSE h.probe_until END,
             last_observed_at=clock_timestamp()"#
     )
 });
@@ -96,7 +129,7 @@ async fn record(
     store: &Store,
     deployment: Uuid,
     error: Option<InferenceError>,
-    probe: Option<i64>,
+    recorder: Recorder,
 ) -> Result<(), InferenceError> {
     if !affects_health(error) {
         return Ok(());
@@ -164,12 +197,19 @@ async fn record(
     // A success closes the circuit, frees the slot and forgets the openings;
     // a counted failure at the threshold opens it for the deployment's
     // cooldown doubled once per earlier opening, capped at 300 s (or the
-    // cooldown, if longer), and ends any probe slot. Neither applies without
+    // cooldown, if longer), and ends any probe slot; a decision on an open or
+    // half-open circuit always frees the slot. None of this applies without
     // the authority to change the circuit.
+    let (epoch, unclaimed) = match recorder {
+        Recorder::Attempt => (None, false),
+        Recorder::Probe(epoch) => (Some(epoch), false),
+        Recorder::Unclaimed => (None, true),
+    };
     let result = sqlx::query(RECORD_SQL.as_str())
         .bind(deployment)
         .bind(error.is_some())
-        .bind(probe)
+        .bind(epoch)
+        .bind(unclaimed)
         .execute(&store.pool)
         .await
         .map_err(|_| InferenceError::Storage)?;

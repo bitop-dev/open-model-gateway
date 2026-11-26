@@ -34,16 +34,30 @@ async fn expire(f: &crate::governance::tests::db::Fixture, deployment: Uuid) {
     f.store.caches.forget_health(deployment);
 }
 
-/// (seconds the circuit stays open from now, rounded; reopen count; probe held).
+/// (the circuit's remaining cooldown, rounded up to a multiple of 5 s, `0`
+/// once it has passed (half-open), `None` while closed; reopen count; probe
+/// held). Every cooldown these tests set is a multiple of 5 s, so the value
+/// is the cooldown just set unless the runner stalls for 5 s or more between
+/// the write and this read.
 async fn circuit(
     f: &crate::governance::tests::db::Fixture,
     deployment: Uuid,
 ) -> (Option<i64>, i32, bool) {
-    sqlx::query_as("SELECT round(EXTRACT(EPOCH FROM open_until-clock_timestamp()))::int8, reopen_count, probe_holder IS NOT NULL FROM deployment_health WHERE deployment_id=$1")
+    sqlx::query_as("SELECT CASE WHEN open_until IS NULL THEN NULL WHEN open_until <= clock_timestamp() THEN 0 ELSE (ceil(EXTRACT(EPOCH FROM open_until-clock_timestamp())/5)*5)::int8 END, reopen_count, probe_holder IS NOT NULL FROM deployment_health WHERE deployment_id=$1")
         .bind(deployment)
         .fetch_one(&f.store.pool)
         .await
         .unwrap()
+}
+
+/// The probe slot ends now, as if its hold had passed with nobody freeing it.
+async fn expire_slot(f: &crate::governance::tests::db::Fixture, deployment: Uuid) {
+    sqlx::query("UPDATE deployment_health SET probe_until=clock_timestamp()-interval '1 millisecond' WHERE deployment_id=$1 AND probe_holder IS NOT NULL")
+        .bind(deployment)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    f.store.caches.forget_health(deployment);
 }
 
 const HOLD: Duration = Duration::from_secs(60);
@@ -108,14 +122,21 @@ async fn an_expired_cooldown_admits_one_probe_across_replicas(pool: PgPool) {
         1,
         "{claims:?}"
     );
-    // While it is held, a probing plan sees the route cooling down for the
-    // slot's remaining time, on both replicas.
+    // While it is held (for 60 s), a probing plan sees the route cooling
+    // down, on both replicas, and is told to come back within 5 s: a probe
+    // usually ends long before its slot would.
+    let soon = 1..=PROBE_RETRY_AFTER_SECONDS as u32;
     for store in [&f.store, &other] {
         match plan_probing(store, &f.principal, "company/smart", only, Uuid::new_v4()).await {
-            Err(InferenceError::RouteCoolingDown(seconds)) => assert!((1..=60).contains(&seconds)),
+            Err(InferenceError::RouteCoolingDown(seconds)) => {
+                assert!(soon.contains(&seconds), "{seconds}");
+            }
             other => panic!("expected cooling down, got {other:?}"),
         }
     }
+    assert!(
+        matches!(claim_probe(&f.store, deployment.id, Uuid::new_v4(), HOLD).await.unwrap(), ProbeClaim::Busy(seconds) if soon.contains(&seconds))
+    );
     // A caller that records no health still reaches it, as an expired cooldown always did.
     let unrecorded = plan(
         &f.store,
@@ -340,23 +361,14 @@ async fn a_probe_slot_ends_without_a_decision(pool: PgPool) {
     release_probe(&f.store, deployment.id, first).await.unwrap();
     assert_eq!(circuit(&f, deployment.id).await, (Some(0), 1, false));
     // The holder dies (nothing is written): the slot ends at `probe_until`.
-    let ProbeClaim::Claimed(dead) = claim_probe(
-        &f.store,
-        deployment.id,
-        Uuid::new_v4(),
-        Duration::from_millis(200),
-    )
-    .await
-    .unwrap() else {
-        panic!()
-    };
+    let dead = claimed(&f, deployment.id).await;
     assert!(matches!(
         claim_probe(&f.store, deployment.id, Uuid::new_v4(), HOLD)
             .await
             .unwrap(),
         ProbeClaim::Busy(_)
     ));
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    expire_slot(&f, deployment.id).await;
     let ProbeClaim::Claimed(next) = claim_probe(&f.store, deployment.id, Uuid::new_v4(), HOLD)
         .await
         .unwrap()
@@ -376,7 +388,7 @@ async fn a_probe_slot_ends_without_a_decision(pool: PgPool) {
             .is_some()
     );
     // A claim on a route whose circuit reopened meanwhile (the probe failed)
-    // is busy, not claimed.
+    // is busy, not claimed; the open circuit reports its own remaining cooldown.
     record_probe_result(&f.store, deployment.id, Some(InferenceError::Busy), next)
         .await
         .unwrap();
@@ -472,7 +484,7 @@ async fn only_an_unexpired_held_slot_is_renewed_for_the_send(pool: PgPool) {
         &f.store,
         deployment.id,
         Uuid::new_v4(),
-        Duration::from_secs(1),
+        Duration::from_secs(30),
     )
     .await
     .unwrap()
@@ -485,20 +497,18 @@ async fn only_an_unexpired_held_slot_is_renewed_for_the_send(pool: PgPool) {
             .await
             .unwrap()
     );
-    let until: i64 = sqlx::query_scalar(
-        "SELECT round(EXTRACT(EPOCH FROM probe_until-clock_timestamp()))::int8 FROM deployment_health WHERE deployment_id=$1",
+    // Rebased on the send's own hold (60 s) rather than the claim's (30 s):
+    // the slot now outlasts 30 s by more than any stall between the two.
+    let rebased: bool = sqlx::query_scalar(
+        "SELECT probe_until > clock_timestamp() + interval '40 seconds' FROM deployment_health WHERE deployment_id=$1",
     )
     .bind(deployment.id)
     .fetch_one(&f.store.pool)
     .await
     .unwrap();
-    assert_eq!(until, 60, "rebased on the send's own hold");
+    assert!(rebased, "rebased on the send's own hold");
     // Expired before the send: lost, and the slot is not revived.
-    sqlx::query("UPDATE deployment_health SET probe_until=clock_timestamp()-interval '1 millisecond' WHERE deployment_id=$1")
-        .bind(deployment.id)
-        .execute(&f.store.pool)
-        .await
-        .unwrap();
+    expire_slot(&f, deployment.id).await;
     assert!(
         !renew_probe(&f.store, deployment.id, held, HOLD)
             .await
@@ -520,4 +530,110 @@ async fn only_an_unexpired_held_slot_is_renewed_for_the_send(pool: PgPool) {
             .unwrap()
     );
     assert!(!circuit(&f, deployment.id).await.2);
+}
+
+/// A probe whose slot expired with nobody claiming it again still decides:
+/// it is the only request that was let through.
+#[dbtest::test]
+async fn an_expired_slot_nobody_claimed_again_still_decides(pool: PgPool) {
+    let f = fixture(pool).await;
+    let deployment = opened(&f, 60).await;
+    expire(&f, deployment.id).await;
+    let epoch = claimed(&f, deployment.id).await;
+    expire_slot(&f, deployment.id).await;
+    record_probe_result(
+        &f.store,
+        deployment.id,
+        Some(InferenceError::UpstreamUnavailable),
+        epoch,
+    )
+    .await
+    .unwrap();
+    assert_eq!(circuit(&f, deployment.id).await, (Some(120), 2, false));
+    expire(&f, deployment.id).await;
+    let epoch = claimed(&f, deployment.id).await;
+    expire_slot(&f, deployment.id).await;
+    record_probe_result(&f.store, deployment.id, None, epoch)
+        .await
+        .unwrap();
+    assert_eq!(circuit(&f, deployment.id).await, (None, 0, false));
+}
+
+/// The threshold was raised while the route was half-open: the probe's
+/// failure no longer reaches it, so the circuit stays half-open, and the
+/// probe's decision still frees the slot for the next request.
+#[dbtest::test]
+async fn a_probe_failure_below_a_raised_threshold_leaves_the_route_half_open(pool: PgPool) {
+    let f = fixture(pool).await;
+    let deployment = opened(&f, 60).await;
+    sqlx::query("UPDATE deployment_routing SET failure_threshold=5 WHERE deployment_id=$1")
+        .bind(deployment.id)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    expire(&f, deployment.id).await;
+    let epoch = claimed(&f, deployment.id).await;
+    record_probe_result(
+        &f.store,
+        deployment.id,
+        Some(InferenceError::UpstreamUnavailable),
+        epoch,
+    )
+    .await
+    .unwrap();
+    assert_eq!(circuit(&f, deployment.id).await, (Some(0), 1, false));
+    assert!(claimed(&f, deployment.id).await > epoch);
+}
+
+/// A route only a kind that never claims the probe slot uses (realtime
+/// sessions) keeps a working breaker: after the cooldown its success closes
+/// the half-open circuit and a counted failure reopens it with the backoff;
+/// it never changes an open circuit, nor one whose slot a probe holds.
+#[dbtest::test]
+async fn a_route_only_never_claiming_kinds_use_keeps_its_breaker(pool: PgPool) {
+    let f = fixture(pool).await;
+    let deployment = opened(&f, 60).await;
+    let failed = Some(InferenceError::UpstreamUnavailable);
+    // Open: neither a success nor a failure changes it.
+    for result in [None, failed] {
+        record_unclaimed_result(&f.store, deployment.id, result)
+            .await
+            .unwrap();
+        assert_eq!(circuit(&f, deployment.id).await, (Some(60), 1, false));
+    }
+    // Half-open, nobody holds the slot: a counted failure reopens it, doubled.
+    expire(&f, deployment.id).await;
+    record_unclaimed_result(&f.store, deployment.id, failed)
+        .await
+        .unwrap();
+    assert_eq!(circuit(&f, deployment.id).await, (Some(120), 2, false));
+    // Half-open with a probe holding the slot: it changes nothing, and the
+    // probe still decides.
+    expire(&f, deployment.id).await;
+    let epoch = claimed(&f, deployment.id).await;
+    for result in [None, failed] {
+        record_unclaimed_result(&f.store, deployment.id, result)
+            .await
+            .unwrap();
+        assert_eq!(circuit(&f, deployment.id).await, (Some(0), 2, true));
+    }
+    release_probe(&f.store, deployment.id, epoch).await.unwrap();
+    // Half-open, the slot free again: a success closes it and forgets the openings.
+    record_unclaimed_result(&f.store, deployment.id, None)
+        .await
+        .unwrap();
+    assert_eq!(circuit(&f, deployment.id).await, (None, 0, false));
+    // Closed: it counts as any result does (threshold 1 opens for 60 s).
+    record_unclaimed_result(&f.store, deployment.id, failed)
+        .await
+        .unwrap();
+    assert_eq!(circuit(&f, deployment.id).await, (Some(60), 1, false));
+    // A claiming kind's result without the slot changes nothing while half-open.
+    expire(&f, deployment.id).await;
+    for result in [None, failed] {
+        record_result(&f.store, deployment.id, result)
+            .await
+            .unwrap();
+        assert_eq!(circuit(&f, deployment.id).await, (Some(0), 1, false));
+    }
 }

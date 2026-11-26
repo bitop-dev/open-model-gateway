@@ -525,7 +525,7 @@ impl RealtimeSession {
                 timeout(
                     Duration::from_millis(250),
                     self.repository
-                        .route_result(self.deployment_id, provider_error)
+                        .route_unclaimed_result(self.deployment_id, provider_error)
                 )
                 .await,
                 Ok(Ok(()))

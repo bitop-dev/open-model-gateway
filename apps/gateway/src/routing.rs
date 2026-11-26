@@ -528,7 +528,7 @@ fn eligible_candidates(
             if c.circuit_open {
                 Some(c.cooldown_remaining_seconds)
             } else if busy(c) {
-                Some(c.probe_held_seconds)
+                Some(c.probe_held_seconds.min(PROBE_RETRY_AFTER_SECONDS))
             } else {
                 None
             }
@@ -650,9 +650,13 @@ pub fn may_fail_over_unsent(plan: &RoutePlan, error: InferenceError) -> bool {
 mod health;
 #[cfg(test)]
 use health::affects_health;
-pub use health::{RouteHealth, health, record_probe_result, record_result};
+pub use health::{
+    RouteHealth, health, record_probe_result, record_result, record_unclaimed_result,
+};
 mod probe;
-pub use probe::{ProbeClaim, claim_probe, close_probe, release_probe, renew_probe};
+pub use probe::{
+    PROBE_RETRY_AFTER_SECONDS, ProbeClaim, claim_probe, close_probe, release_probe, renew_probe,
+};
 #[cfg(all(test, feature = "integration-tests"))]
 mod probe_tests;
 #[cfg(test)]

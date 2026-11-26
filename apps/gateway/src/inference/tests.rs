@@ -1556,9 +1556,30 @@ async fn a_probe_refused_at_admission_frees_its_slot() {
 }
 
 /// A route whose circuit never opened is not claimed: the engine adds no
-/// statement for it.
+/// statement for it, for generation (complete and streamed) and for a
+/// workload (embeddings).
 #[tokio::test]
 async fn a_healthy_plan_makes_no_probe_call() {
+    let (mut engine, repository, _) = fixture(Mode::Complete, EngineLimits::default());
+    engine
+        .registry
+        .register(Arc::new(EmbeddingAdapter { malformed: false }))
+        .unwrap();
+    {
+        let mut targets = repository.deployments.lock().unwrap();
+        targets[0].provider = "embedding_mock".into();
+        targets[0].supported_protocols = vec!["embeddings".into()];
+    }
+    let embedding = EmbeddingRequest {
+        model: "public/alias".into(),
+        input: vec!["text".into()],
+        dimensions: Some(2),
+    };
+    engine
+        .execute_embeddings(principal(), embedding, Uuid::new_v4())
+        .await
+        .unwrap();
+    assert_eq!(probe_log(&repository, 1).await, ["health"]);
     for stream in [false, true] {
         let mode = if stream { Mode::Stream } else { Mode::Complete };
         let (engine, repository, _) = fixture(mode, EngineLimits::default());
@@ -1644,7 +1665,9 @@ async fn a_probe_dropped_before_its_admission_ends_frees_the_slot() {
 /// the request ends with the first attempt's own error.
 #[tokio::test]
 async fn a_failover_route_whose_circuit_opened_since_the_plan_is_not_used() {
-    let (engine, repo, backup) = failover_fixture(Mode::Throttled, false, false);
+    // The first route fails with an ambiguous transport error, which this
+    // plan allows to fail over; the second route's circuit opened since.
+    let (engine, repo, backup) = failover_fixture(Mode::Error, false, true);
     let second = repo.deployments.lock().unwrap()[1].id;
     repo.route_states
         .lock()
@@ -1656,7 +1679,8 @@ async fn a_failover_route_whose_circuit_opened_since_the_plan_is_not_used() {
             .execute(principal(), request(false), root)
             .await
             .err(),
-        Some(InferenceError::Busy)
+        Some(InferenceError::UpstreamUnavailable),
+        "the first attempt's own error, not the generic Busy"
     );
     assert_eq!(backup.calls.load(Ordering::SeqCst), 0);
     assert_eq!(*repo.attempts.lock().unwrap(), vec![(root, 1)]);

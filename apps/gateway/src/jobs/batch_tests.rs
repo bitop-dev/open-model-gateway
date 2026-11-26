@@ -267,9 +267,6 @@ impl ProviderAdapter for Fake {
         _: &Deployment,
         request: ChatRequest,
     ) -> Result<ProviderOutput, InferenceError> {
-        // This fake stands for an upstream call: as a real adapter's request
-        // builder would, it marks the attempt as possibly sent.
-        crate::inference::dispatch::started();
         let text = request.messages[0].content.clone().unwrap_or_default();
         {
             let mut script = self.script.lock().unwrap();
