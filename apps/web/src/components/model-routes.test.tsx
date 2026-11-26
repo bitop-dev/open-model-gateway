@@ -9,7 +9,7 @@ import { DashboardNavigationProvider } from "./navigation-link";
 import { markup, model } from "../lib/test-fixtures";
 
 const price = (id: string, input: string, output: string): Price => ({ id: `price-${id}`, deployment_id: id, pricing_version: 2, input_microusd_per_million: input, output_microusd_per_million: output, input_token_limit: 8000, output_token_limit: 64, cache_pricing: null, created_at: "2026-10-01T00:00:00Z" });
-const routing = (priority: number, weight = 1): DeploymentRouting => ({ routing: { priority, weight, residency: null, failure_threshold: 3, cooldown_seconds: 30 }, health: { consecutive_failures: 0, open_until: null } });
+const routing = (priority: number, weight = 1): DeploymentRouting => ({ routing: { priority, weight, residency: null, failure_threshold: 3, cooldown_seconds: 30 }, health: { consecutive_failures: 0, open_until: null, last_observed_at: null, circuit: "closed", cooling_until: null, probe_in_progress: false, probe_until: null, reopen_count: 0, observation: "none", as_of: "2026-11-26T10:00:41Z" } });
 function route(id: string, opts: { name?: string; priority?: number; enabled?: boolean; connection?: boolean; input?: string; output?: string; policy?: string } = {}): RouteRow {
   const enabled = opts.enabled ?? true, connection = opts.connection ?? true;
   const detail: RouteDetail = { id, model_id: model.id, provider_connection_id: `conn-${id}`, provider_name: "OpenAI prod", upstream_model: opts.name ?? id, enabled, provider: "openai", connection_enabled: connection, region: null, workload: "generation", protocols: ["chat_completions"], data_policy: { data_collection: opts.policy ?? "unknown", basis: "not_configured" }, price: price(id, opts.input ?? "100000", opts.output ?? "500000") };
