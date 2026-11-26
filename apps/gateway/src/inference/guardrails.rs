@@ -145,6 +145,9 @@ impl Store {
 /// Inputs above this many bytes are scanned off the async workers, at most
 /// `SCANS` at a time per replica.
 const LARGE_INPUT: usize = 64 * 1024;
+/// Custom patterns are any user's, so their scans leave the async workers
+/// above this size.
+const CUSTOM_INLINE: usize = 4 * 1024;
 static SCANS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
 
 /// The facts of a request the guardrail step records.
@@ -234,7 +237,10 @@ impl super::Engine {
         let decision = match input {
             // A large input is scanned on the blocking pool (the patterns run
             // in linear time, but over megabytes and many rules).
-            Some(input) if input.len() > LARGE_INPUT => {
+            Some(input)
+                if input.len() > LARGE_INPUT
+                    || (policy.has_custom() && input.len() > CUSTOM_INLINE) =>
+            {
                 // A slot moves into the scan, so it is held until the scan
                 // ends even when the request is dropped.
                 let slot = SCANS.acquire().await.map_err(|_| InferenceError::Busy)?;

@@ -4,8 +4,11 @@
 //! backtracking), and these limits bound what a compiled pattern may hold.
 use regex::{Regex, RegexBuilder};
 
-/// The compiled program of one pattern (the crate's default is 10 MiB).
-pub const COMPILED_LIMIT: usize = 1 << 20;
+/// The compiled program of one pattern (the crate's default is 10 MiB). A
+/// custom pattern is any user's (a personal workspace's owner writes its local
+/// layer), and a program this small also bounds the work per scanned byte when
+/// a pattern defeats the lazy DFA.
+pub const COMPILED_LIMIT: usize = 64 << 10;
 /// The lazy DFA cache of one pattern (the crate's default is 2 MiB).
 pub const DFA_LIMIT: usize = 1 << 20;
 /// How deeply a pattern may nest (the crate's default is 250).

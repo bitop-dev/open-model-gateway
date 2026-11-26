@@ -158,56 +158,106 @@ impl PatternDetector {
         } else {
             Vec::new()
         };
-        found.extend(self.custom_findings(input).0);
+        let budget = Budget::new(super::enforce::CUSTOM_BUDGET);
+        found.extend(
+            self.custom_findings(input, &budget)
+                .map(|f| f.0)
+                .unwrap_or_default(),
+        );
         Findings(found)
+    }
+    /// Whether the rule has custom patterns.
+    pub fn has_custom(&self) -> bool {
+        !self.custom.is_empty()
     }
     /// Whether the built-in secret shapes run for this rule.
     pub fn secrets(&self) -> bool {
         self.secrets
     }
-    /// Matches of the rule's custom patterns, in time linear in the text
-    /// (a custom pattern is an administrator's, so its cost is bounded
-    /// whatever it is): each step finds the earliest end of a match, which
-    /// scans no further than that end, then the match's start within the text
-    /// just scanned. Patterns that can match the empty string are refused at
-    /// save; an empty match here never counts.
-    pub fn custom_findings(&self, input: &Inspection<'_>) -> Findings {
+    /// Matches of the rule's custom patterns, within a time budget: a
+    /// custom pattern is any user's, so its cost per byte is too. Text is
+    /// scanned in windows of `WINDOW` bytes overlapping by `OVERLAP`, so one
+    /// regex call is bounded, and the budget is checked between windows and
+    /// matches; spent, the scan stops with `BudgetSpent` (the rule then fails
+    /// under its `on_error`). A match up to `OVERLAP` bytes long is found
+    /// whole in some window; empty matches never count.
+    pub fn custom_findings(
+        &self,
+        input: &Inspection<'_>,
+        budget: &Budget,
+    ) -> Result<Findings, BudgetSpent> {
         let mut found = Vec::new();
         for (index, segment) in input.segments.iter().enumerate() {
             let text: &str = &segment.text;
             for pattern in &self.custom {
-                let mut at = 0;
-                while at < text.len() {
-                    let Some(end) = pattern.shortest_match_at(text, at) else {
-                        break;
-                    };
-                    let span = pattern
-                        .find_at(&text[..end], at)
-                        .map_or(at..end, |m| m.range());
-                    if found.len() == MAX_FINDINGS {
-                        return Findings(found);
-                    }
-                    if !span.is_empty() {
+                let mut start = 0;
+                loop {
+                    let end = boundary(text, (start + WINDOW).min(text.len()));
+                    let last = end == text.len();
+                    for m in pattern.find_iter(&text[start..end]) {
+                        if budget.spent() {
+                            return Err(BudgetSpent);
+                        }
+                        // Cut by the window's end: found whole in the next one.
+                        if m.is_empty() || (!last && m.end() == end - start) {
+                            continue;
+                        }
+                        if found.len() == MAX_FINDINGS {
+                            return Ok(Findings(found));
+                        }
                         found.push(Finding {
                             category: Category::Custom,
                             segment: index,
-                            span,
+                            span: start + m.start()..start + m.end(),
                         });
                     }
-                    at = if end > at { end } else { next_char(text, at) };
+                    if last {
+                        break;
+                    }
+                    if budget.spent() {
+                        return Err(BudgetSpent);
+                    }
+                    let back = boundary(text, end.saturating_sub(OVERLAP));
+                    start = boundary_up(text, back.max(start + 1));
                 }
             }
         }
-        Findings(found)
+        Ok(Findings(found))
     }
 }
 
-/// The byte offset after the character at `at`.
-fn next_char(text: &str, at: usize) -> usize {
-    text[at..]
-        .chars()
-        .next()
-        .map_or(text.len(), |c| at + c.len_utf8())
+/// Bytes of text one custom-pattern call scans, and the overlap of
+/// consecutive windows.
+const WINDOW: usize = 4096;
+const OVERLAP: usize = 1024;
+
+/// The time a request's custom patterns may take in all.
+pub struct Budget(std::time::Instant);
+impl Budget {
+    pub fn new(limit: std::time::Duration) -> Self {
+        Self(std::time::Instant::now() + limit)
+    }
+    fn spent(&self) -> bool {
+        std::time::Instant::now() >= self.0
+    }
+}
+/// A request's custom-pattern budget ran out.
+#[derive(Debug)]
+pub struct BudgetSpent;
+
+/// The char boundary at or before `i`.
+fn boundary(text: &str, mut i: usize) -> usize {
+    while !text.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+/// The char boundary at or after `i`.
+fn boundary_up(text: &str, mut i: usize) -> usize {
+    while i < text.len() && !text.is_char_boundary(i) {
+        i += 1;
+    }
+    i
 }
 
 #[async_trait]

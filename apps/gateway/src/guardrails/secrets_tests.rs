@@ -193,16 +193,50 @@ fn random_base64url_data_matches_nothing() {
 }
 
 #[test]
-fn a_hostile_custom_pattern_scans_in_linear_time() {
-    // `find_iter` is quadratic for this pattern on this text; the custom scan
-    // is not.
+fn a_hostile_custom_pattern_is_bounded_by_windows_and_the_budget() {
+    // Quadratic for `find_iter` over the whole text; windows bound each call.
     let custom = PatternDetector::new(&[Category::Custom], &["[a-z]+X|a".to_owned()]).unwrap();
     let text = "a".repeat(2 << 20);
     let mut input = Inspection::default();
     input.push(&text, Part::Content);
     let started = std::time::Instant::now();
-    assert_eq!(custom.custom_findings(&input).0.len(), MAX_FINDINGS);
+    let budget = Budget::new(std::time::Duration::from_secs(30));
+    assert_eq!(
+        custom.custom_findings(&input, &budget).unwrap().0.len(),
+        MAX_FINDINGS
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    // A pattern that defeats the lazy DFA stops when the budget is spent.
+    // The slowest such pattern the program limit still admits.
+    let slow = [2000, 1000, 500, 300, 200, 100]
+        .into_iter()
+        .find_map(|n| PatternDetector::new(&[Category::Custom], &[format!("a[ab]{{{n}}}[^ab]")]))
+        .unwrap();
+    let mut x: u32 = 7;
+    let noise: String = (0..(2 << 20))
+        .map(|_| {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            if x >> 16 & 1 == 0 { 'a' } else { 'b' }
+        })
+        .collect();
+    let mut input = Inspection::default();
+    input.push(&noise, Part::Content);
+    let started = std::time::Instant::now();
+    let budget = Budget::new(std::time::Duration::from_millis(50));
+    assert!(slow.custom_findings(&input, &budget).is_err());
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
+
+#[test]
+fn a_value_cut_by_a_window_is_found_whole_and_counted_once() {
+    let custom = PatternDetector::new(&[Category::Custom], &["ACME-[0-9]+".to_owned()]).unwrap();
+    // The value straddles the first window's end.
+    let text = format!("{}ACME-123456 and ACME-123456", "x".repeat(4090));
+    let mut input = Inspection::default();
+    input.push(&text, Part::Content);
+    let budget = Budget::new(std::time::Duration::from_secs(5));
+    let found = custom.custom_findings(&input, &budget).unwrap();
+    assert_eq!(found.distinct(&input, Category::Custom), 1);
 }
 
 #[test]
@@ -212,6 +246,7 @@ fn a_scan_keeps_a_bounded_number_of_matches() {
     let text = "x".repeat(MAX_FINDINGS * 3);
     input.push(&text, Part::Content);
     assert_eq!(custom.scan(&input).0.len(), MAX_FINDINGS);
+    assert!(custom.has_custom());
 }
 
 #[test]

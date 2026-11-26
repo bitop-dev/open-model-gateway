@@ -101,6 +101,18 @@ impl Policy {
     }
 }
 
+/// The time a request's custom patterns may take in all.
+pub const CUSTOM_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
+impl Policy {
+    /// Whether any rule scans custom patterns (whose cost is any user's).
+    pub fn has_custom(&self) -> bool {
+        self.rules
+            .iter()
+            .any(|r| matches!(&r.runner, Runner::Pattern(d) if d.has_custom()))
+    }
+}
+
 /// What a decision records (`guardrail_events.action`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -188,6 +200,45 @@ fn rank(kind: RefusalKind) -> u8 {
     }
 }
 
+impl CompiledRule {
+    fn event(&self, category: Category, action: Action, count: u32) -> Event {
+        Event {
+            rule_set_id: self.rule_set_id,
+            rule_id: self.id,
+            revision: self.revision,
+            layer: self.layer,
+            detector: self.kind,
+            category,
+            action,
+            count,
+            refused: false,
+        }
+    }
+}
+
+/// Make `r`'s refusal the request's unless a stronger one is already.
+fn refuse(d: &mut Decision, r: &CompiledRule, kind: RefusalKind, category: Category) {
+    let refusal = Refusal {
+        kind,
+        rule_set_id: r.rule_set_id,
+        rule_id: r.id,
+        category,
+        detector: r.kind,
+    };
+    if d.refusal.is_none_or(|c| rank(kind) < rank(c.kind)) {
+        d.refusal = Some(refusal);
+    }
+}
+
+/// A rule that gave no verdict (it cannot run, or its scan ran out of
+/// budget) fails under its own `on_error`.
+fn failed(d: &mut Decision, r: &CompiledRule, category: Category) {
+    d.events.push(r.event(category, Action::DetectorFailed, 1));
+    if r.on_error == OnError::FailClosed {
+        refuse(d, r, RefusalKind::DetectorFailed, category);
+    }
+}
+
 impl Policy {
     /// Run every rule that applies to `workload` on `input` (`None`: the
     /// workload carries no text a detector can read).
@@ -195,47 +246,26 @@ impl Policy {
         let mut decision = Decision::default();
         // The built-in secret shapes, scanned once for every rule that uses them.
         let mut builtin: Option<super::detector::Findings> = None;
-        let refuse = |d: &mut Decision, r: &CompiledRule, kind, category| {
-            let refusal = Refusal {
-                kind,
-                rule_set_id: r.rule_set_id,
-                rule_id: r.id,
-                category,
-                detector: r.kind,
-            };
-            if d.refusal.is_none_or(|c| rank(kind) < rank(c.kind)) {
-                d.refusal = Some(refusal);
-            }
-        };
+        let budget = super::secrets::Budget::new(CUSTOM_BUDGET);
         for r in self
             .rules
             .iter()
             .filter(|r| r.workloads.contains(&workload))
         {
             let first = r.categories.first().copied().unwrap_or(Category::Custom);
-            let event = |category, action, count| Event {
-                rule_set_id: r.rule_set_id,
-                rule_id: r.id,
-                revision: r.revision,
-                layer: r.layer,
-                detector: r.kind,
-                category,
-                action,
-                count,
-                refused: false,
-            };
+            let event = |category, action, count| r.event(category, action, count);
             let Runner::Pattern(detector) = &r.runner else {
-                decision
-                    .events
-                    .push(event(first, Action::DetectorFailed, 1));
-                if r.on_error == OnError::FailClosed {
-                    refuse(&mut decision, r, RefusalKind::DetectorFailed, first);
-                }
+                failed(&mut decision, r, first);
                 continue;
             };
             let blocking = r.action == InputAction::Block;
             if let Some(input) = input {
-                let custom = detector.custom_findings(input);
+                let Ok(custom) = detector.custom_findings(input, &budget) else {
+                    // The request's custom-pattern budget ran out: this rule
+                    // gave no verdict.
+                    failed(&mut decision, r, Category::Custom);
+                    continue;
+                };
                 for &category in &r.categories {
                     let count = if category == Category::Secret && detector.secrets() {
                         builtin
