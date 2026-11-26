@@ -322,21 +322,23 @@ impl LineRun {
         }
     }
 
-    /// The guardrail step could not inspect the line now (no scan or compile
-    /// slot, its policy not loaded): nothing was admitted or sent, so it is
-    /// tried again after the error's delay, growing, without spending an
-    /// attempt (`true` once the wait is over and the batch still runs). A
-    /// line still refused after `GUARDRAIL_TRIES` fails with that error.
+    /// The guardrail step could not inspect the line now: nothing could be
+    /// scanned (no scan or compile slot, the policy not loaded), or the
+    /// custom-pattern budget ran out. Nothing was admitted or sent, so the
+    /// line is tried again after the error's delay, growing, without spending
+    /// an attempt: up to `GUARDRAIL_TRIES` times for the first cause and
+    /// `SPENT_TRIES` for the second, each counted on its own. `true` once the
+    /// wait is over, the line holds its workers again and the batch still
+    /// runs; otherwise the line fails with that error.
     async fn rescan_later(
         &self,
         e: InferenceError,
         pin: &mut Option<Pin>,
         workers: &mut Workers,
     ) -> bool {
-        let tries = &mut workers.rescans;
-        let limit = match rescan_cause(e) {
-            Some(Rescan::Busy) => GUARDRAIL_TRIES,
-            Some(Rescan::Spent) => SPENT_TRIES,
+        let (tries, limit) = match rescan_cause(e) {
+            Some(Rescan::Busy) => (&mut workers.busy, GUARDRAIL_TRIES),
+            Some(Rescan::Spent) => (&mut workers.spent, SPENT_TRIES),
             None => return false,
         };
         if *tries >= limit || self.state.should_stop(&self.job) {
@@ -344,15 +346,21 @@ impl LineRun {
         }
         let seconds = e.retry_after_seconds().unwrap_or(1) << (*tries).min(5);
         *tries += 1;
-        // The worker permits go back while the line waits: a waiting line
-        // never keeps other lines (of any batch) from running.
-        workers.held = None;
+        // The process worker goes back while the line waits, so a waiting
+        // line never keeps other batches' lines from running. It keeps its
+        // batch's permit (and its route claim): a batch never has more lines
+        // claimed than its concurrency.
+        workers.process = None;
         tokio::time::sleep(std::time::Duration::from_secs(
             seconds.min(GUARDRAIL_RETRY_CAP).into(),
         ))
         .await;
-        // A batch stopped meanwhile (cancelled, expired, lost) runs nothing more.
         if self.state.should_stop(&self.job) || !workers.reacquire().await {
+            return false;
+        }
+        // A batch stopped while the line waited for its worker runs nothing
+        // more (cancelled, expired, its budget spent, lost).
+        if self.state.should_stop(&self.job) {
             return false;
         }
         // The dispatch's probe slot was the first try's.
@@ -593,41 +601,40 @@ fn rescan_cause(e: InferenceError) -> Option<Rescan> {
     }
 }
 
-/// A line's per-batch and process worker permits, given back while the line
-/// waits to be inspected again, and how often it was.
+/// A line's per-batch and process worker permits (the process permit given
+/// back while the line waits to be inspected again), and how often it waited
+/// for each cause.
 pub(super) struct Workers {
-    rescans: u32,
-    held: Option<(
-        tokio::sync::OwnedSemaphorePermit,
-        tokio::sync::OwnedSemaphorePermit,
-    )>,
-    per_batch: Arc<tokio::sync::Semaphore>,
+    busy: u32,
+    spent: u32,
+    _batch: tokio::sync::OwnedSemaphorePermit,
+    process: Option<tokio::sync::OwnedSemaphorePermit>,
     pool: Arc<tokio::sync::Semaphore>,
 }
 impl Workers {
     pub(super) fn new(
-        permits: (
+        (batch, process): (
             tokio::sync::OwnedSemaphorePermit,
             tokio::sync::OwnedSemaphorePermit,
         ),
     ) -> Self {
         Self {
-            rescans: 0,
-            per_batch: Arc::clone(permits.0.semaphore()),
-            pool: Arc::clone(permits.1.semaphore()),
-            held: Some(permits),
+            busy: 0,
+            spent: 0,
+            _batch: batch,
+            pool: Arc::clone(process.semaphore()),
+            process: Some(process),
         }
     }
-    /// Both permits again, in dispatch's order; `false` if closed.
+    /// The process permit again; `false` if the pool closed.
     async fn reacquire(&mut self) -> bool {
-        let Ok(local) = Arc::clone(&self.per_batch).acquire_owned().await else {
-            return false;
-        };
-        let Ok(global) = Arc::clone(&self.pool).acquire_owned().await else {
-            return false;
-        };
-        self.held = Some((local, global));
-        true
+        match Arc::clone(&self.pool).acquire_owned().await {
+            Ok(permit) => {
+                self.process = Some(permit);
+                true
+            }
+            Err(_) => false,
+        }
     }
 }
 
