@@ -44,10 +44,15 @@ impl Default for ImageInputLimits {
     }
 }
 
-/// The default budget: with the chart's 1 GiB memory limit, its worst case
-/// (`DEFAULT_BUFFER_BYTES` × [`COPY_FACTOR`]) leaves room for text traffic
-/// (docs/operations.md "Image input memory"; checked by the helm test).
-pub const DEFAULT_BUFFER_BYTES: usize = 96 * MIB;
+/// The default budget. In the chart's 1 GiB memory limit it fits beside a
+/// [`BASELINE_BYTES`] process and the most text traffic can hold (every one
+/// of `GATEWAY_MAX_CONCURRENT_REQUESTS` with a [`TEXT_BODY_BYTES`] body at
+/// [`COPY_FACTOR`] copies): 100 + 128 × 2 × 3 + 48 × 3 = 1012 MiB
+/// (docs/operations.md "Image input memory"; tests/helm-chart.test.mjs).
+pub const DEFAULT_BUFFER_BYTES: usize = 48 * MIB;
+/// Memory a running replica holds before any request body (measured warm
+/// at about 75 MiB; the allowance in the arithmetic above).
+pub const BASELINE_BYTES: usize = 100 * MIB;
 
 impl ImageInputLimits {
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self> {

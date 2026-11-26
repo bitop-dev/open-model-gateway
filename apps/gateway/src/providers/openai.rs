@@ -363,38 +363,13 @@ fn check_status(status: StatusCode) -> Result<()> {
 
 pub(super) use chat_controls::{encode_chat, json_schema_format};
 
-/// Chat Completions content: a string, or parts whose images are
-/// placeholders the body splices (`image_body`), numbered in message order.
-fn chat_content(content: Option<&Content>, images: &mut usize) -> Value {
-    match content {
-        None => Value::Null,
-        Some(Content::Text(text)) => json!(text),
-        Some(Content::Parts(parts)) => Value::Array(
-            parts
-                .iter()
-                .map(|part| match part {
-                    Part::Text(text) => json!({"type":"text","text":text}),
-                    Part::Image(image) => {
-                        let mut url = json!({"url": super::image_body::placeholder(*images)});
-                        *images += 1;
-                        if let Some(detail) = image.detail() {
-                            url["detail"] = json!(detail.as_str());
-                        }
-                        json!({"type":"image_url","image_url":url})
-                    }
-                })
-                .collect(),
-        ),
-    }
-}
-
 pub(super) fn encode(model: &str, request: &ChatRequest) -> Value {
     let mut images = 0;
     let messages: Vec<Value> = request
         .messages
         .iter()
         .map(|message| {
-            let mut value = json!({"role": message.role, "content": chat_content(message.content.as_ref(), &mut images)});
+            let mut value = json!({"role": message.role, "content": super::image_body::chat_content(message.content.as_ref(), &mut images)});
             if message.role == Role::Tool && message.tool_result_is_error {
                 value["content"] = json!(format!(
                     "[tool_error]\n{}",

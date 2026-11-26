@@ -12,9 +12,11 @@ use std::sync::LazyLock;
 
 use serde_json::Value;
 
+use serde_json::json;
+
 use crate::inference::{
     error::InferenceError,
-    types::{ChatRequest, Content, ImageInput},
+    types::{ChatRequest, Content, ImageInput, Part},
 };
 
 static NONCE: LazyLock<String> =
@@ -32,6 +34,31 @@ pub(crate) fn images(request: &ChatRequest) -> impl Iterator<Item = &ImageInput>
         .iter()
         .filter_map(|m| m.content.as_ref())
         .flat_map(Content::images)
+}
+
+/// Chat Completions content: a string, or parts whose images are
+/// placeholders the body splices (`image_body`), numbered in message order.
+pub(crate) fn chat_content(content: Option<&Content>, images: &mut usize) -> Value {
+    match content {
+        None => Value::Null,
+        Some(Content::Text(text)) => json!(text),
+        Some(Content::Parts(parts)) => Value::Array(
+            parts
+                .iter()
+                .map(|part| match part {
+                    Part::Text(text) => json!({"type":"text","text":text}),
+                    Part::Image(image) => {
+                        let mut url = json!({"url": placeholder(*images)});
+                        *images += 1;
+                        if let Some(detail) = image.detail() {
+                            url["detail"] = json!(detail.as_str());
+                        }
+                        json!({"type":"image_url","image_url":url})
+                    }
+                })
+                .collect(),
+        ),
+    }
 }
 
 /// `value` as JSON bytes, with the request's images spliced in (data URLs).

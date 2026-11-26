@@ -150,6 +150,8 @@ Watch `gateway_otlp_logs_pushes_total{outcome}`, `gateway_otlp_logs_rejected_rec
 | `GATEWAY_CONFIG_CACHE` | `on` | `on`: per-replica caches of pre-admission reads with change notifications ([governance](governance.md#caches-and-change-notifications)); admission always re-checks live. `off`: every read is live (no LISTEN connection, no version poll). Any other value fails startup. |
 | `GATEWAY_LISTEN_DATABASE_URL` | `DATABASE_URL` | The one session connection per replica that LISTENs for configuration changes. LISTEN needs a session: behind a transaction-mode PgBouncer point it at PostgreSQL directly (or a session-mode pooler database), with the runtime role. Without notifications caches still follow changes through the 1 s version poll. An empty value is refused. |
 | `GATEWAY_MAX_CONCURRENT_REQUESTS` | `128` (staging: 32) | Per-replica inference concurrency. Requests beyond it get 429 and are counted under `scope="gateway_capacity"`. |
+| `GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT` | `20971520` (20 MiB) | Largest body of a Chat Completions or Responses request that carries [inline images](protocol-matrix.md#image-input); 2 MiB to 256 MiB. A larger body is refused with 413 before it is read. |
+| `GATEWAY_IMAGE_INPUT_BUFFER_BYTES` | `50331648` (48 MiB) | Per replica: the request bodies above 2 MiB that may be in flight at once on those two routes ([image input memory](#image-input-memory)); 0 to 64 GiB, 0 allows no body above 2 MiB. Raise it only with the container's memory limit. |
 | `GATEWAY_REQUEST_TIMEOUT_SECONDS` | `120` | Inference deadline. Time spent waiting for admission counts toward it. |
 | `GATEWAY_COUNT_TOKENS_PER_KEY_PER_MINUTE` | `60` | Per replica: token counts (`POST /v1/messages/count_tokens`) each key may make per UTC minute, provider-backed or estimated. 1 to 100,000. Each of these three settings is decimal digits only (leading zeros allowed; no sign or spaces); any other value stops startup with an error naming it. |
 | `GATEWAY_COUNT_TOKENS_PER_CONNECTION_PER_MINUTE` | `600` | Per replica: provider-backed token counts (native Anthropic routes) per provider connection credential per UTC minute, across all keys. Bounds how hard counts can drive the installation's credential into the provider's count rate limit. 1 to 1,000,000. |
@@ -1050,6 +1052,18 @@ A second, isolated stack (for example two agents measuring at once) uses `--proj
 `tools/loadgen/tests/end_to_end.rs` runs the same seed, real gateway (with the real `openai_compatible` adapter), mock, generator and verification in one process against a throwaway database on `DATABASE_URL`, as part of `cargo test --workspace --all-features`.
 
 The generator, mock, gateways and PostgreSQL share one machine in the laptop stack, so they compete for CPU. For certification runs (scale plan P8) put the generator and mock on separate hosts.
+
+## Image input memory
+
+Chat Completions and Responses requests with [inline images](protocol-matrix.md#image-input) may send bodies above the shared 2 MiB limit, so their memory is bounded per replica by `GATEWAY_IMAGE_INPUT_BUFFER_BYTES` (`inference::image_buffer`):
+
+- A request whose `Content-Length` is above 2 MiB takes that length, rounded up to whole MiB, from the buffer before a byte of its body is read, after its key is authenticated, and returns it when its response body ends (a stream included) or the client goes away. A request with no `Content-Length` is held to 2 MiB as it streams.
+- With the buffer spent the request gets 503 `image_input_busy` with `Retry-After: 1`; nothing is read, admitted or sent. A body larger than the whole buffer, or than `GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT`, gets 413.
+- Each body is held by at most three copies at once (`COPY_FACTOR`): the received body, the parsed request, and the upstream body. Each image's base64 moves from the parsed request into the request without a copy and is written into the upstream body once.
+
+**Measured** (local debug build, one replica; `serve` against a mock upstream): one 18 MiB request with three 4.5 MiB images raised the process's peak memory by 34 MiB (1.9× the body); five such requests at once, which fill the 96 MiB test buffer, by 227 MiB (2.5×).
+
+**The default, 48 MiB**, keeps the worst case inside the chart's 1 GiB memory limit. That limit has to hold a running replica (100 MiB allowed, about 75 MiB measured warm), every one of `GATEWAY_MAX_CONCURRENT_REQUESTS` holding a 2 MiB text body at three copies, and the buffer at three copies: 100 + 128 × 2 × 3 + 48 × 3 = 1012 MiB. `tests/helm-chart.test.mjs` checks the same sum against the rendered chart. A larger buffer needs a larger memory limit, or a lower `GATEWAY_MAX_CONCURRENT_REQUESTS`. At 48 MiB a replica serves two 20 MiB requests, or sixteen 3 MiB screenshots, at once; text requests never wait for the buffer.
 
 ## Capacity baseline
 
