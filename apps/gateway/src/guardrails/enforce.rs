@@ -1,30 +1,28 @@
-//! Input enforcement (docs/guardrails-design.md §3 "Input", §6): a
+//! Input enforcement (docs/guardrails-design.md §3 "Input", §4, §6): a
 //! workspace's effective rules compiled for the engine, the text a request
 //! sends upstream, and the decision for one request.
 //!
 //! Every rule runs on its own and the strictest outcome wins. A rule this
 //! release cannot run (its detector, category, action or workload needs a
 //! later release) is never skipped silently: it fails like a detector, under
-//! its own `on_error`. The decision holds rule ids, codes and counts, never
-//! matched text.
+//! its own `on_error`. A rule whose scan could not finish now (its budget ran
+//! out, or no scan slot was free) is unavailable: the request is refused with
+//! a retryable `guardrail_unavailable` whatever the rule's `on_error`, never
+//! forwarded uninspected. The decision holds rule ids, codes and counts,
+//! never matched text.
+use std::cell::OnceCell;
 use std::collections::BTreeSet;
 
 use serde_json::Value;
 use uuid::Uuid;
 
-use super::detector::{Inspection, Part};
+use super::detector::{Budget, DetectContext, Detector, Findings, Inspection, Part};
 use super::policy::{
     Category, DetectorKind, EffectiveRule, InactiveReason, InputAction, Layer, OnError,
     Uninspectable, Workload,
 };
 use super::secrets::PatternDetector;
 use crate::inference::types::{ChatRequest, Role};
-
-enum Runner {
-    Pattern(PatternDetector),
-    /// Stored by a later release, or a pattern that no longer compiles.
-    CannotRun,
-}
 
 /// One effective rule, ready to run.
 pub struct CompiledRule {
@@ -38,7 +36,15 @@ pub struct CompiledRule {
     on_error: OnError,
     workloads: BTreeSet<Workload>,
     uninspectable: Uninspectable,
-    runner: Runner,
+    /// A local tightening entry made this platform rule stricter, so its
+    /// outcome may be an owner-made choice.
+    tightened: bool,
+    /// `None`: a rule this release cannot run (a later release's detector,
+    /// or a pattern that no longer compiles).
+    detector: Option<Box<dyn Detector>>,
+    /// The rule has custom patterns from a local layer (user-written).
+    local_custom: bool,
+    custom: bool,
 }
 
 /// A workspace's effective input rules. Empty when nothing applies, which is
@@ -50,8 +56,8 @@ pub struct Policy {
 impl Policy {
     /// The rules that run: active entries, and entries this release cannot
     /// run (which fail under their `on_error`). Inactive entries (egress under
-    /// `local_only`, a dangling tightening) and rules whose input action is
-    /// `off` do not run.
+    /// `local_only`, a dangling tightening) and runnable rules whose input
+    /// action is `off` do not run.
     pub fn compile(effective: &[EffectiveRule]) -> Self {
         let mut rules = Vec::new();
         for e in effective {
@@ -62,21 +68,21 @@ impl Policy {
                 Some(_) => continue,
             };
             // A rule this release cannot run fails under its on_error whatever
-            // its input action (it may enforce on output); others run on input
-            // only when their input action is not `off`.
+            // its input action (it may enforce on output).
             if runnable && rule.input_action == InputAction::Off {
                 continue;
             }
             let categories: Vec<Category> = rule.detector.categories.iter().copied().collect();
-            let runner = match rule.detector.kind {
+            let detector: Option<Box<dyn Detector>> = match rule.detector.kind {
                 DetectorKind::Pattern if runnable => PatternDetector::within(
                     &categories,
                     &rule.detector.patterns,
                     super::patterns::Limit::of(e.layer),
                 )
-                .map_or(Runner::CannotRun, Runner::Pattern),
-                _ => Runner::CannotRun,
+                .map(|d| Box::new(d) as Box<dyn Detector>),
+                _ => None,
             };
+            let custom = !rule.detector.patterns.is_empty();
             rules.push(CompiledRule {
                 id: e.id,
                 rule_set_id: e.rule_set_id,
@@ -88,7 +94,10 @@ impl Policy {
                 on_error: rule.on_error,
                 workloads: rule.workloads.clone(),
                 uninspectable: rule.uninspectable,
-                runner,
+                tightened: !e.tightened_by.is_empty(),
+                detector,
+                local_custom: custom && e.layer == Layer::WorkspaceLocal,
+                custom,
             });
         }
         Self { rules }
@@ -101,19 +110,30 @@ impl Policy {
     pub fn applies_to(&self, workload: Workload) -> bool {
         self.rules.iter().any(|r| r.workloads.contains(&workload))
     }
-}
-
-/// The time a request's custom patterns may take in all.
-pub const CUSTOM_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
-
-impl Policy {
-    /// Whether any rule scans custom patterns (whose cost is any user's).
+    /// Whether any rule scans custom patterns.
     pub fn has_custom(&self) -> bool {
-        self.rules
-            .iter()
-            .any(|r| matches!(&r.runner, Runner::Pattern(d) if d.has_custom()))
+        self.rules.iter().any(|r| r.custom)
+    }
+    /// Whether any rule scans custom patterns a local layer's writer wrote
+    /// (their scans use their own slots).
+    pub fn has_local_custom(&self) -> bool {
+        self.rules.iter().any(|r| r.local_custom)
     }
 }
+
+/// The time a request's custom patterns may take in all (tests run with a
+/// long one, so a stalled runner never turns into a refusal; the budget's
+/// own behaviour is tested with step budgets).
+pub const CUSTOM_BUDGET: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_secs(60)
+} else {
+    std::time::Duration::from_millis(250)
+};
+
+/// The workloads whose input this release inspects (also through
+/// `/v1/messages/count_tokens` and gateway-run batch lines). A rule that
+/// names another workload does not cover it yet.
+pub const INSPECTED_WORKLOADS: [&str; 2] = ["generation", "embeddings"];
 
 /// What a decision records (`guardrail_events.action`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,6 +168,8 @@ pub struct Event {
     pub count: u32,
     /// The decision the client was refused with.
     pub refused: bool,
+    /// The rule was a platform rule a local tightening made stricter.
+    pub tightened: bool,
 }
 
 /// Why a request is refused.
@@ -155,7 +177,11 @@ pub struct Event {
 pub enum RefusalKind {
     /// A blocking rule found something (400 `guardrail_input_blocked`).
     InputBlocked,
-    /// A fail-closed rule could not run (503 `guardrail_detector_failed`).
+    /// A fail-closed rule's scan could not finish now (503
+    /// `guardrail_unavailable`, retryable).
+    Unavailable,
+    /// A fail-closed rule cannot run in this release (503
+    /// `guardrail_detector_failed`, not retryable).
     DetectorFailed,
     /// An enforcing rule cannot read some of the request (400
     /// `guardrail_not_supported`).
@@ -172,7 +198,6 @@ pub struct Refusal {
     pub category: Category,
     pub detector: DetectorKind,
 }
-
 impl Refusal {
     /// The `guardrail` object of an error body: the policy (rule set), the
     /// rule, the stage, the category family and the detector.
@@ -197,8 +222,9 @@ pub struct Decision {
 fn rank(kind: RefusalKind) -> u8 {
     match kind {
         RefusalKind::InputBlocked => 0,
-        RefusalKind::DetectorFailed => 1,
-        RefusalKind::NotSupported => 2,
+        RefusalKind::Unavailable => 1,
+        RefusalKind::DetectorFailed => 2,
+        RefusalKind::NotSupported => 3,
     }
 }
 
@@ -214,7 +240,11 @@ impl CompiledRule {
             action,
             count,
             refused: false,
+            tightened: self.tightened,
         }
+    }
+    fn first(&self) -> Category {
+        self.categories.first().copied().unwrap_or(Category::Custom)
     }
 }
 
@@ -232,51 +262,59 @@ fn refuse(d: &mut Decision, r: &CompiledRule, kind: RefusalKind, category: Categ
     }
 }
 
-/// A rule that gave no verdict (it cannot run, or its scan ran out of
-/// budget) fails under its own `on_error`.
-fn failed(d: &mut Decision, r: &CompiledRule, category: Category) {
+/// A rule that gave no verdict. One that cannot run in this release
+/// (`DetectorFailed`) fails under its own `on_error`. One that could not
+/// finish now (`Unavailable`: its budget ran out, or no scan slot was free)
+/// refuses the request with a retryable error whatever its `on_error`: a
+/// request is never forwarded uninspected because the gateway was busy.
+fn failed(d: &mut Decision, r: &CompiledRule, category: Category, kind: RefusalKind) {
     d.events.push(r.event(category, Action::DetectorFailed, 1));
-    if r.on_error == OnError::FailClosed {
-        refuse(d, r, RefusalKind::DetectorFailed, category);
+    if kind == RefusalKind::Unavailable || r.on_error == OnError::FailClosed {
+        refuse(d, r, kind, category);
     }
 }
 
 impl Policy {
     /// Run every rule that applies to `workload` on `input` (`None`: the
-    /// workload carries no text a detector can read).
+    /// workload carries no text a detector can read), within the request's
+    /// custom-pattern budget.
     pub fn decide(&self, workload: Workload, input: Option<&Inspection<'_>>) -> Decision {
+        self.decide_with(workload, input, &Budget::time(CUSTOM_BUDGET))
+    }
+    /// As [`Policy::decide`], within `budget`.
+    pub fn decide_with(
+        &self,
+        workload: Workload,
+        input: Option<&Inspection<'_>>,
+        budget: &Budget,
+    ) -> Decision {
         let mut decision = Decision::default();
-        // The built-in secret shapes, scanned once for every rule that uses them.
-        let mut builtin: Option<super::detector::Findings> = None;
-        let budget = super::secrets::Budget::new(CUSTOM_BUDGET);
+        let builtin: OnceCell<Findings> = OnceCell::new();
+        let ctx = DetectContext {
+            budget,
+            builtin: &builtin,
+        };
         for r in self
             .rules
             .iter()
             .filter(|r| r.workloads.contains(&workload))
         {
-            let first = r.categories.first().copied().unwrap_or(Category::Custom);
-            let event = |category, action, count| r.event(category, action, count);
-            let Runner::Pattern(detector) = &r.runner else {
-                failed(&mut decision, r, first);
+            let Some(detector) = &r.detector else {
+                failed(&mut decision, r, r.first(), RefusalKind::DetectorFailed);
                 continue;
             };
             let blocking = r.action == InputAction::Block;
             if let Some(input) = input {
-                // The request's custom-pattern budget may run out: the rule's
-                // custom category then gives no verdict and fails under its
-                // on_error, while its built-in secret shapes still decide.
-                let custom = detector.custom_findings(input, &budget);
-                if custom.spent {
-                    failed(&mut decision, r, Category::Custom);
+                let Ok(inspected) = detector.inspect(&ctx, input) else {
+                    failed(&mut decision, r, r.first(), RefusalKind::DetectorFailed);
+                    continue;
+                };
+                if !inspected.complete {
+                    // The budget ran out: the custom patterns gave no verdict
+                    // now (what they found until then still counts below).
+                    failed(&mut decision, r, Category::Custom, RefusalKind::Unavailable);
                 }
-                for &category in &r.categories {
-                    let count = if category == Category::Secret && detector.secrets() {
-                        builtin
-                            .get_or_insert_with(|| super::secrets::builtin(input))
-                            .distinct(input, category)
-                    } else {
-                        custom.findings.distinct(input, category)
-                    };
+                for (category, count) in inspected.counts {
                     if count == 0 {
                         continue;
                     }
@@ -286,7 +324,7 @@ impl Policy {
                         Action::Monitored
                     };
                     let count = u32::try_from(count).unwrap_or(u32::MAX).min(1_000_000);
-                    decision.events.push(event(category, action, count));
+                    decision.events.push(r.event(category, action, count));
                     if blocking {
                         refuse(&mut decision, r, RefusalKind::InputBlocked, category);
                     }
@@ -294,27 +332,46 @@ impl Policy {
             }
             if input.is_none_or(|i| i.uninspectable) {
                 // Nothing was found: the rule could not read the request.
-                decision.events.push(event(first, Action::Skipped, 1));
+                decision.events.push(r.event(r.first(), Action::Skipped, 1));
                 if blocking && r.uninspectable == Uninspectable::Deny {
-                    refuse(&mut decision, r, RefusalKind::NotSupported, first);
+                    refuse(&mut decision, r, RefusalKind::NotSupported, r.first());
                 }
             }
         }
-        if let Some(r) = decision.refusal {
-            let action = match r.kind {
-                RefusalKind::InputBlocked => Action::Blocked,
-                RefusalKind::NotSupported => Action::Skipped,
-                RefusalKind::DetectorFailed => Action::DetectorFailed,
-            };
-            if let Some(e) = decision
-                .events
-                .iter_mut()
-                .find(|e| e.rule_id == r.rule_id && e.category == r.category && e.action == action)
-            {
-                e.refused = true;
-            }
-        }
+        mark_refused(&mut decision);
         decision
+    }
+    /// The decision when no scan could run now (no scan slot was free): every
+    /// rule that applies is unavailable, under its own `on_error`.
+    pub fn unavailable(&self, workload: Workload) -> Decision {
+        let mut decision = Decision::default();
+        for r in self
+            .rules
+            .iter()
+            .filter(|r| r.workloads.contains(&workload))
+        {
+            failed(&mut decision, r, r.first(), RefusalKind::Unavailable);
+        }
+        mark_refused(&mut decision);
+        decision
+    }
+}
+
+/// Mark the event the request was refused with.
+fn mark_refused(decision: &mut Decision) {
+    if let Some(r) = decision.refusal {
+        let action = match r.kind {
+            RefusalKind::InputBlocked => Action::Blocked,
+            RefusalKind::NotSupported => Action::Skipped,
+            RefusalKind::DetectorFailed | RefusalKind::Unavailable => Action::DetectorFailed,
+        };
+        if let Some(e) = decision
+            .events
+            .iter_mut()
+            .find(|e| e.rule_id == r.rule_id && e.category == r.category && e.action == action)
+        {
+            e.refused = true;
+        }
     }
 }
 
@@ -322,7 +379,8 @@ impl Policy {
 /// tool-call ids, names and arguments, raw and parsed), tool definitions, the
 /// forced tool's name, and the native Messages envelopes and options that
 /// replace or add to them on Anthropic routes (system, stop sequences,
-/// output schema, context management, earlier thinking). A value present in
+/// output schema, context management, thinking, task budget, cache controls,
+/// deferred tools, earlier thinking, `anthropic-beta` values). A value present in
 /// several forms counts once. Consecutive system messages, and a native
 /// message's text blocks, are also read joined, so text split across blocks
 /// is found. Images, audio, and documents that are not plain text cannot be
@@ -382,11 +440,23 @@ pub fn chat_inspection(request: &ChatRequest) -> Inspection<'_> {
         for t in &options.history_thinking {
             block(t, Part::Content, &mut input);
         }
-        for v in [&options.output_config, &options.context_management]
-            .into_iter()
-            .flatten()
+        for v in [
+            &options.output_config,
+            &options.context_management,
+            &options.thinking,
+            &options.task_budget,
+        ]
+        .into_iter()
+        .flatten()
         {
             json(v, Part::System, &mut input);
+        }
+        for v in options.cache_controls.iter().chain(&options.defer_loading) {
+            json(v, Part::System, &mut input);
+        }
+        // `anthropic-beta` values are client text forwarded as headers.
+        for beta in &options.beta_headers {
+            input.push(beta, Part::System);
         }
         for stop in options.stop_sequences.iter().flatten() {
             input.push(stop, Part::System);

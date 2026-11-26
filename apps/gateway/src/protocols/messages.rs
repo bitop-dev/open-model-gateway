@@ -453,10 +453,21 @@ fn error_body(e: InferenceError) -> Value {
         | InferenceError::UpstreamRejected
         | InferenceError::Unsupported => "invalid_request_error",
         InferenceError::Guardrail(r)
-            if r.kind != crate::guardrails::enforce::RefusalKind::DetectorFailed =>
+            if matches!(
+                r.kind,
+                crate::guardrails::enforce::RefusalKind::InputBlocked
+                    | crate::guardrails::enforce::RefusalKind::NotSupported
+            ) =>
         {
             "invalid_request_error"
         }
+        InferenceError::Guardrail(r)
+            if r.kind == crate::guardrails::enforce::RefusalKind::Unavailable =>
+        {
+            "overloaded_error"
+        }
+        InferenceError::GuardrailThrottled(_) => "rate_limit_error",
+        InferenceError::GuardrailUnavailable => "overloaded_error",
         InferenceError::ModelUnavailable => "not_found_error",
         InferenceError::Unauthenticated => "authentication_error",
         // Anthropic has no budget type for HTTP 429; the message distinguishes it.

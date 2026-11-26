@@ -1,6 +1,7 @@
 //! Positives are assembled at test time from a prefix and filler, so no
 //! complete credential appears in the source; negatives are ordinary code,
-//! identifiers, hashes and encoded data.
+//! identifiers, hashes and encoded data. Budgets are step counts, so no
+//! assertion depends on the machine's speed.
 use super::*;
 use crate::guardrails::detector::Part;
 
@@ -17,13 +18,26 @@ fn alnum(n: usize) -> String {
         .take(n)
         .collect()
 }
+/// A deterministic stream of bytes (xorshift).
+fn noise(seed: u64) -> impl Iterator<Item = u64> {
+    let mut x = seed;
+    std::iter::repeat_with(move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    })
+}
 
 fn positives() -> Vec<(&'static str, String)> {
-    let b64 = |n| alnum(n);
     vec![
         (
             "aws_access_key_id",
             format!("{}{}", "AK", "IA") + &rep('Q', 16),
+        ),
+        (
+            "aws_secret_access_key",
+            format!("aws_secret_{}_key = \"{}\"", "access", alnum(40)),
         ),
         ("github_token", format!("{}_{}", "ghp", alnum(36))),
         (
@@ -64,9 +78,9 @@ fn positives() -> Vec<(&'static str, String)> {
             "jwt",
             format!(
                 "{}.{}.{}",
-                "eyJ".to_owned() + &b64(20),
-                "eyJ".to_owned() + &b64(30),
-                b64(43)
+                "eyJ".to_owned() + &alnum(20),
+                "eyJ".to_owned() + &alnum(30),
+                alnum(43)
             ),
         ),
         (
@@ -88,219 +102,234 @@ fn positives() -> Vec<(&'static str, String)> {
     ]
 }
 
-fn secrets() -> PatternDetector {
-    PatternDetector::new(&[Category::Secret], &[]).unwrap()
-}
-fn found(detector: &PatternDetector, text: &str) -> usize {
+fn input(text: &str) -> Inspection<'_> {
     let mut input = Inspection::default();
     input.push(text, Part::Content);
-    detector.scan(&input).unwrap().0.len()
+    input
+}
+fn found(text: &str) -> usize {
+    builtin(&input(text)).0.len()
+}
+fn custom(pattern: &str) -> PatternDetector {
+    PatternDetector::new(&[Category::Custom], &[pattern.to_owned()]).unwrap()
+}
+fn spans(d: &PatternDetector, text: &str) -> Vec<String> {
+    let input = input(text);
+    let out = d.custom_findings(&input, &Budget::steps(1_000_000));
+    assert!(!out.spent);
+    out.findings
+        .0
+        .iter()
+        .map(|f| text[f.span.clone()].to_owned())
+        .collect()
 }
 
 #[test]
-fn every_builtin_rule_matches_its_shape_inside_prose() {
+fn every_builtin_rule_matches_its_shape_in_prose_punctuation_and_escapes() {
     let positives = positives();
     assert_eq!(positives.len(), BUILTIN.len(), "one positive per rule");
-    let d = secrets();
     for (name, value) in positives {
-        let text = format!("please use {value} for the deploy");
-        assert!(found(&d, &text) >= 1, "{name} not found");
-        // Punctuation around it does not hide it; base64url data around it
-        // makes it part of an encoded blob.
         for around in [
+            format!("please use {value} for the deploy"),
             format!("\"{value}\""),
             format!("key={value};"),
             format!("({value})"),
-        ] {
-            assert!(found(&d, &around) >= 1, "{name} in {around}");
-        }
-        assert_eq!(
-            found(&d, &format!("Zx9aB3dE5{value}_Q")),
-            0,
-            "{name} inside base64url"
-        );
-        // An escape or one glued character does not hide it.
-        for glued in [
             format!("\\n{value}"),
             format!("%20{value}%22"),
             format!("x{value}x"),
         ] {
-            assert!(found(&d, &glued) >= 1, "{name} in {glued}");
+            assert!(found(&around) >= 1, "{name} in {around}");
         }
+        assert_eq!(
+            found(&format!("Zx9aB3dE5{value}_Q")),
+            0,
+            "{name} inside base64url"
+        );
+    }
+    // The newer shapes of the review: PGP blocks, a driver suffix, no user.
+    for value in [
+        format!("-----{} PGP {} KEY BLOCK-----", "BEGIN", "PRIVATE"),
+        format!("{}+psycopg2://app:{}@db:5432/x", "postgresql", alnum(12)),
+        format!("{}://:{}@cache:6379", "redis", alnum(12)),
+        format!("{}-ant-oat01-{}", "sk", alnum(95)),
+    ] {
+        assert!(found(&value) >= 1, "{value}");
     }
 }
 
 #[test]
-fn ordinary_text_matches_nothing() {
-    let d = secrets();
-    let negatives = [
-        "fn main() { let key = std::env::var(\"API_KEY\")?; println!(\"{key:?}\"); }",
-        "550e8400-e29b-41d4-a716-446655440000",
-        "sha256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
-        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
-        "postgres://db.internal:5432/main (no password in the URL)",
-        "-----BEGIN PUBLIC KEY-----",
-        "The AKIA prefix marks an AWS access key id.",
-        "omg_ is the gateway's key prefix; see docs/identity.md",
-        "eyJ alone is just the start of a base64 JSON object",
+fn a_label_before_or_after_a_token_does_not_hide_it() {
+    let tokens = [
+        format!("{}_{}", "ghp", alnum(36)),
+        format!("{}{}", "AK", "IA") + &rep('Q', 16),
+        format!("{}_{}.{}", "omg", hex(32), hex(64)),
     ];
-    for text in negatives {
-        assert_eq!(found(&d, text), 0, "{text}");
+    let before = [
+        "key_",
+        "deploy_token-",
+        "access_token_",
+        "aws-access-key-",
+        "PROD_DEPLOY_TOKEN_",
+        "my-service-account-api-token-v2-",
+    ];
+    for token in &tokens {
+        for label in before {
+            assert!(label.len() <= 32);
+            assert!(found(&format!("{label}{token}")) >= 1, "{label}{token}");
+        }
+        for label in ["_prod", "-staging-v2", "_PRIMARY_KEY"] {
+            assert!(found(&format!("{token}{label}")) >= 1, "{token}{label}");
+        }
+    }
+    // Longer than a label, or not a label's shape: glue.
+    let glued = format!("{}{}", "abcdefgh".repeat(5), tokens[0]);
+    assert_eq!(found(&glued), 0, "a 40-byte run is data");
+    assert_eq!(
+        found(&format!("aB3dE5gH7j_{}", tokens[0])),
+        0,
+        "mixed case is data"
+    );
+}
+
+#[test]
+fn ordinary_and_encoded_data_matches_nothing() {
+    let mut corpus = Vec::new();
+    // 1 MiB each of random base64 and base64url.
+    for (seed, alphabet) in [
+        (
+            7_u64,
+            &b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"[..],
+        ),
+        (
+            11,
+            &b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"[..],
+        ),
+    ] {
+        corpus.push(
+            noise(seed)
+                .take(1 << 20)
+                .map(|x| alphabet[(x % 64) as usize] as char)
+                .collect::<String>(),
+        );
+    }
+    let mut ids = noise(13);
+    for _ in 0..2_000 {
+        let a = ids.next().unwrap();
+        let b = ids.next().unwrap();
+        corpus.push(uuid::Uuid::from_u64_pair(a, b).to_string());
+        corpus.push(format!("{a:016x}{b:016x}{:08x}", a as u32)); // a git SHA
+        corpus.push(format!("{a:016x}{b:016x}{a:016x}{b:016x}")); // a SHA-256
+    }
+    corpus.extend(
+        [
+            "fn main() { let key = std::env::var(\"API_KEY\")?; println!(\"{key:?}\"); }",
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+            "postgres://db.internal:5432/main (no password in the URL)",
+            "-----BEGIN PUBLIC KEY-----",
+            "The AKIA prefix marks an AWS access key id.",
+            "omg_ is the gateway's key prefix; see docs/identity.md",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0",
+            "eyJ.eyJ.x and eyJ alone",
+            "my-component-name-v2 service-account-token-rotation ghp-style-name hf_hub",
+        ]
+        .map(str::to_owned),
+    );
+    for text in &corpus {
+        assert_eq!(found(text), 0, "{}", &text[..text.len().min(80)]);
     }
 }
 
 #[test]
 fn custom_patterns_match_only_for_their_rule() {
-    let custom =
-        PatternDetector::new(&[Category::Custom], &["PROJECT-[A-Z]{4}".to_owned()]).unwrap();
-    assert_eq!(found(&custom, "status of PROJECT-ABCD and PROJECT-WXYZ"), 2);
+    let d = custom("PROJECT-[A-Z]{4}");
+    assert_eq!(
+        spans(&d, "status of PROJECT-ABCD and PROJECT-WXYZ").len(),
+        2
+    );
     // A custom-only rule never runs the built-in shapes.
-    assert_eq!(found(&custom, &format!("{}_{}", "ghp", alnum(36))), 0);
+    assert!(spans(&d, &format!("{}_{}", "ghp", alnum(36))).is_empty());
     assert!(PatternDetector::new(&[Category::Custom], &["(unclosed".to_owned()]).is_none());
 }
 
 #[test]
 fn a_repeated_value_counts_once() {
-    let d = secrets();
     let key = format!("{}_{}.{}", "omg", hex(32), hex(64));
     let mut input = Inspection::default();
     let first = format!("key {key}");
     let second = format!("again {key}");
     input.push(&first, Part::Content);
     input.push(&second, Part::ToolArguments);
-    let findings = d.scan(&input).unwrap();
+    let findings = builtin(&input);
     assert_eq!(findings.0.len(), 2);
     assert_eq!(findings.distinct(&input, Category::Secret), 1);
 }
 
 #[test]
-fn random_base64url_data_matches_nothing() {
-    let d = secrets();
-    // A deterministic stand-in for random base64url: no built-in prefix is
-    // a standalone token inside it.
-    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
-    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let blob: String = (0..1_000_000)
-        .map(|_| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            alphabet[(x % 64) as usize] as char
-        })
-        .collect();
-    let blob = format!("{}hf_{}{}", &blob[..500_000], alnum(36), &blob[500_000..]);
-    assert_eq!(found(&d, &blob), 0);
-}
-
-#[test]
-fn a_hostile_custom_pattern_is_bounded_by_windows_and_the_budget() {
-    // Quadratic for `find_iter` over the whole text; windows bound each call.
-    let custom = PatternDetector::new(&[Category::Custom], &["[a-z]+X|a".to_owned()]).unwrap();
-    let text = "a".repeat(2 << 20);
-    let mut input = Inspection::default();
-    input.push(&text, Part::Content);
-    let started = std::time::Instant::now();
-    let budget = Budget::new(std::time::Duration::from_secs(30));
-    assert_eq!(
-        custom.custom_findings(&input, &budget).findings.0.len(),
-        MAX_FINDINGS
-    );
-    assert!(started.elapsed() < std::time::Duration::from_secs(10));
-    // A pattern that defeats the lazy DFA stops when the budget is spent.
-    // The slowest such pattern the program limit still admits.
-    let slow = [2000, 1000, 500, 300, 200, 100]
-        .into_iter()
-        .find_map(|n| PatternDetector::new(&[Category::Custom], &[format!("a[ab]{{{n}}}[^ab]")]))
-        .unwrap();
-    let mut x: u32 = 7;
-    let noise: String = (0..(2 << 20))
-        .map(|_| {
-            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-            if x >> 16 & 1 == 0 { 'a' } else { 'b' }
-        })
-        .collect();
-    let mut input = Inspection::default();
-    input.push(&noise, Part::Content);
-    let started = std::time::Instant::now();
-    let budget = Budget::new(std::time::Duration::from_millis(50));
-    assert!(slow.custom_findings(&input, &budget).spent);
-    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+fn a_match_hidden_by_a_window_edge_is_still_found_and_counted_once() {
+    // The first window ends right after `abcdef`: `$` matched only because
+    // of the cut; the `c` inside it is the real match.
+    let text = format!("{}abcdefzzz", "x".repeat(4090));
+    assert_eq!(spans(&custom("abcdef$|c"), &text), ["c"]);
+    // `\b` matched at the cut; `bcd` starts inside the cut match.
+    let text = format!("{}abcdef rest", "x".repeat(4093));
+    assert_eq!(spans(&custom(r"abc\b|bcd"), &text), ["bcd"]);
+    // A longer match re-found past the cut is counted once, whole.
+    let text = format!("{}1234567890 tail", "x".repeat(4090));
+    assert_eq!(spans(&custom("[0-9]+"), &text), ["1234567890"]);
 }
 
 #[test]
 fn windows_neither_lose_long_values_nor_invent_boundaries() {
-    let budget = || Budget::new(std::time::Duration::from_secs(5));
-    // A value longer than the overlap, cut by the first window's end.
-    let password = PatternDetector::new(
-        &[Category::Custom],
-        &[r"(?i)password\s*[:=]\s*\S+".to_owned()],
-    )
-    .unwrap();
     let text = format!("{}password=hunter2{}", "x ".repeat(1498), "A".repeat(1200));
-    let mut input = Inspection::default();
-    input.push(&text, Part::Content);
-    let found = password.custom_findings(&input, &budget()).findings;
-    assert_eq!(found.0.len(), 1);
-    assert_eq!(&text[found.0[0].span.clone()], &text[2996..]);
-    // A word boundary is judged on the whole text, not where a window starts.
-    let word = PatternDetector::new(&[Category::Custom], &[r"\bfoo\b".to_owned()]).unwrap();
+    let found = spans(&custom(r"(?i)password\s*[:=]\s*\S+"), &text);
+    assert_eq!(found, [&text[2996..]]);
     let text = format!("{}yfoo{}", "y".repeat(3071), " ".repeat(2000));
-    let mut input = Inspection::default();
-    input.push(&text, Part::Content);
     assert!(
-        word.custom_findings(&input, &budget())
-            .findings
-            .0
-            .is_empty()
+        spans(&custom(r"\bfoo\b"), &text).is_empty(),
+        "no boundary at a window start"
     );
-    // A boundary the window's cut would make is not a match.
-    let digits = PatternDetector::new(&[Category::Custom], &[r"\b[0-9]{16}\b".to_owned()]).unwrap();
     let text = format!("{}{} tail", " ".repeat(4080), "1".repeat(20));
-    let mut input = Inspection::default();
-    input.push(&text, Part::Content);
     assert!(
-        digits
-            .custom_findings(&input, &budget())
-            .findings
-            .0
-            .is_empty()
+        spans(&custom(r"\b[0-9]{16}\b"), &text).is_empty(),
+        "no boundary at a cut"
     );
-    // A short segment that never matches still checks the budget.
-    let slow = PatternDetector::new(&[Category::Custom], &["qqqq".to_owned()]).unwrap();
-    let mut input = Inspection::default();
-    input.push("short", Part::Content);
-    let spent = Budget::new(std::time::Duration::ZERO);
-    assert!(slow.custom_findings(&input, &spent).spent);
+    let text = format!("{}ACME-123456 and ACME-123456", "x".repeat(4090));
+    let d = custom("ACME-[0-9]+");
+    let input = input(&text);
+    let out = d.custom_findings(&input, &Budget::steps(1_000));
+    assert_eq!(out.findings.distinct(&input, Category::Custom), 1);
 }
 
 #[test]
-fn a_value_cut_by_a_window_is_found_whole_and_counted_once() {
-    let custom = PatternDetector::new(&[Category::Custom], &["ACME-[0-9]+".to_owned()]).unwrap();
-    // The value straddles the first window's end.
-    let text = format!("{}ACME-123456 and ACME-123456", "x".repeat(4090));
-    let mut input = Inspection::default();
-    input.push(&text, Part::Content);
-    let budget = Budget::new(std::time::Duration::from_secs(5));
-    let found = custom.custom_findings(&input, &budget).findings;
-    assert_eq!(found.distinct(&input, Category::Custom), 1);
+fn the_budget_bounds_every_scan_in_regex_calls() {
+    // `find_iter` is quadratic for this pattern on this text; each window
+    // call here is bounded, and the scan stops at the match cap.
+    let hostile = custom("[a-z]+X|a");
+    let text = "a".repeat(2 << 20);
+    let input_ = input(&text);
+    let budget = Budget::steps(1_000_000);
+    let out = hostile.custom_findings(&input_, &budget);
+    assert_eq!(out.findings.0.len(), MAX_FINDINGS);
+    assert!(1_000_000 - budget.left().unwrap() <= MAX_FINDINGS as u64 + 1);
+    // A spent budget stops the scan and keeps what was found.
+    let budget = Budget::steps(3);
+    let out = hostile.custom_findings(&input_, &budget);
+    assert!(out.spent);
+    assert_eq!(
+        out.findings.0.len(),
+        3,
+        "one match per step until the budget ran out, all kept"
+    );
+    // A short segment that never matches still takes a step.
+    let out = custom("qqqq").custom_findings(&input("short"), &Budget::steps(0));
+    assert!(out.spent);
 }
 
 #[test]
 fn a_scan_keeps_a_bounded_number_of_matches() {
-    let custom = PatternDetector::new(&[Category::Custom], &["x".to_owned()]).unwrap();
-    let mut input = Inspection::default();
+    let d = custom("x");
     let text = "x".repeat(MAX_FINDINGS * 3);
-    input.push(&text, Part::Content);
-    assert_eq!(custom.scan(&input).unwrap().0.len(), MAX_FINDINGS);
-    assert!(custom.has_custom());
-}
-
-#[test]
-fn every_rule_is_bounded_and_linear() {
-    // A long run of near-matches is scanned once, not re-tried per position.
-    let d = secrets();
-    let text = format!("{} ", "AKIA").repeat(200_000);
-    let started = std::time::Instant::now();
-    assert_eq!(found(&d, &text), 0);
-    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    let out = d.custom_findings(&input(&text), &Budget::steps(u64::MAX));
+    assert_eq!(out.findings.0.len(), MAX_FINDINGS);
+    assert!(d.has_custom());
 }

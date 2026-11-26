@@ -952,6 +952,19 @@
         "enforced": {
           "const": true
         },
+        "inspected_workloads": {
+          "description": "The workloads whose input this release inspects (also through count_tokens and gateway-run batch lines). A rule that names another workload does not cover it yet.",
+          "items": {
+            "enum": [
+              "generation",
+              "embeddings"
+            ]
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array",
+          "uniqueItems": true
+        },
         "kind": {
           "enum": [
             "personal",
@@ -1728,6 +1741,7 @@
         "local_visible",
         "effective",
         "enforced",
+        "inspected_workloads",
         "type_default",
         "override",
         "decisions_this_month"
@@ -1822,10 +1836,24 @@
             "type": "object"
           },
           "type": "array"
+        },
+        "inspected_workloads": {
+          "description": "The workloads whose input this release inspects (also through count_tokens and gateway-run batch lines). A rule that names another workload does not cover it yet.",
+          "items": {
+            "enum": [
+              "generation",
+              "embeddings"
+            ]
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array",
+          "uniqueItems": true
         }
       },
       "required": [
-        "detectors"
+        "detectors",
+        "inspected_workloads"
       ],
       "type": "object"
     },
@@ -1833,6 +1861,19 @@
     "get_api_v1_platform_workspace_types_by_kind_guardrailsResponse": {
       "additionalProperties": false,
       "properties": {
+        "inspected_workloads": {
+          "description": "The workloads whose input this release inspects (also through count_tokens and gateway-run batch lines). A rule that names another workload does not cover it yet.",
+          "items": {
+            "enum": [
+              "generation",
+              "embeddings"
+            ]
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array",
+          "uniqueItems": true
+        },
         "kind": {
           "enum": [
             "personal",
@@ -2067,7 +2108,8 @@
       },
       "required": [
         "kind",
-        "rule_set"
+        "rule_set",
+        "inspected_workloads"
       ],
       "type": "object"
     },
@@ -2368,6 +2410,19 @@
         },
         "enforced": {
           "const": true
+        },
+        "inspected_workloads": {
+          "description": "The workloads whose input this release inspects (also through count_tokens and gateway-run batch lines). A rule that names another workload does not cover it yet.",
+          "items": {
+            "enum": [
+              "generation",
+              "embeddings"
+            ]
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array",
+          "uniqueItems": true
         },
         "kind": {
           "enum": [
@@ -3372,6 +3427,7 @@
         "local_visible",
         "effective",
         "enforced",
+        "inspected_workloads",
         "type_default",
         "override",
         "decisions_this_month"
@@ -3626,6 +3682,19 @@
         },
         "enforced": {
           "const": true
+        },
+        "inspected_workloads": {
+          "description": "The workloads whose input this release inspects (also through count_tokens and gateway-run batch lines). A rule that names another workload does not cover it yet.",
+          "items": {
+            "enum": [
+              "generation",
+              "embeddings"
+            ]
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array",
+          "uniqueItems": true
         },
         "kind": {
           "enum": [
@@ -4182,6 +4251,7 @@
         "local_visible",
         "effective",
         "enforced",
+        "inspected_workloads",
         "can_edit"
       ],
       "type": "object"
@@ -4211,6 +4281,19 @@
     "put_api_v1_platform_workspace_types_by_kind_guardrailsResponse": {
       "additionalProperties": false,
       "properties": {
+        "inspected_workloads": {
+          "description": "The workloads whose input this release inspects (also through count_tokens and gateway-run batch lines). A rule that names another workload does not cover it yet.",
+          "items": {
+            "enum": [
+              "generation",
+              "embeddings"
+            ]
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array",
+          "uniqueItems": true
+        },
         "kind": {
           "enum": [
             "personal",
@@ -4438,7 +4521,8 @@
       },
       "required": [
         "kind",
-        "rule_set"
+        "rule_set",
+        "inspected_workloads"
       ],
       "type": "object"
     },
@@ -4761,6 +4845,19 @@
         "enforced": {
           "const": true
         },
+        "inspected_workloads": {
+          "description": "The workloads whose input this release inspects (also through count_tokens and gateway-run batch lines). A rule that names another workload does not cover it yet.",
+          "items": {
+            "enum": [
+              "generation",
+              "embeddings"
+            ]
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array",
+          "uniqueItems": true
+        },
         "kind": {
           "enum": [
             "personal",
@@ -5744,6 +5841,7 @@
         "local_visible",
         "effective",
         "enforced",
+        "inspected_workloads",
         "type_default",
         "override",
         "decisions_this_month"
@@ -6022,6 +6120,19 @@
         },
         "enforced": {
           "const": true
+        },
+        "inspected_workloads": {
+          "description": "The workloads whose input this release inspects (also through count_tokens and gateway-run batch lines). A rule that names another workload does not cover it yet.",
+          "items": {
+            "enum": [
+              "generation",
+              "embeddings"
+            ]
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array",
+          "uniqueItems": true
         },
         "kind": {
           "enum": [
@@ -6571,6 +6682,7 @@
         "local_visible",
         "effective",
         "enforced",
+        "inspected_workloads",
         "can_edit"
       ],
       "type": "object"

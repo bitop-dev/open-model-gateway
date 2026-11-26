@@ -1,7 +1,8 @@
 //! Decisions of compiled policies on assembled inputs (no database).
 use super::*;
 use crate::guardrails::policy::{
-    Detector, Entry, OutputMode, Protection, RedactScope, Rule, RuleSet, StoredRule, compose,
+    Detector, Entry, OutputMode, Protection, RedactScope, Rule, RuleSet, StoredRule, Tightening,
+    compose,
 };
 use crate::inference::types::{
     ChatRequest, FunctionTool, Message, MessagesOptions, Role, ToolCall,
@@ -169,9 +170,22 @@ fn texts<'a>(input: &'a Inspection<'_>) -> Vec<&'a str> {
 }
 fn found(input: &Inspection<'_>) -> bool {
     let p = policy(vec![rule(&[Category::Secret], &[], InputAction::Block)]);
-    p.decide(Workload::Generation, Some(input))
-        .refusal
-        .is_some()
+    let rule_id = p.rules[0].id;
+    match p.decide(Workload::Generation, Some(input)).refusal {
+        Some(r) => {
+            assert_eq!(
+                (r.kind, r.rule_id, r.category, r.detector),
+                (
+                    RefusalKind::InputBlocked,
+                    rule_id,
+                    Category::Secret,
+                    DetectorKind::Pattern
+                )
+            );
+            true
+        }
+        None => false,
+    }
 }
 fn request(
     messages: Vec<Message>,
@@ -325,4 +339,245 @@ fn escaped_arguments_ids_stop_sequences_and_split_blocks_are_read() {
         found(&chat_inspection(&request(Vec::new(), Vec::new(), blocks))),
         "split blocks"
     );
+}
+
+fn set(layer: Layer, local_only: Option<bool>, entries: Vec<(Uuid, Entry)>) -> RuleSet {
+    RuleSet {
+        id: Uuid::now_v7(),
+        layer,
+        revision: 7,
+        local_only,
+        rules: entries
+            .into_iter()
+            .map(|(id, entry)| StoredRule { id, entry })
+            .collect(),
+    }
+}
+fn ruled(r: Rule) -> (Uuid, Entry) {
+    (Uuid::now_v7(), Entry::Rule(Box::new(r)))
+}
+
+#[test]
+fn composed_layers_are_enforced_with_tightenings_and_local_only() {
+    let monitor_id = Uuid::now_v7();
+    let mut later = rule(&[Category::Moderation], &[], InputAction::Block);
+    later.protection = Protection::Moderation;
+    later.detector.kind = DetectorKind::Systemone;
+    let platform = |local_only| {
+        set(
+            Layer::WorkspaceOverride,
+            Some(local_only),
+            vec![
+                (
+                    monitor_id,
+                    Entry::Rule(Box::new(rule(
+                        &[Category::Secret],
+                        &[],
+                        InputAction::Monitor,
+                    ))),
+                ),
+                ruled(later.clone()),
+            ],
+        )
+    };
+    let tighten_id = Uuid::now_v7();
+    let local = set(
+        Layer::WorkspaceLocal,
+        None,
+        vec![
+            (
+                tighten_id,
+                Entry::Tightens(
+                    monitor_id,
+                    Tightening {
+                        input_action: Some(InputAction::Block),
+                        output_mode: None,
+                        on_error: None,
+                        threshold: None,
+                    },
+                ),
+            ),
+            ruled(rule(
+                &[Category::Custom],
+                &["ACME-[0-9]{4}"],
+                InputAction::Monitor,
+            )),
+        ],
+    );
+    let k = key();
+    let body = format!("{k} ACME-1234");
+    // local_only: the egress rule does not run; the tightened platform rule
+    // blocks and says it was tightened; the local custom rule monitors.
+    let p = Policy::compile(&compose(Some(&platform(true)), Some(&local)));
+    assert!(p.has_local_custom());
+    let d = p.decide(Workload::Generation, Some(&text(&body)));
+    let refusal = d.refusal.expect("the tightening blocks");
+    assert_eq!(
+        (refusal.kind, refusal.rule_id, refusal.category),
+        (RefusalKind::InputBlocked, monitor_id, Category::Secret)
+    );
+    let summary: Vec<_> = d
+        .events
+        .iter()
+        .map(|e| (e.layer, e.action, e.category, e.tightened, e.refused))
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            (
+                Layer::WorkspaceOverride,
+                Action::Blocked,
+                Category::Secret,
+                true,
+                true
+            ),
+            (
+                Layer::WorkspaceLocal,
+                Action::Monitored,
+                Category::Custom,
+                false,
+                false
+            ),
+        ]
+    );
+    // Without local_only the later-release rule runs under its on_error and
+    // the block outranks its failure.
+    let p = Policy::compile(&compose(Some(&platform(false)), Some(&local)));
+    let d = p.decide(Workload::Generation, Some(&text(&body)));
+    assert_eq!(d.refusal.map(|r| r.kind), Some(RefusalKind::InputBlocked));
+    assert!(
+        d.events
+            .iter()
+            .any(|e| e.action == Action::DetectorFailed && !e.refused)
+    );
+    let d = p.decide(Workload::Generation, Some(&text("clean")));
+    let refusal = d.refusal.expect("fail-closed");
+    assert_eq!(refusal.kind, RefusalKind::DetectorFailed);
+    assert_eq!(refusal.detector, DetectorKind::Systemone);
+}
+
+#[test]
+fn the_strongest_refusal_of_several_rules_answers() {
+    let mut later = rule(&[Category::Moderation], &[], InputAction::Block);
+    later.protection = Protection::Moderation;
+    later.detector.kind = DetectorKind::Systemone;
+    let custom = rule(&[Category::Custom], &["ACME-[0-9]{4}"], InputAction::Block);
+    let secret = rule(&[Category::Secret], &[], InputAction::Block);
+    let ids = |p: &Policy| p.rules.iter().map(|r| r.id).collect::<Vec<_>>();
+    // Not supported < detector failed < unavailable < blocked, in any order.
+    let mut input = text("ACME-0001");
+    input.uninspectable = true;
+    for order in [
+        vec![later.clone(), custom.clone(), secret.clone()],
+        vec![secret.clone(), custom.clone(), later.clone()],
+    ] {
+        let p = policy(order);
+        let rules = ids(&p);
+        let d = p.decide(Workload::Generation, Some(&input));
+        let refusal = d.refusal.unwrap();
+        assert_eq!(refusal.kind, RefusalKind::InputBlocked);
+        assert_eq!(refusal.category, Category::Custom);
+        let custom_id = rules[p.rules.iter().position(|r| r.custom).unwrap()];
+        assert_eq!(refusal.rule_id, custom_id);
+        assert_eq!(d.events.iter().filter(|e| e.refused).count(), 1);
+        // Without a match: the custom rule's spent budget (unavailable)
+        // outranks the later rule's failure and the secret rule's unreadable part.
+        let d = p.decide_with(Workload::Generation, Some(&input), &Budget::steps(0));
+        let refusal = d.refusal.unwrap();
+        assert_eq!(
+            (refusal.kind, refusal.rule_id),
+            (RefusalKind::Unavailable, custom_id)
+        );
+        let d = p.decide(Workload::Generation, Some(&text("clean")));
+        assert_eq!(d.refusal.unwrap().kind, RefusalKind::DetectorFailed);
+    }
+    let d = policy(vec![secret]).decide(Workload::Generation, Some(&input));
+    assert_eq!(d.refusal.unwrap().kind, RefusalKind::NotSupported);
+}
+
+#[test]
+fn a_spent_budget_is_unavailable_whatever_on_error_and_keeps_its_findings() {
+    for on_error in [OnError::FailOpen, OnError::FailClosed] {
+        for action in [InputAction::Monitor, InputAction::Block] {
+            let mut r = rule(&[Category::Custom], &["ACME-[0-9]{4}|zzzz"], action);
+            r.on_error = on_error;
+            let p = policy(vec![r]);
+            let id = p.rules[0].id;
+            let body = format!("ACME-0001 {}", "x".repeat(20_000));
+            let d = p.decide_with(Workload::Generation, Some(&text(&body)), &Budget::steps(1));
+            let refusal = d.refusal.expect("never forwarded uninspected");
+            // A match found before the budget ran out still blocks.
+            let kind = if action == InputAction::Block {
+                RefusalKind::InputBlocked
+            } else {
+                RefusalKind::Unavailable
+            };
+            assert_eq!(
+                (refusal.kind, refusal.rule_id),
+                (kind, id),
+                "{on_error:?} {action:?}"
+            );
+            let kept = if action == InputAction::Block {
+                Action::Blocked
+            } else {
+                Action::Monitored
+            };
+            let mut actions: Vec<_> = d.events.iter().map(|e| (e.action, e.count)).collect();
+            actions.sort_by_key(|(a, _)| a.as_str());
+            let mut expected = vec![(Action::DetectorFailed, 1), (kept, 1)];
+            expected.sort_by_key(|(a, _)| a.as_str());
+            assert_eq!(actions, expected, "{on_error:?} {action:?}");
+        }
+    }
+}
+
+#[test]
+fn no_slot_is_unavailable_for_every_rule_and_a_detector_failure_follows_on_error() {
+    let mut open = rule(&[Category::Secret], &[], InputAction::Monitor);
+    open.on_error = OnError::FailOpen;
+    let p = policy(vec![open.clone()]);
+    let d = p.unavailable(Workload::Generation);
+    assert_eq!(d.refusal.map(|r| r.kind), Some(RefusalKind::Unavailable));
+    assert!(d.events[0].refused);
+    assert!(
+        policy(vec![open])
+            .unavailable(Workload::Rerank)
+            .refusal
+            .is_none()
+    );
+}
+
+#[test]
+fn every_option_string_a_messages_request_forwards_is_read() {
+    let k = key();
+    let value = json!({"note": k});
+    for options in [
+        MessagesOptions {
+            beta_headers: vec![format!("context-1m-2025-08-07,{k}")],
+            ..MessagesOptions::default()
+        },
+        MessagesOptions {
+            thinking: Some(value.clone()),
+            ..MessagesOptions::default()
+        },
+        MessagesOptions {
+            task_budget: Some(value.clone()),
+            ..MessagesOptions::default()
+        },
+        MessagesOptions {
+            cache_controls: vec![value.clone()],
+            ..MessagesOptions::default()
+        },
+        MessagesOptions {
+            defer_loading: vec![value.clone()],
+            ..MessagesOptions::default()
+        },
+        MessagesOptions {
+            history_thinking: vec![value.clone()],
+            ..MessagesOptions::default()
+        },
+    ] {
+        let r = request(vec![said(Role::User, "hi")], Vec::new(), options);
+        assert!(found(&chat_inspection(&r)));
+    }
 }

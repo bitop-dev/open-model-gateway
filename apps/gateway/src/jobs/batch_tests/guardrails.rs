@@ -147,3 +147,116 @@ async fn a_native_batch_is_refused_by_an_enforcing_rule(pool: PgPool) {
         .await;
     assert!(job.is_ok());
 }
+
+/// One type-default rule of the principal's workspace kind.
+async fn rule_set(f: &crate::governance::tests::db::Fixture, action: &str) {
+    let kind: String = sqlx::query_scalar("SELECT kind FROM workspaces WHERE id=$1")
+        .bind(f.principal.workspace_id)
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    let on_error = if action == "block" {
+        "fail_closed"
+    } else {
+        "fail_open"
+    };
+    let set = Uuid::now_v7();
+    let mut tx = f.store.pool.begin().await.unwrap();
+    sqlx::query("INSERT INTO guardrail_rule_sets(id,layer,kind,local_only,updated_by) VALUES($1,'type_default',$2,false,$3)")
+        .bind(set).bind(&kind).bind(f.owner).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable) VALUES($1,$2,0,'Secrets','secrets','pattern','{secret}',$3,'user_text','off',$4,'{generation}','deny')")
+        .bind(Uuid::now_v7()).bind(set).bind(action).bind(on_error).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+}
+
+/// A monitor rule does not enforce: a native batch runs natively, and its
+/// unread lines are recorded `skipped`, not refused.
+#[dbtest::test]
+async fn a_native_batch_under_a_monitor_rule_is_created_and_recorded_skipped(pool: PgPool) {
+    let w = world_with(pool, true, false, 1, None).await;
+    let f = &w.f;
+    rule_set(f, "monitor").await;
+    let file = w
+        .upload(&f.principal, &[chat_line("a", "company/smart", "hello")])
+        .await;
+    let job = w
+        .create(f.principal, &file, BatchEndpoint::ChatCompletions, None)
+        .await
+        .expect("a monitor rule lets the batch through");
+    let mode: String = sqlx::query_scalar("SELECT batch_mode FROM async_jobs WHERE id=$1")
+        .bind(job.id)
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(mode, "native");
+    let recorded: Vec<(String, bool, String)> =
+        sqlx::query_as("SELECT action,refused,operation FROM guardrail_events")
+            .fetch_all(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        recorded,
+        [("skipped".into(), false, "chat_completions".into())]
+    );
+}
+
+/// Blocked lines hold no route capacity: with a route that runs one line at
+/// a time, the clean line after three blocked ones still runs in the same
+/// pass, and nothing is left running or reserved.
+#[dbtest::test]
+async fn blocked_lines_release_the_route_capacity_they_were_scheduled_on(pool: PgPool) {
+    let w = world_with(pool, false, false, 1, None).await;
+    let f = &w.f;
+    sqlx::query("INSERT INTO deployment_batch_scheduling(deployment_id,max_concurrency,updated_by) VALUES($1,1,$2)")
+        .bind(f.deployment).bind(f.owner).execute(&f.store.pool).await.unwrap();
+    rule_set(f, "block").await;
+    let hex: String = "0123456789abcdef".chars().cycle().take(96).collect();
+    let secret = format!("{}_{}.{}", "omg", &hex[..32], &hex[32..]);
+    let mut lines: Vec<Value> = (0..3)
+        .map(|i| {
+            chat_line(
+                &format!("leak{i}"),
+                "company/smart",
+                &format!("use {secret}"),
+            )
+        })
+        .collect();
+    lines.push(chat_line("clean", "company/smart", "hello"));
+    let file = w.upload(&f.principal, &lines).await;
+    let job = w
+        .create(f.principal, &file, BatchEndpoint::ChatCompletions, None)
+        .await
+        .unwrap();
+    let _ = Runner::new(w.jobs.clone()).run_next().await;
+    let job = w.reload(&job).await;
+    let states: Vec<(i32, String)> =
+        sqlx::query_as("SELECT line_no,state FROM batch_lines WHERE job_id=$1 ORDER BY line_no")
+            .bind(job.id)
+            .fetch_all(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        states,
+        [
+            (0, "failed".into()),
+            (1, "failed".into()),
+            (2, "failed".into()),
+            (3, "succeeded".into()),
+        ]
+    );
+    let held: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM batch_lines WHERE job_id=$1 AND state='running'),
+                (SELECT count(*) FROM governance_reservations WHERE deployment_id=$2 AND state='pending')",
+    )
+    .bind(job.id)
+    .bind(f.deployment)
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(held, (0, 0), "no line or reservation holds the route");
+    let refused: i64 = sqlx::query_scalar("SELECT count(*) FROM guardrail_events WHERE refused")
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(refused, 3);
+}

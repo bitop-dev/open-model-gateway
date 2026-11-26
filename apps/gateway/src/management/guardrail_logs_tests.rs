@@ -135,6 +135,14 @@ async fn refused_requests_are_listed_as_blocked_with_logs_visibility(pool: PgPoo
         .execute(&pool)
         .await
         .unwrap();
+    // A platform rule a local tightening made stricter decided this one: its
+    // outcome may be the owner's choice, so it is left out too.
+    let tightened = "INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,tightened) SELECT gen_random_uuid(),gen_random_uuid(),workspace_id,api_key_id,'chat_completions','company/smart','input',gen_random_uuid(),gen_random_uuid(),1,'workspace_override','pattern','secret','blocked',1,true,true FROM guardrail_events WHERE root_request_id=$1";
+    sqlx::query(tightened)
+        .bind(private)
+        .execute(&pool)
+        .await
+        .unwrap();
     let (status, totals) = call(
         &f.s,
         &f.auditor,
@@ -147,6 +155,38 @@ async fn refused_requests_are_listed_as_blocked_with_logs_visibility(pool: PgPoo
     assert_eq!(
         totals["decisions_this_month"],
         json!([{"action":"monitored","category":"secret","decisions":1,"findings":3}])
+    );
+    // A shared workspace's totals count every layer and tightening.
+    sqlx::query(tightened)
+        .bind(own)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, totals) = call(
+        &f.s,
+        &f.auditor,
+        "GET",
+        &format!("/api/v1/platform/workspaces/{}/guardrails", f.team),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{totals}");
+    let mut seen: Vec<(String, String, i64)> = totals["decisions_this_month"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| {
+            (
+                t["action"].as_str().unwrap().to_owned(),
+                t["category"].as_str().unwrap().to_owned(),
+                t["decisions"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    seen.sort();
+    assert!(
+        seen.contains(&("blocked".into(), "secret".into(), 1)),
+        "{seen:?}"
     );
     // Attempt lists have nothing a refused request could match.
     for path in ["generations", "sessions"] {

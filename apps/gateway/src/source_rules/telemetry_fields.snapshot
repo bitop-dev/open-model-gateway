@@ -91,7 +91,7 @@ inference/request_telemetry.rs :: impl RequestTelemetry::finish :: span attribut
 inference/request_telemetry.rs :: impl RequestTelemetry::finish :: span attribute :: span . attribute (telemetry :: Attribute :: Outcome (outcome))
 inference/request_telemetry.rs :: impl RequestTelemetry::finish :: span attribute :: span . attribute (telemetry :: Attribute :: Streamed (self . streamed))
 inference/guardrails.rs :: count :: metrics call :: crate :: metrics :: METRICS . guardrail_decision ("input" , event . detector . as_str () , event . category . as_str () , event . action . as_str ())
-inference/guardrails.rs :: impl Engine::guard_input :: metrics call :: crate :: metrics :: METRICS . guardrail_detector_seconds ("pattern" , started . elapsed ())
+inference/guardrails.rs :: timed :: metrics call :: crate :: metrics :: METRICS . guardrail_detector_seconds ("pattern" , started . elapsed ())
 jobs/batch.rs :: impl Jobs::create_batch :: metrics call :: crate :: metrics :: METRICS . observe_batch_created (mode . as_str ())
 jobs/mod.rs :: impl Attempt::drop :: event :: crate :: ops_log :: emit (crate :: ops_log :: OpsEvent :: FinalizationNeedsReconciliation { finalizer : crate :: ops_log :: Finalizer :: JobCancel , trace : None })
 jobs/mod.rs :: impl Attempt::fail :: event :: crate :: ops_log :: emit (crate :: ops_log :: OpsEvent :: FinalizationNeedsReconciliation { finalizer : crate :: ops_log :: Finalizer :: JobFail , trace : None })

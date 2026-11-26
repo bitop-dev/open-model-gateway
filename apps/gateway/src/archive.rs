@@ -61,7 +61,7 @@ pub enum Group {
     Audit,
     Storage,
     /// Guardrail decisions (#840): their own group, because they start with
-    /// migration 0093 and have no partitions for the older months.
+    /// migration 0094 and have no partitions for the older months.
     Guardrails,
 }
 impl Group {

@@ -556,6 +556,8 @@ mod count_db_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod guardrail_db_tests;
 #[cfg(all(test, feature = "integration-tests"))]
+mod guardrail_limits_db_tests;
+#[cfg(all(test, feature = "integration-tests"))]
 mod settlement_disconnect_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod steering_tests;

@@ -337,8 +337,9 @@ impl Engine {
                 .unwrap_or(InferenceError::Unsupported)
                 .into());
         }
-        // A count sends the request's text to the provider: the guardrails
-        // of a Messages request apply before any route is used.
+        // A count may send the request's text to the provider (a provider
+        // count; a local estimate sends nothing): the guardrails of a Messages
+        // request apply before any route is used.
         let facts = super::guardrails::Guarded {
             request_id,
             operation: "count_tokens",

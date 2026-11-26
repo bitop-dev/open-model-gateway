@@ -4,23 +4,32 @@
 //!
 //! The built-in rules match credentials by their documented shape: a fixed
 //! prefix or structure, so ordinary code, UUIDs, hashes and base64 data do not
-//! match. A match counts unless it is glued to a run of eight or more
-//! base64url characters (letters, digits, `_`, `-`) on either side: inside an
-//! encoded blob it is data, not a credential. Quotes, spaces, `=`, `:` and
-//! escapes such as `\n` or `%20` around one do not hide it. A PEM private key is matched on its `BEGIN` line, which is enough to
+//! match. A match is data, not a credential, when it sits inside an encoded
+//! blob: glued to a run of eight or more base64url characters (letters,
+//! digits, `_`, `-`) on either side. A run of at most 32 characters that is a
+//! label (snake or kebab case words, the separator against the token, as in
+//! `deploy_token-` or `aws-access-key-`) is not glue. Quotes, spaces, `=`,
+//! `:` and escapes such as `\n` or `%20` around a credential do not hide it.
+//! A PEM or PGP private key is matched on its `BEGIN` line, which is enough to
 //! refuse it and keeps the match short.
 use std::sync::LazyLock;
 
-use async_trait::async_trait;
 use regex::{Regex, RegexSet};
 
-use super::detector::{DetectContext, Detector, DetectorError, Finding, Findings, Inspection};
+use super::detector::{
+    Budget, BudgetSpent, DetectContext, Detector, DetectorError, Finding, Findings, Inspected,
+    Inspection,
+};
 use super::policy::{Category, DetectorKind, Egress};
 
 /// The built-in secret shapes, by name (names are for tests and docs only;
 /// a decision records the rule and the category `secret`).
 pub const BUILTIN: &[(&str, &str)] = &[
     ("aws_access_key_id", r"(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}"),
+    (
+        "aws_secret_access_key",
+        r#"(?i:aws_?secret_?access_?key)["']?\s*[:=]\s*["']?[A-Za-z0-9/+]{40}"#,
+    ),
     (
         "github_token",
         r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,255}",
@@ -39,19 +48,22 @@ pub const BUILTIN: &[(&str, &str)] = &[
     ),
     (
         "anthropic_api_key",
-        r"sk-ant-(?:api|admin)[0-9]{2}-[A-Za-z0-9_\-]{80,120}",
+        r"sk-ant-(?:api|admin|oat)[0-9]{2}-[A-Za-z0-9_\-]{80,120}",
     ),
     ("google_api_key", r"AIza[0-9A-Za-z_\-]{35}"),
     ("huggingface_token", r"hf_[A-Za-z0-9]{34,40}"),
     ("npm_token", r"npm_[A-Za-z0-9]{36}"),
-    ("private_key", r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----"),
+    (
+        "private_key",
+        r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----",
+    ),
     (
         "jwt",
         r"eyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{16,}",
     ),
     (
         "connection_string_password",
-        r"(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|rediss?|amqps?|mssql|sqlserver)://[^\s:/@]{1,256}:[^\s@/]{1,256}@[^\s/]{1,256}",
+        r"(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|rediss?|amqps?|mssql|sqlserver)(?:\+[a-z0-9]{1,32})?://[^\s:/@]{0,256}:[^\s@/]{1,256}@[^\s/]{1,256}",
     ),
     (
         "azure_storage_connection_string",
@@ -87,22 +99,47 @@ fn encoded(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
 }
 /// A run of this many base64url characters next to a match makes it part of
-/// an encoded blob.
+/// an encoded blob, unless the run is a label of at most `LABEL_MAX` bytes.
 const BLOB_RUN: usize = 8;
+const LABEL_MAX: usize = 32;
+/// A word of a label: letters of one case, then digits (`token`, `KEY`, `v2`).
+fn word(w: &[u8]) -> bool {
+    let letters = w.iter().take_while(|b| b.is_ascii_alphabetic()).count();
+    let (alpha, digits) = w.split_at(letters);
+    letters > 0
+        && digits.iter().all(u8::is_ascii_digit)
+        && (alpha.iter().all(u8::is_ascii_lowercase) || alpha.iter().all(u8::is_ascii_uppercase))
+}
+/// Snake or kebab case words with the separator against the token.
+fn label(run: &[u8], before: bool) -> bool {
+    let sep = |b: &u8| *b == b'_' || *b == b'-';
+    let (edge, words) = if before {
+        (run.last(), &run[..run.len().saturating_sub(1)])
+    } else {
+        (run.first(), run.get(1..).unwrap_or_default())
+    };
+    edge.is_some_and(sep) && words.split(sep).all(word)
+}
+/// Whether a run of base64url characters next to a match glues it into data.
+fn glued(run: &[u8], before: bool) -> bool {
+    run.len() >= BLOB_RUN && !(run.len() <= LABEL_MAX && label(run, before))
+}
 /// Whether `span` of `text` stands apart from base64url data around it.
 fn standalone(text: &[u8], span: std::ops::Range<usize>) -> bool {
-    let before = text[..span.start]
-        .iter()
-        .rev()
-        .take(BLOB_RUN)
-        .take_while(|b| encoded(**b))
-        .count();
-    let after = text[span.end..]
-        .iter()
-        .take(BLOB_RUN)
-        .take_while(|b| encoded(**b))
-        .count();
-    before < BLOB_RUN && after < BLOB_RUN
+    let start = span.start
+        - text[..span.start]
+            .iter()
+            .rev()
+            .take(LABEL_MAX + 1)
+            .take_while(|b| encoded(**b))
+            .count();
+    let end = span.end
+        + text[span.end..]
+            .iter()
+            .take(LABEL_MAX + 1)
+            .take_while(|b| encoded(**b))
+            .count();
+    !glued(&text[start..span.start], true) && !glued(&text[span.end..end], false)
 }
 
 /// Every match of the built-in secret shapes (shared by every rule that has
@@ -131,15 +168,45 @@ pub fn builtin(input: &Inspection<'_>) -> Findings {
 
 /// One rule's pattern detector: the built-in secret shapes when the rule has
 /// the `secret` category, and its custom patterns (compiled within the limits
-/// of `patterns::compile`) for `custom`.
+/// of `patterns::compile_within`) for `custom`.
 pub struct PatternDetector {
     categories: Vec<Category>,
     secrets: bool,
     custom: Vec<Regex>,
 }
+
+/// A rule's custom-pattern matches, and whether its scan ran out of budget
+/// before the end (the matches found until then are kept).
+pub struct Custom {
+    pub findings: Findings,
+    pub spent: bool,
+}
+
+/// How far ahead one custom-pattern call looks; after a window without a
+/// match the next starts `OVERLAP` bytes before its end; a match cut by the
+/// window is searched again up to `EXTEND` bytes from its start.
+const WINDOW: usize = 4096;
+const OVERLAP: usize = 1024;
+const EXTEND: usize = 8192;
+
+/// The char boundary at or before `i`.
+fn boundary(text: &str, mut i: usize) -> usize {
+    while !text.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+/// The char boundary at or after `i`.
+fn boundary_up(text: &str, mut i: usize) -> usize {
+    while i < text.len() && !text.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
 impl PatternDetector {
-    /// `None` when a custom pattern no longer compiles within the limits (the
-    /// rule then fails like a detector that cannot run).
+    /// `None` when a custom pattern no longer compiles within a local
+    /// layer's limits (the rule then fails like a detector that cannot run).
     pub fn new(categories: &[Category], patterns: &[String]) -> Option<Self> {
         Self::within(categories, patterns, super::patterns::Limit::Local)
     }
@@ -159,43 +226,23 @@ impl PatternDetector {
             custom,
         })
     }
-    /// Every match, synchronously (the detector never waits on anything);
-    /// `BudgetSpent` when the custom patterns ran out of time having found
-    /// nothing.
-    pub fn scan(&self, input: &Inspection<'_>) -> Result<Findings, BudgetSpent> {
-        let mut found = if self.secrets {
-            builtin(input).0
-        } else {
-            Vec::new()
-        };
-        let budget = Budget::new(super::enforce::CUSTOM_BUDGET);
-        let custom = self.custom_findings(input, &budget);
-        found.extend(custom.findings.0);
-        if custom.spent && found.is_empty() {
-            return Err(BudgetSpent);
-        }
-        Ok(Findings(found))
-    }
     /// Whether the rule has custom patterns.
     pub fn has_custom(&self) -> bool {
         !self.custom.is_empty()
     }
-    /// Whether the built-in secret shapes run for this rule.
-    pub fn secrets(&self) -> bool {
-        self.secrets
-    }
-    /// Matches of the rule's custom patterns, within a time budget: a
-    /// custom pattern may be any user's, so its cost per byte is too. Each
-    /// step searches the text from its position, with the text before it as
+    /// Matches of the rule's custom patterns, within a budget: a custom
+    /// pattern may be any user's, so its cost per byte is too. Each step
+    /// searches the text from its position, with the text before it as
     /// context (so `\b` and `^` mean what they mean in the whole text), but
     /// only up to `WINDOW` bytes ahead, so one regex call is bounded; the
-    /// budget is checked before every call, and spent, the scan stops with
-    /// `BudgetSpent` (the rule then fails under its `on_error`). A match cut
-    /// by that horizon is searched again up to `EXTEND` bytes further and
-    /// counted. A value longer than `OVERLAP` that its pattern matches only
-    /// whole (say `BEGIN…END`) can be missed when it starts more than
-    /// `OVERLAP` bytes before a horizon; empty matches never count. What was
-    /// found before the budget ran out is kept.
+    /// budget is checked before every call. A match that ends exactly at that
+    /// horizon is searched again with `EXTEND` bytes more: the match found
+    /// from the same position (the same one, longer, or a later one the cut
+    /// had hidden) is the one counted, and the scan resumes after it. A value
+    /// longer than `OVERLAP` that its pattern matches only whole (say
+    /// `BEGIN…END`) can be missed when it starts more than `OVERLAP` bytes
+    /// before a horizon; empty matches never count. What was found before
+    /// the budget ran out is kept.
     pub fn custom_findings(&self, input: &Inspection<'_>, budget: &Budget) -> Custom {
         let mut found = Vec::new();
         let spent = self.scan_custom(input, budget, &mut found).is_err();
@@ -225,18 +272,20 @@ impl PatternDetector {
                         pos = boundary_up(text, back.max(pos + 1));
                         continue;
                     };
-                    let mut m = Some(cut);
-                    if cut.end() == end && end < text.len() {
-                        // Searched again past the cut: the same start is the
-                        // match (perhaps longer); none, or a later start, shows
-                        // the cut itself made it match (a `\b` or `$` there).
+                    let found_here = if cut.end() == end && end < text.len() {
                         budget.check()?;
                         let further = boundary(text, (cut.start() + EXTEND).min(text.len()));
-                        m = pattern
-                            .find_at(&text[..further], cut.start())
-                            .filter(|longer| longer.start() == cut.start());
-                    }
-                    if let Some(m) = m.filter(|m| !m.is_empty()) {
+                        pattern.find_at(&text[..further], cut.start())
+                    } else {
+                        Some(cut)
+                    };
+                    let Some(m) = found_here else {
+                        // Nothing starts at or after the cut's start once the
+                        // text goes on: the cut made that match.
+                        pos = boundary_up(text, cut.start() + 1);
+                        continue;
+                    };
+                    if !m.is_empty() {
                         if found.len() == MAX_FINDINGS {
                             return Ok(());
                         }
@@ -246,8 +295,8 @@ impl PatternDetector {
                             span: m.range(),
                         });
                     }
-                    pos = if cut.end() > pos {
-                        cut.end()
+                    pos = if m.end() > pos {
+                        m.end()
                     } else {
                         boundary_up(text, pos + 1)
                     };
@@ -258,54 +307,6 @@ impl PatternDetector {
     }
 }
 
-/// How far ahead one custom-pattern call looks; after a window without a
-/// match the next starts `OVERLAP` bytes before its end; a match cut by the
-/// window is searched again up to `EXTEND` bytes from its start.
-const WINDOW: usize = 4096;
-const OVERLAP: usize = 1024;
-const EXTEND: usize = 8192;
-
-/// The time a request's custom patterns may take in all.
-pub struct Budget(std::time::Instant);
-impl Budget {
-    pub fn new(limit: std::time::Duration) -> Self {
-        Self(std::time::Instant::now() + limit)
-    }
-    fn check(&self) -> Result<(), BudgetSpent> {
-        if std::time::Instant::now() >= self.0 {
-            Err(BudgetSpent)
-        } else {
-            Ok(())
-        }
-    }
-}
-/// A request's custom-pattern budget ran out.
-#[derive(Debug)]
-pub struct BudgetSpent;
-
-/// A rule's custom-pattern matches, and whether its scan ran out of budget
-/// before the end (the matches found until then are kept).
-pub struct Custom {
-    pub findings: Findings,
-    pub spent: bool,
-}
-
-/// The char boundary at or before `i`.
-fn boundary(text: &str, mut i: usize) -> usize {
-    while !text.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-/// The char boundary at or after `i`.
-fn boundary_up(text: &str, mut i: usize) -> usize {
-    while i < text.len() && !text.is_char_boundary(i) {
-        i += 1;
-    }
-    i
-}
-
-#[async_trait]
 impl Detector for PatternDetector {
     fn kind(&self) -> DetectorKind {
         DetectorKind::Pattern
@@ -316,12 +317,37 @@ impl Detector for PatternDetector {
     fn categories(&self) -> &[Category] {
         &self.categories
     }
-    async fn inspect(
+    /// Distinct values per category: the shared built-in findings for
+    /// `secret`, the rule's custom patterns for `custom` (incomplete when the
+    /// budget ran out first).
+    fn inspect(
         &self,
-        _ctx: &DetectContext,
+        ctx: &DetectContext<'_>,
         input: &Inspection<'_>,
-    ) -> Result<Findings, DetectorError> {
-        self.scan(input).map_err(|_| DetectorError::Timeout)
+    ) -> Result<Inspected, DetectorError> {
+        let custom = self
+            .has_custom()
+            .then(|| self.custom_findings(input, ctx.budget));
+        let counts = self
+            .categories
+            .iter()
+            .map(|&category| {
+                let n = if category == Category::Secret && self.secrets {
+                    ctx.builtin
+                        .get_or_init(|| builtin(input))
+                        .distinct(input, category)
+                } else {
+                    custom
+                        .as_ref()
+                        .map_or(0, |c| c.findings.distinct(input, category))
+                };
+                (category, n)
+            })
+            .collect();
+        Ok(Inspected {
+            counts,
+            complete: custom.is_none_or(|c| !c.spent),
+        })
     }
 }
 

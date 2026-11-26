@@ -8,9 +8,6 @@
 use std::borrow::Cow;
 use std::ops::Range;
 
-use async_trait::async_trait;
-use tokio::time::Instant;
-
 use super::policy::{Category, DetectorKind, Egress};
 
 /// Where a segment's text came from.
@@ -128,27 +125,77 @@ impl Findings {
     }
 }
 
-/// Why a detector gave no verdict. The rule's `on_error` decides what follows.
+/// What one detector found in a request: distinct matched values per
+/// category, and whether it read everything (`false`: its budget ran out
+/// first; the counts found until then still stand).
+pub struct Inspected {
+    pub counts: Vec<(Category, usize)>,
+    pub complete: bool,
+}
+
+/// Why a detector gave no verdict at all (it cannot run in this release).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DetectorError {
-    Timeout,
     Unavailable,
 }
 
-/// What a detector may know about the request beyond its text.
-pub struct DetectContext {
-    pub deadline: Instant,
+/// The time (or, in tests, the number of regex calls) a request's custom
+/// patterns may take in all. Checked before every call.
+pub enum Budget {
+    Clock(std::time::Instant),
+    Steps(std::cell::Cell<u64>),
+}
+impl Budget {
+    pub fn time(limit: std::time::Duration) -> Self {
+        Self::Clock(std::time::Instant::now() + limit)
+    }
+    /// A budget of `n` regex calls, whatever they cost (tests).
+    pub fn steps(n: u64) -> Self {
+        Self::Steps(std::cell::Cell::new(n))
+    }
+    /// Take one step; `Err` once the budget is spent.
+    pub fn check(&self) -> Result<(), BudgetSpent> {
+        match self {
+            Self::Clock(deadline) if std::time::Instant::now() >= *deadline => Err(BudgetSpent),
+            Self::Clock(_) => Ok(()),
+            Self::Steps(left) => match left.get() {
+                0 => Err(BudgetSpent),
+                n => {
+                    left.set(n - 1);
+                    Ok(())
+                }
+            },
+        }
+    }
+    /// Steps left (a step budget; `None` for a clock).
+    pub fn left(&self) -> Option<u64> {
+        match self {
+            Self::Steps(left) => Some(left.get()),
+            Self::Clock(_) => None,
+        }
+    }
+}
+/// A request's custom-pattern budget ran out.
+#[derive(Debug)]
+pub struct BudgetSpent;
+
+/// What a detector shares within one request: the budget, and the built-in
+/// secret findings (scanned once for every rule that uses them).
+pub struct DetectContext<'a> {
+    pub budget: &'a Budget,
+    pub builtin: &'a std::cell::OnceCell<Findings>,
 }
 
-/// Implemented by the built-in detectors and, later, external ones.
-#[async_trait]
+/// Implemented by the built-in detectors (and, in later phases, model and
+/// external ones, which add an asynchronous call). Phase 1's pattern detector
+/// runs synchronously within the request's budget.
 pub trait Detector: Send + Sync {
     fn kind(&self) -> DetectorKind;
     fn egress(&self) -> Egress;
     fn categories(&self) -> &[Category];
-    async fn inspect(
+    fn inspect(
         &self,
-        ctx: &DetectContext,
+        ctx: &DetectContext<'_>,
         input: &Inspection<'_>,
-    ) -> Result<Findings, DetectorError>;
+    ) -> Result<Inspected, DetectorError>;
 }

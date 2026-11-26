@@ -457,6 +457,98 @@ async fn concurrent_admissions_lock_no_parent_rows(pool: PgPool) {
     assert!(report.consistent(), "{report:#?}");
 }
 
+/// Guardrail decisions (0094) lock no authority row either: overlapping
+/// event inserts, held open, and a burst through the engine's writer leave
+/// every workspace and key tuple's `t_xmax` unchanged; a key of another
+/// workspace is still refused (23503).
+#[dbtest::test]
+async fn concurrent_guardrail_events_lock_no_parent_rows(pool: PgPool) {
+    sqlx::query("CREATE EXTENSION IF NOT EXISTS pageinspect")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let f = fixture(pool.clone()).await;
+    const INSERT: &str = "INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count) VALUES(gen_random_uuid(),gen_random_uuid(),$1,$2,'chat_completions','m','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','secret','blocked',1)";
+    let before = (
+        xmax(&pool, "workspaces").await,
+        xmax(&pool, "api_keys").await,
+    );
+    let mut open = Vec::new();
+    for _ in 0..3 {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query(INSERT)
+            .bind(f.principal.workspace_id)
+            .bind(f.principal.key_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        open.push(tx);
+    }
+    assert_eq!(
+        (
+            xmax(&pool, "workspaces").await,
+            xmax(&pool, "api_keys").await
+        ),
+        before,
+        "an open event insert locked an authority row"
+    );
+    for tx in open {
+        tx.commit().await.unwrap();
+    }
+    let events = [crate::guardrails::enforce::Event {
+        rule_set_id: Uuid::now_v7(),
+        rule_id: Uuid::now_v7(),
+        revision: 1,
+        layer: crate::guardrails::policy::Layer::TypeDefault,
+        detector: crate::guardrails::policy::DetectorKind::Pattern,
+        category: crate::guardrails::policy::Category::Secret,
+        action: crate::guardrails::enforce::Action::Monitored,
+        count: 1,
+        refused: false,
+        tightened: false,
+    }];
+    let mut tasks = Vec::new();
+    for i in 0..64 {
+        let store = f.store.clone();
+        let principal = if i % 2 == 0 { f.principal } else { f.team };
+        tasks.push(tokio::spawn(async move {
+            store
+                .record_guardrail_events(&crate::inference::guardrails::GuardrailRecord {
+                    root_request_id: Uuid::now_v7(),
+                    principal,
+                    operation: "chat_completions",
+                    model: "m",
+                    streamed: false,
+                    events: &events,
+                    omitted: 0,
+                })
+                .await
+                .unwrap();
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    assert_eq!(
+        (
+            xmax(&pool, "workspaces").await,
+            xmax(&pool, "api_keys").await
+        ),
+        before,
+        "a parent row was locked"
+    );
+    let err = sqlx::query(INSERT)
+        .bind(f.team.workspace_id)
+        .bind(f.principal.key_id)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_database_error().and_then(|e| e.code()).as_deref(),
+        Some("23503")
+    );
+}
+
 /// The verifier finds orphans and scope mismatches written around the
 /// triggers (replication role) and a disabled guard; the job opens one
 /// incident with one delivery; only a full clean run resolves it.

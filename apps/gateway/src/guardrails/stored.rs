@@ -197,13 +197,35 @@ pub async fn workspace_layers(
     conn: &mut PgConnection,
     workspace: Uuid,
 ) -> Result<Result<(Option<RuleSet>, Option<RuleSet>), Unreadable>, sqlx::Error> {
-    let heads: Vec<(Uuid, String, i64, Option<bool>)> = sqlx::query_as(
+    let heads = workspace_heads(conn, workspace).await?;
+    layers_of(conn, heads).await
+}
+
+/// The rule sets that apply to a workspace: id, layer, revision and
+/// `local_only` (one statement). Every change of a set or its rules moves
+/// its revision (0092), and a kind change selects another type default, so
+/// equal heads mean an equal policy.
+pub type Heads = Vec<(Uuid, String, i64, Option<bool>)>;
+pub async fn workspace_heads(
+    conn: &mut PgConnection,
+    workspace: Uuid,
+) -> Result<Heads, sqlx::Error> {
+    let mut heads: Heads = sqlx::query_as(
         "SELECT s.id,s.layer,s.revision,s.local_only FROM guardrail_rule_sets s JOIN workspaces w ON w.id=$1
          WHERE (s.layer='type_default' AND s.kind=w.kind) OR s.workspace_id=$1",
     )
     .bind(workspace)
     .fetch_all(&mut *conn)
     .await?;
+    heads.sort();
+    Ok(heads)
+}
+
+/// The layers of `heads`, with their rules (one statement per set).
+pub async fn layers_of(
+    conn: &mut PgConnection,
+    heads: Heads,
+) -> Result<Result<(Option<RuleSet>, Option<RuleSet>), Unreadable>, sqlx::Error> {
     if heads.is_empty() {
         return Ok(Ok((None, None)));
     }

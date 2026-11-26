@@ -52,8 +52,13 @@ pub(super) fn all() -> Vec<InferenceError> {
         InferenceError::InvalidUpstream,
         InferenceError::Storage,
     ];
+    all.extend([
+        InferenceError::GuardrailUnavailable,
+        InferenceError::GuardrailThrottled(1),
+    ]);
     for kind in [
         RefusalKind::InputBlocked,
+        RefusalKind::Unavailable,
         RefusalKind::DetectorFailed,
         RefusalKind::NotSupported,
     ] {
@@ -100,6 +105,8 @@ pub(super) const fn guard(error: InferenceError) -> usize {
         InferenceError::Storage => 20,
         InferenceError::ScopeBusy => 21,
         InferenceError::Guardrail(_) => 22,
+        InferenceError::GuardrailUnavailable => 23,
+        InferenceError::GuardrailThrottled(_) => 24,
     }
 }
 const _: fn(InferenceError) -> usize = guard;

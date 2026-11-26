@@ -38,6 +38,30 @@ pub const DFA_LIMIT: usize = 1 << 20;
 /// How deeply a pattern may nest (the crate's default is 250).
 pub const NEST_LIMIT: u32 = 64;
 
+/// Pattern compiles per replica (at save, and when the engine compiles a
+/// workspace's policy), in separate slots for the platform layers (Platform
+/// Admins) and the local layers (every User owns one, on their personal
+/// workspace), so local writers never queue ahead of the platform.
+pub static PLATFORM_COMPILES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+pub static LOCAL_COMPILES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+/// Run `work` on the blocking pool while holding one of `slots`. The slot
+/// moves into the blocking task, so it is held until the work ends even when
+/// the caller is dropped (a client that disconnects never frees a slot while
+/// its compile still runs). `None` if the work could not run.
+pub async fn in_slot<T: Send + 'static>(
+    slots: &'static tokio::sync::Semaphore,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let slot = slots.acquire().await.ok()?;
+    tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        work()
+    })
+    .await
+    .ok()
+}
+
 /// Compile one custom pattern within the limits of a local layer.
 pub fn compile(pattern: &str) -> Option<Regex> {
     compile_within(pattern, Limit::Local)

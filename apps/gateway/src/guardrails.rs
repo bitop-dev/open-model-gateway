@@ -8,6 +8,7 @@
 //! is not inspected yet.
 pub mod detector;
 pub mod enforce;
+pub mod limits;
 pub mod patterns;
 pub mod policy;
 pub mod secrets;

@@ -50,6 +50,10 @@ impl FieldName {
 /// queue behind a short stall takes to drain once it ends.
 pub const SCOPE_BUSY_RETRY_SECONDS: u32 = 2;
 
+/// Seconds a client should wait before retrying a request whose guardrail
+/// scan could not run now.
+pub const GUARDRAIL_RETRY_SECONDS: u32 = 1;
+
 /// Safe errors only. Never embed upstream bodies, URLs, credentials or prompts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InferenceError {
@@ -107,6 +111,14 @@ pub enum InferenceError {
     /// A guardrail refused the request before admission (nothing was
     /// reserved or sent): ids and fixed codes only, never matched text.
     Guardrail(crate::guardrails::enforce::Refusal),
+    /// The guardrail step could not run now (no scan slot was free in time,
+    /// or the workspace's policy could not be read): nothing was inspected,
+    /// reserved or sent. Retryable after the indicated delay.
+    GuardrailUnavailable,
+    /// This key's guardrail refusals reached the per-replica limit for the
+    /// current minute: refused before any scan. Retryable after the
+    /// indicated seconds.
+    GuardrailThrottled(u32),
 }
 
 impl InferenceError {
@@ -140,7 +152,10 @@ impl InferenceError {
                     "guardrail_detector_failed"
                 }
                 crate::guardrails::enforce::RefusalKind::NotSupported => "guardrail_not_supported",
+                crate::guardrails::enforce::RefusalKind::Unavailable => "guardrail_unavailable",
             },
+            Self::GuardrailUnavailable => "guardrail_unavailable",
+            Self::GuardrailThrottled(_) => "guardrail_rate_limited",
         }
     }
     /// Budget/accounting denials are not transient; SDKs must not auto-retry them.
@@ -158,16 +173,23 @@ impl InferenceError {
                     | Self::ContextLength
                     | Self::TokenReservationExceedsLimit(_)
                     | Self::PriceUnbounded
-                    // A guardrail decision does not change on retry, and a
-                    // retry would run the detectors again.
-                    | Self::Guardrail(_)
             )
+            // A guardrail decision does not change on retry, and a retry
+            // would run the detectors again; an unavailable scan may succeed.
+            || matches!(self, Self::Guardrail(r) if r.kind != crate::guardrails::enforce::RefusalKind::Unavailable)
     }
     /// Seconds a client should wait before retrying (`Retry-After`), if known.
     pub fn retry_after_seconds(self) -> Option<u32> {
         match self {
             Self::RouteCoolingDown(seconds) => Some(seconds.max(1)),
             Self::ScopeBusy => Some(SCOPE_BUSY_RETRY_SECONDS),
+            Self::GuardrailUnavailable => Some(GUARDRAIL_RETRY_SECONDS),
+            Self::Guardrail(r)
+                if r.kind == crate::guardrails::enforce::RefusalKind::Unavailable =>
+            {
+                Some(GUARDRAIL_RETRY_SECONDS)
+            }
+            Self::GuardrailThrottled(seconds) => Some(seconds.max(1)),
             _ => None,
         }
     }
@@ -230,9 +252,18 @@ impl InferenceError {
                     "A guardrail detector could not run and its rule fails closed; error.guardrail names the rule"
                 }
                 crate::guardrails::enforce::RefusalKind::NotSupported => {
-                    "A guardrail policy enforces on this request, but part of it (an image, audio or an encoded document) cannot be inspected"
+                    "A guardrail policy enforces on this request, but part of it (an image, audio or an encoded document) cannot be inspected; nothing was matched"
+                }
+                crate::guardrails::enforce::RefusalKind::Unavailable => {
+                    "A guardrail rule could not finish inspecting the request now; nothing was sent. Retry after the indicated delay"
                 }
             },
+            Self::GuardrailUnavailable => {
+                "Guardrail inspection is busy or unavailable; nothing was inspected or sent. Retry after the indicated delay"
+            }
+            Self::GuardrailThrottled(_) => {
+                "Too many requests from this API key were refused by guardrails; retry after the indicated delay"
+            }
         }
     }
 }

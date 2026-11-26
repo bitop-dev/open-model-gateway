@@ -62,7 +62,13 @@ pub(super) async fn detail(
     // Visibility of the root itself ignores list filters.
     let sql = format!(
         "{} SELECT {ROW},started_at,workspace_id FROM roots",
-        logs::roots_with_refused(&scope, "e.root_request_id=$4", "e.root_request_id=$4")
+        logs::roots_with_refused(
+            &scope,
+            "e.root_request_id=$4",
+            // A root id is a UUIDv7 drawn when the request started: its
+            // decisions lie within minutes of that time (one partition).
+            "e.root_request_id=$4 AND (uuid_extract_timestamp($4) IS NULL OR (e.created_at>=uuid_extract_timestamp($4)-interval '10 minutes' AND e.created_at<uuid_extract_timestamp($4)+interval '10 minutes'))",
+        )
     );
     let (mut summary, started, ws): (Value, UtcInstant, Uuid) = sqlx::query_as(&sql)
         .bind(scope.workspace)
@@ -97,9 +103,10 @@ pub(super) async fn detail(
         .await?;
     // Guardrail decisions on this request (#840): ids, codes and counts
     // only; visibility is the root's.
-    let (decisions,): (Value,) = sqlx::query_as("SELECT coalesce(jsonb_agg(jsonb_build_object('rule_set_id',g.rule_set_id,'rule_id',g.rule_id,'revision',g.revision,'layer',g.layer,'stage',g.stage,'detector',g.detector_kind,'category',g.category,'action',g.action,'count',g.count,'refused',g.refused,'created_at',g.created_at) ORDER BY g.created_at,g.id),'[]'::jsonb) FROM guardrail_events g WHERE g.root_request_id=$1 AND g.workspace_id=$2")
+    let (decisions,): (Value,) = sqlx::query_as("SELECT coalesce(jsonb_agg(jsonb_build_object('rule_set_id',g.rule_set_id,'rule_id',g.rule_id,'revision',g.revision,'layer',g.layer,'stage',g.stage,'detector',g.detector_kind,'category',g.category,'action',g.action,'count',g.count,'refused',g.refused,'created_at',g.created_at) ORDER BY g.created_at,g.id),'[]'::jsonb) FROM guardrail_events g WHERE g.root_request_id=$1 AND g.workspace_id=$2 AND g.created_at>=$3-interval '10 minutes' AND g.created_at<$3+interval '10 minutes'")
         .bind(root)
         .bind(ws)
+        .bind(started)
         .fetch_one(&mut *tx)
         .await?;
     let prev: Option<(Uuid,)> = bind_filters(

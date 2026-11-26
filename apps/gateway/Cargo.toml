@@ -85,9 +85,9 @@ tokio-rustls = { version = "=0.26.6", default-features = false, features = ["rin
 # patterns compile under fixed size limits (guardrails/patterns.rs). Also the
 # dev-only SQL tokenizer of the UUID binding policy.
 regex = "=1.13.1"
-# Its parser (already a dependency of `regex`, same lock) refuses a custom
-# pattern that can match the empty string (guardrails/patterns.rs). Also the
-# dev-only SQL tokenizer of the UUID binding policy.
+# The parser `regex` itself uses (same locked version): guardrails/patterns.rs
+# refuses a custom pattern whose minimum match length is 0. Tests also use it
+# to tokenize literal SQL for the UUID binding policy.
 regex-syntax = "=0.8.11"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["limit", "fs"] }

@@ -25,7 +25,7 @@ CREATE TABLE guardrail_events (
  created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
  -- The client request (a gateway-run batch line's own request id).
  root_request_id uuid NOT NULL,
- workspace_id uuid NOT NULL REFERENCES workspaces(id),
+ workspace_id uuid NOT NULL,
  api_key_id uuid NOT NULL,
  -- The client operation: a generation protocol or a workload.
  operation text NOT NULL CHECK (operation IN ('chat_completions','responses','messages','count_tokens','embeddings',
@@ -46,12 +46,35 @@ CREATE TABLE guardrail_events (
  -- This decision is the one the client was refused with (one per refused
  -- request; such a request has no execution row).
  refused boolean NOT NULL DEFAULT false,
- PRIMARY KEY (id, created_at),
- FOREIGN KEY (workspace_id, api_key_id) REFERENCES api_keys(workspace_id, id)
+ -- The rule is a platform rule a local tightening made stricter: its action
+ -- may be the workspace's own choice (left out of a personal workspace's
+ -- platform totals).
+ tightened boolean NOT NULL DEFAULT false,
+ -- Further decisions of the request not written as rows (on its first row:
+ -- at most 16 rows are written per request).
+ omitted integer NOT NULL DEFAULT 0 CHECK (omitted BETWEEN 0 AND 10000),
+ PRIMARY KEY (id, created_at)
 ) PARTITION BY RANGE (created_at);
 CREATE INDEX guardrail_events_request ON guardrail_events (root_request_id, created_at);
 CREATE INDEX guardrail_events_workspace_time ON guardrail_events (workspace_id, created_at, id);
 CREATE INDEX guardrail_events_refused ON guardrail_events (workspace_id, created_at) WHERE refused;
+-- The key is a key of the event's workspace (so the workspace exists too),
+-- checked at insert with a plain read, as 0034 does for executions: a
+-- foreign key would take FOR KEY SHARE on the workspace and key rows for
+-- every event (MultiXacts on authority rows in the hot path). Those rows are
+-- never removed or re-keyed (0034's guards), so the read cannot race a
+-- removal. A violation raises 23503, like the foreign key would.
+CREATE FUNCTION guardrail_events_parent_check() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF NOT EXISTS(SELECT 1 FROM public.api_keys k WHERE k.workspace_id=NEW.workspace_id AND k.id=NEW.api_key_id) THEN
+  RAISE EXCEPTION 'guardrail event key is not a key of its workspace' USING ERRCODE='23503',
+   DETAIL=format('workspace_id=%s api_key_id=%s', NEW.workspace_id, NEW.api_key_id);
+ END IF;
+ RETURN NEW;
+END $$;
+REVOKE ALL ON FUNCTION guardrail_events_parent_check() FROM PUBLIC;
+CREATE TRIGGER guardrail_events_parent_check BEFORE INSERT ON guardrail_events
+ FOR EACH ROW EXECUTE FUNCTION guardrail_events_parent_check();
 CREATE TRIGGER guardrail_events_immutable BEFORE UPDATE OR DELETE ON guardrail_events
  FOR EACH ROW EXECUTE FUNCTION immutable_history();
 CREATE TRIGGER guardrail_events_no_truncate BEFORE TRUNCATE ON guardrail_events

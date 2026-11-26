@@ -104,33 +104,20 @@ pub(super) fn routes() -> Router<Store> {
 mod store;
 use store::{Platform, Scope, foreign_ids, load, platform, store};
 
-/// Pattern compiles per replica, in separate slots for the platform layers
-/// (Platform Admins) and the local layers (every User owns one, on their
-/// personal workspace), so local writers never queue ahead of the platform.
-static PLATFORM_COMPILES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
-static LOCAL_COMPILES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+use patterns::{LOCAL_COMPILES, PLATFORM_COMPILES};
 
-/// Run `work` on the blocking pool while holding one of `slots`. The slot
-/// moves into the blocking task, so it is held until the work ends even when
-/// the request is dropped (a client that disconnects never frees a slot while
-/// its compile still runs).
+/// Run `work` in one of `slots` (`patterns::in_slot`), as a management error.
 async fn in_slot<T: Send + 'static>(
     slots: &'static tokio::sync::Semaphore,
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T> {
-    let unavailable = || {
+    patterns::in_slot(slots, work).await.ok_or_else(|| {
         ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
             "Management storage unavailable",
         )
-    };
-    let slot = slots.acquire().await.map_err(|_| unavailable())?;
-    tokio::task::spawn_blocking(move || {
-        let _slot = slot;
-        work()
+        .into()
     })
-    .await
-    .map_err(|_| unavailable().into())
 }
 
 /// The body's custom patterns that compile within the limits. Compiling needs
@@ -319,8 +306,9 @@ fn workspace_json(
         "local": if local_visible { set_json(local, local_patterns) } else { Value::Null },
         "local_visible": local_visible,
         "effective": effective,
-        // What this release inspects: nothing yet (#840 policy model only).
+        // The engine enforces input rules, for these workloads only.
         "enforced": true,
+        "inspected_workloads": crate::guardrails::enforce::INSPECTED_WORKLOADS,
     })
 }
 
@@ -354,7 +342,9 @@ async fn detectors(
 ) -> Result<Json<Value>> {
     let tx = platform_tx(&s, &u, false).await?;
     tx.commit().await?;
-    Ok(Json(json!({"detectors": policy::detectors_json()})))
+    Ok(Json(
+        json!({"detectors": policy::detectors_json(), "inspected_workloads": crate::guardrails::enforce::INSPECTED_WORKLOADS}),
+    ))
 }
 
 async fn type_guardrails(
@@ -367,7 +357,7 @@ async fn type_guardrails(
     let set = load(&mut tx, Scope::Type(&k)).await?;
     tx.commit().await?;
     Ok(Json(
-        json!({"kind": k, "rule_set": set_json(set.as_ref(), true)}),
+        json!({"kind": k, "rule_set": set_json(set.as_ref(), true), "inspected_workloads": crate::guardrails::enforce::INSPECTED_WORKLOADS}),
     ))
 }
 
@@ -404,8 +394,32 @@ async fn put_type_guardrails(
     let set = load(&mut tx, scope).await?;
     tx.commit().await?;
     Ok(Json(
-        json!({"kind": k, "rule_set": set_json(set.as_ref(), true)}),
+        json!({"kind": k, "rule_set": set_json(set.as_ref(), true), "inspected_workloads": crate::guardrails::enforce::INSPECTED_WORKLOADS}),
     ))
+}
+
+/// This month's decisions on a workspace per action and category, read
+/// after the management transaction committed (a month-wide aggregate never
+/// runs while the installation row is held). Totals only, never request
+/// detail, so also for a personal workspace; never of what its owner chose:
+/// its local layer's rules, or a platform rule its owner tightened.
+/// `findings` sums the distinct matches of decisions that found something.
+async fn with_totals(s: &Store, ws: Uuid, mut v: Value) -> Result<Value> {
+    let owner_visible = v["kind"] != "personal";
+    let totals: Vec<(String, String, i64, i64)> = sqlx::query_as(
+        "SELECT action,category,count(*),coalesce(sum(count) FILTER(WHERE action IN('monitored','redacted','blocked','stopped')),0)::bigint FROM guardrail_events WHERE workspace_id=$1 AND created_at>=date_trunc('month',clock_timestamp(),'UTC') AND ($2 OR (layer<>'workspace_local' AND NOT tightened)) GROUP BY action,category ORDER BY action,category",
+    )
+    .bind(ws)
+    .bind(owner_visible)
+    .fetch_all(&s.pool)
+    .await?;
+    v["decisions_this_month"] = totals
+        .into_iter()
+        .map(|(action, category, decisions, findings)| {
+            json!({"action":action,"category":category,"decisions":decisions,"findings":findings})
+        })
+        .collect();
+    Ok(v)
 }
 
 async fn platform_view(tx: &mut Transaction<'_, Postgres>, ws: Uuid) -> Result<Value> {
@@ -420,22 +434,6 @@ async fn platform_view(tx: &mut Transaction<'_, Postgres>, ws: Uuid) -> Result<V
     let mut v = workspace_json(ws, &p, local.as_ref(), local_visible, true, true);
     v["type_default"] = set_json(p.type_default.as_ref(), true);
     v["override"] = set_json(p.workspace_override.as_ref(), true);
-    // Totals only (no request detail), so also for a personal workspace;
-    // never of its local layer's rules, which are the owner's own choice.
-    // `findings` sums the distinct matches of decisions that found something.
-    let totals: Vec<(String, String, i64, i64)> = sqlx::query_as(
-        "SELECT action,category,count(*),coalesce(sum(count) FILTER(WHERE action IN('monitored','redacted','blocked','stopped')),0)::bigint FROM guardrail_events WHERE workspace_id=$1 AND created_at>=date_trunc('month',clock_timestamp(),'UTC') AND ($2 OR layer<>'workspace_local') GROUP BY action,category ORDER BY action,category",
-    )
-    .bind(ws)
-    .bind(local_visible)
-    .fetch_all(&mut **tx)
-    .await?;
-    v["decisions_this_month"] = totals
-        .into_iter()
-        .map(|(action, category, decisions, findings)| {
-            json!({"action":action,"category":category,"decisions":decisions,"findings":findings})
-        })
-        .collect();
     Ok(v)
 }
 
@@ -447,7 +445,7 @@ async fn platform_workspace_guardrails(
     let mut tx = platform_tx(&s, &u, false).await?;
     let v = platform_view(&mut tx, ws).await?;
     tx.commit().await?;
-    Ok(Json(v))
+    Ok(Json(with_totals(&s, ws, v).await?))
 }
 
 async fn put_platform_workspace_guardrails(
@@ -491,7 +489,7 @@ async fn put_platform_workspace_guardrails(
     .await?;
     let v = platform_view(&mut tx, ws).await?;
     tx.commit().await?;
-    Ok(Json(v))
+    Ok(Json(with_totals(&s, ws, v).await?))
 }
 
 async fn reset_platform_workspace_guardrails(
@@ -522,7 +520,7 @@ async fn reset_platform_workspace_guardrails(
     }
     let v = platform_view(&mut tx, ws).await?;
     tx.commit().await?;
-    Ok(Json(v))
+    Ok(Json(with_totals(&s, ws, v).await?))
 }
 
 async fn workspace_view(

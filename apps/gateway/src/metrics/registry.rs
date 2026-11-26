@@ -444,7 +444,7 @@ impl Metrics {
         );
         registry.register(
             "guardrail_detector_seconds",
-            "Time a request's guardrail detectors took, by detector kind",
+            "Time a request's guardrail scan took, by detector kind (the scan itself: never a wait for a scan slot or a policy load)",
             self.guardrail_detector.clone(),
         );
         registry.register(

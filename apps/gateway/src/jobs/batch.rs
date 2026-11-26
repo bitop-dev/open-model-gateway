@@ -271,7 +271,8 @@ impl Jobs {
         // A native batch's lines go to the provider's own batch API, which
         // this release does not inspect: its workspace's guardrails decide
         // before anything is reserved (gateway-run lines are inspected one by
-        // one by the engine).
+        // one by the engine). Whether a batch runs natively is the plan's
+        // outcome, so this follows the plan.
         if mode == BatchMode::Native {
             let (operation, workload) = match request.endpoint {
                 BatchEndpoint::Embeddings => ("embeddings", Workload::Embeddings),
@@ -287,10 +288,15 @@ impl Jobs {
                 workload,
             };
             if let Err(refused) = self.store.guard_unread(&principal, facts).await {
-                // Nothing was admitted: the private copy of the input goes too.
-                let _ = files
+                // Nothing was admitted: the private copy of the input goes too
+                // (if that fails, batch retention removes it).
+                if files
                     .delete(plan.work_file, Some(principal.workspace_id))
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(file_id = %plan.work_file, "could not remove a refused batch's private input copy; retention removes it");
+                }
                 return Err(refused.into());
             }
         }

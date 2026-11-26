@@ -55,18 +55,18 @@ fn mock(hits: Arc<AtomicUsize>) -> Router {
     })
 }
 
-struct World {
-    f: Fixture,
-    token: String,
-    base: String,
-    hits: Arc<AtomicUsize>,
+pub(super) struct World {
+    pub(super) f: Fixture,
+    pub(super) token: String,
+    pub(super) base: String,
+    pub(super) hits: Arc<AtomicUsize>,
     _upstream: Server,
     _gateway: Server,
 }
-async fn world(pool: PgPool, protocols: &str) -> World {
+pub(super) async fn world(pool: PgPool, protocols: &str) -> World {
     world_on(pool, protocols, "openai").await
 }
-async fn world_on(pool: PgPool, protocols: &str, provider: &str) -> World {
+pub(super) async fn world_on(pool: PgPool, protocols: &str, provider: &str) -> World {
     let mut f = fixture(pool).await;
     let token = issue_key(&mut f).await;
     sqlx::query("UPDATE deployments SET enabled=false WHERE id=$1")
@@ -111,7 +111,7 @@ async fn world_on(pool: PgPool, protocols: &str, provider: &str) -> World {
 }
 
 /// The type default of the principal's workspace kind, with one rule.
-async fn type_default(
+pub(super) async fn type_default(
     w: &World,
     action: &str,
     categories: &str,
@@ -174,12 +174,16 @@ async fn type_default(
 }
 
 /// A gateway key's shape, assembled here (never a real key).
-fn secret() -> String {
+pub(super) fn secret() -> String {
     let hex: String = "0123456789abcdef".chars().cycle().take(96).collect();
     format!("{}_{}.{}", "omg", &hex[..32], &hex[32..])
 }
 
-async fn send(w: &World, path: &str, body: Value) -> (StatusCode, Option<String>, Value) {
+pub(super) async fn send(
+    w: &World,
+    path: &str,
+    body: Value,
+) -> (StatusCode, Option<String>, Value) {
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let response = client
         .post(format!("{}{path}", w.base))
@@ -197,7 +201,7 @@ async fn send(w: &World, path: &str, body: Value) -> (StatusCode, Option<String>
     (status, retry, response.json().await.unwrap_or(Value::Null))
 }
 
-async fn events(w: &World) -> Vec<(String, String, String, i32)> {
+pub(super) async fn events(w: &World) -> Vec<(String, String, String, i32)> {
     sqlx::query_as(
         "SELECT operation,action,category,count FROM guardrail_events ORDER BY created_at,id",
     )

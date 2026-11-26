@@ -3318,6 +3318,8 @@
           "guardrail_detector_failed",
           "guardrail_input_blocked",
           "guardrail_not_supported",
+          "guardrail_rate_limited",
+          "guardrail_unavailable",
           "invalid_request_error",
           "invalid_upstream_response",
           "job_limit_exceeded",

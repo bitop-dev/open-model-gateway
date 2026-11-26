@@ -39,6 +39,7 @@ def guardrails(t):
     target = first(written.get("override", "rules")).get("id")
     t.ok("guardrails.override-replaces-type-default", written.get("platform", "source") == "workspace_override")
     t.ok("guardrails.enforced", written.get("enforced") is True)
+    t.ok("guardrails.inspected-workloads", written.get("inspected_workloads") == ["generation", "embeddings"])
     t.expect("guardrails.override-auditor-read", auditor.get(platform), 200)
 
     # The local layer tightens, never loosens, and adds a custom pattern.
