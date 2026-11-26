@@ -465,9 +465,10 @@ impl super::Engine {
 /// failed before an attempt, or abandoned), it counts toward its key's bound
 /// of recorded requests (`RECORDED`): the guardrail step runs before
 /// admission, so without it a key whose requests admission refuses could
-/// make the replica write rows without bound. Once an attempt is admitted,
-/// admission's own limits bound the request and it never counts, whatever
-/// happens upstream.
+/// make the replica write rows without bound. Once an attempt is admitted
+/// the request never counts, whatever happens upstream: it is bounded like
+/// any admitted request, by the rate, concurrency and budget limits that
+/// apply to it. A token count is never admitted, so it always counts.
 #[must_use]
 pub(super) struct Unadmitted {
     key: Option<Uuid>,

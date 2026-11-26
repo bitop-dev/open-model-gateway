@@ -66,7 +66,7 @@ pub(crate) fn settlement(job: &JobRow, v: &UpstreamVideo) -> Option<Settlement> 
 
 /// How long a video may stay without a provider id before its create counts
 /// as interrupted: the create call is bounded at 60 s, with at most one
-/// keyed resend, so a create still unadmitted after this never returns.
+/// keyed resend, so a create still unanswered after this never returns.
 pub(crate) const VIDEO_CREATE_GRACE: TimeDelta = TimeDelta::minutes(10);
 /// A record slower than this is not followed by a create: it would leave too
 /// little of the grace for the create call and its one resend.

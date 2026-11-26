@@ -445,6 +445,11 @@ async fn an_admitted_request_that_fails_upstream_does_not_count(pool: PgPool) {
             .await
             .unwrap();
         assert!(admitted >= 1, "the attempt was admitted");
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM guardrail_events")
+            .fetch_one(&w.f.store.pool)
+            .await
+            .unwrap();
+        assert!(rows >= 1, "its decisions wrote rows");
         assert_eq!(after, before, "an admitted request never counts");
         break;
     }

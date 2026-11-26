@@ -705,7 +705,7 @@ fn cookie_attributes_are_host_only_and_explicit() {
 /// connection as the provider closes it is lost, and identity traffic is never
 /// retried, so the sign-in fails after its one-time attempt is already consumed
 /// (#417: the local issuer closes after about 6 s idle). This provider answers the
-/// first request on a connection and drops any later one unadmitted, which is
+/// first request on a connection and drops any later one unanswered, which is
 /// what that race looks like from the gateway: every identity request must
 /// arrive on a connection of its own.
 #[tokio::test]

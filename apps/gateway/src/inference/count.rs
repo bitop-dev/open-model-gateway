@@ -348,12 +348,12 @@ impl Engine {
             workload: crate::guardrails::policy::Workload::Generation,
         };
         let inspect = || Some(crate::guardrails::enforce::chat_inspection(&request));
-        // Counts are already bounded per key and minute (above), so a count
-        // never counts as unadmitted.
-        timeout_at(deadline, self.guard_input(&principal, facts, inspect))
+        // A count is never admitted, so one whose decisions wrote rows counts
+        // toward the key's bound of unadmitted recorded requests (its own
+        // per-key bound can be set higher).
+        let _recorded = timeout_at(deadline, self.guard_input(&principal, facts, inspect))
             .await
-            .map_err(|_| InferenceError::Timeout)??
-            .admitted();
+            .map_err(|_| InferenceError::Timeout)??;
         let plan = timeout_at(
             deadline,
             self.repository
