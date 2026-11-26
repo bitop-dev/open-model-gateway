@@ -29,6 +29,9 @@ use crate::jobs::{
     insert_batch,
 };
 
+mod end;
+pub use end::EnvelopeEnd;
+
 /// The price list a batch reservation is valued with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PriceTier {
@@ -657,27 +660,6 @@ pub async fn close_batch(
     Ok(close(store, envelope, elapsed_ms, end, None).await? == Closed::Settled)
 }
 
-/// How a batch envelope's execution ends when it is closed at zero.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EnvelopeEnd {
-    /// Its lines ran (a gateway-run batch's runner closes it).
-    Succeeded,
-    /// The client cancelled it before anything was sent.
-    Cancelled,
-    /// It ended before anything was sent, without a client's cancellation
-    /// (a native batch whose submission expired).
-    Failed,
-}
-impl EnvelopeEnd {
-    fn state(self) -> &'static str {
-        match self {
-            Self::Succeeded => "succeeded",
-            Self::Cancelled => "cancelled",
-            Self::Failed => "failed",
-        }
-    }
-}
-
 /// [`close_batch`] for a gateway-run batch's runner: only while it still holds
 /// the batch's claim, checked in the settling transaction.
 pub(crate) async fn close_gateway_batch(
@@ -765,7 +747,7 @@ async fn close_batch_once(
         tx.commit().await.map_err(storage)?;
         return Ok(Closed::NotPending);
     }
-    let changed = sqlx::query("UPDATE inference_executions SET state=$3,input_tokens=0,output_tokens=0,elapsed_ms=$2,completed_at=clock_timestamp(),finish_reason=CASE $3 WHEN 'cancelled' THEN 'cancelled' WHEN 'failed' THEN 'error' ELSE 'stop' END WHERE id=$1 AND state='started' AND workload_kind='batches'")
+    let changed = sqlx::query("UPDATE inference_executions SET state=$3,input_tokens=0,output_tokens=0,elapsed_ms=$2,completed_at=clock_timestamp(),finish_reason=CASE $3 WHEN 'cancelled' THEN 'cancelled' WHEN 'failed' THEN 'error' ELSE 'stop' END,error_code=CASE $3 WHEN 'failed' THEN 'submission_expired' ELSE error_code END WHERE id=$1 AND state='started' AND workload_kind='batches'")
         .bind(envelope)
         .bind(elapsed_ms.min(i64::MAX as u64) as i64)
         .bind(end.state())

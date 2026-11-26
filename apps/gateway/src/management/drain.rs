@@ -76,8 +76,10 @@ fn hidden(c: char) -> bool {
                 | '\u{2800}'
                 | '\u{3164}'
                 | '\u{FFA0}'
-                // U+FE0E and U+FE0F choose text or emoji presentation and
-                // cannot hide text ("⚠️" carries U+FE0F): they are allowed.
+                // U+FE0E and U+FE0F (text or emoji presentation) are allowed
+                // so emoji read as written ("⚠️" carries U+FE0F). Like any
+                // combining mark they show nothing on their own, so two
+                // reasons may differ by them unseen; they hide no words.
                 | '\u{FE00}'..='\u{FE0D}'
                 | '\u{180B}'..='\u{180D}'
                 | '\u{180F}'

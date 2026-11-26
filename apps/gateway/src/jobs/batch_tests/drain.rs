@@ -198,12 +198,16 @@ async fn settled_unsent(
         (got.as_str(), code.as_deref(), settled, started),
         (state, error, true, false)
     );
-    let ran: String = sqlx::query_scalar("SELECT state FROM inference_executions WHERE id=$1")
-        .bind(job.execution_id)
-        .fetch_one(&w.f.store.pool)
-        .await
-        .unwrap();
+    let (ran, ran_code): (String, Option<String>) =
+        sqlx::query_as("SELECT state, error_code FROM inference_executions WHERE id=$1")
+            .bind(job.execution_id)
+            .fetch_one(&w.f.store.pool)
+            .await
+            .unwrap();
     assert_eq!(ran, execution);
+    if execution == "failed" {
+        assert_eq!(ran_code.as_deref(), Some("submission_expired"));
+    }
     let (reservation, _, actual, _) = reservation(&w.f, job.execution_id).await;
     assert_eq!((reservation.as_str(), actual), ("settled", Some(0)));
     let ledger: Vec<(String, Option<i64>)> = sqlx::query_as(
@@ -459,4 +463,46 @@ async fn a_job_route_drained_after_the_plan_is_passed_over(pool: PgPool) {
     let error = select().await.err().unwrap();
     assert_eq!(error, InferenceError::RouteDrained(None));
     assert_eq!(error.code(), "model_temporarily_unavailable");
+}
+
+/// Past its poll deadline: a batch that ended unsent and whose settlement
+/// did not complete is still claimed and settled at zero; a claimed
+/// submission that never recorded a provider id is still claimed and, past
+/// the grace, ends `submission_interrupted`, keeping its hold.
+#[dbtest::test]
+async fn past_the_deadline_an_unsent_end_settles_and_an_unrecorded_submission_is_interrupted(
+    pool: PgPool,
+) {
+    let w = world(pool, true, false, 2).await;
+    let unsent = native(&w).await;
+    sqlx::query("UPDATE async_jobs SET state='failed', upstream_status='failed', error_code='submission_expired', completed_at=clock_timestamp(), poll_deadline_at=now()-interval '1 minute' WHERE id=$1")
+        .bind(unsent.id)
+        .execute(&w.f.store.pool)
+        .await
+        .unwrap();
+    let claimed = native(&w).await;
+    sqlx::query("UPDATE async_jobs SET submit_started_at=now()-interval '2 hours', poll_deadline_at=now()-interval '1 minute' WHERE id=$1")
+        .bind(claimed.id)
+        .execute(&w.f.store.pool)
+        .await
+        .unwrap();
+    w.poll().await;
+    settled_unsent(&w, &unsent, "failed", Some("submission_expired"), "failed").await;
+    let (state, error): (String, Option<String>) =
+        sqlx::query_as("SELECT state, error_code FROM async_jobs WHERE id=$1")
+            .bind(claimed.id)
+            .fetch_one(&w.f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        (state.as_str(), error.as_deref()),
+        ("failed", Some("submission_interrupted"))
+    );
+    let (_, _, actual, _) = reservation(&w.f, claimed.execution_id).await;
+    assert_ne!(
+        actual,
+        Some(0),
+        "a submission that may have been sent is never settled at zero"
+    );
+    assert!(w.openai.script.lock().unwrap().submitted.is_empty());
 }

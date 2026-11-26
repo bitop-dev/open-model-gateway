@@ -350,6 +350,10 @@ impl Jobs {
         let elapsed = (UtcInstant::now() - job.created_at)
             .whole_milliseconds()
             .max(0) as u64;
+        // A reservation that reconciliation already took (its lease ran
+        // out) is no longer pending: `close_batch` changes nothing and its
+        // hold stays unknown for reconciliation. The job is marked settled
+        // either way, so it is not claimed again.
         crate::governance::batch::close_batch(&self.store, job.execution_id, elapsed, end).await?;
         store::mark_settled(&self.store, job.id).await?;
         self.discard_work_file(job).await;
