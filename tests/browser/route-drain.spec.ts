@@ -44,7 +44,8 @@ test("an admin drains a route and its connection and reads the drain in words", 
     await expect(section.getByText("Not drained", { exact: true })).toBeVisible();
     // A connection drain: its page counts the routes it takes out, and the
     // route page says the route is drained through it.
-    await page.goto(`/admin/providers/${connection}?tab=drain`);
+    await page.goto(`/admin/providers/${connection}`);
+    await page.getByRole("tab", { name: "Drain" }).click();
     const panel = page.getByText("Draining it would take out 1 enabled route on this connection.", { exact: false });
     await expect(panel).toBeVisible();
     const drainConnection = page.getByRole("button", { name: "Drain connection…", exact: true });
