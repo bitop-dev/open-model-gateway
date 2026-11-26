@@ -1047,7 +1047,7 @@ A second, isolated stack (for example two agents measuring at once) uses `--proj
 
 `run --readers N` adds N concurrent closed-loop management readers for the duration of the run: platform cost report, usage overview and request log, a shared workspace's usage overview and requests, `/me/summary`, `/me` and `/v1/models`, over the last `--reader-days` (default 7) days. They use the seeded reader: user 1 is a platform Auditor that owns shared workspace 1, with a browser session whose cookie is derived from the seed like the keys. The JSON report gains `reader` (per-endpoint statuses and latency), and `report` adds a readers column.
 
-`tools/loadgen/tests/end_to_end.rs` runs the same seed, real gateway (with the real `openai_compatible` adapter), mock, generator and verification in one process against a throwaway database on `DATABASE_URL`, as part of `cargo test --workspace --all-features`.
+`tools/loadgen/tests/end_to_end.rs` runs the same seed, real gateway (with the real `openai_compatible` adapter), mock, generator and verification in one process against a throwaway database on `DATABASE_URL`, as part of `cargo test --workspace --all-features`. Its settlement scenario proves exact settlement, not capacity: a request shed by the 1.5 s admission bound on a loaded host (`503 scope_busy`, nothing written) is resent after its `Retry-After` with the same nonce (`RunConfig::retry_shed`; the CLI never resends), and every request must still settle exactly once with one upstream call.
 
 The generator, mock, gateways and PostgreSQL share one machine in the laptop stack, so they compete for CPU. For certification runs (scale plan P8) put the generator and mock on separate hosts.
 
