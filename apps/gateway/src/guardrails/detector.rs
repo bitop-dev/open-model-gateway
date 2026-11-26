@@ -5,6 +5,7 @@
 //! locates a match so the caller can count distinct values (and, in a later
 //! phase, redact). Nothing here is stored or logged; a decision records the
 //! rule, the category and a count.
+use std::borrow::Cow;
 use std::ops::Range;
 
 use async_trait::async_trait;
@@ -22,9 +23,10 @@ pub enum Part {
     ToolDescription,
 }
 
-/// One piece of text the request sends upstream.
+/// One piece of text the request sends upstream: borrowed from it, or
+/// derived from it (parsed tool-call arguments, joined text blocks).
 pub struct Segment<'a> {
-    pub text: &'a str,
+    pub text: Cow<'a, str>,
     pub part: Part,
 }
 
@@ -38,7 +40,18 @@ pub struct Inspection<'a> {
 impl<'a> Inspection<'a> {
     pub fn push(&mut self, text: &'a str, part: Part) {
         if !text.is_empty() {
-            self.segments.push(Segment { text, part });
+            self.segments.push(Segment {
+                text: Cow::Borrowed(text),
+                part,
+            });
+        }
+    }
+    pub fn push_owned(&mut self, text: String, part: Part) {
+        if !text.is_empty() {
+            self.segments.push(Segment {
+                text: Cow::Owned(text),
+                part,
+            });
         }
     }
 }
@@ -62,7 +75,7 @@ impl Findings {
             if let Some(text) = input
                 .segments
                 .get(f.segment)
-                .and_then(|s| s.text.get(f.span.clone()))
+                .and_then(|s| s.text.as_ref().get(f.span.clone()))
             {
                 seen.insert(text);
             }

@@ -45538,7 +45538,7 @@
         "additionalProperties": false,
         "properties": {
           "decisions_this_month": {
-            "description": "This month's guardrail decisions on the workspace (UTC month), per action and category: totals only, never request detail, also for a personal workspace (#840).",
+            "description": "This month's guardrail decisions on the workspace (UTC month), per action and category: totals only, never request detail, also for a personal workspace, but never of a personal workspace's local layer (#840).",
             "items": {
               "additionalProperties": false,
               "properties": {
@@ -45566,7 +45566,8 @@
                   "type": "integer"
                 },
                 "findings": {
-                  "minimum": 1,
+                  "description": "Distinct matches of the decisions that found something (0 for skipped or failed rules).",
+                  "minimum": 0,
                   "type": "integer"
                 }
               },
@@ -49605,7 +49606,7 @@
         "additionalProperties": false,
         "properties": {
           "decisions_this_month": {
-            "description": "This month's guardrail decisions on the workspace (UTC month), per action and category: totals only, never request detail, also for a personal workspace (#840).",
+            "description": "This month's guardrail decisions on the workspace (UTC month), per action and category: totals only, never request detail, also for a personal workspace, but never of a personal workspace's local layer (#840).",
             "items": {
               "additionalProperties": false,
               "properties": {
@@ -49633,7 +49634,8 @@
                   "type": "integer"
                 },
                 "findings": {
-                  "minimum": 1,
+                  "description": "Distinct matches of the decisions that found something (0 for skipped or failed rules).",
+                  "minimum": 0,
                   "type": "integer"
                 }
               },
@@ -58178,7 +58180,7 @@
         "additionalProperties": false,
         "properties": {
           "decisions_this_month": {
-            "description": "This month's guardrail decisions on the workspace (UTC month), per action and category: totals only, never request detail, also for a personal workspace (#840).",
+            "description": "This month's guardrail decisions on the workspace (UTC month), per action and category: totals only, never request detail, also for a personal workspace, but never of a personal workspace's local layer (#840).",
             "items": {
               "additionalProperties": false,
               "properties": {
@@ -58206,7 +58208,8 @@
                   "type": "integer"
                 },
                 "findings": {
-                  "minimum": 1,
+                  "description": "Distinct matches of the decisions that found something (0 for skipped or failed rules).",
+                  "minimum": 0,
                   "type": "integer"
                 }
               },

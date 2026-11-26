@@ -105,6 +105,9 @@ fn every_builtin_rule_matches_its_shape_inside_prose() {
     for (name, value) in positives {
         let text = format!("please use {value} for the deploy");
         assert!(found(&d, &text) >= 1, "{name} not found");
+        // A character glued to either end does not hide it.
+        let glued = format!("x{value}x");
+        assert!(found(&d, &glued) >= 1, "{name} glued");
     }
 }
 

@@ -128,7 +128,13 @@ async fn refused_requests_are_listed_as_blocked_with_logs_visibility(pool: PgPoo
     .await;
     let staff = roots(&staff);
     assert!(staff.contains(&own.to_string()) && !staff.contains(&private.to_string()));
-    // For a personal workspace they see this month's totals only.
+    // For a personal workspace they see this month's totals only, and never
+    // of its local layer (the refused request above was decided there).
+    sqlx::query("INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count) SELECT gen_random_uuid(),gen_random_uuid(),workspace_id,api_key_id,'embeddings','company/smart','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','secret','monitored',3 FROM guardrail_events WHERE root_request_id=$1")
+        .bind(private)
+        .execute(&pool)
+        .await
+        .unwrap();
     let (status, totals) = call(
         &f.s,
         &f.auditor,
@@ -140,7 +146,7 @@ async fn refused_requests_are_listed_as_blocked_with_logs_visibility(pool: PgPoo
     assert_eq!(status, StatusCode::OK, "{totals}");
     assert_eq!(
         totals["decisions_this_month"],
-        json!([{"action":"blocked","category":"custom","decisions":1,"findings":2}])
+        json!([{"action":"monitored","category":"secret","decisions":1,"findings":3}])
     );
     // Attempt lists have nothing a refused request could match.
     for path in ["generations", "sessions"] {

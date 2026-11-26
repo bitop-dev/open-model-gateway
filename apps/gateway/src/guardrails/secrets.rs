@@ -4,7 +4,8 @@
 //!
 //! The built-in rules match credentials by their documented shape: a fixed
 //! prefix or structure, so ordinary code, UUIDs, hashes and base64 data do not
-//! match. A PEM private key is matched on its `BEGIN` line, which is enough to
+//! match. They are not anchored on word boundaries: a character glued to a
+//! credential does not hide it. A PEM private key is matched on its `BEGIN` line, which is enough to
 //! refuse it and keeps the match short.
 use std::sync::LazyLock;
 
@@ -17,47 +18,38 @@ use super::policy::{Category, DetectorKind, Egress};
 /// The built-in secret shapes, by name (names are for tests and docs only;
 /// a decision records the rule and the category `secret`).
 pub const BUILTIN: &[(&str, &str)] = &[
-    (
-        "aws_access_key_id",
-        r"\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b",
-    ),
+    ("aws_access_key_id", r"(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}"),
     (
         "github_token",
-        r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,255}\b",
+        r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,255}",
     ),
-    (
-        "github_fine_grained_token",
-        r"\bgithub_pat_[A-Za-z0-9_]{82}\b",
-    ),
-    ("gitlab_token", r"\bglpat-[A-Za-z0-9_\-]{20,}\b"),
-    ("slack_token", r"\bxox[abposr]-[A-Za-z0-9-]{10,250}\b"),
+    ("github_fine_grained_token", r"github_pat_[A-Za-z0-9_]{82}"),
+    ("gitlab_token", r"glpat-[A-Za-z0-9_\-]{20,}"),
+    ("slack_token", r"xox[abposr]-[A-Za-z0-9-]{10,250}"),
     (
         "slack_webhook",
         r"https://hooks\.slack\.com/services/T[A-Z0-9]{8,}/B[A-Z0-9]{8,}/[A-Za-z0-9]{24}",
     ),
-    (
-        "stripe_secret_key",
-        r"\b(?:sk|rk)_live_[A-Za-z0-9]{24,99}\b",
-    ),
+    ("stripe_secret_key", r"(?:sk|rk)_live_[A-Za-z0-9]{24,99}"),
     (
         "openai_api_key",
-        r"\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_\-]{20,}T3BlbkFJ[A-Za-z0-9_\-]{20,}",
+        r"sk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_\-]{20,}T3BlbkFJ[A-Za-z0-9_\-]{20,}",
     ),
     (
         "anthropic_api_key",
-        r"\bsk-ant-(?:api|admin)[0-9]{2}-[A-Za-z0-9_\-]{80,120}",
+        r"sk-ant-(?:api|admin)[0-9]{2}-[A-Za-z0-9_\-]{80,120}",
     ),
-    ("google_api_key", r"\bAIza[0-9A-Za-z_\-]{35}\b"),
-    ("huggingface_token", r"\bhf_[A-Za-z0-9]{34,40}\b"),
-    ("npm_token", r"\bnpm_[A-Za-z0-9]{36}\b"),
+    ("google_api_key", r"AIza[0-9A-Za-z_\-]{35}"),
+    ("huggingface_token", r"hf_[A-Za-z0-9]{34,40}"),
+    ("npm_token", r"npm_[A-Za-z0-9]{36}"),
     ("private_key", r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----"),
     (
         "jwt",
-        r"\beyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{16,}",
+        r"eyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{16,}",
     ),
     (
         "connection_string_password",
-        r"\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|rediss?|amqps?|mssql|sqlserver)://[^\s:/@]{1,256}:[^\s@/]{1,256}@[^\s/]{1,256}",
+        r"(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|rediss?|amqps?|mssql|sqlserver)://[^\s:/@]{1,256}:[^\s@/]{1,256}@[^\s/]{1,256}",
     ),
     (
         "azure_storage_connection_string",
@@ -65,11 +57,11 @@ pub const BUILTIN: &[(&str, &str)] = &[
     ),
     (
         "gateway_inference_key",
-        r"\bomg_[0-9a-fA-F]{32}\.[0-9a-fA-F]{64}\b",
+        r"omg_[0-9a-fA-F]{32}\.[0-9a-fA-F]{64}",
     ),
     (
         "gateway_admin_token",
-        r"\bomg_admin_[0-9a-fA-F]{32}\.[0-9a-fA-F]{64}\b",
+        r"omg_admin_[0-9a-fA-F]{32}\.[0-9a-fA-F]{64}",
     ),
 ];
 
@@ -84,6 +76,31 @@ static SECRETS: LazyLock<Builtin> = LazyLock::new(|| Builtin {
         .map(|(_, p)| Regex::new(p).expect("built-in secret pattern"))
         .collect(),
 });
+
+/// At most this many matches are kept per scan (the count saturates there),
+/// so a pattern that matches everywhere costs bounded memory.
+pub const MAX_FINDINGS: usize = 10_000;
+
+/// Every match of the built-in secret shapes (shared by every rule that has
+/// the `secret` category in one request).
+pub fn builtin(input: &Inspection<'_>) -> Findings {
+    let mut found = Vec::new();
+    for (index, segment) in input.segments.iter().enumerate() {
+        for i in SECRETS.any.matches(&segment.text).iter() {
+            for m in SECRETS.each[i].find_iter(&segment.text) {
+                if found.len() == MAX_FINDINGS {
+                    return Findings(found);
+                }
+                found.push(Finding {
+                    category: Category::Secret,
+                    segment: index,
+                    span: m.range(),
+                });
+            }
+        }
+    }
+    Findings(found)
+}
 
 /// One rule's pattern detector: the built-in secret shapes when the rule has
 /// the `secret` category, and its custom patterns (compiled within the limits
@@ -109,21 +126,27 @@ impl PatternDetector {
     }
     /// Every match, synchronously (the detector never waits on anything).
     pub fn scan(&self, input: &Inspection<'_>) -> Findings {
+        let mut found = if self.secrets {
+            builtin(input).0
+        } else {
+            Vec::new()
+        };
+        found.extend(self.custom_findings(input).0);
+        Findings(found)
+    }
+    /// Whether the built-in secret shapes run for this rule.
+    pub fn secrets(&self) -> bool {
+        self.secrets
+    }
+    /// Matches of the rule's custom patterns; empty matches never count.
+    pub fn custom_findings(&self, input: &Inspection<'_>) -> Findings {
         let mut found = Vec::new();
         for (index, segment) in input.segments.iter().enumerate() {
-            if self.secrets {
-                for i in SECRETS.any.matches(segment.text).iter() {
-                    for m in SECRETS.each[i].find_iter(segment.text) {
-                        found.push(Finding {
-                            category: Category::Secret,
-                            segment: index,
-                            span: m.range(),
-                        });
-                    }
-                }
-            }
             for pattern in &self.custom {
-                for m in pattern.find_iter(segment.text) {
+                for m in pattern.find_iter(&segment.text).filter(|m| !m.is_empty()) {
+                    if found.len() == MAX_FINDINGS {
+                        return Findings(found);
+                    }
                     found.push(Finding {
                         category: Category::Custom,
                         segment: index,

@@ -337,6 +337,16 @@ impl Engine {
                 .unwrap_or(InferenceError::Unsupported)
                 .into());
         }
+        // A count sends the request's text to the provider: the guardrails
+        // of a Messages request apply before any route is used.
+        self.guard_chat(
+            &principal,
+            &request,
+            request_id,
+            ApiProtocol::Messages,
+            deadline,
+        )
+        .await?;
         let plan = timeout_at(
             deadline,
             self.repository

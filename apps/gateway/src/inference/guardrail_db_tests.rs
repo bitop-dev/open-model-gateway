@@ -20,6 +20,7 @@ use crate::governance::tests::db::{Fixture, fixture};
 use crate::inference::error::InferenceError;
 use crate::providers::{
     ProviderRegistry,
+    anthropic::AnthropicAdapter,
     openai::OpenAiAdapter,
     secrets::{Secret, SecretResolver},
 };
@@ -60,6 +61,9 @@ struct World {
     _gateway: Server,
 }
 async fn world(pool: PgPool, protocols: &str) -> World {
+    world_on(pool, protocols, "openai").await
+}
+async fn world_on(pool: PgPool, protocols: &str, provider: &str) -> World {
     let mut f = fixture(pool).await;
     let token = issue_key(&mut f).await;
     sqlx::query("UPDATE deployments SET enabled=false WHERE id=$1")
@@ -73,16 +77,25 @@ async fn world(pool: PgPool, protocols: &str) -> World {
     .execute(&f.store.pool)
     .await
     .unwrap();
-    add_deployment(&f, "openai", "env:OPENAI_NOT_RESOLVED", None, "gpt-test", 1).await;
+    add_deployment(&f, provider, "env:NOT_RESOLVED", None, "gpt-test", 1).await;
     let hits = Arc::new(AtomicUsize::new(0));
     let (upstream, up) = serve(mock(hits.clone())).await;
     let mut registry = ProviderRegistry::default();
-    registry
-        .register(Arc::new(OpenAiAdapter::for_test(
-            Arc::new(Resolver),
-            format!("{upstream}/v1"),
-        )))
-        .unwrap();
+    if provider == "anthropic" {
+        registry
+            .register(Arc::new(AnthropicAdapter::for_test(
+                Arc::new(Resolver),
+                format!("{upstream}/v1"),
+            )))
+            .unwrap();
+    } else {
+        registry
+            .register(Arc::new(OpenAiAdapter::for_test(
+                Arc::new(Resolver),
+                format!("{upstream}/v1"),
+            )))
+            .unwrap();
+    }
     let (base, gw) = start_gateway(&f, registry).await;
     World {
         f,
@@ -324,4 +337,23 @@ async fn a_canary_through_every_action_is_stored_logged_and_measured_nowhere(poo
     for (name, text) in [("metrics", metrics), ("log", capture.text())] {
         assert!(!text.contains(&canary), "found in the {name}");
     }
+}
+
+#[dbtest::test]
+async fn a_token_count_is_inspected_before_it_reaches_the_provider(pool: PgPool) {
+    let w = world_on(pool, "'messages'", "anthropic").await;
+    type_default(&w, "block", "{secret}", &[]).await;
+    let body = json!({"model":"company/smart","messages":[{"role":"user","content":format!("count {}", secret())}]});
+    let (status, retry, body) = send(&w, "/v1/messages/count_tokens", body).await;
+    assert_eq!(
+        (status, retry.as_deref()),
+        (StatusCode::BAD_REQUEST, Some("false")),
+        "{body}"
+    );
+    assert_eq!(body["error"]["guardrail"]["category"], "secret");
+    assert_eq!(
+        w.hits.load(Ordering::SeqCst),
+        0,
+        "nothing was sent to count"
+    );
 }

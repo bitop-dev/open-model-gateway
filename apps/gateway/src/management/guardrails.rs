@@ -416,11 +416,14 @@ async fn platform_view(tx: &mut Transaction<'_, Postgres>, ws: Uuid) -> Result<V
     let mut v = workspace_json(ws, &p, local.as_ref(), local_visible, true, true);
     v["type_default"] = set_json(p.type_default.as_ref(), true);
     v["override"] = set_json(p.workspace_override.as_ref(), true);
-    // Totals only (no request detail), so also for a personal workspace.
+    // Totals only (no request detail), so also for a personal workspace;
+    // never of its local layer's rules, which are the owner's own choice.
+    // `findings` sums the distinct matches of decisions that found something.
     let totals: Vec<(String, String, i64, i64)> = sqlx::query_as(
-        "SELECT action,category,count(*),sum(count)::bigint FROM guardrail_events WHERE workspace_id=$1 AND created_at>=date_trunc('month',clock_timestamp(),'UTC') GROUP BY action,category ORDER BY action,category",
+        "SELECT action,category,count(*),coalesce(sum(count) FILTER(WHERE action IN('monitored','redacted','blocked','stopped')),0)::bigint FROM guardrail_events WHERE workspace_id=$1 AND created_at>=date_trunc('month',clock_timestamp(),'UTC') AND ($2 OR layer<>'workspace_local') GROUP BY action,category ORDER BY action,category",
     )
     .bind(ws)
+    .bind(local_visible)
     .fetch_all(&mut **tx)
     .await?;
     v["decisions_this_month"] = totals

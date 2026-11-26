@@ -3,6 +3,7 @@
 //! and list. Native batches are then driven by the poller (`native`),
 //! gateway-run batches by the batch runner (`runner`). Batches created by
 //! the 0016 passthrough are still polled until settled (`refresh_legacy`).
+use crate::guardrails::policy::Workload;
 use gateway_datetime_compat::UtcInstant;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
@@ -267,6 +268,26 @@ impl Jobs {
         } else {
             BatchMode::Gateway
         };
+        // A native batch's lines go to the provider's own batch API, which
+        // this release does not inspect: its workspace's guardrails decide
+        // before anything is reserved (gateway-run lines are inspected one by
+        // one by the engine).
+        if mode == BatchMode::Native {
+            let (operation, workload) = match request.endpoint {
+                BatchEndpoint::Embeddings => ("embeddings", Workload::Embeddings),
+                BatchEndpoint::Responses => ("responses", Workload::Generation),
+                BatchEndpoint::Messages => ("messages", Workload::Generation),
+                BatchEndpoint::ChatCompletions => ("chat_completions", Workload::Generation),
+            };
+            let facts = crate::inference::guardrails::Guarded {
+                request_id,
+                operation,
+                model: &plan.model,
+                streamed: false,
+                workload,
+            };
+            self.store.guard_unread(&principal, facts).await?;
+        }
         // The envelope reservation and the job row are one transaction: the
         // envelope's lease runs to the job's deadline from the moment it
         // exists, and a rollback leaves neither. A lost COMMIT acknowledgement

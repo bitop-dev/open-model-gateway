@@ -75,3 +75,62 @@ async fn a_blocked_line_gets_the_interactive_error_body(pool: PgPool) {
         .unwrap();
     assert_eq!(recorded, ("blocked".into(), true));
 }
+
+/// A native batch's lines go to the provider's batch API, which this release
+/// does not inspect: an enforcing rule refuses the batch before anything is
+/// reserved (gateway-run mode inspects each line instead).
+#[dbtest::test]
+async fn a_native_batch_is_refused_by_an_enforcing_rule(pool: PgPool) {
+    let w = world_with(pool, true, false, 1, None).await;
+    let f = &w.f;
+    let kind: String = sqlx::query_scalar("SELECT kind FROM workspaces WHERE id=$1")
+        .bind(f.principal.workspace_id)
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    let mut tx = f.store.pool.begin().await.unwrap();
+    let set = Uuid::now_v7();
+    sqlx::query("INSERT INTO guardrail_rule_sets(id,layer,kind,local_only,updated_by) VALUES($1,'type_default',$2,false,$3)")
+        .bind(set).bind(&kind).bind(f.owner).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable) VALUES($1,$2,0,'Secrets','secrets','pattern','{secret}','block','user_text','off','fail_closed','{generation}','deny')")
+        .bind(Uuid::now_v7()).bind(set).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    let file = w
+        .upload(&f.principal, &[chat_line("a", "company/smart", "hello")])
+        .await;
+    let before: i64 = sqlx::query_scalar("SELECT count(*) FROM governance_reservations")
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    let refused = w
+        .create(f.principal, &file, BatchEndpoint::ChatCompletions, None)
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(CreateError::Job(JobError::Inference(InferenceError::Guardrail(r))))
+                if r.kind == crate::guardrails::enforce::RefusalKind::NotSupported
+        ),
+        "a native batch is refused"
+    );
+    let after: i64 = sqlx::query_scalar("SELECT count(*) FROM governance_reservations")
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(before, after, "nothing was reserved");
+    let recorded: (String, bool) = sqlx::query_as("SELECT action,refused FROM guardrail_events")
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(recorded, ("skipped".into(), true));
+    // Gateway-run mode inspects the lines and runs the batch.
+    let job = w
+        .create(
+            f.principal,
+            &file,
+            BatchEndpoint::ChatCompletions,
+            Some(json!({"omg_mode": "gateway"})),
+        )
+        .await;
+    assert!(job.is_ok());
+}

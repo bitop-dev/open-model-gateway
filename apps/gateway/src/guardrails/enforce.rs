@@ -61,7 +61,10 @@ impl Policy {
                 Some(InactiveReason::NotRunnable) => false,
                 Some(_) => continue,
             };
-            if rule.input_action == InputAction::Off {
+            // A rule this release cannot run fails under its on_error whatever
+            // its input action (it may enforce on output); others run on input
+            // only when their input action is not `off`.
+            if runnable && rule.input_action == InputAction::Off {
                 continue;
             }
             let categories: Vec<Category> = rule.detector.categories.iter().copied().collect();
@@ -190,6 +193,8 @@ impl Policy {
     /// workload carries no text a detector can read).
     pub fn decide(&self, workload: Workload, input: Option<&Inspection<'_>>) -> Decision {
         let mut decision = Decision::default();
+        // The built-in secret shapes, scanned once for every rule that uses them.
+        let mut builtin: Option<super::detector::Findings> = None;
         let refuse = |d: &mut Decision, r: &CompiledRule, kind, category| {
             let refusal = Refusal {
                 kind,
@@ -230,9 +235,15 @@ impl Policy {
             };
             let blocking = r.action == InputAction::Block;
             if let Some(input) = input {
-                let findings = detector.scan(input);
+                let custom = detector.custom_findings(input);
                 for &category in &r.categories {
-                    let count = findings.distinct(input, category);
+                    let count = if category == Category::Secret && detector.secrets() {
+                        builtin
+                            .get_or_insert_with(|| super::secrets::builtin(input))
+                            .distinct(input, category)
+                    } else {
+                        custom.distinct(input, category)
+                    };
                     if count == 0 {
                         continue;
                     }
@@ -249,17 +260,17 @@ impl Policy {
                 }
             }
             if input.is_none_or(|i| i.uninspectable) {
+                // Nothing was found: the rule could not read the request.
+                decision.events.push(event(first, Action::Skipped, 1));
                 if blocking && r.uninspectable == Uninspectable::Deny {
-                    decision.events.push(event(first, Action::Blocked, 1));
                     refuse(&mut decision, r, RefusalKind::NotSupported, first);
-                } else {
-                    decision.events.push(event(first, Action::Skipped, 1));
                 }
             }
         }
         if let Some(r) = decision.refusal {
             let action = match r.kind {
-                RefusalKind::InputBlocked | RefusalKind::NotSupported => Action::Blocked,
+                RefusalKind::InputBlocked => Action::Blocked,
+                RefusalKind::NotSupported => Action::Skipped,
                 RefusalKind::DetectorFailed => Action::DetectorFailed,
             };
             if let Some(e) = decision
@@ -274,12 +285,18 @@ impl Policy {
     }
 }
 
-/// The text a generation request sends upstream: every message, tool call
-/// and tool definition, and the native Messages envelopes that replace them on
-/// Anthropic routes (a value present in both counts once). Images, and
-/// documents that are not plain text, cannot be read.
+/// The text a generation request sends upstream: every message (content,
+/// tool-call ids, names and arguments, raw and parsed), tool definitions, the
+/// forced tool's name, and the native Messages envelopes and options that
+/// replace or add to them on Anthropic routes (system, stop sequences,
+/// output schema, context management, earlier thinking). A value present in
+/// several forms counts once. Consecutive system messages, and a native
+/// message's text blocks, are also read joined, so text split across blocks
+/// is found. Images, audio, and documents that are not plain text cannot be
+/// read.
 pub fn chat_inspection(request: &ChatRequest) -> Inspection<'_> {
     let mut input = Inspection::default();
+    let mut system = Vec::new();
     for m in &request.messages {
         let part = match m.role {
             Role::System | Role::Developer => Part::System,
@@ -288,34 +305,72 @@ pub fn chat_inspection(request: &ChatRequest) -> Inspection<'_> {
         };
         if let Some(text) = &m.content {
             input.push(text, part);
+            if part == Part::System {
+                system.push(text.as_str());
+            }
+        }
+        if part != Part::System {
+            join(&mut input, &mut system, Part::System);
+        }
+        if let Some(id) = &m.tool_call_id {
+            input.push(id, Part::ToolResult);
         }
         for call in &m.tool_calls {
+            input.push(&call.id, Part::ToolArguments);
             input.push(&call.name, Part::ToolArguments);
             input.push(&call.arguments, Part::ToolArguments);
+            // Adapters may decode the arguments: read them decoded too.
+            if let Ok(parsed) = serde_json::from_str::<Value>(&call.arguments) {
+                owned(&parsed, Part::ToolArguments, &mut input);
+            }
         }
     }
+    join(&mut input, &mut system, Part::System);
     for tool in &request.tools {
         input.push(&tool.name, Part::ToolDescription);
         if let Some(d) = &tool.description {
             input.push(d, Part::ToolDescription);
         }
-        walk(&tool.parameters, Part::ToolDescription, &mut input);
+        json(&tool.parameters, Part::ToolDescription, &mut input);
+    }
+    if let Some(crate::inference::types::ToolChoice::Function(name)) = &request.tool_choice {
+        input.push(name, Part::ToolDescription);
     }
     if let Some(options) = &request.messages_options {
-        for v in &options.native_messages {
-            walk(v, Part::Content, &mut input);
+        for m in &options.native_messages {
+            message(m, &mut input);
         }
-        for v in &options.native_tools {
-            walk(v, Part::ToolDescription, &mut input);
+        for t in &options.native_tools {
+            json(t, Part::ToolDescription, &mut input);
         }
         if let Some(system) = &options.system {
-            walk(system, Part::System, &mut input);
+            content(system, Part::System, &mut input);
+        }
+        for t in &options.history_thinking {
+            block(t, Part::Content, &mut input);
+        }
+        for v in [&options.output_config, &options.context_management]
+            .into_iter()
+            .flatten()
+        {
+            json(v, Part::System, &mut input);
+        }
+        for stop in options.stop_sequences.iter().flatten() {
+            input.push(stop, Part::System);
         }
         if !options.images.is_empty() {
             input.uninspectable = true;
         }
     }
     input
+}
+
+/// Push the joined texts of `pending` (two or more) and clear it.
+fn join<'a>(input: &mut Inspection<'a>, pending: &mut Vec<&'a str>, part: Part) {
+    if pending.len() > 1 {
+        input.push_owned(pending.concat(), part);
+    }
+    pending.clear();
 }
 
 /// The text of embedding inputs.
@@ -327,45 +382,105 @@ pub fn texts_inspection<'a>(texts: impl IntoIterator<Item = &'a String>) -> Insp
     input
 }
 
-/// Every string of a JSON value, except encodings no detector reads: an
-/// image, or a document whose source is not plain text, makes the request
-/// uninspectable; signatures are opaque.
-fn walk<'a>(v: &'a Value, part: Part, input: &mut Inspection<'a>) {
-    match v {
+/// A native Messages message: `{role, content}`.
+fn message<'a>(m: &'a Value, input: &mut Inspection<'a>) {
+    match m.get("content") {
+        Some(c) => content(c, Part::Content, input),
+        None => json(m, Part::Content, input),
+    }
+}
+
+/// Message or system content: a string, or blocks (whose texts are also
+/// read joined).
+fn content<'a>(c: &'a Value, part: Part, input: &mut Inspection<'a>) {
+    match c {
         Value::String(s) => input.push(s, part),
-        Value::Array(items) => items.iter().for_each(|i| walk(i, part, input)),
-        Value::Object(map) => {
-            let kind = map.get("type").and_then(Value::as_str);
-            if matches!(
-                kind,
-                Some("image" | "image_url" | "input_image" | "audio" | "file")
-            ) {
-                input.uninspectable = true;
-                return;
+        Value::Array(blocks) => {
+            let mut texts = Vec::new();
+            for b in blocks {
+                if let Some(Value::String(t)) = b.get("text") {
+                    texts.push(t.as_str());
+                }
+                block(b, part, input);
             }
+            join(input, &mut texts, part);
+        }
+        other => json(other, part, input),
+    }
+}
+
+/// One content block. Known shapes skip only what is opaque (a signature, an
+/// encoded or remote source); any other value has every string read.
+fn block<'a>(b: &'a Value, part: Part, input: &mut Inspection<'a>) {
+    let Some(map) = b.as_object() else {
+        return json(b, part, input);
+    };
+    match map.get("type").and_then(Value::as_str) {
+        Some("image" | "image_url" | "input_image" | "audio" | "input_audio" | "file") => {
+            input.uninspectable = true;
+        }
+        Some("thinking") => {
+            if let Some(Value::String(t)) = map.get("thinking") {
+                input.push(t, part);
+            }
+        }
+        // Provider-encrypted reasoning the provider returned; it holds no
+        // client text.
+        Some("redacted_thinking") => {}
+        Some("document") => {
             for (key, value) in map {
-                match (key.as_str(), value) {
-                    ("signature" | "type" | "role" | "media_type" | "cache_control", _) => {}
-                    ("source", Value::Object(source)) => {
-                        match source.get("type").and_then(Value::as_str) {
-                            Some("text") => {
-                                if let Some(Value::String(data)) = source.get("data") {
-                                    input.push(data, part);
-                                }
-                            }
-                            Some("content") => {
-                                if let Some(content) = source.get("content") {
-                                    walk(content, part, input);
-                                }
-                            }
-                            // base64, url, file: encoded or remote content.
-                            _ => input.uninspectable = true,
-                        }
-                    }
-                    _ => walk(value, part, input),
+                if key == "source" {
+                    source(value, part, input);
+                } else {
+                    json(value, part, input);
                 }
             }
         }
+        Some("tool_result") => {
+            for (key, value) in map {
+                if key == "content" {
+                    content(value, Part::ToolResult, input);
+                } else {
+                    json(value, Part::ToolResult, input);
+                }
+            }
+        }
+        _ => json(b, part, input),
+    }
+}
+
+/// A document's source: plain text or content blocks are read; anything
+/// else (base64, a URL, a file) cannot be.
+fn source<'a>(s: &'a Value, part: Part, input: &mut Inspection<'a>) {
+    match s.get("type").and_then(Value::as_str) {
+        Some("text") => match s.get("data") {
+            Some(Value::String(data)) => input.push(data, part),
+            _ => input.uninspectable = true,
+        },
+        Some("content") => match s.get("content") {
+            Some(c) => content(c, part, input),
+            None => input.uninspectable = true,
+        },
+        _ => input.uninspectable = true,
+    }
+}
+
+/// Every string of an arbitrary JSON value (keys skip nothing).
+fn json<'a>(v: &'a Value, part: Part, input: &mut Inspection<'a>) {
+    match v {
+        Value::String(s) => input.push(s, part),
+        Value::Array(items) => items.iter().for_each(|i| json(i, part, input)),
+        Value::Object(map) => map.values().for_each(|i| json(i, part, input)),
+        _ => {}
+    }
+}
+
+/// As [`json`], for a value the gateway parsed itself.
+fn owned(v: &Value, part: Part, input: &mut Inspection<'_>) {
+    match v {
+        Value::String(s) => input.push_owned(s.clone(), part),
+        Value::Array(items) => items.iter().for_each(|i| owned(i, part, input)),
+        Value::Object(map) => map.values().for_each(|i| owned(i, part, input)),
         _ => {}
     }
 }

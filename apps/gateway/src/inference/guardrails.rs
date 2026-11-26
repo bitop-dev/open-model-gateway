@@ -57,13 +57,46 @@ impl Store {
             .map_err(route_lookup_storage)?
             // A stored value this release cannot read refuses the request.
             .map_err(|_| InferenceError::Storage)?;
-        let policy = Arc::new(Policy::compile(&compose(platform.as_ref(), local.as_ref())));
+        // Compiling custom patterns takes milliseconds each: off the async workers.
+        let effective = compose(platform.as_ref(), local.as_ref());
+        let policy = Arc::new(
+            tokio::task::spawn_blocking(move || Policy::compile(&effective))
+                .await
+                .map_err(|_| InferenceError::Storage)?,
+        );
         if let Some(stamp) = stamp {
             self.caches
                 .guardrails
                 .insert(workspace, Arc::clone(&policy), stamp);
         }
         Ok(policy)
+    }
+
+    /// The guardrail step of a request whose text this release does not read
+    /// (a native batch: its lines are encoded for the provider's own batch
+    /// API): an enforcing rule refuses it, a monitor rule records `skipped`.
+    pub(crate) async fn guard_unread(
+        &self,
+        principal: &Principal,
+        request: Guarded<'_>,
+    ) -> Result<(), InferenceError> {
+        let policy = self.guardrail_policy(principal.workspace_id).await?;
+        let decision = policy.decide(request.workload, None);
+        count(&decision);
+        if !decision.events.is_empty() {
+            self.record_guardrail_events(&GuardrailRecord {
+                root_request_id: request.request_id,
+                principal: *principal,
+                operation: request.operation,
+                model: request.model,
+                streamed: request.streamed,
+                events: &decision.events,
+            })
+            .await?;
+        }
+        decision
+            .refusal
+            .map_or(Ok(()), |r| Err(InferenceError::Guardrail(r)))
     }
 
     /// Append one request's decisions (one statement, outside any admission
@@ -108,12 +141,24 @@ impl Store {
 }
 
 /// The facts of a request the guardrail step records.
-pub(super) struct Guarded<'a> {
-    pub(super) request_id: Uuid,
-    pub(super) operation: &'static str,
-    pub(super) model: &'a str,
-    pub(super) streamed: bool,
-    pub(super) workload: Workload,
+pub(crate) struct Guarded<'a> {
+    pub(crate) request_id: Uuid,
+    pub(crate) operation: &'static str,
+    pub(crate) model: &'a str,
+    pub(crate) streamed: bool,
+    pub(crate) workload: Workload,
+}
+
+/// Count a decision's events in the metrics.
+fn count(decision: &crate::guardrails::enforce::Decision) {
+    for event in &decision.events {
+        crate::metrics::METRICS.guardrail_decision(
+            "input",
+            event.detector.as_str(),
+            event.category.as_str(),
+            event.action.as_str(),
+        );
+    }
 }
 
 impl super::Engine {
@@ -183,14 +228,7 @@ impl super::Engine {
             policy.decide(workload, input.as_ref())
         };
         crate::metrics::METRICS.guardrail_detector_seconds("pattern", started.elapsed());
-        for event in &decision.events {
-            crate::metrics::METRICS.guardrail_decision(
-                "input",
-                event.detector.as_str(),
-                event.category.as_str(),
-                event.action.as_str(),
-            );
-        }
+        count(&decision);
         if !decision.events.is_empty() {
             self.repository
                 .record_guardrails(&GuardrailRecord {

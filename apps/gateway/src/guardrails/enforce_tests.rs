@@ -3,6 +3,9 @@ use super::*;
 use crate::guardrails::policy::{
     Detector, Entry, OutputMode, Protection, RedactScope, Rule, RuleSet, StoredRule, compose,
 };
+use crate::inference::types::{
+    ChatRequest, FunctionTool, Message, MessagesOptions, Role, ToolCall,
+};
 use serde_json::json;
 
 fn rule(categories: &[Category], patterns: &[&str], action: InputAction) -> Rule {
@@ -155,6 +158,41 @@ fn a_rule_this_release_cannot_run_fails_under_its_on_error() {
     assert_eq!(d.events[0].action, Action::DetectorFailed);
 }
 
+fn texts<'a>(input: &'a Inspection<'_>) -> Vec<&'a str> {
+    input.segments.iter().map(|s| s.text.as_ref()).collect()
+}
+fn found(input: &Inspection<'_>) -> bool {
+    let p = policy(vec![rule(&[Category::Secret], &[], InputAction::Block)]);
+    p.decide(Workload::Generation, Some(input))
+        .refusal
+        .is_some()
+}
+fn request(
+    messages: Vec<Message>,
+    tools: Vec<FunctionTool>,
+    options: MessagesOptions,
+) -> ChatRequest {
+    ChatRequest {
+        messages_options: Some(Box::new(options)),
+        model: "m".into(),
+        messages,
+        tools,
+        tool_choice: None,
+        temperature: None,
+        max_output_tokens: None,
+        stream: false,
+    }
+}
+fn said(role: Role, content: &str) -> Message {
+    Message {
+        role,
+        content: Some(content.into()),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+        tool_result_is_error: false,
+    }
+}
+
 #[test]
 fn native_envelopes_are_read_and_images_are_not() {
     let k = key();
@@ -164,15 +202,103 @@ fn native_envelopes_are_read_and_images_are_not() {
         {"type":"thinking","thinking":"t","signature":"opaque-signature"}
     ]});
     let mut input = Inspection::default();
-    walk(&native, Part::Content, &mut input);
-    let texts: Vec<&str> = input.segments.iter().map(|s| s.text).collect();
-    assert!(texts.iter().any(|t| t.contains(&k)));
-    assert!(texts.contains(&"plain notes"));
-    assert!(!texts.contains(&"opaque-signature"));
+    message(&native, &mut input);
+    let read = texts(&input);
+    assert!(read.iter().any(|t| t.contains(&k)));
+    assert!(read.contains(&"plain notes"));
+    assert!(!read.contains(&"opaque-signature"));
     assert!(!input.uninspectable);
     let image = json!({"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo"}}]});
     let mut input = Inspection::default();
-    walk(&image, Part::Content, &mut input);
+    message(&image, &mut input);
     assert!(input.uninspectable);
     assert!(input.segments.is_empty(), "image data is never scanned");
+}
+
+#[test]
+fn text_in_any_json_key_of_a_tool_or_tool_input_is_read() {
+    let k = key();
+    // A schema property named like a block key, and a tool input with one.
+    let schema = json!({"type":"object","properties":{"type":{"type":"string","description":k},"role":{"enum":[k]}}});
+    let tool = FunctionTool {
+        name: "t".into(),
+        description: None,
+        parameters: schema,
+        strict: None,
+    };
+    assert!(found(&chat_inspection(&request(
+        Vec::new(),
+        vec![tool],
+        MessagesOptions::default()
+    ))));
+    let native = MessagesOptions {
+        native_messages: vec![
+            json!({"role":"assistant","content":[{"type":"tool_use","id":"x","name":"t","input":{"signature":k,"source":{"type":"text","note":k}}}]}),
+        ],
+        ..MessagesOptions::default()
+    };
+    let sent = request(Vec::new(), Vec::new(), native);
+    let input = chat_inspection(&sent);
+    assert!(found(&input));
+    assert!(!input.uninspectable, "a tool input is not an attachment");
+}
+
+#[test]
+fn escaped_arguments_ids_stop_sequences_and_split_blocks_are_read() {
+    let k = key();
+    let escaped = format!("{{\"k\":\"\\u006f{}\"}}", &k[1..]);
+    let mut assistant = said(Role::Assistant, "");
+    assistant.tool_calls.push(ToolCall {
+        id: "call".into(),
+        name: "t".into(),
+        arguments: escaped,
+    });
+    assert!(
+        found(&chat_inspection(&request(
+            vec![assistant],
+            Vec::new(),
+            MessagesOptions::default()
+        ))),
+        "decoded arguments"
+    );
+    let mut result = said(Role::Tool, "ok");
+    result.tool_call_id = Some(k.clone());
+    assert!(
+        found(&chat_inspection(&request(
+            vec![result],
+            Vec::new(),
+            MessagesOptions::default()
+        ))),
+        "tool call id"
+    );
+    let stops = MessagesOptions {
+        stop_sequences: Some(vec![k.clone()]),
+        ..MessagesOptions::default()
+    };
+    assert!(
+        found(&chat_inspection(&request(Vec::new(), Vec::new(), stops))),
+        "stop sequence"
+    );
+    let (head, tail) = k.split_at(20);
+    let split = vec![
+        said(Role::System, head),
+        said(Role::System, tail),
+        said(Role::User, "hi"),
+    ];
+    assert!(
+        found(&chat_inspection(&request(
+            split,
+            Vec::new(),
+            MessagesOptions::default()
+        ))),
+        "split system"
+    );
+    let blocks = MessagesOptions {
+        system: Some(json!([{"type":"text","text":head},{"type":"text","text":tail}])),
+        ..MessagesOptions::default()
+    };
+    assert!(
+        found(&chat_inspection(&request(Vec::new(), Vec::new(), blocks))),
+        "split blocks"
+    );
 }

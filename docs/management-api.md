@@ -344,7 +344,7 @@ Catalog/model authorization retirement deletes affected key selections but retai
 
 ## Guardrail policies (#840)
 
-Guardrail rules live in three layers that mirror the limit layers ([guardrails design](guardrails-design.md#5-policy-model), [governance](governance.md)). The engine enforces their input rules on generation and embeddings requests (response text is not inspected), and every response carries `enforced: true`. A stored rule this release cannot run appears with `active: false` and `inactive_reason: "not_runnable"`, and fails under its own `on_error`. `GET`, `PUT` and `DELETE /platform/workspaces/{ws}/guardrails` also return `decisions_this_month`: the workspace's guardrail decisions this UTC month per `action` and `category`, with `decisions` (events) and `findings` (summed counts), totals only and also for a personal workspace.
+Guardrail rules live in three layers that mirror the limit layers ([guardrails design](guardrails-design.md#5-policy-model), [governance](governance.md)). The engine enforces their input rules on generation and embeddings requests (response text is not inspected), and every response carries `enforced: true`. A stored rule this release cannot run appears with `active: false` and `inactive_reason: "not_runnable"`, and fails under its own `on_error`. `GET`, `PUT` and `DELETE /platform/workspaces/{ws}/guardrails` also return `decisions_this_month`: the workspace's guardrail decisions this UTC month per `action` and `category`, with `decisions` (events) and `findings` (summed distinct matches of decisions that found something), totals only and also for a personal workspace, never of a personal workspace's local layer.
 
 | Route | Who |
 | --- | --- |
