@@ -655,6 +655,46 @@ mod guardrail_busy_tests {
         })
     }
 
+    #[tokio::test]
+    async fn a_waiting_line_gives_back_only_its_process_worker() {
+        let batch = Arc::new(tokio::sync::Semaphore::new(2));
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut workers = Workers::new((
+            Arc::clone(&batch).try_acquire_owned().unwrap(),
+            Arc::clone(&pool).try_acquire_owned().unwrap(),
+        ));
+        assert_eq!(
+            (batch.available_permits(), pool.available_permits()),
+            (1, 0)
+        );
+        // While it waits: the process worker is free, the batch permit (and
+        // so the batch's bound on claimed lines) is still held.
+        workers.process = None;
+        assert_eq!(
+            (batch.available_permits(), pool.available_permits()),
+            (1, 1)
+        );
+        let other = Arc::clone(&pool).try_acquire_owned().unwrap();
+        // It takes the worker back only once another line gives it up.
+        let reacquired = tokio::spawn(async move {
+            assert!(workers.reacquire().await);
+            workers
+        });
+        tokio::task::yield_now().await;
+        assert!(!reacquired.is_finished());
+        drop(other);
+        let workers = reacquired.await.unwrap();
+        assert_eq!(
+            (batch.available_permits(), pool.available_permits()),
+            (1, 0)
+        );
+        drop(workers);
+        assert_eq!(
+            (batch.available_permits(), pool.available_permits()),
+            (2, 1)
+        );
+    }
+
     #[test]
     fn only_a_refusal_that_could_not_finish_is_tried_again() {
         let busy = |e| rescan_cause(e) == Some(Rescan::Busy);
