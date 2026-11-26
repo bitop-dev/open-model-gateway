@@ -1183,13 +1183,14 @@ async fn inference_openapi_generation_refusals_and_beta_headers(pool: PgPool) {
             "generation authentication status"
         );
         // The image input routes read a declared body up to their image
-        // input cap (so this non-JSON one is a 400) and refuse one past it
+        // input cap and refuse it before any parse when more than 2 MiB of it
+        // is not image data (this one has none), and refuse one past the cap
         // before reading it, as every other route does past 2 MiB.
         let mut cases = vec![(oversized(path, &key, false), StatusCode::PAYLOAD_TOO_LARGE)];
         if super::generation::IMAGE_INPUT_PATHS.contains(&path) {
             let cap = crate::inference::image_buffer::ImageInputLimits::default().body_bytes;
             cases = vec![
-                (oversized(path, &key, false), StatusCode::BAD_REQUEST),
+                (oversized(path, &key, false), StatusCode::PAYLOAD_TOO_LARGE),
                 (declared(path, &key, cap + 1), StatusCode::PAYLOAD_TOO_LARGE),
             ];
         }
