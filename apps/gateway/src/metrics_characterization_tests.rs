@@ -168,6 +168,8 @@ pub(crate) fn populated_registry() -> &'static Metrics {
     m.token_count("provider");
     m.key_issuance_refused("holder", "create");
     m.egress_denied("telemetry");
+    m.guardrail_decision("input", "pattern", "secret", "blocked");
+    m.guardrail_detector_seconds("pattern", std::time::Duration::from_millis(1));
     m.upstream_connection_lost("local");
     m.upstream_connection_opened("local");
     m.audit_export_delivery("delivered");

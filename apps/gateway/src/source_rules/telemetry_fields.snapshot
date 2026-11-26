@@ -90,6 +90,8 @@ inference/request_telemetry.rs :: impl RequestTelemetry::finish :: span attribut
 inference/request_telemetry.rs :: impl RequestTelemetry::finish :: span attribute :: span . attribute (telemetry :: Attribute :: Operation (self . operation))
 inference/request_telemetry.rs :: impl RequestTelemetry::finish :: span attribute :: span . attribute (telemetry :: Attribute :: Outcome (outcome))
 inference/request_telemetry.rs :: impl RequestTelemetry::finish :: span attribute :: span . attribute (telemetry :: Attribute :: Streamed (self . streamed))
+inference/guardrails.rs :: count :: metrics call :: crate :: metrics :: METRICS . guardrail_decision ("input" , event . detector . as_str () , event . category . as_str () , event . action . as_str ())
+inference/guardrails.rs :: impl Engine::guard_input :: metrics call :: crate :: metrics :: METRICS . guardrail_detector_seconds ("pattern" , started . elapsed ())
 jobs/batch.rs :: impl Jobs::create_batch :: metrics call :: crate :: metrics :: METRICS . observe_batch_created (mode . as_str ())
 jobs/mod.rs :: impl Attempt::drop :: event :: crate :: ops_log :: emit (crate :: ops_log :: OpsEvent :: FinalizationNeedsReconciliation { finalizer : crate :: ops_log :: Finalizer :: JobCancel , trace : None })
 jobs/mod.rs :: impl Attempt::fail :: event :: crate :: ops_log :: emit (crate :: ops_log :: OpsEvent :: FinalizationNeedsReconciliation { finalizer : crate :: ops_log :: Finalizer :: JobFail , trace : None })
@@ -211,6 +213,8 @@ metrics/operations.rs :: impl Metrics::set_report_queue :: family :: self . repo
 metrics/operations.rs :: impl Metrics::token_count :: family :: self . token_counts . get_or_create (& [("outcome" , outcome . to_owned ())])
 metrics/operations.rs :: impl Metrics::upstream_connection_lost :: family :: self . upstream_connection_lost . get_or_create (& [("client" , client . to_owned ())])
 metrics/operations.rs :: impl Metrics::upstream_connection_opened :: family :: self . upstream_connections_opened . get_or_create (& [("client" , client . to_owned ())])
+metrics/operations.rs :: impl Metrics::guardrail_decision :: family :: self . guardrail_decisions . get_or_create (& [("stage" , stage . to_owned ()) , ("detector" , detector . to_owned ()) , ("family" , family . to_owned ()) , ("action" , action . to_owned ())])
+metrics/operations.rs :: impl Metrics::guardrail_detector_seconds :: family :: self . guardrail_detector . get_or_create (& [("detector" , detector . to_owned ())])
 metrics/registry.rs :: every_client :: family :: family . get_or_create (& [("client" , client . as_str () . to_owned ())]) :: client from client = crate :: egress :: UpstreamClient :: ALL
 metrics/registry.rs :: impl Metrics::new :: metrics call :: metrics . register_alerts_and_locks (& mut registry)
 metrics/registry.rs :: impl Metrics::new :: metrics call :: metrics . register_exports (& mut registry , families)

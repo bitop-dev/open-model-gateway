@@ -37,15 +37,28 @@ pub struct Segment<'a> {
 pub struct Inspection<'a> {
     pub segments: Vec<Segment<'a>>,
     pub uninspectable: bool,
-    seen: std::collections::HashSet<u64>,
-    /// Keyed per process and inspection, so a client cannot compute a text
-    /// whose hash equals another's and have it skipped.
-    keys: std::collections::hash_map::RandomState,
+    /// Segments by the hash of their text. A hash already seen is compared
+    /// with the texts it stands for, so a colliding text is never skipped.
+    seen: std::collections::HashMap<u64, Vec<usize>>,
 }
 impl<'a> Inspection<'a> {
     fn fresh(&mut self, text: &str) -> bool {
-        use std::hash::BuildHasher;
-        !text.is_empty() && self.seen.insert(self.keys.hash_one(text))
+        use std::hash::{BuildHasher, BuildHasherDefault};
+        if text.is_empty() {
+            return false;
+        }
+        let hash = BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default()
+            .hash_one(text);
+        let same = self.seen.get(&hash).is_some_and(|indices| {
+            indices
+                .iter()
+                .any(|i| self.segments[*i].text.as_ref() == text)
+        });
+        if same {
+            return false;
+        }
+        self.seen.entry(hash).or_default().push(self.segments.len());
+        true
     }
     pub fn push(&mut self, text: &'a str, part: Part) {
         if self.fresh(text) {
@@ -83,7 +96,6 @@ impl<'a> Inspection<'a> {
                 .collect(),
             uninspectable: self.uninspectable,
             seen: self.seen,
-            keys: self.keys,
         }
     }
 }

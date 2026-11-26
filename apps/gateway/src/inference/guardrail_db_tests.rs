@@ -37,7 +37,10 @@ fn mock(hits: Arc<AtomicUsize>) -> Router {
         let hits = hits.clone();
         async move {
             hits.fetch_add(1, Ordering::SeqCst);
-            let body = if uri.path().ends_with("/embeddings") {
+            let body = if uri.path().ends_with("/messages") {
+                json!({"id":"m1","type":"message","role":"assistant","model":"m","content":[{"type":"text","text":"ok"}],
+                    "stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}})
+            } else if uri.path().ends_with("/embeddings") {
                 json!({"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2]}],"model":"m","usage":{"prompt_tokens":1,"total_tokens":1}})
             } else {
                 json!({"id":"c1","object":"chat.completion","created":1,"model":"m",
@@ -297,16 +300,34 @@ async fn a_monitor_rule_records_and_lets_the_request_through(pool: PgPool) {
 #[dbtest::test]
 async fn a_canary_through_every_action_is_stored_logged_and_measured_nowhere(pool: PgPool) {
     let capture = crate::log_capture_test::Capture::start();
-    let w = world(pool, "'chat_completions'").await;
+    // An Anthropic route, which takes image blocks.
+    let w = world_on(pool, "'chat_completions','messages'", "anthropic").await;
     let canary = format!("CANARY-{}", &Uuid::now_v7().simple().to_string()[..12]);
     let pattern = "CANARY-[0-9a-f]{12}".to_owned();
     let chat = json!({"model":"company/smart","messages":[{"role":"user","content":format!("note {canary}")}]});
-    // Monitored, then blocked (generation and embeddings).
-    type_default(&w, "monitor", "{custom}", std::slice::from_ref(&pattern)).await;
+    let with_image = json!({"model":"company/smart","max_tokens":16,"messages":[{"role":"user","content":[
+        {"type":"text","text":format!("note {canary}")},
+        {"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="}}]}]});
+    // Monitored (and skipped: the image cannot be read), with a rule this
+    // release cannot run beside it (detector_failed, fail-open).
+    let (set, _) = type_default(&w, "monitor", "{custom}", std::slice::from_ref(&pattern)).await;
+    let mut tx = w.f.store.pool.begin().await.unwrap();
+    sqlx::query("UPDATE guardrail_rule_sets SET revision=revision+1,updated_by=$2 WHERE id=$1")
+        .bind(set)
+        .bind(w.f.owner)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable) VALUES($1,$2,1,'Later','moderation','systemone','{moderation}','monitor','user_text','off','fail_open','{generation}','deny')")
+        .bind(Uuid::now_v7()).bind(set).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
     assert_eq!(
         send(&w, "/v1/chat/completions", chat.clone()).await.0,
         StatusCode::OK
     );
+    let (status, _, body) = send(&w, "/v1/messages", with_image).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Blocked.
     type_default(&w, "block", "{custom}", std::slice::from_ref(&pattern)).await;
     let (status, _, body) = send(&w, "/v1/chat/completions", chat).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -314,8 +335,13 @@ async fn a_canary_through_every_action_is_stored_logged_and_measured_nowhere(poo
         !body.to_string().contains(&canary),
         "error bodies never echo the match"
     );
-    let actions: Vec<String> = events(&w).await.into_iter().map(|e| e.1).collect();
-    assert_eq!(actions, ["monitored", "blocked"]);
+    let mut actions: Vec<String> = events(&w).await.into_iter().map(|e| e.1).collect();
+    actions.sort();
+    actions.dedup();
+    assert_eq!(
+        actions,
+        ["blocked", "detector_failed", "monitored", "skipped"]
+    );
     // Every table, the log and the metrics.
     let tables: Vec<String> = sqlx::query_scalar(
         "SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename",
