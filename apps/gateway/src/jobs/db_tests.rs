@@ -1077,49 +1077,6 @@ async fn a_video_reconciled_during_the_provider_call_is_recorded_and_finishes(po
     assert_eq!(amounts(&f, request_id).await.2, None);
 }
 
-#[dbtest::test]
-async fn a_video_record_global_prefix_failure_is_a_storage_failure(pool: PgPool) {
-    let f = fixture(pool).await;
-    let limited = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .after_connect(|connection, _| {
-            Box::pin(async move {
-                sqlx::query("SET lock_timeout='200ms'")
-                    .execute(connection)
-                    .await?;
-                Ok(())
-            })
-        })
-        .connect_with((*f.store.pool.connect_options()).clone())
-        .await
-        .unwrap();
-    let store =
-        Store::new(limited).with_admission_mode(crate::governance::locks::AdmissionMode::Global);
-    let mut blocker = crate::db::begin(&f.store.pool).await.unwrap();
-    sqlx::query("SELECT id FROM installation WHERE singleton FOR NO KEY UPDATE")
-        .execute(&mut *blocker)
-        .await
-        .unwrap();
-    let handle = crate::db::diagnostics::Handle::new();
-    let result = crate::db::diagnostics::scope(
-        handle.clone(),
-        crate::governance::jobs::accept_job(
-            &store,
-            Uuid::new_v4(),
-            UtcInstant::now(),
-            async |_| Ok(()),
-        ),
-    )
-    .await;
-    blocker.rollback().await.unwrap();
-    assert_eq!(result, Err(InferenceError::Storage));
-    assert_eq!(
-        crate::db::accounting_failure::tests::labels(&handle.signals()),
-        [("job_storage", "lock_timeout")]
-    );
-    store.pool.close().await;
-}
-
 /// Video and 0016 batch observations: a poller writes only under its current
 /// claim, a client read writes only while no poller holds the job, and
 /// progress and counts never go back (#802). `state` stays compare-and-set.

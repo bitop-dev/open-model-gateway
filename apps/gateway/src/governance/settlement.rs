@@ -26,19 +26,12 @@ pub(super) struct Reservation {
     /// Pinned price list (0021): `standard` or `batch`.
     pub(super) price_tier: String,
 }
-/// A reservation with its execution's labels. Scoped mode (`lock`): locks
-/// the reservation row, the serializer of everything that changes one
+/// A reservation with its execution's labels, locking the reservation row:
+/// the serializer of everything that changes one
 /// reservation (settlement, reconciliation, realtime windows).
-pub(super) async fn reservation(
-    tx: &mut Tx<'_>,
-    id: Uuid,
-    lock: bool,
-) -> Result<Reservation, InferenceError> {
-    sqlx::query_as(if lock {
-        "SELECT r.workspace_id,r.api_key_id,r.admitted_at,r.deployment_id,r.price_id,r.state,r.input_tokens,r.output_tokens,r.billing_usage,e.workload_kind,r.reserved_tokens,r.meter_usage,r.output_image_variant,r.provider_cost_microusd,e.provider,e.public_model,r.request_count,r.price_tier FROM governance_reservations r JOIN inference_executions e ON e.id=r.execution_id WHERE r.execution_id=$1 FOR UPDATE OF r"
-    } else {
-        "SELECT r.workspace_id,r.api_key_id,r.admitted_at,r.deployment_id,r.price_id,r.state,r.input_tokens,r.output_tokens,r.billing_usage,e.workload_kind,r.reserved_tokens,r.meter_usage,r.output_image_variant,r.provider_cost_microusd,e.provider,e.public_model,r.request_count,r.price_tier FROM governance_reservations r JOIN inference_executions e ON e.id=r.execution_id WHERE r.execution_id=$1"
-    }).bind(id).fetch_one(&mut **tx).await.map_err(storage)
+pub(super) async fn reservation(tx: &mut Tx<'_>, id: Uuid) -> Result<Reservation, InferenceError> {
+    sqlx::query_as("SELECT r.workspace_id,r.api_key_id,r.admitted_at,r.deployment_id,r.price_id,r.state,r.input_tokens,r.output_tokens,r.billing_usage,e.workload_kind,r.reserved_tokens,r.meter_usage,r.output_image_variant,r.provider_cost_microusd,e.provider,e.public_model,r.request_count,r.price_tier FROM governance_reservations r JOIN inference_executions e ON e.id=r.execution_id WHERE r.execution_id=$1 FOR UPDATE OF r")
+        .bind(id).fetch_one(&mut **tx).await.map_err(storage)
 }
 impl Reservation {
     /// The totals buckets a change of this reservation touches.
@@ -639,8 +632,7 @@ async fn finish_unobserved(
     settlement_waiting(Waiting::Database);
     timer.phase("connect");
     crate::telemetry::mark_phase(crate::telemetry::SpanName::SettlementConnect);
-    settlement_prefix(store, &mut tx).await?;
-    let r = reservation(&mut tx, record.id, scoped(store)).await?;
+    let r = reservation(&mut tx, record.id).await?;
     timer.phase("locks");
     crate::telemetry::mark_phase(crate::telemetry::SpanName::SettlementLocks);
     let mut usage = workload_usage(&r, record.usage, InferenceError::Storage)?;
@@ -690,9 +682,9 @@ async fn finish_unobserved(
     let (actual, components, violated) = terminal_amount(value, complete, free, unsent);
     timer.phase("read");
     crate::telemetry::mark_phase(crate::telemetry::SpanName::SettlementRead);
-    // Scoped: the reservation's totals rows, held from here to commit (its
+    // The reservation's totals rows, held from here to commit (its
     // triggers then take the counter rows in canonical order).
-    lock_rows(store, &mut tx, &[r.touch()], None).await?;
+    lock_rows(&mut tx, &[r.touch()], None).await?;
     timer.phase("lock_rows");
     crate::telemetry::mark_phase(crate::telemetry::SpanName::SettlementTotalsLocks);
     // One statement (one round trip while the totals rows are held): the

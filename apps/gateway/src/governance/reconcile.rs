@@ -8,8 +8,8 @@ const RECONCILE_BATCH: i64 = 50;
 /// retained) and their executions cancelled. Work is claimed in batches of
 /// [`RECONCILE_BATCH`] with `FOR UPDATE SKIP LOCKED`, one transaction per
 /// batch, so concurrent replicas never process (or wait on) the same rows.
-/// Scoped: claimed reservation rows, then their totals rows in canonical
-/// order; global: the installation lock once per batch.
+/// Lock order: claimed reservation rows, then their totals rows in
+/// canonical order.
 pub async fn reconcile_expired(store: &Store, limit: i64) -> Result<u64, InferenceError> {
     if !(1..=10_000).contains(&limit) {
         return Err(InferenceError::InvalidRequest);
@@ -29,7 +29,6 @@ pub async fn reconcile_expired(store: &Store, limit: i64) -> Result<u64, Inferen
 async fn reconcile_batch(store: &Store, batch: i64) -> Result<usize, InferenceError> {
     {
         let mut tx = crate::db::begin(&store.pool).await.map_err(begin_storage)?;
-        settlement_prefix(store, &mut tx).await?;
         let due: Vec<(Uuid, Uuid, Uuid, UtcInstant)> = sqlx::query_as("SELECT execution_id,workspace_id,api_key_id,admitted_at FROM governance_reservations WHERE state='pending' AND lease_expires_at<=clock_timestamp() ORDER BY lease_expires_at,execution_id LIMIT $1 FOR UPDATE SKIP LOCKED")
             .bind(batch)
             .fetch_all(&mut *tx)
@@ -43,7 +42,7 @@ async fn reconcile_batch(store: &Store, batch: i64) -> Result<usize, InferenceEr
                 at: d.3,
             })
             .collect();
-        lock_rows(store, &mut tx, &touches, None).await?;
+        lock_rows(&mut tx, &touches, None).await?;
         let claimed: Vec<Uuid> = due.iter().map(|d| d.0).collect();
         let ids: Vec<Uuid> = sqlx::query_scalar("UPDATE governance_reservations SET state='unknown' WHERE execution_id=ANY($1) AND state='pending' RETURNING execution_id")
             .bind(&claimed)
@@ -116,9 +115,8 @@ async fn revalidate_token(tx: &mut Tx<'_>, actor: ReconcilingActor) -> Result<()
     Ok(())
 }
 /// The start of an operator's reconciliation transaction: the shared catalog
-/// lock and the actor's authority (workspace, user) held until commit in
-/// scoped mode, the installation lock in global mode, then the admin-token
-/// liveness check. Callers lock the reservation row next, then its totals
+/// lock and the actor's authority (workspace, user) held until commit, then
+/// the admin-token liveness check. Callers lock the reservation row next, then its totals
 /// rows (the canonical order, `governance::locks`).
 pub(super) async fn operator_tx(
     store: &Store,
@@ -126,33 +124,18 @@ pub(super) async fn operator_tx(
     actor: ReconcilingActor,
 ) -> Result<Tx<'static>, InferenceError> {
     let mut tx = crate::db::begin(&store.pool).await.map_err(begin_storage)?;
-    if scoped(store) {
-        // The actor's authority (workspace, user) cannot be revoked until
-        // commit; then the reservation row, then its totals rows.
-        catalog_lock(&mut tx).await?;
-        locks::shared(
-            &mut tx,
-            [
-                locks::Scope::Workspace(workspace),
-                locks::Scope::User(actor.user_id),
-            ],
-        )
-        .await
-        .map_err(storage)?;
-    } else {
-        lock(&mut tx).await?;
-        // Global mode takes no User-scope advisory lock for a browser actor
-        // (preserving this mode's original behaviour exactly); a token
-        // actor needs the owner's authority lock held before the token
-        // row check below, or a concurrent owner-loss trigger could revoke
-        // the token between this check and the role check that follows,
-        // observing neither consistently.
-        if actor.token_id.is_some() {
-            locks::shared(&mut tx, [locks::Scope::User(actor.user_id)])
-                .await
-                .map_err(storage)?;
-        }
-    }
+    // The actor's authority (workspace, user) cannot be revoked until
+    // commit; then the reservation row, then its totals rows.
+    catalog_lock(&mut tx).await?;
+    locks::shared(
+        &mut tx,
+        [
+            locks::Scope::Workspace(workspace),
+            locks::Scope::User(actor.user_id),
+        ],
+    )
+    .await
+    .map_err(storage)?;
     revalidate_token(&mut tx, actor).await?;
     Ok(tx)
 }
@@ -160,12 +143,11 @@ pub(super) async fn operator_tx(
 /// shared, or the actor's own personal workspace (personal details never
 /// become platform-public). Re-checked in the transaction after the locks.
 pub(super) async fn operator_authorized(
-    store: &Store,
     tx: &mut Tx<'_>,
     actor: ReconcilingActor,
     workspace: Uuid,
 ) -> Result<(), InferenceError> {
-    let authorized:Option<Uuid>=sqlx::query_scalar(&format!("SELECT u.id FROM users u JOIN effective_platform_roles p ON p.user_id=u.id AND p.role='admin' JOIN workspaces w ON w.id=$2 AND w.disabled_at IS NULL WHERE u.id=$1 AND u.disabled_at IS NULL AND u.cleaned_at IS NULL AND (w.kind IN('team','project') OR w.owner_user_id=u.id){}", if scoped(store) { "" } else { " FOR SHARE OF u,w" }))
+    let authorized:Option<Uuid>=sqlx::query_scalar("SELECT u.id FROM users u JOIN effective_platform_roles p ON p.user_id=u.id AND p.role='admin' JOIN workspaces w ON w.id=$2 AND w.disabled_at IS NULL WHERE u.id=$1 AND u.disabled_at IS NULL AND u.cleaned_at IS NULL AND (w.kind IN('team','project') OR w.owner_user_id=u.id)")
         .bind(actor.user_id).bind(workspace).fetch_optional(&mut **tx).await.map_err(storage)?;
     if authorized.is_none() {
         return Err(InferenceError::InvalidRequest);
@@ -202,13 +184,13 @@ async fn resolve_usage_once(
     actor: ReconcilingActor,
 ) -> Result<(), InferenceError> {
     let mut tx = operator_tx(store, workspace, actor).await?;
-    let r = reservation(&mut tx, execution, scoped(store)).await?;
+    let r = reservation(&mut tx, execution).await?;
     // Realtime sessions are valued per response (`realtime`); an aggregate
     // reconciliation could not reproduce that valuation, so it is refused.
     if r.workspace_id != workspace || r.workload_kind == WorkloadKind::Realtime.as_str() {
         return Err(InferenceError::InvalidRequest);
     }
-    operator_authorized(store, &mut tx, actor, workspace).await?;
+    operator_authorized(&mut tx, actor, workspace).await?;
     let usage = workload_usage(&r, usage, InferenceError::InvalidRequest)?;
     let (input, output) = usage_values(usage)?;
     let billing = billing_json(usage)?;
@@ -264,7 +246,7 @@ async fn resolve_usage_once(
     }
     let value = pinned_value(&mut tx, &r, usage).await?;
     let actual = value.actual.ok_or(InferenceError::Configuration)?;
-    lock_rows(store, &mut tx, &[r.touch()], None).await?;
+    lock_rows(&mut tx, &[r.touch()], None).await?;
     sqlx::query("UPDATE governance_reservations SET state='settled',actual_microusd=$2,input_tokens=$3,output_tokens=$4,billing_usage=$5,cost_components=$6,meter_usage=$7,output_image_variant=$8,provider_cost_microusd=$9 WHERE execution_id=$1 AND admitted_at=$10").bind(execution).bind(actual).bind(input).bind(output).bind(&billing).bind(value.components.map(|c|c.to_value())).bind(&m.meters).bind(&m.variant).bind(m.provider_cost).bind(r.admitted_at).execute(&mut *tx).await.map_err(storage)?;
     sqlx::query("UPDATE inference_executions SET input_tokens=$2,output_tokens=$3,billing_usage=$4,meter_usage=$5,output_image_variant=$6,provider_cost_microusd=$7 WHERE id=$1 AND started_at=$8").bind(execution).bind(input).bind(output).bind(billing).bind(m.meters).bind(m.variant).bind(m.provider_cost).bind(r.admitted_at).execute(&mut *tx).await.map_err(storage)?;
     ledger(

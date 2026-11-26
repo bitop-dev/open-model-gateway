@@ -21,8 +21,7 @@
 //! Database triggers (0027) also take the exclusive authority lock on every
 //! row change admission depends on, so no code path can forget it; the
 //! gateway takes the same locks up front so they are never acquired out of
-//! order. In `GATEWAY_ADMISSION_MODE=global`, admission and settlement
-//! take the installation row lock.
+//! order.
 use std::cell::Cell;
 
 use gateway_datetime_compat::UtcInstant;
@@ -32,37 +31,29 @@ use uuid::Uuid;
 /// The catalog advisory lock (single 64-bit key space).
 pub const CATALOG_LOCK: i64 = 72419502;
 
-/// Admission protocol (`GATEWAY_ADMISSION_MODE`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum AdmissionMode {
-    /// Scoped authority locks and totals/counter row locks (default).
-    #[default]
-    Scoped,
-    /// Admission and settlement serialize on the installation row.
-    Global,
+/// `GATEWAY_ADMISSION_MODE`: unset or `scoped`, the one admission protocol
+/// (this module's lock order). The global mode, which serialized admission
+/// and settlement on the installation row, was removed after v0.19.0
+/// (#853): `global` stops startup with an error that says so, and any other
+/// value is invalid. Read with the rest of the configuration, before the
+/// database is contacted.
+pub fn check_admission_mode(value: Option<&str>) -> anyhow::Result<()> {
+    match value.map(str::trim) {
+        None | Some("scoped") => Ok(()),
+        Some("global") => anyhow::bail!(
+            "GATEWAY_ADMISSION_MODE=global was removed after v0.19.0 (#853): admission always uses scoped locks; remove the setting (or set it to scoped)"
+        ),
+        Some(_) => anyhow::bail!(
+            "GATEWAY_ADMISSION_MODE must be scoped (the global mode was removed after v0.19.0, #853)"
+        ),
+    }
 }
-impl AdmissionMode {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "scoped" => Some(Self::Scoped),
-            "global" => Some(Self::Global),
-            _ => None,
-        }
-    }
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Scoped => "scoped",
-            Self::Global => "global",
-        }
-    }
-    /// `GATEWAY_ADMISSION_MODE` (unset: scoped). Invalid values are errors.
-    pub fn from_env() -> anyhow::Result<Self> {
-        match std::env::var("GATEWAY_ADMISSION_MODE") {
-            Err(std::env::VarError::NotPresent) => Ok(Self::default()),
-            Ok(v) => Self::parse(v.trim())
-                .ok_or_else(|| anyhow::anyhow!("GATEWAY_ADMISSION_MODE must be scoped or global")),
-            Err(_) => anyhow::bail!("GATEWAY_ADMISSION_MODE must be scoped or global"),
-        }
+/// [`check_admission_mode`] of the process environment.
+pub fn admission_mode_from_env() -> anyhow::Result<()> {
+    match std::env::var("GATEWAY_ADMISSION_MODE") {
+        Err(std::env::VarError::NotPresent) => check_admission_mode(None),
+        Ok(value) => check_admission_mode(Some(&value)),
+        Err(std::env::VarError::NotUnicode(_)) => check_admission_mode(Some("")),
     }
 }
 
@@ -440,10 +431,27 @@ mod tests {
     }
 
     #[test]
-    fn modes_parse() {
-        assert_eq!(AdmissionMode::parse("scoped"), Some(AdmissionMode::Scoped));
-        assert_eq!(AdmissionMode::parse("global"), Some(AdmissionMode::Global));
-        assert_eq!(AdmissionMode::parse("serialized"), None);
-        assert_eq!(AdmissionMode::default(), AdmissionMode::Scoped);
+    fn only_the_scoped_mode_is_accepted() {
+        for accepted in [None, Some("scoped"), Some(" scoped ")] {
+            check_admission_mode(accepted).unwrap();
+        }
+        let removed = check_admission_mode(Some("global"))
+            .unwrap_err()
+            .to_string();
+        for named in [
+            "GATEWAY_ADMISSION_MODE=global",
+            "removed after v0.19.0",
+            "#853",
+            "remove the setting",
+        ] {
+            assert!(removed.contains(named), "{named}: {removed}");
+        }
+        for invalid in ["", "Global", "serialized", "scoped,global"] {
+            let error = check_admission_mode(Some(invalid)).unwrap_err().to_string();
+            assert!(
+                error.contains("GATEWAY_ADMISSION_MODE must be scoped"),
+                "{invalid}: {error}"
+            );
+        }
     }
 }
