@@ -12,6 +12,7 @@ pub mod limits;
 pub mod patterns;
 pub mod policy;
 pub mod secrets;
+pub mod shared;
 pub mod stored;
 pub mod view;
 pub mod write;

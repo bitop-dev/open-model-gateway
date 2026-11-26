@@ -10,18 +10,15 @@
 //!   `WAITERS` requests in the step (running or waiting); more are refused at
 //!   once. The wait for a slot is bounded (`WAIT`), never the request
 //!   deadline. Both end in a retryable `guardrail_unavailable`.
-//! - **Refusals.** A key whose requests guardrails refused after a scan
-//!   `REFUSALS_PER_MINUTE` times in the current minute on this replica gets
-//!   429 `guardrail_rate_limited` before any scan, until the minute ends (a
-//!   refused request is never admitted, so no other limit counts it). A
-//!   request refused because no slot was free scanned nothing and does not
-//!   count.
-//! - **Unadmitted recorded requests.** Likewise after `RECORDED_PER_MINUTE`
-//!   requests of a key whose decisions wrote rows and that were never
-//!   admitted (`inference::guardrails::Unadmitted`; a native batch's create
-//!   always counts): the step runs before admission, so a key whose requests
-//!   admission then refuses could otherwise make the replica scan and write
-//!   rows without bound.
+//! - **Unadmitted recorded requests.** A key with `RECORDED_PER_MINUTE`
+//!   requests in the current minute on this replica whose decisions wrote
+//!   rows and that were never admitted (a guardrail refusal is one; see
+//!   `inference::guardrails::Unadmitted`) gets 429 `guardrail_rate_limited`
+//!   before any scan, until the minute ends: the step runs before admission,
+//!   so a key whose requests are refused could otherwise make the replica
+//!   scan and write rows without bound. A request refused because no slot
+//!   was free scanned and wrote nothing and does not count. Gateway-run batch
+//!   lines are exempt (their batch was accepted with a bounded line count).
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
@@ -128,6 +125,15 @@ impl ScanSlots {
             _entered: entered,
         })
     }
+    /// Requests of `workspace` in the step now, holding or waiting (tests).
+    #[cfg(test)]
+    pub fn in_step(&self, workspace: Uuid) -> usize {
+        self.workspaces
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&workspace)
+            .map_or(0, |e| e.0)
+    }
     /// Slots free in the pool (tests).
     pub fn available(&self) -> usize {
         self.pool.available_permits()
@@ -141,20 +147,17 @@ pub static LOCAL_SCANS: LazyLock<Arc<ScanSlots>> =
 pub static SHARED_SCANS: LazyLock<Arc<ScanSlots>> =
     LazyLock::new(|| ScanSlots::new(SLOTS, SHARE, WAITERS, WAIT));
 
-/// Guardrail refusals a key may have in one minute on one replica before it
-/// is throttled.
-pub const REFUSALS_PER_MINUTE: u32 = 30;
 /// Keys tracked at once; a key beyond them is not throttled (memory stays
 /// bounded; the tracked set restarts every minute).
 pub const TRACKED_KEYS: usize = 65_536;
 
-/// Counts guardrail refusals per key in the current minute.
-pub struct RefusalLimiter {
+/// Counts events per key in the current minute, within a bounded map.
+pub struct KeyLimiter {
     limit: u32,
     capacity: usize,
     minute: Mutex<(u64, HashMap<Uuid, u32>)>,
 }
-impl RefusalLimiter {
+impl KeyLimiter {
     pub fn new(limit: u32, capacity: usize) -> Self {
         Self {
             limit,
@@ -180,12 +183,12 @@ impl RefusalLimiter {
             _ => Ok(()),
         })
     }
-    /// Refusals of `key` counted this minute (tests).
+    /// Events of `key` counted this minute (tests).
     #[cfg(test)]
     pub fn counted(&self, key: Uuid, now: u64) -> u32 {
         self.at(now, |map| map.get(&key).copied().unwrap_or(0))
     }
-    /// Count one refusal of `key`.
+    /// Count one event of `key`.
     pub fn note(&self, key: Uuid, now: u64) {
         let capacity = self.capacity;
         self.at(now, |map| {
@@ -196,17 +199,15 @@ impl RefusalLimiter {
     }
 }
 
-/// This replica's guardrail refusals.
-pub static REFUSALS: LazyLock<RefusalLimiter> =
-    LazyLock::new(|| RefusalLimiter::new(REFUSALS_PER_MINUTE, TRACKED_KEYS));
-
-/// Requests of a key whose decisions wrote rows, per minute on one replica.
+/// Requests of a key whose decisions wrote rows and that were never admitted
+/// (a guardrail refusal included), per minute on one replica: the one
+/// per-key bound of the guardrail step.
 pub const RECORDED_PER_MINUTE: u32 = 600;
-/// This replica's requests that wrote decision rows.
-pub static RECORDED: LazyLock<RefusalLimiter> =
-    LazyLock::new(|| RefusalLimiter::new(RECORDED_PER_MINUTE, TRACKED_KEYS));
+/// This replica's unadmitted requests that wrote decision rows.
+pub static RECORDED: LazyLock<KeyLimiter> =
+    LazyLock::new(|| KeyLimiter::new(RECORDED_PER_MINUTE, TRACKED_KEYS));
 
-/// Seconds since the epoch (the refusal limiter's clock).
+/// Seconds since the epoch (the key limiter's clock).
 pub fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

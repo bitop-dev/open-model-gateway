@@ -41,7 +41,7 @@ pub struct CompiledRule {
     tightened: bool,
     /// `None`: a rule this release cannot run (a later release's detector,
     /// or a pattern that no longer compiles).
-    detector: Option<Box<dyn Detector>>,
+    detector: Option<std::sync::Arc<dyn Detector>>,
     /// The rule has custom patterns from a local layer (user-written).
     local_custom: bool,
     custom: bool,
@@ -59,6 +59,16 @@ impl Policy {
     /// `local_only`, a dangling tightening) and runnable rules whose input
     /// action is `off` do not run.
     pub fn compile(effective: &[EffectiveRule]) -> Self {
+        Self::compile_with(effective, &std::collections::HashMap::new())
+    }
+    /// As [`Policy::compile`], with the rules' custom-pattern detectors
+    /// already compiled (`shared::detectors`, by rule id); a rule missing
+    /// there is compiled here. Rules without custom patterns compile no
+    /// regex (the built-in shapes are compiled once per process).
+    pub fn compile_with(
+        effective: &[EffectiveRule],
+        compiled: &std::collections::HashMap<Uuid, super::shared::Compiled>,
+    ) -> Self {
         let mut rules = Vec::new();
         for e in effective {
             let Some(rule) = &e.rule else { continue };
@@ -73,13 +83,16 @@ impl Policy {
                 continue;
             }
             let categories: Vec<Category> = rule.detector.categories.iter().copied().collect();
-            let detector: Option<Box<dyn Detector>> = match rule.detector.kind {
-                DetectorKind::Pattern if runnable => PatternDetector::within(
-                    &categories,
-                    &rule.detector.patterns,
-                    super::patterns::Limit::of(e.layer),
-                )
-                .map(|d| Box::new(d) as Box<dyn Detector>),
+            let detector: Option<std::sync::Arc<dyn Detector>> = match rule.detector.kind {
+                DetectorKind::Pattern if runnable => match compiled.get(&e.id) {
+                    Some(shared) => shared.clone().map(|d| d as std::sync::Arc<dyn Detector>),
+                    None => PatternDetector::within(
+                        &categories,
+                        &rule.detector.patterns,
+                        super::patterns::Limit::of(e.layer),
+                    )
+                    .map(|d| std::sync::Arc::new(d) as std::sync::Arc<dyn Detector>),
+                },
                 _ => None,
             };
             let custom = !rule.detector.patterns.is_empty();

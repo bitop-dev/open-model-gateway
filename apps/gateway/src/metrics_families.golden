@@ -36,6 +36,7 @@ gateway_file_store_bytes counter backend,op Traffic
 gateway_file_store_operations counter backend,op,outcome Traffic
 gateway_guardrail_decisions counter action,detector,family,stage Traffic
 gateway_guardrail_detector_seconds histogram detector Traffic
+gateway_guardrail_unscanned counter reason Traffic
 gateway_history_partition_months_ahead gauge table System
 gateway_history_verify_findings gauge - System
 gateway_http_request_duration_seconds histogram method,route Traffic

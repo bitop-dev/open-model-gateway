@@ -19,6 +19,9 @@ SET lock_timeout = '10s';
 ALTER TABLE history_partitions DROP CONSTRAINT history_partitions_archive_group_check;
 ALTER TABLE history_partitions ADD CONSTRAINT history_partitions_archive_group_check
  CHECK (archive_group IN ('history','audit','storage','guardrails'));
+ALTER TABLE archived_partitions DROP CONSTRAINT archived_partitions_archive_group_check;
+ALTER TABLE archived_partitions ADD CONSTRAINT archived_partitions_archive_group_check
+ CHECK (archive_group IN ('history','audit','storage','guardrails'));
 
 CREATE TABLE guardrail_events (
  id uuid NOT NULL,

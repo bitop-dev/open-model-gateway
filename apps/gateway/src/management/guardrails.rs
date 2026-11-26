@@ -406,11 +406,23 @@ async fn put_type_guardrails(
 /// `findings` sums the distinct matches of decisions that found something.
 async fn with_totals(s: &Store, ws: Uuid, mut v: Value) -> Result<Value> {
     let owner_visible = v["kind"] != "personal";
+    // A bound parameter, so only this month's partition is read (a volatile
+    // expression in the predicate prunes nothing).
+    let today = gateway_datetime_compat::UtcInstant::now().date();
+    let month = gateway_datetime_compat::CalendarDate::new(today.year(), today.month(), 1)
+        .and_then(|d| d.midnight())
+        .map_err(|_| {
+            ApiError(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Management storage unavailable",
+            )
+        })?;
     let totals: Vec<(String, String, i64, i64)> = sqlx::query_as(
-        "SELECT action,category,count(*),coalesce(sum(count) FILTER(WHERE action IN('monitored','redacted','blocked','stopped')),0)::bigint FROM guardrail_events WHERE workspace_id=$1 AND created_at>=date_trunc('month',clock_timestamp(),'UTC') AND ($2 OR (layer<>'workspace_local' AND NOT tightened)) GROUP BY action,category ORDER BY action,category",
+        "SELECT action,category,count(*),coalesce(sum(count) FILTER(WHERE action IN('monitored','redacted','blocked','stopped')),0)::bigint FROM guardrail_events WHERE workspace_id=$1 AND created_at>=$3 AND ($2 OR (layer<>'workspace_local' AND NOT tightened)) GROUP BY action,category ORDER BY action,category",
     )
     .bind(ws)
     .bind(owner_visible)
+    .bind(month)
     .fetch_all(&s.pool)
     .await?;
     v["decisions_this_month"] = totals

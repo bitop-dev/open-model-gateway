@@ -67,6 +67,7 @@ fn positives() -> Vec<(&'static str, String)> {
             "anthropic_api_key",
             format!("{}-ant-api03-{}", "sk", alnum(95)),
         ),
+        ("openrouter_api_key", format!("{}-or-v1-{}", "sk", hex(64))),
         ("google_api_key", format!("{}{}", "AI", "za") + &alnum(35)),
         ("huggingface_token", format!("{}_{}", "hf", alnum(34))),
         ("npm_token", format!("{}_{}", "npm", alnum(36))),
@@ -157,9 +158,41 @@ fn every_builtin_rule_matches_its_shape_in_prose_punctuation_and_escapes() {
         format!("{}+psycopg2://app:{}@db:5432/x", "postgresql", alnum(12)),
         format!("{}://:{}@cache:6379", "redis", alnum(12)),
         format!("{}-ant-oat01-{}", "sk", alnum(95)),
+        format!("{}://app:{}@db:5432/x", "POSTGRES", alnum(12)),
+        format!("{}+Psycopg2://app:{}@db:5432/x", "PostgreSQL", alnum(12)),
+        format!("{{\"Secret{}\": \"{}\"}}", "AccessKey", alnum(40)),
+        format!("{}-1-A0{}-1234567890-{}", "xapp", rep('B', 9), hex(64)),
     ] {
         assert!(found(&value) >= 1, "{value}");
     }
+    // Near misses of those shapes.
+    for value in [
+        format!("{}://db.internal:5432/main", "POSTGRES"),
+        format!("{}-or-v1-{}", "sk", hex(40)),
+        format!("{{\"Secret{}\": \"{}\"}}", "Key", alnum(40)),
+        format!("{{\"Secret{}\": \"{}\"}}", "AccessKey", alnum(20)),
+        format!("{}-1", "xapp"),
+    ] {
+        assert_eq!(found(&value), 0, "{value}");
+    }
+}
+
+#[test]
+fn a_pem_header_glued_to_its_body_is_found() {
+    let body = alnum(64);
+    let header = |kind: &str| format!("-----{} {kind}{} KEY-----", "BEGIN", " PRIVATE");
+    for text in [
+        // Newlines stripped, as in `.env` files and CI secrets.
+        format!("PRIVATE_KEY={}{body}", header("RSA")),
+        format!("{}{body}", header("EC")),
+        // The newline written as an escape.
+        format!("\"{}\\n{body}\\n\"", header("RSA")),
+        format!("key: {}\\n{body}", header("OPENSSH")),
+    ] {
+        assert!(found(&text) >= 1, "{}", &text[..24]);
+    }
+    // Glued data before the header still makes it data.
+    assert_eq!(found(&format!("Zx9aB3dE5gH7jK{}{body}", header("RSA"))), 0);
 }
 
 #[test]

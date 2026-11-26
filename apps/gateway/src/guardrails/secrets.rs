@@ -28,9 +28,10 @@ pub const BUILTIN: &[(&str, &str)] = &[
     ("aws_access_key_id", r"(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}"),
     (
         "aws_secret_access_key",
-        // The identifier the keyword ends (`prodAwsSecretAccessKey`) is part
-        // of the match, so it never glues the match to data.
-        r#"(?i:[a-z0-9_]*aws_?secret_?access_?key)["']?\s*[:=]\s*["']?[A-Za-z0-9/+]{40}"#,
+        // The identifier the keyword ends (`prodAwsSecretAccessKey`, AWS's
+        // own JSON `SecretAccessKey`) is part of the match, so it never glues
+        // the match to data.
+        r#"(?i:[a-z0-9_]*secret_?access_?key)["']?\s*[:=]\s*["']?[A-Za-z0-9/+]{40}"#,
     ),
     (
         "github_token",
@@ -38,7 +39,7 @@ pub const BUILTIN: &[(&str, &str)] = &[
     ),
     ("github_fine_grained_token", r"github_pat_[A-Za-z0-9_]{82}"),
     ("gitlab_token", r"glpat-[A-Za-z0-9_\-]{20,}"),
-    ("slack_token", r"xox[abposr]-[A-Za-z0-9-]{10,250}"),
+    ("slack_token", r"(?:xox[abposr]|xapp)-[A-Za-z0-9-]{10,250}"),
     (
         "slack_webhook",
         r"https://hooks\.slack\.com/services/T[A-Z0-9]{8,}/B[A-Z0-9]{8,}/[A-Za-z0-9]{24}",
@@ -52,6 +53,7 @@ pub const BUILTIN: &[(&str, &str)] = &[
         "anthropic_api_key",
         r"sk-ant-(?:api|admin|oat)[0-9]{2}-[A-Za-z0-9_\-]{80,120}",
     ),
+    ("openrouter_api_key", r"sk-or-v1-[0-9a-f]{64}"),
     ("google_api_key", r"AIza[0-9A-Za-z_\-]{35}"),
     ("huggingface_token", r"hf_[A-Za-z0-9]{34,40}"),
     ("npm_token", r"npm_[A-Za-z0-9]{36}"),
@@ -65,7 +67,7 @@ pub const BUILTIN: &[(&str, &str)] = &[
     ),
     (
         "connection_string_password",
-        r"(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|rediss?|amqps?|mssql|sqlserver)(?:\+[a-z0-9]{1,32})?://[^\s:/@]{0,256}:[^\s@/]{1,256}@[^\s/]{1,256}",
+        r"(?i:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|rediss?|amqps?|mssql|sqlserver)(?i:\+[a-z0-9]{1,32})?://[^\s:/@]{0,256}:[^\s@/]{1,256}@[^\s/]{1,256}",
     ),
     (
         "azure_storage_connection_string",
@@ -136,8 +138,13 @@ fn label(run: &[u8], before: bool) -> bool {
 fn glued(run: &[u8], before: bool) -> bool {
     run.len() >= BLOB_RUN && !(run.len() <= LABEL_MAX && label(run, before))
 }
-/// Whether `span` of `text` stands apart from base64url data around it.
-fn standalone(text: &[u8], span: std::ops::Range<usize>) -> bool {
+/// Shapes whose match ends in its own delimiter (a PEM header's trailing
+/// `-----`): what follows is the key's body, never glue.
+const DELIMITED_AFTER: &[&str] = &["private_key"];
+
+/// Whether `span` of `text` stands apart from base64url data around it (only
+/// before it when `delimited` says the match ends in its own delimiter).
+fn standalone(text: &[u8], span: std::ops::Range<usize>, delimited: bool) -> bool {
     let start = span.start
         - text[..span.start]
             .iter()
@@ -151,7 +158,7 @@ fn standalone(text: &[u8], span: std::ops::Range<usize>) -> bool {
             .take(LABEL_MAX + 1)
             .take_while(|b| encoded(**b))
             .count();
-    !glued(&text[start..span.start], true) && !glued(&text[span.end..end], false)
+    !glued(&text[start..span.start], true) && (delimited || !glued(&text[span.end..end], false))
 }
 
 /// Every match of the built-in secret shapes (shared by every rule that has
@@ -160,10 +167,13 @@ pub fn builtin(input: &Inspection<'_>) -> Findings {
     let mut found = Vec::new();
     for (index, segment) in input.segments.iter().enumerate() {
         for i in SECRETS.any.matches(&segment.text).iter() {
-            for m in SECRETS.each[i]
-                .find_iter(&segment.text)
-                .filter(|m| standalone(segment.text.as_bytes(), m.range()))
-            {
+            for m in SECRETS.each[i].find_iter(&segment.text).filter(|m| {
+                standalone(
+                    segment.text.as_bytes(),
+                    m.range(),
+                    DELIMITED_AFTER.contains(&BUILTIN[i].0),
+                )
+            }) {
                 if found.len() == MAX_FINDINGS {
                     return Findings(found);
                 }

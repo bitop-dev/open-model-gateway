@@ -83,8 +83,8 @@ async fn a_slot_moved_into_work_is_held_until_the_work_ends() {
 }
 
 #[test]
-fn refusals_are_counted_per_key_and_minute_within_a_bounded_map() {
-    let limiter = RefusalLimiter::new(3, 2);
+fn events_are_counted_per_key_and_minute_within_a_bounded_map() {
+    let limiter = KeyLimiter::new(3, 2);
     let (a, b, c) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
     let now = 600 + 15;
     for _ in 0..3 {

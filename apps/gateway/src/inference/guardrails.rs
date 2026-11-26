@@ -22,10 +22,7 @@ use crate::auth::Principal;
 use crate::cache::Lookup;
 use crate::guardrails::detector::Inspection;
 use crate::guardrails::enforce::{Decision, Event, Policy, RefusalKind};
-use crate::guardrails::limits::{
-    self, LOCAL_SCANS, MAX_EVENT_ROWS, RECORDED, REFUSALS, SHARED_SCANS,
-};
-use crate::guardrails::patterns::{LOCAL_COMPILES, PLATFORM_COMPILES};
+use crate::guardrails::limits::{self, LOCAL_SCANS, MAX_EVENT_ROWS, RECORDED, SHARED_SCANS};
 use crate::guardrails::policy::{Workload, compose};
 use crate::guardrails::stored::{self, Heads};
 use crate::store::Store;
@@ -167,41 +164,26 @@ impl Store {
                 return Ok(Arc::clone(&entry.policy));
             }
         }
-        let Ok((platform, local)) = stored::layers_of(&mut conn, heads.clone())
+        // Heads and rules from one snapshot: the policy is cached under the
+        // heads it was read at.
+        let (heads, layers) = stored::workspace_layers(&mut conn, workspace)
             .await
-            .map_err(route_lookup_storage)?
-        else {
+            .map_err(route_lookup_storage)?;
+        drop(conn);
+        let Ok((platform, local)) = layers else {
             tracing::warn!(workspace_id = %workspace, "a stored guardrail rule is not readable by this release");
             return Err(InferenceError::GuardrailUnavailable);
         };
-        drop(conn);
         let effective = compose(platform.as_ref(), local.as_ref());
-        let patterns = |set: &Option<crate::guardrails::policy::RuleSet>| {
-            set.iter().flat_map(|s| &s.rules).any(|r| {
-                matches!(&r.entry, crate::guardrails::policy::Entry::Rule(rule) if !rule.detector.patterns.is_empty())
-            })
-        };
-        // Compiling custom patterns takes milliseconds each: in a compile
-        // slot, off the async workers and without a connection, waiting for
-        // one at most as long as for a scan slot; a policy without them
-        // compiles at once.
-        let slots = if patterns(&local) {
-            Some(&LOCAL_COMPILES)
-        } else if patterns(&platform) {
-            Some(&PLATFORM_COMPILES)
-        } else {
-            None
-        };
-        let policy = match slots {
-            Some(slots) => {
-                crate::guardrails::patterns::in_slot_within(slots, Some(limits::WAIT), move || {
-                    Policy::compile(&effective)
-                })
-                .await
-            }
-            None => Some(Policy::compile(&effective)),
-        }
-        .ok_or(InferenceError::GuardrailUnavailable)?;
+        // Custom patterns are compiled once per replica and rule revision,
+        // shared by every workspace's policy (`guardrails::shared`): in a
+        // compile slot, off the async workers and without a connection,
+        // waiting for one at most as long as for a scan slot. The rest of a
+        // policy compiles no regex.
+        let compiled = crate::guardrails::shared::detectors(&effective)
+            .await
+            .map_err(|_| InferenceError::GuardrailUnavailable)?;
+        let policy = Policy::compile_with(&effective, &compiled);
         Ok(keep(Arc::new(CachedPolicy {
             heads,
             policy: Arc::new(policy),
@@ -236,7 +218,7 @@ impl Store {
             .await?;
             RECORDED.note(principal.key_id, limits::now());
         }
-        verdict(principal, &decision)
+        verdict(&decision)
     }
 
     /// Append one request's decisions (one statement, outside any admission
@@ -323,24 +305,23 @@ fn rows(decision: &Decision) -> (Vec<Event>, u32) {
     (events, u32::try_from(omitted).unwrap_or(u32::MAX))
 }
 
-/// 429 before any scan when the key's refusals reached this minute's bound.
+/// 429 before any scan when the key reached this minute's bound of
+/// unadmitted recorded requests.
 fn throttled(principal: &Principal) -> Result<(), InferenceError> {
-    let now = limits::now();
-    REFUSALS
-        .check(principal.key_id, now)
-        .and(RECORDED.check(principal.key_id, now))
-        .map_err(InferenceError::GuardrailThrottled)
+    RECORDED
+        .check(principal.key_id, limits::now())
+        .map_err(|seconds| {
+            crate::metrics::METRICS.guardrail_unscanned("rate_limited");
+            InferenceError::GuardrailThrottled(seconds)
+        })
 }
 
-/// The request's outcome; a refusal counts toward the key's bound.
-fn verdict(principal: &Principal, decision: &Decision) -> Result<(), InferenceError> {
-    match decision.refusal {
-        Some(refusal) => {
-            REFUSALS.note(principal.key_id, limits::now());
-            Err(InferenceError::Guardrail(refusal))
-        }
-        None => Ok(()),
-    }
+/// The request's outcome (a refusal's rows count toward the key's bound
+/// through its [`Unadmitted`] mark).
+fn verdict(decision: &Decision) -> Result<(), InferenceError> {
+    decision
+        .refusal
+        .map_or(Ok(()), |r| Err(InferenceError::Guardrail(r)))
 }
 
 impl super::Engine {
@@ -392,7 +373,9 @@ impl super::Engine {
         if !policy.applies_to(workload) {
             return Ok(Unadmitted::new(None));
         }
-        throttled(principal)?;
+        if self.per_key_bound {
+            throttled(principal)?;
+        }
         let input = input();
         let decision = match input {
             // Off the async workers, in a bounded slot that moves into the
@@ -425,7 +408,7 @@ impl super::Engine {
                             .refusal
                             .filter(|r| r.kind == RefusalKind::Unavailable)
                         {
-                            count(&decision);
+                            crate::metrics::METRICS.guardrail_unscanned("no_slot");
                             return Err(InferenceError::Guardrail(refusal));
                         }
                         // Refused anyway by a rule this release cannot run
@@ -441,7 +424,8 @@ impl super::Engine {
         };
         let (events, omitted) = rows(&decision);
         // Taken before the insert, so a request dropped during it counts too.
-        let unadmitted = Unadmitted::new((!events.is_empty()).then_some(principal.key_id));
+        let unadmitted =
+            Unadmitted::new((self.per_key_bound && !events.is_empty()).then_some(principal.key_id));
         if !events.is_empty() {
             self.repository
                 .record_guardrails(&GuardrailRecord {
@@ -455,7 +439,7 @@ impl super::Engine {
                 })
                 .await?;
         }
-        verdict(principal, &decision)?;
+        verdict(&decision)?;
         Ok(unadmitted)
     }
 }

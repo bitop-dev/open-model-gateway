@@ -25,6 +25,16 @@ impl Limit {
             Self::Local => 64 << 10,
         }
     }
+    /// The lazy DFA cache of one pattern, per scan using it at once (the
+    /// crate's default is 2 MiB). Smaller for local layers: any user writes
+    /// one, a cached local policy keeps up to 50 patterns, and the request's
+    /// budget already bounds the slower path a full cache falls back to.
+    pub fn dfa(self) -> usize {
+        match self {
+            Self::Platform => 1 << 20,
+            Self::Local => 128 << 10,
+        }
+    }
     pub fn of(layer: super::policy::Layer) -> Self {
         if layer == super::policy::Layer::WorkspaceLocal {
             Self::Local
@@ -33,8 +43,6 @@ impl Limit {
         }
     }
 }
-/// The lazy DFA cache of one pattern (the crate's default is 2 MiB).
-pub const DFA_LIMIT: usize = 1 << 20;
 /// How deeply a pattern may nest (the crate's default is 250).
 pub const NEST_LIMIT: u32 = 64;
 
@@ -93,7 +101,7 @@ pub fn compile_within(pattern: &str, limit: Limit) -> Option<Regex> {
     }
     let regex = RegexBuilder::new(pattern)
         .size_limit(limit.program())
-        .dfa_size_limit(DFA_LIMIT)
+        .dfa_size_limit(limit.dfa())
         .nest_limit(NEST_LIMIT)
         .build()
         .ok()?;

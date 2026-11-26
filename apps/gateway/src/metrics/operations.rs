@@ -149,7 +149,8 @@ impl Metrics {
         family: &'static str,
         action: &'static str,
     ) {
-        self.guardrail_decisions
+        self.guardrails
+            .decisions
             .get_or_create(&[
                 ("stage", stage.to_owned()),
                 ("detector", detector.to_owned()),
@@ -159,13 +160,23 @@ impl Metrics {
             .inc();
     }
 
+    /// A request the guardrail step refused without a scan (`rate_limited`
+    /// or `no_slot`).
+    pub(crate) fn guardrail_unscanned(&self, reason: &'static str) {
+        self.guardrails
+            .unscanned
+            .get_or_create(&[("reason", reason.to_owned())])
+            .inc();
+    }
+
     /// How long a request's guardrail detectors of one kind took.
     pub(crate) fn guardrail_detector_seconds(
         &self,
         detector: &'static str,
         elapsed: std::time::Duration,
     ) {
-        self.guardrail_detector
+        self.guardrails
+            .detector
             .get_or_create(&[("detector", detector.to_owned())])
             .observe(elapsed.as_secs_f64());
     }

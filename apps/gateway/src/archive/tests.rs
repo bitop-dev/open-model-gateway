@@ -204,6 +204,86 @@ async fn closed_months_archive_only_when_settled_rolled_and_past_retention(pool:
     assert!(consistent(&pool).await);
 }
 
+/// Guardrail decisions archive as their own group: refused while a legal
+/// hold covers a decision's key holder (the hold query runs), then exported,
+/// recorded in `archived_partitions` as `guardrails` and detached.
+#[dbtest::test]
+async fn guardrail_decisions_archive_as_their_own_group_after_legal_holds(pool: PgPool) {
+    let f = fixture(pool.clone()).await;
+    let upper: UtcInstant = sqlx::query_scalar(
+        "SELECT legacy_upper FROM history_partitions WHERE parent='guardrail_events'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    crate::partitions::ensure_at(&pool, 6, upper).await.unwrap();
+    let month = upper.checked_add_months(1).unwrap();
+    let next = upper.checked_add_months(2).unwrap();
+    let later = next.checked_add_months(1).unwrap();
+    let label = month.format("%Y-%m").to_string();
+    for day in 1..=3 {
+        sqlx::query("INSERT INTO guardrail_events(id,created_at,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused) VALUES($1,$2,$1,$3,$4,'chat_completions','company/smart','input',$1,$1,1,'type_default','pattern','secret','blocked',1,true)")
+            .bind(Uuid::now_v7())
+            .bind(month + gateway_datetime_compat::SignedDuration::days(day))
+            .bind(f.principal.workspace_id)
+            .bind(f.principal.key_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let req = Request {
+        group: Group::Guardrails,
+        month: Month::parse(&label).unwrap(),
+        to: dir.path().to_path_buf(),
+        drop: false,
+        retention_months: 1,
+    };
+    // A guardrail month has no legacy partition to archive.
+    let legacy = Request {
+        group: Group::Guardrails,
+        month: Month::Legacy,
+        to: dir.path().to_path_buf(),
+        drop: false,
+        retention_months: 1,
+    };
+    assert!(archive_as_of(&pool, &legacy, later).await.is_err());
+    // Held like the request it decided on: the key's holder is on hold.
+    let hold = Uuid::new_v4();
+    sqlx::query("INSERT INTO legal_holds(id,user_id,reference) VALUES($1,$2,'CASE-840')")
+        .bind(hold)
+        .bind(f.owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let e = archive_as_of(&pool, &req, later).await.unwrap_err();
+    assert_eq!(refusal(e), Refusal::Held(3));
+    sqlx::query("UPDATE legal_holds SET released_at=now(),released_by_user_id=(SELECT id FROM users ORDER BY id LIMIT 1) WHERE id=$1")
+        .bind(hold)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let report = archive_as_of(&pool, &req, later).await.unwrap();
+    assert_eq!(report.disposition, "detached");
+    assert_eq!(report.files.len(), 1);
+    assert_eq!(
+        (report.files[0].parent.as_str(), report.files[0].rows),
+        ("guardrail_events", 3)
+    );
+    verify_directory(&report.directory).unwrap();
+    let recorded: String = sqlx::query_scalar("SELECT archive_group FROM archived_partitions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(recorded, "guardrails");
+    let suffix = month.format("%Y_%m").to_string();
+    let (public, archived): (bool, bool) = sqlx::query_as(&format!("SELECT to_regclass('public.guardrail_events_p{suffix}') IS NOT NULL,to_regclass('omg_archive.guardrail_events_p{suffix}') IS NOT NULL"))
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!((public, archived), (false, true));
+    // A month is archived once.
+    assert!(archive_as_of(&pool, &req, later).await.is_err());
+}
+
 #[test]
 fn month_and_group_arguments_are_strict() {
     assert_eq!(Month::parse("legacy"), Some(Month::Legacy));

@@ -109,6 +109,10 @@ pub struct Engine {
     recorder: Option<telemetry::Recorder>,
     /// Token-count windows, concurrency and clock of this process (`count`).
     counts: Arc<count::Counts>,
+    /// Whether the guardrail step applies its per-key bound (not to
+    /// gateway-run batch lines: their batch was accepted with a bounded line
+    /// count, and a clean line never fails because others were refused).
+    per_key_bound: bool,
 }
 
 impl Engine {
@@ -172,6 +176,7 @@ impl Engine {
             realtime: realtime::RealtimeLimits::default(),
             recorder: None,
             counts: Arc::new(count::Counts::new(limits.count_concurrency)),
+            per_key_bound: true,
         })
     }
 
@@ -211,6 +216,7 @@ impl Engine {
             // same as every other non-interactive admission path.
             recorder: None,
             counts: self.counts.clone(),
+            per_key_bound: false,
         }
     }
 

@@ -233,7 +233,7 @@ impl LineRun {
             }
         };
         let model = line.request.model().to_owned();
-        let mut attempt: i16 = 1;
+        let (mut attempt, mut unscanned): (i16, u32) = (1, 0);
         loop {
             let result = self
                 .execute(line.request.clone(), execution, pin, line.plan)
@@ -260,6 +260,7 @@ impl LineRun {
                     }
                     return;
                 }
+                Err(e) if self.rescan_later(e, &mut unscanned, &mut pin).await => {}
                 Err(e) => {
                     // Busy from an ungated refusal (`LineRepository::refuse_ungated`)
                     // never reached a provider: only a
@@ -315,6 +316,32 @@ impl LineRun {
                 }
             }
         }
+    }
+
+    /// The guardrail step could not inspect the line now (no scan slot, its
+    /// budget spent, its policy not loaded): nothing was admitted or sent, so
+    /// it is tried again after the error's delay, growing, without spending
+    /// an attempt (`true` once the wait is over). A line whose scan cannot
+    /// finish after `GUARDRAIL_TRIES` fails with that error: its input, not
+    /// the replica, is then the cause.
+    async fn rescan_later(
+        &self,
+        e: InferenceError,
+        tries: &mut u32,
+        pin: &mut Option<Pin>,
+    ) -> bool {
+        if !guardrail_busy(e) || *tries >= GUARDRAIL_TRIES || self.state.should_stop(&self.job) {
+            return false;
+        }
+        let seconds = e.retry_after_seconds().unwrap_or(1) << (*tries).min(5);
+        *tries += 1;
+        tokio::time::sleep(std::time::Duration::from_secs(
+            seconds.min(GUARDRAIL_RETRY_CAP).into(),
+        ))
+        .await;
+        // The dispatch's probe slot was the first try's.
+        *pin = pin.map(|pin| Pin { probe: None, ..pin });
+        true
     }
 
     async fn emit_success(
@@ -517,4 +544,22 @@ impl LineRun {
                 .map(BatchResponse::Embeddings),
         }
     }
+}
+
+/// Tries of a line the guardrail step could not inspect now, and the
+/// longest wait between two (seconds): about three minutes in all.
+const GUARDRAIL_TRIES: u32 = 10;
+const GUARDRAIL_RETRY_CAP: u32 = 30;
+
+/// A guardrail refusal that says nothing about the line: the step could not
+/// run now.
+fn guardrail_busy(e: InferenceError) -> bool {
+    matches!(
+        e,
+        InferenceError::GuardrailUnavailable
+            | InferenceError::Guardrail(crate::guardrails::enforce::Refusal {
+                kind: crate::guardrails::enforce::RefusalKind::Unavailable,
+                ..
+            })
+    )
 }

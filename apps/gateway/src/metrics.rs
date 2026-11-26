@@ -47,6 +47,17 @@ type L3 = [(&'static str, String); 3];
 type L4 = [(&'static str, String); 4];
 type Histograms<L> = Family<L, Histogram, fn() -> Histogram>;
 
+/// The guardrail step's families (fixed label sets).
+struct GuardrailMetrics {
+    /// Decisions by stage, detector kind, category family and action (custom
+    /// rules count as `custom`).
+    decisions: Family<L4, Counter>,
+    detector: Histograms<L1>,
+    /// Requests the step refused without a scan (and so without a decision
+    /// row): `rate_limited` (the key's bound) or `no_slot`.
+    unscanned: Family<L1, Counter>,
+}
+
 /// Distinct values admitted per dynamic label before folding into `other`.
 const MAX_DYNAMIC_VALUES: usize = 200;
 const MAX_LABEL_CHARS: usize = 96;
@@ -243,10 +254,7 @@ pub struct Metrics {
     token_counts: Family<L1, Counter>,
     key_issuance_refused: Family<L2, Counter>,
     egress_denied: Family<L1, Counter>,
-    /// Guardrail decisions by stage, detector kind, category family and
-    /// action (fixed sets; custom rules count as `custom`).
-    guardrail_decisions: Family<L4, Counter>,
-    guardrail_detector: Histograms<L1>,
+    guardrails: GuardrailMetrics,
     upstream_connection_lost: Family<L1, Counter>,
     upstream_connections_opened: Family<L1, Counter>,
     job_lease_renewals: Family<L1, Counter>,

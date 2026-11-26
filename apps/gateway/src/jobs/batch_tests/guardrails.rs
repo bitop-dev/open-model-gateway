@@ -260,3 +260,122 @@ async fn blocked_lines_release_the_route_capacity_they_were_scheduled_on(pool: P
         .unwrap();
     assert_eq!(refused, 3);
 }
+
+/// Blocked lines never fail the clean ones: batch lines are exempt from the
+/// per-key bound (their batch was accepted with a bounded line count), so 40
+/// blocked lines throttle nothing.
+#[dbtest::test]
+async fn blocked_lines_never_fail_the_clean_ones(pool: PgPool) {
+    let w = world_with(pool, false, false, 2, None).await;
+    let f = &w.f;
+    rule_set(f, "block").await;
+    let hex: String = "0123456789abcdef".chars().cycle().take(96).collect();
+    let secret = format!("{}_{}.{}", "omg", &hex[..32], &hex[32..]);
+    let lines: Vec<Value> = (0..80)
+        .map(|i| {
+            if i % 2 == 0 {
+                chat_line(
+                    &format!("leak{i}"),
+                    "company/smart",
+                    &format!("use {secret}"),
+                )
+            } else {
+                chat_line(&format!("clean{i}"), "company/smart", "hello")
+            }
+        })
+        .collect();
+    let file = w.upload(&f.principal, &lines).await;
+    let job = w
+        .create(f.principal, &file, BatchEndpoint::ChatCompletions, None)
+        .await
+        .unwrap();
+    // Already at the key's bound: batch lines neither count nor are refused.
+    for _ in 0..crate::guardrails::limits::RECORDED_PER_MINUTE {
+        crate::guardrails::limits::RECORDED
+            .note(f.principal.key_id, crate::guardrails::limits::now());
+    }
+    let _ = Runner::new(w.jobs.clone()).run_next().await;
+    let job = w.reload(&job).await;
+    let states: Vec<(String, Option<String>, i64)> = sqlx::query_as(
+        "SELECT state,error_code,count(*) FROM batch_lines WHERE job_id=$1 GROUP BY 1,2 ORDER BY 1",
+    )
+    .bind(job.id)
+    .fetch_all(&f.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        states,
+        [
+            ("failed".into(), Some("guardrail_input_blocked".into()), 40),
+            ("succeeded".into(), None, 40),
+        ]
+    );
+}
+
+/// A line that meets a full scan pool is tried again after the error's
+/// delay and succeeds; it spends no attempt.
+#[dbtest::test]
+async fn a_line_that_meets_a_full_scan_pool_is_retried_and_succeeds(pool: PgPool) {
+    let w = world_with(pool, false, false, 1, None).await;
+    let f = &w.f;
+    let kind: String = sqlx::query_scalar("SELECT kind FROM workspaces WHERE id=$1")
+        .bind(f.principal.workspace_id)
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    let set = Uuid::now_v7();
+    let mut tx = f.store.pool.begin().await.unwrap();
+    sqlx::query("INSERT INTO guardrail_rule_sets(id,layer,kind,local_only,updated_by) VALUES($1,'type_default',$2,false,$3)")
+        .bind(set).bind(&kind).bind(f.owner).execute(&mut *tx).await.unwrap();
+    // A custom pattern: every scan takes a slot.
+    sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable,patterns) VALUES($1,$2,0,'Ids','custom','pattern','{custom}','block','user_text','off','fail_closed','{generation}','deny',ARRAY['ACME-[0-9]{4}'])")
+        .bind(Uuid::now_v7()).bind(set).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    let file = w
+        .upload(
+            &f.principal,
+            &[chat_line("clean", "company/smart", "hello")],
+        )
+        .await;
+    let job = w
+        .create(f.principal, &file, BatchEndpoint::ChatCompletions, None)
+        .await
+        .unwrap();
+    // The workspace's whole share is held until the line has waited for a
+    // slot and given up (it entered the step and left it again).
+    let slots = &crate::guardrails::limits::SHARED_SCANS;
+    let ws = f.principal.workspace_id;
+    let share = crate::guardrails::limits::SHARE;
+    let mut held = Vec::new();
+    for _ in 0..share {
+        held.push(slots.acquire(ws).await.unwrap());
+    }
+    let release = tokio::spawn(async move {
+        while slots.in_step(ws) == share {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        while slots.in_step(ws) > share {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        drop(held);
+    });
+    let _ = Runner::new(w.jobs.clone()).run_next().await;
+    release.await.unwrap();
+    let job = w.reload(&job).await;
+    let line: (String, i16) =
+        sqlx::query_as("SELECT state,attempts FROM batch_lines WHERE job_id=$1")
+            .bind(job.id)
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        line,
+        ("succeeded".into(), 1),
+        "retried without spending an attempt"
+    );
+    let out = w.read(f.principal.workspace_id, job.output_file_id).await;
+    assert!(
+        out.iter().any(|l| l["response"]["status_code"] == 200),
+        "{out:?}"
+    );
+}

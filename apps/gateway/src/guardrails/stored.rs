@@ -191,15 +191,30 @@ pub async fn load(
 }
 
 /// A workspace's stored layers: its platform layer (the override if one
-/// exists, else its kind's type default) and its local layer. One query when
-/// none exists (the common case), else one more per layer for its rules.
+/// exists, else its kind's type default) and its local layer, with the heads
+/// they were read at. Heads and rules come from one snapshot (one
+/// `REPEATABLE READ, READ ONLY` transaction), so a set removed or changed
+/// between the reads can never come back as a set without its rules (an
+/// empty override would shadow the type default).
 pub async fn workspace_layers(
     conn: &mut PgConnection,
     workspace: Uuid,
-) -> Result<Result<(Option<RuleSet>, Option<RuleSet>), Unreadable>, sqlx::Error> {
-    let heads = workspace_heads(conn, workspace).await?;
-    layers_of(conn, heads).await
+) -> Result<(Heads, Result<Layers, Unreadable>), sqlx::Error> {
+    use sqlx::Connection as _;
+    let mut tx = conn.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let heads = workspace_heads(&mut tx, workspace).await?;
+    #[cfg(test)]
+    tests_pause::between_reads(workspace).await;
+    let layers = layers_of(&mut tx, heads.clone()).await?;
+    tx.commit().await?;
+    Ok((heads, layers))
 }
+
+/// A platform layer and a local layer.
+pub type Layers = (Option<RuleSet>, Option<RuleSet>);
 
 /// The rule sets that apply to a workspace: id, layer, revision and
 /// `local_only` (one statement). Every change of a set or its rules moves
@@ -221,11 +236,12 @@ pub async fn workspace_heads(
     Ok(heads)
 }
 
-/// The layers of `heads`, with their rules (one statement per set).
-pub async fn layers_of(
+/// The layers of `heads`, with their rules (one statement per set; within
+/// the snapshot [`workspace_layers`] holds).
+async fn layers_of(
     conn: &mut PgConnection,
     heads: Heads,
-) -> Result<Result<(Option<RuleSet>, Option<RuleSet>), Unreadable>, sqlx::Error> {
+) -> Result<Result<Layers, Unreadable>, sqlx::Error> {
     if heads.is_empty() {
         return Ok(Ok((None, None)));
     }
@@ -261,4 +277,29 @@ pub async fn layers_of(
     let over = take(&mut sets, Layer::WorkspaceOverride);
     let default = take(&mut sets, Layer::TypeDefault);
     Ok(Ok((over.or(default), local)))
+}
+
+/// Tests: pause a workspace's snapshot read between its heads and its rules.
+#[cfg(test)]
+pub mod tests_pause {
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+    use tokio::sync::Notify;
+    use uuid::Uuid;
+    type Pause = (Arc<Notify>, Arc<Notify>);
+    static PAUSES: LazyLock<Mutex<HashMap<Uuid, Pause>>> = LazyLock::new(Default::default);
+    /// The next snapshot of `workspace` notifies `reached` after its heads,
+    /// then waits for `resume`.
+    pub fn arm(workspace: Uuid) -> Pause {
+        let pause = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        PAUSES.lock().unwrap().insert(workspace, pause.clone());
+        pause
+    }
+    pub(super) async fn between_reads(workspace: Uuid) {
+        let pause = PAUSES.lock().unwrap().remove(&workspace);
+        if let Some((reached, resume)) = pause {
+            reached.notify_one();
+            resume.notified().await;
+        }
+    }
 }

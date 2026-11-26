@@ -14,7 +14,7 @@ use uuid::Uuid;
 use super::guardrail_db_tests::{World, events, secret, type_default, world};
 use crate::auth::NewApiKey;
 use crate::guardrails::detector::Inspection;
-use crate::guardrails::limits::{self, REFUSALS, REFUSALS_PER_MINUTE, SHARE, SHARED_SCANS};
+use crate::guardrails::limits::{self, RECORDED, RECORDED_PER_MINUTE, SHARE, SHARED_SCANS};
 use crate::guardrails::policy::Workload;
 use crate::store::Store;
 
@@ -122,7 +122,7 @@ async fn no_scan_slot_is_a_retryable_503_and_other_workspaces_are_served(pool: P
     // A busy refusal scanned nothing: it writes no row and does not count
     // toward the key's refusal bound.
     assert!(events(&w).await.is_empty());
-    assert_eq!(REFUSALS.counted(w.f.principal.key_id, limits::now()), 0);
+    assert_eq!(RECORDED.counted(w.f.principal.key_id, limits::now()), 0);
     // With the slots free again the same request is inspected and passes.
     let (status, _, _) = post(
         &w.base,
@@ -172,10 +172,12 @@ async fn a_detector_failure_follows_on_error_on_every_protocol(pool: PgPool) {
     );
 }
 
-/// A key refused `REFUSALS_PER_MINUTE` times this minute gets 429 before any
-/// scan, and nothing is recorded for the throttled request.
+/// A refusal wrote rows and was never admitted, so it counts toward the
+/// key's one bound: at `RECORDED_PER_MINUTE` this minute the key gets 429
+/// before any scan, nothing is recorded for the throttled request, and the
+/// unscanned counter says why.
 #[dbtest::test]
-async fn a_key_that_keeps_being_refused_is_throttled_before_the_scan(pool: PgPool) {
+async fn refusals_count_toward_the_one_bound_and_a_throttled_request_is_counted(pool: PgPool) {
     let w = world(pool, "'chat_completions'").await;
     type_default(&w, "block", "{secret}", &[]).await;
     let key = w.f.principal.key_id;
@@ -184,8 +186,8 @@ async fn a_key_that_keeps_being_refused_is_throttled_before_the_scan(pool: PgPoo
     // starts again (at most twice).
     for attempt in 0.. {
         let minute = limits::now() / 60;
-        for _ in 1..REFUSALS_PER_MINUTE {
-            REFUSALS.note(key, limits::now());
+        for _ in 1..RECORDED_PER_MINUTE {
+            RECORDED.note(key, limits::now());
         }
         let recorded = events(&w).await.len();
         let (last, _, _) = post(&w.base, &w.token, "/v1/chat/completions", &leak).await;
@@ -207,6 +209,11 @@ async fn a_key_that_keeps_being_refused_is_throttled_before_the_scan(pool: PgPoo
         break;
     }
     assert_eq!(w.hits.load(Ordering::SeqCst), 0);
+    let metrics = crate::metrics::METRICS.render(None).await;
+    assert!(
+        metrics.contains("gateway_guardrail_unscanned_total{reason=\"rate_limited\"}"),
+        "the throttled request is counted"
+    );
 }
 
 /// A request writes at most `MAX_EVENT_ROWS` decision rows: the refused one
@@ -368,9 +375,9 @@ async fn a_key_whose_unadmitted_requests_keep_writing_rows_is_throttled(pool: Pg
     let monitored = bodies(&format!("use {}", secret()))[0].1.clone();
     for attempt in 0.. {
         let minute = limits::now() / 60;
-        let before = limits::RECORDED.counted(key, limits::now());
+        let before = RECORDED.counted(key, limits::now());
         let (answered, _, _) = post(&w.base, &w.token, "/v1/chat/completions", &monitored).await;
-        let after_answered = limits::RECORDED.counted(key, limits::now());
+        let after_answered = RECORDED.counted(key, limits::now());
         // One request a minute: the next one is refused by admission.
         sqlx::query("INSERT INTO key_policies(workspace_id,governance_key_id,requests_per_minute) VALUES($1,$2,1) ON CONFLICT DO NOTHING")
             .bind(w.f.principal.workspace_id)
@@ -379,9 +386,9 @@ async fn a_key_whose_unadmitted_requests_keep_writing_rows_is_throttled(pool: Pg
             .await
             .unwrap();
         let (refused, _, _) = post(&w.base, &w.token, "/v1/chat/completions", &monitored).await;
-        let after_refused = limits::RECORDED.counted(key, limits::now());
-        for _ in after_refused..limits::RECORDED_PER_MINUTE {
-            limits::RECORDED.note(key, limits::now());
+        let after_refused = RECORDED.counted(key, limits::now());
+        for _ in after_refused..RECORDED_PER_MINUTE {
+            RECORDED.note(key, limits::now());
         }
         let recorded = events(&w).await.len();
         let (status, headers, body) =
@@ -432,9 +439,9 @@ async fn an_admitted_request_that_fails_upstream_does_not_count(pool: PgPool) {
     drop(w.upstream);
     for attempt in 0.. {
         let minute = limits::now() / 60;
-        let before = limits::RECORDED.counted(key, limits::now());
+        let before = RECORDED.counted(key, limits::now());
         let (status, _, body) = post(&w.base, &w.token, "/v1/chat/completions", &monitored).await;
-        let after = limits::RECORDED.counted(key, limits::now());
+        let after = RECORDED.counted(key, limits::now());
         if limits::now() / 60 != minute {
             assert!(attempt < 2, "the minute changed during every attempt");
             continue;
@@ -453,4 +460,124 @@ async fn an_admitted_request_that_fails_upstream_does_not_count(pool: PgPool) {
         assert_eq!(after, before, "an admitted request never counts");
         break;
     }
+}
+
+/// The policy is read in one snapshot: an override removed between the read
+/// of the heads and the read of its rules is still read whole (never as an
+/// empty set that would shadow the type default), and the next lookup reads
+/// the type default.
+#[dbtest::test]
+async fn an_override_removed_between_the_reads_is_never_an_empty_policy(pool: PgPool) {
+    let w = world(pool.clone(), "'chat_completions'").await;
+    let ws = w.f.principal.workspace_id;
+    type_default(&w, "block", "{secret}", &[]).await;
+    let set = Uuid::now_v7();
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("INSERT INTO guardrail_rule_sets(id,layer,workspace_id,local_only,updated_by) VALUES($1,'workspace_override',$2,false,$3)")
+        .bind(set).bind(ws).bind(w.f.owner).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable) VALUES($1,$2,0,'Watch','secrets','pattern','{secret}','monitor','user_text','off','fail_open','{generation,embeddings}','deny')")
+        .bind(Uuid::now_v7()).bind(set).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    let store = Arc::new(replica(&pool, false).await);
+    let (reached, resume) = crate::guardrails::stored::tests_pause::arm(ws);
+    let load = {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move { store.guardrail_policy(ws).await.unwrap() })
+    };
+    reached.notified().await;
+    // An admin resets the override while the snapshot is between its reads.
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("UPDATE guardrail_rule_sets SET revision=revision+1,updated_by=$2 WHERE id=$1")
+        .bind(set)
+        .bind(w.f.owner)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM guardrail_rules WHERE rule_set_id=$1")
+        .bind(set)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM guardrail_rule_sets WHERE id=$1")
+        .bind(set)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    resume.notify_one();
+    let during = load.await.unwrap();
+    assert!(!during.is_empty(), "the override was read with its rule");
+    assert!(
+        !refuses(&during),
+        "the override's monitor rule, as of the snapshot"
+    );
+    let after = store.guardrail_policy(ws).await.unwrap();
+    assert!(refuses(&after), "then the type default");
+}
+
+/// One platform edit compiles its patterns once per replica: 200 workspaces
+/// of one kind load their policies at once, before and after a change of the
+/// type default, and none answers `guardrail_unavailable`.
+#[dbtest::test]
+async fn a_platform_layer_is_compiled_once_for_every_workspace_of_its_kind(pool: PgPool) {
+    let w = world(pool.clone(), "'chat_completions'").await;
+    let set = Uuid::now_v7();
+    let rule = "INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable,patterns) VALUES($1,$2,0,'Ids','custom','pattern','{custom}','block','user_text','off','fail_closed','{generation}','deny',ARRAY[$3])";
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("INSERT INTO guardrail_rule_sets(id,layer,kind,local_only,updated_by) VALUES($1,'type_default','project',false,$2)")
+        .bind(set).bind(w.f.owner).execute(&mut *tx).await.unwrap();
+    sqlx::query(rule)
+        .bind(Uuid::now_v7())
+        .bind(set)
+        .bind("ACME-[0-9]{4}")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let workspaces: Vec<Uuid> = (0..200).map(|_| Uuid::now_v7()).collect();
+    sqlx::query("INSERT INTO workspaces(id,name,kind) SELECT id,'P-'||id,'project' FROM unnest($1::uuid[]) id")
+        .bind(&workspaces)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let store = Arc::new(replica(&pool, true).await);
+    let load_all = || {
+        futures_util::future::join_all(workspaces.iter().map(|ws| {
+            let store = Arc::clone(&store);
+            let ws = *ws;
+            tokio::spawn(async move { store.guardrail_policy(ws).await })
+        }))
+    };
+    for loaded in load_all().await {
+        assert!(!loaded.unwrap().unwrap().is_empty(), "none answers 503");
+    }
+    assert_eq!(crate::guardrails::shared::compiles(set), 1);
+    // The platform changes its pattern: one more compile, for all of them.
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("UPDATE guardrail_rule_sets SET revision=revision+1,updated_by=$2 WHERE id=$1")
+        .bind(set)
+        .bind(w.f.owner)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM guardrail_rules WHERE rule_set_id=$1")
+        .bind(set)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(rule)
+        .bind(Uuid::now_v7())
+        .bind(set)
+        .bind("ACME-[0-9]{6}")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    crate::notify::poll_once(&store.pool, &store.caches.versions)
+        .await
+        .unwrap();
+    for loaded in load_all().await {
+        assert!(!loaded.unwrap().unwrap().is_empty(), "none answers 503");
+    }
+    assert_eq!(crate::guardrails::shared::compiles(set), 2);
 }

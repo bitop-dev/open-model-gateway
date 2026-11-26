@@ -104,6 +104,7 @@ classes! {
     "gateway_egress_denied" => (System, Counter, "1", ["purpose"]),
     "gateway_guardrail_decisions" => (Traffic, Counter, "1", ["action", "detector", "family", "stage"]),
     "gateway_guardrail_detector_seconds" => (Traffic, Histogram, "s", ["detector"]),
+    "gateway_guardrail_unscanned" => (Traffic, Counter, "1", ["reason"]),
     "gateway_file_store_bytes" => (Traffic, Counter, "By", ["backend", "op"]),
     "gateway_file_store_operations" => (Traffic, Counter, "1", ["backend", "op", "outcome"]),
     "gateway_history_partition_months_ahead" => (System, Gauge, "mo", ["table"]),
