@@ -217,13 +217,16 @@ fn a_label_before_or_after_a_token_does_not_hide_it() {
     );
     assert_eq!(found(&identifier), 0, "{identifier}");
     // A labelled AWS secret key behind any identifier.
-    let secret = alnum(40);
-    for line in [
-        format!("const productionAwsSecretAccessKey = \"{secret}\""),
-        format!("{}_aws_secret_access_key: {secret}", "x".repeat(60)),
-        format!("AWS_SECRET_ACCESS_KEY={secret}"),
-    ] {
-        assert!(found(&line) >= 1, "{line}");
+    let value = alnum(40);
+    for (case, line) in [
+        format!("const productionAwsSecretAccessKey = \"{value}\""),
+        format!("{}_aws_secret_access_key: {value}", "x".repeat(60)),
+        format!("AWS_SECRET_ACCESS_KEY={value}"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert!(found(line) >= 1, "labelled AWS key, case {case}");
     }
 }
 
