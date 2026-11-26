@@ -65,9 +65,11 @@ pub(super) async fn detail(
         logs::roots_with_refused(
             &scope,
             "e.root_request_id=$4",
-            // A root id is a UUIDv7 drawn when the request started: its
-            // decisions lie within minutes of that time (one partition).
-            "e.root_request_id=$4 AND (uuid_extract_timestamp($4) IS NULL OR (e.created_at>=uuid_extract_timestamp($4)-interval '10 minutes' AND e.created_at<uuid_extract_timestamp($4)+interval '10 minutes'))",
+            // A root id is a UUIDv7 drawn when the request arrived (a
+            // gateway-run batch line's when the line was read): its
+            // decisions lie after that, within the longest completion window
+            // (168 h; at most two monthly partitions).
+            "e.root_request_id=$4 AND (uuid_extract_timestamp($4) IS NULL OR (e.created_at>=uuid_extract_timestamp($4)-interval '10 minutes' AND e.created_at<uuid_extract_timestamp($4)+interval '8 days'))",
         )
     );
     let (mut summary, started, ws): (Value, UtcInstant, Uuid) = sqlx::query_as(&sql)

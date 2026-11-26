@@ -342,7 +342,9 @@ impl Policy {
         decision
     }
     /// The decision when no scan could run now (no scan slot was free): every
-    /// rule that applies is unavailable, under its own `on_error`.
+    /// rule that applies is unavailable (a retryable refusal), except a rule
+    /// this release cannot run, which is a detector failure under its own
+    /// `on_error` as in [`Policy::decide_with`].
     pub fn unavailable(&self, workload: Workload) -> Decision {
         let mut decision = Decision::default();
         for r in self
@@ -350,7 +352,12 @@ impl Policy {
             .iter()
             .filter(|r| r.workloads.contains(&workload))
         {
-            failed(&mut decision, r, r.first(), RefusalKind::Unavailable);
+            let kind = if r.detector.is_some() {
+                RefusalKind::Unavailable
+            } else {
+                RefusalKind::DetectorFailed
+            };
+            failed(&mut decision, r, r.first(), kind);
         }
         mark_refused(&mut decision);
         decision

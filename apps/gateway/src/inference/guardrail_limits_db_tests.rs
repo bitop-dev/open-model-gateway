@@ -119,9 +119,10 @@ async fn no_scan_slot_is_a_retryable_503_and_other_workspaces_are_served(pool: P
         3,
         "only the team's requests reached the provider"
     );
-    let recorded = events(&w).await;
-    assert_eq!(recorded.len(), 3);
-    assert!(recorded.iter().all(|e| e.1 == "detector_failed"));
+    // A busy refusal scanned nothing: it writes no row and does not count
+    // toward the key's refusal bound.
+    assert!(events(&w).await.is_empty());
+    assert_eq!(REFUSALS.counted(w.f.principal.key_id, limits::now()), 0);
     // With the slots free again the same request is inspected and passes.
     let (status, _, _) = post(
         &w.base,
@@ -352,4 +353,39 @@ async fn a_cached_policy_costs_no_statement_and_follows_every_change(pool: PgPoo
     .await;
     let loads: Vec<_> = loads.into_iter().map(Result::unwrap).collect();
     assert!(loads.iter().all(|p| Arc::ptr_eq(p, &loads[0])));
+}
+
+/// Requests that wrote decision rows are bounded per key too: the step runs
+/// before admission, so a key whose requests admission refuses could
+/// otherwise make the replica scan and write rows without bound.
+#[dbtest::test]
+async fn a_key_whose_requests_keep_writing_rows_is_throttled_before_the_scan(pool: PgPool) {
+    let w = world(pool, "'chat_completions'").await;
+    type_default(&w, "monitor", "{secret}", &[]).await;
+    let key = w.f.principal.key_id;
+    let monitored = bodies(&format!("use {}", secret()))[0].1.clone();
+    for attempt in 0.. {
+        let minute = limits::now() / 60;
+        for _ in 1..limits::RECORDED_PER_MINUTE {
+            limits::RECORDED.note(key, limits::now());
+        }
+        let (last, _, _) = post(&w.base, &w.token, "/v1/chat/completions", &monitored).await;
+        let recorded = events(&w).await.len();
+        let (status, headers, body) =
+            post(&w.base, &w.token, "/v1/chat/completions", &monitored).await;
+        if limits::now() / 60 != minute {
+            assert!(attempt < 2, "the minute changed during every attempt");
+            continue;
+        }
+        assert_eq!(last, 200, "the last recorded request within the bound runs");
+        assert_eq!(status, 429, "{body}");
+        assert_eq!(error(&body)["code"], "guardrail_rate_limited");
+        assert!(header(&headers, "retry-after").is_some());
+        assert_eq!(
+            events(&w).await.len(),
+            recorded,
+            "the throttled request wrote no row"
+        );
+        break;
+    }
 }

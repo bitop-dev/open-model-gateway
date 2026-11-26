@@ -540,11 +540,32 @@ fn no_slot_is_unavailable_for_every_rule_and_a_detector_failure_follows_on_error
     assert_eq!(d.refusal.map(|r| r.kind), Some(RefusalKind::Unavailable));
     assert!(d.events[0].refused);
     assert!(
-        policy(vec![open])
+        policy(vec![open.clone()])
             .unavailable(Workload::Rerank)
             .refusal
             .is_none()
     );
+    // A rule this release cannot run stays a detector failure under its own
+    // on_error: fail-open records it and does not refuse; beside a runnable
+    // rule, the request is unavailable (and that rule is the one named).
+    let mut later = rule(&[Category::Moderation], &[], InputAction::Monitor);
+    later.protection = Protection::Moderation;
+    later.detector.kind = DetectorKind::Systemone;
+    later.on_error = OnError::FailOpen;
+    let d = policy(vec![later.clone()]).unavailable(Workload::Generation);
+    assert!(d.refusal.is_none());
+    assert_eq!(d.events[0].action, Action::DetectorFailed);
+    let p = policy(vec![later.clone(), open]);
+    let runnable = p.rules[1].id;
+    let d = p.unavailable(Workload::Generation);
+    let refusal = d.refusal.unwrap();
+    assert_eq!(
+        (refusal.kind, refusal.rule_id),
+        (RefusalKind::Unavailable, runnable)
+    );
+    later.on_error = OnError::FailClosed;
+    let d = policy(vec![later]).unavailable(Workload::Generation);
+    assert_eq!(d.refusal.unwrap().kind, RefusalKind::DetectorFailed);
 }
 
 #[test]

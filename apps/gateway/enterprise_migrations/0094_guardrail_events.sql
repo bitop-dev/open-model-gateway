@@ -64,7 +64,7 @@ CREATE INDEX guardrail_events_refused ON guardrail_events (workspace_id, created
 -- every event (MultiXacts on authority rows in the hot path). Those rows are
 -- never removed or re-keyed (0034's guards), so the read cannot race a
 -- removal. A violation raises 23503, like the foreign key would.
-CREATE FUNCTION guardrail_events_parent_check() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE FUNCTION guardrail_events_parent_check() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
 BEGIN
  IF NOT EXISTS(SELECT 1 FROM public.api_keys k WHERE k.workspace_id=NEW.workspace_id AND k.id=NEW.api_key_id) THEN
   RAISE EXCEPTION 'guardrail event key is not a key of its workspace' USING ERRCODE='23503',

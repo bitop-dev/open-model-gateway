@@ -21,8 +21,10 @@ use super::repository::route_lookup_storage;
 use crate::auth::Principal;
 use crate::cache::Lookup;
 use crate::guardrails::detector::Inspection;
-use crate::guardrails::enforce::{Decision, Event, Policy};
-use crate::guardrails::limits::{self, LOCAL_SCANS, MAX_EVENT_ROWS, REFUSALS, SHARED_SCANS};
+use crate::guardrails::enforce::{Decision, Event, Policy, RefusalKind};
+use crate::guardrails::limits::{
+    self, LOCAL_SCANS, MAX_EVENT_ROWS, RECORDED, REFUSALS, SHARED_SCANS,
+};
 use crate::guardrails::patterns::{LOCAL_COMPILES, PLATFORM_COMPILES};
 use crate::guardrails::policy::{Workload, compose};
 use crate::guardrails::stored::{self, Heads};
@@ -50,10 +52,48 @@ pub struct CachedPolicy {
     policy: Arc<Policy>,
 }
 
-/// One load per workspace at a time on this replica: concurrent misses wait
-/// for it instead of compiling copies.
+/// One compile per workspace at a time on this replica: concurrent misses
+/// wait for it instead of compiling copies.
 static LOADS: LazyLock<Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(Default::default);
+
+/// Holds a workspace's load lock; the map entry goes with its last holder or
+/// waiter (an entry a dropped waiter leaves behind goes with the workspace's
+/// next load).
+struct Load {
+    workspace: Uuid,
+    lock: Arc<tokio::sync::Mutex<()>>,
+    held: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+impl Load {
+    async fn enter(workspace: Uuid) -> Self {
+        let lock = {
+            let mut loads = LOADS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Arc::clone(loads.entry(workspace).or_default())
+        };
+        let mut load = Self {
+            workspace,
+            lock,
+            held: None,
+        };
+        load.held = Some(Arc::clone(&load.lock).lock_owned().await);
+        load
+    }
+}
+impl Drop for Load {
+    fn drop(&mut self) {
+        self.held = None;
+        let mut loads = LOADS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Only the map and this holder: nobody else waits for it.
+        if Arc::strong_count(&self.lock) == 2 {
+            loads.remove(&self.workspace);
+        }
+    }
+}
 
 /// Inputs above this many bytes, and any input a custom pattern scans (its
 /// cost may be any user's), are scanned off the async workers in scan slots.
@@ -62,49 +102,33 @@ const LARGE_INPUT: usize = 64 * 1024;
 impl Store {
     /// A workspace's compiled guardrail policy (empty ones too): a cache hit
     /// costs no statement; a stale or unconfirmed entry costs one read of the
-    /// rule-set heads, and a recompile only when they changed.
+    /// rule-set heads, and a recompile only when they changed. A confirmed
+    /// miss waits for a load of the workspace already running and is then
+    /// served by it; with unconfirmed versions every lookup reads the heads
+    /// (in parallel) and only compiles wait for each other.
     pub(crate) async fn guardrail_policy(
         &self,
         workspace: Uuid,
     ) -> Result<Arc<Policy>, InferenceError> {
         let cache = &self.caches.guardrails;
-        // Taken before the lookup, which drops a stale entry.
-        let stale = cache.peek(&workspace);
-        if let Lookup::Hit(entry) = cache.get(&self.caches.versions, &workspace) {
-            return Ok(Arc::clone(&entry.policy));
-        }
-        let lock = {
-            let mut loads = LOADS
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            Arc::clone(loads.entry(workspace).or_default())
-        };
-        let loaded = {
-            let _load = lock.lock().await;
-            self.load_guardrail_policy(workspace, stale).await
-        };
-        {
-            let mut loads = LOADS
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if Arc::strong_count(&lock) == 2 {
-                loads.remove(&workspace);
-            }
-        }
-        loaded
-    }
-
-    async fn load_guardrail_policy(
-        &self,
-        workspace: Uuid,
-        stale: Option<Arc<CachedPolicy>>,
-    ) -> Result<Arc<Policy>, InferenceError> {
-        let cache = &self.caches.guardrails;
-        let stamp = match cache.get(&self.caches.versions, &workspace) {
-            // Another request loaded it while this one waited.
+        let versions = &self.caches.versions;
+        // Peeked before each lookup, which drops a stale entry.
+        let mut stale = cache.peek(&workspace);
+        let mut load = None;
+        let stamp = match cache.get(versions, &workspace) {
             Lookup::Hit(entry) => return Ok(Arc::clone(&entry.policy)),
-            Lookup::Miss(stamp) => Some(stamp),
             Lookup::Bypass => None,
+            Lookup::Miss(_) => {
+                load = Some(Load::enter(workspace).await);
+                // One stored while this request waited is newer.
+                stale = cache.peek(&workspace).or(stale);
+                match cache.get(versions, &workspace) {
+                    // Loaded by the request this one waited for.
+                    Lookup::Hit(entry) => return Ok(Arc::clone(&entry.policy)),
+                    Lookup::Miss(stamp) => Some(stamp),
+                    Lookup::Bypass => None,
+                }
+            }
         };
         let keep = |entry: Arc<CachedPolicy>| {
             let policy = Arc::clone(&entry.policy);
@@ -129,6 +153,13 @@ impl Store {
             return Err(InferenceError::GuardrailUnavailable);
         };
         drop(conn);
+        if load.is_none() {
+            let _ = load.insert(Load::enter(workspace).await);
+            // Compiled from the same heads while this one waited.
+            if let Some(entry) = cache.peek(&workspace).filter(|e| e.heads == heads) {
+                return Ok(Arc::clone(&entry.policy));
+            }
+        }
         let effective = compose(platform.as_ref(), local.as_ref());
         let patterns = |set: &Option<crate::guardrails::policy::RuleSet>| {
             set.iter().flat_map(|s| &s.rules).any(|r| {
@@ -136,20 +167,25 @@ impl Store {
             })
         };
         // Compiling custom patterns takes milliseconds each: in a compile
-        // slot, off the async workers and without a connection; a policy
-        // without them compiles at once.
-        let policy = if patterns(&local) {
-            crate::guardrails::patterns::in_slot(&LOCAL_COMPILES, move || {
-                Policy::compile(&effective)
-            })
-            .await
+        // slot, off the async workers and without a connection, waiting for
+        // one at most as long as for a scan slot; a policy without them
+        // compiles at once.
+        let slots = if patterns(&local) {
+            Some(&LOCAL_COMPILES)
         } else if patterns(&platform) {
-            crate::guardrails::patterns::in_slot(&PLATFORM_COMPILES, move || {
-                Policy::compile(&effective)
-            })
-            .await
+            Some(&PLATFORM_COMPILES)
         } else {
-            Some(Policy::compile(&effective))
+            None
+        };
+        let policy = match slots {
+            Some(slots) => tokio::time::timeout(
+                limits::WAIT,
+                crate::guardrails::patterns::in_slot(slots, move || Policy::compile(&effective)),
+            )
+            .await
+            .ok()
+            .flatten(),
+            None => Some(Policy::compile(&effective)),
         }
         .ok_or(InferenceError::GuardrailUnavailable)?;
         Ok(keep(Arc::new(CachedPolicy {
@@ -184,6 +220,7 @@ impl Store {
                 omitted,
             })
             .await?;
+            RECORDED.note(principal.key_id, limits::now());
         }
         verdict(principal, &decision)
     }
@@ -274,8 +311,10 @@ fn rows(decision: &Decision) -> (Vec<Event>, u32) {
 
 /// 429 before any scan when the key's refusals reached this minute's bound.
 fn throttled(principal: &Principal) -> Result<(), InferenceError> {
+    let now = limits::now();
     REFUSALS
-        .check(principal.key_id, limits::now())
+        .check(principal.key_id, now)
+        .and(RECORDED.check(principal.key_id, now))
         .map_err(InferenceError::GuardrailThrottled)
 }
 
@@ -361,7 +400,21 @@ impl super::Engine {
                         .await
                         .map_err(|_| InferenceError::GuardrailUnavailable)?
                     }
-                    Err(limits::NoSlot) => policy.unavailable(workload),
+                    Err(limits::NoSlot) => {
+                        let decision = policy.unavailable(workload);
+                        // Busy, like an admission `Busy`: nothing was scanned,
+                        // so the refusal writes no row and does not count
+                        // toward the key's refusal bound (a saturated replica
+                        // never throttles clean traffic).
+                        if let Some(refusal) = decision
+                            .refusal
+                            .filter(|r| r.kind == RefusalKind::Unavailable)
+                        {
+                            count(&decision);
+                            return Err(InferenceError::Guardrail(refusal));
+                        }
+                        decision
+                    }
                 }
             }
             input => timed(|| policy.decide(workload, input.as_ref())),
@@ -379,6 +432,7 @@ impl super::Engine {
                     omitted,
                 })
                 .await?;
+            RECORDED.note(principal.key_id, limits::now());
         }
         verdict(principal, &decision)
     }

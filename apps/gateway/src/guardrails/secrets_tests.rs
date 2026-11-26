@@ -140,6 +140,11 @@ fn every_builtin_rule_matches_its_shape_in_prose_punctuation_and_escapes() {
         ] {
             assert!(found(&around) >= 1, "{name} in {around}");
         }
+        // A labelled AWS secret key carries a keyword, `=` and quotes that
+        // encoded data never has, and absorbs the identifier before it.
+        if name == "aws_secret_access_key" {
+            continue;
+        }
         assert_eq!(
             found(&format!("Zx9aB3dE5{value}_Q")),
             0,
@@ -171,13 +176,24 @@ fn a_label_before_or_after_a_token_does_not_hide_it() {
         "aws-access-key-",
         "PROD_DEPLOY_TOKEN_",
         "my-service-account-api-token-v2-",
+        "api_key_1_",
+        "__secret_",
+        "DeployKey_",
+        "prodDeployToken-",
     ];
     for token in &tokens {
         for label in before {
             assert!(label.len() <= 32);
             assert!(found(&format!("{label}{token}")) >= 1, "{label}{token}");
         }
-        for label in ["_prod", "-staging-v2", "_PRIMARY_KEY"] {
+        for label in [
+            "_prod",
+            "-staging-v2",
+            "_PRIMARY_KEY",
+            "_Prod_Key",
+            "-1",
+            "__",
+        ] {
             assert!(found(&format!("{token}{label}")) >= 1, "{token}{label}");
         }
     }
@@ -187,8 +203,17 @@ fn a_label_before_or_after_a_token_does_not_hide_it() {
     assert_eq!(
         found(&format!("aB3dE5gH7j_{}", tokens[0])),
         0,
-        "mixed case is data"
+        "letters and digits mixed is data"
     );
+    // A labelled AWS secret key behind any identifier.
+    let secret = alnum(40);
+    for line in [
+        format!("const productionAwsSecretAccessKey = \"{secret}\""),
+        format!("{}_aws_secret_access_key: {secret}", "x".repeat(60)),
+        format!("AWS_SECRET_ACCESS_KEY={secret}"),
+    ] {
+        assert!(found(&line) >= 1, "{line}");
+    }
 }
 
 #[test]
@@ -273,6 +298,26 @@ fn a_match_hidden_by_a_window_edge_is_still_found_and_counted_once() {
     // `\b` matched at the cut; `bcd` starts inside the cut match.
     let text = format!("{}abcdef rest", "x".repeat(4093));
     assert_eq!(spans(&custom(r"abc\b|bcd"), &text), ["bcd"]);
+    // A match that starts before a `\b` the cut made is found whole.
+    let text = format!("{}ID-1234567890x", ".".repeat(4089));
+    assert_eq!(
+        spans(&custom(r"ID-[0-9]{10}|[0-9]{4}\b"), &text),
+        ["ID-1234567890"]
+    );
+    // A shorter alternative that ends before the cut is not taken for the
+    // longer one that runs past it, nor for one that starts earlier.
+    let text = format!("{}xabcy tail", "q".repeat(4093));
+    assert_eq!(spans(&custom("x.{0,10}y|x"), &text), ["xabcy"]);
+    let text = format!("{}xacby tail", "q".repeat(4092));
+    assert_eq!(spans(&custom("x.{0,10}y|c"), &text), ["xacby"]);
+    // Dense matches near a window end each cost one call.
+    let d = custom("[0-9]");
+    let text = format!("{}{}", "q".repeat(3500), "1".repeat(3000));
+    let input_ = input(&text);
+    let budget = Budget::steps(1_000_000);
+    let out = d.custom_findings(&input_, &budget);
+    assert_eq!(out.findings.0.len(), 3000);
+    assert!(1_000_000 - budget.left().unwrap() <= 3000 + 4);
     // A longer match re-found past the cut is counted once, whole.
     let text = format!("{}1234567890 tail", "x".repeat(4090));
     assert_eq!(spans(&custom("[0-9]+"), &text), ["1234567890"]);

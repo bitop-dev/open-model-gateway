@@ -10,10 +10,16 @@
 //!   `WAITERS` requests in the step (running or waiting); more are refused at
 //!   once. The wait for a slot is bounded (`WAIT`), never the request
 //!   deadline. Both end in a retryable `guardrail_unavailable`.
-//! - **Refusals.** A key whose requests guardrails refused `REFUSALS_PER_MINUTE`
-//!   times in the current minute on this replica gets 429
-//!   `guardrail_rate_limited` before any scan, until the minute ends (a
-//!   refused request is never admitted, so no other limit counts it).
+//! - **Refusals.** A key whose requests guardrails refused after a scan
+//!   `REFUSALS_PER_MINUTE` times in the current minute on this replica gets
+//!   429 `guardrail_rate_limited` before any scan, until the minute ends (a
+//!   refused request is never admitted, so no other limit counts it). A
+//!   request refused because no slot was free scanned nothing and does not
+//!   count.
+//! - **Recorded requests.** Likewise after `RECORDED_PER_MINUTE` requests of a
+//!   key whose decisions wrote rows: the step runs before admission, so a
+//!   key whose requests admission then refuses could otherwise make the
+//!   replica scan and write rows without bound.
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
@@ -172,6 +178,11 @@ impl RefusalLimiter {
             _ => Ok(()),
         })
     }
+    /// Refusals of `key` counted this minute (tests).
+    #[cfg(test)]
+    pub fn counted(&self, key: Uuid, now: u64) -> u32 {
+        self.at(now, |map| map.get(&key).copied().unwrap_or(0))
+    }
     /// Count one refusal of `key`.
     pub fn note(&self, key: Uuid, now: u64) {
         let capacity = self.capacity;
@@ -186,6 +197,12 @@ impl RefusalLimiter {
 /// This replica's guardrail refusals.
 pub static REFUSALS: LazyLock<RefusalLimiter> =
     LazyLock::new(|| RefusalLimiter::new(REFUSALS_PER_MINUTE, TRACKED_KEYS));
+
+/// Requests of a key whose decisions wrote rows, per minute on one replica.
+pub const RECORDED_PER_MINUTE: u32 = 600;
+/// This replica's requests that wrote decision rows.
+pub static RECORDED: LazyLock<RefusalLimiter> =
+    LazyLock::new(|| RefusalLimiter::new(RECORDED_PER_MINUTE, TRACKED_KEYS));
 
 /// Seconds since the epoch (the refusal limiter's clock).
 pub fn now() -> u64 {

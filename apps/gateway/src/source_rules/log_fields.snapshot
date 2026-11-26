@@ -7,7 +7,7 @@ http.rs :: request_context :: info :: header_latency_ms=started.elapsed().as_mil
 http.rs :: request_context :: info_span :: method=%request.method() ; request_id=request_id
 inference/attempt.rs :: impl Engine::eligible_candidates :: warn :: error=?other ; provider=%deployment.provider
 inference/attempt.rs :: report_unsettled :: error :: execution_id=%id ; trace_id=trace.as_ref().map(LogTraceId::as_str)
-inference/guardrails.rs :: impl Store::load_guardrail_policy :: warn :: workspace_id=%workspace
+inference/guardrails.rs :: impl Store::guardrail_policy :: warn :: workspace_id=%workspace
 inference/mod.rs :: end_probe_in_background :: warn :: execution_id=%execution_id
 inference/mod.rs :: impl ExecutionGuard::drop :: error :: execution_id=%execution_id ; trace_id=log_trace_id.as_ref().map(LogTraceId::as_str)
 inference/mod.rs :: impl ExecutionGuard::finish :: warn :: execution_id=%self.id ; trace_id=self.log_trace_id.as_ref().map(LogTraceId::as_str)

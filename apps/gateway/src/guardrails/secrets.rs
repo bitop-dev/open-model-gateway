@@ -28,7 +28,9 @@ pub const BUILTIN: &[(&str, &str)] = &[
     ("aws_access_key_id", r"(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}"),
     (
         "aws_secret_access_key",
-        r#"(?i:aws_?secret_?access_?key)["']?\s*[:=]\s*["']?[A-Za-z0-9/+]{40}"#,
+        // The identifier the keyword ends (`prodAwsSecretAccessKey`) is part
+        // of the match, so it never glues the match to data.
+        r#"(?i:[a-z0-9_]*aws_?secret_?access_?key)["']?\s*[:=]\s*["']?[A-Za-z0-9/+]{40}"#,
     ),
     (
         "github_token",
@@ -102,13 +104,11 @@ fn encoded(b: u8) -> bool {
 /// an encoded blob, unless the run is a label of at most `LABEL_MAX` bytes.
 const BLOB_RUN: usize = 8;
 const LABEL_MAX: usize = 32;
-/// A word of a label: letters of one case, then digits (`token`, `KEY`, `v2`).
+/// A word of a label: letters, then digits (`token`, `KEY`, `deployKey`,
+/// `v2`, `1`; empty between two separators). Random base64url mixes them.
 fn word(w: &[u8]) -> bool {
     let letters = w.iter().take_while(|b| b.is_ascii_alphabetic()).count();
-    let (alpha, digits) = w.split_at(letters);
-    letters > 0
-        && digits.iter().all(u8::is_ascii_digit)
-        && (alpha.iter().all(u8::is_ascii_lowercase) || alpha.iter().all(u8::is_ascii_uppercase))
+    w[letters..].iter().all(u8::is_ascii_digit)
 }
 /// Snake or kebab case words with the separator against the token.
 fn label(run: &[u8], before: bool) -> bool {
@@ -183,8 +183,9 @@ pub struct Custom {
 }
 
 /// How far ahead one custom-pattern call looks; after a window without a
-/// match the next starts `OVERLAP` bytes before its end; a match cut by the
-/// window is searched again up to `EXTEND` bytes from its start.
+/// match the next starts `OVERLAP` bytes before its end; a match that ends
+/// within `OVERLAP` of the window's end is searched again up to `EXTEND`
+/// bytes from its start.
 const WINDOW: usize = 4096;
 const OVERLAP: usize = 1024;
 const EXTEND: usize = 8192;
@@ -272,16 +273,22 @@ impl PatternDetector {
                         pos = boundary_up(text, back.max(pos + 1));
                         continue;
                     };
-                    let found_here = if cut.end() == end && end < text.len() {
+                    // A match within `OVERLAP` of a cut window may be a
+                    // shorter alternative of one that runs past the cut (or
+                    // exist only because of the cut): search the same start
+                    // again with the text going on. A first match nearer the
+                    // start needs no second call, so dense matches cost one
+                    // call each.
+                    let found_here = if end < text.len() && cut.end() + OVERLAP > end {
                         budget.check()?;
                         let further = boundary(text, (cut.start() + EXTEND).min(text.len()));
-                        pattern.find_at(&text[..further], cut.start())
+                        pattern.find_at(&text[..further], pos)
                     } else {
                         Some(cut)
                     };
                     let Some(m) = found_here else {
-                        // Nothing starts at or after the cut's start once the
-                        // text goes on: the cut made that match.
+                        // Nothing starts at or after `pos` once the text goes
+                        // on: the cut made that match.
                         pos = boundary_up(text, cut.start() + 1);
                         continue;
                     };
