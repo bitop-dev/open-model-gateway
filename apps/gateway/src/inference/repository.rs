@@ -225,11 +225,21 @@ pub trait InferenceRepository: Send + Sync {
         candidates: &[Deployment],
         _request_id: Uuid,
     ) -> Result<crate::routing::RoutePlan, InferenceError> {
-        Ok(crate::routing::RoutePlan {
-            deployment_ids: candidates.iter().map(|d| d.id).collect(),
-            max_attempts: 1,
-            allow_ambiguous_failover: false,
-        })
+        Ok(crate::routing::RoutePlan::single(
+            candidates.iter().map(|d| d.id).collect(),
+        ))
+    }
+    /// [`Self::route_plan`] for attempts that record health and may be a
+    /// half-open route's probe (`routing::plan_probing`).
+    async fn route_plan_probing(
+        &self,
+        principal: &Principal,
+        model: &str,
+        candidates: &[Deployment],
+        request_id: Uuid,
+    ) -> Result<crate::routing::RoutePlan, InferenceError> {
+        self.route_plan(principal, model, candidates, request_id)
+            .await
     }
     async fn route_result(
         &self,
@@ -237,6 +247,66 @@ pub trait InferenceRepository: Send + Sync {
         _error: Option<InferenceError>,
     ) -> Result<(), InferenceError> {
         Ok(())
+    }
+    /// `routing::record_probe_result`: the result of the attempt that holds
+    /// the probe slot under `epoch`.
+    async fn route_probe_result(
+        &self,
+        deployment: Uuid,
+        error: Option<InferenceError>,
+        _epoch: i64,
+    ) -> Result<(), InferenceError> {
+        self.route_result(deployment, error).await
+    }
+    /// `routing::record_unclaimed_result`: the result of a kind that never
+    /// claims the probe slot (realtime sessions).
+    async fn route_unclaimed_result(
+        &self,
+        deployment: Uuid,
+        error: Option<InferenceError>,
+    ) -> Result<(), InferenceError> {
+        self.route_result(deployment, error).await
+    }
+    /// `routing::route_state`: the route's circuit now.
+    async fn route_state(
+        &self,
+        _deployment: Uuid,
+    ) -> Result<crate::routing::RouteState, InferenceError> {
+        Ok(crate::routing::RouteState::Closed)
+    }
+    /// `routing::claim_probe`.
+    async fn route_probe_claim(
+        &self,
+        _deployment: Uuid,
+        _holder: Uuid,
+        _hold: std::time::Duration,
+    ) -> Result<crate::routing::ProbeClaim, InferenceError> {
+        Ok(crate::routing::ProbeClaim::Closed)
+    }
+    /// `routing::close_probe`.
+    async fn route_probe_close(
+        &self,
+        _deployment: Uuid,
+        _epoch: i64,
+    ) -> Result<(), InferenceError> {
+        Ok(())
+    }
+    /// `routing::release_probe`.
+    async fn route_probe_release(
+        &self,
+        _deployment: Uuid,
+        _epoch: i64,
+    ) -> Result<(), InferenceError> {
+        Ok(())
+    }
+    /// `routing::renew_probe`.
+    async fn route_probe_renew(
+        &self,
+        _deployment: Uuid,
+        _epoch: i64,
+        _hold: std::time::Duration,
+    ) -> Result<bool, InferenceError> {
+        Ok(true)
     }
     // Realtime sessions (`inference::realtime`, `governance::realtime`).
     /// Per-response output window: `cap`, lowered to the latest price's
@@ -423,12 +493,68 @@ impl InferenceRepository for Store {
     ) -> Result<crate::routing::RoutePlan, InferenceError> {
         crate::routing::plan(self, principal, model, candidates, request_id).await
     }
+    async fn route_plan_probing(
+        &self,
+        principal: &Principal,
+        model: &str,
+        candidates: &[Deployment],
+        request_id: Uuid,
+    ) -> Result<crate::routing::RoutePlan, InferenceError> {
+        crate::routing::plan_probing(self, principal, model, candidates, request_id).await
+    }
     async fn route_result(
         &self,
         deployment: Uuid,
         error: Option<InferenceError>,
     ) -> Result<(), InferenceError> {
         crate::routing::record_result(self, deployment, error).await
+    }
+    async fn route_probe_result(
+        &self,
+        deployment: Uuid,
+        error: Option<InferenceError>,
+        epoch: i64,
+    ) -> Result<(), InferenceError> {
+        crate::routing::record_probe_result(self, deployment, error, epoch).await
+    }
+    async fn route_unclaimed_result(
+        &self,
+        deployment: Uuid,
+        error: Option<InferenceError>,
+    ) -> Result<(), InferenceError> {
+        crate::routing::record_unclaimed_result(self, deployment, error).await
+    }
+    async fn route_state(
+        &self,
+        deployment: Uuid,
+    ) -> Result<crate::routing::RouteState, InferenceError> {
+        crate::routing::route_state(self, deployment).await
+    }
+    async fn route_probe_claim(
+        &self,
+        deployment: Uuid,
+        holder: Uuid,
+        hold: std::time::Duration,
+    ) -> Result<crate::routing::ProbeClaim, InferenceError> {
+        crate::routing::claim_probe(self, deployment, holder, hold).await
+    }
+    async fn route_probe_close(&self, deployment: Uuid, epoch: i64) -> Result<(), InferenceError> {
+        crate::routing::close_probe(self, deployment, epoch).await
+    }
+    async fn route_probe_release(
+        &self,
+        deployment: Uuid,
+        epoch: i64,
+    ) -> Result<(), InferenceError> {
+        crate::routing::release_probe(self, deployment, epoch).await
+    }
+    async fn route_probe_renew(
+        &self,
+        deployment: Uuid,
+        epoch: i64,
+        hold: std::time::Duration,
+    ) -> Result<bool, InferenceError> {
+        crate::routing::renew_probe(self, deployment, epoch, hold).await
     }
     async fn realtime_window_output(
         &self,

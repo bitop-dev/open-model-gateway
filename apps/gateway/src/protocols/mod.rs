@@ -357,6 +357,8 @@ mod tests {
             deployment_ids: Vec::new(),
             max_attempts: 2,
             allow_ambiguous_failover: false,
+            probes: Vec::new(),
+            held_probe: None,
         };
         assert!(!crate::routing::may_failover(&plan, error));
         assert!(!crate::routing::may_fail_over_unsent(&plan, error));

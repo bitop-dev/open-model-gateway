@@ -139,6 +139,10 @@ enum Retry {
 }
 
 impl LineRun {
+    /// The probe slot bound of this run's lines (`Engine::probe_hold`).
+    pub(super) fn probe_hold(&self) -> std::time::Duration {
+        self.engine.probe_hold()
+    }
     async fn emit_error(
         &self,
         records: &mpsc::Sender<Record>,
@@ -197,9 +201,22 @@ impl LineRun {
         n: i32,
         raw: Vec<u8>,
         mut execution: Uuid,
-        pin: Option<Pin>,
+        mut pin: Option<Pin>,
         records: mpsc::Sender<Record>,
     ) {
+        // The probe slot dispatch claimed for this line is freed if the line
+        // ends before its attempt reaches the engine (an unparseable line, or
+        // the task aborted); from the attempt on, the engine and `unpin` end it.
+        let mut slot = pin.and_then(|pin| {
+            pin.probe.map(|epoch| {
+                crate::inference::ProbeTicket::held(
+                    self.repository.clone(),
+                    pin.deployment,
+                    execution,
+                    epoch,
+                )
+            })
+        });
         let line = match lines::parse_work_line(&raw, self.endpoint) {
             Ok(l) => l,
             Err(_) => {
@@ -221,6 +238,9 @@ impl LineRun {
             let result = self
                 .execute(line.request.clone(), execution, pin, line.plan)
                 .await;
+            if let Some(slot) = slot.take() {
+                let _ = slot.into_epoch();
+            }
             match result {
                 Ok(response) => {
                     self.state.succeeded();
@@ -248,13 +268,19 @@ impl LineRun {
                     if e == InferenceError::Busy && pin.is_some() {
                         self.state.rate_limited();
                     }
-                    let retryable = matches!(
-                        e,
-                        InferenceError::Busy
-                            | InferenceError::ScopeBusy
-                            | InferenceError::UpstreamUnavailable
-                            | InferenceError::Timeout
-                    );
+                    // The line's pinned route could not be used when it was
+                    // sent (its circuit open, or its probe slot held by
+                    // another request or lost): nothing was sent, and the
+                    // attempt is retried after its backoff like a failed one.
+                    let cooling = matches!(e, InferenceError::RouteCoolingDown(_)) && pin.is_some();
+                    let retryable = cooling
+                        || matches!(
+                            e,
+                            InferenceError::Busy
+                                | InferenceError::ScopeBusy
+                                | InferenceError::UpstreamUnavailable
+                                | InferenceError::Timeout
+                        );
                     if retryable
                         && attempt <= self.job.retry_limit
                         && !self.state.should_stop(&self.job)
@@ -266,6 +292,9 @@ impl LineRun {
                             Retry::Started(next) => {
                                 attempt += 1;
                                 execution = next;
+                                // The dispatch's probe slot was the first
+                                // attempt's; a retry claims its own.
+                                pin = pin.map(|pin| Pin { probe: None, ..pin });
                                 continue;
                             }
                             Retry::ConfirmedFailure => {
@@ -430,8 +459,13 @@ impl LineRun {
             // merely carrying a plan: a creation-time plan alone (an
             // omitted-maximum line dispatched ungated because its pinned
             // route was briefly ineligible) must not count as gated.
-            self.repository
-                .pin(execution, deployment, plan.map(|p| p.price), pin.is_some());
+            self.repository.pin(
+                execution,
+                deployment,
+                plan.map(|p| p.price),
+                pin.is_some(),
+                pin.and_then(|p| p.probe.map(|epoch| (p.deployment, epoch))),
+            );
         }
         // An omitted-maximum line is pinned at plan time to this one price,
         // which already resolved and validated the line against this exact

@@ -116,8 +116,11 @@ impl Runner {
             );
             return Ok(false);
         };
+        let Some(probe) = self.line_probe(run, head, route).await else {
+            return Ok(false);
+        };
         let mut started = false;
-        match self
+        let claimed = self
             .scheduler
             .claim(
                 &run.state.fence,
@@ -127,14 +130,23 @@ impl Runner {
                 route,
                 settings.max_concurrency,
             )
-            .await
+            .await;
+        if let Some(epoch) = probe
+            && !matches!(claimed, Ok(Claim::Claimed))
         {
+            // No capacity for the line: its probe slot is freed for another
+            // request (bounded; otherwise it ends at its expiry).
+            let release = crate::routing::release_probe(&self.jobs.store, route, epoch);
+            let _ = tokio::time::timeout(Duration::from_millis(250), release).await;
+        }
+        match claimed {
             Ok(Claim::Claimed) => {
                 let head = lane.take().ok_or(InferenceError::Storage)?;
                 let pin = Pin {
                     deployment: route,
                     priority: settings.priority,
                     max_concurrency: settings.max_concurrency,
+                    probe,
                 };
                 spawn_line(tasks, run.line, run.records, head, Some(pin), permits);
                 started = true;
@@ -151,6 +163,45 @@ impl Runner {
             Err(_) => note(report, route, waiting, None, false),
         }
         Ok(started)
+    }
+
+    /// The route as it is now, before the line claims its capacity (the
+    /// plan may be up to `REPLAN` old): `Some(None)` when its circuit is
+    /// closed; once half-open the line runs only as its probe
+    /// (`Some(Some(epoch))`). `None` while the circuit is open or another
+    /// request holds the probe: the line waits as for a cooldown (planned
+    /// again after `REPLAN`; nothing is claimed, sent or retried).
+    async fn line_probe(
+        &self,
+        run: &Dispatch<'_>,
+        head: &mut Head,
+        route: Uuid,
+    ) -> Option<Option<i64>> {
+        use crate::routing::{ProbeClaim, RouteState};
+        let store = &self.jobs.store;
+        let usable = match crate::routing::route_state(store, route).await {
+            Ok(RouteState::Closed) => Some(None),
+            Ok(RouteState::HalfOpen) => {
+                match crate::routing::claim_probe(
+                    store,
+                    route,
+                    head.execution,
+                    run.line.probe_hold(),
+                )
+                .await
+                {
+                    Ok(ProbeClaim::Claimed(epoch)) => Some(Some(epoch)),
+                    Ok(ProbeClaim::Closed) => Some(None),
+                    Ok(ProbeClaim::Busy(_)) | Err(_) => None,
+                }
+            }
+            Ok(RouteState::Open(_)) | Err(_) => None,
+        };
+        if usable.is_none() {
+            head.cooling = true;
+            head.planned = Some(Instant::now());
+        }
+        usable
     }
 
     /// Plan the head line's route again when it was never planned or its
