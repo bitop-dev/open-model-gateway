@@ -129,6 +129,8 @@ pub struct Event {
     pub category: Category,
     pub action: Action,
     pub count: u32,
+    /// The decision the client was refused with.
+    pub refused: bool,
 }
 
 /// Why a request is refused.
@@ -200,7 +202,11 @@ impl Policy {
                 d.refusal = Some(refusal);
             }
         };
-        for r in self.rules.iter().filter(|r| r.workloads.contains(&workload)) {
+        for r in self
+            .rules
+            .iter()
+            .filter(|r| r.workloads.contains(&workload))
+        {
             let first = r.categories.first().copied().unwrap_or(Category::Custom);
             let event = |category, action, count| Event {
                 rule_set_id: r.rule_set_id,
@@ -211,9 +217,12 @@ impl Policy {
                 category,
                 action,
                 count,
+                refused: false,
             };
             let Runner::Pattern(detector) = &r.runner else {
-                decision.events.push(event(first, Action::DetectorFailed, 1));
+                decision
+                    .events
+                    .push(event(first, Action::DetectorFailed, 1));
                 if r.on_error == OnError::FailClosed {
                     refuse(&mut decision, r, RefusalKind::DetectorFailed, first);
                 }
@@ -246,6 +255,19 @@ impl Policy {
                 } else {
                     decision.events.push(event(first, Action::Skipped, 1));
                 }
+            }
+        }
+        if let Some(r) = decision.refusal {
+            let action = match r.kind {
+                RefusalKind::InputBlocked | RefusalKind::NotSupported => Action::Blocked,
+                RefusalKind::DetectorFailed => Action::DetectorFailed,
+            };
+            if let Some(e) = decision
+                .events
+                .iter_mut()
+                .find(|e| e.rule_id == r.rule_id && e.category == r.category && e.action == action)
+            {
+                e.refused = true;
             }
         }
         decision
@@ -314,7 +336,10 @@ fn walk<'a>(v: &'a Value, part: Part, input: &mut Inspection<'a>) {
         Value::Array(items) => items.iter().for_each(|i| walk(i, part, input)),
         Value::Object(map) => {
             let kind = map.get("type").and_then(Value::as_str);
-            if matches!(kind, Some("image" | "image_url" | "input_image" | "audio" | "file")) {
+            if matches!(
+                kind,
+                Some("image" | "image_url" | "input_image" | "audio" | "file")
+            ) {
                 input.uninspectable = true;
                 return;
             }

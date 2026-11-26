@@ -95,7 +95,12 @@ async fn world(pool: PgPool, protocols: &str) -> World {
 }
 
 /// The type default of the principal's workspace kind, with one rule.
-async fn type_default(w: &World, action: &str, categories: &str, patterns: &[String]) -> (Uuid, Uuid) {
+async fn type_default(
+    w: &World,
+    action: &str,
+    categories: &str,
+    patterns: &[String],
+) -> (Uuid, Uuid) {
     let pool = &w.f.store.pool;
     let kind: String = sqlx::query_scalar("SELECT kind FROM workspaces WHERE id=$1")
         .bind(w.f.principal.workspace_id)
@@ -103,20 +108,23 @@ async fn type_default(w: &World, action: &str, categories: &str, patterns: &[Str
         .await
         .unwrap();
     let mut tx = pool.begin().await.unwrap();
-    let existing: Option<Uuid> =
-        sqlx::query_scalar("SELECT id FROM guardrail_rule_sets WHERE layer='type_default' AND kind=$1")
-            .bind(&kind)
-            .fetch_optional(&mut *tx)
-            .await
-            .unwrap();
+    let existing: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM guardrail_rule_sets WHERE layer='type_default' AND kind=$1",
+    )
+    .bind(&kind)
+    .fetch_optional(&mut *tx)
+    .await
+    .unwrap();
     let set = match existing {
         Some(set) => {
-            sqlx::query("UPDATE guardrail_rule_sets SET revision=revision+1,updated_by=$2 WHERE id=$1")
-                .bind(set)
-                .bind(w.f.owner)
-                .execute(&mut *tx)
-                .await
-                .unwrap();
+            sqlx::query(
+                "UPDATE guardrail_rule_sets SET revision=revision+1,updated_by=$2 WHERE id=$1",
+            )
+            .bind(set)
+            .bind(w.f.owner)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
             sqlx::query("DELETE FROM guardrail_rules WHERE rule_set_id=$1")
                 .bind(set)
                 .execute(&mut *tx)
@@ -132,8 +140,16 @@ async fn type_default(w: &World, action: &str, categories: &str, patterns: &[Str
         }
     };
     let rule = Uuid::now_v7();
-    let protection = if patterns.is_empty() { "secrets" } else { "custom" };
-    let on_error = if action == "block" { "fail_closed" } else { "fail_open" };
+    let protection = if patterns.is_empty() {
+        "secrets"
+    } else {
+        "custom"
+    };
+    let on_error = if action == "block" {
+        "fail_closed"
+    } else {
+        "fail_open"
+    };
     sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable,patterns) VALUES($1,$2,0,'Rule',$3,'pattern',$4::text[],$5,'user_text','off',$6,'{generation,embeddings}','deny',$7)")
         .bind(rule).bind(set).bind(protection).bind(categories).bind(action).bind(on_error).bind(patterns)
         .execute(&mut *tx).await.unwrap();
@@ -166,10 +182,12 @@ async fn send(w: &World, path: &str, body: Value) -> (StatusCode, Option<String>
 }
 
 async fn events(w: &World) -> Vec<(String, String, String, i32)> {
-    sqlx::query_as("SELECT operation,action,category,count FROM guardrail_events ORDER BY created_at,id")
-        .fetch_all(&w.f.store.pool)
-        .await
-        .unwrap()
+    sqlx::query_as(
+        "SELECT operation,action,category,count FROM guardrail_events ORDER BY created_at,id",
+    )
+    .fetch_all(&w.f.store.pool)
+    .await
+    .unwrap()
 }
 
 #[dbtest::test]
@@ -181,7 +199,10 @@ async fn a_blocked_input_reserves_nothing_and_every_protocol_says_why(pool: PgPo
     let guardrail = json!({"policy_id": set, "rule_id": rule, "stage": "input", "category": "secret", "detector": "pattern"});
     let chat = json!({"model":"company/smart","messages":[{"role":"user","content":format!("deploy with {key}")}]});
     let (status, retry, body) = send(&w, "/v1/chat/completions", chat).await;
-    assert_eq!((status, retry.as_deref()), (StatusCode::BAD_REQUEST, Some("false")));
+    assert_eq!(
+        (status, retry.as_deref()),
+        (StatusCode::BAD_REQUEST, Some("false"))
+    );
     assert_eq!(body["error"]["code"], "guardrail_input_blocked");
     assert_eq!(body["error"]["type"], "invalid_request_error");
     assert_eq!(body["error"]["guardrail"], guardrail);
@@ -192,7 +213,10 @@ async fn a_blocked_input_reserves_nothing_and_every_protocol_says_why(pool: PgPo
     assert_eq!(body["error"]["guardrail"], guardrail);
     let messages = json!({"model":"company/smart","max_tokens":16,"messages":[{"role":"user","content":[{"type":"text","text":format!("deploy with {key}")}]}]});
     let (status, retry, body) = send(&w, "/v1/messages", messages).await;
-    assert_eq!((status, retry.as_deref()), (StatusCode::BAD_REQUEST, Some("false")));
+    assert_eq!(
+        (status, retry.as_deref()),
+        (StatusCode::BAD_REQUEST, Some("false"))
+    );
     assert_eq!(body["type"], "error");
     assert_eq!(body["error"]["type"], "invalid_request_error");
     assert_eq!(body["error"]["guardrail"], guardrail);
@@ -203,7 +227,11 @@ async fn a_blocked_input_reserves_nothing_and_every_protocol_says_why(pool: PgPo
     let recorded = events(&w).await;
     let ops: Vec<&str> = recorded.iter().map(|e| e.0.as_str()).collect();
     assert_eq!(ops, ["chat_completions", "responses", "messages"]);
-    assert!(recorded.iter().all(|e| (e.1.as_str(), e.2.as_str(), e.3) == ("blocked", "secret", 1)));
+    assert!(
+        recorded
+            .iter()
+            .all(|e| (e.1.as_str(), e.2.as_str(), e.3) == ("blocked", "secret", 1))
+    );
     // Text without a secret passes, once.
     let clean = json!({"model":"company/smart","messages":[{"role":"user","content":"hello"}]});
     let (status, _, _) = send(&w, "/v1/chat/completions", clean).await;
@@ -221,10 +249,16 @@ async fn embeddings_inputs_are_inspected(pool: PgPool) {
         json!({"model":"company/smart","input":["fine", format!("and {}", secret())]}),
     )
     .await;
-    assert_eq!((status, retry.as_deref()), (StatusCode::BAD_REQUEST, Some("false")));
+    assert_eq!(
+        (status, retry.as_deref()),
+        (StatusCode::BAD_REQUEST, Some("false"))
+    );
     assert_eq!(body["error"]["code"], "guardrail_input_blocked");
     assert_eq!(w.hits.load(Ordering::SeqCst), 0);
-    assert!(!body.to_string().contains("omg_"), "the body never echoes the match");
+    assert!(
+        !body.to_string().contains("omg_"),
+        "the body never echoes the match"
+    );
     assert_eq!(events(&w).await[0].0, "embeddings");
 }
 
@@ -236,7 +270,15 @@ async fn a_monitor_rule_records_and_lets_the_request_through(pool: PgPool) {
     let (status, _, _) = send(&w, "/v1/chat/completions", chat).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(w.hits.load(Ordering::SeqCst), 1);
-    assert_eq!(events(&w).await, [("chat_completions".into(), "monitored".into(), "custom".into(), 2)]);
+    assert_eq!(
+        events(&w).await,
+        [(
+            "chat_completions".into(),
+            "monitored".into(),
+            "custom".into(),
+            2
+        )]
+    );
 }
 
 #[dbtest::test]
@@ -248,18 +290,26 @@ async fn a_canary_through_every_action_is_stored_logged_and_measured_nowhere(poo
     let chat = json!({"model":"company/smart","messages":[{"role":"user","content":format!("note {canary}")}]});
     // Monitored, then blocked (generation and embeddings).
     type_default(&w, "monitor", "{custom}", std::slice::from_ref(&pattern)).await;
-    assert_eq!(send(&w, "/v1/chat/completions", chat.clone()).await.0, StatusCode::OK);
+    assert_eq!(
+        send(&w, "/v1/chat/completions", chat.clone()).await.0,
+        StatusCode::OK
+    );
     type_default(&w, "block", "{custom}", std::slice::from_ref(&pattern)).await;
     let (status, _, body) = send(&w, "/v1/chat/completions", chat).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(!body.to_string().contains(&canary), "error bodies never echo the match");
+    assert!(
+        !body.to_string().contains(&canary),
+        "error bodies never echo the match"
+    );
     let actions: Vec<String> = events(&w).await.into_iter().map(|e| e.1).collect();
     assert_eq!(actions, ["monitored", "blocked"]);
     // Every table, the log and the metrics.
-    let tables: Vec<String> = sqlx::query_scalar("SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename")
-        .fetch_all(&w.f.store.pool)
-        .await
-        .unwrap();
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename",
+    )
+    .fetch_all(&w.f.store.pool)
+    .await
+    .unwrap();
     for table in tables {
         let rows: String = sqlx::query_scalar(&format!(
             "SELECT coalesce(jsonb_agg(to_jsonb(t)),'[]'::jsonb)::text FROM public.\"{table}\" t"

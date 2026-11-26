@@ -6,8 +6,8 @@ mod deadline_stream;
 pub mod dispatch;
 mod embeddings;
 pub mod error;
-pub mod guardrails;
 pub(crate) mod evidence;
+pub mod guardrails;
 mod hand_off;
 pub mod images;
 pub mod realtime;
@@ -242,6 +242,7 @@ impl Engine {
                 request_id,
                 guardrails::operation(protocol),
                 &request.model,
+                request.stream,
                 crate::guardrails::policy::Workload::Generation,
                 || Some(crate::guardrails::enforce::chat_inspection(&request)),
             ),

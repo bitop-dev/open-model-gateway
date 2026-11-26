@@ -21637,6 +21637,88 @@
         ],
         "type": "object"
       },
+      "S6GuardrailDecision": {
+        "additionalProperties": false,
+        "description": "One guardrail decision on the request: ids, codes and a count of distinct matched values, never text.",
+        "properties": {
+          "action": {
+            "enum": [
+              "monitored",
+              "redacted",
+              "blocked",
+              "stopped",
+              "detector_failed",
+              "skipped"
+            ]
+          },
+          "category": {
+            "enum": [
+              "secret",
+              "personal_data",
+              "moderation",
+              "prompt_injection",
+              "custom"
+            ]
+          },
+          "count": {
+            "maximum": 1000000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "detector": {
+            "enum": [
+              "pattern",
+              "systemone",
+              "llm_judge",
+              "external"
+            ]
+          },
+          "layer": {
+            "enum": [
+              "type_default",
+              "workspace_override",
+              "workspace_local"
+            ]
+          },
+          "refused": {
+            "type": "boolean"
+          },
+          "revision": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "rule_id": {
+            "$ref": "#/components/schemas/IdentityUuid"
+          },
+          "rule_set_id": {
+            "$ref": "#/components/schemas/IdentityUuid"
+          },
+          "stage": {
+            "enum": [
+              "input",
+              "output"
+            ]
+          }
+        },
+        "required": [
+          "rule_set_id",
+          "rule_id",
+          "revision",
+          "layer",
+          "stage",
+          "detector",
+          "category",
+          "action",
+          "count",
+          "refused",
+          "created_at"
+        ],
+        "type": "object"
+      },
       "S6Id": {
         "additionalProperties": false,
         "properties": {
@@ -23454,7 +23536,8 @@
             ]
           },
           "attempts": {
-            "minimum": 1,
+            "description": "Attempts made; 0 for a request a guardrail refused.",
+            "minimum": 0,
             "type": "integer"
           },
           "cached_input_tokens": {
@@ -23510,6 +23593,57 @@
               {
                 "minimum": 0,
                 "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "guardrail": {
+            "anyOf": [
+              {
+                "additionalProperties": false,
+                "description": "The request's guardrail decisions in brief (#840): whether one refused it, and the distinct actions and categories. Null when no rule decided anything.",
+                "properties": {
+                  "actions": {
+                    "items": {
+                      "enum": [
+                        "monitored",
+                        "redacted",
+                        "blocked",
+                        "stopped",
+                        "detector_failed",
+                        "skipped"
+                      ]
+                    },
+                    "minItems": 1,
+                    "type": "array",
+                    "uniqueItems": true
+                  },
+                  "categories": {
+                    "items": {
+                      "enum": [
+                        "secret",
+                        "personal_data",
+                        "moderation",
+                        "prompt_injection",
+                        "custom"
+                      ]
+                    },
+                    "minItems": 1,
+                    "type": "array",
+                    "uniqueItems": true
+                  },
+                  "refused": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "refused",
+                  "actions",
+                  "categories"
+                ],
+                "type": "object"
               },
               {
                 "type": "null"
@@ -23596,7 +23730,11 @@
             "$ref": "#/components/schemas/IdentityNullableDecimal"
           },
           "provider": {
-            "type": "string"
+            "description": "Null for a request a guardrail refused (no attempt reached a provider).",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "reasoning_tokens": {
             "$ref": "#/components/schemas/IdentityNullableDecimal"
@@ -23625,7 +23763,8 @@
               "succeeded",
               "failed",
               "cancelled",
-              "indeterminate"
+              "indeterminate",
+              "blocked"
             ]
           },
           "streamed": {
@@ -23723,7 +23862,8 @@
           "session_id",
           "app",
           "job",
-          "trace_id"
+          "trace_id",
+          "guardrail"
         ],
         "type": "object"
       },
@@ -23737,7 +23877,8 @@
             ]
           },
           "attempt_count": {
-            "minimum": 1,
+            "description": "Attempts made; 0 for a request a guardrail refused.",
+            "minimum": 0,
             "type": "integer"
           },
           "attempts": {
@@ -23804,6 +23945,63 @@
                 "type": "null"
               }
             ]
+          },
+          "guardrail": {
+            "anyOf": [
+              {
+                "additionalProperties": false,
+                "description": "The request's guardrail decisions in brief (#840): whether one refused it, and the distinct actions and categories. Null when no rule decided anything.",
+                "properties": {
+                  "actions": {
+                    "items": {
+                      "enum": [
+                        "monitored",
+                        "redacted",
+                        "blocked",
+                        "stopped",
+                        "detector_failed",
+                        "skipped"
+                      ]
+                    },
+                    "minItems": 1,
+                    "type": "array",
+                    "uniqueItems": true
+                  },
+                  "categories": {
+                    "items": {
+                      "enum": [
+                        "secret",
+                        "personal_data",
+                        "moderation",
+                        "prompt_injection",
+                        "custom"
+                      ]
+                    },
+                    "minItems": 1,
+                    "type": "array",
+                    "uniqueItems": true
+                  },
+                  "refused": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "refused",
+                  "actions",
+                  "categories"
+                ],
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "guardrail_decisions": {
+            "items": {
+              "$ref": "#/components/schemas/S6GuardrailDecision"
+            },
+            "type": "array"
           },
           "held_microusd": {
             "$ref": "#/components/schemas/IdentityUnsignedDecimal"
@@ -24010,7 +24208,11 @@
             "$ref": "#/components/schemas/IdentityNullableUuid"
           },
           "provider": {
-            "type": "string"
+            "description": "Null for a request a guardrail refused (no attempt reached a provider).",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "reasoning_tokens": {
             "$ref": "#/components/schemas/IdentityNullableDecimal"
@@ -24039,7 +24241,8 @@
               "succeeded",
               "failed",
               "cancelled",
-              "indeterminate"
+              "indeterminate",
+              "blocked"
             ]
           },
           "streamed": {
@@ -24144,7 +24347,9 @@
           "workspace_id",
           "attempt_count",
           "prev_id",
-          "next_id"
+          "next_id",
+          "guardrail",
+          "guardrail_decisions"
         ],
         "type": "object"
       },
@@ -24839,7 +25044,8 @@
             ]
           },
           "attempts": {
-            "minimum": 1,
+            "description": "Attempts made; 0 for a request a guardrail refused.",
+            "minimum": 0,
             "type": "integer"
           },
           "cached_input_tokens": {
@@ -24895,6 +25101,57 @@
               {
                 "minimum": 0,
                 "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "guardrail": {
+            "anyOf": [
+              {
+                "additionalProperties": false,
+                "description": "The request's guardrail decisions in brief (#840): whether one refused it, and the distinct actions and categories. Null when no rule decided anything.",
+                "properties": {
+                  "actions": {
+                    "items": {
+                      "enum": [
+                        "monitored",
+                        "redacted",
+                        "blocked",
+                        "stopped",
+                        "detector_failed",
+                        "skipped"
+                      ]
+                    },
+                    "minItems": 1,
+                    "type": "array",
+                    "uniqueItems": true
+                  },
+                  "categories": {
+                    "items": {
+                      "enum": [
+                        "secret",
+                        "personal_data",
+                        "moderation",
+                        "prompt_injection",
+                        "custom"
+                      ]
+                    },
+                    "minItems": 1,
+                    "type": "array",
+                    "uniqueItems": true
+                  },
+                  "refused": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "refused",
+                  "actions",
+                  "categories"
+                ],
+                "type": "object"
               },
               {
                 "type": "null"
@@ -24981,7 +25238,11 @@
             "$ref": "#/components/schemas/IdentityNullableDecimal"
           },
           "provider": {
-            "type": "string"
+            "description": "Null for a request a guardrail refused (no attempt reached a provider).",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "reasoning_tokens": {
             "$ref": "#/components/schemas/IdentityNullableDecimal"
@@ -25010,7 +25271,8 @@
               "succeeded",
               "failed",
               "cancelled",
-              "indeterminate"
+              "indeterminate",
+              "blocked"
             ]
           },
           "streamed": {
@@ -25112,7 +25374,8 @@
           "session_id",
           "app",
           "job",
-          "trace_id"
+          "trace_id",
+          "guardrail"
         ],
         "type": "object"
       },
@@ -25126,7 +25389,8 @@
             ]
           },
           "attempt_count": {
-            "minimum": 1,
+            "description": "Attempts made; 0 for a request a guardrail refused.",
+            "minimum": 0,
             "type": "integer"
           },
           "attempts": {
@@ -25193,6 +25457,63 @@
                 "type": "null"
               }
             ]
+          },
+          "guardrail": {
+            "anyOf": [
+              {
+                "additionalProperties": false,
+                "description": "The request's guardrail decisions in brief (#840): whether one refused it, and the distinct actions and categories. Null when no rule decided anything.",
+                "properties": {
+                  "actions": {
+                    "items": {
+                      "enum": [
+                        "monitored",
+                        "redacted",
+                        "blocked",
+                        "stopped",
+                        "detector_failed",
+                        "skipped"
+                      ]
+                    },
+                    "minItems": 1,
+                    "type": "array",
+                    "uniqueItems": true
+                  },
+                  "categories": {
+                    "items": {
+                      "enum": [
+                        "secret",
+                        "personal_data",
+                        "moderation",
+                        "prompt_injection",
+                        "custom"
+                      ]
+                    },
+                    "minItems": 1,
+                    "type": "array",
+                    "uniqueItems": true
+                  },
+                  "refused": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "refused",
+                  "actions",
+                  "categories"
+                ],
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "guardrail_decisions": {
+            "items": {
+              "$ref": "#/components/schemas/S6GuardrailDecision"
+            },
+            "type": "array"
           },
           "held_microusd": {
             "$ref": "#/components/schemas/IdentityUnsignedDecimal"
@@ -25399,7 +25720,11 @@
             "$ref": "#/components/schemas/IdentityNullableUuid"
           },
           "provider": {
-            "type": "string"
+            "description": "Null for a request a guardrail refused (no attempt reached a provider).",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "reasoning_tokens": {
             "$ref": "#/components/schemas/IdentityNullableDecimal"
@@ -25428,7 +25753,8 @@
               "succeeded",
               "failed",
               "cancelled",
-              "indeterminate"
+              "indeterminate",
+              "blocked"
             ]
           },
           "streamed": {
@@ -25537,7 +25863,9 @@
           "workspace_id",
           "attempt_count",
           "prev_id",
-          "next_id"
+          "next_id",
+          "guardrail",
+          "guardrail_decisions"
         ],
         "type": "object"
       },
@@ -70471,12 +70799,12 @@
             }
           },
           {
-            "description": "Comma-separated attempt statuses (succeeded, failed, cancelled, indeterminate, in_progress); no empty items.",
+            "description": "Comma-separated statuses (succeeded, failed, cancelled, indeterminate, in_progress, blocked: a guardrail refused the request before any attempt); no empty items.",
             "in": "query",
             "name": "status",
             "required": false,
             "schema": {
-              "pattern": "^(succeeded|failed|cancelled|indeterminate|in_progress)(,(succeeded|failed|cancelled|indeterminate|in_progress))*$",
+              "pattern": "^(succeeded|failed|cancelled|indeterminate|in_progress|blocked)(,(succeeded|failed|cancelled|indeterminate|in_progress|blocked))*$",
               "type": "string"
             }
           },
@@ -70548,6 +70876,22 @@
                 "videos",
                 "batches",
                 "jobs"
+              ]
+            }
+          },
+          {
+            "description": "Requests with guardrail decisions (#840): any, refused (a guardrail refused the request), or one action.",
+            "in": "query",
+            "name": "guardrail",
+            "required": false,
+            "schema": {
+              "enum": [
+                "any",
+                "refused",
+                "monitored",
+                "blocked",
+                "detector_failed",
+                "skipped"
               ]
             }
           }
@@ -70667,12 +71011,12 @@
             }
           },
           {
-            "description": "Comma-separated attempt statuses (succeeded, failed, cancelled, indeterminate, in_progress); no empty items.",
+            "description": "Comma-separated statuses (succeeded, failed, cancelled, indeterminate, in_progress, blocked: a guardrail refused the request before any attempt); no empty items.",
             "in": "query",
             "name": "status",
             "required": false,
             "schema": {
-              "pattern": "^(succeeded|failed|cancelled|indeterminate|in_progress)(,(succeeded|failed|cancelled|indeterminate|in_progress))*$",
+              "pattern": "^(succeeded|failed|cancelled|indeterminate|in_progress|blocked)(,(succeeded|failed|cancelled|indeterminate|in_progress|blocked))*$",
               "type": "string"
             }
           },
@@ -70744,6 +71088,22 @@
                 "videos",
                 "batches",
                 "jobs"
+              ]
+            }
+          },
+          {
+            "description": "Requests with guardrail decisions (#840): any, refused (a guardrail refused the request), or one action.",
+            "in": "query",
+            "name": "guardrail",
+            "required": false,
+            "schema": {
+              "enum": [
+                "any",
+                "refused",
+                "monitored",
+                "blocked",
+                "detector_failed",
+                "skipped"
               ]
             }
           },
@@ -70893,12 +71253,12 @@
             }
           },
           {
-            "description": "Comma-separated attempt statuses (succeeded, failed, cancelled, indeterminate, in_progress); no empty items.",
+            "description": "Comma-separated statuses (succeeded, failed, cancelled, indeterminate, in_progress, blocked: a guardrail refused the request before any attempt); no empty items.",
             "in": "query",
             "name": "status",
             "required": false,
             "schema": {
-              "pattern": "^(succeeded|failed|cancelled|indeterminate|in_progress)(,(succeeded|failed|cancelled|indeterminate|in_progress))*$",
+              "pattern": "^(succeeded|failed|cancelled|indeterminate|in_progress|blocked)(,(succeeded|failed|cancelled|indeterminate|in_progress|blocked))*$",
               "type": "string"
             }
           },
@@ -70970,6 +71330,22 @@
                 "videos",
                 "batches",
                 "jobs"
+              ]
+            }
+          },
+          {
+            "description": "Requests with guardrail decisions (#840): any, refused (a guardrail refused the request), or one action.",
+            "in": "query",
+            "name": "guardrail",
+            "required": false,
+            "schema": {
+              "enum": [
+                "any",
+                "refused",
+                "monitored",
+                "blocked",
+                "detector_failed",
+                "skipped"
               ]
             }
           }
@@ -88160,12 +88536,12 @@
             }
           },
           {
-            "description": "Comma-separated attempt statuses (succeeded, failed, cancelled, indeterminate, in_progress); no empty items.",
+            "description": "Comma-separated statuses (succeeded, failed, cancelled, indeterminate, in_progress, blocked: a guardrail refused the request before any attempt); no empty items.",
             "in": "query",
             "name": "status",
             "required": false,
             "schema": {
-              "pattern": "^(succeeded|failed|cancelled|indeterminate|in_progress)(,(succeeded|failed|cancelled|indeterminate|in_progress))*$",
+              "pattern": "^(succeeded|failed|cancelled|indeterminate|in_progress|blocked)(,(succeeded|failed|cancelled|indeterminate|in_progress|blocked))*$",
               "type": "string"
             }
           },
@@ -88228,6 +88604,22 @@
                 "videos",
                 "batches",
                 "jobs"
+              ]
+            }
+          },
+          {
+            "description": "Requests with guardrail decisions (#840): any, refused (a guardrail refused the request), or one action.",
+            "in": "query",
+            "name": "guardrail",
+            "required": false,
+            "schema": {
+              "enum": [
+                "any",
+                "refused",
+                "monitored",
+                "blocked",
+                "detector_failed",
+                "skipped"
               ]
             }
           }
@@ -90333,12 +90725,12 @@
             }
           },
           {
-            "description": "Comma-separated attempt statuses (succeeded, failed, cancelled, indeterminate, in_progress); no empty items.",
+            "description": "Comma-separated statuses (succeeded, failed, cancelled, indeterminate, in_progress, blocked: a guardrail refused the request before any attempt); no empty items.",
             "in": "query",
             "name": "status",
             "required": false,
             "schema": {
-              "pattern": "^(succeeded|failed|cancelled|indeterminate|in_progress)(,(succeeded|failed|cancelled|indeterminate|in_progress))*$",
+              "pattern": "^(succeeded|failed|cancelled|indeterminate|in_progress|blocked)(,(succeeded|failed|cancelled|indeterminate|in_progress|blocked))*$",
               "type": "string"
             }
           },
@@ -90401,6 +90793,22 @@
                 "videos",
                 "batches",
                 "jobs"
+              ]
+            }
+          },
+          {
+            "description": "Requests with guardrail decisions (#840): any, refused (a guardrail refused the request), or one action.",
+            "in": "query",
+            "name": "guardrail",
+            "required": false,
+            "schema": {
+              "enum": [
+                "any",
+                "refused",
+                "monitored",
+                "blocked",
+                "detector_failed",
+                "skipped"
               ]
             }
           },
@@ -90557,12 +90965,12 @@
             }
           },
           {
-            "description": "Comma-separated attempt statuses (succeeded, failed, cancelled, indeterminate, in_progress); no empty items.",
+            "description": "Comma-separated statuses (succeeded, failed, cancelled, indeterminate, in_progress, blocked: a guardrail refused the request before any attempt); no empty items.",
             "in": "query",
             "name": "status",
             "required": false,
             "schema": {
-              "pattern": "^(succeeded|failed|cancelled|indeterminate|in_progress)(,(succeeded|failed|cancelled|indeterminate|in_progress))*$",
+              "pattern": "^(succeeded|failed|cancelled|indeterminate|in_progress|blocked)(,(succeeded|failed|cancelled|indeterminate|in_progress|blocked))*$",
               "type": "string"
             }
           },
@@ -90625,6 +91033,22 @@
                 "videos",
                 "batches",
                 "jobs"
+              ]
+            }
+          },
+          {
+            "description": "Requests with guardrail decisions (#840): any, refused (a guardrail refused the request), or one action.",
+            "in": "query",
+            "name": "guardrail",
+            "required": false,
+            "schema": {
+              "enum": [
+                "any",
+                "refused",
+                "monitored",
+                "blocked",
+                "detector_failed",
+                "skipped"
               ]
             }
           }

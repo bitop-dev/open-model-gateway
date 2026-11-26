@@ -136,7 +136,9 @@ impl InferenceError {
             Self::Storage => "accounting_unavailable",
             Self::Guardrail(r) => match r.kind {
                 crate::guardrails::enforce::RefusalKind::InputBlocked => "guardrail_input_blocked",
-                crate::guardrails::enforce::RefusalKind::DetectorFailed => "guardrail_detector_failed",
+                crate::guardrails::enforce::RefusalKind::DetectorFailed => {
+                    "guardrail_detector_failed"
+                }
                 crate::guardrails::enforce::RefusalKind::NotSupported => "guardrail_not_supported",
             },
         }

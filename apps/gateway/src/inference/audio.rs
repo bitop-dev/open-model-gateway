@@ -313,7 +313,8 @@ pub fn transcription_meters(input_audio_ms: Option<u64>) -> MeterUsage {
 impl Workload for TranscriptionRequest {
     type Response = TranscriptionResponse;
     const PROTOCOL: ApiProtocol = ApiProtocol::AudioTranscriptions;
-    const GUARDRAIL: crate::guardrails::policy::Workload = crate::guardrails::policy::Workload::AudioTranscriptions;
+    const GUARDRAIL: crate::guardrails::policy::Workload =
+        crate::guardrails::policy::Workload::AudioTranscriptions;
     fn model(&self) -> &str {
         &self.model
     }
@@ -466,7 +467,8 @@ pub struct SpeechResponse {
 impl Workload for SpeechRequest {
     type Response = SpeechResponse;
     const PROTOCOL: ApiProtocol = ApiProtocol::AudioSpeech;
-    const GUARDRAIL: crate::guardrails::policy::Workload = crate::guardrails::policy::Workload::AudioSpeech;
+    const GUARDRAIL: crate::guardrails::policy::Workload =
+        crate::guardrails::policy::Workload::AudioSpeech;
     const STREAMED: bool = true;
     fn model(&self) -> &str {
         &self.model

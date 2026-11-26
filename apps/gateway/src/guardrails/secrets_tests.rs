@@ -21,30 +21,70 @@ fn alnum(n: usize) -> String {
 fn positives() -> Vec<(&'static str, String)> {
     let b64 = |n| alnum(n);
     vec![
-        ("aws_access_key_id", format!("{}{}", "AK", "IA") + &rep('Q', 16)),
+        (
+            "aws_access_key_id",
+            format!("{}{}", "AK", "IA") + &rep('Q', 16),
+        ),
         ("github_token", format!("{}_{}", "ghp", alnum(36))),
-        ("github_fine_grained_token", format!("{}_pat_{}", "github", alnum(82))),
+        (
+            "github_fine_grained_token",
+            format!("{}_pat_{}", "github", alnum(82)),
+        ),
         ("gitlab_token", format!("{}-{}", "glpat", alnum(20))),
-        ("slack_token", format!("{}-{}-{}", "xoxb", hex(12), alnum(24))),
+        (
+            "slack_token",
+            format!("{}-{}-{}", "xoxb", hex(12), alnum(24)),
+        ),
         (
             "slack_webhook",
-            format!("https://hooks.slack.com/services/T{}/B{}/{}", rep('A', 9), rep('B', 9), alnum(24)),
+            format!(
+                "https://hooks.slack.com/services/T{}/B{}/{}",
+                rep('A', 9),
+                rep('B', 9),
+                alnum(24)
+            ),
         ),
         ("stripe_secret_key", format!("{}_live_{}", "sk", alnum(24))),
-        ("openai_api_key", format!("{}-proj-{}{}{}", "sk", alnum(24), "T3Blbk", "FJ") + &alnum(24)),
-        ("anthropic_api_key", format!("{}-ant-api03-{}", "sk", alnum(95))),
+        (
+            "openai_api_key",
+            format!("{}-proj-{}{}{}", "sk", alnum(24), "T3Blbk", "FJ") + &alnum(24),
+        ),
+        (
+            "anthropic_api_key",
+            format!("{}-ant-api03-{}", "sk", alnum(95)),
+        ),
         ("google_api_key", format!("{}{}", "AI", "za") + &alnum(35)),
         ("huggingface_token", format!("{}_{}", "hf", alnum(34))),
         ("npm_token", format!("{}_{}", "npm", alnum(36))),
-        ("private_key", format!("-----{} RSA {} KEY-----", "BEGIN", "PRIVATE")),
-        ("jwt", format!("{}.{}.{}", "eyJ".to_owned() + &b64(20), "eyJ".to_owned() + &b64(30), b64(43))),
+        (
+            "private_key",
+            format!("-----{} RSA {} KEY-----", "BEGIN", "PRIVATE"),
+        ),
+        (
+            "jwt",
+            format!(
+                "{}.{}.{}",
+                "eyJ".to_owned() + &b64(20),
+                "eyJ".to_owned() + &b64(30),
+                b64(43)
+            ),
+        ),
         (
             "connection_string_password",
             format!("{}://app:{}@db.internal:5432/main", "postgres", alnum(16)),
         ),
-        ("azure_storage_connection_string", format!("Account{}={}==", "Key", alnum(86))),
-        ("gateway_inference_key", format!("{}_{}.{}", "omg", hex(32), hex(64))),
-        ("gateway_admin_token", format!("{}_admin_{}.{}", "omg", hex(32), hex(64))),
+        (
+            "azure_storage_connection_string",
+            format!("Account{}={}==", "Key", alnum(86)),
+        ),
+        (
+            "gateway_inference_key",
+            format!("{}_{}.{}", "omg", hex(32), hex(64)),
+        ),
+        (
+            "gateway_admin_token",
+            format!("{}_admin_{}.{}", "omg", hex(32), hex(64)),
+        ),
     ]
 }
 
@@ -89,7 +129,8 @@ fn ordinary_text_matches_nothing() {
 
 #[test]
 fn custom_patterns_match_only_for_their_rule() {
-    let custom = PatternDetector::new(&[Category::Custom], &["PROJECT-[A-Z]{4}".to_owned()]).unwrap();
+    let custom =
+        PatternDetector::new(&[Category::Custom], &["PROJECT-[A-Z]{4}".to_owned()]).unwrap();
     assert_eq!(found(&custom, "status of PROJECT-ABCD and PROJECT-WXYZ"), 2);
     // A custom-only rule never runs the built-in shapes.
     assert_eq!(found(&custom, &format!("{}_{}", "ghp", alnum(36))), 0);

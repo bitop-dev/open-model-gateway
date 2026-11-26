@@ -17,21 +17,36 @@ use super::policy::{Category, DetectorKind, Egress};
 /// The built-in secret shapes, by name (names are for tests and docs only;
 /// a decision records the rule and the category `secret`).
 pub const BUILTIN: &[(&str, &str)] = &[
-    ("aws_access_key_id", r"\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b"),
-    ("github_token", r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,255}\b"),
-    ("github_fine_grained_token", r"\bgithub_pat_[A-Za-z0-9_]{82}\b"),
+    (
+        "aws_access_key_id",
+        r"\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b",
+    ),
+    (
+        "github_token",
+        r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,255}\b",
+    ),
+    (
+        "github_fine_grained_token",
+        r"\bgithub_pat_[A-Za-z0-9_]{82}\b",
+    ),
     ("gitlab_token", r"\bglpat-[A-Za-z0-9_\-]{20,}\b"),
     ("slack_token", r"\bxox[abposr]-[A-Za-z0-9-]{10,250}\b"),
     (
         "slack_webhook",
         r"https://hooks\.slack\.com/services/T[A-Z0-9]{8,}/B[A-Z0-9]{8,}/[A-Za-z0-9]{24}",
     ),
-    ("stripe_secret_key", r"\b(?:sk|rk)_live_[A-Za-z0-9]{24,99}\b"),
+    (
+        "stripe_secret_key",
+        r"\b(?:sk|rk)_live_[A-Za-z0-9]{24,99}\b",
+    ),
     (
         "openai_api_key",
         r"\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_\-]{20,}T3BlbkFJ[A-Za-z0-9_\-]{20,}",
     ),
-    ("anthropic_api_key", r"\bsk-ant-(?:api|admin)[0-9]{2}-[A-Za-z0-9_\-]{80,120}"),
+    (
+        "anthropic_api_key",
+        r"\bsk-ant-(?:api|admin)[0-9]{2}-[A-Za-z0-9_\-]{80,120}",
+    ),
     ("google_api_key", r"\bAIza[0-9A-Za-z_\-]{35}\b"),
     ("huggingface_token", r"\bhf_[A-Za-z0-9]{34,40}\b"),
     ("npm_token", r"\bnpm_[A-Za-z0-9]{36}\b"),
@@ -48,8 +63,14 @@ pub const BUILTIN: &[(&str, &str)] = &[
         "azure_storage_connection_string",
         r"AccountKey=[A-Za-z0-9+/]{80,}={0,2}",
     ),
-    ("gateway_inference_key", r"\bomg_[0-9a-fA-F]{32}\.[0-9a-fA-F]{64}\b"),
-    ("gateway_admin_token", r"\bomg_admin_[0-9a-fA-F]{32}\.[0-9a-fA-F]{64}\b"),
+    (
+        "gateway_inference_key",
+        r"\bomg_[0-9a-fA-F]{32}\.[0-9a-fA-F]{64}\b",
+    ),
+    (
+        "gateway_admin_token",
+        r"\bomg_admin_[0-9a-fA-F]{32}\.[0-9a-fA-F]{64}\b",
+    ),
 ];
 
 struct Builtin {

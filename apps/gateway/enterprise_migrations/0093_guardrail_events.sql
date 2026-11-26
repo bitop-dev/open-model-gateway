@@ -31,6 +31,8 @@ CREATE TABLE guardrail_events (
  operation text NOT NULL CHECK (operation IN ('chat_completions','responses','messages','embeddings',
   'rerank','systemone','audio_speech','images','audio_transcriptions')),
  model text NOT NULL CHECK (char_length(model) BETWEEN 1 AND 200),
+ -- Whether the client asked for a stream (generation only).
+ streamed boolean NOT NULL DEFAULT false,
  stage text NOT NULL CHECK (stage IN ('input','output')),
  rule_set_id uuid NOT NULL,
  rule_id uuid NOT NULL,
@@ -41,11 +43,15 @@ CREATE TABLE guardrail_events (
  action text NOT NULL CHECK (action IN ('monitored','redacted','blocked','stopped','detector_failed','skipped')),
  -- Findings of this rule and category in the request (at least one).
  count integer NOT NULL CHECK (count BETWEEN 1 AND 1000000),
+ -- This decision is the one the client was refused with (one per refused
+ -- request; such a request has no execution row).
+ refused boolean NOT NULL DEFAULT false,
  PRIMARY KEY (id, created_at),
  FOREIGN KEY (workspace_id, api_key_id) REFERENCES api_keys(workspace_id, id)
 ) PARTITION BY RANGE (created_at);
 CREATE INDEX guardrail_events_request ON guardrail_events (root_request_id, created_at);
 CREATE INDEX guardrail_events_workspace_time ON guardrail_events (workspace_id, created_at, id);
+CREATE INDEX guardrail_events_refused ON guardrail_events (workspace_id, created_at) WHERE refused;
 CREATE TRIGGER guardrail_events_immutable BEFORE UPDATE OR DELETE ON guardrail_events
  FOR EACH ROW EXECUTE FUNCTION immutable_history();
 CREATE TRIGGER guardrail_events_no_truncate BEFORE TRUNCATE ON guardrail_events

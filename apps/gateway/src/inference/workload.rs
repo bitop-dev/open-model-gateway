@@ -248,7 +248,8 @@ pub(super) fn within_ceilings(usage: Usage, ceilings: MeterUsage) -> bool {
 impl Workload for EmbeddingRequest {
     type Response = EmbeddingResponse;
     const PROTOCOL: ApiProtocol = ApiProtocol::Embeddings;
-    const GUARDRAIL: crate::guardrails::policy::Workload = crate::guardrails::policy::Workload::Embeddings;
+    const GUARDRAIL: crate::guardrails::policy::Workload =
+        crate::guardrails::policy::Workload::Embeddings;
     fn inspection(&self) -> Option<crate::guardrails::detector::Inspection<'_>> {
         Some(crate::guardrails::enforce::texts_inspection(&self.input))
     }
@@ -289,7 +290,8 @@ impl Workload for EmbeddingRequest {
 impl Workload for RerankRequest {
     type Response = RerankResponse;
     const PROTOCOL: ApiProtocol = ApiProtocol::Rerank;
-    const GUARDRAIL: crate::guardrails::policy::Workload = crate::guardrails::policy::Workload::Rerank;
+    const GUARDRAIL: crate::guardrails::policy::Workload =
+        crate::guardrails::policy::Workload::Rerank;
     fn model(&self) -> &str {
         &self.model
     }
@@ -324,7 +326,8 @@ impl Workload for RerankRequest {
 impl Workload for SystemoneRequest {
     type Response = SystemoneResponse;
     const PROTOCOL: ApiProtocol = ApiProtocol::Systemone;
-    const GUARDRAIL: crate::guardrails::policy::Workload = crate::guardrails::policy::Workload::Systemone;
+    const GUARDRAIL: crate::guardrails::policy::Workload =
+        crate::guardrails::policy::Workload::Systemone;
     fn model(&self) -> &str {
         &self.model
     }
@@ -418,6 +421,7 @@ impl Engine {
                 request_id,
                 W::GUARDRAIL.as_str(),
                 request.model(),
+                W::STREAMED,
                 W::GUARDRAIL,
                 || request.inspection(),
             ),

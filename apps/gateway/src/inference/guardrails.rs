@@ -30,6 +30,8 @@ pub struct GuardrailRecord<'a> {
     pub operation: &'static str,
     /// The catalog model the request named.
     pub model: &'a str,
+    /// Whether the client asked for a stream.
+    pub streamed: bool,
     pub events: &'a [Event],
 }
 
@@ -55,10 +57,7 @@ impl Store {
             .map_err(route_lookup_storage)?
             // A stored value this release cannot read refuses the request.
             .map_err(|_| InferenceError::Storage)?;
-        let policy = Arc::new(Policy::compile(&compose(
-            platform.as_ref(),
-            local.as_ref(),
-        )));
+        let policy = Arc::new(Policy::compile(&compose(platform.as_ref(), local.as_ref())));
         if let Some(stamp) = stamp {
             self.caches
                 .guardrails
@@ -76,10 +75,10 @@ impl Store {
         let e = record.events;
         let col = |f: fn(&Event) -> String| e.iter().map(f).collect::<Vec<_>>();
         sqlx::query(
-            "INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count)
-             SELECT id,$2,$3,$4,$5,$6,'input',rule_set_id,rule_id,revision,layer,detector_kind,category,action,count
-             FROM unnest($1::uuid[],$7::uuid[],$8::uuid[],$9::bigint[],$10::text[],$11::text[],$12::text[],$13::text[],$14::int[])
-              AS t(id,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count)",
+            "INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,streamed,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused)
+             SELECT id,$2,$3,$4,$5,$6,$16,'input',rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused
+             FROM unnest($1::uuid[],$7::uuid[],$8::uuid[],$9::bigint[],$10::text[],$11::text[],$12::text[],$13::text[],$14::int[],$15::boolean[])
+              AS t(id,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused)",
         )
         .bind(e.iter().map(|_| Uuid::now_v7()).collect::<Vec<_>>())
         .bind(record.root_request_id)
@@ -99,6 +98,8 @@ impl Store {
                 .map(|v| i32::try_from(v.count).unwrap_or(i32::MAX))
                 .collect::<Vec<_>>(),
         )
+        .bind(e.iter().map(|v| v.refused).collect::<Vec<_>>())
+        .bind(record.streamed)
         .execute(&self.pool)
         .await
         .map_err(route_lookup_storage)?;
@@ -128,6 +129,7 @@ impl super::Engine {
         request_id: Uuid,
         operation: &'static str,
         model: &str,
+        streamed: bool,
         workload: Workload,
         input: impl FnOnce() -> Option<Inspection<'a>>,
     ) -> Result<(), InferenceError> {
@@ -156,6 +158,7 @@ impl super::Engine {
                     principal: *principal,
                     operation,
                     model,
+                    streamed,
                     events: &decision.events,
                 })
                 .await?;

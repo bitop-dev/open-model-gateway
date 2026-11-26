@@ -82,10 +82,11 @@ fn http_status(error: InferenceError) -> StatusCode {
         | InferenceError::ScopeBusy
         | InferenceError::RouteCoolingDown(_) => StatusCode::SERVICE_UNAVAILABLE,
         InferenceError::Guardrail(r) => match r.kind {
-            crate::guardrails::enforce::RefusalKind::DetectorFailed => StatusCode::SERVICE_UNAVAILABLE,
-            crate::guardrails::enforce::RefusalKind::InputBlocked | crate::guardrails::enforce::RefusalKind::NotSupported => {
-                StatusCode::BAD_REQUEST
+            crate::guardrails::enforce::RefusalKind::DetectorFailed => {
+                StatusCode::SERVICE_UNAVAILABLE
             }
+            crate::guardrails::enforce::RefusalKind::InputBlocked
+            | crate::guardrails::enforce::RefusalKind::NotSupported => StatusCode::BAD_REQUEST,
         },
     }
 }

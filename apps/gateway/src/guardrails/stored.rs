@@ -190,7 +190,6 @@ pub async fn load(
     })))
 }
 
-
 /// A workspace's stored layers: its platform layer (the override if one
 /// exists, else its kind's type default) and its local layer. One query when
 /// none exists (the common case), else one more per layer for its rules.

@@ -301,7 +301,8 @@ impl InferenceRepository for Repo {
     async fn guardrails(
         &self,
         _: Uuid,
-    ) -> std::result::Result<std::sync::Arc<crate::guardrails::enforce::Policy>, InferenceError> {
+    ) -> std::result::Result<std::sync::Arc<crate::guardrails::enforce::Policy>, InferenceError>
+    {
         Ok(std::sync::Arc::default())
     }
     async fn record_guardrails(

@@ -29,7 +29,9 @@ fn rule(categories: &[Category], patterns: &[&str], action: InputAction) -> Rule
             OnError::FailOpen
         },
         timeout_ms: None,
-        workloads: [Workload::Generation, Workload::Embeddings].into_iter().collect(),
+        workloads: [Workload::Generation, Workload::Embeddings]
+            .into_iter()
+            .collect(),
         uninspectable: Uninspectable::Deny,
     }
 }
@@ -69,16 +71,35 @@ fn a_block_rule_refuses_with_ids_and_a_count() {
     assert_eq!(refusal.kind, RefusalKind::InputBlocked);
     assert_eq!(refusal.category, Category::Secret);
     assert_eq!(d.events.len(), 1);
-    assert_eq!((d.events[0].action, d.events[0].count, d.events[0].revision), (Action::Blocked, 1, 3));
+    assert_eq!(
+        (d.events[0].action, d.events[0].count, d.events[0].revision),
+        (Action::Blocked, 1, 3)
+    );
+    assert!(d.events[0].refused, "the refusing decision is marked");
 }
 
 #[test]
 fn monitor_records_and_lets_the_request_through() {
-    let p = policy(vec![rule(&[Category::Custom], &["PROJECT-[0-9]{4}"], InputAction::Monitor)]);
-    let d = p.decide(Workload::Embeddings, Some(&text("PROJECT-1234, PROJECT-5678")));
+    let p = policy(vec![rule(
+        &[Category::Custom],
+        &["PROJECT-[0-9]{4}"],
+        InputAction::Monitor,
+    )]);
+    let d = p.decide(
+        Workload::Embeddings,
+        Some(&text("PROJECT-1234, PROJECT-5678")),
+    );
     assert!(d.refusal.is_none());
-    assert_eq!((d.events[0].action, d.events[0].count), (Action::Monitored, 2));
-    assert!(p.decide(Workload::Generation, Some(&text("nothing here"))).events.is_empty());
+    assert_eq!(
+        (d.events[0].action, d.events[0].count),
+        (Action::Monitored, 2)
+    );
+    assert!(!d.events[0].refused);
+    assert!(
+        p.decide(Workload::Generation, Some(&text("nothing here")))
+            .events
+            .is_empty()
+    );
 }
 
 #[test]
@@ -90,7 +111,11 @@ fn off_rules_and_other_workloads_do_not_run() {
     let p = policy(vec![only_generation]);
     assert!(!p.applies_to(Workload::Embeddings));
     let k = key();
-    assert!(p.decide(Workload::Embeddings, Some(&text(&k))).refusal.is_none());
+    assert!(
+        p.decide(Workload::Embeddings, Some(&text(&k)))
+            .refusal
+            .is_none()
+    );
 }
 
 #[test]
