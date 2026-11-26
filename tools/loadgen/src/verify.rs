@@ -3,7 +3,8 @@
 //!
 //! Read-only. Every successful request must have exactly one execution, one
 //! settled reservation and exactly one hold and one settlement ledger entry,
-//! with exact sums; denied requests must have no execution; and no
+//! with exact sums; denied requests (429) and every attempt shed before
+//! admission (`scope_busy`, resent or not) must have no execution; and no
 //! reservation admitted during the run may remain pending. `budget verify`
 //! (maintained totals vs a full scan) is run separately by the runner.
 use std::time::Duration;
@@ -85,6 +86,11 @@ impl Database {
             .iter()
             .filter(|r| r.status == 429)
             .filter_map(|r| r.request_id)
+            .chain(
+                records
+                    .iter()
+                    .flat_map(|r| r.shed_request_ids.iter().copied()),
+            )
             .collect();
         let mut c = DatabaseCheck {
             ok_requests: records.iter().filter(|r| r.ok).count() as u64,
