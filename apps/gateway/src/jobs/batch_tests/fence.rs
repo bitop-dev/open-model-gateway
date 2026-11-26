@@ -57,7 +57,7 @@ fn flushing_after(w: &World, age: Duration) -> Jobs {
 /// (`claim_gateway` takes `FOR UPDATE SKIP LOCKED`), and the loop claims
 /// again on its next tick. So an empty claim is retried, for at most
 /// [`REACH`]; a run that claimed returns its own result.
-fn start_replacement(
+pub(super) fn start_replacement(
     w: &World,
     job: &JobRow,
     jobs: Jobs,
@@ -1023,8 +1023,14 @@ async fn crashed_batch_finalization_outputs_are_reclaimed_without_retention(pool
     assert_eq!(sweep_once(db, runtime, 100).await.unwrap().claimed, 0);
     old.abort();
     assert!(old.await.unwrap_err().is_cancelled());
-    lapse(&w, &job).await;
-    assert!(Runner::new(w.jobs.clone()).run_next().await.unwrap());
+    // Aborting the run leaves its lease renewal task running (its handle is
+    // dropped, not aborted): the replacement claims as the runner loop does.
+    assert!(
+        start_replacement(&w, &job, w.jobs.clone())
+            .await
+            .unwrap()
+            .unwrap()
+    );
     let done = w.reload(&job).await;
     assert!(done.settled_at.is_some());
     let cost = crate::governance::batch::batch_cost(db, job.id)
@@ -1798,9 +1804,12 @@ async fn a_segment_commit_error_keeps_the_file_and_recovery_does_not_replay(pool
     .execute(db)
     .await
     .unwrap();
-    // The whole run, provider calls included: a planning failure costs one REPLAN.
+    // The whole run, provider calls included: a planning failure costs one
+    // REPLAN. Its segment flushes when the run's lines end, never on its age
+    // first (which would stop the run at the refused commit before `two`).
+    let age = REACH + Duration::from_secs(5);
     assert!(
-        tokio::time::timeout(REACH, start(&w))
+        tokio::time::timeout(REACH, start_with(flushing_after(&w, age)))
             .await
             .unwrap()
             .unwrap()

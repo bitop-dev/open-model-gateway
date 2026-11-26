@@ -1,7 +1,7 @@
 //! A provider answer is charged once across either side of the result commit.
 use super::*;
 use super::{
-    fence::{lapse, start},
+    fence::{REACH, start, start_replacement},
     http_support::{Resolver, Server, client},
 };
 use crate::jobs::schedule::claims::RetryCommitFault;
@@ -102,7 +102,10 @@ async fn crash_worker() {
     let dir = std::env::var("BATCH_TEST_DIR").unwrap();
     let store = crate::store::Store::new(pool);
     let engine = loopback_engine(&store, &std::env::var("BATCH_TEST_UPSTREAM").unwrap());
-    let jobs = loopback_jobs(store, engine, local_files(dir.as_ref()).await, 1);
+    let mut jobs = loopback_jobs(store, engine, local_files(dir.as_ref()).await, 1);
+    jobs.segment_age = std::env::var("BATCH_TEST_SEGMENT_AGE_MS")
+        .ok()
+        .map(|ms| Duration::from_millis(ms.parse().unwrap()));
     jobs.finalize_hold.arm();
     assert!(Runner::new(jobs).run_next().await.unwrap());
 }
@@ -140,6 +143,12 @@ fn start_process(w: &World, dir: &std::path::Path, upstream: &Server) -> tokio::
         )
         .env("BATCH_TEST_DIR", dir)
         .env("BATCH_TEST_UPSTREAM", &upstream.base)
+        // The worker flushes on the parent's segment age (`run_case`).
+        .envs(
+            w.jobs
+                .segment_age
+                .map(|age| ("BATCH_TEST_SEGMENT_AGE_MS", age.as_millis().to_string())),
+        )
         // The parent shard's libtest output must contain just its own summary.
         .stdout(std::process::Stdio::null())
         .kill_on_drop(true)
@@ -305,6 +314,15 @@ async fn run_case(pool: PgPool, case: Case) {
     .await
     .unwrap();
     w.jobs = loopback_jobs(store, engine, files, concurrency);
+    // A fault case runs its lines one at a time and asserts where all their
+    // answers are (none written before the held commit, or all in segment 0).
+    // Each line reaches the provider within `REACH` (a planning failure costs
+    // a REPLAN), so `dispatch` bounds them all, and their segment is flushed
+    // when the lines end, never on its age first.
+    let dispatch = REACH * size as u32;
+    if fault.is_some() {
+        w.jobs.segment_age = Some(dispatch + Duration::from_secs(5));
+    }
     if let Case::CapacityTakeover(loss) = case {
         let process = matches!(loss, Loss::Crash).then(|| start_process(&w, dir.path(), &upstream));
         check_takeover_capacity(&w, &job, &calls, &release_provider, process).await;
@@ -434,7 +452,7 @@ async fn run_case(pool: PgPool, case: Case) {
         assert!(!Runner::new(w.jobs.clone()).run_next().await.unwrap());
     } else if let Some((_, loss)) = fault {
         if before {
-            tokio::time::timeout(Duration::from_secs(20),async {
+            tokio::time::timeout(dispatch, async {
                 loop {
                     let waiting:bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE relation='stored_files'::regclass AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND NOT granted)").fetch_one(&w.f.store.pool).await.unwrap();
                     if waiting {break}
@@ -447,7 +465,7 @@ async fn run_case(pool: PgPool, case: Case) {
                 "the one-slot route drains before the first grouped write"
             );
         } else if crash {
-            tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::time::timeout(dispatch, async {
                 while w.reload(&job).await.finalizing_at.is_none() {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
@@ -455,7 +473,7 @@ async fn run_case(pool: PgPool, case: Case) {
             .await
             .unwrap();
         } else {
-            tokio::time::timeout(Duration::from_secs(20), w.jobs.finalize_hold.reached())
+            tokio::time::timeout(dispatch, w.jobs.finalize_hold.reached())
                 .await
                 .unwrap();
         }
@@ -499,9 +517,11 @@ async fn run_case(pool: PgPool, case: Case) {
             child.kill().await.unwrap();
             assert!(!child.wait().await.unwrap().success());
         }
-        lapse(&w, &job).await;
-        let owner = start(&w);
-        tokio::time::timeout(Duration::from_secs(10), async {
+        // The replacement claims as the runner loop does (`start_replacement`):
+        // the old runner of a takeover still renews, and a claim skips a job
+        // row another transaction holds.
+        let owner = start_replacement(&w, &job, w.jobs.clone());
+        tokio::time::timeout(REACH, async {
             while sqlx::query_scalar::<_, i64>("SELECT runner_epoch FROM async_jobs WHERE id=$1")
                 .bind(job.id)
                 .fetch_one(&w.f.store.pool)
@@ -1286,8 +1306,9 @@ async fn check_backoff_retry(
 
 #[dbtest::test]
 async fn a_takeover_keeps_the_pending_provider_call_in_route_capacity(pool: PgPool) {
+    // The sum of `check_takeover_capacity`'s phase bounds, and set-up.
     tokio::time::timeout(
-        Duration::from_secs(30),
+        REACH * 4 + Duration::from_secs(30),
         run_case(pool, Case::CapacityTakeover(Loss::Takeover)),
     )
     .await
@@ -1296,8 +1317,9 @@ async fn a_takeover_keeps_the_pending_provider_call_in_route_capacity(pool: PgPo
 
 #[dbtest::test]
 async fn lease_recovery_releases_a_crashed_runners_route_slot(pool: PgPool) {
+    // The sum of `check_takeover_capacity`'s phase bounds, and set-up.
     tokio::time::timeout(
-        Duration::from_secs(30),
+        REACH * 4 + Duration::from_secs(30),
         run_case(pool, Case::CapacityTakeover(Loss::Crash)),
     )
     .await
@@ -1311,27 +1333,39 @@ async fn check_takeover_capacity(
     release: &tokio::sync::Semaphore,
     mut process: Option<tokio::process::Child>,
 ) {
+    // Each phase has its own bound, from REACH: a line reaches the provider
+    // within REACH (a planning failure costs a REPLAN).
     let old = process.is_none().then(|| start(w));
-    while calls.load(Ordering::SeqCst) == 0 {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    lapse(w, job).await;
-    let owner = start(w);
-    loop {
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "takeover exceeded route capacity"
-        );
-        // Only a demand heartbeat after interruption shows that the new
-        // owner has tried to dispatch the remaining line.
-        let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT FROM batch_lines l JOIN batch_route_waits w USING(job_id,deployment_id) WHERE l.job_id=$1 AND l.state='interrupted' AND w.reason='concurrency' AND w.updated_at>l.finished_at)")
-            .bind(job.id).fetch_one(&w.f.store.pool).await.unwrap();
-        if waiting {
-            break;
+    tokio::time::timeout(REACH, async {
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    })
+    .await
+    .expect("the first runner reaches the provider");
+    // The old runner still renews its lease, and a claim skips a job row
+    // another transaction holds: the replacement claims as the runner loop
+    // does (`start_replacement`, within REACH), then plans (within REACH).
+    let owner = start_replacement(w, job, w.jobs.clone());
+    tokio::time::timeout(REACH * 2, async {
+        loop {
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "takeover exceeded route capacity"
+            );
+            // Only a demand heartbeat after interruption shows that the new
+            // owner has tried to dispatch the remaining line.
+            let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT FROM batch_lines l JOIN batch_route_waits w USING(job_id,deployment_id) WHERE l.job_id=$1 AND l.state='interrupted' AND w.reason='concurrency' AND w.updated_at>l.finished_at)")
+                .bind(job.id).fetch_one(&w.f.store.pool).await.unwrap();
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the replacement tries to dispatch the remaining line");
     let scheduler = crate::jobs::schedule::Scheduler::new(w.jobs.store.clone(), None);
     assert_eq!(
         scheduler.running_lines(w.claude_deployment).await.unwrap(),
@@ -1351,9 +1385,16 @@ async fn check_takeover_capacity(
     }
     release.add_permits(1);
     if let Some(old) = old {
-        assert!(old.await.unwrap().unwrap());
+        let finished = tokio::time::timeout(REACH, old).await;
+        assert!(finished.expect("the old runner finishes").unwrap().unwrap());
     }
-    assert!(owner.await.unwrap().unwrap());
+    let finished = tokio::time::timeout(REACH, owner).await;
+    assert!(
+        finished
+            .expect("the replacement finishes")
+            .unwrap()
+            .unwrap()
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     let done = w.reload(job).await;
     assert_eq!(

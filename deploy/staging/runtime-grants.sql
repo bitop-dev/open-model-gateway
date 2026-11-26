@@ -224,6 +224,16 @@ GRANT INSERT(id,name,subjects,workspace_ids,open_days,cadence,start_day,start_mo
 GRANT UPDATE(name,subjects,workspace_ids,open_days,cadence,start_day,start_month,next_run_at,paused_at,paused_by,deleted_at,deleted_by,updated_by,updated_at) ON public.access_review_schedules TO gateway_runtime;
 GRANT INSERT(id,schedule_id,period_at,outcome,reason) ON public.access_review_schedule_runs TO gateway_runtime;
 GRANT EXECUTE ON FUNCTION public.omg_access_review_start_scheduled(uuid,uuid,uuid,timestamptz) TO gateway_runtime;
+-- #840: guardrail policies (0092). The runtime writes a layer's rule set
+-- (the guard requires a current Platform Admin for platform layers and a
+-- current owner or admin of the workspace for its local layer, keeps each
+-- set's scope and moves its revision forward by one) and replaces its rules
+-- (no UPDATE: rules are deleted and inserted). Only an override set is
+-- removed. The pattern check runs inside the rules' CHECK constraint.
+GRANT SELECT ON public.guardrail_rule_sets,public.guardrail_rules TO gateway_runtime;
+GRANT INSERT(id,layer,kind,workspace_id,local_only,updated_by),UPDATE(revision,local_only,updated_by),DELETE ON public.guardrail_rule_sets TO gateway_runtime;
+GRANT INSERT(id,rule_set_id,position,tightens_rule_id,name,protection,detector_kind,detector_ref,categories,input_action,redact_scope,output_mode,threshold,on_error,timeout_ms,workloads,uninspectable,patterns),DELETE ON public.guardrail_rules TO gateway_runtime;
+GRANT EXECUTE ON FUNCTION public.guardrail_patterns_valid(text[]) TO gateway_runtime;
 -- Installation spend rules (0026) edit their period and reference amount.
 GRANT UPDATE(name,enabled,budget_layers,thresholds,spike_factor_percent,min_spend_microusd,
  window_minutes,error_rate_percent,min_requests,consecutive_failures,provider_connection_id,

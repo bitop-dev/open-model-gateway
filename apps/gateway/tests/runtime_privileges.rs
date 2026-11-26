@@ -141,6 +141,8 @@ async fn enterprise_runtime_allowlist_and_rollback_probes(pool: PgPool) {
         "access_review_notification_reads",
         "access_review_schedules",
         "access_review_schedule_runs",
+        "guardrail_rule_sets",
+        "guardrail_rules",
         "budget_totals",
         "rate_minute_counters",
         "inflight_counters",

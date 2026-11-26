@@ -22,6 +22,7 @@ mod errors;
 mod files;
 pub(crate) mod governance;
 mod group_mapping_preview;
+mod guardrails;
 mod key_safety;
 mod keys;
 mod legal_holds;
@@ -196,6 +197,7 @@ fn feature_routes(router: Router<Store>) -> Router<Store> {
         .merge(setup::routes())
         .merge(governance::routes())
         .merge(governance::platform_routes())
+        .merge(guardrails::routes())
         .merge(logs::routes())
         .merge(settings::routes())
         .merge(audit_export::routes())

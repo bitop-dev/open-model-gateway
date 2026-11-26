@@ -51,14 +51,20 @@ pub enum Topic {
     Policy,
     /// Installation settings.
     Settings,
+    /// Guardrail rule sets and rules (migration 0092): the per-replica cache
+    /// of each workspace's effective guardrail rules.
+    Guardrails,
 }
+/// The number of topics (`config_versions` rows this binary knows).
+const TOPICS: usize = 6;
 impl Topic {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; TOPICS] = [
         Self::Access,
         Self::Catalog,
         Self::Keys,
         Self::Policy,
         Self::Settings,
+        Self::Guardrails,
     ];
     pub fn as_str(self) -> &'static str {
         match self {
@@ -67,6 +73,7 @@ impl Topic {
             Self::Keys => "keys",
             Self::Policy => "policy",
             Self::Settings => "settings",
+            Self::Guardrails => "guardrails",
         }
     }
     pub fn parse(value: &str) -> Option<Self> {
@@ -88,12 +95,12 @@ pub fn parse_payload(payload: &str) -> Option<(Topic, u64)> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stamp {
     generation: u64,
-    versions: [u64; 5],
+    versions: [u64; TOPICS],
 }
 
 /// This replica's view of the configuration versions.
 pub struct ConfigVersions {
-    versions: [AtomicU64; 5],
+    versions: [AtomicU64; TOPICS],
     /// Raised on every listener (re)connect and on enable: entries stamped
     /// under an older generation are invalid.
     generation: AtomicU64,
@@ -153,7 +160,7 @@ impl ConfigVersions {
         if !self.fresh() {
             return None;
         }
-        let mut versions = [0u64; 5];
+        let mut versions = [0u64; TOPICS];
         for topic in topics {
             versions[topic.index()] = self.versions[topic.index()].load(Ordering::Acquire);
         }
