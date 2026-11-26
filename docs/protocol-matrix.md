@@ -13,7 +13,7 @@ Current inference routes share key authentication, global public model aliases, 
 | `ollama` | Compatible Chat subset | No | Translated via Chat | Native `/api/embed`, no dimensions | No | `/v1/systemone` (v0.35.0+) |
 | `openrouter` | Compatible Chat subset (stream/non-stream) | No | Translated via Chat | String input; client float/base64; fixed native widths only | Native `/rerank` | Native `/systemone` |
 
-**Guardrails.** No route inspects request or response text yet. Guardrail policies can be stored and composed ([guardrails design](guardrails-design.md), #840), but no rule monitors or blocks anything until phase 1's detector and engine step land.
+**Guardrails (input only, #840).** Every generation request (Chat Completions, Responses, Messages and gateway-run batch lines) and every embeddings request runs its workspace's guardrail rules on its input before routing and admission ([guardrails design](guardrails-design.md)): a refused request reserves nothing and reaches no provider. The refusal keeps each protocol's error shape and adds an `error.guardrail` object (`policy_id`, `rule_id`, `stage`, `category`, `detector`; never matched text) with `x-should-retry: false`: `guardrail_input_blocked` (400) for a finding of a blocking rule, `guardrail_not_supported` (400) when an enforcing rule cannot read part of the request (an image, audio or an encoded document; other workloads are not inspected and are refused the same way), `guardrail_detector_failed` (503) for a fail-closed rule this release cannot run. OpenAI shape: type `invalid_request_error` (`server_error` for the 503); Anthropic shape: `invalid_request_error` (`api_error` for the 503). Response text is not inspected.
 
 ### Speech routes
 

@@ -858,6 +858,7 @@ open-model-gateway partitions ensure --ahead 3
 ```sh
 open-model-gateway archive partition history 2024-01 --to /secure/archive   # executions, reservations, ledger
 open-model-gateway archive partition audit 2019-01 --to /secure/archive --retention-months 84
+open-model-gateway archive partition guardrails 2027-01 --to /secure/archive  # guardrail decisions (from migration 0093 on)
 open-model-gateway archive verify /secure/archive/history-2024-01-<id>       # checksums, no database
 ```
 
