@@ -349,11 +349,11 @@ impl Engine {
         };
         let inspect = || Some(crate::guardrails::enforce::chat_inspection(&request));
         // Counts are already bounded per key and minute (above), so a count
-        // never counts as unanswered.
+        // never counts as unadmitted.
         timeout_at(deadline, self.guard_input(&principal, facts, inspect))
             .await
             .map_err(|_| InferenceError::Timeout)??
-            .answered();
+            .admitted();
         let plan = timeout_at(
             deadline,
             self.repository

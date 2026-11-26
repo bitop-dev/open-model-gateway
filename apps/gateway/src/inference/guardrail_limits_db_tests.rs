@@ -355,10 +355,10 @@ async fn a_cached_policy_costs_no_statement_and_follows_every_change(pool: PgPoo
     assert!(loads.iter().all(|p| Arc::ptr_eq(p, &loads[0])));
 }
 
-/// Requests that wrote decision rows and were not answered (refused by
+/// Requests that wrote decision rows and were never admitted (refused by
 /// admission, failed or abandoned) are bounded per key too: the step runs
 /// before admission, so a key whose requests admission refuses could
-/// otherwise make the replica scan and write rows without bound. Answered
+/// otherwise make the replica scan and write rows without bound. Admitted
 /// monitored requests never count.
 #[dbtest::test]
 async fn a_key_whose_unadmitted_requests_keep_writing_rows_is_throttled(pool: PgPool) {
@@ -398,7 +398,7 @@ async fn a_key_whose_unadmitted_requests_keep_writing_rows_is_throttled(pool: Pg
         assert_eq!(
             (answered, after_answered),
             (200, before),
-            "an answered request never counts"
+            "an admitted request never counts"
         );
         assert_eq!(refused, 429, "admission refused the second request");
         assert_eq!(
@@ -414,6 +414,38 @@ async fn a_key_whose_unadmitted_requests_keep_writing_rows_is_throttled(pool: Pg
             recorded,
             "the throttled request wrote no row"
         );
+        break;
+    }
+}
+
+/// Once an attempt is admitted, admission's own limits bound the request: a
+/// monitored request whose provider then fails does not count toward the
+/// key's bound of unadmitted recorded requests.
+#[dbtest::test]
+async fn an_admitted_request_that_fails_upstream_does_not_count(pool: PgPool) {
+    let w = world(pool, "'chat_completions'").await;
+    type_default(&w, "monitor", "{secret}", &[]).await;
+    let key = w.f.principal.key_id;
+    let monitored = bodies(&format!("use {}", secret()))[0].1.clone();
+    // The provider is gone before the first request (no pooled connection
+    // to it survives).
+    drop(w.upstream);
+    for attempt in 0.. {
+        let minute = limits::now() / 60;
+        let before = limits::RECORDED.counted(key, limits::now());
+        let (status, _, body) = post(&w.base, &w.token, "/v1/chat/completions", &monitored).await;
+        let after = limits::RECORDED.counted(key, limits::now());
+        if limits::now() / 60 != minute {
+            assert!(attempt < 2, "the minute changed during every attempt");
+            continue;
+        }
+        assert!(status >= 500, "the provider failed: {status} {body}");
+        let admitted: i64 = sqlx::query_scalar("SELECT count(*) FROM inference_executions")
+            .fetch_one(&w.f.store.pool)
+            .await
+            .unwrap();
+        assert!(admitted >= 1, "the attempt was admitted");
+        assert_eq!(after, before, "an admitted request never counts");
         break;
     }
 }

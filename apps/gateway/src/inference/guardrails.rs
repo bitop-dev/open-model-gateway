@@ -147,7 +147,13 @@ impl Store {
         };
         let (mut conn, mut heads) = read_heads().await?;
         if let Some(entry) = stale.filter(|e| e.heads == heads) {
-            return Ok(keep(entry));
+            // Unconfirmed, it is served as it is: storing it again could
+            // replace a newer compile.
+            return Ok(if stamp.is_some() {
+                keep(entry)
+            } else {
+                Arc::clone(&entry.policy)
+            });
         }
         if load.is_none() {
             // Unconfirmed: the heads were read without the lock, so read them
@@ -346,7 +352,7 @@ impl super::Engine {
         request_id: Uuid,
         protocol: super::types::ApiProtocol,
         deadline: tokio::time::Instant,
-    ) -> Result<Unanswered, InferenceError> {
+    ) -> Result<Unadmitted, InferenceError> {
         let facts = Guarded {
             request_id,
             operation: operation(protocol),
@@ -365,8 +371,8 @@ impl super::Engine {
     }
 
     /// Inspect a request's input under its workspace's policy. `Ok` lets it
-    /// continue, with the [`Unanswered`] mark the caller clears once the
-    /// request is answered; a refusal is an `InferenceError::Guardrail*`. The
+    /// continue, with the [`Unadmitted`] mark the caller clears once an
+    /// attempt is admitted; a refusal is an `InferenceError::Guardrail*`. The
     /// text is collected only when a rule applies to `workload`, and dropped
     /// when the decision is made.
     pub(super) async fn guard_input<'a>(
@@ -374,7 +380,7 @@ impl super::Engine {
         principal: &Principal,
         request: Guarded<'_>,
         input: impl FnOnce() -> Option<Inspection<'a>>,
-    ) -> Result<Unanswered, InferenceError> {
+    ) -> Result<Unadmitted, InferenceError> {
         let Guarded {
             request_id,
             operation,
@@ -384,7 +390,7 @@ impl super::Engine {
         } = request;
         let policy = self.repository.guardrails(principal.workspace_id).await?;
         if !policy.applies_to(workload) {
-            return Ok(Unanswered(None));
+            return Ok(Unadmitted::new(None));
         }
         throttled(principal)?;
         let input = input();
@@ -435,7 +441,7 @@ impl super::Engine {
         };
         let (events, omitted) = rows(&decision);
         // Taken before the insert, so a request dropped during it counts too.
-        let unanswered = Unanswered((!events.is_empty()).then_some(principal.key_id));
+        let unadmitted = Unadmitted::new((!events.is_empty()).then_some(principal.key_id));
         if !events.is_empty() {
             self.repository
                 .record_guardrails(&GuardrailRecord {
@@ -450,27 +456,41 @@ impl super::Engine {
                 .await?;
         }
         verdict(principal, &decision)?;
-        Ok(unanswered)
+        Ok(unadmitted)
     }
 }
 
-/// A request whose guardrail decisions wrote rows and that was not answered
-/// yet. Dropped unanswered (refused by admission, failed, or abandoned), it
-/// counts toward its key's bound of recorded requests (`RECORDED`): the
-/// guardrail step runs before admission, so without it a key whose requests
-/// admission refuses could make the replica write rows without bound.
-/// Answered requests never count, so monitored traffic is never throttled.
+/// A request whose guardrail decisions wrote rows and that was not admitted
+/// yet. Dropped before admission (refused by guardrails or by admission,
+/// failed before an attempt, or abandoned), it counts toward its key's bound
+/// of recorded requests (`RECORDED`): the guardrail step runs before
+/// admission, so without it a key whose requests admission refuses could
+/// make the replica write rows without bound. Once an attempt is admitted,
+/// admission's own limits bound the request and it never counts, whatever
+/// happens upstream.
 #[must_use]
-pub(super) struct Unanswered(Option<Uuid>);
-impl Unanswered {
-    /// The request was answered: it does not count.
-    pub(super) fn answered(mut self) {
-        self.0 = None;
+pub(super) struct Unadmitted {
+    key: Option<Uuid>,
+    admitted: std::sync::atomic::AtomicBool,
+}
+impl Unadmitted {
+    fn new(key: Option<Uuid>) -> Self {
+        Self {
+            key,
+            admitted: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+    /// An attempt of the request was admitted: it does not count.
+    pub(super) fn admitted(&self) {
+        self.admitted
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
-impl Drop for Unanswered {
+impl Drop for Unadmitted {
     fn drop(&mut self) {
-        if let Some(key) = self.0 {
+        if let Some(key) = self.key
+            && !self.admitted.load(std::sync::atomic::Ordering::Relaxed)
+        {
             RECORDED.note(key, limits::now());
         }
     }

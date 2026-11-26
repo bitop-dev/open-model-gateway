@@ -414,7 +414,7 @@ impl Engine {
         }
         // Guardrails, before the route plan and any admission (as for
         // generation): a refused input reserves nothing.
-        let unanswered = timeout_at(
+        let unadmitted = timeout_at(
             deadline,
             self.guard_input(
                 &principal,
@@ -500,6 +500,7 @@ impl Engine {
             .and_then(|admitted| admitted);
             // A probe slot it held is freed as `probe` drops.
             admitted?;
+            unadmitted.admitted();
             // Non-generation workloads carry no trace correlation id.
             let mut guard = ExecutionGuard::new(
                 self.repository.clone(),
@@ -555,7 +556,6 @@ impl Engine {
                         // free-rejection rule out; the flag is for a streamed
                         // workload that attaches without them.
                         guard.telemetry.stream_returned = true;
-                        unanswered.answered();
                         return Ok(W::attach(
                             response,
                             StreamSettlement {
@@ -567,7 +567,6 @@ impl Engine {
                         ));
                     }
                     guard.finish(Outcome::Succeeded, None, None).await?;
-                    unanswered.answered();
                     return Ok(response);
                 }
                 Err(error) => {

@@ -60,7 +60,7 @@ pub(super) struct World {
     pub(super) token: String,
     pub(super) base: String,
     pub(super) hits: Arc<AtomicUsize>,
-    _upstream: Server,
+    pub(super) upstream: Server,
     _gateway: Server,
 }
 pub(super) async fn world(pool: PgPool, protocols: &str) -> World {
@@ -105,7 +105,7 @@ pub(super) async fn world_on(pool: PgPool, protocols: &str, provider: &str) -> W
         token,
         base,
         hits,
-        _upstream: up,
+        upstream: up,
         _gateway: gw,
     }
 }

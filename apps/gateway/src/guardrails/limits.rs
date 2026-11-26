@@ -16,10 +16,12 @@
 //!   refused request is never admitted, so no other limit counts it). A
 //!   request refused because no slot was free scanned nothing and does not
 //!   count.
-//! - **Recorded requests.** Likewise after `RECORDED_PER_MINUTE` requests of a
-//!   key whose decisions wrote rows: the step runs before admission, so a
-//!   key whose requests admission then refuses could otherwise make the
-//!   replica scan and write rows without bound.
+//! - **Unadmitted recorded requests.** Likewise after `RECORDED_PER_MINUTE`
+//!   requests of a key whose decisions wrote rows and that were never
+//!   admitted (`inference::guardrails::Unadmitted`; a native batch's create
+//!   always counts): the step runs before admission, so a key whose requests
+//!   admission then refuses could otherwise make the replica scan and write
+//!   rows without bound.
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
