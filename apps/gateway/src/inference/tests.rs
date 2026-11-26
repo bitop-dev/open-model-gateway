@@ -18,6 +18,8 @@ struct MemoryRepository {
     finish_calls: AtomicUsize,
     finished: tokio::sync::Notify,
     fail_start: AtomicBool,
+    /// `start` never returns (an admission stuck behind a lock).
+    hang_start: AtomicBool,
     fail_finish: AtomicBool,
     /// `finish` never returns (a write stuck behind a lock or a failover).
     hang_finish: AtomicBool,
@@ -115,6 +117,9 @@ impl InferenceRepository for MemoryRepository {
             .unwrap()
             .push((record.root_request_id, record.attempt_number));
         self.starts.fetch_add(1, Ordering::SeqCst);
+        if self.hang_start.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         if self.fail_start.load(Ordering::SeqCst) {
             return Err(InferenceError::Storage);
         }
@@ -1574,4 +1579,27 @@ async fn a_probe_dropped_by_its_client_frees_the_slot() {
         [format!("claim {route}"), "release 7".into()]
     );
     assert!(repository.health.lock().unwrap().is_empty(), "no decision");
+}
+
+/// The request is dropped while its admission is still pending, before any
+/// attempt guard exists: the slot it claimed is freed all the same.
+#[tokio::test]
+async fn a_probe_dropped_before_its_admission_ends_frees_the_slot() {
+    use crate::routing::ProbeClaim;
+    let (engine, repository, adapter) = fixture(Mode::Complete, EngineLimits::default());
+    let route = probing(&repository, ProbeClaim::Claimed(7));
+    repository.hang_start.store(true, Ordering::SeqCst);
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            engine.execute(principal(), request(false), Uuid::new_v4())
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        probe_log(&repository, 2).await,
+        [format!("claim {route}"), "release 7".into()]
+    );
 }

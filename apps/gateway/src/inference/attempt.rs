@@ -72,20 +72,6 @@ impl Engine {
     /// settlement of its outcome. Gives the request's telemetry back when the
     /// upstream call failed, its settlement succeeded and the plan allows a
     /// failover; otherwise the request's result.
-    /// An attempt admission refused: nothing reached the provider, so its
-    /// telemetry ends here and a probe slot it held is freed.
-    async fn unadmitted(
-        &self,
-        mut telemetry: RequestTelemetry,
-        error: InferenceError,
-        deployment: Uuid,
-        probe: Option<i64>,
-        execution_id: Uuid,
-    ) -> AttemptEnd {
-        telemetry.finish(telemetry::Outcome::Error, Some(error));
-        self.release_unsent(deployment, probe, execution_id).await;
-        AttemptEnd::Return(Err(error))
-    }
     pub(super) async fn attempt(
         &self,
         scope: &RequestScope<'_>,
@@ -93,7 +79,7 @@ impl Engine {
         attempt: usize,
         deployment: &Deployment,
         adapter: Arc<dyn crate::providers::ProviderAdapter>,
-        probe: Option<i64>,
+        probe: Option<super::ProbeTicket>,
     ) -> AttemptEnd {
         let RequestScope {
             request,
@@ -128,9 +114,9 @@ impl Engine {
                 // attempt - so, like every other terminal return in this
                 // function, telemetry must be finished explicitly here
                 // rather than left for Drop to mislabel `cancelled`.
-                return self
-                    .unadmitted(telemetry, error, deployment.id, probe, execution_id)
-                    .await;
+                // A probe slot it held is freed as `probe` drops.
+                telemetry.finish(telemetry::Outcome::Error, Some(error));
+                return AttemptEnd::Return(Err(error));
             }
         };
         // Logging-only correlation (#98): known only once a
@@ -148,7 +134,7 @@ impl Engine {
             permit.clone(),
             log_trace_id,
         );
-        guard.probe = probe;
+        guard.probe = probe.and_then(super::ProbeTicket::into_epoch);
         let output = call_upstream(
             &mut guard, &*adapter, deployment, request, &admission, deadline, protocol,
         )

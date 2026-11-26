@@ -460,10 +460,8 @@ impl Engine {
             .await
             .map_err(|_| InferenceError::Timeout)
             .and_then(|admitted| admitted);
-            if let Err(error) = admitted {
-                self.release_unsent(target.id, probe, execution_id).await;
-                return Err(error);
-            }
+            // A probe slot it held is freed as `probe` drops.
+            admitted?;
             // Non-generation workloads carry no trace correlation id.
             let mut guard = ExecutionGuard::new(
                 self.repository.clone(),
@@ -473,7 +471,7 @@ impl Engine {
                 permit.clone(),
                 None,
             );
-            guard.probe = probe;
+            guard.probe = probe.and_then(super::ProbeTicket::into_epoch);
             let evidence_ok =
                 |u: Usage| valid_usage(u) && (!input_only || u.output_tokens == Some(0));
             // As for generation (`attempt::call_upstream`): the dispatch scope

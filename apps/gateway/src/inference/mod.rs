@@ -115,23 +115,6 @@ impl Engine {
     pub(crate) fn probe_hold(&self) -> Duration {
         self.limits.request_timeout + SETTLEMENT_DEADLINE
     }
-    /// A probe slot held by an attempt that sent nothing (refused at
-    /// admission) is freed for the next request, bounded like the advisory
-    /// health write.
-    async fn release_unsent(&self, deployment: Uuid, probe: Option<i64>, execution_id: Uuid) {
-        if let Some(epoch) = probe
-            && !matches!(
-                timeout(
-                    Duration::from_millis(250),
-                    self.repository.route_probe_release(deployment, epoch)
-                )
-                .await,
-                Ok(Ok(()))
-            )
-        {
-            tracing::warn!(execution_id = %execution_id, "routing probe update failed");
-        }
-    }
     /// [`route_use`] for this engine's attempts: the probe slot it holds for
     /// `id`, or `None` (the wait noted in `cooling`) while another request
     /// holds it.
@@ -141,8 +124,8 @@ impl Engine {
         id: Uuid,
         holder: Uuid,
         cooling: &mut Option<u32>,
-    ) -> Option<Option<i64>> {
-        match route_use(&*self.repository, plan, id, holder, self.probe_hold()).await {
+    ) -> Option<Option<ProbeTicket>> {
+        match route_use(&self.repository, plan, id, holder, self.probe_hold()).await {
             RouteUse::Go(probe) => Some(probe),
             RouteUse::Busy(seconds) => {
                 *cooling = Some(cooling.map_or(seconds, |c| c.min(seconds)));
@@ -439,8 +422,8 @@ pub(crate) const SETTLEMENT_DEADLINE: Duration = Duration::from_secs(3);
 
 /// Whether an attempt may use a planned route now.
 pub(crate) enum RouteUse {
-    /// Yes; holding the route's probe slot under this epoch, if it is half-open.
-    Go(Option<i64>),
+    /// Yes; holding the route's probe slot, if it is half-open.
+    Go(Option<ProbeTicket>),
     /// No: another request holds the half-open route's probe slot (or the
     /// circuit opened again) for about this many seconds. Nothing was sent.
     Busy(u32),
@@ -460,27 +443,90 @@ pub(crate) fn exhausted(cooling: Option<u32>, attempts: usize) -> InferenceError
 /// deadline); every other route as before. A claim that cannot be made
 /// (storage) is treated as busy: the route is not used unclaimed.
 pub(crate) async fn route_use(
-    repository: &dyn InferenceRepository,
+    repository: &Arc<dyn InferenceRepository>,
     plan: &crate::routing::RoutePlan,
     id: Uuid,
     holder: Uuid,
     hold: Duration,
 ) -> RouteUse {
     use crate::routing::ProbeClaim;
+    let ticket = |epoch| ProbeTicket {
+        repository: repository.clone(),
+        deployment: id,
+        holder,
+        epoch: Some(epoch),
+    };
     if let Some((held, epoch)) = plan.held_probe
         && held == id
     {
-        return RouteUse::Go(Some(epoch));
+        return RouteUse::Go(Some(ticket(epoch)));
     }
     if !plan.probes.contains(&id) {
         return RouteUse::Go(None);
     }
     match repository.route_probe_claim(id, holder, hold).await {
-        Ok(ProbeClaim::Claimed(epoch)) => RouteUse::Go(Some(epoch)),
+        Ok(ProbeClaim::Claimed(epoch)) => RouteUse::Go(Some(ticket(epoch))),
         Ok(ProbeClaim::Closed) => RouteUse::Go(None),
         Ok(ProbeClaim::Busy(seconds)) => RouteUse::Busy(seconds),
         Err(_) => RouteUse::Busy(1),
     }
+}
+
+/// A probe slot an attempt holds before its `ExecutionGuard` owns it. If the
+/// attempt ends first (refused at admission, or the request dropped while it
+/// was admitted), dropping the ticket frees the slot for the next request;
+/// the guard takes the epoch over once it exists ([`Self::into_epoch`]).
+pub(crate) struct ProbeTicket {
+    repository: Arc<dyn InferenceRepository>,
+    deployment: Uuid,
+    holder: Uuid,
+    epoch: Option<i64>,
+}
+impl ProbeTicket {
+    /// The slot's epoch, now the guard's to end.
+    pub(crate) fn into_epoch(mut self) -> Option<i64> {
+        self.epoch.take()
+    }
+}
+impl Drop for ProbeTicket {
+    fn drop(&mut self) {
+        if let Some(epoch) = self.epoch.take() {
+            let _ = end_probe_in_background(
+                self.repository.clone(),
+                self.deployment,
+                epoch,
+                false,
+                self.holder,
+            );
+        }
+    }
+}
+
+/// End a probe slot in the background, bounded like the advisory health
+/// write: close the circuit (a stream's first content) or free the slot.
+/// Both are fenced by `epoch`, so a slot that ended otherwise (a decision,
+/// its expiry, a newer claim) is left alone; a write that never lands leaves
+/// the slot to end at its expiry.
+fn end_probe_in_background(
+    repository: Arc<dyn InferenceRepository>,
+    deployment: Uuid,
+    epoch: i64,
+    close: bool,
+    execution_id: Uuid,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let runtime = tokio::runtime::Handle::try_current().ok()?;
+    Some(runtime.spawn(async move {
+        let write = async {
+            if close {
+                repository.route_probe_close(deployment, epoch).await
+            } else {
+                repository.route_probe_release(deployment, epoch).await
+            }
+        };
+        if !matches!(timeout(Duration::from_millis(250), write).await, Ok(Ok(()))) {
+            tracing::warn!(execution_id = %execution_id, "routing probe update failed");
+        }
+    }))
 }
 struct ExecutionGuard {
     repository: Arc<dyn InferenceRepository>,
@@ -554,29 +600,15 @@ impl ExecutionGuard {
             }
         }
     }
-    /// End this attempt's probe slot in the background, bounded like the
-    /// advisory health write: close the circuit (first content) or free the
-    /// slot. Both are fenced by `epoch`, so a slot that ended otherwise (a
-    /// decision, its expiry, a newer claim) is left alone; a write that never
-    /// lands leaves the slot to end at its expiry.
+    /// End this attempt's probe slot (`end_probe_in_background`).
     fn end_probe(&self, epoch: i64, close: bool) -> Option<tokio::task::JoinHandle<()>> {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return None;
-        };
-        let (repository, deployment, execution_id) =
-            (self.repository.clone(), self.deployment_id, self.id);
-        Some(runtime.spawn(async move {
-            let write = async {
-                if close {
-                    repository.route_probe_close(deployment, epoch).await
-                } else {
-                    repository.route_probe_release(deployment, epoch).await
-                }
-            };
-            if !matches!(timeout(Duration::from_millis(250), write).await, Ok(Ok(()))) {
-                tracing::warn!(execution_id = %execution_id, "routing probe update failed");
-            }
-        }))
+        end_probe_in_background(
+            self.repository.clone(),
+            self.deployment_id,
+            epoch,
+            close,
+            self.id,
+        )
     }
     /// Telemetry as of now: generation time ends when the attempt finishes.
     fn telemetry_now(&self) -> AttemptTelemetry {
