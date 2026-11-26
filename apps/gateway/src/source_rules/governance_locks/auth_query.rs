@@ -46,5 +46,33 @@ pub(super) fn scan(scan: &mut Scan<'_>, file: &syn::File) {
         scan.findings
             .push("auth.rs: expected one admission query and revalidation function".into());
     }
+    // The constant's name and that one call are the only mentions: no other
+    // statement can extend or re-run the query (an identifier, a string or
+    // a macro's tokens all count; doc comments do not).
+    let mut mentions = Mentions(0);
+    mentions.visit_file(file);
+    if mentions.0 != 2 {
+        scan.findings.push(format!(
+            "auth.rs: ADMISSION_SQL is mentioned {} times besides its definition; only revalidate_admission may run it",
+            mentions.0.saturating_sub(1)
+        ));
+    }
     scan.visit_file(file);
+}
+
+struct Mentions(usize);
+impl<'ast> Visit<'ast> for Mentions {
+    fn visit_ident(&mut self, ident: &'ast syn::Ident) {
+        if ident.unraw() == "ADMISSION_SQL" {
+            self.0 += 1;
+        }
+    }
+    fn visit_lit_str(&mut self, literal: &'ast LitStr) {
+        self.0 += literal.value().matches("ADMISSION_SQL").count();
+    }
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        self.visit_path(&mac.path);
+        self.0 += mac.tokens.to_string().matches("ADMISSION_SQL").count();
+    }
+    fn visit_attribute(&mut self, _: &'ast syn::Attribute) {}
 }

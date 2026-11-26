@@ -72,6 +72,8 @@ fn authority_reader_rejects_unreadable_revalidation_code() {
 fn the_admission_authority_query_takes_no_row_locks() {
     let source = AUTHORITY;
     assert!(violations(&parse_fixture("auth.rs", source)).is_empty());
+    let documented = format!("/// Runs [`ADMISSION_SQL`].\n{source}");
+    assert!(violations(&parse_fixture("auth.rs", &documented)).is_empty());
     for changed in [
         source.replace("SELECT 1", "SELECT 1 FOR SHARE OF k,w"),
         source.replace("SELECT 1", "SELECT 1 FoR KEY SHARE"),
@@ -87,6 +89,20 @@ fn the_admission_authority_query_takes_no_row_locks() {
             "query(\"SELECT lock_installation()\"); sqlx::query_as",
         ),
         source.replace("fn revalidate_admission", "fn revalidate_admission_with"),
+        // A second use of the query, wherever its lock clause comes from.
+        source.replace(
+            "sqlx::query_as(ADMISSION_SQL);",
+            r#"sqlx::query_as(ADMISSION_SQL); sqlx::query_as(&format!("{}{}", ADMISSION_SQL, crate::db::SUFFIX));"#,
+        ),
+        source.replace(
+            "sqlx::query_as(ADMISSION_SQL);",
+            r#"let s = format!("{ADMISSION_SQL} FOR {}", "SHARE"); sqlx::query_as(&s); if false { sqlx::query_as(ADMISSION_SQL); }"#,
+        ),
+        source.replace(
+            "sqlx::query_as(ADMISSION_SQL);",
+            r#"sqlx::query_as(ADMISSION_SQL.to_owned() + " FOR" + " SHARE"); if false { sqlx::query_as(ADMISSION_SQL); }"#,
+        ),
+        format!("{source} fn other() {{ sqlx::query_as(ADMISSION_SQL); }}"),
     ] {
         assert!(
             !violations(&parse_fixture("auth.rs", &changed)).is_empty(),
