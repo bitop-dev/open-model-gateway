@@ -8,18 +8,9 @@ use crate::inference::repository::InferenceRepository;
 use crate::jobs::fence::BatchFence;
 use sqlx::PgPool;
 
-#[dbtest::test]
-async fn a_pinned_attempt_is_planned_as_its_route_is_now(pool: PgPool) {
-    use crate::routing::RoutePlan;
-    let f = fixture(pool).await;
-    let deployment = f
-        .store
-        .deployments(&f.principal, "company/smart")
-        .await
-        .unwrap()
-        .remove(0);
-    let route = deployment.id;
-    let repository = LineRepository {
+/// A line repository of a batch that exists only for planning.
+fn lines(f: &crate::governance::tests::db::Fixture) -> LineRepository {
+    LineRepository {
         store: f.store.clone(),
         batch: crate::governance::batch::LineContext {
             envelope: Uuid::new_v4(),
@@ -32,12 +23,29 @@ async fn a_pinned_attempt_is_planned_as_its_route_is_now(pool: PgPool) {
         pins: Mutex::default(),
         claimed: Mutex::default(),
         probes: Mutex::default(),
-    };
+    }
+}
+
+#[dbtest::test]
+async fn a_pinned_attempt_is_planned_as_its_route_is_now(pool: PgPool) {
+    use crate::routing::RoutePlan;
+    let f = fixture(pool).await;
+    let deployment = f
+        .store
+        .deployments(&f.principal, "company/smart")
+        .await
+        .unwrap()
+        .remove(0);
+    let route = deployment.id;
+    let repository = lines(&f);
     let only = std::slice::from_ref(&deployment);
     let (gated, ungated, held) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
     repository.pin(gated, route, None, true, None);
     repository.pin(ungated, route, None, false, None);
-    repository.pin(held, route, None, true, Some(7));
+    repository.pin(held, route, None, true, Some((route, 7)));
+    // A slot claimed on another route is never handed over for this one.
+    let elsewhere = Uuid::new_v4();
+    repository.pin(elsewhere, route, None, true, Some((Uuid::new_v4(), 7)));
     let planned =
         |execution| repository.route_plan_probing(&f.principal, "company/smart", only, execution);
     let circuit = |until: &'static str| {
@@ -77,6 +85,13 @@ async fn a_pinned_attempt_is_planned_as_its_route_is_now(pool: PgPool) {
             ..single.clone()
         }
     );
+    assert_eq!(
+        planned(elsewhere).await.unwrap(),
+        RoutePlan {
+            probes: vec![route],
+            ..single.clone()
+        }
+    );
     // Ungated: planned as before in every state, and admission refuses it.
     for until in [
         "clock_timestamp()+interval '60 seconds'",
@@ -85,4 +100,49 @@ async fn a_pinned_attempt_is_planned_as_its_route_is_now(pool: PgPool) {
         circuit(until).await;
         assert_eq!(planned(ungated).await.unwrap(), single);
     }
+}
+
+/// An ungated attempt with no pin and no creation-time plan (no route could
+/// take the line) is planned as a caller that decides nothing: a half-open
+/// route is no probe for it, so the engine makes no claim, and the slot
+/// stays free for a request that can be admitted.
+#[dbtest::test]
+async fn an_unpinned_ungated_attempt_claims_no_probe_slot(pool: PgPool) {
+    let f = fixture(pool).await;
+    let deployment = f
+        .store
+        .deployments(&f.principal, "company/smart")
+        .await
+        .unwrap()
+        .remove(0);
+    let repository = lines(&f);
+    sqlx::query("INSERT INTO deployment_health(deployment_id,consecutive_failures,open_until,last_observed_at,reopen_count) VALUES($1,3,clock_timestamp()-interval '1 millisecond',clock_timestamp(),1)")
+        .bind(deployment.id)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    let only = std::slice::from_ref(&deployment);
+    // A caller whose attempts decide would be the probe here.
+    let probing = f
+        .store
+        .route_plan_probing(&f.principal, "company/smart", only, Uuid::new_v4())
+        .await
+        .unwrap();
+    assert_eq!(probing.probes, vec![deployment.id]);
+    let planned = repository
+        .route_plan_probing(&f.principal, "company/smart", only, Uuid::new_v4())
+        .await
+        .unwrap();
+    assert_eq!(
+        (planned.deployment_ids, planned.probes, planned.held_probe),
+        (vec![deployment.id], vec![], None)
+    );
+    let held: bool = sqlx::query_scalar(
+        "SELECT probe_holder IS NOT NULL FROM deployment_health WHERE deployment_id=$1",
+    )
+    .bind(deployment.id)
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    assert!(!held);
 }

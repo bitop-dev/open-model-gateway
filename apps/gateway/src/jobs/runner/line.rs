@@ -464,7 +464,7 @@ impl LineRun {
                 deployment,
                 plan.map(|p| p.price),
                 pin.is_some(),
-                pin.and_then(|p| p.probe),
+                pin.and_then(|p| p.probe.map(|epoch| (p.deployment, epoch))),
             );
         }
         // An omitted-maximum line is pinned at plan time to this one price,

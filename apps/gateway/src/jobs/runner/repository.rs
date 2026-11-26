@@ -57,12 +57,16 @@ impl LineRepository {
         if !self.gated(request_id) {
             return Ok(RoutePlan::single(vec![deployment]));
         }
+        // A slot is handed to the engine only for the route it was claimed
+        // on; one claimed on another route stays the line's, and `unpin`
+        // frees it on that route.
         let held_probe = self
             .probes
             .lock()
             .expect("probes")
             .get(&request_id)
-            .copied();
+            .copied()
+            .filter(|(route, _)| *route == deployment);
         let probes = match held_probe {
             Some(_) => Vec::new(),
             None => match self.store.route_state(deployment).await? {
@@ -80,14 +84,15 @@ impl LineRepository {
     /// Record `execution`'s routing/pricing plan. `claimed` is `true` only
     /// when the scheduler itself claimed route capacity for this attempt at
     /// dispatch (`pin.is_some()` at the `LineRun::execute` call site), never
-    /// merely because a creation-time plan exists.
+    /// merely because a creation-time plan exists. `probe` is the slot the
+    /// line claimed at dispatch, with the route it was claimed on.
     pub(super) fn pin(
         &self,
         execution: Uuid,
         deployment: Uuid,
         price: Option<Uuid>,
         claimed: bool,
-        probe: Option<i64>,
+        probe: Option<(Uuid, i64)>,
     ) {
         self.pins
             .lock()
@@ -96,11 +101,8 @@ impl LineRepository {
         if claimed {
             self.claimed.lock().expect("claimed").insert(execution);
         }
-        if let Some(epoch) = probe {
-            self.probes
-                .lock()
-                .expect("probes")
-                .insert(execution, (deployment, epoch));
+        if let Some(probe) = probe {
+            self.probes.lock().expect("probes").insert(execution, probe);
         }
     }
     /// The attempt ended. A probe slot it claimed and the engine did not end
@@ -345,6 +347,13 @@ impl InferenceRepository for LineRepository {
                 self.pinned_plan(d, request_id).await
             }
             Some(_) => Err(InferenceError::ModelUnavailable),
+            // An ungated attempt (admission refuses it, #243) never claims a
+            // probe slot: it is planned as a caller that decides nothing.
+            None if !self.gated(request_id) => {
+                self.store
+                    .route_plan(principal, model, candidates, request_id)
+                    .await
+            }
             None => {
                 self.store
                     .route_plan_probing(principal, model, candidates, request_id)
