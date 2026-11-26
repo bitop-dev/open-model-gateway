@@ -80,7 +80,8 @@ fn http_status(error: InferenceError) -> StatusCode {
         | InferenceError::PriceUnbounded
         | InferenceError::Storage
         | InferenceError::ScopeBusy
-        | InferenceError::RouteCoolingDown(_) => StatusCode::SERVICE_UNAVAILABLE,
+        | InferenceError::RouteCoolingDown(_)
+        | InferenceError::RouteDrained(_) => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
 
@@ -134,7 +135,9 @@ fn openai_error_body(error: InferenceError) -> serde_json::Value {
         "rate_limit_error"
     } else if matches!(
         error,
-        InferenceError::RouteCoolingDown(_) | InferenceError::ScopeBusy
+        InferenceError::RouteCoolingDown(_)
+            | InferenceError::RouteDrained(_)
+            | InferenceError::ScopeBusy
     ) {
         // OpenAI's type for transient server-side unavailability (HTTP 5xx).
         "server_error"

@@ -244,14 +244,15 @@ impl Jobs {
                 Ok(id) => id,
                 // A compatible model route within policy may wait out
                 // cooldown. The scheduler will check it again at dispatch.
-                Err(InferenceError::RouteCoolingDown(_))
+                Err(InferenceError::RouteCoolingDown(_) | InferenceError::RouteDrained(_))
                     if candidates.contains(&model_route) && routes.is_cooling(model_route) =>
                 {
                     return Ok(LineRouting::default());
                 }
                 Err(
-                    error
-                    @ (InferenceError::RouteCoolingDown(_) | InferenceError::ModelUnavailable),
+                    error @ (InferenceError::RouteCoolingDown(_)
+                    | InferenceError::RouteDrained(_)
+                    | InferenceError::ModelUnavailable),
                 ) => {
                     return Ok(LineRouting {
                         gateway_error: Some(error),

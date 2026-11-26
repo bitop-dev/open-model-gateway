@@ -41,7 +41,8 @@ impl LineRepository {
     /// An attempt that holds route capacity (`claimed`: a first attempt or a
     /// retry) uses the probe slot the line claimed at dispatch (renewed at the
     /// send), or else the route's circuit now: an open circuit sends nothing
-    /// (`RouteCoolingDown`), and a half-open one is used only as its probe
+    /// (`RouteCoolingDown`), nor does a drained route (`RouteDrained`), and a
+    /// half-open one is used only as its probe
     /// (the engine claims; another holder's slot sends nothing either).
     ///
     /// An ungated attempt (a line pinned by its creation-time plan that no
@@ -73,6 +74,7 @@ impl LineRepository {
                 RouteState::Closed => Vec::new(),
                 RouteState::HalfOpen => vec![deployment],
                 RouteState::Open(seconds) => return Err(InferenceError::RouteCoolingDown(seconds)),
+                RouteState::Drained(seconds) => return Err(InferenceError::RouteDrained(seconds)),
             },
         };
         Ok(RoutePlan {

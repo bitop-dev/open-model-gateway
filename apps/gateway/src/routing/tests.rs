@@ -10,6 +10,8 @@ fn candidate(id: u128, priority: i32, weight: i32, residency: &str) -> Candidate
         cooldown_remaining_seconds: 0,
         half_open: false,
         probe_held_seconds: 0,
+        drained: false,
+        drain_ends_in: None,
     }
 }
 #[test]
@@ -130,6 +132,47 @@ fn disabled_and_open_routes_are_skipped_without_probes() {
     assert_eq!(
         order_candidates(&RoutingPolicy::default(), vec![disabled], [0; 32], false),
         Err(InferenceError::ModelUnavailable)
+    );
+}
+/// A drained route takes no new attempt. With only drained routes left the
+/// model is temporarily unavailable (`Retry-After` only for a drain that
+/// ends within the hour); beside an open circuit, the sooner return wins.
+#[test]
+fn drained_routes_are_skipped_and_reported_only_when_nothing_else_serves() {
+    let drained = |id, ends: Option<f64>| Candidate {
+        drained: true,
+        drain_ends_in: ends,
+        ..candidate(id, 0, 1, "us")
+    };
+    let mut open = candidate(3, 0, 1, "us");
+    open.circuit_open = true;
+    open.cooldown_remaining_seconds = 12;
+    let p = RoutingPolicy::default();
+    assert_eq!(
+        order_candidates(
+            &p,
+            vec![drained(1, None), candidate(2, 1, 1, "us")],
+            [0; 32],
+            true
+        )
+        .unwrap()
+        .deployment_ids,
+        vec![Uuid::from_u128(2)]
+    );
+    for (ends, retry) in [(None, None), (Some(99.2), Some(100)), (Some(7200.0), None)] {
+        assert_eq!(
+            order_candidates(&p, vec![drained(1, ends)], [0; 32], false),
+            Err(InferenceError::RouteDrained(retry)),
+            "{ends:?}"
+        );
+    }
+    assert_eq!(
+        order_candidates(&p, vec![drained(1, None), open.clone()], [0; 32], true),
+        Err(InferenceError::RouteCoolingDown(12))
+    );
+    assert_eq!(
+        order_candidates(&p, vec![drained(1, Some(5.0)), open], [0; 32], true),
+        Err(InferenceError::RouteCoolingDown(5))
     );
 }
 #[test]

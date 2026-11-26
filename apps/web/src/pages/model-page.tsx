@@ -17,7 +17,8 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { detailTime } from "../lib/format";
 import { useQueries } from "@tanstack/react-query";
-import { Activity, CircleDollarSign, FileCode2, Layers, LayoutDashboard, Library, Pencil, Plus, Route as RouteIcon, ShieldQuestion, Split, History } from "lucide-react";
+import { Activity, CircleDollarSign, CirclePause, FileCode2, Layers, LayoutDashboard, Library, Pencil, Plus, Route as RouteIcon, ShieldQuestion, Split, History } from "lucide-react";
+import { RouteDrain } from "../components/route-drain";
 import { api, platformPath, type Catalog, type Deployment, type Model, type ModelProtocol, type Provider, type ServerPolicy, type Session } from "../lib/api";
 import { deploymentRoutingBody, formatMicroUsd, modelRoutingBody, routeHealth, useHealthRefresh, type DeploymentRouting, type ModelRouting, type Price, type WorkloadKind } from "../lib/governance";
 import { HEADLINE_METERS, METER_SPECS, basePrice, cheapestPrice, countNoun, formatAudio, priceItems, priceTokenCeilings, unitFor, workloadLabels, workloadOf, type BasePrice } from "../lib/pricing";
@@ -357,6 +358,7 @@ export function RoutePage({ session, route: d, path, tab }: { session: Session; 
     { id: "data-policy", label: "Data policy", icon: <ShieldQuestion aria-hidden />, title: "Data policy", content: <RouteDataPolicy route={d} /> },
     { id: "protocols", label: "Protocols & features", icon: <FileCode2 aria-hidden />, title: "Protocols & features", content: <RouteFeatures route={d} workload={workload} /> },
     { id: "routing", label: "Routing", icon: <Split aria-hidden />, title: "Routing settings", description: "Fallback follows the model's routing policy.", actions: writable ? <Button size="sm" variant="secondary" disabled={!routing.data} aria-label="Edit routing settings" onClick={() => routing.data && ask({ title: `Routing · ${title}`, description: "No implicit retries: fallback attempts follow the model's routing policy only.", fields: deploymentRoutingFields(routing.data.routing), submitLabel: "Save routing", successNotice: "Routing saved.", run: (v, signal) => api(routingPath(d.id), { method: "PUT", body: deploymentRoutingBody(v, routing.data!.routing, true), signal }) })}><Pencil aria-hidden />Edit</Button> : undefined, content: <RouteRouting query={routing} /> },
+    { id: "drain", label: "Drain", icon: <CirclePause aria-hidden />, title: "Drain", description: "Take the route out of new requests without disabling it.", content: <RouteDrain id={d.id} name={title} writable={writable} /> },
     { id: "batch-scheduling", label: "Batch scheduling", icon: <Layers aria-hidden />, title: "Batch scheduling", description: "When gateway-run batch lines may start here.", actions: writable ? <Button size="sm" variant="secondary" disabled={!batch.data} aria-label="Edit batch scheduling" onClick={() => batch.data && editBatchScheduling(ask, d.id, batch.data, title)}><Pencil aria-hidden />Edit</Button> : undefined, content: <RouteBatchScheduling query={batch} /> },
     { id: "price-history", label: "Price history", icon: <History aria-hidden />, title: "Price history", content: <PriceVersions path={`${path}/prices`} writable={false} deployment={d} /> },
   ];

@@ -306,3 +306,26 @@ export function routeHealth(health: RouteHealth): RouteHealthView {
   if (health.observation === "stale") return { state: `Unknown lately · no traffic observed for over ${HEALTH_STALE_AFTER_MINUTES} minutes${health.consecutive_failures > 0 ? ` · ${plural(health.consecutive_failures, "consecutive observed failure")} before that` : ""}`, until: null, backoff };
   return { state: health.consecutive_failures > 0 ? `Closed · ${plural(health.consecutive_failures, "consecutive observed failure")}` : "Closed · no recent failures", until: null, backoff };
 }
+
+/** An operator drain on a route or a connection (#49): it takes no new requests while active. */
+export type Drain = { reason: string; until: string | null; state: "active" | "ended"; drained_at: string; drained_by: { id: string; label: string } };
+export type DeploymentDrain = { drain: Drain | null; connection: { id: string; name: string; drain: Drain | null }; drained: boolean; as_of: string };
+export type ConnectionDrain = { drain: Drain | null; routes: number; as_of: string };
+/** The longest drain reason, in characters (`management::drain::REASON_MAX_CHARS`). */
+export const DRAIN_REASON_MAX = 500;
+export type DrainView = { state: string; facts: { label: string; value: string; time?: true }[] };
+/**
+ * A drain in words. Times are absolute (`time`: an ISO instant to render as
+ * one); an ended drain reads as ended, never as active.
+ */
+export function drainView(drain: Drain | null): DrainView {
+  if (!drain) return { state: "Not drained", facts: [] };
+  const who = [{ label: "Reason", value: drain.reason }, { label: "Drained by", value: drain.drained_by.label }, { label: "Drained at", value: drain.drained_at, time: true as const }];
+  if (drain.state === "ended") return { state: "Drain ended · takes requests again", facts: [...(drain.until ? [{ label: "Ended at", value: drain.until, time: true as const }] : []), ...who] };
+  return { state: "Drained · takes no new requests", facts: [drain.until ? { label: "Until", value: drain.until, time: true as const } : { label: "Until", value: "Until someone ends it" }, ...who] };
+}
+/** The `until` of a drain lasting `hours` from the gateway's `asOf` (never the browser's clock); `null` without hours. */
+export function drainUntil(asOf: string, hours: string): string | null {
+  if (!hours.trim()) return null;
+  return new Date(Date.parse(asOf) + Number(hours) * 3_600_000).toISOString();
+}

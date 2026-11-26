@@ -693,6 +693,7 @@ pub(crate) async fn audit(
                     s.len() <= 32 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
                 }))
                 || super::guardrails::audit_field(action, k, v)
+                || super::drain::audit_field(action, k, v)
             {
                 safe.insert(k.clone(), v.clone());
             }

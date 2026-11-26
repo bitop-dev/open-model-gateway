@@ -424,6 +424,10 @@ pub(crate) const ROUTES: &[Route] = routes! {
     "PUT"                  "/api/v1/platform/models/{model}/routing" => PlatformWrite, CATALOG_WRITE;
     "GET"                  "/api/v1/platform/deployments/{deployment}/routing" => PlatformRead, PLATFORM_READ;
     "PUT"                  "/api/v1/platform/deployments/{deployment}/routing" => PlatformWrite, CATALOG_WRITE;
+    "GET"                  "/api/v1/platform/deployments/{deployment}/drain" => PlatformRead, PLATFORM_READ;
+    "PUT DELETE"           "/api/v1/platform/deployments/{deployment}/drain" => PlatformWrite, CATALOG_WRITE;
+    "GET"                  "/api/v1/platform/providers/{id}/drain" => PlatformRead, PLATFORM_READ;
+    "PUT DELETE"           "/api/v1/platform/providers/{id}/drain" => PlatformWrite, CATALOG_WRITE;
     "GET"                  "/api/v1/platform/cost-report" => PlatformRead, PLATFORM_READ;
     // Admin API token management. Browser session (Platform Admin) only,
     // never delegable to a token, regardless of any scope it holds.

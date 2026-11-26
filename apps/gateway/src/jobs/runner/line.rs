@@ -272,7 +272,10 @@ impl LineRun {
                     // sent (its circuit open, or its probe slot held by
                     // another request or lost): nothing was sent, and the
                     // attempt is retried after its backoff like a failed one.
-                    let cooling = matches!(e, InferenceError::RouteCoolingDown(_)) && pin.is_some();
+                    let cooling = matches!(
+                        e,
+                        InferenceError::RouteCoolingDown(_) | InferenceError::RouteDrained(_)
+                    ) && pin.is_some();
                     let retryable = cooling
                         || matches!(
                             e,

@@ -114,6 +114,10 @@ struct Candidate {
     half_open: bool,
     /// Whole seconds until a held probe slot ends on its own (0 when free).
     probe_held_seconds: i32,
+    /// An operator drain applies now (`routing::drain`): no new attempt.
+    drained: bool,
+    /// Seconds until the drain ends, when it ends at all.
+    drain_ends_in: Option<f64>,
 }
 
 /// The caller owns current authorization and capability checks. The database query
@@ -219,7 +223,7 @@ impl RouteInputs {
             .collect();
         matches!(
             eligible_candidates(&self.policy, candidates, false),
-            Err(InferenceError::RouteCoolingDown(_))
+            Err(InferenceError::RouteCoolingDown(_) | InferenceError::RouteDrained(_))
         )
     }
 
@@ -267,7 +271,7 @@ async fn live_inputs(
         .await
         .map_err(route_lookup_storage)?
         .unwrap_or_default();
-    let rows = sqlx::query_as::<_, Candidate>(
+    let sql = format!(
         r#"SELECT d.id AS deployment_id, COALESCE(r.priority,0) AS priority,
                   COALESCE(r.weight,1) AS weight, COALESCE(r.residency,'unspecified') AS residency,
                   false AS operator_disabled,
@@ -278,7 +282,8 @@ async fn live_inputs(
                   COALESCE(h.open_until <= statement_timestamp(),false) AS half_open,
                   CASE WHEN h.probe_until > statement_timestamp()
                        THEN LEAST(86400, GREATEST(1, CEIL(EXTRACT(EPOCH FROM h.probe_until - statement_timestamp()))))::int
-                       ELSE 0 END AS probe_held_seconds
+                       ELSE 0 END AS probe_held_seconds,
+                  {drained} AS drained, {ends} AS drain_ends_in
            FROM unnest($3::uuid[]) WITH ORDINALITY AS input(id, position)
            JOIN deployments d ON d.id=input.id
            JOIN models m ON m.id=d.model_id
@@ -287,13 +292,16 @@ async fn live_inputs(
            LEFT JOIN deployment_health h ON h.deployment_id=d.id
            WHERE m.public_name=$2 AND workspace_model_allowed($1,m.id) AND d.enabled AND p.enabled
            ORDER BY input.position"#,
-    )
-    .bind(principal.workspace_id)
-    .bind(model)
-    .bind(ids)
-    .fetch_all(&store.pool)
-    .await
-    .map_err(route_lookup_storage)?;
+        drained = drain::ROUTE_DRAINED,
+        ends = drain::DRAIN_ENDS_IN,
+    );
+    let rows = sqlx::query_as::<_, Candidate>(&sql)
+        .bind(principal.workspace_id)
+        .bind(model)
+        .bind(ids)
+        .fetch_all(&store.pool)
+        .await
+        .map_err(route_lookup_storage)?;
     Ok((policy, rows))
 }
 
@@ -389,6 +397,10 @@ async fn cached_inputs(
                 cooldown_remaining_seconds: open.map_or(0, seconds),
                 half_open: until.is_some() && open.is_none(),
                 probe_held_seconds: probe.map_or(0, seconds),
+                drained: entry.is_some_and(|h| h.drained_at(now)),
+                drain_ends_in: entry
+                    .and_then(|h| h.drain_until)
+                    .map(|until| until.saturating_duration_since(now).as_secs_f64()),
             }
         })
         .collect();
@@ -404,15 +416,30 @@ async fn load_health(
     use crate::cache::HealthEntry;
     let loaded = std::time::Instant::now();
     // (deployment, failures, seconds until the circuit closes, seconds
-    // since the last observation, seconds the probe slot is held, openings)
-    type HealthRow = (Uuid, i32, Option<f64>, Option<f64>, Option<f64>, i32);
-    let rows: Vec<HealthRow> = sqlx::query_as(
-        "SELECT deployment_id,consecutive_failures,EXTRACT(EPOCH FROM open_until-clock_timestamp())::float8,EXTRACT(EPOCH FROM clock_timestamp()-last_observed_at)::float8,EXTRACT(EPOCH FROM probe_until-clock_timestamp())::float8,reopen_count FROM deployment_health WHERE deployment_id=ANY($1)",
-    )
-    .bind(ids)
-    .fetch_all(&store.pool)
-    .await
-    .map_err(route_lookup_storage)?;
+    // since the last observation, seconds the probe slot is held, openings,
+    // drained, seconds until the drain ends)
+    type HealthRow = (
+        Uuid,
+        Option<i32>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<i32>,
+        bool,
+        Option<f64>,
+    );
+    // The drain is read with the health (one statement): it lives on the
+    // deployment and its connection, the circuit on the health row.
+    let sql = format!(
+        "SELECT d.id,h.consecutive_failures,EXTRACT(EPOCH FROM h.open_until-clock_timestamp())::float8,EXTRACT(EPOCH FROM clock_timestamp()-h.last_observed_at)::float8,EXTRACT(EPOCH FROM h.probe_until-clock_timestamp())::float8,h.reopen_count,{},{} FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id LEFT JOIN deployment_health h ON h.deployment_id=d.id WHERE d.id=ANY($1)",
+        drain::ROUTE_DRAINED,
+        drain::DRAIN_ENDS_IN
+    );
+    let rows: Vec<HealthRow> = sqlx::query_as(&sql)
+        .bind(ids)
+        .fetch_all(&store.pool)
+        .await
+        .map_err(route_lookup_storage)?;
     let mut fresh: Vec<(Uuid, HealthEntry)> = ids
         .iter()
         .map(|id| {
@@ -425,12 +452,22 @@ async fn load_health(
                     observed_age: None,
                     probe_until: None,
                     reopen_count: 0,
+                    drained: false,
+                    drain_until: None,
                 },
             )
         })
         .collect();
-    for (id, failures, open_for, observed, probe_for, reopens) in rows {
+    for (id, failures, open_for, observed, probe_for, reopens, drained, drain_for) in rows {
         if let Some(entry) = fresh.iter_mut().find(|(d, _)| *d == id) {
+            entry.1.drained = drained;
+            entry.1.drain_until = drain_for
+                .filter(|_| drained)
+                .map(|s| loaded + std::time::Duration::from_secs_f64(s.clamp(0.0, 1e9)));
+            let (Some(failures), Some(reopens)) = (failures, reopens) else {
+                // No health row: a route that never failed.
+                continue;
+            };
             entry.1.consecutive_failures = failures;
             // An expired circuit is kept, as of the load (half-open).
             entry.1.open_until = open_for
@@ -452,6 +489,9 @@ async fn load_health(
 /// respect.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RouteState {
+    /// An operator drain applies (`routing::drain`): no new attempt, whatever
+    /// the circuit; for about this many more seconds, when it has an end.
+    Drained(Option<u32>),
     Closed,
     /// The cooldown has passed: the route is used only as its probe.
     HalfOpen,
@@ -472,6 +512,11 @@ pub async fn route_state(store: &Store, deployment: Uuid) -> Result<RouteState, 
         }
     };
     let now = std::time::Instant::now();
+    if entry.drained_at(now) {
+        return Ok(RouteState::Drained(entry.drain_until.map(|until| {
+            (until - now).as_secs_f64().ceil().clamp(1.0, 1e9) as u32
+        })));
+    }
     Ok(match entry.open_until {
         None => RouteState::Closed,
         Some(until) if until > now => {
@@ -517,6 +562,16 @@ fn eligible_candidates(
                 .as_deref()
                 .is_none_or(|label| label == c.residency)
     });
+    // A drained route takes no new attempt (and is never a probe). If drains
+    // are the only reason nothing can serve the model, it is temporarily
+    // unavailable, with `Retry-After` only for a drain that ends soon.
+    let drained = candidates.iter().any(|c| c.drained);
+    let drain_retry = candidates
+        .iter()
+        .filter(|c| c.drained)
+        .filter_map(|c| drain::retry_after(c.drain_ends_in))
+        .min();
+    candidates.retain(|c| !c.drained);
     // Routes in cooldown are skipped, and for a probing caller a half-open
     // route whose probe another request holds. If that is the only reason
     // nothing can serve the model, say so (retryable, with the soonest
@@ -545,7 +600,12 @@ fn eligible_candidates(
     if candidates.is_empty()
         && let Some(seconds) = cooling
     {
-        return Err(InferenceError::RouteCoolingDown(seconds));
+        return Err(InferenceError::RouteCoolingDown(
+            drain_retry.map_or(seconds, |drain| drain.min(seconds)),
+        ));
+    }
+    if candidates.is_empty() && drained {
+        return Err(InferenceError::RouteDrained(drain_retry));
     }
     // Stable sorting retains repository order when priority values tie.
     if candidates.is_empty() {
@@ -655,10 +715,13 @@ pub use health::{
     HEALTH_STALE_AFTER_SECONDS, RouteHealth, health, record_probe_result, record_result,
     record_unclaimed_result,
 };
+pub(crate) mod drain;
 mod probe;
 pub use probe::{
     PROBE_RETRY_AFTER_SECONDS, ProbeClaim, claim_probe, close_probe, release_probe, renew_probe,
 };
+#[cfg(all(test, feature = "integration-tests"))]
+mod drain_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod probe_tests;
 #[cfg(test)]

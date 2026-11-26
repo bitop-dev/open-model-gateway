@@ -170,6 +170,16 @@ pub struct HealthEntry {
     pub probe_until: Option<Instant>,
     /// Openings since the route last served a complete success.
     pub reopen_count: i32,
+    /// An operator drain applied when loaded (`routing::drain`): it lasts
+    /// until `drain_until` (local clock), or without an end when `None`.
+    pub drained: bool,
+    pub drain_until: Option<Instant>,
+}
+impl HealthEntry {
+    /// The route is drained at `now`.
+    pub fn drained_at(&self, now: Instant) -> bool {
+        self.drained && self.drain_until.is_none_or(|until| until > now)
+    }
 }
 
 /// Health entries are reused for this long (cross-replica circuit changes

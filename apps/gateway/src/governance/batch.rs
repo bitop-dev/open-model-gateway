@@ -80,16 +80,40 @@ pub struct BatchHold {
 }
 
 /// The deployment of `id` serving `model` to this workspace/key right now
-/// (live catalog, key restrictions, enabled route and connection).
+/// (live catalog, key restrictions, enabled route and connection). With
+/// `sends`, the admission sends to it now (a line, a native batch's
+/// submission), so a drained route is refused; a gateway-run batch's
+/// envelope sends nothing, and its lines wait out a drain at dispatch.
 async fn current_deployment(
     tx: &mut Tx<'_>,
     workspace: Uuid,
     lineage: Uuid,
     id: Uuid,
     model: &str,
+    sends: bool,
 ) -> Result<Deployment, InferenceError> {
-    sqlx::query_as::<_,Deployment>("SELECT d.id,p.provider,d.upstream_model,p.credential_ref,p.endpoint,p.region,m.supported_protocols FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id JOIN models m ON m.id=d.model_id WHERE d.id=$2 AND m.public_name=$3 AND workspace_model_allowed($1,m.id) AND d.enabled AND p.enabled AND (NOT EXISTS(SELECT 1 FROM key_model_restrictions WHERE workspace_id=$1 AND governance_key_id=$4) OR EXISTS(SELECT 1 FROM key_model_selections WHERE workspace_id=$1 AND governance_key_id=$4 AND model_id=m.id))")
-        .bind(workspace).bind(id).bind(model).bind(lineage).fetch_optional(&mut **tx).await.map_err(storage)?.ok_or(InferenceError::ModelUnavailable)
+    // A drained route admits nothing that sends (`routing::drain`); a line
+    // is retried after its backoff, as for an open circuit.
+    let sql = format!(
+        "SELECT d.id,p.provider,d.upstream_model,p.credential_ref,p.endpoint,p.region,m.supported_protocols,{} AS drained,{} AS drain_retry_after FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id JOIN models m ON m.id=d.model_id WHERE d.id=$2 AND m.public_name=$3 AND workspace_model_allowed($1,m.id) AND d.enabled AND p.enabled AND (NOT EXISTS(SELECT 1 FROM key_model_restrictions WHERE workspace_id=$1 AND governance_key_id=$4) OR EXISTS(SELECT 1 FROM key_model_selections WHERE workspace_id=$1 AND governance_key_id=$4 AND model_id=m.id))",
+        crate::routing::drain::ROUTE_DRAINED,
+        crate::routing::drain::DRAIN_RETRY_AFTER.as_str()
+    );
+    let row = sqlx::query(&sql)
+        .bind(workspace)
+        .bind(id)
+        .bind(model)
+        .bind(lineage)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(storage)?
+        .ok_or(InferenceError::ModelUnavailable)?;
+    if sends && sqlx::Row::try_get::<bool, _>(&row, "drained").map_err(storage)? {
+        let retry =
+            sqlx::Row::try_get::<Option<i32>, _>(&row, "drain_retry_after").map_err(storage)?;
+        return Err(InferenceError::RouteDrained(retry.map(i32::unsigned_abs)));
+    }
+    <Deployment as sqlx::FromRow<_>>::from_row(&row).map_err(storage)
 }
 fn same_target(current: &Deployment, expected: &Deployment) -> bool {
     current.id == expected.id
@@ -293,8 +317,15 @@ async fn admit_batch_unobserved(
     let (mut tokens, mut held) = (0i64, 0i64);
     let mut pinned: Option<(Uuid, PriceTier)> = None;
     for g in groups {
-        let current =
-            current_deployment(&mut tx, workspace, lineage, g.deployment.id, &g.model).await?;
+        let current = current_deployment(
+            &mut tx,
+            workspace,
+            lineage,
+            g.deployment.id,
+            &g.model,
+            native,
+        )
+        .await?;
         if !same_target(&current, &g.deployment) || !serves(&current, g.protocol, native) {
             return Err(InferenceError::Configuration);
         }
@@ -513,6 +544,7 @@ async fn admit_line_unobserved(
         lineage,
         record.deployment_id,
         &record.model,
+        true,
     )
     .await?;
     if current.provider != record.provider

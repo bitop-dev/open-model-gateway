@@ -537,6 +537,20 @@ async fn every_json_management_write_rejects_unknown_fields_after_valid_control(
         json!({"priority":0,"weight":1,"residency":null,"failure_threshold":3,"cooldown_seconds":30})
     );
     case!(
+        "drain::put_deployment",
+        "PUT",
+        format!("{platform}/deployments/{deployment}/drain"),
+        &f.admin,
+        json!({"reason":"Matrix maintenance","until":null})
+    );
+    case!(
+        "drain::put_connection",
+        "PUT",
+        format!("{platform}/providers/{connection}/drain"),
+        &f.admin,
+        json!({"reason":"Matrix maintenance","until":null})
+    );
+    case!(
         "batch_scheduling::write",
         "PUT",
         format!("{platform}/deployments/{deployment}/batch-scheduling"),

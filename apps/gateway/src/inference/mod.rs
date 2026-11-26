@@ -511,6 +511,8 @@ pub(crate) async fn route_use(
             Ok(RouteState::Closed) => false,
             Ok(RouteState::HalfOpen) => true,
             Ok(RouteState::Open(seconds)) => return RouteUse::Busy(seconds),
+            // Drained since the plan: no new attempt on it.
+            Ok(RouteState::Drained(seconds)) => return RouteUse::Busy(seconds.unwrap_or(1)),
             Err(_) => return RouteUse::Busy(1),
         }
     } else {
@@ -799,6 +801,8 @@ impl Drop for ExecutionGuard {
 pub(crate) mod admission_validation_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod count_db_tests;
+#[cfg(all(test, feature = "integration-tests"))]
+mod drain_e2e_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod probe_e2e_tests;
 #[cfg(all(test, feature = "integration-tests"))]

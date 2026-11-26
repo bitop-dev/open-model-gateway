@@ -81,6 +81,30 @@ When a circuit's cooldown has passed, the route is **half-open**: traffic does n
 
 No row or observation means unknown, not healthy. A closed circuit means eligible, not verified uptime. The view is sanitized: no endpoint, credential reference, payload or raw error text, and not the probe's holder (an execution id) or its epoch. No external probes or provider response bodies appear in it.
 
+## Drain: taking a route out without removing it
+
+A Platform Admin can **drain** a deployment, or a provider connection (which drains every deployment on it), with a reason, an optional `until`, and the time and person recorded. A drained route takes no new attempt; requests already running finish. The drain lifts on its own when `until` passes (it is evaluated whenever routes are read; no job clears it), or when someone ends it.
+
+**What a drain does that `enabled=false` does not.** A drain changes routing only; everywhere else the route is as it was:
+
+| | Drained | Disabled (`enabled=false`) |
+| --- | --- | --- |
+| New attempts on the route | None | None |
+| `GET /v1/models` | The model is still listed | Not listed once no enabled route serves it |
+| A request for a model whose routes are all drained | 503 `model_temporarily_unavailable` (retryable; `Retry-After` only when a drain ends within the hour) | 404 `model_not_found` |
+| Catalog eligibility, workspace and key model selection, Admin readiness counts | Unchanged | Readiness counts the route as not enabled |
+| A gateway-run batch created before the change | Its lines not yet dispatched wait for the drain to end | Its lines fail as for a model with no route |
+| Native jobs (batches, videos) already submitted | Keep polling and settle | Stop: their pinned route no longer serves |
+| Configuration history | Not a configuration change (audited as `routing.drain_*`) | A configuration change with a revision |
+
+**Where it applies.** Interactive requests and their failover attempts, workloads, realtime sessions (no new session; an open one runs to its end), token counts, native job submissions, and gateway-run batch lines. A drained route is never claimed as a half-open route's probe; a probe that was in flight when the drain was set ends without deciding the circuit, and its slot is freed. A closed circuit still counts what in-flight requests observe. Batch lines: a line not yet dispatched waits, without a worker, as for an open circuit; a line already running retries after its usual backoff, sends nothing to the drained route, and fails once its retries are spent. A new batch for a model whose routes are all drained is refused with the same retryable 503 as during a cooldown.
+
+**How fast.** Admission refuses a drained route under the shared catalog lock that a drain change takes exclusively, so once a drain commits no attempt is admitted on it on any replica, whatever plan the request carries. Planning reads the drain with the route's health through the per-replica health cache, at most 1 s (`HEALTH_TTL`) old on another replica; a request planned from that stale view is refused at admission with the 503, not sent. Token counts are not admitted: they follow planning alone, so another replica may still send one to a just-drained route for up to that second.
+
+**The reason** is at most 500 characters, without control characters, kept in the audit log (`routing.drain_set`, `routing.drain_changed`, `routing.drain_cleared`) and shown to Platform Admins and Auditors. It never reaches an inference client or a log line, and it is in no CSV export.
+
+API: `GET/PUT/DELETE /api/v1/platform/deployments/{deployment}/drain` and `/api/v1/platform/providers/{id}/drain` ([governance API](governance-api.md)).
+
 ## Cancellation and evidence
 
 Deadline watchdogs drop upstream transport even with unpolled downstream streams. Dropping transport cannot guarantee upstream cancellation or zero cost; expired leases later become unknown holds rather than refunds. See [governance](governance.md).

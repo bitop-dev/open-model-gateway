@@ -1,5 +1,6 @@
 import { type ReactNode } from "react";
-import { Boxes, Plus, Settings } from "lucide-react";
+import { Boxes, CirclePause, Plus, Settings } from "lucide-react";
+import { ConnectionDrainPanel } from "../components/route-drain";
 import { api, platformPath, type Model, type Provider, type Session } from "../lib/api";
 import { ResourceLink } from "../components/navigation-link";
 import { ActionProvider, Button, CollectionTable, ErrorNotice, Heading, Status, useAction, useApi } from "../components/ui";
@@ -44,6 +45,7 @@ function ConnectionRecord({ session, provider: p, tab, onTabChange }: { session:
     facts={[{ label: "Endpoint", value: p.endpoint ? code(p.endpoint) : p.provider === "bedrock" ? "Regional endpoint" : "Provider default" }, { label: "Region", value: p.region ?? undefined }, { label: "Authentication", value: p.auth_mode === "none" ? "None (approved local endpoint)" : p.provider === "bedrock" ? awsAuthLabel(p.aws_auth) : "Environment variable (hidden)" }, { label: "ID", value: <CopyId value={p.id} label="connection ID" /> }]}
     sections={[
       { id: "models", title: "Models on this connection", tabLabel: "Models", icon: <Boxes aria-hidden />, count: p.model_count, content: <ConnectionModels provider={p} writable={writable} /> },
+      { id: "drain", title: "Drain", tabLabel: "Drain", icon: <CirclePause aria-hidden />, content: <ConnectionDrainPanel id={p.id} name={p.name} writable={writable} /> },
       { id: "settings", title: p.provider === "bedrock" ? "AWS access" : "Authentication reference", tabLabel: "Settings", icon: <Settings aria-hidden />, hidden: !writable, content: p.provider === "bedrock" ? <ChangeAwsAccess provider={p} /> : <RotateProviderReference provider={p} /> },
     ]} />;
 }
