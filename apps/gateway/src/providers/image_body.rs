@@ -63,10 +63,13 @@ pub(crate) fn chat_content(content: Option<&Content>, images: &mut usize) -> Val
 
 /// Messages content blocks for content with parts (Anthropic): text blocks,
 /// and base64 image blocks whose `data` is a placeholder that
-/// [`json_body_base64`] splices, numbered in message order.
+/// [`json_body_base64`] splices, numbered in message order. A blank text
+/// part beside an image carries nothing and is not sent: Messages refuses
+/// a text block without visible text.
 pub(crate) fn messages_blocks(parts: &[Part], images: &mut usize) -> Vec<Value> {
     parts
         .iter()
+        .filter(|part| !matches!(part, Part::Text(text) if text.trim().is_empty()))
         .map(|part| match part {
             Part::Text(text) => json!({"type":"text","text":text}),
             Part::Image(image) => {
@@ -91,8 +94,8 @@ pub(crate) struct ImageLimits {
     pub count: usize,
     /// Pixels per side, checked when the image's header states them.
     pub side: u32,
-    /// The images' base64 and the request's text together, against the
-    /// provider's request size.
+    /// The images' base64 and everything else the wire sends, against the
+    /// provider's request size ([`check_request_size`]).
     pub request_bytes: usize,
     /// The wire takes OpenAI's `detail` hint. Without it only `auto`, the
     /// provider's own behaviour, is accepted: `low` or `high` would be
@@ -100,14 +103,14 @@ pub(crate) struct ImageLimits {
     pub detail: bool,
 }
 
-/// Refuses a request whose images the provider's wire cannot carry.
+/// Refuses a request whose images the provider's wire cannot carry, one by
+/// one and by count.
 pub(crate) fn check_limits(
     request: &ChatRequest,
     limits: &ImageLimits,
 ) -> Result<(), InferenceError> {
     let refuse = InferenceError::InvalidField("image");
     let mut count = 0usize;
-    let mut total = 0usize;
     for image in images(request) {
         count += 1;
         let over_side = image
@@ -127,19 +130,23 @@ pub(crate) fn check_limits(
         {
             return Err(refuse);
         }
-        total = total.saturating_add(image.base64().len());
     }
-    if count == 0 {
-        return Ok(());
-    }
-    let text = request
-        .messages
-        .iter()
-        .filter_map(|m| m.content.as_ref())
-        .map(Content::text_len)
+    Ok(())
+}
+
+/// Refuses a request with images whose images' base64 and `other`, the
+/// bytes of everything else the encoder will send (text, tools, schemas,
+/// tool arguments), exceed the provider's request size.
+pub(crate) fn check_request_size(
+    request: &ChatRequest,
+    other: usize,
+    limits: &ImageLimits,
+) -> Result<(), InferenceError> {
+    let total = images(request)
+        .map(|i| i.base64().len())
         .fold(0usize, usize::saturating_add);
-    if total.saturating_add(text) > limits.request_bytes {
-        return Err(refuse);
+    if total > 0 && total.saturating_add(other) > limits.request_bytes {
+        return Err(InferenceError::InvalidField("image"));
     }
     Ok(())
 }
@@ -298,16 +305,15 @@ mod tests {
             ]),
             refused
         );
-        // The images' base64 and the text together: 2 × 199 + 3 > 400.
-        let two = |text: &str| {
-            vec![
-                Part::Text(text.into()),
-                sized(1, 199, None),
-                sized(1, 199, None),
-            ]
-        };
-        assert_eq!(ok(two("ab")), Ok(()));
-        assert_eq!(ok(two("abc")), refused);
+        // The images' base64 and everything else sent: 2 × 199 + 3 > 400.
+        let two = request(vec![sized(1, 199, None), sized(1, 199, None)]);
+        assert_eq!(check_request_size(&two, 2, &limits), Ok(()));
+        assert_eq!(check_request_size(&two, 3, &limits), refused);
+        // No image: the provider's own size rules, not these.
+        assert_eq!(
+            check_request_size(&request(vec![]), usize::MAX, &limits),
+            Ok(())
+        );
         // `detail`: `auto` is the provider's own behaviour; `low` and `high`
         // would be dropped.
         for (detail, verdict) in [

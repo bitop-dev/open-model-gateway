@@ -278,6 +278,8 @@ fn encode_with(request: &ChatRequest, decode: bool) -> Result<Input> {
     for message in &request.messages {
         turns.push(message)?;
     }
+    // Text, tool arguments, tool specifications and the output schema.
+    super::image_body::check_request_size(request, turns.size, &images::LIMITS)?;
     let mut input = turns.finish(request, tools)?;
     input.output = output;
     Ok(input)

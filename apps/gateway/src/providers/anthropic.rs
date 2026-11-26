@@ -382,6 +382,11 @@ fn encode(model: &str, request: &ChatRequest) -> Result<Value> {
     set_tools(&mut value, request);
     set_native_overrides(&mut value, request);
     set_tool_choice(&mut value, request);
+    if request.has_images() {
+        // The body without its images' data (each still a placeholder).
+        let other = serde_json::to_vec(&value).map_or(usize::MAX, |b| b.len());
+        super::image_body::check_request_size(request, other, &IMAGE_LIMITS)?;
+    }
     Ok(value)
 }
 fn finish(value: &Value) -> Result<FinishReason> {

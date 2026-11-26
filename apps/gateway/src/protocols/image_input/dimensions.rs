@@ -3,16 +3,16 @@
 //! named, instead of the provider refusing it after.
 //!
 //! Best effort and bounded: every read is a checked slice of the decoded
-//! bytes, nothing allocates, and the JPEG walk advances by at least two bytes
-//! per segment. A header this does not understand, or one that states a
-//! zero dimension, gives `None`, and the provider decides.
+//! bytes, nothing allocates, and every step of the GIF and JPEG walks
+//! advances. A header this does not understand, or one that states a zero
+//! dimension, gives `None`, and the provider decides.
 use crate::inference::types::ImageType;
 
 /// Width and height in pixels, when the header states them.
 pub(crate) fn dimensions(kind: ImageType, bytes: &[u8]) -> Option<(u32, u32)> {
     let (width, height) = match kind {
         ImageType::Png => png(bytes)?,
-        ImageType::Gif => (le16(bytes, 6)?, le16(bytes, 8)?),
+        ImageType::Gif => gif(bytes)?,
         ImageType::Webp => webp(bytes)?,
         ImageType::Jpeg => jpeg(bytes)?,
     };
@@ -39,6 +39,69 @@ fn png(bytes: &[u8]) -> Option<(u32, u32)> {
     let width = u32::from_be_bytes(take(bytes, 16)?);
     let height = u32::from_be_bytes(take(bytes, 20)?);
     Some((width, height))
+}
+
+/// The logical screen, widened by each frame's extent (its offset plus its
+/// size), so a frame larger than the screen is not hidden behind it. The
+/// walk stops at the trailer, an unknown block or the end of the bytes, with
+/// what it has read.
+fn gif(bytes: &[u8]) -> Option<(u32, u32)> {
+    let (mut width, mut height) = (le16(bytes, 6)?, le16(bytes, 8)?);
+    let Some(&flags) = bytes.get(10) else {
+        return Some((width, height));
+    };
+    let mut at = 13 + color_table(flags);
+    loop {
+        match bytes.get(at) {
+            // Image descriptor: left, top, width, height, flags; then the
+            // local color table, the LZW code size and the data sub-blocks.
+            Some(0x2c) => {
+                let (Some(left), Some(top), Some(w), Some(h), Some(&flags)) = (
+                    le16(bytes, at + 1),
+                    le16(bytes, at + 3),
+                    le16(bytes, at + 5),
+                    le16(bytes, at + 7),
+                    bytes.get(at + 9),
+                ) else {
+                    break;
+                };
+                width = width.max(left + w);
+                height = height.max(top + h);
+                match sub_blocks(bytes, at + 10 + color_table(flags) + 1) {
+                    Some(next) => at = next,
+                    None => break,
+                }
+            }
+            // Extension: label, then sub-blocks.
+            Some(0x21) => match sub_blocks(bytes, at + 2) {
+                Some(next) => at = next,
+                None => break,
+            },
+            _ => break,
+        }
+    }
+    Some((width, height))
+}
+
+/// The bytes of a GIF color table its flags announce.
+fn color_table(flags: u8) -> usize {
+    if flags & 0x80 == 0 {
+        0
+    } else {
+        3 << ((flags & 7) + 1)
+    }
+}
+
+/// The offset after a run of GIF sub-blocks starting at `at` (each a length
+/// byte and that many bytes, ending with a zero length).
+fn sub_blocks(bytes: &[u8], mut at: usize) -> Option<usize> {
+    loop {
+        let length = usize::from(*bytes.get(at)?);
+        at = at.checked_add(1 + length)?;
+        if length == 0 {
+            return Some(at);
+        }
+    }
 }
 
 /// `RIFF....WEBP`, then the first chunk: lossy `VP8 `, lossless `VP8L` or
@@ -121,6 +184,19 @@ mod tests {
         );
         let gif = [b"GIF89a".as_slice(), &[0x41, 0x1f, 0x02, 0x00]].concat();
         assert_eq!(dimensions(ImageType::Gif, &gif), Some((8001, 2)));
+        // A 1x1 screen with a global color table, an extension, then a
+        // 9000x20 frame at offset 5,0: the frame's extent counts.
+        let mut framed = [b"GIF89a".as_slice(), &[1, 0, 1, 0, 0x80, 0, 0]].concat();
+        framed.extend_from_slice(&[0; 6]); // two-entry color table
+        framed.extend_from_slice(&[0x21, 0xf9, 4, 0, 0, 0, 0, 0]); // control extension
+        framed.extend_from_slice(&[0x2c, 5, 0, 0, 0, 0x28, 0x23, 20, 0, 0]); // descriptor
+        framed.extend_from_slice(&[2, 2, 0x44, 0x01, 0, 0x3b]); // code size, data, trailer
+        assert_eq!(dimensions(ImageType::Gif, &framed), Some((9005, 20)));
+        // Cut inside the frame's data: what was read stands.
+        assert_eq!(
+            dimensions(ImageType::Gif, &framed[..framed.len() - 4]),
+            Some((9005, 20))
+        );
         // Lossy: frame tag, start code, 14-bit width and height.
         let lossy = webp(
             b"VP8 ",

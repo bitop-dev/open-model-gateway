@@ -712,6 +712,24 @@ async fn inline_images_reach_messages_as_base64_image_blocks() {
 }
 
 #[tokio::test]
+async fn images_across_turns_keep_their_order_and_blank_text_is_not_sent() {
+    let (request, data) = super::super::contract::multi_image_request();
+    let mock = Mock::new(200, None).await;
+    mock.adapter.execute(&target(), request).await.unwrap();
+    let sent = mock.capture.lock().unwrap()[0].2.clone();
+    let image = |k: usize| json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":data[k]}});
+    assert_eq!(sent["system"], json!([{"type":"text","text":"be brief"}]));
+    assert_eq!(
+        sent["messages"],
+        json!([
+            {"role":"user","content":[{"type":"text","text":"compare"}, image(0), image(1)]},
+            {"role":"assistant","content":[{"type":"text","text":"two images"}]},
+            {"role":"user","content":[image(2), {"type":"text","text":"and this"}]}
+        ])
+    );
+}
+
+#[tokio::test]
 async fn images_the_messages_wire_cannot_carry_are_refused_before_anything_is_sent() {
     use super::super::contract::image_request_with;
     // Nothing listens at the target, so a request that was sent would fail

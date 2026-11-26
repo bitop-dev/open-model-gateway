@@ -1290,6 +1290,64 @@ async fn inline_images_reach_converse_as_image_blocks_of_their_bytes() {
 }
 
 #[tokio::test]
+async fn images_across_turns_keep_their_order_and_blank_text_is_not_sent() {
+    let (request, data) = super::super::contract::multi_image_request();
+    let mock = Mock::serve(complete(false), wire(events(false)), 200).await;
+    mock.adapter().execute(&target(), request).await.unwrap();
+    let sent = mock.requests.lock().unwrap()[0].body.clone();
+    let image = |k: usize| json!({"image":{"format":"png","source":{"bytes":data[k]}}});
+    assert_eq!(sent["system"], json!([{"text":"be brief"}]));
+    assert_eq!(
+        sent["messages"],
+        json!([
+            {"role":"user","content":[{"text":"compare"}, image(0), image(1)]},
+            {"role":"assistant","content":[{"text":"two images"}]},
+            {"role":"user","content":[image(2), {"text":"and this"}]}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn the_request_size_counts_images_and_everything_else_sent() {
+    use base64::Engine as _;
+    // Five images of 3.7 MB pass one by one (under 3.75 MB) but are 24.7 MB
+    // of base64 together; four are 19.7 MB, under the 20 MB, until a tool
+    // description takes the rest of it.
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.resize(3_700_000, 7);
+    let url = format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    );
+    let request = |count: usize, description: usize| {
+        let mut images = crate::protocols::image_input::Images::default();
+        let mut r = super::super::contract::image_request_with(false, None);
+        r.messages[0].content = Some(Content::Parts(
+            (0..count)
+                .map(|_| Part::Image(images.take(url.clone(), None, "image").unwrap()))
+                .collect(),
+        ));
+        r.tools = vec![FunctionTool {
+            name: "lookup".into(),
+            description: Some("d".repeat(description)),
+            parameters: serde_json::json!({"type":"object"}),
+            strict: None,
+        }];
+        r
+    };
+    let adapter = BedrockAdapter::for_test("http://127.0.0.1:9");
+    let refused = Err(InferenceError::InvalidField("image"));
+    assert_eq!(adapter.validate_chat_request(&request(5, 1)), refused);
+    assert_eq!(adapter.validate_chat_request(&request(4, 1)), Ok(()));
+    assert_eq!(adapter.validate_chat_request(&request(4, 300_000)), refused);
+    // Refused in the encoder too, before anything is sent.
+    assert_eq!(
+        adapter.execute(&target(), request(4, 300_000)).await.err(),
+        refused.err()
+    );
+}
+
+#[tokio::test]
 async fn images_converse_cannot_carry_are_refused_before_anything_is_sent() {
     use super::super::contract::image_request_with;
     // Nothing listens at the target, so a request that was sent would fail
@@ -1363,17 +1421,32 @@ async fn an_image_reaches_no_log_line_whatever_rust_log_enables() {
         Part::Text("what is this?".into()),
         Part::Image(image),
     ]));
-    // Served, and refused by the upstream, with and without the policy.
-    for status in [200, 400] {
+    // Served and refused by the upstream, complete and streamed.
+    for (status, stream) in [(200, false), (400, false), (200, true), (400, true)] {
         for policy in [false, true] {
             let mock = Mock::serve(complete(false), wire(events(false)), status).await;
             let (lines, subscriber) = capture(policy);
             let (adapter, deployment) = (mock.adapter(), target());
-            let result = adapter
-                .execute(&deployment, request.clone())
-                .with_subscriber(subscriber)
-                .await;
-            assert_eq!(result.is_ok(), status == 200, "status {status}");
+            let mut request = request.clone();
+            request.stream = stream;
+            let result = async {
+                let output = adapter.execute(&deployment, request).await?;
+                if let ProviderOutput::Stream(events) = output {
+                    // Read to its end under the same subscriber.
+                    let events: Vec<_> = events.collect().await;
+                    events
+                        .into_iter()
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                }
+                Ok::<_, InferenceError>(())
+            }
+            .with_subscriber(subscriber)
+            .await;
+            assert_eq!(
+                result.is_ok(),
+                status == 200,
+                "status {status} stream {stream}"
+            );
             if let Err(error) = &result {
                 assert!(!format!("{error:?}{error}").contains(canary));
             }

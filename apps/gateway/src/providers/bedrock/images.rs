@@ -17,8 +17,9 @@ use crate::{
 
 /// Bedrock's limits for Converse images: 3.75 MB, 8000 px a side and 20
 /// images (API reference, `Message.content`), and 20 MB per request
-/// (Anthropic's documentation of Claude on Bedrock). Megabytes are taken as
-/// 10^6 bytes, the smaller reading.
+/// (Anthropic's documentation of Claude on Bedrock), counted over the
+/// images' base64 and everything else the request sends. Megabytes are
+/// taken as 10^6 bytes, the smaller reading.
 pub(super) const LIMITS: ImageLimits = ImageLimits {
     per_image: 3_750_000,
     per_image_base64: usize::MAX,
@@ -38,7 +39,9 @@ pub(super) fn blocks(
     let mut blocks = Vec::new();
     for part in parts {
         match part {
-            Part::Text(text) if text.is_empty() => {}
+            // Converse refuses a blank text block; beside an image it
+            // carries nothing.
+            Part::Text(text) if text.trim().is_empty() => {}
             Part::Text(text) => blocks.push(aws::ContentBlock::Text(text.clone())),
             Part::Image(image) => {
                 let bytes = if decode {
