@@ -622,21 +622,57 @@ mod db {
             (status, &v["drain"], &v["drained"]),
             (StatusCode::OK, &Value::Null, &json!(false))
         );
-        // Refused: no reason, blank, too long, a control character, an
-        // `until` past or too far, an unknown field.
-        for body in [
-            json!({"until":null}),
-            json!({"reason":"   ","until":null}),
-            json!({"reason":"x".repeat(501),"until":null}),
-            json!({"reason":"line one\nline two","until":null}),
-            json!({"reason":"tab\there","until":null}),
-            json!({"reason":"ok","until":"2000-01-01T00:00:00Z"}),
-            json!({"reason":"ok","until":"2999-01-01T00:00:00Z"}),
-            json!({"reason":"ok","until":null,"state":"active"}),
+        // Refused, each with its own status and machine reason: the body's
+        // shape (422), the schema's length (400, no reason), and what the
+        // schema cannot state (400 with a reason).
+        for (body, status, reason) in [
+            (json!({"until":null}), 422, None),
+            (
+                json!({"reason":"ok","until":null,"state":"active"}),
+                422,
+                None,
+            ),
+            (json!({"reason":"","until":null}), 400, None),
+            (json!({"reason":"x".repeat(501),"until":null}), 400, None),
+            (
+                json!({"reason":"   ","until":null}),
+                400,
+                Some("drain_reason_invalid"),
+            ),
+            (
+                json!({"reason":"line one\nline two","until":null}),
+                400,
+                Some("drain_reason_invalid"),
+            ),
+            (
+                json!({"reason":"tab\there","until":null}),
+                400,
+                Some("drain_reason_invalid"),
+            ),
+            (
+                json!({"reason":"\u{200B}","until":null}),
+                400,
+                Some("drain_reason_invalid"),
+            ),
+            (
+                json!({"reason":"ok \u{202E}kcatta","until":null}),
+                400,
+                Some("drain_reason_invalid"),
+            ),
+            (
+                json!({"reason":"ok","until":"2000-01-01T00:00:00Z"}),
+                400,
+                Some("drain_until_invalid"),
+            ),
+            (
+                json!({"reason":"ok","until":"2999-01-01T00:00:00Z"}),
+                400,
+                Some("drain_until_invalid"),
+            ),
         ] {
-            // 400 from the handler's checks, 422 from the body's shape.
-            let status = call(&f, &admin, "PUT", &path, body.clone()).await.0;
-            assert!(matches!(status.as_u16(), 400 | 422), "{body}: {status}");
+            let (got, v) = call(&f, &admin, "PUT", &path, body.clone()).await;
+            assert_eq!(got.as_u16(), status, "{body}");
+            assert_eq!(v["error"]["reason"].as_str(), reason, "{body}");
         }
         assert!(audits().await.is_empty());
         let reason = "Replacing the node: \"=HYPERLINK(1)\" <b>soon</b>";

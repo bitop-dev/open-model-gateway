@@ -5,10 +5,12 @@
 //! and cleared together under the exclusive catalog lock, each change audited
 //! with its reason.
 //!
-//! The reason is operator text: at most [`REASON_MAX_CHARS`] characters, no
-//! control characters (so it cannot break a log or syslog line), and it is
-//! only ever returned as a JSON string. It never reaches an inference client
-//! or a log line.
+//! The reason is operator text: at most [`REASON_MAX_CHARS`] characters, with
+//! no control, invisible or bidirectional character and no line separator
+//! (so it cannot hide, reorder or break a line where it is shown), and it is
+//! only ever returned as a JSON string. It is kept in the audit log (and so in
+//! its export); it never reaches an inference client or an operational log
+//! line.
 use super::*;
 use gateway_datetime_compat::UtcInstant;
 
@@ -18,8 +20,7 @@ pub(crate) const REASON_MAX_CHARS: usize = 500;
 /// A drain's `until` is at most this far ahead.
 const UNTIL_MAX_DAYS: i32 = 366;
 
-pub(super) const REASON_INVALID: &str =
-    "A drain reason is 1 to 500 characters after trimming, with no control characters";
+pub(super) const REASON_INVALID: &str = "A drain reason is 1 to 500 characters after trimming, with no control, invisible or bidirectional characters";
 pub(super) const UNTIL_INVALID: &str =
     "A drain's until is in the future and at most 366 days ahead";
 
@@ -42,10 +43,29 @@ fn reason(raw: &str) -> Result<String, ApiError> {
         return Err(invalid());
     }
     let reason = raw.trim();
-    if reason.is_empty() || reason.chars().any(char::is_control) {
+    if reason.is_empty() || reason.chars().any(hidden) {
         return Err(ApiError(StatusCode::BAD_REQUEST, REASON_INVALID));
     }
     Ok(reason.to_owned())
+}
+
+/// A character a reason may not hold: a control character, or one that is
+/// invisible or reorders or breaks the text where it is shown (format
+/// characters such as zero-width spaces and bidirectional controls, and the
+/// line and paragraph separators).
+fn hidden(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{061C}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+        )
 }
 
 /// The drained resource's two kinds: its table and its audit resource type.
@@ -309,9 +329,7 @@ pub(super) fn audit_field(action: &str, key: &str, value: &Value) -> bool {
     action.starts_with("routing.drain_")
         && match key {
             "drain_reason" => value.as_str().is_some_and(|r| {
-                !r.is_empty()
-                    && r.chars().count() <= REASON_MAX_CHARS
-                    && !r.chars().any(char::is_control)
+                !r.is_empty() && r.chars().count() <= REASON_MAX_CHARS && !r.chars().any(hidden)
             }),
             "drain_until" => {
                 value.is_null()

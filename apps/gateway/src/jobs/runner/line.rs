@@ -272,10 +272,7 @@ impl LineRun {
                     // sent (its circuit open, or its probe slot held by
                     // another request or lost): nothing was sent, and the
                     // attempt is retried after its backoff like a failed one.
-                    let cooling = matches!(
-                        e,
-                        InferenceError::RouteCoolingDown(_) | InferenceError::RouteDrained(_)
-                    ) && pin.is_some();
+                    let cooling = unusable(e) && pin.is_some();
                     let retryable = cooling
                         || matches!(
                             e,
@@ -520,4 +517,13 @@ impl LineRun {
                 .map(BatchResponse::Embeddings),
         }
     }
+}
+
+/// The line's route could not be used when it was sent (its circuit open,
+/// its probe slot held elsewhere or lost, or drained): nothing was sent.
+fn unusable(error: InferenceError) -> bool {
+    matches!(
+        error,
+        InferenceError::RouteCoolingDown(_) | InferenceError::RouteDrained(_)
+    )
 }

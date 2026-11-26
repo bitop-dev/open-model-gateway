@@ -490,7 +490,8 @@ async fn load_health(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RouteState {
     /// An operator drain applies (`routing::drain`): no new attempt, whatever
-    /// the circuit; for about this many more seconds, when it has an end.
+    /// the circuit; for about this many more seconds, when it ends within the
+    /// hour (`drain::retry_after`).
     Drained(Option<u32>),
     Closed,
     /// The cooldown has passed: the route is used only as its probe.
@@ -513,9 +514,9 @@ pub async fn route_state(store: &Store, deployment: Uuid) -> Result<RouteState, 
     };
     let now = std::time::Instant::now();
     if entry.drained_at(now) {
-        return Ok(RouteState::Drained(entry.drain_until.map(|until| {
-            (until - now).as_secs_f64().ceil().clamp(1.0, 1e9) as u32
-        })));
+        return Ok(RouteState::Drained(drain::retry_after(
+            entry.drain_until.map(|until| (until - now).as_secs_f64()),
+        )));
     }
     Ok(match entry.open_until {
         None => RouteState::Closed,

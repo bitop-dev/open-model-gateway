@@ -484,9 +484,21 @@ impl BatchFence {
 impl BatchFence {
     /// Claim the submission: exclusive with an early cancel, and refused once
     /// the claim ended, so a poller that lost the batch never submits it.
+    /// Claim the native batch's one submission. Not while its route is
+    /// drained (`routing::drain`): the job stays queued and is polled again at
+    /// its next poll; a submission claimed before the drain committed is in
+    /// flight and proceeds.
     pub(crate) async fn claim_submit(&self, store: &Store) -> FenceResult<bool> {
-        let claimed = self.query("UPDATE async_jobs SET submit_started_at=clock_timestamp() WHERE id=$1 AND runner_id=$2 AND runner_epoch=$3 AND submit_started_at IS NULL AND upstream_id IS NULL AND cancel_requested_at IS NULL AND state='queued'")
-            .execute(&store.pool).await.map_err(job_storage)?.rows_affected();
+        let sql = format!(
+            "UPDATE async_jobs SET submit_started_at=clock_timestamp() WHERE id=$1 AND runner_id=$2 AND runner_epoch=$3 AND submit_started_at IS NULL AND upstream_id IS NULL AND cancel_requested_at IS NULL AND state='queued' AND NOT EXISTS(SELECT 1 FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id WHERE d.id=async_jobs.deployment_id AND {})",
+            crate::routing::drain::ROUTE_DRAINED
+        );
+        let claimed = self
+            .query(&sql)
+            .execute(&store.pool)
+            .await
+            .map_err(job_storage)?
+            .rows_affected();
         Ok(claimed == 1)
     }
 

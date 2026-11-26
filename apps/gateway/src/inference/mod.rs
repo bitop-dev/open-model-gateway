@@ -118,7 +118,7 @@ impl Engine {
     /// [`route_use`] for this engine's attempts, within the request's
     /// deadline: the probe slot it holds for `id` (held at most until the
     /// deadline and the settlement deadline), or `None` (the wait noted in
-    /// `cooling`) while the route cannot be used. `live` for an attempt after
+    /// `passed`) while the route cannot be used. `live` for an attempt after
     /// the first, whose plan is no longer fresh.
     async fn usable(
         &self,
@@ -127,7 +127,7 @@ impl Engine {
         holder: Uuid,
         deadline: tokio::time::Instant,
         live: bool,
-        cooling: &mut Option<u32>,
+        passed: &mut Passed,
     ) -> Result<Option<Option<ProbeTicket>>, InferenceError> {
         let hold =
             deadline.saturating_duration_since(tokio::time::Instant::now()) + SETTLEMENT_DEADLINE;
@@ -140,7 +140,11 @@ impl Engine {
         Ok(match used {
             RouteUse::Go(probe) => Some(probe),
             RouteUse::Busy(seconds) => {
-                *cooling = Some(cooling.map_or(seconds, |c| c.min(seconds)));
+                passed.cool(seconds);
+                None
+            }
+            RouteUse::Drained(seconds) => {
+                passed.drain(seconds);
                 None
             }
         })
@@ -290,7 +294,7 @@ impl Engine {
             protocol,
             streamed,
         };
-        let (mut attempt, mut cooling, mut failed_over) = (0, None, None);
+        let (mut attempt, mut passed, mut failed_over) = (0, Passed::default(), None);
         for id in &plan.deployment_ids {
             if attempt == plan.max_attempts {
                 break;
@@ -301,7 +305,7 @@ impl Engine {
             // `cancelled` with no `error.type`.
             let route = match self.route_of(&candidates, *id) {
                 Ok(route) => self
-                    .usable(&plan, *id, request_id, deadline, attempt > 0, &mut cooling)
+                    .usable(&plan, *id, request_id, deadline, attempt > 0, &mut passed)
                     .await
                     .map(|probe| probe.map(|probe| (route, probe))),
                 Err(error) => Err(error),
@@ -314,19 +318,15 @@ impl Engine {
                     return Err(error);
                 }
             };
-            telemetry = match self
-                .attempt(&scope, telemetry, attempt, deployment, adapter, probe)
-                .await
-            {
-                AttemptEnd::Failover(telemetry, error) => {
-                    failed_over = Some(error);
-                    telemetry
+            let end = self.attempt(&scope, telemetry, attempt, deployment, adapter, probe);
+            match after(end.await, &mut passed, &mut failed_over) {
+                std::ops::ControlFlow::Continue((next, spent)) => {
+                    (telemetry, attempt) = (next, attempt + usize::from(spent));
                 }
-                AttemptEnd::Return(result) => return result,
-            };
-            attempt += 1;
+                std::ops::ControlFlow::Break(result) => return result,
+            }
         }
-        let error = exhausted(cooling, attempt, failed_over);
+        let error = exhausted(passed, attempt, failed_over);
         telemetry.finish(telemetry::Outcome::Error, Some(error));
         Err(error)
     }
@@ -451,17 +451,71 @@ pub(crate) enum RouteUse {
     /// No: another request holds the half-open route's probe slot (or the
     /// circuit opened again) for about this many seconds. Nothing was sent.
     Busy(u32),
+    /// No: an operator drained the route (`routing::drain`); it returns in
+    /// about this many seconds when that is within the hour. Nothing was sent.
+    Drained(Option<u32>),
+}
+
+/// The routes a request passed over without an attempt: the soonest return
+/// of one cooling down, and whether (and about when) a drained one returns.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct Passed {
+    cooling: Option<u32>,
+    drained: Option<Option<u32>>,
+}
+impl Passed {
+    fn cool(&mut self, seconds: u32) {
+        self.cooling = Some(self.cooling.map_or(seconds, |c| c.min(seconds)));
+    }
+    /// A drained route; `seconds` is its `Retry-After`, when within the hour.
+    pub(crate) fn drain(&mut self, seconds: Option<u32>) {
+        let seconds =
+            seconds.filter(|s| *s <= crate::routing::drain::DRAIN_RETRY_AFTER_WITHIN_SECONDS);
+        self.drained = Some(match (self.drained.flatten(), seconds) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        });
+    }
+}
+
+/// An attempt that did not return: its telemetry, and whether it spent an
+/// attempt. A route admission refused as drained since the plan was read
+/// sent nothing and spends none; the next route is tried. `Break`: the
+/// request's result.
+fn after(
+    end: AttemptEnd,
+    passed: &mut Passed,
+    failed_over: &mut Option<InferenceError>,
+) -> std::ops::ControlFlow<Result<ProviderOutput, InferenceError>, (RequestTelemetry, bool)> {
+    use std::ops::ControlFlow::{Break, Continue};
+    match end {
+        AttemptEnd::Failover(telemetry, error) => {
+            *failed_over = Some(error);
+            Continue((telemetry, true))
+        }
+        AttemptEnd::Skipped(telemetry, seconds) => {
+            passed.drain(seconds);
+            Continue((telemetry, false))
+        }
+        AttemptEnd::Return(result) => Break(result),
+    }
 }
 
 /// The error of a request whose plan ran out: the routes left could not be
-/// used and none was attempted (cooling down), or the attempts ran out.
+/// used and none was attempted (cooling down, or drained by an operator), or
+/// the attempts ran out.
 pub(crate) fn exhausted(
-    cooling: Option<u32>,
+    passed: Passed,
     attempts: usize,
     failed_over: Option<InferenceError>,
 ) -> InferenceError {
-    match (cooling, failed_over) {
-        (Some(seconds), _) if attempts == 0 => InferenceError::RouteCoolingDown(seconds),
+    match (passed.cooling, failed_over) {
+        (Some(seconds), _) if attempts == 0 => InferenceError::RouteCoolingDown(
+            passed.drained.flatten().map_or(seconds, |d| d.min(seconds)),
+        ),
+        (None, _) if attempts == 0 && passed.drained.is_some() => {
+            InferenceError::RouteDrained(passed.drained.flatten())
+        }
         // The last attempt failed over to routes none of which could be used:
         // its own error stands.
         (_, Some(error)) => error,
@@ -512,7 +566,7 @@ pub(crate) async fn route_use(
             Ok(RouteState::HalfOpen) => true,
             Ok(RouteState::Open(seconds)) => return RouteUse::Busy(seconds),
             // Drained since the plan: no new attempt on it.
-            Ok(RouteState::Drained(seconds)) => return RouteUse::Busy(seconds.unwrap_or(1)),
+            Ok(RouteState::Drained(seconds)) => return RouteUse::Drained(seconds),
             Err(_) => return RouteUse::Busy(1),
         }
     } else {

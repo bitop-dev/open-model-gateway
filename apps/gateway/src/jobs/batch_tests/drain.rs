@@ -110,3 +110,39 @@ async fn a_line_in_flight_when_its_route_is_drained_sends_nothing_more(pool: PgP
         (Some(0), Some(1))
     );
 }
+
+/// A native batch accepted before its route is drained is not submitted
+/// while the drain applies: it stays queued, nothing reaches the provider,
+/// and it is submitted at its first poll once the drain ends.
+#[dbtest::test]
+async fn a_native_batch_queued_before_a_drain_waits_to_be_submitted(pool: PgPool) {
+    let w = world(pool, true, false, 2).await;
+    let file = w
+        .upload(&w.f.principal, &[chat_line("a", "company/smart", "one")])
+        .await;
+    let job = w
+        .create(w.f.principal, &file, BatchEndpoint::ChatCompletions, None)
+        .await
+        .unwrap();
+    assert_eq!(job.mode(), Some(BatchMode::Native));
+    drain(&w, "NULL").await;
+    w.poll().await;
+    assert!(
+        w.openai.script.lock().unwrap().submitted.is_empty(),
+        "nothing is submitted to a drained route"
+    );
+    let queued: (String, bool) =
+        sqlx::query_as("SELECT state, submit_started_at IS NULL FROM async_jobs WHERE id=$1")
+            .bind(job.id)
+            .fetch_one(&w.f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(queued, ("queued".into(), true));
+    sqlx::query("UPDATE deployments SET drain_reason=NULL,drain_until=NULL,drained_by=NULL,drained_at=NULL WHERE id=$1")
+        .bind(w.f.deployment)
+        .execute(&w.f.store.pool)
+        .await
+        .unwrap();
+    w.poll().await;
+    assert_eq!(w.openai.script.lock().unwrap().submitted.len(), 1);
+}

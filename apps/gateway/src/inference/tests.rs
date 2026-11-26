@@ -18,6 +18,9 @@ struct MemoryRepository {
     finish_calls: AtomicUsize,
     finished: tokio::sync::Notify,
     fail_start: AtomicBool,
+    /// Routes admission refuses as drained (`routing::drain`) before it
+    /// records anything.
+    drained_at_admission: Mutex<std::collections::HashSet<Uuid>>,
     /// `start` never returns (an admission stuck behind a lock).
     hang_start: AtomicBool,
     fail_finish: AtomicBool,
@@ -147,6 +150,14 @@ impl InferenceRepository for MemoryRepository {
         Ok(())
     }
     async fn start(&self, record: &ExecutionStart) -> Result<(), InferenceError> {
+        if self
+            .drained_at_admission
+            .lock()
+            .unwrap()
+            .contains(&record.deployment_id)
+        {
+            return Err(InferenceError::RouteDrained(None));
+        }
         self.attempts
             .lock()
             .unwrap()
@@ -1753,4 +1764,39 @@ async fn a_held_probe_lost_before_the_send_sends_nothing() {
     );
     assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
     assert_eq!(probe_log(&repository, 3).await[0], "renew 7");
+}
+
+/// Admission refuses a route drained since the plan was read (another
+/// replica's health cache): nothing was sent, no attempt is spent, and the
+/// next route serves the request, even when the plan allows one attempt.
+#[tokio::test]
+async fn a_route_drained_at_admission_is_passed_over_without_spending_an_attempt() {
+    let (engine, repo, backup) = failover_fixture(Mode::Complete, false, false);
+    let first = repo.deployments.lock().unwrap()[0].id;
+    repo.plan.lock().unwrap().as_mut().unwrap().max_attempts = 1;
+    repo.drained_at_admission.lock().unwrap().insert(first);
+    let root = Uuid::new_v4();
+    assert!(matches!(
+        engine.execute(principal(), request(false), root).await,
+        Ok(ProviderOutput::Complete(_))
+    ));
+    assert_eq!(backup.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(*repo.attempts.lock().unwrap(), vec![(root, 1)]);
+}
+
+/// The only route is drained at admission: the model is temporarily
+/// unavailable, without a `Retry-After` for a drain with no end.
+#[tokio::test]
+async fn a_lone_route_drained_at_admission_reports_the_drain() {
+    let (engine, repo, adapter) = fixture(Mode::Complete, EngineLimits::default());
+    let only = repo.deployments.lock().unwrap()[0].id;
+    repo.drained_at_admission.lock().unwrap().insert(only);
+    assert_eq!(
+        engine
+            .execute(principal(), request(false), Uuid::new_v4())
+            .await
+            .err(),
+        Some(InferenceError::RouteDrained(None))
+    );
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 0);
 }

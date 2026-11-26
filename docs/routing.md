@@ -101,7 +101,7 @@ A Platform Admin can **drain** a deployment, or a provider connection (which dra
 
 **How fast.** Admission refuses a drained route under the shared catalog lock that a drain change takes exclusively, so once a drain commits no attempt is admitted on it on any replica, whatever plan the request carries. Planning reads the drain with the route's health through the per-replica health cache, at most 1 s (`HEALTH_TTL`) old on another replica; a request planned from that stale view is refused at admission with the 503, not sent. Token counts are not admitted: they follow planning alone, so another replica may still send one to a just-drained route for up to that second.
 
-**The reason** is at most 500 characters, without control characters, kept in the audit log (`routing.drain_set`, `routing.drain_changed`, `routing.drain_cleared`) and shown to Platform Admins and Auditors. It never reaches an inference client or a log line, and it is in no CSV export.
+**The reason** is at most 500 characters, without control, invisible or bidirectional characters or line separators, kept in the audit log (`routing.drain_set`, `routing.drain_changed`, `routing.drain_cleared`; the audit export carries it, JSON-encoded) and shown to Platform Admins and Auditors. It never reaches an inference client or an operational log line, and it is in no CSV export.
 
 API: `GET/PUT/DELETE /api/v1/platform/deployments/{deployment}/drain` and `/api/v1/platform/providers/{id}/drain` ([governance API](governance-api.md)).
 

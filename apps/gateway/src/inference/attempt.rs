@@ -115,6 +115,11 @@ impl Engine {
                 // function, telemetry must be finished explicitly here
                 // rather than left for Drop to mislabel `cancelled`.
                 // A probe slot it held is freed as `probe` drops.
+                if let InferenceError::RouteDrained(seconds) = error {
+                    // Nothing was admitted or sent: the request goes on to
+                    // its next route with the same telemetry.
+                    return AttemptEnd::Skipped(telemetry, seconds);
+                }
                 telemetry.finish(telemetry::Outcome::Error, Some(error));
                 return AttemptEnd::Return(Err(error));
             }
@@ -308,6 +313,10 @@ pub(super) struct RequestScope<'a> {
 pub(super) enum AttemptEnd {
     /// The attempt failed with this error and the next route may be tried.
     Failover(RequestTelemetry, InferenceError),
+    /// Admission refused the route as drained (`routing::drain`), for about
+    /// this many seconds: nothing was admitted or sent, and no attempt is
+    /// spent.
+    Skipped(RequestTelemetry, Option<u32>),
     Return(Result<ProviderOutput, InferenceError>),
 }
 

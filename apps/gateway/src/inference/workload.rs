@@ -415,7 +415,7 @@ impl Engine {
             .as_secs()
             .min(i64::MAX as u64 - 5) as i64
             + 5;
-        let (mut attempt, mut cooling, mut failed_over) = (0usize, None, None);
+        let (mut attempt, mut passed, mut failed_over) = (0usize, super::Passed::default(), None);
         for id in &plan.deployment_ids {
             if attempt == plan.max_attempts {
                 break;
@@ -434,7 +434,7 @@ impl Engine {
                 Uuid::now_v7()
             };
             let Some(probe) = self
-                .usable(&plan, *id, request_id, deadline, attempt > 0, &mut cooling)
+                .usable(&plan, *id, request_id, deadline, attempt > 0, &mut passed)
                 .await?
             else {
                 continue;
@@ -463,8 +463,16 @@ impl Engine {
             .await
             .map_err(|_| InferenceError::Timeout)
             .and_then(|admitted| admitted);
-            // A probe slot it held is freed as `probe` drops.
-            admitted?;
+            // A probe slot it held is freed as `probe` drops. Refused as
+            // drained since the plan was read: nothing was admitted or sent,
+            // and the next route is tried without spending an attempt.
+            match admitted {
+                Err(InferenceError::RouteDrained(seconds)) => {
+                    passed.drain(seconds);
+                    continue;
+                }
+                other => other?,
+            };
             // Non-generation workloads carry no trace correlation id.
             let mut guard = ExecutionGuard::new(
                 self.repository.clone(),
@@ -549,7 +557,7 @@ impl Engine {
                 }
             }
         }
-        Err(super::exhausted(cooling, attempt, failed_over))
+        Err(super::exhausted(passed, attempt, failed_over))
     }
 }
 

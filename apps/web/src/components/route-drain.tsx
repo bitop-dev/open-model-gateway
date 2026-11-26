@@ -26,7 +26,11 @@ function DrainActions({ path, name, drain, asOf, noun }: { path: string; name: s
       { name: "reason", label: "Reason", type: "textarea", required: true, maxLength: DRAIN_REASON_MAX, value: active ? drain.reason : "", help: "Shown to admins and auditors and kept in the audit log; never shown to API clients." },
       { name: "hours", label: "Ends after (hours)", type: "number", min: 1, max: 8784, value: "", help: "Leave empty to drain until someone ends it." },
     ],
-    run: (values, signal) => api(path, { method: "PUT", body: { reason: values.reason, until: drainUntil(asOf, values.hours ?? "") }, signal }),
+    // `until` is measured from the gateway's clock at submit, not at page load.
+    run: async (values, signal) => {
+      const now = values.hours?.trim() ? (await api<{ as_of: string }>(path, { signal })).as_of : asOf;
+      return api(path, { method: "PUT", body: { reason: values.reason, until: drainUntil(now, values.hours ?? "") }, signal });
+    },
   });
   const end = () => ask({ title: `End drain · ${name}`, description: `The ${noun} takes new requests again at once.`, submitLabel: "End drain", successNotice: "Drain ended.", run: (_, signal) => api(path, { method: "DELETE", signal }) });
   return <Inline gap={2}><Button size="sm" variant="secondary" onClick={edit}>{active ? "Change drain…" : `Drain ${noun}…`}</Button>{drain && <Button size="sm" variant="secondary" onClick={end}>{active ? "End drain" : "Clear ended drain"}</Button>}</Inline>;

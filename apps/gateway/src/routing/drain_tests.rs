@@ -161,6 +161,43 @@ async fn a_drained_connection_drains_every_route_on_it(pool: PgPool) {
         Err(InferenceError::RouteDrained(Some(s))) => assert!((280..=300).contains(&s), "{s}"),
         other => panic!("{other:?}"),
     }
+    // The other way round: the connection's drain ends later.
+    drain(
+        &f,
+        "provider_connections",
+        connection,
+        "clock_timestamp()+interval '300 seconds'",
+    )
+    .await;
+    drain(
+        &f,
+        "deployments",
+        route.id,
+        "clock_timestamp()+interval '60 seconds'",
+    )
+    .await;
+    match plan_of(&f, &route).await {
+        Err(InferenceError::RouteDrained(Some(s))) => assert!((280..=300).contains(&s), "{s}"),
+        other => panic!("{other:?}"),
+    }
+    // One drain without an end: no `Retry-After`.
+    drain(&f, "deployments", route.id, "NULL").await;
+    assert_eq!(
+        plan_of(&f, &route).await,
+        Err(InferenceError::RouteDrained(None))
+    );
+    // A drained connection with an expired deployment drain: the connection's.
+    drain(
+        &f,
+        "deployments",
+        route.id,
+        "clock_timestamp()-interval '1 second'",
+    )
+    .await;
+    match plan_of(&f, &route).await {
+        Err(InferenceError::RouteDrained(Some(s))) => assert!((280..=300).contains(&s), "{s}"),
+        other => panic!("{other:?}"),
+    }
     // Drained and its circuit open too: it returns when the drain ends,
     // not when the cooldown does.
     sqlx::query("INSERT INTO deployment_health(deployment_id,consecutive_failures,open_until,last_observed_at,reopen_count) VALUES($1,3,clock_timestamp()+interval '30 seconds',clock_timestamp(),1)")
