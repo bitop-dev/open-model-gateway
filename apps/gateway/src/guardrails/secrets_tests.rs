@@ -94,7 +94,7 @@ fn secrets() -> PatternDetector {
 fn found(detector: &PatternDetector, text: &str) -> usize {
     let mut input = Inspection::default();
     input.push(text, Part::Content);
-    detector.scan(&input).0.len()
+    detector.scan(&input).unwrap().0.len()
 }
 
 #[test]
@@ -168,7 +168,7 @@ fn a_repeated_value_counts_once() {
     let second = format!("again {key}");
     input.push(&first, Part::Content);
     input.push(&second, Part::ToolArguments);
-    let findings = d.scan(&input);
+    let findings = d.scan(&input).unwrap();
     assert_eq!(findings.0.len(), 2);
     assert_eq!(findings.distinct(&input, Category::Secret), 1);
 }
@@ -228,6 +228,40 @@ fn a_hostile_custom_pattern_is_bounded_by_windows_and_the_budget() {
 }
 
 #[test]
+fn windows_neither_lose_long_values_nor_invent_boundaries() {
+    let budget = || Budget::new(std::time::Duration::from_secs(5));
+    // A value longer than the overlap, cut by the first window's end.
+    let password = PatternDetector::new(
+        &[Category::Custom],
+        &[r"(?i)password\s*[:=]\s*\S+".to_owned()],
+    )
+    .unwrap();
+    let text = format!("{}password=hunter2{}", "x ".repeat(1498), "A".repeat(1200));
+    let mut input = Inspection::default();
+    input.push(&text, Part::Content);
+    let found = password.custom_findings(&input, &budget()).unwrap();
+    assert_eq!(found.0.len(), 1);
+    assert_eq!(&text[found.0[0].span.clone()], &text[2996..]);
+    // A word boundary is judged on the whole text, not where a window starts.
+    let word = PatternDetector::new(&[Category::Custom], &[r"\bfoo\b".to_owned()]).unwrap();
+    let text = format!("{}yfoo{}", "y".repeat(3071), " ".repeat(2000));
+    let mut input = Inspection::default();
+    input.push(&text, Part::Content);
+    assert!(
+        word.custom_findings(&input, &budget())
+            .unwrap()
+            .0
+            .is_empty()
+    );
+    // A short segment that never matches still checks the budget.
+    let slow = PatternDetector::new(&[Category::Custom], &["qqqq".to_owned()]).unwrap();
+    let mut input = Inspection::default();
+    input.push("short", Part::Content);
+    let spent = Budget::new(std::time::Duration::ZERO);
+    assert!(slow.custom_findings(&input, &spent).is_err());
+}
+
+#[test]
 fn a_value_cut_by_a_window_is_found_whole_and_counted_once() {
     let custom = PatternDetector::new(&[Category::Custom], &["ACME-[0-9]+".to_owned()]).unwrap();
     // The value straddles the first window's end.
@@ -245,7 +279,7 @@ fn a_scan_keeps_a_bounded_number_of_matches() {
     let mut input = Inspection::default();
     let text = "x".repeat(MAX_FINDINGS * 3);
     input.push(&text, Part::Content);
-    assert_eq!(custom.scan(&input).0.len(), MAX_FINDINGS);
+    assert_eq!(custom.scan(&input).unwrap().0.len(), MAX_FINDINGS);
     assert!(custom.has_custom());
 }
 

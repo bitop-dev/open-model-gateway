@@ -141,9 +141,17 @@ impl PatternDetector {
     /// `None` when a custom pattern no longer compiles within the limits (the
     /// rule then fails like a detector that cannot run).
     pub fn new(categories: &[Category], patterns: &[String]) -> Option<Self> {
+        Self::within(categories, patterns, super::patterns::Limit::Local)
+    }
+    /// As [`PatternDetector::new`], for patterns of a layer with `limit`.
+    pub fn within(
+        categories: &[Category],
+        patterns: &[String],
+        limit: super::patterns::Limit,
+    ) -> Option<Self> {
         let custom = patterns
             .iter()
-            .map(|p| super::patterns::compile(p))
+            .map(|p| super::patterns::compile_within(p, limit))
             .collect::<Option<Vec<_>>>()?;
         Some(Self {
             categories: categories.to_vec(),
@@ -151,20 +159,17 @@ impl PatternDetector {
             custom,
         })
     }
-    /// Every match, synchronously (the detector never waits on anything).
-    pub fn scan(&self, input: &Inspection<'_>) -> Findings {
+    /// Every match, synchronously (the detector never waits on anything);
+    /// `BudgetSpent` when the custom patterns ran out of time.
+    pub fn scan(&self, input: &Inspection<'_>) -> Result<Findings, BudgetSpent> {
         let mut found = if self.secrets {
             builtin(input).0
         } else {
             Vec::new()
         };
         let budget = Budget::new(super::enforce::CUSTOM_BUDGET);
-        found.extend(
-            self.custom_findings(input, &budget)
-                .map(|f| f.0)
-                .unwrap_or_default(),
-        );
-        Findings(found)
+        found.extend(self.custom_findings(input, &budget)?.0);
+        Ok(Findings(found))
     }
     /// Whether the rule has custom patterns.
     pub fn has_custom(&self) -> bool {
@@ -175,12 +180,15 @@ impl PatternDetector {
         self.secrets
     }
     /// Matches of the rule's custom patterns, within a time budget: a
-    /// custom pattern is any user's, so its cost per byte is too. Text is
-    /// scanned in windows of `WINDOW` bytes overlapping by `OVERLAP`, so one
-    /// regex call is bounded, and the budget is checked between windows and
-    /// matches; spent, the scan stops with `BudgetSpent` (the rule then fails
-    /// under its `on_error`). A match up to `OVERLAP` bytes long is found
-    /// whole in some window; empty matches never count.
+    /// custom pattern may be any user's, so its cost per byte is too. Each
+    /// step searches the text from its position, with the text before it as
+    /// context (so `\b` and `^` mean what they mean in the whole text), but
+    /// only up to `WINDOW` bytes ahead, so one regex call is bounded; the
+    /// budget is checked before every call, and spent, the scan stops with
+    /// `BudgetSpent` (the rule then fails under its `on_error`). A match cut
+    /// by that horizon is searched again up to `EXTEND` bytes further and
+    /// counted. A match that needs more than `OVERLAP` bytes past the horizon
+    /// to start matching at all can be missed; empty matches never count.
     pub fn custom_findings(
         &self,
         input: &Inspection<'_>,
@@ -190,35 +198,40 @@ impl PatternDetector {
         for (index, segment) in input.segments.iter().enumerate() {
             let text: &str = &segment.text;
             for pattern in &self.custom {
-                let mut start = 0;
-                loop {
-                    let end = boundary(text, (start + WINDOW).min(text.len()));
-                    let last = end == text.len();
-                    for m in pattern.find_iter(&text[start..end]) {
-                        if budget.spent() {
-                            return Err(BudgetSpent);
+                let mut pos = 0;
+                while pos < text.len() {
+                    budget.check()?;
+                    let end = boundary(text, (pos + WINDOW).min(text.len()));
+                    let Some(mut m) = pattern.find_at(&text[..end], pos) else {
+                        if end == text.len() {
+                            break;
                         }
-                        // Cut by the window's end: found whole in the next one.
-                        if m.is_empty() || (!last && m.end() == end - start) {
-                            continue;
+                        let back = boundary(text, end - OVERLAP.min(end - pos));
+                        pos = boundary_up(text, back.max(pos + 1));
+                        continue;
+                    };
+                    if m.end() == end && end < text.len() {
+                        budget.check()?;
+                        let further = boundary(text, (m.start() + EXTEND).min(text.len()));
+                        if let Some(longer) = pattern.find_at(&text[..further], m.start()) {
+                            m = longer;
                         }
+                    }
+                    if !m.is_empty() {
                         if found.len() == MAX_FINDINGS {
                             return Ok(Findings(found));
                         }
                         found.push(Finding {
                             category: Category::Custom,
                             segment: index,
-                            span: start + m.start()..start + m.end(),
+                            span: m.range(),
                         });
                     }
-                    if last {
-                        break;
-                    }
-                    if budget.spent() {
-                        return Err(BudgetSpent);
-                    }
-                    let back = boundary(text, end.saturating_sub(OVERLAP));
-                    start = boundary_up(text, back.max(start + 1));
+                    pos = if m.end() > pos {
+                        m.end()
+                    } else {
+                        boundary_up(text, pos + 1)
+                    };
                 }
             }
         }
@@ -226,10 +239,12 @@ impl PatternDetector {
     }
 }
 
-/// Bytes of text one custom-pattern call scans, and the overlap of
-/// consecutive windows.
+/// How far ahead one custom-pattern call looks; after a window without a
+/// match the next starts `OVERLAP` bytes before its end; a match cut by the
+/// window is searched again up to `EXTEND` bytes from its start.
 const WINDOW: usize = 4096;
 const OVERLAP: usize = 1024;
+const EXTEND: usize = 8192;
 
 /// The time a request's custom patterns may take in all.
 pub struct Budget(std::time::Instant);
@@ -237,8 +252,12 @@ impl Budget {
     pub fn new(limit: std::time::Duration) -> Self {
         Self(std::time::Instant::now() + limit)
     }
-    fn spent(&self) -> bool {
-        std::time::Instant::now() >= self.0
+    fn check(&self) -> Result<(), BudgetSpent> {
+        if std::time::Instant::now() >= self.0 {
+            Err(BudgetSpent)
+        } else {
+            Ok(())
+        }
     }
 }
 /// A request's custom-pattern budget ran out.
@@ -276,7 +295,7 @@ impl Detector for PatternDetector {
         _ctx: &DetectContext,
         input: &Inspection<'_>,
     ) -> Result<Findings, DetectorError> {
-        Ok(self.scan(input))
+        self.scan(input).map_err(|_| DetectorError::Timeout)
     }
 }
 

@@ -69,10 +69,12 @@ impl Policy {
             }
             let categories: Vec<Category> = rule.detector.categories.iter().copied().collect();
             let runner = match rule.detector.kind {
-                DetectorKind::Pattern if runnable => {
-                    PatternDetector::new(&categories, &rule.detector.patterns)
-                        .map_or(Runner::CannotRun, Runner::Pattern)
-                }
+                DetectorKind::Pattern if runnable => PatternDetector::within(
+                    &categories,
+                    &rule.detector.patterns,
+                    super::patterns::Limit::of(e.layer),
+                )
+                .map_or(Runner::CannotRun, Runner::Pattern),
                 _ => Runner::CannotRun,
             };
             rules.push(CompiledRule {
@@ -260,19 +262,22 @@ impl Policy {
             };
             let blocking = r.action == InputAction::Block;
             if let Some(input) = input {
-                let Ok(custom) = detector.custom_findings(input, &budget) else {
-                    // The request's custom-pattern budget ran out: this rule
-                    // gave no verdict.
+                // The request's custom-pattern budget may run out: the rule's
+                // custom category then gives no verdict and fails under its
+                // on_error, while its built-in secret shapes still decide.
+                let custom = detector.custom_findings(input, &budget);
+                if custom.is_err() {
                     failed(&mut decision, r, Category::Custom);
-                    continue;
-                };
+                }
                 for &category in &r.categories {
                     let count = if category == Category::Secret && detector.secrets() {
                         builtin
                             .get_or_insert_with(|| super::secrets::builtin(input))
                             .distinct(input, category)
-                    } else {
+                    } else if let Ok(custom) = &custom {
                         custom.distinct(input, category)
+                    } else {
+                        continue;
                     };
                     if count == 0 {
                         continue;

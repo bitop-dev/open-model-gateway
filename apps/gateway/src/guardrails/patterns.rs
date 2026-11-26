@@ -1,22 +1,51 @@
-//! Custom patterns: compiled with fixed limits, so an administrator's pattern
-//! cannot exhaust memory or time. A pattern is compiled at save; whatever later
-//! compiles stored patterns uses `compile` too, so it holds the same limits. The `regex` crate matches in time linear in the input (no
-//! backtracking), and these limits bound what a compiled pattern may hold.
+//! Custom patterns: compiled with fixed limits, so a pattern cannot exhaust
+//! memory or time. A pattern is compiled at save; whatever later compiles
+//! stored patterns uses `compile` too, so it holds the same limits. The
+//! `regex` crate matches in time linear in the input (no backtracking); these
+//! limits bound what a compiled pattern may hold, and so the work per byte.
 use regex::{Regex, RegexBuilder};
 
-/// The compiled program of one pattern (the crate's default is 10 MiB). A
-/// custom pattern is any user's (a personal workspace's owner writes its local
-/// layer), and a program this small also bounds the work per scanned byte when
-/// a pattern defeats the lazy DFA.
-pub const COMPILED_LIMIT: usize = 64 << 10;
+/// Who wrote a pattern, which sets its program limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Limit {
+    /// A platform layer (Platform Admins): up to 1 MiB, so Unicode classes
+    /// (`\w`, `\d`, `\b`) fit.
+    Platform,
+    /// A local layer, which any user writes for a personal workspace: up to
+    /// 64 KiB, which also bounds the work per scanned byte when a pattern
+    /// defeats the lazy DFA (ASCII classes such as `[0-9]` or `(?-u:\w)` stay
+    /// small).
+    Local,
+}
+impl Limit {
+    /// The compiled program of one pattern (the crate's default is 10 MiB).
+    pub fn program(self) -> usize {
+        match self {
+            Self::Platform => 1 << 20,
+            Self::Local => 64 << 10,
+        }
+    }
+    pub fn of(layer: super::policy::Layer) -> Self {
+        if layer == super::policy::Layer::WorkspaceLocal {
+            Self::Local
+        } else {
+            Self::Platform
+        }
+    }
+}
 /// The lazy DFA cache of one pattern (the crate's default is 2 MiB).
 pub const DFA_LIMIT: usize = 1 << 20;
 /// How deeply a pattern may nest (the crate's default is 250).
 pub const NEST_LIMIT: u32 = 64;
 
-/// Compile one custom pattern within the limits. The byte limit is checked
-/// before anything parses the pattern, so parsing is bounded too.
+/// Compile one custom pattern within the limits of a local layer.
 pub fn compile(pattern: &str) -> Option<Regex> {
+    compile_within(pattern, Limit::Local)
+}
+
+/// Compile one custom pattern within `limit`. The byte limit is checked
+/// before anything parses the pattern, so parsing is bounded too.
+pub fn compile_within(pattern: &str, limit: Limit) -> Option<Regex> {
     // PostgreSQL text cannot hold NUL, so such a pattern is never storable.
     if pattern.is_empty()
         || pattern.len() > super::policy::MAX_PATTERN_BYTES
@@ -25,7 +54,7 @@ pub fn compile(pattern: &str) -> Option<Regex> {
         return None;
     }
     let regex = RegexBuilder::new(pattern)
-        .size_limit(COMPILED_LIMIT)
+        .size_limit(limit.program())
         .dfa_size_limit(DFA_LIMIT)
         .nest_limit(NEST_LIMIT)
         .build()
@@ -43,9 +72,14 @@ pub fn compile(pattern: &str) -> Option<Regex> {
     (!empty).then_some(regex)
 }
 
-/// Whether a pattern compiles within the limits (the save-time check).
+/// Whether a pattern compiles within a local layer's limits.
 pub fn valid(pattern: &str) -> bool {
     compile(pattern).is_some()
+}
+
+/// Whether a pattern compiles within `limit` (the save-time check).
+pub fn valid_within(pattern: &str, limit: Limit) -> bool {
+    compile_within(pattern, limit).is_some()
 }
 
 #[cfg(test)]

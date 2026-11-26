@@ -152,7 +152,11 @@ async fn compiled(body: &LayerIn, layer: Layer) -> Result<HashSet<String>> {
         &PLATFORM_COMPILES
     };
     in_slot(slots, move || {
-        wanted.into_iter().filter(|p| patterns::valid(p)).collect()
+        let limit = patterns::Limit::of(layer);
+        wanted
+            .into_iter()
+            .filter(|p| patterns::valid_within(p, limit))
+            .collect()
     })
     .await
 }
