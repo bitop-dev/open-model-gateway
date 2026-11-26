@@ -16,7 +16,10 @@ async fn key(
 async fn admission(store: &Store, principal: &Principal) -> Option<Uuid> {
     let mut tx = store.pool.begin().await.unwrap();
     lifecycle::lock(&mut tx).await.unwrap();
-    let value = revalidate(&mut tx, principal).await.unwrap();
+    let value = revalidate_admission(&mut tx, principal)
+        .await
+        .unwrap()
+        .map(|(lineage, _shared)| lineage);
     tx.commit().await.unwrap();
     value
 }

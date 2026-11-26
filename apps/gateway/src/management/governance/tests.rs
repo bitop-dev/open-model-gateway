@@ -982,34 +982,18 @@ mod db {
             "financial report under a held installation lock: {}ms",
             started.elapsed().as_millis()
         );
-        // ...and scoped admission (P3) never takes it either; the global
-        // admission mode (operational rollback) still serializes on it.
-        // Scoped mode must finish while the lock is still held; the bound is
-        // generous because slow CI runners can take well over 100ms for an
-        // uncontended admission. Global mode must still be waiting at 100ms.
+        // ...and admission never takes it either: it finishes while the lock
+        // is still held (the bound is generous because slow CI runners can
+        // take well over 100ms for an uncontended admission).
         let second = f.start();
-        let admission = crate::governance::admit(&f.store, &second, &req, 30);
-        tokio::pin!(admission);
-        let global = f.store.admission_mode() == crate::governance::locks::AdmissionMode::Global;
-        let bound = if global {
-            std::time::Duration::from_millis(100)
-        } else {
-            std::time::Duration::from_secs(10)
-        };
-        let first = tokio::time::timeout(bound, &mut admission).await;
-        assert_eq!(
-            first.is_err(),
-            global,
-            "scoped admission must not wait on the installation lock; global must"
-        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            crate::governance::admit(&f.store, &second, &req, 30),
+        )
+        .await
+        .expect("admission must not wait on the installation lock")
+        .unwrap();
         blocker.commit().await.unwrap();
-        match first {
-            Ok(result) => result.unwrap(),
-            Err(_) => tokio::time::timeout(std::time::Duration::from_secs(2), &mut admission)
-                .await
-                .unwrap()
-                .unwrap(),
-        }
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM governance_reservations")
                 .fetch_one(&f.store.pool)

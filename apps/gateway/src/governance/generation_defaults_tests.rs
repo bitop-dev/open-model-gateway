@@ -606,9 +606,9 @@ async fn wait_catalog_writer_blocked(pool: &sqlx::PgPool, admission: i32) -> i32
     )
     .await
 }
-async fn publication_barrier(pool: sqlx::PgPool, mode: locks::AdmissionMode) {
-    let mut f = fixture(pool).await;
-    f.store = f.store.with_admission_mode(mode);
+#[dbtest::test]
+async fn generation_defaults_publication_barrier(pool: sqlx::PgPool) {
+    let f = fixture(pool).await;
     let old = f.price(1_000_000).await;
     let d = f
         .store
@@ -617,20 +617,12 @@ async fn publication_barrier(pool: sqlx::PgPool, mode: locks::AdmissionMode) {
         .unwrap()
         .remove(0);
     let mut blocker = f.store.pool.begin().await.unwrap();
-    match mode {
-        locks::AdmissionMode::Scoped => locks::exclusive(
-            &mut blocker,
-            [locks::Scope::Workspace(f.principal.workspace_id)],
-        )
-        .await
-        .unwrap(),
-        locks::AdmissionMode::Global => {
-            sqlx::query("SELECT id FROM installation FOR NO KEY UPDATE")
-                .execute(&mut *blocker)
-                .await
-                .unwrap();
-        }
-    }
+    locks::exclusive(
+        &mut blocker,
+        [locks::Scope::Workspace(f.principal.workspace_id)],
+    )
+    .await
+    .unwrap();
     let s = f.start();
     let mut r = request();
     r.max_output_tokens = None;
@@ -702,14 +694,6 @@ async fn publication_barrier(pool: sqlx::PgPool, mode: locks::AdmissionMode) {
         .unwrap(),
         new
     );
-}
-#[dbtest::test]
-async fn generation_defaults_publication_barrier_scoped(pool: sqlx::PgPool) {
-    publication_barrier(pool, locks::AdmissionMode::Scoped).await;
-}
-#[dbtest::test]
-async fn generation_defaults_publication_barrier_global(pool: sqlx::PgPool) {
-    publication_barrier(pool, locks::AdmissionMode::Global).await;
 }
 
 #[dbtest::test]

@@ -120,7 +120,6 @@ fn span_name(span: &telemetry::Span) -> &'static str {
     match value["name"].as_str().unwrap() {
         "admission.queue" => "admission.queue",
         "admission.connect" => "admission.connect",
-        "admission.catalog_locks" => "admission.catalog_locks",
         "admission.authority_locks" => "admission.authority_locks",
         "admission.read" => "admission.read",
         "admission.totals_locks" => "admission.totals_locks",

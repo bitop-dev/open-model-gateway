@@ -547,9 +547,19 @@ pub(crate) mod db {
     #[dbtest::test]
     async fn credential_shared_locks_and_all_live_authority(pool: PgPool) {
         let f = fixture(pool).await;
+        // An admission's shared authority locks (taken before it reads the
+        // authority rows, without row locks) hold off a revocation, whose
+        // trigger takes the user's lock exclusively, until it commits.
         let mut tx = f.store.pool.begin().await.unwrap();
+        sqlx::query("SELECT * FROM omg_admission_locks($1,$2,$3)")
+            .bind(f.principal.workspace_id)
+            .bind(f.principal.user_id)
+            .bind(f.principal.key_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
         assert!(
-            crate::auth::revalidate(&mut tx, &f.principal)
+            crate::auth::revalidate_admission(&mut tx, &f.principal)
                 .await
                 .unwrap()
                 .is_some()

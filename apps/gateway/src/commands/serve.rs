@@ -317,7 +317,7 @@ async fn listen(
         .transpose()?
         .map(|listen| store.start_change_notifications(listen));
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
-    tracing::info!(address = %listener.local_addr()?, serving_web = web.is_some(), admission_mode = store.admission_mode().as_str(), config_cache = config.config_cache, work_lease_holder = %leases.holder(), "gateway listening");
+    tracing::info!(address = %listener.local_addr()?, serving_web = web.is_some(), config_cache = config.config_cache, work_lease_holder = %leases.holder(), "gateway listening");
     // Separate, optional metrics listener: never the public port or SPA.
     let metrics = match config.metrics_listen {
         Some(address) => {

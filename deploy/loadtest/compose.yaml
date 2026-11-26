@@ -24,8 +24,6 @@ x-gateway: &gateway
     DATABASE_URL: postgres://gateway_runtime:${OMG_LOADTEST_RUNTIME_PASSWORD:?run scripts/loadtest.py up}@${OMG_LOADTEST_DB_HOST:-pgbouncer}:${OMG_LOADTEST_DB_PORT:-6432}/${OMG_LOADTEST_DB:-omg_loadtest}
     GATEWAY_DATABASE_MAX_CONNECTIONS: ${OMG_LOADTEST_POOL:-10}
     GATEWAY_MAX_CONCURRENT_REQUESTS: ${OMG_LOADTEST_MAX_CONCURRENT:-128}
-    # Scoped admission locks (default) or the former installation row lock.
-    GATEWAY_ADMISSION_MODE: ${OMG_LOADTEST_ADMISSION_MODE:-scoped}
     # Per-replica caches (P4): LISTEN needs a session, so it always connects
     # to PostgreSQL directly, never through transaction-mode PgBouncer.
     GATEWAY_CONFIG_CACHE: ${OMG_LOADTEST_CONFIG_CACHE:-on}

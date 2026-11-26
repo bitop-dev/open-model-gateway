@@ -1268,3 +1268,83 @@ async fn an_unusable_oidc_ca_file_stops_startup_naming_the_setting(pool: sqlx::P
         "{stderr}"
     );
 }
+
+/// #853: the global admission mode was removed. `global`, or any value other
+/// than `scoped`, stops `serve` with an error naming the removal, before the
+/// database is contacted (a listener on the database address sees no
+/// connection), and the process exits non-zero; unset and `scoped` pass
+/// configuration and go on to dial the database.
+#[test]
+fn a_removed_or_invalid_admission_mode_stops_startup_before_the_database() {
+    let f = Fixture::new();
+    let database = TcpListener::bind("127.0.0.1:0").unwrap();
+    database.set_nonblocking(true).unwrap();
+    let url = format!(
+        "postgres://gateway:never-dialed-marker@{}/gateway",
+        database.local_addr().unwrap()
+    );
+    for (value, message) in [
+        (
+            "global",
+            "GATEWAY_ADMISSION_MODE=global was removed after v0.19.0 (#853)",
+        ),
+        ("Global", "GATEWAY_ADMISSION_MODE must be scoped"),
+        ("serialized", "GATEWAY_ADMISSION_MODE must be scoped"),
+        ("", "GATEWAY_ADMISSION_MODE must be scoped"),
+    ] {
+        let output = f.run(
+            &["serve"],
+            [
+                ("DATABASE_URL", url.as_str()),
+                ("GATEWAY_ADMISSION_MODE", value),
+            ],
+        );
+        assert_eq!(output.status.code(), Some(1), "{value:?}");
+        assert!(output.stdout.is_empty(), "{value:?}");
+        let stderr = text(&output.stderr);
+        assert!(stderr.contains(message), "{value:?}: {stderr}");
+        assert!(!stderr.contains("never-dialed-marker"), "{value:?}");
+        assert!(
+            matches!(database.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "{value:?}: the database was contacted"
+        );
+    }
+    // Accepted values reach the database: the process connects, and is
+    // stopped once it has.
+    for value in [None, Some("scoped")] {
+        let empty_env_file = f.secret("empty.env", "");
+        let mut command = Command::new(BINARY);
+        command
+            .arg("serve")
+            .env_clear()
+            .env("GATEWAY_ENV_FILE", empty_env_file)
+            .env("DATABASE_URL", &url)
+            .current_dir(f.dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Some(value) = value {
+            command.env("GATEWAY_ADMISSION_MODE", value);
+        }
+        let mut child = command.spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let connected = loop {
+            match database.accept() {
+                Ok(_) => break true,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("{e}"),
+            }
+            if std::time::Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            connected,
+            "{value:?}: configuration refused an accepted value"
+        );
+        // Drain any further connection attempts of this process.
+        while database.accept().is_ok() {}
+    }
+}

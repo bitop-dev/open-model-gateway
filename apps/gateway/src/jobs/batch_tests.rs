@@ -919,23 +919,7 @@ async fn omitted_batch_maxima_pin_parent_child_and_native_execution_without_rewr
 
 #[dbtest::test]
 async fn omitted_maximum_stale_planning_price_is_refused_before_parent_admission(pool: PgPool) {
-    stale_plan_is_refused_then_replanned(pool, crate::governance::locks::AdmissionMode::Scoped)
-        .await;
-}
-
-#[dbtest::test]
-async fn omitted_maximum_stale_planning_price_is_refused_in_global_admission(pool: PgPool) {
-    stale_plan_is_refused_then_replanned(pool, crate::governance::locks::AdmissionMode::Global)
-        .await;
-}
-
-async fn stale_plan_is_refused_then_replanned(
-    pool: PgPool,
-    mode: crate::governance::locks::AdmissionMode,
-) {
-    let mut w = world(pool, true, false, 1).await;
-    w.f.store = w.f.store.clone().with_admission_mode(mode);
-    w.jobs.store = w.f.store.clone();
+    let w = world(pool, true, false, 1).await;
     let f = &w.f;
     let mut line = chat_line("a", "company/smart", "default");
     line["body"]

@@ -621,16 +621,12 @@ impl Store {
             .await
             .map_err(route_lookup_storage)?;
         // Candidate planning only: admission re-checks everything live under
-        // its locks, so the scoped mode reads without row locks (no
-        // MultiXacts on authority rows in the hot path).
-        let lineage = if self.admission_mode == crate::governance::locks::AdmissionMode::Scoped {
-            crate::auth::revalidate_admission_with(&mut tx, principal, false)
-                .await
-                .map(|opt| opt.map(|(lineage, _shared)| lineage))
-        } else {
-            crate::auth::revalidate(&mut tx, principal).await
-        }
-        .map_err(route_lookup_storage)?;
+        // its locks, so this reads without row locks (no MultiXacts on
+        // authority rows in the hot path).
+        let lineage = crate::auth::revalidate_admission(&mut tx, principal)
+            .await
+            .map(|opt| opt.map(|(lineage, _shared)| lineage))
+            .map_err(route_lookup_storage)?;
         let Some(lineage) = lineage else {
             // The key is no longer valid (a stale key-cache hit, or revoked
             // since authentication): refuse it as authentication would.

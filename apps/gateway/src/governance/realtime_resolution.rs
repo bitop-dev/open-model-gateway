@@ -34,11 +34,10 @@ pub enum Resolved {
 /// - `Unauthenticated`: the actor's admin token was revoked meanwhile.
 ///
 /// Lock order (`governance::locks`): the shared catalog lock and the actor's
-/// workspace and user authority (or the installation lock in global mode),
-/// then the session's reservation row, then the response row, then the
-/// session's totals rows. Two resolutions of one session therefore serialize
-/// on its reservation row: the second sees what the first wrote, and exactly
-/// one settles the session.
+/// workspace and user authority, then the session's reservation row, then
+/// the response row, then the session's totals rows. Two resolutions of one
+/// session therefore serialize on its reservation row: the second sees what
+/// the first wrote, and exactly one settles the session.
 pub async fn resolve_response(
     store: &Store,
     workspace: Uuid,
@@ -216,11 +215,11 @@ async fn unrowed(
 
 async fn resolve_response_once(store: &Store, q: &Request<'_>) -> Result<Resolved, InferenceError> {
     let mut tx = super::reconcile::operator_tx(store, q.workspace, q.actor).await?;
-    let r = reservation(&mut tx, q.execution, scoped(store)).await?;
+    let r = reservation(&mut tx, q.execution).await?;
     if r.workspace_id != q.workspace || r.workload_kind != WorkloadKind::Realtime.as_str() {
         return Err(InferenceError::InvalidRequest);
     }
-    super::reconcile::operator_authorized(store, &mut tx, q.actor, q.workspace).await?;
+    super::reconcile::operator_authorized(&mut tx, q.actor, q.workspace).await?;
     let s = session(&mut tx, q.execution).await?;
     let (open, expired): (bool, bool) = sqlx::query_as(
         "SELECT state='started',error_code IS NOT DISTINCT FROM 'lease_expired' FROM inference_executions WHERE id=$1 AND started_at=$2",
@@ -280,7 +279,7 @@ async fn resolve_response_once(store: &Store, q: &Request<'_>) -> Result<Resolve
     let t = totals(&mut tx, q.execution).await?;
     let settles = accounted && t.responses == t.settled;
     if settles {
-        settle_session(store, &mut tx, &r, q.execution, q.evidence, &t, 0).await?;
+        settle_session(&mut tx, &r, q.execution, q.evidence, &t, 0).await?;
     }
     sqlx::query("INSERT INTO audit_events(id,workspace_id,actor_user_id,action,resource_type,resource_id,metadata,admin_token_id) VALUES($1,$2,$3,'realtime_response.reconciled','execution',$4,jsonb_build_object('sequence',$5::int,'session_settled',$6::boolean),$7)")
         .bind(Uuid::new_v4()).bind(q.workspace).bind(q.actor.user_id).bind(q.execution).bind(q.sequence).bind(settles).bind(q.actor.token_id)
@@ -297,7 +296,6 @@ async fn resolve_response_once(store: &Store, q: &Request<'_>) -> Result<Resolve
 /// with the responses' sum (`finish` would have written the same) and one
 /// `reconciliation` ledger entry carrying this resolution's evidence.
 async fn settle_session(
-    store: &Store,
     tx: &mut Tx<'_>,
     r: &settlement::Reservation,
     execution: Uuid,
@@ -324,7 +322,7 @@ async fn settle_session(
         ..MeterUsage::default()
     };
     let meter_json = serde_json::to_value(meters).map_err(|_| InferenceError::Storage)?;
-    lock_rows(store, tx, &[r.touch()], None).await?;
+    lock_rows(tx, &[r.touch()], None).await?;
     let settled = sqlx::query("UPDATE governance_reservations SET state='settled',actual_microusd=$3,input_tokens=$4,output_tokens=$5,billing_usage=NULL,cost_components=$6,meter_usage=$7 WHERE execution_id=$1 AND admitted_at=$2 AND state='unknown'")
         .bind(execution).bind(r.admitted_at).bind(t.actual).bind(t.input).bind(t.output).bind(components).bind(&meter_json)
         .execute(&mut **tx).await.map_err(storage)?.rows_affected();
@@ -411,11 +409,11 @@ async fn resolve_session_once(
     q: &SessionRequest<'_>,
 ) -> Result<Result<Resolved, SessionRefusal>, InferenceError> {
     let mut tx = super::reconcile::operator_tx(store, q.workspace, q.actor).await?;
-    let r = reservation(&mut tx, q.execution, scoped(store)).await?;
+    let r = reservation(&mut tx, q.execution).await?;
     if r.workspace_id != q.workspace || r.workload_kind != WorkloadKind::Realtime.as_str() {
         return Err(InferenceError::InvalidRequest);
     }
-    super::reconcile::operator_authorized(store, &mut tx, q.actor, q.workspace).await?;
+    super::reconcile::operator_authorized(&mut tx, q.actor, q.workspace).await?;
     let s = session(&mut tx, q.execution).await?;
     let (open, expired): (bool, bool) = sqlx::query_as(
         "SELECT state='started',error_code IS NOT DISTINCT FROM 'lease_expired' FROM inference_executions WHERE id=$1 AND started_at=$2",
@@ -460,7 +458,7 @@ async fn resolve_session_once(
     // A remainder stated as all zero is a request that was never served: it
     // is recorded (its window and evidence) but counts no request.
     let uncounted = i64::from(q.remainder.is_some_and(|(_, c)| c == [0; 6]));
-    settle_session(store, &mut tx, &r, q.execution, q.evidence, &t, uncounted).await?;
+    settle_session(&mut tx, &r, q.execution, q.evidence, &t, uncounted).await?;
     sqlx::query("INSERT INTO audit_events(id,workspace_id,actor_user_id,action,resource_type,resource_id,metadata,admin_token_id) VALUES($1,$2,$3,'realtime_session.reconciled','execution',$4,jsonb_build_object('remainder_sequence',$5::int),$6)")
         .bind(Uuid::new_v4()).bind(q.workspace).bind(q.actor.user_id).bind(q.execution).bind(remainder).bind(q.actor.token_id)
         .execute(&mut *tx).await.map_err(storage)?;

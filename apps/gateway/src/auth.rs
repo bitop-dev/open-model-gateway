@@ -150,57 +150,28 @@ impl Store {
     }
 }
 
-/// Caller holds catalog advisory lock (72419502), then installation row lock.
-/// SHARE prevents concurrent non-key revocation until admission commits.
-pub(crate) async fn revalidate(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    principal: &Principal,
-) -> Result<Option<Uuid>, sqlx::Error> {
-    revalidate_with(tx, principal, true).await
-}
-
-/// [`revalidate`] in one round trip, for admission under the installation
-/// lock: the same live rules and the same `FOR SHARE` row locks (each locking
-/// CTE is fully read through `count(*)`, so every matching row is locked as
-/// the multi-statement form does). Equality with [`revalidate`] is tested.
-#[cfg(all(test, feature = "integration-tests"))]
-pub(crate) async fn revalidate_admission(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    principal: &Principal,
-) -> Result<Option<(Uuid, bool)>, sqlx::Error> {
-    revalidate_admission_with(tx, principal, true).await
-}
-
-/// [`revalidate_admission`] with (`lock`, the global admission mode) or
-/// without row locks (scoped admission: the caller holds the shared
-/// authority locks of the key's workspace, user and lineage
-/// (`governance::locks`), which every revocation takes exclusively, so the
-/// rows read cannot change until commit and no `FOR SHARE` is needed).
+/// One round trip for admission, which holds the shared authority locks of
+/// the key's workspace, user and lineage (`governance::locks`), and for
+/// candidate planning, which admission re-checks under those locks. Every
+/// revocation takes those locks exclusively, so under them the rows read
+/// cannot change until commit and no row lock is needed (no MultiXacts on
+/// authority rows in the hot path). The same live rules as
+/// [`revalidate_snapshot`] (equality is tested).
 /// The second element of a live result is whether the admitting workspace is
 /// shared (`team`/`project`): the authoritative, live-revalidated kind the
 /// admission commit path uses to decide trace export eligibility
 /// (`governance::admit_unobserved`), never a cached or client-asserted kind.
-pub(crate) async fn revalidate_admission_with(
+pub(crate) async fn revalidate_admission(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     principal: &Principal,
-    lock: bool,
 ) -> Result<Option<(Uuid, bool)>, sqlx::Error> {
     type Row = (Uuid, String, Option<Uuid>, i64, i64, i64, i64);
-    static UNLOCKED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        ADMISSION_SQL
-            .replace(" FOR SHARE OF k,w", "")
-            .replace(" FOR SHARE", "")
-    });
-    let row: Option<Row> = sqlx::query_as(if lock {
-        ADMISSION_SQL
-    } else {
-        UNLOCKED.as_str()
-    })
-    .bind(principal.workspace_id)
-    .bind(principal.key_id)
-    .bind(principal.user_id)
-    .fetch_optional(&mut **tx)
-    .await?;
+    let row: Option<Row> = sqlx::query_as(ADMISSION_SQL)
+        .bind(principal.workspace_id)
+        .bind(principal.key_id)
+        .bind(principal.user_id)
+        .fetch_optional(&mut **tx)
+        .await?;
     let Some((lineage, kind, owner, user, roles, grants, account)) = row else {
         return Ok(None);
     };
@@ -220,43 +191,27 @@ const ADMISSION_SQL: &str = "WITH k AS MATERIALIZED (SELECT k.governance_key_id 
           JOIN workspaces w ON w.id=k.workspace_id WHERE k.workspace_id=$1 AND k.id=$2
           AND k.issued_to_user_id IS NOT DISTINCT FROM $3::uuid
           AND k.revoked_at IS NULL AND k.disabled_at IS NULL AND (k.expires_at IS NULL OR k.expires_at>clock_timestamp())
-          AND w.disabled_at IS NULL FOR SHARE OF k,w),
-        u AS MATERIALIZED (SELECT id FROM users WHERE $3::uuid IS NOT NULL AND EXISTS(SELECT 1 FROM k) AND id=$3 AND disabled_at IS NULL AND cleaned_at IS NULL FOR SHARE),
-        r AS MATERIALIZED (SELECT id FROM platform_role_grants WHERE EXISTS(SELECT 1 FROM u) AND user_id=$3 AND revoked_at IS NULL FOR SHARE),
+          AND w.disabled_at IS NULL),
+        u AS MATERIALIZED (SELECT id FROM users WHERE $3::uuid IS NOT NULL AND EXISTS(SELECT 1 FROM k) AND id=$3 AND disabled_at IS NULL AND cleaned_at IS NULL),
+        r AS MATERIALIZED (SELECT id FROM platform_role_grants WHERE EXISTS(SELECT 1 FROM u) AND user_id=$3 AND revoked_at IS NULL),
         g AS MATERIALIZED (SELECT id FROM workspace_membership_grants WHERE EXISTS(SELECT 1 FROM r) AND EXISTS(SELECT 1 FROM k WHERE kind IN('team','project'))
-          AND workspace_id=$1 AND user_id=$3 AND revoked_at IS NULL FOR SHARE),
+          AND workspace_id=$1 AND user_id=$3 AND revoked_at IS NULL),
         s AS MATERIALIZED (SELECT id FROM service_accounts WHERE $3::uuid IS NULL AND EXISTS(SELECT 1 FROM k WHERE kind IN('team','project'))
-          AND workspace_id=$1 AND id=(SELECT account FROM k) AND disabled_at IS NULL FOR SHARE)
+          AND workspace_id=$1 AND id=(SELECT account FROM k) AND disabled_at IS NULL)
         SELECT k.lineage,k.kind,k.owner,(SELECT count(*) FROM u),(SELECT count(*) FROM r),(SELECT count(*) FROM g),(SELECT count(*) FROM s) FROM k";
 
-/// [`revalidate`] without row locks, for read-only snapshot reads
-/// (`crate::reporting`, e.g. `/v1/models`): the same live rules evaluated in
-/// the caller's snapshot. Never for admission, which must lock.
+/// The live authority rules evaluated in the caller's snapshot without row
+/// locks: read-only reads (`crate::reporting`, e.g. `/v1/models`) and the
+/// reference [`revalidate_admission`] is tested against.
 pub(crate) async fn revalidate_snapshot(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     principal: &Principal,
 ) -> Result<Option<Uuid>, sqlx::Error> {
-    revalidate_with(tx, principal, false).await
-}
-
-async fn revalidate_with(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    principal: &Principal,
-    lock: bool,
-) -> Result<Option<Uuid>, sqlx::Error> {
-    let share = |sql: &'static str, locked: &'static str| if lock { locked } else { sql };
-    let row: Option<(Uuid, Option<Uuid>, String, Option<Uuid>)> = sqlx::query_as(share(
-        "SELECT k.governance_key_id,k.service_account_id,w.kind,w.owner_user_id FROM api_keys k
+    let row: Option<(Uuid, Option<Uuid>, String, Option<Uuid>)> = sqlx::query_as("SELECT k.governance_key_id,k.service_account_id,w.kind,w.owner_user_id FROM api_keys k
          JOIN workspaces w ON w.id=k.workspace_id WHERE k.workspace_id=$1 AND k.id=$2
          AND k.issued_to_user_id IS NOT DISTINCT FROM $3::uuid
          AND k.revoked_at IS NULL AND k.disabled_at IS NULL AND (k.expires_at IS NULL OR k.expires_at>clock_timestamp())
-         AND w.disabled_at IS NULL",
-        "SELECT k.governance_key_id,k.service_account_id,w.kind,w.owner_user_id FROM api_keys k
-         JOIN workspaces w ON w.id=k.workspace_id WHERE k.workspace_id=$1 AND k.id=$2
-         AND k.issued_to_user_id IS NOT DISTINCT FROM $3::uuid
-         AND k.revoked_at IS NULL AND k.disabled_at IS NULL AND (k.expires_at IS NULL OR k.expires_at>clock_timestamp())
-         AND w.disabled_at IS NULL FOR SHARE OF k,w",
-    ))
+         AND w.disabled_at IS NULL")
     .bind(principal.workspace_id)
     .bind(principal.key_id)
     .bind(principal.user_id)
@@ -266,17 +221,18 @@ async fn revalidate_with(
         return Ok(None);
     };
     if let Some(user) = principal.user_id {
-        let active: Option<Uuid> = sqlx::query_scalar(share(
+        let active: Option<Uuid> = sqlx::query_scalar(
             "SELECT id FROM users WHERE id=$1 AND disabled_at IS NULL AND cleaned_at IS NULL",
-            "SELECT id FROM users WHERE id=$1 AND disabled_at IS NULL AND cleaned_at IS NULL FOR SHARE",
-        )).bind(user).fetch_optional(&mut **tx).await?;
+        )
+        .bind(user)
+        .fetch_optional(&mut **tx)
+        .await?;
         if active.is_none() {
             return Ok(None);
         }
-        let roles: Vec<Uuid> = sqlx::query_scalar(share(
+        let roles: Vec<Uuid> = sqlx::query_scalar(
             "SELECT id FROM platform_role_grants WHERE user_id=$1 AND revoked_at IS NULL",
-            "SELECT id FROM platform_role_grants WHERE user_id=$1 AND revoked_at IS NULL FOR SHARE",
-        ))
+        )
         .bind(user)
         .fetch_all(&mut **tx)
         .await?;
@@ -290,16 +246,10 @@ async fn revalidate_with(
             return Ok(None);
         }
         // Global administrative authority is deliberately NOT shared-workspace membership.
-        let grants: Vec<Uuid> = sqlx::query_scalar(share(
-            "SELECT id FROM workspace_membership_grants WHERE workspace_id=$1 AND user_id=$2 AND revoked_at IS NULL",
-            "SELECT id FROM workspace_membership_grants WHERE workspace_id=$1 AND user_id=$2 AND revoked_at IS NULL FOR SHARE",
-        )).bind(principal.workspace_id).bind(user).fetch_all(&mut **tx).await?;
+        let grants: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM workspace_membership_grants WHERE workspace_id=$1 AND user_id=$2 AND revoked_at IS NULL").bind(principal.workspace_id).bind(user).fetch_all(&mut **tx).await?;
         Ok((!grants.is_empty()).then_some(lineage))
     } else if matches!(kind.as_str(), "team" | "project") {
-        let account: Option<Uuid> = sqlx::query_scalar(share(
-            "SELECT id FROM service_accounts WHERE workspace_id=$1 AND id=$2 AND disabled_at IS NULL",
-            "SELECT id FROM service_accounts WHERE workspace_id=$1 AND id=$2 AND disabled_at IS NULL FOR SHARE",
-        )).bind(principal.workspace_id).bind(service_account).fetch_optional(&mut **tx).await?;
+        let account: Option<Uuid> = sqlx::query_scalar("SELECT id FROM service_accounts WHERE workspace_id=$1 AND id=$2 AND disabled_at IS NULL").bind(principal.workspace_id).bind(service_account).fetch_optional(&mut **tx).await?;
         Ok(account.map(|_| lineage))
     } else {
         Ok(None)
