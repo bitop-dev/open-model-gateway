@@ -344,8 +344,7 @@ async fn leaves(pool: &PgPool, table: &str) -> Vec<String> {
 /// code path takes no row lock on any parent (workspaces, keys, deployments,
 /// price versions, cost centers: every tuple's `t_xmax` is unchanged) and
 /// creates no MultiXact on history rows. A positive control shows the probe
-/// detects the `FOR KEY SHARE` MultiXacts a foreign key creates. (Global
-/// admission mode reads parents `FOR SHARE` by design and is not probed.)
+/// detects the `FOR KEY SHARE` MultiXacts a foreign key creates.
 #[dbtest::test]
 async fn concurrent_admissions_lock_no_parent_rows(pool: PgPool) {
     sqlx::query("CREATE EXTENSION IF NOT EXISTS pageinspect")
@@ -389,10 +388,6 @@ async fn concurrent_admissions_lock_no_parent_rows(pool: PgPool) {
         .execute(&pool)
         .await
         .unwrap();
-    if f.store.admission_mode() != crate::governance::locks::AdmissionMode::Scoped {
-        return;
-    }
-
     const PARENTS: [&str; 5] = [
         "workspaces",
         "api_keys",

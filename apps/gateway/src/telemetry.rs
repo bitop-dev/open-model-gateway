@@ -105,7 +105,7 @@ fixed_enum!(SpanName {
     UpstreamAttempt => "upstream.attempt", Settlement => "settlement",
     RatePrune => "rate_prune", LockWaitPrune => "lock_wait_prune",
     AdmissionQueue => "admission.queue", AdmissionConnect => "admission.connect",
-    AdmissionCatalogLocks => "admission.catalog_locks", AdmissionAuthorityLocks => "admission.authority_locks",
+    AdmissionAuthorityLocks => "admission.authority_locks",
     AdmissionRead => "admission.read", AdmissionPrice => "admission.price", AdmissionTotalsLocks => "admission.totals_locks",
     AdmissionLimits => "admission.limits", AdmissionWrite => "admission.write", AdmissionCommit => "admission.commit",
     SettlementQueue => "settlement.queue", SettlementConnect => "settlement.connect", SettlementLocks => "settlement.locks",

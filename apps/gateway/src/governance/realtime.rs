@@ -182,7 +182,7 @@ async fn reserve_window_once(
     settlement_waiting(Waiting::Connection);
     let mut tx = crate::db::begin(&store.pool).await.map_err(begin_storage)?;
     settlement_waiting(Waiting::Database);
-    admission_prefix(store, &mut tx, principal, deadline).await?;
+    admission_prefix(&mut tx, principal).await?;
     let (lineage, _shared) = authorize(store, &mut tx, principal).await?;
     let s = session(&mut tx, id).await?;
     if s.workspace_id != principal.workspace_id
@@ -193,7 +193,7 @@ async fn reserve_window_once(
         return Err(InferenceError::Storage);
     }
     // Each new window is new work: the model must still be authorized.
-    let allowed: Option<Uuid> = sqlx::query_scalar(&format!("SELECT d.id FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id JOIN models m ON m.id=d.model_id WHERE d.id=$2 AND m.public_name=$3 AND workspace_model_allowed($1,m.id) AND d.enabled AND p.enabled AND 'realtime'=ANY(m.supported_protocols) AND (NOT EXISTS(SELECT 1 FROM key_model_restrictions WHERE workspace_id=$1 AND governance_key_id=$4) OR EXISTS(SELECT 1 FROM key_model_selections WHERE workspace_id=$1 AND governance_key_id=$4 AND model_id=m.id)){}", catalog_share(store)))
+    let allowed: Option<Uuid> = sqlx::query_scalar("SELECT d.id FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id JOIN models m ON m.id=d.model_id WHERE d.id=$2 AND m.public_name=$3 AND workspace_model_allowed($1,m.id) AND d.enabled AND p.enabled AND 'realtime'=ANY(m.supported_protocols) AND (NOT EXISTS(SELECT 1 FROM key_model_restrictions WHERE workspace_id=$1 AND governance_key_id=$4) OR EXISTS(SELECT 1 FROM key_model_selections WHERE workspace_id=$1 AND governance_key_id=$4 AND model_id=m.id))")
         .bind(s.workspace_id).bind(s.deployment_id).bind(model).bind(lineage)
         .fetch_optional(&mut *tx).await.map_err(storage)?;
     if allowed.is_none() {
@@ -220,10 +220,9 @@ async fn reserve_window_once(
         None => (None, None),
     };
     let grows = hold.is_none_or(|h| h > 0) || tokens.is_some_and(|(_, d)| d > 0);
-    // Scoped: the session's totals and minute rows (its admission buckets)
-    // before reading them; every admission in that minute locks them too.
+    // The session's totals and minute rows (its admission buckets) before
+    // reading them; every admission in that minute locks them too.
     lock_rows(
-        store,
         &mut tx,
         &[locks::Touch {
             workspace: s.workspace_id,
@@ -452,7 +451,6 @@ async fn settle_response_once(
     settlement_waiting(Waiting::Connection);
     let mut tx = crate::db::begin(&store.pool).await.map_err(begin_storage)?;
     settlement_waiting(Waiting::Database);
-    settlement_prefix(store, &mut tx).await?;
     let s = session(&mut tx, id).await?;
     if s.state != "pending" {
         return Err(InferenceError::Storage);
@@ -478,7 +476,6 @@ async fn settle_response_once(
     });
     let count = |f: fn(&RealtimeUsage) -> u64| usage.map(|u| f(&u) as i64);
     lock_rows(
-        store,
         &mut tx,
         &[locks::Touch {
             workspace: s.workspace_id,
@@ -585,8 +582,7 @@ async fn finish_once(store: &Store, record: &RealtimeFinish) -> Result<Finished,
     settlement_waiting(Waiting::Connection);
     let mut tx = crate::db::begin(&store.pool).await.map_err(begin_storage)?;
     settlement_waiting(Waiting::Database);
-    settlement_prefix(store, &mut tx).await?;
-    let r = reservation(&mut tx, record.id, scoped(store)).await?;
+    let r = reservation(&mut tx, record.id).await?;
     let s = session(&mut tx, record.id).await?;
     if r.state != "pending" {
         // Lease expiry already marked it unknown; never overwrite.
@@ -641,7 +637,7 @@ async fn finish_once(store: &Store, record: &RealtimeFinish) -> Result<Finished,
         ..MeterUsage::default()
     };
     let meter_json = serde_json::to_value(meters).map_err(|_| InferenceError::Storage)?;
-    lock_rows(store, &mut tx, &[r.touch()], None).await?;
+    lock_rows(&mut tx, &[r.touch()], None).await?;
     let changed = sqlx::query("UPDATE inference_executions SET state=$2,error_code=$3,input_tokens=$4,output_tokens=$5,billing_usage=NULL,elapsed_ms=$6,completed_at=clock_timestamp(),meter_usage=$7,finish_reason=$8,time_to_first_token_ms=$9,generation_ms=$10 WHERE id=$1 AND state='started'")
         .bind(record.id).bind(record.outcome.as_str()).bind(record.error.map(|e| e.code()))
         .bind(input).bind(output).bind(record.elapsed_ms.min(i64::MAX as u64) as i64).bind(&meter_json)

@@ -124,25 +124,14 @@ struct Gateway {
     pool: PgPool,
 }
 /// Holds the first row a window admission of the team workspace waits for:
-/// its lifetime totals row in the scoped mode, the installation row in the
-/// global mode (which locks no scope rows; every writer takes that row first).
+/// its lifetime totals row.
 async fn hold_admission_row(g: &Gateway) -> sqlx::Transaction<'static, sqlx::Postgres> {
     let mut held = g.pool.begin().await.unwrap();
-    match Store::new(g.pool.clone()).admission_mode() {
-        crate::governance::locks::AdmissionMode::Scoped => {
-            sqlx::query("SELECT 1 FROM budget_totals WHERE scope_kind='workspace' AND scope_id=$1 AND period='lifetime' FOR UPDATE")
-                .bind(g.keys.team_workspace_id)
-                .execute(&mut *held)
-                .await
-                .unwrap();
-        }
-        crate::governance::locks::AdmissionMode::Global => {
-            sqlx::query("SELECT 1 FROM installation WHERE singleton FOR NO KEY UPDATE")
-                .execute(&mut *held)
-                .await
-                .unwrap();
-        }
-    }
+    sqlx::query("SELECT 1 FROM budget_totals WHERE scope_kind='workspace' AND scope_id=$1 AND period='lifetime' FOR UPDATE")
+        .bind(g.keys.team_workspace_id)
+        .execute(&mut *held)
+        .await
+        .unwrap();
     held
 }
 fn line(meter: &str, amount: &str) -> Value {

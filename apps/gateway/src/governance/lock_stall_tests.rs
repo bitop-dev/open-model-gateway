@@ -223,7 +223,6 @@ async fn harness(
         .await
         .unwrap();
     let store = Store::new(runtime.clone()).with_admission_lock_wait(admission_lock_wait);
-    assert_eq!(store.admission_mode(), locks::AdmissionMode::Scoped);
     let calls = Arc::new(AtomicUsize::new(0));
     let counted = calls.clone();
     let upstream = Router::new().fallback(move |Json(_): Json<Value>| {
@@ -441,9 +440,9 @@ async fn sample_waits(
     (most, at_rows, any, samples)
 }
 
-/// `n` requests at once with `key`; their latencies, after asserting each
-/// succeeded.
-async fn burst(h: &Harness, key: &str, n: usize) -> (Vec<Duration>, (i64, i64, i64, i64)) {
+/// `n` requests at once with `key`: every response, and the lock waits
+/// sampled meanwhile.
+async fn send_burst(h: &Harness, key: &str, n: usize) -> (Vec<Sent>, (i64, i64, i64, i64)) {
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sampler = tokio::spawn(sample_waits(h.observer.clone(), done.clone()));
     let start = Instant::now();
@@ -456,27 +455,73 @@ async fn burst(h: &Harness, key: &str, n: usize) -> (Vec<Duration>, (i64, i64, i
             start,
         )));
     }
-    let mut latencies = Vec::new();
+    let mut sent = Vec::new();
     for s in sends {
-        let s = tokio::time::timeout(GUARD, s).await.unwrap().unwrap();
+        sent.push(tokio::time::timeout(GUARD, s).await.unwrap().unwrap());
+    }
+    done.store(true, Ordering::SeqCst);
+    (sent, sampler.await.unwrap())
+}
+
+/// `n` requests at once with `key`; their latencies, after asserting each
+/// succeeded.
+async fn burst(h: &Harness, key: &str, n: usize) -> (Vec<Duration>, (i64, i64, i64, i64)) {
+    let (sent, waits) = send_burst(h, key, n).await;
+    let mut latencies = Vec::new();
+    for s in sent {
         assert_eq!(s.status, 200, "{s:?}");
         latencies.push(s.latency);
     }
-    done.store(true, Ordering::SeqCst);
-    (latencies, sampler.await.unwrap())
+    (latencies, waits)
+}
+
+/// A measured burst, never asserted: the latencies of the requests that
+/// succeeded (the printed quantiles and `latency_over_admission_bound` are
+/// theirs), and how many did not, by outcome (`scope_busy`,
+/// `accounting_unavailable` or the HTTP status). Their accounting is still
+/// checked afterwards ([`assert_exact`]).
+async fn measured_burst(
+    h: &Harness,
+    key: &str,
+    n: usize,
+) -> (Vec<Duration>, std::collections::BTreeMap<String, usize>) {
+    let (sent, _) = send_burst(h, key, n).await;
+    let mut latencies = Vec::new();
+    let mut failed = std::collections::BTreeMap::new();
+    for s in sent {
+        if s.status == 200 {
+            latencies.push(s.latency);
+            continue;
+        }
+        let outcome = if s.shed {
+            "scope_busy".to_owned()
+        } else if s.accounting_unavailable {
+            "accounting_unavailable".to_owned()
+        } else {
+            format!("status_{}", s.status)
+        };
+        *failed.entry(outcome).or_insert(0) += 1;
+    }
+    (latencies, failed)
 }
 
 /// Accounting after a run: nothing pending once the settlements that did
 /// not finish are reconciled at lease expiry (unknown, hold kept), no
 /// execution settled twice, one upstream call per reservation (no replay),
 /// in-flight counters back to zero, and `budget verify` and `history verify`
-/// clean. Returns (settled, unknown).
-async fn assert_exact(h: &Harness) -> (i64, i64) {
+/// clean. `others` are further gateways on the same database: their replicas'
+/// gates must have drained too, and their upstream calls count with `h`'s.
+/// Every request has been answered, so every gate permit is back: a
+/// settlement past its deadline (`accounting_unavailable`) was dropped with
+/// its permit and its transaction, which never commits, before that answer.
+/// Returns (settled, unknown).
+async fn assert_exact(h: &Harness, others: &[&Harness]) -> (i64, i64) {
     // The settlement gate drained: every permit is back.
-    let expected = LockGates::for_pool(POOL_SIZE, locks::AdmissionMode::Scoped)
+    let expected = LockGates::for_pool(POOL_SIZE)
         .settlement
         .available_permits();
-    for (store, _, _) in &h.replicas {
+    let gateways = || std::iter::once(h).chain(others.iter().copied());
+    for (store, _, _) in gateways().flat_map(|g| &g.replicas) {
         assert_eq!(
             store.lock_gates.settlement.available_permits(),
             expected,
@@ -501,9 +546,9 @@ async fn assert_exact(h: &Harness) -> (i64, i64) {
     let unknown_settled: i64 = sqlx::query_scalar("SELECT count(*) FROM governance_reservations WHERE state='unknown' AND actual_microusd IS NOT NULL")
         .fetch_one(&h.owner).await.unwrap();
     assert_eq!(unknown_settled, 0, "an unknown outcome is never valued");
+    let calls: usize = gateways().map(|g| g.calls.load(Ordering::SeqCst)).sum();
     assert_eq!(
-        h.calls.load(Ordering::SeqCst) as i64,
-        reservations,
+        calls as i64, reservations,
         "one upstream call per reservation: nothing replayed"
     );
     let inflight: i64 =
@@ -602,7 +647,7 @@ async fn cold_buckets(setup: Setup) {
         ms(cold_max),
         ms(warm_max)
     );
-    let (settled, unknown) = assert_exact(&h).await;
+    let (settled, unknown) = assert_exact(&h, &[]).await;
     assert_eq!(
         (settled, unknown),
         ((BURST + 1 + 2 * ROUNDS * BURST) as i64, 0),
@@ -614,18 +659,24 @@ async fn cold_buckets(setup: Setup) {
     // own. A new backend's first executions plan and run slower, inside the
     // section where one scope's admissions serialize, so the first burst is
     // slower; how many requests took longer than the production bound is
-    // printed with it.
+    // printed with it. A request that does not succeed (a settlement past
+    // its deadline answers `accounting_unavailable`) is counted and printed,
+    // not failed; the accounting of every request of both gateways is then
+    // checked exactly as above.
     let fresh = harness(again, 0, 1, GUARD).await;
     for label in ["new_gateway_first", "new_gateway_later"] {
         let (_, key) = new_scope(&fresh).await;
-        let (mut latencies, _) = burst(&fresh, &key, BURST).await;
+        let (mut latencies, failed) = measured_burst(&fresh, &key, BURST).await;
         eprintln!(
-            "lock_stall cold_bucket round={label} requests={BURST} p50_ms={} max_ms={} latency_over_admission_bound={}",
+            "lock_stall cold_bucket round={label} requests={BURST} ok={} failed={failed:?} p50_ms={} max_ms={} latency_over_admission_bound={}",
+            latencies.len(),
             ms(quantile(&mut latencies, 0.5)),
             ms(quantile(&mut latencies, 1.0)),
             over_bound(&latencies)
         );
     }
+    let (settled, unknown) = assert_exact(&h, &[&fresh]).await;
+    eprintln!("lock_stall cold_bucket new_gateway settled={settled} unknown={unknown}");
 }
 
 /// Requests of a burst whose whole latency exceeded the production admission
@@ -751,7 +802,7 @@ async fn stall_recovery(setup: Setup) {
     let rows = windows(&run);
     summarize(&h, &run).await;
     assess(&rows, &run, &knobs);
-    let (settled, unknown) = assert_exact(&h).await;
+    let (settled, unknown) = assert_exact(&h, &[]).await;
     let in_flight = in_flight_at_stall(&run);
     eprintln!(
         "lock_stall recovery settled={settled} unknown={unknown} in_flight_at_stall={in_flight} offered={}",

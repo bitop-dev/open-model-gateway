@@ -573,26 +573,6 @@ async fn a_terminal_batch_with_a_settled_envelope_can_be_reclaimed(pool: PgPool)
 }
 
 #[dbtest::test]
-async fn a_batch_in_global_admission_mode_inserts_its_job_and_final_lease(pool: PgPool) {
-    let mut w = world(pool, false, false, 1).await;
-    w.jobs.store = w
-        .jobs
-        .store
-        .clone()
-        .with_admission_mode(crate::governance::locks::AdmissionMode::Global);
-    let file = w
-        .upload(&w.f.principal, &[chat_line("a", "company/smart", "one")])
-        .await;
-    let job = w
-        .create(w.f.principal, &file, BatchEndpoint::ChatCompletions, None)
-        .await
-        .unwrap();
-    lease_covers_the_job(&w, &job).await;
-    assert_eq!(admission_rowcounts(&w.f).await, (1, 1, 1, 1));
-    consistent(&w.f).await;
-}
-
-#[dbtest::test]
 async fn a_failed_batch_commit_keeps_work_until_its_outcome_is_known(pool: PgPool) {
     let w = world(pool, false, false, 1).await;
     sqlx::raw_sql("CREATE FUNCTION refuse_job_commit_640() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'commit refused'; END $$; CREATE CONSTRAINT TRIGGER refuse_job_commit_640 AFTER INSERT ON async_jobs DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION refuse_job_commit_640()")

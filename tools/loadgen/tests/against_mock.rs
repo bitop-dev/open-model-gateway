@@ -35,6 +35,7 @@ fn config(targets: Vec<String>, mock: &str) -> RunConfig {
         label: Some("mock".into()),
         readers: 0,
         reader_days: 7,
+        retry_shed: 0,
     }
 }
 
@@ -132,4 +133,82 @@ async fn bad_configurations_are_refused() {
     c.warmup_s = 0.0;
     c.targets.clear();
     assert!(run(c).await.is_err());
+}
+
+/// A stand-in gateway: request `i` (from the nonce) is shed with
+/// `503 scope_busy` on its first attempt when `i % 4 == 0`, always fails
+/// with `503 accounting_unavailable` when `i % 4 == 1`, and succeeds
+/// otherwise.
+async fn shedding_gateway() -> (String, Arc<std::sync::Mutex<Vec<u64>>>) {
+    use axum::{Json, http::StatusCode, response::IntoResponse};
+    let seen: Arc<std::sync::Mutex<Vec<u64>>> = Arc::default();
+    let attempts = seen.clone();
+    let app = axum::Router::new().fallback(move |Json(body): Json<serde_json::Value>| {
+        let attempts = attempts.clone();
+        async move {
+            let content = body["messages"][0]["content"].as_str().unwrap_or_default();
+            let i: u64 = content
+                .split("nonce:")
+                .nth(1)
+                .and_then(|n| n.split('.').next())
+                .and_then(|n| n.rsplit('-').next())
+                .and_then(|n| n.parse().ok())
+                .unwrap();
+            let earlier = {
+                let mut attempts = attempts.lock().unwrap();
+                let earlier = attempts.iter().filter(|a| **a == i).count();
+                attempts.push(i);
+                earlier
+            };
+            let error = |code: &str| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [("retry-after", "1")],
+                    Json(serde_json::json!({"error":{"code":code}})),
+                )
+                    .into_response()
+            };
+            match i % 4 {
+                0 if earlier == 0 => error("scope_busy"),
+                1 => error("accounting_unavailable"),
+                _ => Json(serde_json::json!({"choices":[{"message":{"content":"ok"}}]}))
+                    .into_response(),
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    (base, seen)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_shed_requests_are_resent_and_only_when_asked() {
+    let (gateway, _) = shedding_gateway().await;
+    let mut c = config(vec![gateway], "http://127.0.0.1:9");
+    c.mock_url = None;
+    c.rate = 20.0;
+    c.duration_s = 1.0;
+    c.warmup_s = 0.0;
+    c.stream_ratio = 0.0;
+    // 20 requests: 5 shed once, 5 failing with accounting_unavailable.
+    let report = run(c.clone()).await.unwrap();
+    assert_eq!(report.totals.sent, 20);
+    assert_eq!(report.totals.ok, 10, "{:?}", report.totals);
+    assert_eq!(report.totals.by_error_code["scope_busy"], 5);
+    assert_eq!(report.totals.by_error_code["accounting_unavailable"], 5);
+    assert_eq!(report.totals.shed_retries, 0);
+
+    let (gateway, attempts) = shedding_gateway().await;
+    c.targets = vec![gateway];
+    c.retry_shed = 3;
+    let report = run(c).await.unwrap();
+    // The shed requests are resent once and succeed; every other failure is
+    // reported as it was, never resent.
+    assert_eq!(report.totals.sent, 20);
+    assert_eq!(report.totals.ok, 15, "{:?}", report.totals);
+    assert_eq!(report.totals.by_error_code.get("scope_busy"), None);
+    assert_eq!(report.totals.by_error_code["accounting_unavailable"], 5);
+    assert_eq!(report.totals.shed_retries, 5);
+    assert_eq!(attempts.lock().unwrap().len(), 25);
 }
