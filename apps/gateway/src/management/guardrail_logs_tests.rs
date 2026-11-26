@@ -128,6 +128,20 @@ async fn refused_requests_are_listed_as_blocked_with_logs_visibility(pool: PgPoo
     .await;
     let staff = roots(&staff);
     assert!(staff.contains(&own.to_string()) && !staff.contains(&private.to_string()));
+    // For a personal workspace they see this month's totals only.
+    let (status, totals) = call(
+        &f.s,
+        &f.auditor,
+        "GET",
+        &format!("/api/v1/platform/workspaces/{}/guardrails", f.personal),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{totals}");
+    assert_eq!(
+        totals["decisions_this_month"],
+        json!([{"action":"blocked","category":"custom","decisions":1,"findings":2}])
+    );
     // Attempt lists have nothing a refused request could match.
     for path in ["generations", "sessions"] {
         let (status, _) = call(

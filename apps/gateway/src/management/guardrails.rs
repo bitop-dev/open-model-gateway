@@ -416,6 +416,19 @@ async fn platform_view(tx: &mut Transaction<'_, Postgres>, ws: Uuid) -> Result<V
     let mut v = workspace_json(ws, &p, local.as_ref(), local_visible, true, true);
     v["type_default"] = set_json(p.type_default.as_ref(), true);
     v["override"] = set_json(p.workspace_override.as_ref(), true);
+    // Totals only (no request detail), so also for a personal workspace.
+    let totals: Vec<(String, String, i64, i64)> = sqlx::query_as(
+        "SELECT action,category,count(*),sum(count)::bigint FROM guardrail_events WHERE workspace_id=$1 AND created_at>=date_trunc('month',clock_timestamp(),'UTC') GROUP BY action,category ORDER BY action,category",
+    )
+    .bind(ws)
+    .fetch_all(&mut **tx)
+    .await?;
+    v["decisions_this_month"] = totals
+        .into_iter()
+        .map(|(action, category, decisions, findings)| {
+            json!({"action":action,"category":category,"decisions":decisions,"findings":findings})
+        })
+        .collect();
     Ok(v)
 }
 

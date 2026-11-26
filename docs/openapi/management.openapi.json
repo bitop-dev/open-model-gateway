@@ -45537,6 +45537,50 @@
       "delete_api_v1_platform_workspaces_by_ws_guardrailsResponse": {
         "additionalProperties": false,
         "properties": {
+          "decisions_this_month": {
+            "description": "This month's guardrail decisions on the workspace (UTC month), per action and category: totals only, never request detail, also for a personal workspace (#840).",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "action": {
+                  "enum": [
+                    "monitored",
+                    "redacted",
+                    "blocked",
+                    "stopped",
+                    "detector_failed",
+                    "skipped"
+                  ]
+                },
+                "category": {
+                  "enum": [
+                    "secret",
+                    "personal_data",
+                    "moderation",
+                    "prompt_injection",
+                    "custom"
+                  ]
+                },
+                "decisions": {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "findings": {
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "action",
+                "category",
+                "decisions",
+                "findings"
+              ],
+              "type": "object"
+            },
+            "type": "array",
+            "x-omg-may-be-empty": "No guardrail decision this month."
+          },
           "effective": {
             "anyOf": [
               {
@@ -46563,7 +46607,8 @@
           "effective",
           "enforced",
           "type_default",
-          "override"
+          "override",
+          "decisions_this_month"
         ],
         "type": "object"
       },
@@ -49559,6 +49604,50 @@
       "get_api_v1_platform_workspaces_by_ws_guardrailsResponse": {
         "additionalProperties": false,
         "properties": {
+          "decisions_this_month": {
+            "description": "This month's guardrail decisions on the workspace (UTC month), per action and category: totals only, never request detail, also for a personal workspace (#840).",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "action": {
+                  "enum": [
+                    "monitored",
+                    "redacted",
+                    "blocked",
+                    "stopped",
+                    "detector_failed",
+                    "skipped"
+                  ]
+                },
+                "category": {
+                  "enum": [
+                    "secret",
+                    "personal_data",
+                    "moderation",
+                    "prompt_injection",
+                    "custom"
+                  ]
+                },
+                "decisions": {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "findings": {
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "action",
+                "category",
+                "decisions",
+                "findings"
+              ],
+              "type": "object"
+            },
+            "type": "array",
+            "x-omg-may-be-empty": "No guardrail decision this month."
+          },
           "effective": {
             "anyOf": [
               {
@@ -50812,7 +50901,8 @@
           "effective",
           "enforced",
           "type_default",
-          "override"
+          "override",
+          "decisions_this_month"
         ],
         "type": "object"
       },
@@ -58087,6 +58177,50 @@
       "put_api_v1_platform_workspaces_by_ws_guardrailsResponse": {
         "additionalProperties": false,
         "properties": {
+          "decisions_this_month": {
+            "description": "This month's guardrail decisions on the workspace (UTC month), per action and category: totals only, never request detail, also for a personal workspace (#840).",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "action": {
+                  "enum": [
+                    "monitored",
+                    "redacted",
+                    "blocked",
+                    "stopped",
+                    "detector_failed",
+                    "skipped"
+                  ]
+                },
+                "category": {
+                  "enum": [
+                    "secret",
+                    "personal_data",
+                    "moderation",
+                    "prompt_injection",
+                    "custom"
+                  ]
+                },
+                "decisions": {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "findings": {
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "action",
+                "category",
+                "decisions",
+                "findings"
+              ],
+              "type": "object"
+            },
+            "type": "array",
+            "x-omg-may-be-empty": "No guardrail decision this month."
+          },
           "effective": {
             "anyOf": [
               {
@@ -59320,7 +59454,8 @@
           "effective",
           "enforced",
           "type_default",
-          "override"
+          "override",
+          "decisions_this_month"
         ],
         "type": "object"
       },
