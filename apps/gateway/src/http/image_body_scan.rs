@@ -6,10 +6,15 @@
 //! ordinary strings) must fit the text limit, or parsing it could build a
 //! tree many times its size. [`outside_images`] walks the JSON string
 //! literals with no allocation and sets aside the raw length of at most
-//! [`MAX_IMAGES`] of the longest literals whose text begins with
-//! `data:image/`; whatever is left is what parsing may turn into structure.
-//! Capping the set-aside at the image limit means many small `data:image/`
-//! strings cannot lift the bound. The exact check
+//! [`MAX_IMAGES`] of the longest literals that are whole image URLs as
+//! `image_input::Images::take` accepts them (a PNG, JPEG, WebP or GIF
+//! `data:` prefix, then only base64 characters, at most its length bound);
+//! whatever is left is what parsing may turn into structure. Capping the
+//! set-aside at the image limit means many small image strings cannot lift
+//! the bound, and holding it to the image grammar means what is set aside is
+//! printable ASCII: a parser that echoes one in an error (an image URL in a
+//! field of another type) writes it once, never escaped into a larger
+//! form. The exact check
 //! (`image_buffer::LargeBody::allows`, on the parsed images) still runs after
 //! the parse.
 //!
@@ -18,12 +23,13 @@
 //! the next byte and a `"` closes it. A body that is not valid JSON fails its
 //! parse at its first invalid byte, so the structure built before that lies
 //! in the part both read alike.
-use crate::protocols::image_input::MAX_IMAGES;
-
-const PREFIX: &[u8] = b"data:image/";
+use crate::{
+    inference::types::ImageType,
+    protocols::image_input::{MAX_BASE64_BYTES, MAX_IMAGES},
+};
 
 /// The body's length less the raw lengths of at most [`MAX_IMAGES`] of its
-/// longest `data:image/` string literals.
+/// longest string literals that are image URLs.
 pub(super) fn outside_images(body: &[u8]) -> usize {
     let mut longest = [0usize; MAX_IMAGES];
     let mut at = 0;
@@ -31,7 +37,7 @@ pub(super) fn outside_images(body: &[u8]) -> usize {
         let start = at + open + 1;
         let end = string_end(body, start);
         let literal = &body[start..end];
-        if begins_with_image_prefix(literal) {
+        if is_image_url(literal) {
             // Keep the longest: replace the shortest held so far.
             let (shortest, held) = longest
                 .iter_mut()
@@ -63,39 +69,84 @@ fn string_end(body: &[u8], start: usize) -> usize {
     body.len()
 }
 
-/// Whether a raw literal's decoded text begins with `data:image/`. JSON may
-/// escape any character, and some encoders escape `/` as `\/`, so the first
-/// characters are decoded, not compared byte for byte.
-fn begins_with_image_prefix(literal: &[u8]) -> bool {
+/// The raw literal's characters, decoded one byte each, or `None` at an
+/// escape no image URL can contain. JSON may escape any character, and some
+/// encoders write `/` as `\/`; an image URL is ASCII, so only `\/` and an
+/// ASCII `\uXXXX` decode, and anything else ends the walk.
+fn decoded(literal: &[u8]) -> impl Iterator<Item = Option<u8>> + '_ {
     let mut i = 0;
-    for &want in PREFIX {
-        let Some(&b) = literal.get(i) else {
-            return false;
-        };
-        let (got, width) = if b == b'\\' {
-            match literal.get(i + 1) {
-                Some(b'u') => match literal.get(i + 2..i + 6).and_then(hex4) {
-                    Some(code) if code < 0x80 => (code as u8, 6),
-                    _ => return false,
-                },
-                Some(&escaped) => (escaped, 2),
-                None => return false,
-            }
-        } else {
-            (b, 1)
-        };
-        if got != want {
-            return false;
+    std::iter::from_fn(move || {
+        let &b = literal.get(i)?;
+        if b != b'\\' {
+            i += 1;
+            return Some(Some(b));
         }
-        i += width;
-    }
-    true
+        let (escaped, width) = match literal.get(i + 1) {
+            Some(b'/') => (Some(b'/'), 2),
+            Some(b'u') => (
+                literal
+                    .get(i + 2..i + 6)
+                    .and_then(hex4)
+                    .and_then(|code| u8::try_from(code).ok())
+                    .filter(u8::is_ascii),
+                6,
+            ),
+            _ => (None, 0),
+        };
+        i = if escaped.is_some() {
+            i + width
+        } else {
+            literal.len()
+        };
+        Some(escaped)
+    })
 }
 
+/// Whether a raw literal decodes to an image URL `Images::take` could accept:
+/// a PNG, JPEG, WebP or GIF data URL prefix, then one to
+/// [`MAX_BASE64_BYTES`] characters of the base64 alphabet.
+fn is_image_url(literal: &[u8]) -> bool {
+    let mut chars = decoded(literal);
+    let mut prefix = [0u8; 24];
+    let mut len = 0;
+    while len < prefix.len() {
+        match chars.next() {
+            Some(Some(b)) => {
+                prefix[len] = b;
+                len += 1;
+                if b == b',' {
+                    break;
+                }
+            }
+            _ => return false,
+        }
+    }
+    if !ImageType::ALL
+        .into_iter()
+        .any(|t| t.data_url_prefix().as_bytes() == &prefix[..len])
+    {
+        return false;
+    }
+    let mut data = 0usize;
+    for c in chars {
+        match c {
+            Some(b) if b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=') => {
+                data += 1;
+                if data > MAX_BASE64_BYTES {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    data > 0
+}
+
+/// Four hex digits, exactly as JSON writes them (no sign).
 fn hex4(digits: &[u8]) -> Option<u32> {
-    std::str::from_utf8(digits)
-        .ok()
-        .and_then(|d| u32::from_str_radix(d, 16).ok())
+    digits.iter().try_fold(0u32, |code, &d| {
+        char::from(d).to_digit(16).map(|v| code * 16 + v)
+    })
 }
 
 #[cfg(test)]
@@ -143,23 +194,33 @@ mod tests {
     }
 
     #[test]
-    fn escapes_decide_string_boundaries_and_the_prefix() {
-        // An escaped quote does not end the string, so the brackets after it
-        // are string content, as a parser reads them.
-        let body = r#"["data:image/png;base64,AA\"]]]]","x"]"#;
-        let literal = r#"data:image/png;base64,AA\"]]]]"#;
-        assert_eq!(outside_images(body.as_bytes()), body.len() - literal.len());
-        // `\/` and `/` decode to `/`.
+    fn escapes_decide_string_boundaries_and_what_decodes() {
+        // An escaped quote does not end the string: the brackets after it
+        // are string content, as a parser reads them, and the image literal
+        // after it is found where a parser finds it.
+        let url = image(4);
+        let body = format!(r#"["AA\"]]]]","{url}"]"#);
+        assert_eq!(outside_images(body.as_bytes()), body.len() - url.len());
+        // `\/` and `\u002f` decode to `/`, `\u0064` to `d`, `\u0041` to `A`.
         for literal in [
-            r"data:image\/png;base64,AAAA",
-            r"data:image/png;base64,AAAA",
-            r"data:image/png;base64,AAAA",
+            r"data:image\/png;base64,AA\/A",
+            r"data:image\u002fpng;base64,AAAA",
+            r"\u0064ata:image/png;base64,AAAA",
+            r"data:image/png;base64,AA\u0041A",
         ] {
             let body = format!("[\"{literal}\"]");
             assert_eq!(outside_images(body.as_bytes()), 4, "{literal}");
         }
-        // Not the prefix once decoded.
-        for literal in [r"data:imagE/png", r"data:image\npng", r"data:image\u00"] {
+        // Not an image URL once decoded.
+        for literal in [
+            r"data:imagE/png;base64,AAAA",
+            r"data:image\npng;base64,AAAA",
+            r"data:image\u00",
+            r"data:image\u+02fpng;base64,AAAA",
+            r#"data:image/png;base64,AA\"AA"#,
+            r"data:image/png;base64,AAéA",
+            r"data:image/png;base64,AA\u00e9A",
+        ] {
             let body = format!("[\"{literal}\"]");
             assert_eq!(outside_images(body.as_bytes()), body.len(), "{literal}");
         }
@@ -167,5 +228,33 @@ mod tests {
         for body in [r#"["data:image/png"#, "[\"data:image/png\\"] {
             assert!(outside_images(body.as_bytes()) <= body.len());
         }
+    }
+
+    #[test]
+    fn only_a_whole_image_url_within_its_bound_is_set_aside() {
+        let counts_in_full = |literal: &str| {
+            let body = format!("[\"{literal}\"]");
+            outside_images(body.as_bytes()) == body.len()
+        };
+        for prefix in ["png", "jpeg", "webp", "gif"] {
+            assert!(!counts_in_full(&format!("data:image/{prefix};base64,AAAA")));
+        }
+        // Another type, no data, a byte outside the base64 alphabet (a parser
+        // would escape DEL in an error message at six times its size), or a
+        // body longer than any image may be: counted in full.
+        assert!(counts_in_full("data:image/bmp;base64,AAAA"));
+        assert!(counts_in_full("data:image/png;base64,"));
+        assert!(counts_in_full(&format!(
+            "data:image/png;base64,{}\u{7f}A",
+            "A".repeat(100)
+        )));
+        assert!(counts_in_full(&format!(
+            "data:image/png;base64,{}A",
+            "A".repeat(MAX_BASE64_BYTES)
+        )));
+        assert!(!counts_in_full(&format!(
+            "data:image/png;base64,{}",
+            "A".repeat(MAX_BASE64_BYTES)
+        )));
     }
 }

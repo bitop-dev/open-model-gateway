@@ -108,9 +108,11 @@ struct World {
     deployment: Uuid,
     upstream: Arc<Upstream>,
     _servers: Vec<Server>,
+    _counters: tokio::sync::MutexGuard<'static, ()>,
 }
 
 async fn world(pool: PgPool, limits: ImageInputLimits, priced: bool) -> World {
+    let counters = crate::inference::image_buffer::ROUTER_TESTS.lock().await;
     let mut f = fixture(pool).await;
     let token = issue_key(&mut f).await;
     sqlx::query("UPDATE models SET supported_protocols=ARRAY['chat_completions','responses']")
@@ -153,6 +155,7 @@ async fn world(pool: PgPool, limits: ImageInputLimits, priced: bool) -> World {
         deployment,
         upstream: state,
         _servers: vec![mock],
+        _counters: counters,
     }
 }
 
@@ -678,6 +681,16 @@ async fn structure_past_the_text_limit_is_refused_before_any_parse(pool: PgPool)
                 repeated(r#""data:image/png;base64,AAAA""#, size)
             )),
         ),
+        // An image prefix over bytes outside base64, in a field of another
+        // type: a parser's error would echo it escaped at six times its size,
+        // so it is not set aside.
+        (
+            "/v1/chat/completions",
+            chat(format!(
+                r#""temperature":"data:image/png;base64,{}""#,
+                "\u{7f}".repeat(size)
+            )),
+        ),
     ];
     for (path, body) in hostile {
         // With a trailing byte the body is not JSON: a parse would answer
@@ -695,11 +708,27 @@ async fn structure_past_the_text_limit_is_refused_before_any_parse(pool: PgPool)
             );
             assert_eq!(value["error"]["code"], "payload_too_large");
             assert_eq!(pulled, body.len());
-            assert!(METRICS.image_input_refusal_count("too_large") > before);
+            assert_eq!(METRICS.image_input_refusal_count("too_large"), before + 1);
         }
     }
     assert_eq!(executions(&w).await, 0);
     assert!(w.upstream.bodies.lock().unwrap().is_empty());
+    // A large body that is not JSON is refused as the handler would refuse
+    // it, before a byte is read.
+    let image = serde_json::to_vec(&chat_body(&png_url(2 * MIB + MIB / 4, "p"), false)).unwrap();
+    let request = Request::post("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "text/plain")
+        .header(header::CONTENT_LENGTH, image.len())
+        .header(header::AUTHORIZATION, format!("Bearer {}", w.token));
+    let pulled = Arc::new(AtomicUsize::new(0));
+    let response = w
+        .router
+        .clone()
+        .oneshot(request.body(counted(image, pulled.clone())).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(pulled.load(Ordering::SeqCst), 0);
     // A large image request passes, also with every `/` escaped as JSON
     // allows (`\/`, as some encoders write it).
     let image = serde_json::to_vec(&chat_body(&png_url(4 * MIB, "l"), false)).unwrap();
@@ -744,7 +773,7 @@ async fn every_large_body_refusal_is_counted_by_reason(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
-    assert!(count("too_large") > before);
+    assert_eq!(count("too_large"), before + 1);
     // A stalled body holds 3 of the 4 MiB until its idle bound.
     let body = serde_json::to_vec(&chat_body(&png_url(2 * MIB + MIB / 4, "c"), false)).unwrap();
     let first = Bytes::copy_from_slice(&body[..body.len() / 2]);
@@ -777,7 +806,7 @@ async fn every_large_body_refusal_is_counted_by_reason(pool: PgPool) {
         (status, retry.as_deref(), pulled),
         (StatusCode::SERVICE_UNAVAILABLE, Some("1"), 0)
     );
-    assert!(count("busy") > busy);
+    assert_eq!(count("busy"), busy + 1);
     // timeout: the stalled body reaches its idle bound.
     let response = tokio::time::timeout(std::time::Duration::from_secs(8), held)
         .await
@@ -785,5 +814,5 @@ async fn every_large_body_refusal_is_counted_by_reason(pool: PgPool) {
         .unwrap()
         .unwrap();
     assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
-    assert!(count("timeout") > timeouts);
+    assert_eq!(count("timeout"), timeouts + 1);
 }

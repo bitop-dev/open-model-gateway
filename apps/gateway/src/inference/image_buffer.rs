@@ -292,6 +292,11 @@ impl ImageBuffer {
     }
 }
 
+/// Held by every test that sends large bodies through a router, so each can
+/// assert exact deltas of the process-wide refusal counters.
+#[cfg(test)]
+pub(crate) static ROUTER_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;

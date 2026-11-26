@@ -20,7 +20,7 @@ pub const MAX_IMAGES: usize = 20;
 /// Decoded bytes per image (as native Messages images).
 pub const MAX_DECODED_BYTES: usize = 5 * 1024 * 1024;
 /// The base64 length of [`MAX_DECODED_BYTES`].
-const MAX_BASE64_BYTES: usize = MAX_DECODED_BYTES.div_ceil(3) * 4;
+pub(crate) const MAX_BASE64_BYTES: usize = MAX_DECODED_BYTES.div_ceil(3) * 4;
 
 /// The images one request has taken so far.
 #[derive(Default)]

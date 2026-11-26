@@ -189,6 +189,11 @@ async fn image_input_body(
             METRICS.image_input_refused("busy");
             crate::protocols::image_input_busy()
         }
+        // Refused as the handler's JSON extractor would refuse it, before a
+        // body that could never be parsed is read and holds its share.
+        Admission::Large(_) if !json_content_type(&parts.headers) => {
+            crate::protocols::invalid_request()
+        }
         Admission::Large(permit) => {
             parts.extensions.insert(LargeBody(permit.length));
             let limits = buffer.limits();
@@ -233,6 +238,25 @@ async fn image_input_body(
                 })
         }
     }
+}
+
+/// Whether `Content-Type` is JSON as Axum's `Json` extractor accepts it:
+/// `application/json` or an `application/*+json` type, parameters aside.
+fn json_content_type(headers: &HeaderMap) -> bool {
+    let Some(value) = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let essence = value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    essence == "application/json"
+        || (essence.starts_with("application/") && essence.ends_with("+json"))
 }
 
 /// A response body that keeps its request's share of the image input budget

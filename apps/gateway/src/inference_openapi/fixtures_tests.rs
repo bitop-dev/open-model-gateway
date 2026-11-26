@@ -1389,6 +1389,7 @@ fn with_length(path: &str, key: &str, body: Body, length: usize) -> Request<Body
 #[dbtest::test]
 async fn inference_openapi_generation_image_input_transport(pool: PgPool) {
     use crate::inference::image_buffer::{ImageInputLimits, MIB};
+    let _counters = crate::inference::image_buffer::ROUTER_TESTS.lock().await;
     use futures_util::StreamExt as _;
     let (app, keys) = generation_gateway_with(
         &pool,

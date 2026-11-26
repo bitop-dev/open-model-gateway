@@ -146,6 +146,11 @@ pub(crate) fn large_body_read_failed(error: &(dyn std::error::Error + 'static)) 
         }
         current = e.source();
     }
+    invalid_request()
+}
+/// 400 `invalid_request_error`, as the Chat and Responses handlers answer a
+/// body they cannot read as JSON.
+pub(crate) fn invalid_request() -> Response {
     error_with_body(
         InferenceError::InvalidRequest,
         openai_error_body(InferenceError::InvalidRequest),
