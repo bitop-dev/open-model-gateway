@@ -266,7 +266,7 @@ impl Policy {
                 // custom category then gives no verdict and fails under its
                 // on_error, while its built-in secret shapes still decide.
                 let custom = detector.custom_findings(input, &budget);
-                if custom.is_err() {
+                if custom.spent {
                     failed(&mut decision, r, Category::Custom);
                 }
                 for &category in &r.categories {
@@ -274,10 +274,8 @@ impl Policy {
                         builtin
                             .get_or_insert_with(|| super::secrets::builtin(input))
                             .distinct(input, category)
-                    } else if let Ok(custom) = &custom {
-                        custom.distinct(input, category)
                     } else {
-                        continue;
+                        custom.findings.distinct(input, category)
                     };
                     if count == 0 {
                         continue;

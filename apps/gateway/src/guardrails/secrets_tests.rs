@@ -202,7 +202,7 @@ fn a_hostile_custom_pattern_is_bounded_by_windows_and_the_budget() {
     let started = std::time::Instant::now();
     let budget = Budget::new(std::time::Duration::from_secs(30));
     assert_eq!(
-        custom.custom_findings(&input, &budget).unwrap().0.len(),
+        custom.custom_findings(&input, &budget).findings.0.len(),
         MAX_FINDINGS
     );
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
@@ -223,7 +223,7 @@ fn a_hostile_custom_pattern_is_bounded_by_windows_and_the_budget() {
     input.push(&noise, Part::Content);
     let started = std::time::Instant::now();
     let budget = Budget::new(std::time::Duration::from_millis(50));
-    assert!(slow.custom_findings(&input, &budget).is_err());
+    assert!(slow.custom_findings(&input, &budget).spent);
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
 }
 
@@ -239,7 +239,7 @@ fn windows_neither_lose_long_values_nor_invent_boundaries() {
     let text = format!("{}password=hunter2{}", "x ".repeat(1498), "A".repeat(1200));
     let mut input = Inspection::default();
     input.push(&text, Part::Content);
-    let found = password.custom_findings(&input, &budget()).unwrap();
+    let found = password.custom_findings(&input, &budget()).findings;
     assert_eq!(found.0.len(), 1);
     assert_eq!(&text[found.0[0].span.clone()], &text[2996..]);
     // A word boundary is judged on the whole text, not where a window starts.
@@ -249,7 +249,19 @@ fn windows_neither_lose_long_values_nor_invent_boundaries() {
     input.push(&text, Part::Content);
     assert!(
         word.custom_findings(&input, &budget())
-            .unwrap()
+            .findings
+            .0
+            .is_empty()
+    );
+    // A boundary the window's cut would make is not a match.
+    let digits = PatternDetector::new(&[Category::Custom], &[r"\b[0-9]{16}\b".to_owned()]).unwrap();
+    let text = format!("{}{} tail", " ".repeat(4080), "1".repeat(20));
+    let mut input = Inspection::default();
+    input.push(&text, Part::Content);
+    assert!(
+        digits
+            .custom_findings(&input, &budget())
+            .findings
             .0
             .is_empty()
     );
@@ -258,7 +270,7 @@ fn windows_neither_lose_long_values_nor_invent_boundaries() {
     let mut input = Inspection::default();
     input.push("short", Part::Content);
     let spent = Budget::new(std::time::Duration::ZERO);
-    assert!(slow.custom_findings(&input, &spent).is_err());
+    assert!(slow.custom_findings(&input, &spent).spent);
 }
 
 #[test]
@@ -269,7 +281,7 @@ fn a_value_cut_by_a_window_is_found_whole_and_counted_once() {
     let mut input = Inspection::default();
     input.push(&text, Part::Content);
     let budget = Budget::new(std::time::Duration::from_secs(5));
-    let found = custom.custom_findings(&input, &budget).unwrap();
+    let found = custom.custom_findings(&input, &budget).findings;
     assert_eq!(found.distinct(&input, Category::Custom), 1);
 }
 

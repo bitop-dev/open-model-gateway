@@ -160,7 +160,8 @@ impl PatternDetector {
         })
     }
     /// Every match, synchronously (the detector never waits on anything);
-    /// `BudgetSpent` when the custom patterns ran out of time.
+    /// `BudgetSpent` when the custom patterns ran out of time having found
+    /// nothing.
     pub fn scan(&self, input: &Inspection<'_>) -> Result<Findings, BudgetSpent> {
         let mut found = if self.secrets {
             builtin(input).0
@@ -168,7 +169,11 @@ impl PatternDetector {
             Vec::new()
         };
         let budget = Budget::new(super::enforce::CUSTOM_BUDGET);
-        found.extend(self.custom_findings(input, &budget)?.0);
+        let custom = self.custom_findings(input, &budget);
+        found.extend(custom.findings.0);
+        if custom.spent && found.is_empty() {
+            return Err(BudgetSpent);
+        }
         Ok(Findings(found))
     }
     /// Whether the rule has custom patterns.
@@ -187,14 +192,24 @@ impl PatternDetector {
     /// budget is checked before every call, and spent, the scan stops with
     /// `BudgetSpent` (the rule then fails under its `on_error`). A match cut
     /// by that horizon is searched again up to `EXTEND` bytes further and
-    /// counted. A match that needs more than `OVERLAP` bytes past the horizon
-    /// to start matching at all can be missed; empty matches never count.
-    pub fn custom_findings(
+    /// counted. A value longer than `OVERLAP` that its pattern matches only
+    /// whole (say `BEGIN…END`) can be missed when it starts more than
+    /// `OVERLAP` bytes before a horizon; empty matches never count. What was
+    /// found before the budget ran out is kept.
+    pub fn custom_findings(&self, input: &Inspection<'_>, budget: &Budget) -> Custom {
+        let mut found = Vec::new();
+        let spent = self.scan_custom(input, budget, &mut found).is_err();
+        Custom {
+            findings: Findings(found),
+            spent,
+        }
+    }
+    fn scan_custom(
         &self,
         input: &Inspection<'_>,
         budget: &Budget,
-    ) -> Result<Findings, BudgetSpent> {
-        let mut found = Vec::new();
+        found: &mut Vec<Finding>,
+    ) -> Result<(), BudgetSpent> {
         for (index, segment) in input.segments.iter().enumerate() {
             let text: &str = &segment.text;
             for pattern in &self.custom {
@@ -202,7 +217,7 @@ impl PatternDetector {
                 while pos < text.len() {
                     budget.check()?;
                     let end = boundary(text, (pos + WINDOW).min(text.len()));
-                    let Some(mut m) = pattern.find_at(&text[..end], pos) else {
+                    let Some(cut) = pattern.find_at(&text[..end], pos) else {
                         if end == text.len() {
                             break;
                         }
@@ -210,16 +225,20 @@ impl PatternDetector {
                         pos = boundary_up(text, back.max(pos + 1));
                         continue;
                     };
-                    if m.end() == end && end < text.len() {
+                    let mut m = Some(cut);
+                    if cut.end() == end && end < text.len() {
+                        // Searched again past the cut: the same start is the
+                        // match (perhaps longer); none, or a later start, shows
+                        // the cut itself made it match (a `\b` or `$` there).
                         budget.check()?;
-                        let further = boundary(text, (m.start() + EXTEND).min(text.len()));
-                        if let Some(longer) = pattern.find_at(&text[..further], m.start()) {
-                            m = longer;
-                        }
+                        let further = boundary(text, (cut.start() + EXTEND).min(text.len()));
+                        m = pattern
+                            .find_at(&text[..further], cut.start())
+                            .filter(|longer| longer.start() == cut.start());
                     }
-                    if !m.is_empty() {
+                    if let Some(m) = m.filter(|m| !m.is_empty()) {
                         if found.len() == MAX_FINDINGS {
-                            return Ok(Findings(found));
+                            return Ok(());
                         }
                         found.push(Finding {
                             category: Category::Custom,
@@ -227,15 +246,15 @@ impl PatternDetector {
                             span: m.range(),
                         });
                     }
-                    pos = if m.end() > pos {
-                        m.end()
+                    pos = if cut.end() > pos {
+                        cut.end()
                     } else {
                         boundary_up(text, pos + 1)
                     };
                 }
             }
         }
-        Ok(Findings(found))
+        Ok(())
     }
 }
 
@@ -263,6 +282,13 @@ impl Budget {
 /// A request's custom-pattern budget ran out.
 #[derive(Debug)]
 pub struct BudgetSpent;
+
+/// A rule's custom-pattern matches, and whether its scan ran out of budget
+/// before the end (the matches found until then are kept).
+pub struct Custom {
+    pub findings: Findings,
+    pub spent: bool,
+}
 
 /// The char boundary at or before `i`.
 fn boundary(text: &str, mut i: usize) -> usize {
