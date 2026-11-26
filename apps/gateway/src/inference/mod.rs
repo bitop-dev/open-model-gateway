@@ -110,6 +110,46 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// How long a half-open route's probe slot is held at most: the
+    /// request's own timeout and its settlement deadline.
+    pub(crate) fn probe_hold(&self) -> Duration {
+        self.limits.request_timeout + SETTLEMENT_DEADLINE
+    }
+    /// A probe slot held by an attempt that sent nothing (refused at
+    /// admission) is freed for the next request, bounded like the advisory
+    /// health write.
+    async fn release_unsent(&self, deployment: Uuid, probe: Option<i64>, execution_id: Uuid) {
+        if let Some(epoch) = probe
+            && !matches!(
+                timeout(
+                    Duration::from_millis(250),
+                    self.repository.route_probe_release(deployment, epoch)
+                )
+                .await,
+                Ok(Ok(()))
+            )
+        {
+            tracing::warn!(execution_id = %execution_id, "routing probe update failed");
+        }
+    }
+    /// [`route_use`] for this engine's attempts: the probe slot it holds for
+    /// `id`, or `None` (the wait noted in `cooling`) while another request
+    /// holds it.
+    async fn usable(
+        &self,
+        plan: &crate::routing::RoutePlan,
+        id: Uuid,
+        holder: Uuid,
+        cooling: &mut Option<u32>,
+    ) -> Option<Option<i64>> {
+        match route_use(&*self.repository, plan, id, holder, self.probe_hold()).await {
+            RouteUse::Go(probe) => Some(probe),
+            RouteUse::Busy(seconds) => {
+                *cooling = Some(cooling.map_or(seconds, |c| c.min(seconds)));
+                None
+            }
+        }
+    }
     pub fn new(
         repository: Arc<dyn InferenceRepository>,
         registry: ProviderRegistry,
@@ -235,7 +275,7 @@ impl Engine {
         let plan = timeout_at(
             deadline,
             self.repository
-                .route_plan(&principal, &request.model, &candidates, request_id),
+                .route_plan_probing(&principal, &request.model, &candidates, request_id),
         )
         .await
         .map_err(|_| InferenceError::Timeout)??;
@@ -255,12 +295,11 @@ impl Engine {
             protocol,
             streamed,
         };
-        for (attempt, id) in plan
-            .deployment_ids
-            .iter()
-            .take(plan.max_attempts)
-            .enumerate()
-        {
+        let (mut attempt, mut cooling) = (0, None);
+        for id in &plan.deployment_ids {
+            if attempt == plan.max_attempts {
+                break;
+            }
             let deployment = match candidates.iter().find(|d| d.id == *id) {
                 Some(deployment) => deployment,
                 None => {
@@ -286,16 +325,21 @@ impl Engine {
                     return Err(InferenceError::Configuration);
                 }
             };
+            let Some(probe) = self.usable(&plan, *id, request_id, &mut cooling).await else {
+                continue;
+            };
             telemetry = match self
-                .attempt(&scope, telemetry, attempt, deployment, adapter)
+                .attempt(&scope, telemetry, attempt, deployment, adapter, probe)
                 .await
             {
                 AttemptEnd::Failover(telemetry) => telemetry,
                 AttemptEnd::Return(result) => return result,
             };
+            attempt += 1;
         }
-        telemetry.finish(telemetry::Outcome::Error, Some(InferenceError::Busy));
-        Err(InferenceError::Busy)
+        let error = exhausted(cooling, attempt);
+        telemetry.finish(telemetry::Outcome::Error, Some(error));
+        Err(error)
     }
 }
 
@@ -392,6 +436,52 @@ async fn settle_attempt(
 /// How long a settlement may take: the one the request waits for and the
 /// detached one of a cancelled request alike.
 pub(crate) const SETTLEMENT_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Whether an attempt may use a planned route now.
+pub(crate) enum RouteUse {
+    /// Yes; holding the route's probe slot under this epoch, if it is half-open.
+    Go(Option<i64>),
+    /// No: another request holds the half-open route's probe slot (or the
+    /// circuit opened again) for about this many seconds. Nothing was sent.
+    Busy(u32),
+}
+
+/// The error of a request whose plan ran out: the routes left were other
+/// requests' probes and none was attempted (cooling down), or attempts ran out.
+pub(crate) fn exhausted(cooling: Option<u32>, attempts: usize) -> InferenceError {
+    match cooling {
+        Some(seconds) if attempts == 0 => InferenceError::RouteCoolingDown(seconds),
+        _ => InferenceError::Busy,
+    }
+}
+
+/// A half-open route of the plan is used only by the request that claims its
+/// probe slot, for at most `hold` (the request's timeout and settlement
+/// deadline); every other route as before. A claim that cannot be made
+/// (storage) is treated as busy: the route is not used unclaimed.
+pub(crate) async fn route_use(
+    repository: &dyn InferenceRepository,
+    plan: &crate::routing::RoutePlan,
+    id: Uuid,
+    holder: Uuid,
+    hold: Duration,
+) -> RouteUse {
+    use crate::routing::ProbeClaim;
+    if let Some((held, epoch)) = plan.held_probe
+        && held == id
+    {
+        return RouteUse::Go(Some(epoch));
+    }
+    if !plan.probes.contains(&id) {
+        return RouteUse::Go(None);
+    }
+    match repository.route_probe_claim(id, holder, hold).await {
+        Ok(ProbeClaim::Claimed(epoch)) => RouteUse::Go(Some(epoch)),
+        Ok(ProbeClaim::Closed) => RouteUse::Go(None),
+        Ok(ProbeClaim::Busy(seconds)) => RouteUse::Busy(seconds),
+        Err(_) => RouteUse::Busy(1),
+    }
+}
 struct ExecutionGuard {
     repository: Arc<dyn InferenceRepository>,
     id: Uuid,
@@ -403,6 +493,12 @@ struct ExecutionGuard {
     telemetry: AttemptTelemetry,
     finished: bool,
     health_observation: bool,
+    /// The epoch of the half-open route's probe slot this attempt holds
+    /// (`routing::claim_probe`); `None` once freed or when it holds none.
+    probe: Option<i64>,
+    /// The background close of the probe's circuit at its first content: the
+    /// health write waits for it, so a later failure is an ordinary one.
+    probe_closing: Option<tokio::task::JoinHandle<()>>,
     _permit: SharedPermit,
     /// The request's correlation id (#98), for the reconciliation log lines
     /// below only: `Some` only once a shared-workspace admission has
@@ -436,6 +532,8 @@ impl ExecutionGuard {
             telemetry: AttemptTelemetry::default(),
             finished: false,
             health_observation: true,
+            probe: None,
+            probe_closing: None,
             _permit: permit,
             log_trace_id,
             #[cfg(test)]
@@ -443,12 +541,42 @@ impl ExecutionGuard {
         }
     }
     /// Streams: the first delta carrying text or a tool call sets time to first token.
+    /// It is also a probe's first content: the route is serving, so its circuit
+    /// closes at once (`routing::close_probe`). An event without content (a
+    /// role, a start or a keep-alive) does neither.
     fn first_token(&mut self, text: Option<&str>, tool_calls: &[types::ToolCallDelta]) {
         if self.telemetry.time_to_first_token_ms.is_none()
             && (text.is_some_and(|t| !t.is_empty()) || !tool_calls.is_empty())
         {
             self.telemetry.time_to_first_token_ms = Some(millis(self.dispatched.elapsed()));
+            if let Some(epoch) = self.probe.take() {
+                self.probe_closing = self.end_probe(epoch, true);
+            }
         }
+    }
+    /// End this attempt's probe slot in the background, bounded like the
+    /// advisory health write: close the circuit (first content) or free the
+    /// slot. Both are fenced by `epoch`, so a slot that ended otherwise (a
+    /// decision, its expiry, a newer claim) is left alone; a write that never
+    /// lands leaves the slot to end at its expiry.
+    fn end_probe(&self, epoch: i64, close: bool) -> Option<tokio::task::JoinHandle<()>> {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return None;
+        };
+        let (repository, deployment, execution_id) =
+            (self.repository.clone(), self.deployment_id, self.id);
+        Some(runtime.spawn(async move {
+            let write = async {
+                if close {
+                    repository.route_probe_close(deployment, epoch).await
+                } else {
+                    repository.route_probe_release(deployment, epoch).await
+                }
+            };
+            if !matches!(timeout(Duration::from_millis(250), write).await, Ok(Ok(()))) {
+                tracing::warn!(execution_id = %execution_id, "routing probe update failed");
+            }
+        }))
     }
     /// Telemetry as of now: generation time ends when the attempt finishes.
     fn telemetry_now(&self) -> AttemptTelemetry {
@@ -479,6 +607,11 @@ impl ExecutionGuard {
         // only owner of this attempt's accounting, and `Drop` never settles it.
         self.finished = true;
         let result = self.settle_to_completion(outcome, error, phases).await;
+        // The probe's circuit closed at its first content before this result
+        // is recorded (bounded: the close is).
+        if let Some(closing) = self.probe_closing.take() {
+            let _ = closing.await;
+        }
         // Health is advisory; a failed health write never discards a durably accounted response.
         if self.health_observation
             && outcome != Outcome::Cancelled
@@ -493,11 +626,19 @@ impl ExecutionGuard {
         {
             tracing::warn!(execution_id=%self.id, trace_id = self.log_trace_id.as_ref().map(LogTraceId::as_str), "routing health update failed");
         }
+        // A probe the health write decided has no slot left; one it did not
+        // decide (no health signal, cancelled, or a write that failed) frees it.
+        if let Some(epoch) = self.probe.take() {
+            let _ = self.end_probe(epoch, false);
+        }
         result
     }
 }
 impl Drop for ExecutionGuard {
     fn drop(&mut self) {
+        if let Some(epoch) = self.probe.take() {
+            let _ = self.end_probe(epoch, false);
+        }
         if self.finished {
             return;
         }

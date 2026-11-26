@@ -72,6 +72,20 @@ impl Engine {
     /// settlement of its outcome. Gives the request's telemetry back when the
     /// upstream call failed, its settlement succeeded and the plan allows a
     /// failover; otherwise the request's result.
+    /// An attempt admission refused: nothing reached the provider, so its
+    /// telemetry ends here and a probe slot it held is freed.
+    async fn unadmitted(
+        &self,
+        mut telemetry: RequestTelemetry,
+        error: InferenceError,
+        deployment: Uuid,
+        probe: Option<i64>,
+        execution_id: Uuid,
+    ) -> AttemptEnd {
+        telemetry.finish(telemetry::Outcome::Error, Some(error));
+        self.release_unsent(deployment, probe, execution_id).await;
+        AttemptEnd::Return(Err(error))
+    }
     pub(super) async fn attempt(
         &self,
         scope: &RequestScope<'_>,
@@ -79,6 +93,7 @@ impl Engine {
         attempt: usize,
         deployment: &Deployment,
         adapter: Arc<dyn crate::providers::ProviderAdapter>,
+        probe: Option<i64>,
     ) -> AttemptEnd {
         let RequestScope {
             request,
@@ -90,11 +105,7 @@ impl Engine {
             streamed,
             ..
         } = *scope;
-        let execution_id = if attempt == 0 {
-            request_id
-        } else {
-            Uuid::now_v7()
-        };
+        let execution_id = execution_for(attempt, request_id);
         let attempt_started = Instant::now();
         let attempt_wall_start = telemetry.active().then(telemetry::now_unix_nanos);
         let admission = match self
@@ -117,8 +128,9 @@ impl Engine {
                 // attempt - so, like every other terminal return in this
                 // function, telemetry must be finished explicitly here
                 // rather than left for Drop to mislabel `cancelled`.
-                telemetry.finish(telemetry::Outcome::Error, Some(error));
-                return AttemptEnd::Return(Err(error));
+                return self
+                    .unadmitted(telemetry, error, deployment.id, probe, execution_id)
+                    .await;
             }
         };
         // Logging-only correlation (#98): known only once a
@@ -136,6 +148,7 @@ impl Engine {
             permit.clone(),
             log_trace_id,
         );
+        guard.probe = probe;
         let output = call_upstream(
             &mut guard, &*adapter, deployment, request, &admission, deadline, protocol,
         )
@@ -638,4 +651,13 @@ fn report_unsettled(id: Uuid, trace: Option<LogTraceId>) {
         finalizer: crate::ops_log::Finalizer::GenerationFinish,
         trace,
     });
+}
+
+/// An attempt's execution id: the first attempt's is the request's own.
+fn execution_for(attempt: usize, request_id: Uuid) -> Uuid {
+    if attempt == 0 {
+        request_id
+    } else {
+        Uuid::now_v7()
+    }
 }

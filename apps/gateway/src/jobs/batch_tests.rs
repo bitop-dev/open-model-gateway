@@ -3448,6 +3448,7 @@ mod http_support;
 mod poller;
 mod poller_concurrency;
 mod poller_http;
+mod probe;
 
 /// A gateway-run batch line retries a clean 200-wrapped rate limit under its
 /// retry policy, as it retries an HTTP 429 (#665), and never retries the same

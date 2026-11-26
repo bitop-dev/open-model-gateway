@@ -139,6 +139,10 @@ enum Retry {
 }
 
 impl LineRun {
+    /// The probe slot bound of this run's lines (`Engine::probe_hold`).
+    pub(super) fn probe_hold(&self) -> std::time::Duration {
+        self.engine.probe_hold()
+    }
     async fn emit_error(
         &self,
         records: &mpsc::Sender<Record>,
@@ -430,8 +434,13 @@ impl LineRun {
             // merely carrying a plan: a creation-time plan alone (an
             // omitted-maximum line dispatched ungated because its pinned
             // route was briefly ineligible) must not count as gated.
-            self.repository
-                .pin(execution, deployment, plan.map(|p| p.price), pin.is_some());
+            self.repository.pin(
+                execution,
+                deployment,
+                plan.map(|p| p.price),
+                pin.is_some(),
+                pin.and_then(|p| p.probe),
+            );
         }
         // An omitted-maximum line is pinned at plan time to this one price,
         // which already resolved and validated the line against this exact

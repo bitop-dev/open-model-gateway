@@ -40,7 +40,7 @@ Labels are 1–64 lowercase ASCII letters/digits and `._-`, starting with a lett
 
 ## Passive observations
 
-Validated completion resets failures and clears cooldown. Provider Busy, Overloaded, UpstreamUnavailable and provider-operation Timeout increment the deployment's failures; reaching its threshold opens/extends its configured cooldown. Invalid requests/output, unsupported options and local configuration/storage/accounting errors leave observations unchanged. Opening a stream is not success; terminal validated completion is required. Local cancellation/deadline inactivity is not a provider failure.
+Validated completion resets failures and clears cooldown. Provider Busy, Overloaded, UpstreamUnavailable and provider-operation Timeout increment the deployment's failures; reaching its threshold while the circuit is closed or half-open opens it (see [recovery](#recovery-one-real-request-decides)). A failure while it is open changes nothing more. Invalid requests/output, unsupported options and local configuration/storage/accounting errors leave observations unchanged. Opening a stream is not success; terminal validated completion is required. Local cancellation/deadline inactivity is not a provider failure.
 
 Failures inside a returned stream are observed too, by the class they have ([provider adapters](provider-adapters.md#failures-inside-a-returned-stream)): an error the provider reports inside the stream is classified like the same error as an HTTP response (an overload, rate limit or server error counts; a client-fault or configuration error does not), and a transport failure (a reset, a truncated stream, or corrupt Bedrock binary framing) is `upstream_unavailable` and counts. A frame that arrived whole but is malformed is `invalid_upstream_response` and does not. A client that disconnects mid-stream is a cancellation, never a provider failure. No failover follows any of these: the response was already returned.
 
@@ -48,9 +48,21 @@ SSE resets already counted before #622. EOF before the terminal frame now counts
 
 PostgreSQL upsert/row locking prevents lost failure increments; counts saturate at signed-32 maximum. Concurrent completions are observed in database order, so an in-flight success can reset other recorded failures. Deployment thresholds are read at recording time.
 
-Cooldown expiry reopens eligibility by time, **not an exclusive half-open probe**. Multiple requests can select a newly reopened route; planning holds no probe lease. Existing plans/running attempts are snapshots, not retroactively revoked by health changes.
+Existing plans and running attempts are snapshots, not retroactively revoked by health changes.
 
-Management health includes failure count, nullable last observation and cooldown timestamps. No row/observation means unknown, not healthy. Closed/expired circuits mean eligible, not verified uptime. No external probes or provider response bodies appear in these views.
+## Recovery: one real request decides
+
+When a circuit's cooldown has passed, the route is **half-open**: traffic does not resume at once. The next request that can be a probe uses it alone, and its outcome decides.
+
+- **One prober per route, across replicas.** The request claims the route's probe slot on its health row with one conditional update. The slot ends on its own after the request's timeout plus the 3 s settlement deadline (`GATEWAY_REQUEST_TIMEOUT_SECONDS` + 3), so a request that is dropped, a process that is killed, or a health write that never lands cannot keep the route closed. Every other request treats the route as cooling down: it uses another route of the model if the plan has one (this is not an attempt; nothing was sent), or gets 503 `model_temporarily_unavailable` with `Retry-After` set to the slot's remaining time. A gateway-run batch line waits, exactly as for a cooldown.
+- **The decision.** A complete success (a whole response, or a stream's valid terminal event) closes the circuit. A failure that counts (above) reopens it. A stream closes the circuit at its **first content** (text or a tool call; a role chunk, a start event or a keep-alive does not count), so a long stream does not keep other requests out; if it fails later, that is an ordinary failure. An outcome that is no health signal (a client error, a cancellation, a refusal at admission, a failure before anything was sent) frees the slot for the next request without deciding.
+- **Backoff.** Each opening lasts the deployment's `cooldown_seconds`, doubled once per earlier opening since the route last served a complete success, capped at 300 s, or at `cooldown_seconds` itself where that is longer. With a real request as the probe, the cap is how long a recovered provider can stay excluded: for a model with one route, how long its clients keep getting 503. A complete success forgets the openings; a stream's first content closes the circuit but does not.
+- **Who can be the probe.** Requests whose outcome is recorded as health: chat, Responses and Messages generation, the other workloads (embeddings, images, audio, rerank) and gateway-run batch lines. A token count, a native job's submission and a realtime session record no health: a half-open route stays eligible to them, as an expired cooldown always was, and they never decide.
+- **No active or synthetic probes, for any provider.** The gateway never sends a request of its own to test a route: every upstream attempt needs its own durable reservation, and there is no installation-wide scope to bill a synthetic one to. A provider's health or model-list endpoint would not prove that inference or its credentials work either. Local endpoints (vLLM, SGLang, Ollama) recover the same way as cloud ones.
+
+A route whose circuit never opened costs what it did: no probe statement is made for it.
+
+Management health includes failure count, nullable last observation and cooldown timestamps. No row/observation means unknown, not healthy. A closed circuit means eligible, not verified uptime; an expired one is half-open. No external probes or provider response bodies appear in these views.
 
 ## Cancellation and evidence
 

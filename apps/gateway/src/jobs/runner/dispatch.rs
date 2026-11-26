@@ -116,8 +116,11 @@ impl Runner {
             );
             return Ok(false);
         };
+        let Some(probe) = self.line_probe(run, head, route).await else {
+            return Ok(false);
+        };
         let mut started = false;
-        match self
+        let claimed = self
             .scheduler
             .claim(
                 &run.state.fence,
@@ -127,14 +130,21 @@ impl Runner {
                 route,
                 settings.max_concurrency,
             )
-            .await
+            .await;
+        if let Some(epoch) = probe
+            && !matches!(claimed, Ok(Claim::Claimed))
         {
+            // No capacity for the line: its probe slot is freed for another request.
+            let _ = self.jobs.store.route_probe_release(route, epoch).await;
+        }
+        match claimed {
             Ok(Claim::Claimed) => {
                 let head = lane.take().ok_or(InferenceError::Storage)?;
                 let pin = Pin {
                     deployment: route,
                     priority: settings.priority,
                     max_concurrency: settings.max_concurrency,
+                    probe,
                 };
                 spawn_line(tasks, run.line, run.records, head, Some(pin), permits);
                 started = true;
@@ -153,13 +163,43 @@ impl Runner {
         Ok(started)
     }
 
+    /// A half-open route: the line runs only as its probe. The probe slot
+    /// it claimed (`Some(None)` when the route needs none), or `None`: a slot
+    /// another request holds is a route cooling down, waited out as one is
+    /// (the line is planned again after `REPLAN`; nothing is claimed, sent
+    /// or retried).
+    async fn line_probe(
+        &self,
+        run: &Dispatch<'_>,
+        head: &mut Head,
+        route: Uuid,
+    ) -> Option<Option<i64>> {
+        if !head.probe {
+            return Some(None);
+        }
+        match self
+            .jobs
+            .store
+            .route_probe_claim(route, head.execution, run.line.probe_hold())
+            .await
+        {
+            Ok(crate::routing::ProbeClaim::Claimed(epoch)) => Some(Some(epoch)),
+            Ok(crate::routing::ProbeClaim::Closed) => Some(None),
+            Ok(crate::routing::ProbeClaim::Busy(_)) | Err(_) => {
+                head.cooling = true;
+                head.planned = Some(Instant::now());
+                None
+            }
+        }
+    }
+
     /// Plan the head line's route again when it was never planned or its
     /// plan is older than [`REPLAN`].
     async fn plan_head(&self, run: &Dispatch<'_>, head: &mut Head) {
         // The seed matches admission's estimate. The eligible routes still
         // come from the scheduler's live checks on every replan.
         if head.planned.is_none_or(|t| t.elapsed() >= REPLAN) {
-            (head.route, head.cooling) = match &head.request {
+            (head.route, head.probe, head.cooling) = match &head.request {
                 Some(request) => {
                     match self
                         .plan_route(
@@ -171,12 +211,12 @@ impl Runner {
                         )
                         .await
                     {
-                        Planned::Route(d) => (Some(d), false),
-                        Planned::CoolingDown => (None, true),
-                        Planned::Nothing => (None, false),
+                        Planned::Route(d, probe) => (Some(d), probe, false),
+                        Planned::CoolingDown => (None, false, true),
+                        Planned::Nothing => (None, false, false),
                     }
                 }
-                None => (None, false),
+                None => (None, false, false),
             };
             head.planned = Some(Instant::now());
         }

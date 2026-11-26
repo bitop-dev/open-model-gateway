@@ -1,5 +1,11 @@
 //! Provider-independent routing over an already authorized, capability-filtered candidate set.
-//! No probes or network calls; health is a passive observation, not a guarantee.
+//! No network calls; health is a passive observation, not a guarantee.
+//!
+//! A route whose circuit has opened is closed to traffic until its cooldown
+//! passes; it is then half-open, and one real request decides whether
+//! traffic resumes (the route's probe slot, `claim_probe`). There are no
+//! synthetic probes: every upstream attempt has its own reservation, and no
+//! installation-wide scope exists to bill one to.
 
 use std::collections::HashSet;
 
@@ -27,6 +33,12 @@ pub struct RoutePlan {
     pub deployment_ids: Vec<Uuid>,
     pub max_attempts: usize,
     pub allow_ambiguous_failover: bool,
+    /// Half-open routes of the plan: an attempt on one must first claim its
+    /// probe slot (`claim_probe`). Only a probing plan (`plan_probing`) has any.
+    pub probes: Vec<Uuid>,
+    /// A probe slot the caller already holds for one route (a batch line
+    /// claims it before its route capacity), with its epoch.
+    pub held_probe: Option<(Uuid, i64)>,
 }
 
 impl Default for RoutePlan {
@@ -42,6 +54,8 @@ impl RoutePlan {
             deployment_ids,
             max_attempts: 1,
             allow_ambiguous_failover: false,
+            probes: Vec::new(),
+            held_probe: None,
         }
     }
 }
@@ -96,12 +110,20 @@ struct Candidate {
     circuit_open: bool,
     /// Whole seconds until an open circuit closes (0 when closed).
     cooldown_remaining_seconds: i32,
+    /// The circuit opened and its cooldown has passed: one probe decides.
+    half_open: bool,
+    /// Whole seconds until a held probe slot ends on its own (0 when free).
+    probe_held_seconds: i32,
 }
 
 /// The caller owns current authorization and capability checks. The database query
 /// additionally fences candidate IDs to live workspace authorization and model. Planning does
 /// not reserve a half-open probe or leak a lease if the request is cancelled.
 /// Routing configuration and passive health are platform-global resource state.
+///
+/// For a caller that records no health (a token count, a native job's
+/// submission, a realtime session): it cannot decide a probe, and a
+/// half-open route stays eligible to it, as an expired cooldown always was.
 pub async fn plan(
     store: &Store,
     principal: &Principal,
@@ -114,6 +136,27 @@ pub async fn plan(
         &inputs.policy,
         inputs.rows,
         weighted_order_seed(principal, model, request_id),
+        false,
+    )
+}
+
+/// [`plan`] for a caller whose attempts record health (`record_result`): a
+/// half-open route is in the plan only while its probe slot is free, listed
+/// in `RoutePlan::probes`, and an attempt on it must claim the slot first.
+/// One whose slot another request holds is cooling down.
+pub async fn plan_probing(
+    store: &Store,
+    principal: &Principal,
+    model: &str,
+    candidates: &[Deployment],
+    request_id: Uuid,
+) -> Result<RoutePlan, InferenceError> {
+    let inputs = RouteInputs::load(store, principal, model, candidates).await?;
+    order_candidates(
+        &inputs.policy,
+        inputs.rows,
+        weighted_order_seed(principal, model, request_id),
+        true,
     )
 }
 
@@ -163,6 +206,7 @@ impl RouteInputs {
             &self.policy,
             self.subset(ids),
             weighted_order_seed(principal, model, request_id),
+            true,
         )
     }
 
@@ -174,7 +218,7 @@ impl RouteInputs {
             .cloned()
             .collect();
         matches!(
-            eligible_candidates(&self.policy, candidates),
+            eligible_candidates(&self.policy, candidates, true),
             Err(InferenceError::RouteCoolingDown(_))
         )
     }
@@ -188,7 +232,7 @@ impl RouteInputs {
         request_id: Uuid,
         ids: &HashSet<Uuid>,
     ) -> Result<Uuid, InferenceError> {
-        let candidates = eligible_candidates(&self.policy, self.subset(ids))?;
+        let candidates = eligible_candidates(&self.policy, self.subset(ids), true)?;
         let index = if self.policy.strategy == "weighted" {
             let mut rng = StdRng::from_seed(weighted_order_seed(principal, model, request_id));
             weighted_index(&candidates, &mut rng)?
@@ -230,7 +274,11 @@ async fn live_inputs(
                   COALESCE(h.open_until > statement_timestamp(),false) AS circuit_open,
                   CASE WHEN h.open_until > statement_timestamp()
                        THEN LEAST(86400, GREATEST(1, CEIL(EXTRACT(EPOCH FROM h.open_until - statement_timestamp()))))::int
-                       ELSE 0 END AS cooldown_remaining_seconds
+                       ELSE 0 END AS cooldown_remaining_seconds,
+                  COALESCE(h.open_until <= statement_timestamp(),false) AS half_open,
+                  CASE WHEN h.probe_until > statement_timestamp()
+                       THEN LEAST(86400, GREATEST(1, CEIL(EXTRACT(EPOCH FROM h.probe_until - statement_timestamp()))))::int
+                       ELSE 0 END AS probe_held_seconds
            FROM unnest($3::uuid[]) WITH ORDINALITY AS input(id, position)
            JOIN deployments d ON d.id=input.id
            JOIN models m ON m.id=d.model_id
@@ -315,8 +363,11 @@ async fn cached_inputs(
     let (mut health, missing) = caches.health(&eligible);
     if !missing.is_empty() {
         let loaded = std::time::Instant::now();
-        let rows: Vec<(Uuid, i32, Option<f64>, Option<f64>)> = sqlx::query_as(
-            "SELECT deployment_id,consecutive_failures,EXTRACT(EPOCH FROM open_until-clock_timestamp())::float8,EXTRACT(EPOCH FROM clock_timestamp()-last_observed_at)::float8 FROM deployment_health WHERE deployment_id=ANY($1)",
+        // (deployment, failures, seconds until the circuit closes, seconds
+        // since the last observation, seconds the probe slot is held, openings)
+        type HealthRow = (Uuid, i32, Option<f64>, Option<f64>, Option<f64>, i32);
+        let rows: Vec<HealthRow> = sqlx::query_as(
+            "SELECT deployment_id,consecutive_failures,EXTRACT(EPOCH FROM open_until-clock_timestamp())::float8,EXTRACT(EPOCH FROM clock_timestamp()-last_observed_at)::float8,EXTRACT(EPOCH FROM probe_until-clock_timestamp())::float8,reopen_count FROM deployment_health WHERE deployment_id=ANY($1)",
         )
         .bind(&missing)
         .fetch_all(&store.pool)
@@ -332,16 +383,22 @@ async fn cached_inputs(
                         open_until: None,
                         consecutive_failures: 0,
                         observed_age: None,
+                        probe_until: None,
+                        reopen_count: 0,
                     },
                 )
             })
             .collect();
-        for (id, failures, open_for, observed) in rows {
+        for (id, failures, open_for, observed, probe_for, reopens) in rows {
             if let Some(entry) = fresh.iter_mut().find(|(d, _)| *d == id) {
                 entry.1.consecutive_failures = failures;
+                // An expired circuit is kept, as of the load (half-open).
                 entry.1.open_until = open_for
+                    .map(|s| loaded + std::time::Duration::from_secs_f64(s.clamp(0.0, 86_400.0)));
+                entry.1.probe_until = probe_for
                     .filter(|s| *s > 0.0)
                     .map(|s| loaded + std::time::Duration::from_secs_f64(s.min(86_400.0)));
+                entry.1.reopen_count = reopens;
                 entry.1.observed_age =
                     observed.map(|s| std::time::Duration::from_secs_f64(s.clamp(0.0, 1e9)));
             }
@@ -354,10 +411,15 @@ async fn cached_inputs(
         .into_iter()
         .map(|id| {
             let (priority, weight, residency) = snapshot.rows[&id].clone();
-            let open = health
-                .get(&id)
-                .and_then(|h| h.open_until)
+            let entry = health.get(&id);
+            let until = entry.and_then(|h| h.open_until);
+            let open = until.filter(|until| *until > now);
+            let probe = entry
+                .and_then(|h| h.probe_until)
                 .filter(|until| *until > now);
+            let seconds = |until: std::time::Instant| {
+                (until - now).as_secs_f64().ceil().clamp(1.0, 86_400.0) as i32
+            };
             Candidate {
                 deployment_id: id,
                 priority,
@@ -365,9 +427,9 @@ async fn cached_inputs(
                 residency,
                 operator_disabled: false,
                 circuit_open: open.is_some(),
-                cooldown_remaining_seconds: open.map_or(0, |until| {
-                    (until - now).as_secs_f64().ceil().clamp(1.0, 86_400.0) as i32
-                }),
+                cooldown_remaining_seconds: open.map_or(0, seconds),
+                half_open: until.is_some() && open.is_none(),
+                probe_held_seconds: probe.map_or(0, seconds),
             }
         })
         .collect();
@@ -387,6 +449,7 @@ fn validate_ids(ids: &[Uuid]) -> Result<(), InferenceError> {
 fn eligible_candidates(
     policy: &RoutingPolicy,
     mut candidates: Vec<Candidate>,
+    probing: bool,
 ) -> Result<Vec<Candidate>, InferenceError> {
     policy.validate()?;
     validate_ids(
@@ -409,15 +472,31 @@ fn eligible_candidates(
                 .as_deref()
                 .is_none_or(|label| label == c.residency)
     });
-    // Routes in cooldown are skipped. If cooldown is the only reason nothing can
-    // serve the model, say so (retryable, with the soonest reopening) instead of
-    // reporting the model as missing.
+    // Routes in cooldown are skipped, and for a probing caller a half-open
+    // route whose probe another request holds. If that is the only reason
+    // nothing can serve the model, say so (retryable, with the soonest
+    // reopening) instead of reporting the model as missing.
+    let busy = |c: &Candidate| probing && c.half_open && c.probe_held_seconds > 0;
     let cooling = candidates
         .iter()
-        .filter(|c| c.circuit_open)
-        .map(|c| c.cooldown_remaining_seconds.max(1) as u32)
+        .filter_map(|c| {
+            if c.circuit_open {
+                Some(c.cooldown_remaining_seconds)
+            } else if busy(c) {
+                Some(c.probe_held_seconds)
+            } else {
+                None
+            }
+        })
+        .map(|seconds| seconds.max(1) as u32)
         .min();
-    candidates.retain(|c| !c.circuit_open);
+    candidates.retain(|c| !c.circuit_open && !busy(c));
+    if !probing {
+        // This caller decides no probe: a half-open route is an expired cooldown.
+        for c in &mut candidates {
+            c.half_open = false;
+        }
+    }
     if candidates.is_empty()
         && let Some(seconds) = cooling
     {
@@ -445,8 +524,9 @@ fn order_candidates(
     policy: &RoutingPolicy,
     candidates: Vec<Candidate>,
     seed: [u8; 32],
+    probing: bool,
 ) -> Result<RoutePlan, InferenceError> {
-    let mut candidates = eligible_candidates(policy, candidates)?;
+    let mut candidates = eligible_candidates(policy, candidates, probing)?;
     let mut ordered = Vec::with_capacity(candidates.len());
     if policy.strategy == "weighted" {
         let mut rng = StdRng::from_seed(seed);
@@ -466,9 +546,15 @@ fn order_candidates(
         });
     }
     Ok(RoutePlan {
+        probes: ordered
+            .iter()
+            .filter(|c| c.half_open)
+            .map(|c| c.deployment_id)
+            .collect(),
         deployment_ids: ordered.into_iter().map(|c| c.deployment_id).collect(),
         max_attempts: policy.max_attempts as usize,
         allow_ambiguous_failover: policy.allow_ambiguous_failover,
+        held_probe: None,
     })
 }
 
@@ -552,6 +638,7 @@ pub async fn record_result(
         && store.caches.health_entry(deployment).is_some_and(|h| {
             h.consecutive_failures == 0
                 && h.open_until.is_none()
+                && h.reopen_count == 0
                 && h.observed_age.is_some_and(|age| {
                     age + h.loaded.elapsed()
                         < std::time::Duration::from_secs(OBSERVED_REFRESH_SECONDS as u64)
@@ -563,7 +650,9 @@ pub async fn record_result(
         return Ok(());
     }
     if error.is_none() {
-        let state: Option<(bool, bool)> = sqlx::query_as("SELECT consecutive_failures=0 AND open_until IS NULL, last_observed_at>clock_timestamp()-$2*interval '1 second' FROM deployment_health WHERE deployment_id=$1")
+        // Healthy: no failures, no circuit and no openings left to forget (a
+        // complete success resets the reopen count).
+        let state: Option<(bool, bool)> = sqlx::query_as("SELECT consecutive_failures=0 AND open_until IS NULL AND reopen_count=0, last_observed_at>clock_timestamp()-$2*interval '1 second' FROM deployment_health WHERE deployment_id=$1")
             .bind(deployment)
             .bind(OBSERVED_REFRESH_SECONDS)
             .fetch_optional(&store.pool)
@@ -579,7 +668,7 @@ pub async fn record_result(
                 let Some(_claim) = store.caches.claim_health_refresh(deployment) else {
                     return Ok(());
                 };
-                let refreshed = sqlx::query("UPDATE deployment_health SET last_observed_at=clock_timestamp() WHERE deployment_id=(SELECT deployment_id FROM deployment_health WHERE deployment_id=$1 AND consecutive_failures=0 AND open_until IS NULL FOR UPDATE SKIP LOCKED)")
+                let refreshed = sqlx::query("UPDATE deployment_health SET last_observed_at=clock_timestamp() WHERE deployment_id=(SELECT deployment_id FROM deployment_health WHERE deployment_id=$1 AND consecutive_failures=0 AND open_until IS NULL AND reopen_count=0 FOR UPDATE SKIP LOCKED)")
                     .bind(deployment)
                     .execute(&store.pool)
                     .await
@@ -591,7 +680,7 @@ pub async fn record_result(
                 }
                 // Busy (advisory; the next success retries), unless a failure
                 // committed meanwhile: then this success must end the streak.
-                let healthy: Option<bool> = sqlx::query_scalar("SELECT consecutive_failures=0 AND open_until IS NULL FROM deployment_health WHERE deployment_id=$1")
+                let healthy: Option<bool> = sqlx::query_scalar("SELECT consecutive_failures=0 AND open_until IS NULL AND reopen_count=0 FROM deployment_health WHERE deployment_id=$1")
                     .bind(deployment)
                     .fetch_optional(&store.pool)
                     .await
@@ -604,6 +693,12 @@ pub async fn record_result(
             _ => {}
         }
     }
+    // A failure that reaches the threshold while the circuit is closed or
+    // half-open opens it, for the deployment's cooldown doubled once per
+    // earlier opening, capped at 300 s (or the cooldown, if longer); it ends
+    // any probe slot. One that arrives while the circuit is open changes
+    // nothing more. A success closes the circuit, frees the slot and forgets
+    // the openings.
     let result = sqlx::query(
         r#"WITH policy AS (
             SELECT COALESCE(p.failure_threshold,3) AS threshold,
@@ -613,17 +708,34 @@ pub async fn record_result(
             WHERE d.id=$1
         )
         INSERT INTO deployment_health AS h
-            (deployment_id, consecutive_failures, open_until, last_observed_at)
+            (deployment_id, consecutive_failures, open_until, last_observed_at, reopen_count)
         SELECT $1, CASE WHEN $2 THEN 1 ELSE 0 END,
             CASE WHEN $2 AND threshold <= 1 THEN clock_timestamp() + make_interval(secs => cooldown) ELSE NULL END,
-            clock_timestamp() FROM policy
+            clock_timestamp(), CASE WHEN $2 AND threshold <= 1 THEN 1 ELSE 0 END FROM policy
         ON CONFLICT (deployment_id) DO UPDATE SET
             consecutive_failures=CASE WHEN $2 THEN LEAST(h.consecutive_failures::bigint+1,2147483647)::integer ELSE 0 END,
             open_until=CASE
                 WHEN NOT $2 THEN NULL
                 WHEN h.consecutive_failures::bigint+1 >= (SELECT threshold FROM policy)
-                    THEN GREATEST(h.open_until, clock_timestamp() + make_interval(secs => (SELECT cooldown FROM policy)))
+                     AND (h.open_until IS NULL OR h.open_until <= clock_timestamp())
+                    THEN clock_timestamp() + make_interval(secs => (SELECT LEAST(
+                        cooldown::double precision * power(2, LEAST(h.reopen_count, 20)),
+                        GREATEST(300, cooldown)) FROM policy))
                 ELSE h.open_until END,
+            reopen_count=CASE
+                WHEN NOT $2 THEN 0
+                WHEN h.consecutive_failures::bigint+1 >= (SELECT threshold FROM policy)
+                     AND (h.open_until IS NULL OR h.open_until <= clock_timestamp())
+                    THEN LEAST(h.reopen_count::bigint+1,2147483647)::integer
+                ELSE h.reopen_count END,
+            probe_holder=CASE
+                WHEN NOT $2 OR (h.consecutive_failures::bigint+1 >= (SELECT threshold FROM policy)
+                     AND (h.open_until IS NULL OR h.open_until <= clock_timestamp())) THEN NULL
+                ELSE h.probe_holder END,
+            probe_until=CASE
+                WHEN NOT $2 OR (h.consecutive_failures::bigint+1 >= (SELECT threshold FROM policy)
+                     AND (h.open_until IS NULL OR h.open_until <= clock_timestamp())) THEN NULL
+                ELSE h.probe_until END,
             last_observed_at=clock_timestamp()"#,
     ).bind(deployment).bind(error.is_some()).execute(&store.pool)
         .await.map_err(|_| InferenceError::Storage)?;
@@ -666,5 +778,9 @@ pub async fn health(store: &Store, deployment: Uuid) -> Result<RouteHealth, Infe
     .ok_or(InferenceError::ModelUnavailable)
 }
 
+mod probe;
+pub use probe::{ProbeClaim, claim_probe, close_probe, release_probe};
+#[cfg(all(test, feature = "integration-tests"))]
+mod probe_tests;
 #[cfg(test)]
 mod tests;

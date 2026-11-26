@@ -9,12 +9,12 @@ use crate::jobs::schedule::{Scheduler, claims::RetryClaim};
 /// cooldown: the line is planned again only after one `jobs::runner::REPLAN`,
 /// so a wait of exactly `REPLAN` can expire before the next plan reaches the
 /// provider. Two `REPLAN`s and a margin still bound a stuck runner.
-const REACH: Duration = crate::jobs::runner::REPLAN
+pub(super) const REACH: Duration = crate::jobs::runner::REPLAN
     .saturating_mul(2)
     .saturating_add(Duration::from_secs(10));
 
 /// `world` with one batch of `lines` (chat completions, one line each).
-async fn batch(pool: PgPool, lines: &[(&str, &str)]) -> (World, JobRow) {
+pub(super) async fn batch(pool: PgPool, lines: &[(&str, &str)]) -> (World, JobRow) {
     let w = world(pool, false, false, 1).await;
     let lines: Vec<Value> = lines
         .iter()

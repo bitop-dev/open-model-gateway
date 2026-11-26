@@ -187,6 +187,7 @@ Effort is relative: **S** = narrow change; **M** = several components plus tests
 - [x] Selected (phase 6)
 - **Value:** avoid sending a burst of traffic to a deployment as soon as its cooldown expires.
 - **Scope / done:** distributed, leased half-open probe ownership; stale/unknown health presentation; bounded active checks with backoff; operator-visible drain/maintenance state if needed. Concurrent replicas must not all become the recovery probe.
+- **Decided (#49):** no active or synthetic probes, for any provider: the probe is the first real request after a cooldown, admitted one at a time, because every upstream attempt needs its own reservation and there is no installation-wide scope to bill a synthetic one to. Local endpoints recover the same way; a local readiness pre-check is not planned. Delivered so far: half-open with one probe per route across replicas and capped backoff (D1). Next: health presentation in Admin and the API (D2), and an operator drain state for deployments and connections (D3).
 - **Guardrails:** a successful health endpoint is not proof that model inference or IAM works. Some checks themselves generate: the inspected SGLang Python server's `/health` can generate a token by default, whereas `/ready` does not. Qualify paths per server/version. Any inference probe needs explicit cost/accounting policy; do not generate unapproved background inference. Preserve residency and no-post-stream-failover rules.
 
 ## C. User and administrator experience
@@ -371,7 +372,7 @@ Deliberate limits: native Responses/Messages frontends stream text incrementally
 - [ ] Provider invoices, billing adjustments/credits, customer billing and financial archival.
 - [ ] Exclusive half-open probes, active health checks and OpenTelemetry metrics/traces.
 
-Limits count attempts, including opt-in fallbacks. Reservations require accurate configured HARD provider input ceilings and bounded output (an explicit client maximum or the pinned price's output ceiling); prices are estimates, not invoice guarantees. Unknown unpriced history blocks newly enabled budgets rather than being erased. Cooldowns reopen by elapsed time, not a single-probe gate. Labels are operator assertions, not verified geography. See [governance](governance.md) and [routing](routing.md).
+Limits count attempts, including opt-in fallbacks. Reservations require accurate configured HARD provider input ceilings and bounded output (an explicit client maximum or the pinned price's output ceiling); prices are estimates, not invoice guarantees. Unknown unpriced history blocks newly enabled budgets rather than being erased. After a cooldown, one real request per route decides whether traffic resumes ([routing](routing.md#recovery-one-real-request-decides)). Labels are operator assertions, not verified geography. See [governance](governance.md) and [routing](routing.md).
 
 ## 5. Production operations — next
 

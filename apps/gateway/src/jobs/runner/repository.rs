@@ -32,6 +32,9 @@ pub(super) struct LineRepository {
     /// dispatch (a `Pin` was passed to `LineRun::execute`), distinct from
     /// merely carrying a plan in `pins`.
     pub(super) claimed: Mutex<HashSet<Uuid>>,
+    /// The probe slot each attempt claimed before its route capacity:
+    /// (route, epoch). Its plan hands it to the engine (`held_probe`).
+    pub(super) probes: Mutex<HashMap<Uuid, (Uuid, i64)>>,
 }
 impl LineRepository {
     /// Record `execution`'s routing/pricing plan. `claimed` is `true` only
@@ -44,6 +47,7 @@ impl LineRepository {
         deployment: Uuid,
         price: Option<Uuid>,
         claimed: bool,
+        probe: Option<i64>,
     ) {
         self.pins
             .lock()
@@ -52,10 +56,17 @@ impl LineRepository {
         if claimed {
             self.claimed.lock().expect("claimed").insert(execution);
         }
+        if let Some(epoch) = probe {
+            self.probes
+                .lock()
+                .expect("probes")
+                .insert(execution, (deployment, epoch));
+        }
     }
     pub(super) fn unpin(&self, execution: Uuid) {
         self.pins.lock().expect("pins").remove(&execution);
         self.claimed.lock().expect("claimed").remove(&execution);
+        self.probes.lock().expect("probes").remove(&execution);
     }
     /// Whether the scheduler actually claimed route capacity for `execution`
     /// at dispatch - never merely whether it carries a routing/pricing plan
@@ -264,11 +275,61 @@ impl InferenceRepository for LineRepository {
             }
         }
     }
+    async fn route_plan_probing(
+        &self,
+        principal: &Principal,
+        model: &str,
+        candidates: &[Deployment],
+        request_id: Uuid,
+    ) -> Result<crate::routing::RoutePlan, InferenceError> {
+        let pinned = self
+            .pins
+            .lock()
+            .expect("pins")
+            .get(&request_id)
+            .map(|p| p.0);
+        match pinned {
+            // The line's route, with the probe slot it claimed for it, if any.
+            Some(d) if candidates.iter().any(|c| c.id == d) => Ok(crate::routing::RoutePlan {
+                held_probe: self
+                    .probes
+                    .lock()
+                    .expect("probes")
+                    .get(&request_id)
+                    .copied(),
+                ..crate::routing::RoutePlan::single(vec![d])
+            }),
+            Some(_) => Err(InferenceError::ModelUnavailable),
+            None => {
+                self.store
+                    .route_plan_probing(principal, model, candidates, request_id)
+                    .await
+            }
+        }
+    }
     async fn route_result(
         &self,
         deployment: Uuid,
         error: Option<InferenceError>,
     ) -> Result<(), InferenceError> {
         self.store.route_result(deployment, error).await
+    }
+    async fn route_probe_claim(
+        &self,
+        deployment: Uuid,
+        holder: Uuid,
+        hold: std::time::Duration,
+    ) -> Result<crate::routing::ProbeClaim, InferenceError> {
+        self.store.route_probe_claim(deployment, holder, hold).await
+    }
+    async fn route_probe_close(&self, deployment: Uuid, epoch: i64) -> Result<(), InferenceError> {
+        self.store.route_probe_close(deployment, epoch).await
+    }
+    async fn route_probe_release(
+        &self,
+        deployment: Uuid,
+        epoch: i64,
+    ) -> Result<(), InferenceError> {
+        self.store.route_probe_release(deployment, epoch).await
     }
 }

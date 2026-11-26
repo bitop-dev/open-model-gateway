@@ -386,6 +386,8 @@ async fn explicit_failover_creates_distinct_admitted_attempts() {
         deployment_ids: vec![first.id, second.id],
         max_attempts: 2,
         allow_ambiguous_failover: false,
+        probes: Vec::new(),
+        held_probe: None,
     });
     let root = Uuid::new_v4();
     engine
