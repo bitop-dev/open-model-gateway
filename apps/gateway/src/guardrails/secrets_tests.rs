@@ -105,9 +105,20 @@ fn every_builtin_rule_matches_its_shape_inside_prose() {
     for (name, value) in positives {
         let text = format!("please use {value} for the deploy");
         assert!(found(&d, &text) >= 1, "{name} not found");
-        // A character glued to either end does not hide it.
-        let glued = format!("x{value}x");
-        assert!(found(&d, &glued) >= 1, "{name} glued");
+        // Punctuation around it does not hide it; base64url data around it
+        // makes it part of an encoded blob.
+        for around in [
+            format!("\"{value}\""),
+            format!("key={value};"),
+            format!("({value})"),
+        ] {
+            assert!(found(&d, &around) >= 1, "{name} in {around}");
+        }
+        assert_eq!(
+            found(&d, &format!("Zx9{value}_Q")),
+            0,
+            "{name} inside base64url"
+        );
     }
 }
 
@@ -152,6 +163,34 @@ fn a_repeated_value_counts_once() {
     let findings = d.scan(&input);
     assert_eq!(findings.0.len(), 2);
     assert_eq!(findings.distinct(&input, Category::Secret), 1);
+}
+
+#[test]
+fn random_base64url_data_matches_nothing() {
+    let d = secrets();
+    // A deterministic stand-in for random base64url: no built-in prefix is
+    // a standalone token inside it.
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let blob: String = (0..1_000_000)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            alphabet[(x % 64) as usize] as char
+        })
+        .collect();
+    let blob = format!("{}hf_{}{}", &blob[..500_000], alnum(36), &blob[500_000..]);
+    assert_eq!(found(&d, &blob), 0);
+}
+
+#[test]
+fn a_scan_keeps_a_bounded_number_of_matches() {
+    let custom = PatternDetector::new(&[Category::Custom], &["x".to_owned()]).unwrap();
+    let mut input = Inspection::default();
+    let text = "x".repeat(MAX_FINDINGS * 3);
+    input.push(&text, Part::Content);
+    assert_eq!(custom.scan(&input).0.len(), MAX_FINDINGS);
 }
 
 #[test]

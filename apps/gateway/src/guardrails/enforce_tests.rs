@@ -151,6 +151,12 @@ fn a_rule_this_release_cannot_run_fails_under_its_on_error() {
     let d = p.decide(Workload::Generation, Some(&text("hello")));
     assert_eq!(d.refusal.map(|r| r.kind), Some(RefusalKind::DetectorFailed));
     assert_eq!(d.events[0].action, Action::DetectorFailed);
+    // Also when it enforces only on output (input off).
+    let mut output_only = rule(&[Category::Secret], &[], InputAction::Off);
+    output_only.output_mode = OutputMode::Block;
+    output_only.on_error = OnError::FailClosed;
+    let d = policy(vec![output_only]).decide(Workload::Generation, Some(&text("hello")));
+    assert_eq!(d.refusal.map(|r| r.kind), Some(RefusalKind::DetectorFailed));
     later.on_error = OnError::FailOpen;
     later.input_action = InputAction::Monitor;
     let d = policy(vec![later]).decide(Workload::Generation, Some(&text("hello")));
@@ -206,7 +212,7 @@ fn native_envelopes_are_read_and_images_are_not() {
     let read = texts(&input);
     assert!(read.iter().any(|t| t.contains(&k)));
     assert!(read.contains(&"plain notes"));
-    assert!(!read.contains(&"opaque-signature"));
+    assert!(read.contains(&"opaque-signature"), "a client may send a signature: it is read");
     assert!(!input.uninspectable);
     let image = json!({"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo"}}]});
     let mut input = Inspection::default();
@@ -220,6 +226,21 @@ fn text_in_any_json_key_of_a_tool_or_tool_input_is_read() {
     let k = key();
     // A schema property named like a block key, and a tool input with one.
     let schema = json!({"type":"object","properties":{"type":{"type":"string","description":k},"role":{"enum":[k]}}});
+    let named = json!({"type":"object","properties":{k.clone():{"type":"string"}}});
+    let tool = FunctionTool {
+        name: "t".into(),
+        description: None,
+        parameters: named,
+        strict: None,
+    };
+    assert!(
+        found(&chat_inspection(&request(
+            Vec::new(),
+            vec![tool],
+            MessagesOptions::default()
+        ))),
+        "a property name"
+    );
     let tool = FunctionTool {
         name: "t".into(),
         description: None,

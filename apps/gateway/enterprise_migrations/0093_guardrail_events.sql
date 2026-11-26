@@ -28,7 +28,7 @@ CREATE TABLE guardrail_events (
  workspace_id uuid NOT NULL REFERENCES workspaces(id),
  api_key_id uuid NOT NULL,
  -- The client operation: a generation protocol or a workload.
- operation text NOT NULL CHECK (operation IN ('chat_completions','responses','messages','embeddings',
+ operation text NOT NULL CHECK (operation IN ('chat_completions','responses','messages','count_tokens','embeddings',
   'rerank','systemone','audio_speech','images','audio_transcriptions')),
  model text NOT NULL CHECK (char_length(model) BETWEEN 1 AND 200),
  -- Whether the client asked for a stream (generation only).

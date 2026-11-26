@@ -286,7 +286,13 @@ impl Jobs {
                 streamed: false,
                 workload,
             };
-            self.store.guard_unread(&principal, facts).await?;
+            if let Err(refused) = self.store.guard_unread(&principal, facts).await {
+                // Nothing was admitted: the private copy of the input goes too.
+                let _ = files
+                    .delete(plan.work_file, Some(principal.workspace_id))
+                    .await;
+                return Err(refused.into());
+            }
         }
         // The envelope reservation and the job row are one transaction: the
         // envelope's lease runs to the job's deadline from the moment it

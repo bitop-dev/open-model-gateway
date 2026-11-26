@@ -409,8 +409,9 @@ fn content<'a>(c: &'a Value, part: Part, input: &mut Inspection<'a>) {
     }
 }
 
-/// One content block. Known shapes skip only what is opaque (a signature, an
-/// encoded or remote source); any other value has every string read.
+/// One content block. Known shapes skip only what cannot be read (an
+/// encoded or remote source); any other value has every string read,
+/// signatures and redacted reasoning included (a client may send them).
 fn block<'a>(b: &'a Value, part: Part, input: &mut Inspection<'a>) {
     let Some(map) = b.as_object() else {
         return json(b, part, input);
@@ -419,14 +420,6 @@ fn block<'a>(b: &'a Value, part: Part, input: &mut Inspection<'a>) {
         Some("image" | "image_url" | "input_image" | "audio" | "input_audio" | "file") => {
             input.uninspectable = true;
         }
-        Some("thinking") => {
-            if let Some(Value::String(t)) = map.get("thinking") {
-                input.push(t, part);
-            }
-        }
-        // Provider-encrypted reasoning the provider returned; it holds no
-        // client text.
-        Some("redacted_thinking") => {}
         Some("document") => {
             for (key, value) in map {
                 if key == "source" {
@@ -465,12 +458,17 @@ fn source<'a>(s: &'a Value, part: Part, input: &mut Inspection<'a>) {
     }
 }
 
-/// Every string of an arbitrary JSON value (keys skip nothing).
+/// Every string of an arbitrary JSON value, object keys included.
 fn json<'a>(v: &'a Value, part: Part, input: &mut Inspection<'a>) {
     match v {
         Value::String(s) => input.push(s, part),
         Value::Array(items) => items.iter().for_each(|i| json(i, part, input)),
-        Value::Object(map) => map.values().for_each(|i| json(i, part, input)),
+        Value::Object(map) => {
+            for (key, value) in map {
+                input.push(key, part);
+                json(value, part, input);
+            }
+        }
         _ => {}
     }
 }
@@ -480,7 +478,12 @@ fn owned(v: &Value, part: Part, input: &mut Inspection<'_>) {
     match v {
         Value::String(s) => input.push_owned(s.clone(), part),
         Value::Array(items) => items.iter().for_each(|i| owned(i, part, input)),
-        Value::Object(map) => map.values().for_each(|i| owned(i, part, input)),
+        Value::Object(map) => {
+            for (key, value) in map {
+                input.push_owned(key.clone(), part);
+                owned(value, part, input);
+            }
+        }
         _ => {}
     }
 }

@@ -13,6 +13,19 @@ pub const NEST_LIMIT: u32 = 64;
 
 /// Compile one custom pattern within the limits.
 pub fn compile(pattern: &str) -> Option<Regex> {
+    // A pattern that can match the empty string matches at every position:
+    // it finds nothing and costs a scan of every byte, so it is refused.
+    let empty = regex_syntax::ParserBuilder::new()
+        .nest_limit(NEST_LIMIT)
+        .build()
+        .parse(pattern)
+        .ok()?
+        .properties()
+        .minimum_len()
+        == Some(0);
+    if empty {
+        return None;
+    }
     // PostgreSQL text cannot hold NUL, so such a pattern is never storable.
     if pattern.is_empty()
         || pattern.len() > super::policy::MAX_PATTERN_BYTES
@@ -77,6 +90,9 @@ mod tests {
         assert!(!valid("(unclosed"));
         assert!(!valid(&"a".repeat(513)));
         assert!(!valid("a\0b"), "NUL is not storable");
+        for empty in ["x?", "(?:)", "\\b", "a*", "(?m)^", "a|"] {
+            assert!(!valid(empty), "{empty} can match the empty string");
+        }
         // Small to write, enormous to compile: the size limit refuses it.
         assert!(!valid(r"\w{1000}\w{1000}"));
         assert!(

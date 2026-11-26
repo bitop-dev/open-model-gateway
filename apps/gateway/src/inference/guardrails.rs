@@ -57,7 +57,9 @@ impl Store {
             .map_err(route_lookup_storage)?
             // A stored value this release cannot read refuses the request.
             .map_err(|_| InferenceError::Storage)?;
-        // Compiling custom patterns takes milliseconds each: off the async workers.
+        // Compiling custom patterns takes milliseconds each: off the async
+        // workers, and without holding a connection.
+        drop(conn);
         let effective = compose(platform.as_ref(), local.as_ref());
         let policy = Arc::new(
             tokio::task::spawn_blocking(move || Policy::compile(&effective))
@@ -139,6 +141,9 @@ impl Store {
         Ok(())
     }
 }
+
+/// Inputs above this many bytes are scanned off the async workers.
+const LARGE_INPUT: usize = 64 * 1024;
 
 /// The facts of a request the guardrail step records.
 pub(crate) struct Guarded<'a> {
@@ -223,9 +228,18 @@ impl super::Engine {
             return Ok(());
         }
         let started = std::time::Instant::now();
-        let decision = {
-            let input = input();
-            policy.decide(workload, input.as_ref())
+        let input = input();
+        let decision = match input {
+            // A large input is scanned on the blocking pool (the patterns run
+            // in linear time, but over megabytes and many rules).
+            Some(input) if input.len() > LARGE_INPUT => {
+                let owned = input.into_owned();
+                let policy = Arc::clone(&policy);
+                tokio::task::spawn_blocking(move || policy.decide(workload, Some(&owned)))
+                    .await
+                    .map_err(|_| InferenceError::Storage)?
+            }
+            input => policy.decide(workload, input.as_ref()),
         };
         crate::metrics::METRICS.guardrail_detector_seconds("pattern", started.elapsed());
         count(&decision);

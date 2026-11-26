@@ -31,15 +31,23 @@ pub struct Segment<'a> {
 }
 
 /// The text of one request, and whether it also carries parts no detector
-/// can read (images, documents, audio).
+/// can read (images, documents, audio). A text seen before (the canonical and
+/// native forms of one message, say) is kept once.
 #[derive(Default)]
 pub struct Inspection<'a> {
     pub segments: Vec<Segment<'a>>,
     pub uninspectable: bool,
+    seen: std::collections::HashSet<u64>,
 }
 impl<'a> Inspection<'a> {
+    fn fresh(&mut self, text: &str) -> bool {
+        use std::hash::{BuildHasher, BuildHasherDefault};
+        let hash = BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default()
+            .hash_one(text);
+        !text.is_empty() && self.seen.insert(hash)
+    }
     pub fn push(&mut self, text: &'a str, part: Part) {
-        if !text.is_empty() {
+        if self.fresh(text) {
             self.segments.push(Segment {
                 text: Cow::Borrowed(text),
                 part,
@@ -47,11 +55,33 @@ impl<'a> Inspection<'a> {
         }
     }
     pub fn push_owned(&mut self, text: String, part: Part) {
-        if !text.is_empty() {
+        if self.fresh(&text) {
             self.segments.push(Segment {
                 text: Cow::Owned(text),
                 part,
             });
+        }
+    }
+    /// Bytes of text to scan.
+    pub fn len(&self) -> usize {
+        self.segments.iter().map(|s| s.text.len()).sum()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+    /// The same text, owned (to decide on the blocking pool).
+    pub fn into_owned(self) -> Inspection<'static> {
+        Inspection {
+            segments: self
+                .segments
+                .into_iter()
+                .map(|s| Segment {
+                    text: Cow::Owned(s.text.into_owned()),
+                    part: s.part,
+                })
+                .collect(),
+            uninspectable: self.uninspectable,
+            seen: self.seen,
         }
     }
 }

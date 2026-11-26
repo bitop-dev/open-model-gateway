@@ -4,8 +4,10 @@
 //!
 //! The built-in rules match credentials by their documented shape: a fixed
 //! prefix or structure, so ordinary code, UUIDs, hashes and base64 data do not
-//! match. They are not anchored on word boundaries: a character glued to a
-//! credential does not hide it. A PEM private key is matched on its `BEGIN` line, which is enough to
+//! match. A match counts only when it is not glued to a base64url character
+//! (letter, digit, `_` or `-`) on either side: inside an encoded blob it is
+//! data, not a credential, while quotes, spaces, `=` or `:` around one do not
+//! hide it. A PEM private key is matched on its `BEGIN` line, which is enough to
 //! refuse it and keeps the match short.
 use std::sync::LazyLock;
 
@@ -81,13 +83,25 @@ static SECRETS: LazyLock<Builtin> = LazyLock::new(|| Builtin {
 /// so a pattern that matches everywhere costs bounded memory.
 pub const MAX_FINDINGS: usize = 10_000;
 
+fn encoded(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+}
+/// Whether `span` of `text` stands apart from base64url data around it.
+fn standalone(text: &[u8], span: std::ops::Range<usize>) -> bool {
+    let before = span.start.checked_sub(1).and_then(|i| text.get(i));
+    !before.is_some_and(|b| encoded(*b)) && !text.get(span.end).is_some_and(|b| encoded(*b))
+}
+
 /// Every match of the built-in secret shapes (shared by every rule that has
 /// the `secret` category in one request).
 pub fn builtin(input: &Inspection<'_>) -> Findings {
     let mut found = Vec::new();
     for (index, segment) in input.segments.iter().enumerate() {
         for i in SECRETS.any.matches(&segment.text).iter() {
-            for m in SECRETS.each[i].find_iter(&segment.text) {
+            for m in SECRETS.each[i]
+                .find_iter(&segment.text)
+                .filter(|m| standalone(segment.text.as_bytes(), m.range()))
+            {
                 if found.len() == MAX_FINDINGS {
                     return Findings(found);
                 }

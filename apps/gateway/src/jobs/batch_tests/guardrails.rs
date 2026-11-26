@@ -102,6 +102,11 @@ async fn a_native_batch_is_refused_by_an_enforcing_rule(pool: PgPool) {
         .fetch_one(&f.store.pool)
         .await
         .unwrap();
+    let live = "SELECT count(*) FROM stored_files WHERE deleted_at IS NULL";
+    let files_before: i64 = sqlx::query_scalar(live)
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
     let refused = w
         .create(f.principal, &file, BatchEndpoint::ChatCompletions, None)
         .await;
@@ -118,6 +123,14 @@ async fn a_native_batch_is_refused_by_an_enforcing_rule(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(before, after, "nothing was reserved");
+    let files_after: i64 = sqlx::query_scalar(live)
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        files_before, files_after,
+        "the private copy of the input is gone"
+    );
     let recorded: (String, bool) = sqlx::query_as("SELECT action,refused FROM guardrail_events")
         .fetch_one(&f.store.pool)
         .await
