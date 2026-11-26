@@ -1,7 +1,9 @@
 //! A batch line on a half-open route (#49) runs only as its probe: while
-//! another request holds the probe slot, the line waits as it would for a
-//! route cooling down (nothing is sent, nothing is claimed, no retry is
-//! spent), and once the slot is free it is the probe.
+//! another request holds the probe slot, a line not yet dispatched waits as
+//! it would for a route cooling down (nothing is sent, nothing is claimed, no
+//! retry is spent), and once the slot is free it is the probe. A retry is
+//! sent only as its route is at the send: as its probe while half-open, and
+//! not at all while open, so no worker waits on a circuit.
 use super::fence::{REACH, batch, start};
 use super::*;
 use crate::routing::{ProbeClaim, claim_probe, release_probe};
