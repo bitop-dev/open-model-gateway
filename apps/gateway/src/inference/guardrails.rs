@@ -425,7 +425,9 @@ impl super::Engine {
         // A gateway-run batch line whose budget ran out is tried again by
         // the runner: this try's decisions are not recorded, so Logs and the
         // totals show only the try that answered (the line's last try, or
-        // the one that ran), never a refusal of a request that then ran.
+        // the one that ran), never a refusal of a request that then ran. A
+        // line its batch stops meanwhile is reported as not run. The metrics
+        // count every try's decisions.
         if let Some(refusal) = decision
             .refusal
             .filter(|r| r.kind == RefusalKind::Unavailable && r.scanned && spent_retried())

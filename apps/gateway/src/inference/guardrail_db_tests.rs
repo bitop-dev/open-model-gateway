@@ -439,6 +439,11 @@ async fn an_image_is_refused_by_a_blocking_rule_and_the_text_beside_it_is_read(p
         !body.to_string().contains("iVBOR"),
         "the image is never echoed"
     );
+    let responses = json!({"model":"company/smart","max_output_tokens":16,"input":[{"role":"user","content":[
+        {"type":"input_text","text":format!("deploy with {}", secret())},{"type":"input_image","image_url":PNG}]}]});
+    let (status, _, body) = send(&w, "/v1/responses", responses).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "guardrail_input_blocked");
     // Nothing reached a provider or was reserved.
     assert_eq!(w.hits.load(Ordering::SeqCst), 0);
     assert_eq!(snapshot(&w.f.store.pool).await, before);
@@ -454,8 +459,17 @@ async fn an_image_is_refused_by_a_blocking_rule_and_the_text_beside_it_is_read(p
             ("chat_completions".into(), "skipped".into()),
             ("responses".into(), "skipped".into()),
             ("chat_completions".into(), "blocked".into()),
+            ("responses".into(), "blocked".into()),
         ]
     );
+    // Beside each block, the image was recorded as not read.
+    let skipped: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM guardrail_events WHERE action='skipped' AND NOT refused",
+    )
+    .fetch_one(&w.f.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(skipped, 2);
 }
 
 /// Under a rule that does not block, an image passes and the rule records

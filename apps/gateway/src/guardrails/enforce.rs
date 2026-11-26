@@ -140,9 +140,6 @@ impl Policy {
     }
 }
 
-/// The time a request's custom patterns may take in all (tests run with a
-/// long one, so a stalled runner never turns into a refusal; the budget's
-/// own behaviour is tested with step budgets).
 /// Tests: rules whose next decisions have their custom-pattern budget spent
 /// at once, and how many (the real-path tests run with a long budget).
 #[cfg(test)]
@@ -150,6 +147,9 @@ pub static SPEND_BUDGET: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<Uuid, u32>>,
 > = std::sync::LazyLock::new(Default::default);
 
+/// The time a request's custom patterns may take in all (tests run with a
+/// long one, so a stalled runner never turns into a refusal; the budget's
+/// own behaviour is tested with step budgets).
 pub const CUSTOM_BUDGET: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_secs(60)
 } else {
@@ -476,6 +476,8 @@ pub fn chat_inspection(request: &ChatRequest) -> Inspection<'_> {
                                 system.push(text.as_str());
                             }
                         }
+                        // The text on both sides of an image is still read
+                        // joined: a provider reads the parts in order.
                         crate::inference::types::Part::Image(_) => input.uninspectable = true,
                     }
                 }

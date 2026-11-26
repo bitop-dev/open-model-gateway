@@ -208,19 +208,7 @@ impl LineRun {
         records: mpsc::Sender<Record>,
         mut workers: Workers,
     ) {
-        // The probe slot dispatch claimed for this line is freed if the line
-        // ends before its attempt reaches the engine (an unparseable line, or
-        // the task aborted); from the attempt on, the engine and `unpin` end it.
-        let mut slot = pin.and_then(|pin| {
-            pin.probe.map(|epoch| {
-                crate::inference::ProbeTicket::held(
-                    self.repository.clone(),
-                    pin.deployment,
-                    execution,
-                    epoch,
-                )
-            })
-        });
+        let mut slot = self.held_probe(pin, execution);
         let line = match lines::parse_work_line(&raw, self.endpoint) {
             Ok(l) => l,
             Err(_) => {
@@ -263,7 +251,13 @@ impl LineRun {
                         .stop_for_budget(n, execution, &line.custom_id, &records)
                         .await;
                 }
-                Err(e) if self.rescan_later(e, &mut pin, &mut workers).await => {}
+                Err(e) if self.rescan_later(e, &mut pin, &mut workers).await => {
+                    if let Some(stop) = workers.stopped.take() {
+                        return self
+                            .not_run(n, execution, &line.custom_id, stop, &records)
+                            .await;
+                    }
+                }
                 Err(e) => {
                     // Busy from an ungated refusal (`LineRepository::refuse_ungated`)
                     // never reached a provider: only a
@@ -314,6 +308,46 @@ impl LineRun {
         }
     }
 
+    /// The probe slot dispatch claimed for this line, freed if the line ends
+    /// before its attempt reaches the engine (an unparseable line, or the task
+    /// aborted); from the attempt on, the engine and `unpin` end it.
+    fn held_probe(
+        &self,
+        pin: Option<Pin>,
+        execution: Uuid,
+    ) -> Option<crate::inference::ProbeTicket> {
+        pin.and_then(|pin| {
+            pin.probe.map(|epoch| {
+                crate::inference::ProbeTicket::held(
+                    self.repository.clone(),
+                    pin.deployment,
+                    execution,
+                    epoch,
+                )
+            })
+        })
+    }
+
+    /// A line its batch stopped while it waited to be inspected again: it
+    /// never ran (nothing was admitted or sent), so it is reported like the
+    /// lines the stop left unrun, never as a guardrail refusal.
+    async fn not_run(
+        &self,
+        n: i32,
+        execution: Uuid,
+        custom_id: &str,
+        stop: NotRun,
+        records: &mpsc::Sender<Record>,
+    ) {
+        if self
+            .finished_error(n, execution, None, Some(stop.code()))
+            .await
+        {
+            let value = lines::not_run_line(custom_id, stop);
+            self.emit_error(records, n, execution, value).await;
+        }
+    }
+
     /// Admission refused the line for its budget: it never ran, and the
     /// batch stops.
     async fn stop_for_budget(
@@ -339,8 +373,9 @@ impl LineRun {
     /// line is tried again after the error's delay, growing, without spending
     /// an attempt: up to `GUARDRAIL_TRIES` times for the first cause and
     /// `SPENT_TRIES` for the second, each counted on its own. `true` once the
-    /// wait is over, the line holds its workers again and the batch still
-    /// runs; otherwise the line fails with that error.
+    /// wait is over: the line holds its workers again, or its batch stopped
+    /// meanwhile (`workers.stopped`, and the line is reported as not run);
+    /// `false` when the line is not tried again.
     async fn rescan_later(
         &self,
         e: InferenceError,
@@ -366,13 +401,29 @@ impl LineRun {
             seconds.min(GUARDRAIL_RETRY_CAP).into(),
         ))
         .await;
-        if self.state.should_stop(&self.job) || !workers.reacquire().await {
-            return false;
+        // A batch stopped during the wait, or while the line waited for its
+        // worker, runs nothing more (cancelled, expired, its budget spent,
+        // lost): the line is reported as not run.
+        let stopped = |runner: &Self| {
+            runner
+                .state
+                .stop_reason(&runner.job)
+                .map(|stop| match stop {
+                    Stop::Cancelled => NotRun::Cancelled,
+                    Stop::Expired => NotRun::Expired,
+                    Stop::Budget => NotRun::BudgetExceeded,
+                    Stop::HoldUnavailable => NotRun::HoldUnavailable,
+                    Stop::Lost => NotRun::Failed,
+                })
+        };
+        workers.stopped = stopped(self);
+        if workers.stopped.is_none() && workers.reacquire().await {
+            workers.stopped = stopped(self);
+        } else if workers.stopped.is_none() {
+            workers.stopped = Some(NotRun::Failed);
         }
-        // A batch stopped while the line waited for its worker runs nothing
-        // more (cancelled, expired, its budget spent, lost).
-        if self.state.should_stop(&self.job) {
-            return false;
+        if workers.stopped.is_some() {
+            return true;
         }
         // The dispatch's probe slot was the first try's.
         *pin = pin.map(|pin| Pin { probe: None, ..pin });
@@ -637,6 +688,8 @@ fn rescan_cause(e: InferenceError) -> Option<Rescan> {
 /// back while the line waits to be inspected again), and how often it waited
 /// for each cause.
 pub(super) struct Workers {
+    /// Set when the line's batch stopped while it waited.
+    stopped: Option<NotRun>,
     busy: u32,
     spent: u32,
     _batch: tokio::sync::OwnedSemaphorePermit,
@@ -651,6 +704,7 @@ impl Workers {
         ),
     ) -> Self {
         Self {
+            stopped: None,
             busy: 0,
             spent: 0,
             _batch: batch,
