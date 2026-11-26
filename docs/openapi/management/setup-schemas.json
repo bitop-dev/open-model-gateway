@@ -840,6 +840,50 @@
       ],
       "description": "Closed serde object or existing positional struct array in declared field order. Handler semantic validation is additional."
     },
+    "SetupDeploymentUpdate": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "image_input": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          },
+          "required": [],
+          "additionalProperties": false
+        },
+        {
+          "type": "array",
+          "prefixItems": [
+            {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          ],
+          "minItems": 0,
+          "maxItems": 2,
+          "items": false
+        }
+      ],
+      "description": "Closed serde object or existing positional struct array in declared field order. Handler semantic validation is additional: at least one of `enabled` and `image_input` must be set; `enabled` changes the route's enablement (with its revision and history), `image_input` its image-input opt-in (#24)."
+    },
     "SetupDeploymentInput": {
       "oneOf": [
         {
@@ -862,6 +906,10 @@
             },
             "enabled": {
               "type": "boolean"
+            },
+            "image_input": {
+              "type": "boolean",
+              "description": "Inline image input on this route (#24; default false). Enable it only for an upstream model that bills image input as input tokens: the admission hold covers the price's input token limit, and a model that also charges per image cannot be priced."
             }
           },
           "required": [
@@ -892,10 +940,13 @@
             },
             {
               "type": "boolean"
+            },
+            {
+              "type": "boolean"
             }
           ],
           "minItems": 4,
-          "maxItems": 4,
+          "maxItems": 5,
           "items": false
         }
       ],
@@ -1153,6 +1204,9 @@
         },
         "enabled": {
           "type": "boolean"
+        },
+        "image_input": {
+          "type": "boolean"
         }
       },
       "required": [
@@ -1162,7 +1216,8 @@
         "provider_connection_id",
         "provider_name",
         "upstream_model",
-        "enabled"
+        "enabled",
+        "image_input"
       ],
       "additionalProperties": false
     },
@@ -6158,6 +6213,9 @@
         "enabled": {
           "type": "boolean"
         },
+        "image_input": {
+          "type": "boolean"
+        },
         "provider": {
           "type": "string"
         },
@@ -6256,6 +6314,7 @@
         "provider_name",
         "upstream_model",
         "enabled",
+        "image_input",
         "provider",
         "connection_enabled",
         "region",
@@ -10338,7 +10397,7 @@
       "$ref": "#/components/schemas/SetupDeployment"
     },
     "patch_api_v1_platform_deployments_by_idRequest": {
-      "$ref": "#/components/schemas/SetupEnabled"
+      "$ref": "#/components/schemas/SetupDeploymentUpdate"
     },
     "patch_api_v1_platform_deployments_by_idResponse": {
       "$ref": "#/components/schemas/SetupOk"

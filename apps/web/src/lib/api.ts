@@ -125,7 +125,8 @@ export type PlatformOverviewData = {
   setup: { connections: number; enabled_connections: number; models: number; ready_models: number; enabled_routes: number; priced_enabled_routes: number; catalogs: number; type_defaults: { personal: number; team: number; project: number }; entitled_users: number; oidc_mappings: number };
   glance: { entitled_users: number; teams: number; projects: number; ready_models: number; attempts_7d: string; known_cost_7d_microusd: string };
 };
-export type Deployment = { id: string; model_id: string; model_public_name?: string; provider_connection_id: string; provider_name?: string; upstream_model: string; enabled: boolean };
+/** `image_input` (#24): inline images may use this route (off by default). */
+export type Deployment = { id: string; model_id: string; model_public_name?: string; provider_connection_id: string; provider_name?: string; upstream_model: string; enabled: boolean; image_input?: boolean };
 export type DeploymentConfigurationChange = {
   id: string; created_at: string; target: { kind: "deployment"; id: string };
   actor: { id: string | null; label: string; admin_token_id: string | null };

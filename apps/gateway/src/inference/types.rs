@@ -332,6 +332,33 @@ impl ImageInput {
     }
 }
 
+/// Fails to compile if `$ty` implements any of the traits (the
+/// `assert_not_impl_any` technique: a second blanket impl makes the
+/// associated item's lookup ambiguous only when the bound holds).
+macro_rules! assert_not_impl_any {
+    ($ty:ty: $($tr:path),+ $(,)?) => {
+        const _: fn() = || {
+            trait AmbiguousIfImpl<A> {
+                fn some_item() {}
+            }
+            impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
+            $({
+                #[allow(dead_code)]
+                struct Invalid;
+                impl<T: ?Sized + $tr> AmbiguousIfImpl<Invalid> for T {}
+            })+
+            let _ = <$ty as AmbiguousIfImpl<_>>::some_item;
+        };
+    };
+}
+// Image bytes reach no formatter or serializer: nothing may implement these
+// for the types that hold them, in this crate or a derive.
+assert_not_impl_any!(ImageInput: std::fmt::Debug, std::fmt::Display, serde::Serialize);
+assert_not_impl_any!(Part: std::fmt::Debug, std::fmt::Display, serde::Serialize);
+assert_not_impl_any!(Content: std::fmt::Debug, std::fmt::Display, serde::Serialize);
+assert_not_impl_any!(Message: std::fmt::Debug, std::fmt::Display, serde::Serialize);
+assert_not_impl_any!(ChatRequest: std::fmt::Debug, std::fmt::Display, serde::Serialize);
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ImageType {
     Png,

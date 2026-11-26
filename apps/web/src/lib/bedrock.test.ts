@@ -56,7 +56,7 @@ describe("Bedrock connection form", () => {
     const bedrock = { ...provider, id: "bedrock-connection", provider: "bedrock", region: "us-east-1" };
     const fields = deploymentCreateAction({ providers: [provider, bedrock] }).fields!, upstream = fields.find(f => f.name === "upstream_model")!;
     // A model picked from the server search (its id is a UUID).
-    const values = { model_id: "0190a5f4-7b1e-7c3d-9a2b-4c5d6e7f8a9b", provider_connection_id: bedrock.id, upstream_model: "arn:aws:bedrock:eu-west-1:123456789012:inference-profile/eu.x", enabled: "false" };
+    const values = { model_id: "0190a5f4-7b1e-7c3d-9a2b-4c5d6e7f8a9b", provider_connection_id: bedrock.id, upstream_model: "arn:aws:bedrock:eu-west-1:123456789012:inference-profile/eu.x", enabled: "false", image_input: "false" };
     expect(validateFields(fields, values)).toHaveProperty("upstream_model");
     expect(upstream.helpFor!(values)).toContain("inference profile");
     expect(validateFields(fields, { ...values, upstream_model: "us.anthropic.claude-3-7-sonnet-20250219-v1:0" })).toEqual({});

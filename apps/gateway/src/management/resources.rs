@@ -38,22 +38,18 @@ fn management_openapi_slice3_resource_request_vectors() {
     vectors::<DeploymentInput>(
         "POST",
         "/api/v1/platform/deployments",
-        json!({"model_id":nil,"provider_connection_id":nil,"upstream_model":"contract","enabled":true}),
+        json!({"model_id":nil,"provider_connection_id":nil,"upstream_model":"contract","enabled":true,"image_input":true}),
     );
-    for path in [
+    vectors::<DeploymentUpdate>(
+        "PATCH",
         "/api/v1/platform/deployments/{id}",
+        json!({"enabled":true,"image_input":true}),
+    );
+    vectors::<Enabled>(
+        "POST",
         "/api/v1/platform/deployments/{id}/configuration/preview",
-    ] {
-        vectors::<Enabled>(
-            if path.ends_with("preview") {
-                "POST"
-            } else {
-                "PATCH"
-            },
-            path,
-            json!({"enabled":true}),
-        );
-    }
+        json!({"enabled":true}),
+    );
 }
 
 /// The catalog advisory lock precedes the single installation lock everywhere.

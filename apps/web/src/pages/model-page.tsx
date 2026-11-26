@@ -54,7 +54,7 @@ import { CopyId } from "../components/templates/copy-id";
 import { SectionHeadings } from "../components/ui";
 import { PriceEditorDialog } from "../components/price-editor";
 import { RouteBatchScheduling, editBatchScheduling, useBatchScheduling } from "../components/batch-scheduling";
-import { catalogStatusActions, ConnectionNames, ReadinessBadge, deploymentCreateAction, modelEditBody, modelEditFields, useServerPolicy } from "./catalog";
+import { catalogStatusActions, ConnectionNames, ReadinessBadge, deploymentCreateAction, IMAGE_INPUT_HELP, IMAGE_INPUT_PROFILES, modelEditBody, modelEditFields, useServerPolicy } from "./catalog";
 import { PriceVersions, deploymentRoutingFields, modelRoutingFields, modelRoutingHelp } from "./governance";
 import { WhoGetsIt } from "./model-access";
 import s from "./shared.module.css";
@@ -269,6 +269,7 @@ function RouteActions({ row, workload, writable }: { row: RouteRow; model: Model
     { label: "Publish price…", onSelect: () => setEditing({ importOnOpen: false }) },
     { label: "Import current OpenRouter price…", hidden: profile !== "openrouter", onSelect: () => setEditing({ importOnOpen: true }) },
     { label: "Route page", render: <ResourceLink search={{ page: "deployment-detail", record: route.id }} /> },
+    { label: route.image_input ? "Turn off image input…" : "Allow image input…", hidden: !profile || !IMAGE_INPUT_PROFILES.includes(profile), onSelect: () => ask({ title: `${route.image_input ? "Turn off" : "Allow"} image input · ${route.upstream_model}`, description: route.image_input ? "Requests with images will no longer use this route. Requests already running finish." : IMAGE_INPUT_HELP, submitLabel: route.image_input ? "Turn off" : "Allow", run: (_, signal) => api(`${platformPath}/deployments/${encodeURIComponent(route.id)}`, { method: "PATCH", body: { image_input: !route.image_input }, signal }) }) },
     { label: route.enabled ? "Disable route…" : "Enable route…", danger: route.enabled, onSelectWithTrigger: origin => setReviewing(origin) },
   ]} /><RouteEditor route={route} workload={workload} profile={profile} editing={editing} onClose={() => setEditing(null)} />{reviewing && <DeploymentReviewDialog record={route} name={`route ${route.upstream_model}`} returnFocus={reviewing} fallbackFocus={() => document.getElementById(triggerId)} onClose={() => setReviewing(null)} />}</>;
 }
