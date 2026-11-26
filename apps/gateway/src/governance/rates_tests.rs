@@ -747,7 +747,7 @@ async fn admission_revalidation_matches_the_multi_statement_form(pool: PgPool) {
             let mut tx = pool.begin().await.unwrap();
             let mut allowed = 0;
             for p in principals {
-                let old = crate::auth::revalidate(&mut tx, &p).await.unwrap();
+                let old = crate::auth::revalidate_snapshot(&mut tx, &p).await.unwrap();
                 let new = crate::auth::revalidate_admission(&mut tx, &p)
                     .await
                     .unwrap()

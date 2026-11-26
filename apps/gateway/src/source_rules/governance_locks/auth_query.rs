@@ -1,18 +1,14 @@
-//! Check the scoped form of the authority query and the two expressions
-//! that construct and select it. Other auth functions serve different paths.
+//! The authority reads of admission and candidate planning take no row
+//! locks: every production item of `auth.rs` is scanned like governance code
+//! (no lock clause, advisory lock or installation lock in any statement), and
+//! `ADMISSION_SQL`, the one-round-trip admission query, must stay a literal
+//! read by `revalidate_admission`.
 use super::*;
-
-const KEY_SHARE: &str = " FOR SHARE OF k,w";
-const SHARE: &str = " FOR SHARE";
 
 pub(super) fn source(text: &str) -> Source {
     let path = "auth.rs";
-    let file = tree::production_items(std::path::Path::new(path), text, |item| match item {
-        syn::Item::Const(item) => item.ident.unraw() == "ADMISSION_SQL",
-        syn::Item::Fn(item) => item.sig.ident.unraw() == "revalidate_admission_with",
-        _ => false,
-    })
-    .expect("auth.rs must be present in production");
+    let file = tree::production_items(std::path::Path::new(path), text, |_| true)
+        .expect("auth.rs must be present in production");
     Source {
         path: path.into(),
         module: "auth".into(),
@@ -28,40 +24,18 @@ pub(super) fn scan(scan: &mut Scan<'_>, file: &syn::File) {
         match item {
             syn::Item::Const(item) if item.ident.unraw() == "ADMISSION_SQL" => {
                 constants += 1;
-                if let Expr::Lit(expr) = &*item.expr
-                    && let syn::Lit::Str(sql) = &expr.lit
-                {
-                    let scoped = sql.value().replace(KEY_SHARE, "").replace(SHARE, "");
-                    if let Some(rule) = sql_rule(&scoped, false) {
-                        scan.findings
-                            .push(format!("auth.rs ADMISSION_SQL in scoped mode: {rule}"));
-                    }
-                } else {
+                if !matches!(&*item.expr, Expr::Lit(expr) if matches!(expr.lit, syn::Lit::Str(_))) {
                     scan.findings
                         .push("auth.rs: expected literal ADMISSION_SQL".into());
                 }
             }
-            syn::Item::Fn(f) if f.sig.ident.unraw() == "revalidate_admission_with" => {
+            syn::Item::Fn(f) if f.sig.ident.unraw() == "revalidate_admission" => {
                 functions += 1;
-                let expected: syn::Stmt = syn::parse_quote!(
-                    static UNLOCKED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-                        ADMISSION_SQL.replace(#KEY_SHARE, "").replace(#SHARE, "")
-                    });
-                );
-                let expected = expected.to_token_stream().to_string();
-                let mut initializers = 0;
-                for stmt in &f.block.stmts {
-                    if matches!(stmt, syn::Stmt::Item(syn::Item::Static(_)))
-                        && stmt.to_token_stream().to_string() == expected
-                    {
-                        initializers += 1;
-                    } else {
-                        scan.visit_stmt(stmt);
-                    }
-                }
-                if initializers != 1 || !scan.used.contains(SELECTION) {
+                let expected = quote!(sqlx::query_as(ADMISSION_SQL)).to_string();
+                let tokens = f.block.to_token_stream().to_string();
+                if tokens.matches(&expected).count() != 1 {
                     scan.findings.push(
-                        "auth.rs: inspect authority query construction and mode selection".into(),
+                        "auth.rs: revalidate_admission must run ADMISSION_SQL as written".into(),
                     );
                 }
             }
@@ -72,16 +46,33 @@ pub(super) fn scan(scan: &mut Scan<'_>, file: &syn::File) {
         scan.findings
             .push("auth.rs: expected one admission query and revalidation function".into());
     }
+    // The constant's name and that one call are the only mentions: no other
+    // statement can extend or re-run the query (an identifier, a string or
+    // a macro's tokens all count; doc comments do not).
+    let mut mentions = Mentions(0);
+    mentions.visit_file(file);
+    if mentions.0 != 2 {
+        scan.findings.push(format!(
+            "auth.rs: ADMISSION_SQL is mentioned {} times besides its definition; only revalidate_admission may run it",
+            mentions.0.saturating_sub(1)
+        ));
+    }
+    scan.visit_file(file);
 }
 
-pub(super) const SELECTION: &str = "auth::revalidate_admission_with::selection";
-
-pub(super) fn selection(call: &syn::ExprCall) -> bool {
-    call.to_token_stream().to_string()
-        == quote!(sqlx::query_as(if lock {
-            ADMISSION_SQL
-        } else {
-            UNLOCKED.as_str()
-        }))
-        .to_string()
+struct Mentions(usize);
+impl<'ast> Visit<'ast> for Mentions {
+    fn visit_ident(&mut self, ident: &'ast syn::Ident) {
+        if ident.unraw() == "ADMISSION_SQL" {
+            self.0 += 1;
+        }
+    }
+    fn visit_lit_str(&mut self, literal: &'ast LitStr) {
+        self.0 += literal.value().matches("ADMISSION_SQL").count();
+    }
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        self.visit_path(&mac.path);
+        self.0 += mac.tokens.to_string().matches("ADMISSION_SQL").count();
+    }
+    fn visit_attribute(&mut self, _: &'ast syn::Attribute) {}
 }

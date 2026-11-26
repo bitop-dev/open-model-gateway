@@ -356,11 +356,6 @@ pub async fn run(pool: PgPool) {
 
 async fn scenario(owner: &PgPool, runtime: &PgPool, keys: bootstrap::DevelopmentKeys) {
     let store = Store::new(runtime.clone());
-    assert_eq!(
-        store.admission_mode(),
-        governance::locks::AdmissionMode::Scoped,
-        "this controlled-stall fixture measures the default scoped protocol"
-    );
     let sql_deadlines: (String, String) = sqlx::query_as(
         "SELECT current_setting('lock_timeout'),current_setting('statement_timeout')",
     )
