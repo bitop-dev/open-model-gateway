@@ -45832,6 +45832,10 @@
             "const": true
           },
           "inspected_workloads": {
+            "const": [
+              "generation",
+              "embeddings"
+            ],
             "description": "The workloads whose input this release inspects (also through count_tokens and gateway-run batch lines). A rule that names another workload does not cover it yet.",
             "items": {
               "enum": [
@@ -45839,10 +45843,7 @@
                 "embeddings"
               ]
             },
-            "maxItems": 2,
-            "minItems": 2,
-            "type": "array",
-            "uniqueItems": true
+            "type": "array"
           },
           "kind": {
             "enum": [
@@ -48678,6 +48679,10 @@
             "type": "array"
           },
           "inspected_workloads": {
+            "const": [
+              "generation",
+              "embeddings"
+            ],
             "description": "The workloads whose input this release inspects (also through count_tokens and gateway-run batch lines). A rule that names another workload does not cover it yet.",
             "items": {
               "enum": [
@@ -48685,10 +48690,7 @@
                 "embeddings"
               ]
             },
-            "maxItems": 2,
-            "minItems": 2,
-            "type": "array",
-            "uniqueItems": true
+            "type": "array"
           }
         },
         "required": [
@@ -49329,6 +49331,10 @@
         "additionalProperties": false,
         "properties": {
           "inspected_workloads": {
+            "const": [
+              "generation",
+              "embeddings"
+            ],
             "description": "The workloads whose input this release inspects (also through count_tokens and gateway-run batch lines). A rule that names another workload does not cover it yet.",
             "items": {
               "enum": [
@@ -49336,10 +49342,7 @@
                 "embeddings"
               ]
             },
-            "maxItems": 2,
-            "minItems": 2,
-            "type": "array",
-            "uniqueItems": true
+            "type": "array"
           },
           "kind": {
             "enum": [
@@ -49942,6 +49945,10 @@
             "const": true
           },
           "inspected_workloads": {
+            "const": [
+              "generation",
+              "embeddings"
+            ],
             "description": "The workloads whose input this release inspects (also through count_tokens and gateway-run batch lines). A rule that names another workload does not cover it yet.",
             "items": {
               "enum": [
@@ -49949,10 +49956,7 @@
                 "embeddings"
               ]
             },
-            "maxItems": 2,
-            "minItems": 2,
-            "type": "array",
-            "uniqueItems": true
+            "type": "array"
           },
           "kind": {
             "enum": [
@@ -51471,6 +51475,10 @@
             "const": true
           },
           "inspected_workloads": {
+            "const": [
+              "generation",
+              "embeddings"
+            ],
             "description": "The workloads whose input this release inspects (also through count_tokens and gateway-run batch lines). A rule that names another workload does not cover it yet.",
             "items": {
               "enum": [
@@ -51478,10 +51486,7 @@
                 "embeddings"
               ]
             },
-            "maxItems": 2,
-            "minItems": 2,
-            "type": "array",
-            "uniqueItems": true
+            "type": "array"
           },
           "kind": {
             "enum": [
@@ -57602,6 +57607,10 @@
         "additionalProperties": false,
         "properties": {
           "inspected_workloads": {
+            "const": [
+              "generation",
+              "embeddings"
+            ],
             "description": "The workloads whose input this release inspects (also through count_tokens and gateway-run batch lines). A rule that names another workload does not cover it yet.",
             "items": {
               "enum": [
@@ -57609,10 +57618,7 @@
                 "embeddings"
               ]
             },
-            "maxItems": 2,
-            "minItems": 2,
-            "type": "array",
-            "uniqueItems": true
+            "type": "array"
           },
           "kind": {
             "enum": [
@@ -58558,6 +58564,10 @@
             "const": true
           },
           "inspected_workloads": {
+            "const": [
+              "generation",
+              "embeddings"
+            ],
             "description": "The workloads whose input this release inspects (also through count_tokens and gateway-run batch lines). A rule that names another workload does not cover it yet.",
             "items": {
               "enum": [
@@ -58565,10 +58575,7 @@
                 "embeddings"
               ]
             },
-            "maxItems": 2,
-            "minItems": 2,
-            "type": "array",
-            "uniqueItems": true
+            "type": "array"
           },
           "kind": {
             "enum": [
@@ -60153,6 +60160,10 @@
             "const": true
           },
           "inspected_workloads": {
+            "const": [
+              "generation",
+              "embeddings"
+            ],
             "description": "The workloads whose input this release inspects (also through count_tokens and gateway-run batch lines). A rule that names another workload does not cover it yet.",
             "items": {
               "enum": [
@@ -60160,10 +60171,7 @@
                 "embeddings"
               ]
             },
-            "maxItems": 2,
-            "minItems": 2,
-            "type": "array",
-            "uniqueItems": true
+            "type": "array"
           },
           "kind": {
             "enum": [
