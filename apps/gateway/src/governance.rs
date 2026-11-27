@@ -331,8 +331,28 @@ async fn admit_unobserved(
     let (lineage, shared) = authorize(store, &mut tx, &record.principal).await?;
     // The deployment check also reads the admission clock and the latest
     // price id (one round trip).
-    let row=sqlx::query("SELECT d.id,p.provider,d.upstream_model,p.credential_ref,p.endpoint,p.region,m.supported_protocols,clock_timestamp() AS admission_now,(SELECT x.id FROM deployment_prices x WHERE x.deployment_id=d.id ORDER BY x.created_at DESC,x.id DESC LIMIT 1) AS latest_price_id FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id JOIN models m ON m.id=d.model_id WHERE d.id=$2 AND m.public_name=$3 AND workspace_model_allowed($1,m.id) AND d.enabled AND p.enabled AND (NOT EXISTS(SELECT 1 FROM key_model_restrictions WHERE workspace_id=$1 AND governance_key_id=$4) OR EXISTS(SELECT 1 FROM key_model_selections WHERE workspace_id=$1 AND governance_key_id=$4 AND model_id=m.id))")
-        .bind(workspace).bind(record.deployment_id).bind(&record.model).bind(lineage).fetch_optional(&mut *tx).await.map_err(storage)?.ok_or(InferenceError::ModelUnavailable)?;
+    // A drained route is refused here, under the shared catalog lock a
+    // drain change takes exclusively: once a drain commits, no attempt is
+    // admitted on it, whatever plan the request carries (`routing::drain`).
+    let sql = format!(
+        "SELECT d.id,p.provider,d.upstream_model,p.credential_ref,p.endpoint,p.region,m.supported_protocols,clock_timestamp() AS admission_now,(SELECT x.id FROM deployment_prices x WHERE x.deployment_id=d.id ORDER BY x.created_at DESC,x.id DESC LIMIT 1) AS latest_price_id,{} AS drained,{} AS drain_retry_after FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id JOIN models m ON m.id=d.model_id WHERE d.id=$2 AND m.public_name=$3 AND workspace_model_allowed($1,m.id) AND d.enabled AND p.enabled AND (NOT EXISTS(SELECT 1 FROM key_model_restrictions WHERE workspace_id=$1 AND governance_key_id=$4) OR EXISTS(SELECT 1 FROM key_model_selections WHERE workspace_id=$1 AND governance_key_id=$4 AND model_id=m.id))",
+        crate::routing::drain::ROUTE_DRAINED,
+        crate::routing::drain::DRAIN_RETRY_AFTER.as_str()
+    );
+    let row = sqlx::query(&sql)
+        .bind(workspace)
+        .bind(record.deployment_id)
+        .bind(&record.model)
+        .bind(lineage)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(storage)?
+        .ok_or(InferenceError::ModelUnavailable)?;
+    if sqlx::Row::try_get::<bool, _>(&row, "drained").map_err(storage)? {
+        let retry =
+            sqlx::Row::try_get::<Option<i32>, _>(&row, "drain_retry_after").map_err(storage)?;
+        return Err(InferenceError::RouteDrained(retry.map(i32::unsigned_abs)));
+    }
     let current = <Deployment as sqlx::FromRow<_>>::from_row(&row).map_err(storage)?;
     let database_now: UtcInstant = sqlx::Row::try_get(&row, "admission_now").map_err(storage)?;
     let price =

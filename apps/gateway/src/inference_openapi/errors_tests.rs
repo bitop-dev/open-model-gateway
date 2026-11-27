@@ -34,11 +34,11 @@ fn inference_openapi_vocabulary_covers_every_variant_and_renderer() {
         strings(&doc, "OpenAiErrorType"),
     );
     let anthropic_types = strings(&doc, "AnthropicErrorType");
-    // 18 plain variants, 4 scoped ones in both scopes, 2 guardrail variants
-    // and 4 guardrail refusal kinds.
+    // 18 plain variants, 4 scoped ones in both scopes, 2 guardrail variants,
+    // 4 guardrail refusal kinds and 2 drains (with and without an end).
     assert_eq!(
         e::all().len(),
-        18 + 2 * 4 + 2 + 4,
+        18 + 2 * 4 + 2 + 4 + 2,
         "variant list is not exhaustive"
     );
     // `guard` is exhaustive over InferenceError (a new variant does not compile);
@@ -46,7 +46,7 @@ fn inference_openapi_vocabulary_covers_every_variant_and_renderer() {
     let reached: BTreeSet<usize> = e::all().into_iter().map(e::guard).collect();
     assert_eq!(
         reached,
-        (0..=24).collect::<BTreeSet<_>>(),
+        (0..=25).collect::<BTreeSet<_>>(),
         "all() misses an InferenceError variant that guard() knows"
     );
     for error in e::all() {

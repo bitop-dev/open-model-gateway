@@ -105,10 +105,12 @@ impl Engine {
             )
             .await
         {
-            Ok(admission) => {
-                scope.unadmitted.admitted();
-                admission
-            }
+            Ok(admission) => admission,
+            // Refused as drained since the plan was read: nothing was
+            // admitted or sent, and the request goes on to its next route
+            // with the same telemetry. A probe slot it held is freed as
+            // `probe` drops.
+            Err(InferenceError::RouteDrained(ends)) => return AttemptEnd::Skipped(telemetry, ends),
             Err(error) => {
                 // The timeout and the admission's
                 // own error (e.g. a team-workspace rate or budget
@@ -122,6 +124,8 @@ impl Engine {
                 return AttemptEnd::Return(Err(error));
             }
         };
+        // Only an admitted attempt gets here (every refusal returned above).
+        scope.unadmitted.admitted();
         // Logging-only correlation (#98): known only once a
         // shared-workspace admission has already committed for this
         // request; never for personal workspaces.
@@ -318,6 +322,10 @@ pub(super) struct RequestScope<'a> {
 pub(super) enum AttemptEnd {
     /// The attempt failed with this error and the next route may be tried.
     Failover(RequestTelemetry, InferenceError),
+    /// Admission refused the route as drained (`routing::drain`), for about
+    /// this many seconds: nothing was admitted or sent, and no attempt is
+    /// spent.
+    Skipped(RequestTelemetry, Option<u32>),
     Return(Result<ProviderOutput, InferenceError>),
 }
 

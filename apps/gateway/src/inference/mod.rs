@@ -127,7 +127,7 @@ impl Engine {
     /// [`route_use`] for this engine's attempts, within the request's
     /// deadline: the probe slot it holds for `id` (held at most until the
     /// deadline and the settlement deadline), or `None` (the wait noted in
-    /// `cooling`) while the route cannot be used. `live` for an attempt after
+    /// `passed`) while the route cannot be used. `live` for an attempt after
     /// the first, whose plan is no longer fresh.
     async fn usable(
         &self,
@@ -136,7 +136,7 @@ impl Engine {
         holder: Uuid,
         deadline: tokio::time::Instant,
         live: bool,
-        cooling: &mut Option<u32>,
+        passed: &mut Passed,
     ) -> Result<Option<Option<ProbeTicket>>, InferenceError> {
         let hold =
             deadline.saturating_duration_since(tokio::time::Instant::now()) + SETTLEMENT_DEADLINE;
@@ -149,7 +149,11 @@ impl Engine {
         Ok(match used {
             RouteUse::Go(probe) => Some(probe),
             RouteUse::Busy(seconds) => {
-                *cooling = Some(cooling.map_or(seconds, |c| c.min(seconds)));
+                passed.cool(seconds);
+                None
+            }
+            RouteUse::Drained(seconds) => {
+                passed.drain(seconds);
                 None
             }
         })
@@ -308,7 +312,7 @@ impl Engine {
             protocol,
             streamed,
         };
-        let (mut attempt, mut cooling, mut failed_over) = (0, None, None);
+        let (mut attempt, mut passed, mut failed_over) = (0, Passed::default(), None);
         for id in &plan.deployment_ids {
             if attempt == plan.max_attempts {
                 break;
@@ -319,7 +323,7 @@ impl Engine {
             // `cancelled` with no `error.type`.
             let route = match self.route_of(&candidates, *id) {
                 Ok(route) => self
-                    .usable(&plan, *id, request_id, deadline, attempt > 0, &mut cooling)
+                    .usable(&plan, *id, request_id, deadline, attempt > 0, &mut passed)
                     .await
                     .map(|probe| probe.map(|probe| (route, probe))),
                 Err(error) => Err(error),
@@ -332,19 +336,15 @@ impl Engine {
                     return Err(error);
                 }
             };
-            telemetry = match self
-                .attempt(&scope, telemetry, attempt, deployment, adapter, probe)
-                .await
-            {
-                AttemptEnd::Failover(telemetry, error) => {
-                    failed_over = Some(error);
-                    telemetry
+            let end = self.attempt(&scope, telemetry, attempt, deployment, adapter, probe);
+            match after(end.await, &mut passed, &mut failed_over) {
+                std::ops::ControlFlow::Continue((next, spent)) => {
+                    (telemetry, attempt) = (next, attempt + usize::from(spent));
                 }
-                AttemptEnd::Return(result) => return result,
-            };
-            attempt += 1;
+                std::ops::ControlFlow::Break(result) => return result,
+            }
         }
-        let error = exhausted(cooling, attempt, failed_over);
+        let error = exhausted(passed, attempt, failed_over);
         telemetry.finish(telemetry::Outcome::Error, Some(error));
         Err(error)
     }
@@ -437,89 +437,6 @@ async fn settle_attempt(
 /// How long a settlement may take: the one the request waits for and the
 /// detached one of a cancelled request alike.
 pub(crate) const SETTLEMENT_DEADLINE: Duration = Duration::from_secs(3);
-
-/// Whether an attempt may use a planned route now.
-pub(crate) enum RouteUse {
-    /// Yes; holding the route's probe slot, if it is half-open.
-    Go(Option<ProbeTicket>),
-    /// No: another request holds the half-open route's probe slot (or the
-    /// circuit opened again) for about this many seconds. Nothing was sent.
-    Busy(u32),
-}
-
-/// The error of a request whose plan ran out: the routes left could not be
-/// used and none was attempted (cooling down), or the attempts ran out.
-pub(crate) fn exhausted(
-    cooling: Option<u32>,
-    attempts: usize,
-    failed_over: Option<InferenceError>,
-) -> InferenceError {
-    match (cooling, failed_over) {
-        (Some(seconds), _) if attempts == 0 => InferenceError::RouteCoolingDown(seconds),
-        // The last attempt failed over to routes none of which could be used:
-        // its own error stands.
-        (_, Some(error)) => error,
-        _ => InferenceError::Busy,
-    }
-}
-
-/// A half-open route of the plan is used only by the request that claims its
-/// probe slot, for at most `hold` (the request's timeout and settlement
-/// deadline); every other route as before. A claim that cannot be made
-/// (storage) is treated as busy: the route is not used unclaimed.
-pub(crate) async fn route_use(
-    repository: &Arc<dyn InferenceRepository>,
-    plan: &crate::routing::RoutePlan,
-    id: Uuid,
-    holder: Uuid,
-    hold: Duration,
-    live: bool,
-) -> RouteUse {
-    use crate::routing::{ProbeClaim, RouteState};
-    let ticket = |epoch| ProbeTicket {
-        repository: repository.clone(),
-        deployment: id,
-        holder,
-        epoch: Some(epoch),
-    };
-    // A slot the caller claimed before a wait (a batch line, before its
-    // route capacity) is renewed for this request's own bound; one that
-    // ended meanwhile is no longer the caller's, and the route is not used.
-    if let Some((held, epoch)) = plan.held_probe
-        && held == id
-    {
-        return match repository.route_probe_renew(id, epoch, hold).await {
-            Ok(true) => RouteUse::Go(Some(ticket(epoch))),
-            Ok(false) => RouteUse::Busy(1),
-            // Not known to be lost: the dropped ticket frees it (fenced).
-            Err(_) => {
-                drop(ticket(epoch));
-                RouteUse::Busy(1)
-            }
-        };
-    }
-    // A route planned earlier in the request (a failover attempt) is taken
-    // as it is now: its circuit may have opened or passed its cooldown since.
-    let half_open = if live {
-        match repository.route_state(id).await {
-            Ok(RouteState::Closed) => false,
-            Ok(RouteState::HalfOpen) => true,
-            Ok(RouteState::Open(seconds)) => return RouteUse::Busy(seconds),
-            Err(_) => return RouteUse::Busy(1),
-        }
-    } else {
-        plan.probes.contains(&id)
-    };
-    if !half_open {
-        return RouteUse::Go(None);
-    }
-    match repository.route_probe_claim(id, holder, hold).await {
-        Ok(ProbeClaim::Claimed(epoch)) => RouteUse::Go(Some(ticket(epoch))),
-        Ok(ProbeClaim::Closed) => RouteUse::Go(None),
-        Ok(ProbeClaim::Busy(seconds)) => RouteUse::Busy(seconds),
-        Err(_) => RouteUse::Busy(1),
-    }
-}
 
 /// A probe slot an attempt holds before its `ExecutionGuard` owns it. If the
 /// attempt ends first (refused at admission, or the request dropped while it
@@ -794,9 +711,14 @@ pub(crate) mod admission_validation_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod count_db_tests;
 #[cfg(all(test, feature = "integration-tests"))]
+mod drain_e2e_tests;
+#[cfg(all(test, feature = "integration-tests"))]
 mod guardrail_db_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod guardrail_limits_db_tests;
+mod route_use;
+use route_use::after;
+pub(crate) use route_use::{Passed, RouteUse, exhausted, route_use};
 #[cfg(all(test, feature = "integration-tests"))]
 mod probe_e2e_tests;
 #[cfg(all(test, feature = "integration-tests"))]

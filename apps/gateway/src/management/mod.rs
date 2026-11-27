@@ -19,6 +19,7 @@ mod deployment_configuration;
 mod deployment_history;
 mod deployment_image_input;
 mod directory;
+mod drain;
 mod errors;
 mod files;
 pub(crate) mod governance;
@@ -192,6 +193,7 @@ fn feature_routes(router: Router<Store>) -> Router<Store> {
         .merge(admin_tokens::routes())
         .merge(provider_costs::routes())
         .merge(directory::routes())
+        .merge(drain::routes())
         .merge(group_mapping_preview::routes())
         .merge(resources::platform_routes())
         .merge(catalogs::routes())
