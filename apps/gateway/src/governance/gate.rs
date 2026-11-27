@@ -22,9 +22,11 @@
 //!
 //! Cost per admission: one mutex hold and one map lookup to take a permit
 //! and one to give it back. A request that does not wait allocates nothing
-//! (the map keeps its capacity); one that waits allocates its wake-up
-//! channel. A release while workspaces wait scans the waiting workspaces.
-use std::collections::{HashMap, VecDeque};
+//! (the map keeps its capacity). One that waits allocates its wake-up
+//! channel, and the waiting workspaces are kept in grant order (`order`), so
+//! queueing, leaving the queue and each grant cost O(log n) in the waiting
+//! workspaces and their waiters, never a scan.
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Mutex;
 
 use tokio::sync::oneshot;
@@ -40,17 +42,25 @@ struct State {
     arrivals: u64,
     /// A workspace's entry exists only while it has a holder or a waiter.
     scopes: HashMap<Uuid, Scope>,
+    /// The workspaces with a waiter, in grant order: (permits held, its
+    /// first waiter's arrival, id). Each one's key is kept current by
+    /// [`State::update`], the only place a scope changes.
+    order: BTreeSet<(usize, u64, Uuid)>,
 }
 
 #[derive(Default)]
 struct Scope {
     held: usize,
-    waiters: VecDeque<Waiter>,
+    /// Waiters by arrival.
+    waiters: BTreeMap<u64, oneshot::Sender<()>>,
 }
 
-struct Waiter {
-    arrival: u64,
-    wake: oneshot::Sender<()>,
+impl Scope {
+    fn key(&self, id: Uuid) -> Option<(usize, u64, Uuid)> {
+        self.waiters
+            .first_key_value()
+            .map(|(arrival, _)| (self.held, *arrival, id))
+    }
 }
 
 impl FairGate {
@@ -60,6 +70,7 @@ impl FairGate {
                 free: permits.max(1),
                 arrivals: 0,
                 scopes: HashMap::new(),
+                order: BTreeSet::new(),
             }),
         }
     }
@@ -85,7 +96,7 @@ impl FairGate {
             // a waiter.
             if state.free > 0 {
                 state.free -= 1;
-                state.scopes.entry(workspace).or_default().held += 1;
+                state.update(workspace, |s| s.held += 1);
                 return Some(GatePermit {
                     gate: self,
                     workspace,
@@ -94,12 +105,7 @@ impl FairGate {
             state.arrivals += 1;
             let arrival = state.arrivals;
             let (wake, woken) = oneshot::channel();
-            state
-                .scopes
-                .entry(workspace)
-                .or_default()
-                .waiters
-                .push_back(Waiter { arrival, wake });
+            state.update(workspace, |s| s.waiters.insert(arrival, wake));
             (arrival, woken)
         };
         let mut wait = Wait {
@@ -109,75 +115,116 @@ impl FairGate {
             woken,
             done: false,
         };
-        let granted = tokio::time::timeout_at(deadline, &mut wait.woken).await;
-        if !matches!(granted, Ok(Ok(()))) {
-            return None;
+        match tokio::time::timeout_at(deadline, &mut wait.woken).await {
+            Ok(Ok(())) => {
+                wait.done = true;
+                Some(GatePermit {
+                    gate: self,
+                    workspace,
+                })
+            }
+            // A waiter leaves the queue only by a grant or by its own drop
+            // (below), so its sender is never dropped unsent while it waits;
+            // if it were, nothing was granted and nothing is given back.
+            Ok(Err(_)) => {
+                wait.done = true;
+                None
+            }
+            // Past the deadline: the drop leaves the queue, or gives back a
+            // permit granted meanwhile.
+            Err(_) => None,
         }
-        wait.done = true;
-        Some(GatePermit {
-            gate: self,
-            workspace,
-        })
     }
 
     /// Give back a permit of `workspace`, and hand freed permits to waiters.
     fn release(&self, workspace: Uuid) {
         let mut state = self.lock();
-        if let Some(scope) = state.scopes.get_mut(&workspace) {
-            scope.held -= 1;
-        }
+        state.update(workspace, |s| {
+            debug_assert!(s.held > 0, "a released permit was held");
+            s.held = s.held.saturating_sub(1);
+        });
         state.free += 1;
-        forget_if_idle(&mut state, workspace);
         state.dispatch();
     }
 
     /// Workspaces with an entry (a holder or a waiter).
     #[cfg(test)]
     pub(crate) fn tracked(&self) -> usize {
-        self.lock().scopes.len()
+        let state = self.lock();
+        state.check();
+        state.scopes.len()
     }
 
     /// Permits nobody holds.
     #[cfg(test)]
     pub(crate) fn available(&self) -> usize {
-        self.lock().free
-    }
-}
-
-fn forget_if_idle(state: &mut State, workspace: Uuid) {
-    if state
-        .scopes
-        .get(&workspace)
-        .is_some_and(|s| s.held == 0 && s.waiters.is_empty())
-    {
-        state.scopes.remove(&workspace);
+        let state = self.lock();
+        state.check();
+        state.free
     }
 }
 
 impl State {
+    /// Change `workspace`'s entry (created if absent) with `change`, keep
+    /// its place in `order` current, and drop the entry once it has neither
+    /// a holder nor a waiter.
+    fn update<R>(&mut self, workspace: Uuid, change: impl FnOnce(&mut Scope) -> R) -> R {
+        let scope = self.scopes.entry(workspace).or_default();
+        if let Some(key) = scope.key(workspace) {
+            self.order.remove(&key);
+        }
+        let result = change(scope);
+        if let Some(key) = scope.key(workspace) {
+            self.order.insert(key);
+        }
+        if scope.held == 0 && scope.waiters.is_empty() {
+            self.scopes.remove(&workspace);
+        }
+        result
+    }
+
     /// Hand each free permit to the first waiter of the waiting workspace
     /// holding the fewest permits (ties: its first waiter arrived first). A
-    /// waiter whose wait already ended is skipped.
+    /// waiter whose receiver is gone is skipped.
     fn dispatch(&mut self) {
         while self.free > 0 {
-            let Some(workspace) = self
-                .scopes
-                .iter()
-                .filter_map(|(id, s)| s.waiters.front().map(|w| (s.held, w.arrival, *id)))
-                .min()
-                .map(|(_, _, id)| id)
-            else {
+            let Some(&(_, _, workspace)) = self.order.first() else {
                 return;
             };
-            let scope = self.scopes.get_mut(&workspace).expect("chosen scope");
-            let waiter = scope.waiters.pop_front().expect("chosen waiter");
-            if waiter.wake.send(()).is_ok() {
-                scope.held += 1;
+            let granted = self.update(workspace, |s| {
+                let (_, wake) = s.waiters.pop_first().expect("an ordered scope waits");
+                let granted = wake.send(()).is_ok();
+                if granted {
+                    s.held += 1;
+                }
+                granted
+            });
+            if granted {
                 self.free -= 1;
-            } else {
-                forget_if_idle(self, workspace);
             }
         }
+    }
+
+    /// `order` holds exactly the waiting workspaces under their current
+    /// keys, no entry is idle, and free permits never coexist with waiters.
+    #[cfg(test)]
+    fn check(&self) {
+        let expected: BTreeSet<_> = self
+            .scopes
+            .iter()
+            .filter_map(|(id, s)| s.key(*id))
+            .collect();
+        assert_eq!(self.order, expected, "grant order matches the waiters");
+        assert!(
+            self.scopes
+                .values()
+                .all(|s| s.held > 0 || !s.waiters.is_empty()),
+            "no idle entry"
+        );
+        assert!(
+            self.free == 0 || self.order.is_empty(),
+            "free permits while workspaces wait"
+        );
     }
 }
 
@@ -196,21 +243,14 @@ impl Drop for Wait<'_> {
         if self.done {
             return;
         }
-        let granted = {
-            let mut state = self.gate.lock();
-            let queued = state.scopes.get_mut(&self.workspace).and_then(|s| {
-                let at = s.waiters.iter().position(|w| w.arrival == self.arrival)?;
-                s.waiters.remove(at)
-            });
-            if queued.is_some() {
-                forget_if_idle(&mut state, self.workspace);
-                false
-            } else {
-                // Not queued any more: a release handed it a permit.
-                true
-            }
-        };
-        if granted {
+        // Still queued: leave the queue. Not queued any more: a release
+        // handed it a permit, which is given back.
+        let queued = self
+            .gate
+            .lock()
+            .update(self.workspace, |s| s.waiters.remove(&self.arrival))
+            .is_some();
+        if !queued {
             self.gate.release(self.workspace);
         }
     }

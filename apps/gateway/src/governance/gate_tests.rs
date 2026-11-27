@@ -236,6 +236,109 @@ async fn a_wait_past_its_deadline_gets_no_permit_and_leaves_no_entry() {
     assert_eq!((gate.available(), gate.tracked()), (1, 0));
 }
 
+#[tokio::test]
+async fn a_dropped_waiter_between_others_leaves_its_workspace_queue_in_order() {
+    let gate = FairGate::new(1);
+    let workspace = Uuid::new_v4();
+    let mut held = vec![gate.acquire(workspace, later()).await.unwrap()];
+    let mut waits: Vec<_> = (0..3).map(|n| (n, queue(&gate, workspace))).collect();
+    for (_, wait) in &mut waits {
+        assert!(poll_once(wait).await.is_pending());
+    }
+    drop(waits.remove(1));
+    assert_eq!(gate.tracked(), 1, "the workspace still holds and waits");
+    let mut order = Vec::new();
+    for _ in 0..2 {
+        drop(held.remove(0));
+        order.extend(granted(&mut waits, &mut held).await);
+    }
+    assert_eq!(order, vec![0, 2]);
+    drop(held);
+    assert_eq!((gate.available(), gate.tracked()), (1, 0));
+}
+
+/// A permit handed over before the deadline is taken even when the waiter
+/// is next polled after it.
+#[tokio::test(start_paused = true)]
+async fn a_permit_granted_before_the_deadline_is_taken_after_it() {
+    let gate = FairGate::new(1);
+    let holder = gate.acquire(Uuid::new_v4(), later()).await.unwrap();
+    let mut wait =
+        Box::pin(gate.acquire(Uuid::new_v4(), Instant::now() + Duration::from_millis(100)));
+    assert!(poll_once(&mut wait).await.is_pending());
+    drop(holder);
+    tokio::time::advance(Duration::from_millis(200)).await;
+    let Poll::Ready(Some(permit)) = poll_once(&mut wait).await else {
+        panic!("the granted permit is taken");
+    };
+    assert_eq!(gate.available(), 0);
+    drop(permit);
+    assert_eq!((gate.available(), gate.tracked()), (1, 0));
+}
+
+/// Many admissions of a few workspaces on a multi-threaded runtime, with
+/// random deadlines, holds, cancellations and aborts: never more holders
+/// than permits, and afterwards every permit is free and no entry is left
+/// (`available` and `tracked` also check the grant order).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn permits_are_conserved_under_cancellation_and_deadlines() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const PERMITS: usize = 5;
+    let gate = std::sync::Arc::new(FairGate::new(PERMITS));
+    let workspaces: Vec<_> = (0..7).map(|_| Uuid::new_v4()).collect();
+    let holding = std::sync::Arc::new(AtomicUsize::new(0));
+    let most = std::sync::Arc::new(AtomicUsize::new(0));
+    struct Holding(std::sync::Arc<AtomicUsize>);
+    impl Drop for Holding {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    for round in 0..10u64 {
+        let mut tasks = Vec::new();
+        for n in 0..600u64 {
+            // A fixed mix per task, so a failure reproduces.
+            let mix = (n * 7919 + round * 104_729) % 1000;
+            let (gate, holding, most) = (gate.clone(), holding.clone(), most.clone());
+            let workspace = workspaces[(mix % 7) as usize];
+            tasks.push(tokio::spawn(async move {
+                let deadline = Instant::now() + Duration::from_micros(mix % 3000);
+                let work = async {
+                    if let Some(permit) = gate.acquire(workspace, deadline).await {
+                        let now = holding.fetch_add(1, Ordering::SeqCst) + 1;
+                        let _held = Holding(holding.clone());
+                        most.fetch_max(now, Ordering::SeqCst);
+                        if mix % 2 == 0 {
+                            tokio::task::yield_now().await;
+                        } else {
+                            tokio::time::sleep(Duration::from_micros(mix % 500)).await;
+                        }
+                        drop(permit);
+                    }
+                };
+                if mix % 4 == 0 {
+                    // Cancelled mid-wait or mid-hold.
+                    let _ = tokio::time::timeout(Duration::from_micros(mix % 700), work).await;
+                } else {
+                    work.await;
+                }
+            }));
+        }
+        for (n, task) in tasks.into_iter().enumerate() {
+            if n % 11 == 0 {
+                task.abort();
+            }
+            let _ = task.await;
+        }
+        assert_eq!(
+            (gate.available(), gate.tracked()),
+            (PERMITS, 0),
+            "round {round}"
+        );
+    }
+    assert!(most.load(Ordering::SeqCst) <= PERMITS);
+}
+
 /// Why a workspace needs few of the gate's permits: every admission of one
 /// workspace locks that workspace's own rows (`omg_lock_scope_rows`), so two
 /// admissions of it wait for each other there, whichever key or user they
