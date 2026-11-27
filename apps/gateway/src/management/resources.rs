@@ -43,7 +43,7 @@ fn management_openapi_slice3_resource_request_vectors() {
     vectors::<super::deployment_image_input::DeploymentUpdate>(
         "PATCH",
         "/api/v1/platform/deployments/{id}",
-        json!({"enabled":true,"image_input":true}),
+        json!({"enabled":true,"image_input":true,"video":{"seconds":[4,8],"sizes":["1280x720"]}}),
     );
     vectors::<Enabled>(
         "POST",
@@ -689,8 +689,7 @@ pub(crate) async fn audit(
                 || v.as_str().is_some_and(|s| {
                     s.len() <= 32 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
                 }))
-                || super::guardrails::audit_field(action, k, v)
-                || super::drain::audit_field(action, k, v)
+                || super::audit_fields::allowed(action, k, v)
             {
                 safe.insert(k.clone(), v.clone());
             }
@@ -873,7 +872,7 @@ async fn deployments(
         offset: p.offset,
     }
     .bounds()?;
-    let data:Vec<Value>=sqlx::query_scalar("SELECT jsonb_build_object('id',d.id,'model_id',d.model_id,'model_public_name',m.public_name,'provider_connection_id',d.provider_connection_id,'provider_name',p.name,'upstream_model',d.upstream_model,'enabled',d.enabled,'image_input',d.image_input) FROM deployments d JOIN models m ON m.id=d.model_id JOIN provider_connections p ON p.id=d.provider_connection_id WHERE ($3::text IS NULL OR strpos(lower(d.upstream_model),lower($3))>0) AND ($4::boolean IS NULL OR d.enabled=$4) AND ($5::uuid IS NULL OR d.model_id=$5) AND ($6::uuid IS NULL OR d.provider_connection_id=$6) ORDER BY d.created_at,d.id LIMIT $1 OFFSET $2").bind(l).bind(o).bind(search(p.q.as_deref())?).bind(p.enabled).bind(p.model_id).bind(p.provider_connection_id).fetch_all(&mut *tx).await?;
+    let data:Vec<Value>=sqlx::query_scalar(&format!("SELECT jsonb_build_object('id',d.id,'model_id',d.model_id,'model_public_name',m.public_name,'provider_connection_id',d.provider_connection_id,'provider_name',p.name,'upstream_model',d.upstream_model,'enabled',d.enabled,'image_input',d.image_input,'video',{}) FROM deployments d JOIN models m ON m.id=d.model_id JOIN provider_connections p ON p.id=d.provider_connection_id WHERE ($3::text IS NULL OR strpos(lower(d.upstream_model),lower($3))>0) AND ($4::boolean IS NULL OR d.enabled=$4) AND ($5::uuid IS NULL OR d.model_id=$5) AND ($6::uuid IS NULL OR d.provider_connection_id=$6) ORDER BY d.created_at,d.id LIMIT $1 OFFSET $2", super::deployment_video::VIDEO_JSON)).bind(l).bind(o).bind(search(p.q.as_deref())?).bind(p.enabled).bind(p.model_id).bind(p.provider_connection_id).fetch_all(&mut *tx).await?;
     tx.commit().await?;
     Ok(Json(json!({"data":data})))
 }

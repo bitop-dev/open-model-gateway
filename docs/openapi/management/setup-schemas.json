@@ -856,6 +856,17 @@
                 "boolean",
                 "null"
               ]
+            },
+            "video": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/SetupVideoOptions"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The route's video options; `null` clears them (the route then serves no video request); absent leaves them unchanged."
             }
           },
           "required": [],
@@ -882,7 +893,7 @@
           "items": false
         }
       ],
-      "description": "Closed serde object or existing positional struct array in declared field order. Handler semantic validation is additional: at least one of `enabled` and `image_input` must be set; `enabled` changes the route's enablement (with its revision and history), `image_input` its image-input opt-in (#24)."
+      "description": "Closed serde object, or the existing positional struct array `[enabled, image_input]` (the video options are set only in the object form). Handler semantic validation is additional: at least one of `enabled`, `image_input` and `video` must be set; `enabled` changes the route's enablement (with its revision and history), `image_input` its image-input opt-in (#24), `video` its video options (#52)."
     },
     "SetupDeploymentInput": {
       "oneOf": [
@@ -1207,6 +1218,39 @@
         },
         "image_input": {
           "type": "boolean"
+        },
+        "video": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "seconds": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer"
+                  }
+                },
+                "sizes": {
+                  "type": [
+                    "array",
+                    "null"
+                  ],
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "required": [
+                "seconds",
+                "sizes"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The route's video options (#52): the clip lengths it accepts (the first is the default) and the sizes (`null`: none may be named, none is sent); `null` when it serves no video."
         }
       },
       "required": [
@@ -1217,7 +1261,8 @@
         "provider_name",
         "upstream_model",
         "enabled",
-        "image_input"
+        "image_input",
+        "video"
       ],
       "additionalProperties": false
     },
@@ -6304,6 +6349,39 @@
               "openrouter_free_variant"
             ]
           }
+        },
+        "video": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "seconds": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer"
+                  }
+                },
+                "sizes": {
+                  "type": [
+                    "array",
+                    "null"
+                  ],
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "required": [
+                "seconds",
+                "sizes"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The route's video options (#52): the clip lengths it accepts (the first is the default) and the sizes (`null`: none may be named, none is sent); `null` when it serves no video."
         }
       },
       "required": [
@@ -6315,6 +6393,7 @@
         "upstream_model",
         "enabled",
         "image_input",
+        "video",
         "provider",
         "connection_enabled",
         "region",
@@ -11725,6 +11804,43 @@
       ],
       "additionalProperties": false,
       "description": "The completed operation's per-target outcomes in request order. Targets are applied independently, each in its own transaction with live authorization; a target's outcome is recorded with its change. Targets are matched in order: the same targets in another order are a different payload."
+    },
+    "SetupVideoOptions": {
+      "type": "object",
+      "properties": {
+        "seconds": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 3600
+          },
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true,
+          "description": "Clip lengths (seconds) the route accepts; the first is used when a request names none."
+        },
+        "sizes": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string",
+            "pattern": "^[1-9][0-9]{0,3}x[1-9][0-9]{0,3}$",
+            "x-omg-pattern-boundaries": "WIDTHxHEIGHT, each 1 to 9999 without a leading zero (3 to 9 characters). Bounds and refusals (an empty list, a repeated size, `1280*720`, `01280x720`, `12800x720`) are pinned by management::tests::deployment_video_tests."
+          },
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true,
+          "description": "Sizes the route accepts, `WIDTHxHEIGHT`; `null` or absent: a request may not name a size, and none is sent upstream."
+        }
+      },
+      "required": [
+        "seconds"
+      ],
+      "additionalProperties": false,
+      "description": "A route's video options (0097, #52): a closed object (no positional form)."
     }
   }
 }
