@@ -1370,7 +1370,7 @@ async fn images_converse_cannot_carry_are_refused_before_anything_is_sent() {
 /// What was found: the SDK as locked writes its requests at TRACE but prints
 /// no body (the transmitted body is boxed and shown as `BoxBody`, and
 /// `aws_sigv4` redacts the signed body unless `LOG_SIGNABLE_BODY=true`).
-/// The process subscriber (`log_policy::subscriber`, which every subcommand
+/// The process subscriber (`log_policy::subscriber`, which `main::run`
 /// installs) never records TRACE from the `aws_*` crates, which covers that
 /// switch and an SDK version that prints more: an event there carrying the
 /// bytes is dropped by it and written without it.

@@ -211,3 +211,38 @@ pub(super) fn for_test(client: crate::egress::HttpClient) -> SharedHttpClient {
     });
     http_client_fn(move |_, _| connector.clone())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A body over [`REQUEST_LIMIT`] is refused before the outgoing request is
+    /// built, so the attempt is unsent (`inference::dispatch`); a body within
+    /// it is built (and here fails to connect: nothing listens).
+    #[tokio::test]
+    async fn a_body_over_the_request_limit_is_refused_before_anything_is_built() {
+        let client = crate::egress::client_builder(crate::egress::resolver(
+            crate::egress::Purpose::Provider,
+        ))
+        .build()
+        .unwrap();
+        let connector = Connector {
+            client,
+            streaming_read: None,
+        };
+        let request = |length: usize| {
+            let mut request = HttpRequest::new(SdkBody::from(vec![b' '; length]));
+            request.set_method("POST").unwrap();
+            request
+                .set_uri("http://127.0.0.1:9/model/m/converse")
+                .unwrap();
+            request
+        };
+        for (length, sent) in [(REQUEST_LIMIT + 1, false), (16, true)] {
+            let (result, nothing_sent) =
+                crate::inference::dispatch::observe(connector.call(request(length))).await;
+            assert!(result.is_err(), "{length}");
+            assert_eq!(nothing_sent, !sent, "{length}");
+        }
+    }
+}

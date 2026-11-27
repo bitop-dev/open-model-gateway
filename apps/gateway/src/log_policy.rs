@@ -11,8 +11,10 @@
 //! `aws_*` crates is never recorded, so an operator's `RUST_LOG=trace` cannot
 //! put a request body in the log. Their DEBUG and above follow `RUST_LOG`.
 //!
-//! [`subscriber`] is the process subscriber every subcommand installs
-//! (`main::run`); `providers::bedrock` tests it on a real request.
+//! [`subscriber`] is the process subscriber that `main::run` installs for
+//! every command it runs (all but `healthcheck`, `schema-version` and
+//! `archive verify`, which return before it and use no AWS SDK);
+//! `providers::bedrock` tests it on a real request.
 use tracing_subscriber::{EnvFilter, fmt::MakeWriter, layer::SubscriberExt as _};
 
 /// Whether an event or span of `metadata` may be recorded.
