@@ -1,4 +1,5 @@
 //! String-only, non-streaming /v1/embeddings frontend. No arbitrary passthrough.
+use crate::http::json_body::JsonBodyRejection;
 use crate::{
     auth::Principal,
     http::RequestId,
@@ -13,18 +14,46 @@ use crate::{
 use async_trait::async_trait;
 use axum::{
     Extension, Json,
-    extract::rejection::JsonRejection,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use serde_json::{Value, json};
-#[derive(Deserialize)]
-#[serde(untagged)]
 enum Input {
     Text(String),
     Batch(Vec<String>),
+}
+/// A string or an array of strings, read as it arrives: an untagged enum
+/// would first buffer the whole value into a generic tree to try each form
+/// against it (#872).
+impl<'de> Deserialize<'de> for Input {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Form;
+        impl<'de> serde::de::Visitor<'de> for Form {
+            type Value = Input;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a string or an array of strings")
+            }
+            fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Input, E> {
+                Ok(Input::Text(text.to_owned()))
+            }
+            fn visit_string<E: serde::de::Error>(self, text: String) -> Result<Input, E> {
+                Ok(Input::Text(text))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Input, A::Error> {
+                let mut items = Vec::new();
+                while let Some(item) = seq.next_element::<String>()? {
+                    items.push(item);
+                }
+                Ok(Input::Batch(items))
+            }
+        }
+        deserializer.deserialize_any(Form)
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -118,10 +147,10 @@ pub async fn handle(
     Extension(engine): Extension<Engine>,
     Extension(principal): Extension<Principal>,
     Extension(request_id): Extension<RequestId>,
-    input: Result<Json<Request>, JsonRejection>,
+    input: Result<crate::http::json_body::JsonBody<Request>, JsonBodyRejection>,
 ) -> Response {
     let request = match input {
-        Ok(Json(wire)) => match wire.normalize() {
+        Ok(crate::http::json_body::JsonBody(wire)) => match wire.normalize() {
             Ok(request) => request,
             Err(e) => return super::chat_completions::error_response(e),
         },

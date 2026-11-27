@@ -106,7 +106,7 @@ export const auditActionLabels: Record<string, string> = {
   "configuration.updated": "Changed configuration",
   "configuration.bulk_disabled": "Bulk disabled routes",
   "cost_center.created": "Created cost center", "cost_center.updated": "Changed cost center", "cost_center.archived": "Archived cost center",
-  "deployment.created": "Added route", "deployment.image_input_changed": "Changed route image input",
+  "deployment.created": "Added route", "deployment.image_input_changed": "Changed route image input", "deployment.video_options_changed": "Changed route video options",
   "file.uploaded": "Uploaded file", "file.deleted": "Deleted file",
   "identity.groups_synchronized": "Synchronized SSO groups", "identity.rebound": "Re-linked sign-in identity",
   "installation.bootstrap_demo": "Seeded the demo", "installation.bootstrap_dev": "Set up the development install",

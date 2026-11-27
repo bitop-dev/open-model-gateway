@@ -379,6 +379,12 @@ pub(crate) fn validate_measured(
     text: &str,
     window: u32,
 ) -> Result<(ClientAction, EventSize), Rejection> {
+    // Measured before it is parsed, as every JSON request body is
+    // (`inference::json_weight`).
+    if !crate::inference::json_weight::within_budget(text.as_bytes()) {
+        crate::metrics::METRICS.json_structure_refused("realtime");
+        return Err(invalid("event", "The event is too large"));
+    }
     let value: Value =
         serde_json::from_str(text).map_err(|_| invalid("event", "Events must be JSON objects"))?;
     let e = object(&value, "event")?;

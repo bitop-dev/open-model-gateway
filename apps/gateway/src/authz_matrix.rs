@@ -84,6 +84,12 @@ impl Methods {
             "any" => {
                 self.0.insert("*".to_owned());
             }
+            // `http::json_post`: a POST whose handler is measured first
+            // (that it registers exactly a POST is checked by
+            // `json_post_registers_a_post`).
+            "json_post" => {
+                self.0.insert("POST".to_owned());
+            }
             "on" | "on_service" | "any_service" => panic!("unresolved method registration"),
             _ => (),
         }
@@ -328,5 +334,29 @@ fn scanner_resolves_chained_methods_and_inline_nesting() {
             .map(|m| (m.to_owned(), "/api/thing".to_owned()))
             .into_iter()
             .collect()
+    );
+}
+
+/// `json_post` is inventoried as a POST by name; its definition in http.rs
+/// must register exactly that: one `post(...)` call and no other method.
+#[test]
+fn json_post_registers_a_post() {
+    let source =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/http.rs")).unwrap();
+    let file = syn::parse_file(&source).unwrap();
+    let function = file
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Fn(f) if f.sig.ident == "json_post" => Some(f),
+            _ => None,
+        })
+        .expect("http::json_post is defined");
+    let mut methods = Methods::default();
+    methods.visit_block(&function.block);
+    assert_eq!(
+        methods.0,
+        BTreeSet::from(["POST".to_owned()]),
+        "json_post registers exactly a POST"
     );
 }

@@ -4,6 +4,7 @@
 //! `{id, custom_id, response:{status_code, request_id, body}, error}`.
 //! Nothing here logs or stores content; error messages are fixed strings that
 //! never echo client or provider text.
+use crate::inference::json_weight;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -130,7 +131,9 @@ impl LineError {
                 "The model has no price with ceilings, so the batch cannot be reserved for."
             }
             Self::OutputLimit => "The output maximum exceeds the model's output ceiling.",
-            Self::LineTooLarge => "The line exceeds 4 MiB.",
+            Self::LineTooLarge => {
+                "The line exceeds 4 MiB, or would parse into more than 16 MiB of structure."
+            }
             Self::TooManyLines => "A batch may contain at most 50,000 requests.",
             Self::EmptyFile => "The file contains no requests.",
         }
@@ -179,8 +182,44 @@ pub(crate) struct InputLine {
     pub plan: Option<LinePlan>,
 }
 
+/// A line may be parsed only when its estimate is within the budget every
+/// JSON request body has (`inference::json_weight::line_fits`), at planning
+/// and again when it runs, its work line then also holding the gateway's
+/// plan (`allowance`). The weight is kept for [`inner_within_budget`].
+fn within_budget(raw: &[u8], allowance: usize) -> Result<json_weight::Weight, LineError> {
+    let weight = json_weight::weight(raw);
+    if json_weight::line_fits(weight, raw.len(), 0, allowance) {
+        Ok(weight)
+    } else {
+        crate::metrics::METRICS.json_structure_refused("batch_line");
+        Err(LineError::LineTooLarge)
+    }
+}
+
+/// The parsed line with the JSON documents its strings hold (tool calls'
+/// `arguments`, which adapters and guardrails parse) within the same budget.
+fn inner_within_budget(
+    line: InputLine,
+    weight: json_weight::Weight,
+    len: usize,
+    allowance: usize,
+) -> Result<InputLine, LineError> {
+    let inner = match &line.request {
+        BatchRequest::Chat(request) => json_weight::inner_documents(request),
+        BatchRequest::Embeddings(_) => 0,
+    };
+    if json_weight::line_fits(weight, len, inner, allowance) {
+        Ok(line)
+    } else {
+        crate::metrics::METRICS.json_structure_refused("batch_line");
+        Err(LineError::LineTooLarge)
+    }
+}
+
 /// Read an internal work line; old private copies without a plan still work.
 pub(crate) fn parse_work_line(raw: &[u8], endpoint: BatchEndpoint) -> Result<InputLine, LineError> {
+    let allowance = json_weight::PLAN_ALLOWANCE;
+    let weight = within_budget(raw, allowance)?;
     let mut value: Value = serde_json::from_slice(raw).map_err(|_| LineError::InvalidJson)?;
     let plan = value
         .as_object_mut()
@@ -188,9 +227,12 @@ pub(crate) fn parse_work_line(raw: &[u8], endpoint: BatchEndpoint) -> Result<Inp
         .map(serde_json::from_value::<LinePlan>)
         .transpose()
         .map_err(|_| LineError::InvalidShape)?;
-    let mut line = parse_line(
-        &serde_json::to_vec(&value).map_err(|_| LineError::InvalidJson)?,
-        endpoint,
+    // The one parsed tree, without a second serialization and parse.
+    let mut line = inner_within_budget(
+        parse_line_value(value, endpoint)?,
+        weight,
+        raw.len(),
+        allowance,
     )?;
     line.plan = plan;
     Ok(line)
@@ -199,10 +241,18 @@ pub(crate) fn parse_work_line(raw: &[u8], endpoint: BatchEndpoint) -> Result<Inp
 /// Parse and validate one input line against `endpoint`'s contract. Lines
 /// use the endpoint's optional/required maximum rules.
 pub(crate) fn parse_line(raw: &[u8], endpoint: BatchEndpoint) -> Result<InputLine, LineError> {
+    let weight = within_budget(raw, 0)?;
     let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
-    let Value::Object(mut top) =
-        serde_json::from_slice::<Value>(raw).map_err(|_| LineError::InvalidJson)?
-    else {
+    let line = parse_line_value(
+        serde_json::from_slice::<Value>(raw).map_err(|_| LineError::InvalidJson)?,
+        endpoint,
+    )?;
+    inner_within_budget(line, weight, raw.len(), 0)
+}
+
+/// [`parse_line`] of a line already parsed.
+fn parse_line_value(value: Value, endpoint: BatchEndpoint) -> Result<InputLine, LineError> {
+    let Value::Object(mut top) = value else {
         return Err(LineError::InvalidShape);
     };
     if top.len() != 4
@@ -597,5 +647,58 @@ mod tests {
         let mut big = Lines::default();
         assert!(big.push(&vec![b'x'; BATCH_MAX_LINE_BYTES + 1]).is_err());
         assert!(is_blank(b"  \r"));
+    }
+
+    /// A line within 4 MiB whose body would parse into more structure than
+    /// any request body may is refused before it is parsed, at planning
+    /// (`parse_line`) and when its work line runs (`parse_work_line`); a
+    /// line of the same size made of text is not.
+    #[test]
+    fn a_line_that_parses_too_large_is_refused_before_it_is_parsed() {
+        let mut hostile = chat();
+        hostile["body"]["tool_choice"] = json!(vec![json!({"a": 0}); 200_000]);
+        let hostile = line(hostile);
+        assert!(hostile.len() < BATCH_MAX_LINE_BYTES);
+        let before = crate::metrics::METRICS.json_structure_refusal_count("batch_line");
+        for parse in [parse_line, parse_work_line] {
+            assert_eq!(
+                parse(&hostile, BatchEndpoint::ChatCompletions).err(),
+                Some(LineError::LineTooLarge)
+            );
+        }
+        assert_eq!(
+            crate::metrics::METRICS.json_structure_refusal_count("batch_line"),
+            before + 2
+        );
+        let mut text = chat();
+        text["body"]["messages"][0]["content"] = json!("x".repeat(3 * 1024 * 1024));
+        assert!(parse_line(&line(text), BatchEndpoint::ChatCompletions).is_ok());
+        // A long string with escapes: its scratch and message copies are
+        // bounded by the line's own 4 MiB, not compared with the budget.
+        let mut escaped = chat();
+        escaped["body"]["messages"][0]["content"] = json!("line\n".repeat(600 * 1024));
+        let escaped = line(escaped);
+        assert!(escaped.len() > 3 * 1024 * 1024 && escaped.len() < BATCH_MAX_LINE_BYTES);
+        assert!(!crate::inference::json_weight::within_budget(&escaped));
+        assert!(parse_line(&escaped, BatchEndpoint::ChatCompletions).is_ok());
+        // A line's plain text is no allowance for structure: about 10 MiB of
+        // it (held twice while the line is converted) beside 3.5 MiB of text.
+        let mut dense = chat();
+        dense["body"]["tool_choice"] = json!(vec![json!({"a": 0}); 11_000]);
+        dense["body"]["messages"][0]["content"] = json!("x".repeat(3584 * 1024));
+        let dense = line(dense);
+        assert!(dense.len() < BATCH_MAX_LINE_BYTES);
+        assert_eq!(
+            parse_line(&dense, BatchEndpoint::ChatCompletions).err(),
+            Some(LineError::LineTooLarge)
+        );
+        // Text an error message shows escaped (DEL as six bytes) costs more
+        // than a plain string and is still charged beyond the line's own.
+        let mut shown = chat();
+        shown["body"]["messages"][0]["content"] = json!("\u{7f}".repeat(3 * 1024 * 1024));
+        assert_eq!(
+            parse_line(&line(shown), BatchEndpoint::ChatCompletions).err(),
+            Some(LineError::LineTooLarge)
+        );
     }
 }

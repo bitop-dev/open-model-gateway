@@ -563,7 +563,8 @@ impl Turns {
         {
             return Err(invalid());
         }
-        let args: Value = serde_json::from_str(&call.arguments).map_err(|_| invalid())?;
+        let args =
+            crate::inference::json_weight::parse_document(&call.arguments).ok_or_else(invalid)?;
         if !args.is_object() {
             return Err(invalid());
         }

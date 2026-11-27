@@ -505,7 +505,7 @@ pub fn chat_inspection(request: &ChatRequest) -> Inspection<'_> {
             input.push(&call.name, Part::ToolArguments);
             input.push(&call.arguments, Part::ToolArguments);
             // Adapters may decode the arguments: read them decoded too.
-            if let Ok(parsed) = serde_json::from_str::<Value>(&call.arguments) {
+            if let Some(parsed) = crate::inference::json_weight::parse_document(&call.arguments) {
                 owned(&parsed, Part::ToolArguments, &mut input);
             }
         }

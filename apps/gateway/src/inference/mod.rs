@@ -12,6 +12,7 @@ pub mod guardrails;
 mod hand_off;
 pub mod image_buffer;
 pub mod images;
+pub mod json_weight;
 pub mod realtime;
 pub mod repository;
 mod request_telemetry;
@@ -741,6 +742,8 @@ mod count_db_tests;
 mod drain_e2e_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod guardrail_db_tests;
+#[cfg(all(test, feature = "integration-tests"))]
+mod guardrail_inner_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod guardrail_limits_db_tests;
 mod route_use;

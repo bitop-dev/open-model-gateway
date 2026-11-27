@@ -6,9 +6,10 @@
 //!   line-numbered report (`errors.data[].line`).
 //! - `GET /v1/batches` (this workspace's batches, newest first),
 //!   `GET /v1/batches/{id}`, `POST /v1/batches/{id}/cancel`.
+use crate::http::json_body::JsonBodyRejection;
 use axum::{
     Extension, Json,
-    extract::{Path, Query, State, rejection::JsonRejection},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -70,10 +71,10 @@ pub async fn create(
     Extension(principal): Extension<Principal>,
     Extension(request_id): Extension<RequestId>,
     files: Option<Extension<FileStoreRuntime>>,
-    input: Result<Json<CreateRequest>, JsonRejection>,
+    input: Result<crate::http::json_body::JsonBody<CreateRequest>, JsonBodyRejection>,
 ) -> Response {
     let request = match input {
-        Ok(Json(r)) => r,
+        Ok(crate::http::json_body::JsonBody(r)) => r,
         Err(e) if e.status() == StatusCode::PAYLOAD_TOO_LARGE => return super::payload_too_large(),
         Err(_) => return job_error(InferenceError::InvalidRequest.into()),
     };

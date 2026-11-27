@@ -48,6 +48,7 @@ gateway_inference_attempt_errors counter code,provider Traffic
 gateway_inference_attempts counter model,outcome,provider Traffic
 gateway_inference_tokens counter direction,model,provider Traffic
 gateway_job_lease_renewals counter outcome System
+gateway_json_structure_refusals counter route Traffic
 gateway_key_issuance_refused counter operation,scope Traffic
 gateway_lock_deadlock_retries counter path System
 gateway_metrics_collection_errors counter collector System

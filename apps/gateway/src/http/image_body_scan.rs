@@ -4,7 +4,7 @@
 //! A body above the shared text limit is admitted on its `Content-Length`
 //! for its images. Everything else in it (keys, numbers, arrays, objects and
 //! ordinary strings) must fit the text limit, or parsing it could build a
-//! tree many times its size. [`outside_images`] walks the JSON string
+//! tree many times its size. [`scan`] walks the JSON string
 //! literals with no allocation and sets aside the raw length of at most
 //! [`MAX_IMAGES`] of the longest literals that are an image's data: a whole
 //! image URL as `image_input::Images::take` accepts it (a PNG, JPEG, WebP or
@@ -20,62 +20,66 @@
 //! (`image_buffer::LargeBody::allows`, on the parsed images) still runs after
 //! the parse.
 //!
-//! The walk agrees with any JSON parser on where strings begin and end: from
-//! the first byte, outside a string a `"` opens one; inside, a `\` escapes
-//! the next byte and a `"` closes it. A body that is not valid JSON fails its
-//! parse at its first invalid byte, so the structure built before that lies
-//! in the part both read alike.
+//! The same pass computes the body's structure estimate
+//! (`inference::json_weight::walk`, whose string boundaries are any JSON
+//! parser's), so a large body is read once before it is parsed.
 use crate::{
-    inference::types::ImageType,
+    inference::{json_weight, types::ImageType},
     protocols::image_input::{MAX_BASE64_BYTES, MAX_IMAGES},
 };
 
-/// The body's length less the raw lengths of at most [`MAX_IMAGES`] of its
-/// longest string literals that are image URLs (Chat Completions, Responses).
-pub(super) fn outside_images(body: &[u8]) -> usize {
+/// One pass over a large body: what lies outside its image data, and the
+/// structure estimate of all of it (`inference::json_weight`).
+pub(super) struct Scan {
+    /// The body's length less the raw lengths of at most [`MAX_IMAGES`] of
+    /// its longest string literals that are image data.
+    pub outside: usize,
+    /// What the body may parse into beyond its own bytes (both parts of
+    /// `json_weight::Weight`).
+    pub structure: usize,
+}
+
+/// [`Scan`] of a Chat Completions or Responses body, whose image data is a
+/// whole image URL.
+pub(super) fn chat_body(body: &[u8]) -> Scan {
     scan(body, false)
 }
 
-/// [`outside_images`] for a Messages body, whose image data is also the
-/// padded base64 value of a `data` key (an image source's).
-pub(super) fn outside_messages_images(body: &[u8]) -> usize {
+/// [`Scan`] of a Messages body, whose image data is also the padded base64
+/// value of a `data` key (an image source's).
+pub(super) fn messages_body(body: &[u8]) -> Scan {
     scan(body, true)
 }
 
-fn scan(body: &[u8], data_values: bool) -> usize {
+#[cfg(test)]
+fn outside_images(body: &[u8]) -> usize {
+    chat_body(body).outside
+}
+
+#[cfg(test)]
+fn outside_messages_images(body: &[u8]) -> usize {
+    messages_body(body).outside
+}
+
+fn scan(body: &[u8], data_values: bool) -> Scan {
     let mut longest = [0usize; MAX_IMAGES];
-    let mut at = 0;
-    // Where the string value of the last `data` key opens, if it is one.
-    let mut data_value = None;
-    while let Some(open) = body[at..].iter().position(|&b| b == b'"') {
-        let start = at + open + 1;
-        let end = string_end(body, start);
-        let literal = &body[start..end];
+    // Where the last key ends, when it is `data`.
+    let mut data_key = None;
+    let structure = json_weight::walk(body, |string| {
+        let literal = &body[string.start..string.end];
         // An image is always a value; a key is structure, which parsers copy
         // more often than a value (the error path keeps each key on it).
-        let after = (end + 1).min(body.len());
-        let colon = body[after..]
-            .iter()
-            .position(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
-            .map(|i| after + i)
-            .filter(|&i| body[i] == b':');
-        if let Some(colon) = colon {
-            // A key: remember where its value opens when that value is a
-            // string, so only that literal is read as the key's value.
-            data_value = (data_values && literal == b"data")
-                .then(|| {
-                    body[colon + 1..]
-                        .iter()
-                        .position(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
-                        .map(|i| colon + 1 + i)
-                        .filter(|&i| body[i] == b'"')
-                        .map(|i| i + 1)
-                })
-                .flatten();
-            at = after;
-            continue;
+        if string.key {
+            data_key = (data_values && literal == b"data").then_some(string.end);
+            return false;
         }
-        let source_data = data_value.take() == Some(start) && is_base64(literal);
+        // Only the key's own string value: nothing but the colon and
+        // whitespace between the key's closing quote and this one's opening.
+        let source_data = data_key.take().is_some_and(|key_end| {
+            body[key_end + 1..string.start - 1]
+                .iter()
+                .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b':'))
+        }) && is_base64(literal);
         if source_data || is_image_url(literal) {
             // Keep the longest: replace the shortest held so far.
             let (shortest, held) = longest
@@ -87,25 +91,21 @@ fn scan(body: &[u8], data_values: bool) -> usize {
             if literal.len() > held {
                 longest[shortest] = literal.len();
             }
+            // Image data: its copies are the image input buffer's
+            // (`inference::image_buffer`), not structure. That includes the
+            // parser's scratch copy of an escaped one, whether or not it is
+            // among the literals set aside: the scratch is one buffer, reused,
+            // at most twice the longest literal it decodes, and an image
+            // literal not set aside is no longer than the shortest one that
+            // is.
+            return true;
         }
-        // Past the closing quote (or the end of an unterminated string).
-        at = (end + 1).min(body.len());
+        false
+    });
+    Scan {
+        outside: body.len() - longest.iter().sum::<usize>(),
+        structure: structure.total(),
     }
-    body.len() - longest.iter().sum::<usize>()
-}
-
-/// The index of the `"` that closes the string whose content starts at
-/// `start`, or the body's end when it is unterminated.
-fn string_end(body: &[u8], start: usize) -> usize {
-    let mut i = start;
-    while i < body.len() {
-        match body[i] {
-            b'\\' => i += 2,
-            b'"' => return i,
-            _ => i += 1,
-        }
-    }
-    body.len()
 }
 
 /// The raw literal's characters, decoded one byte each, or `None` at an

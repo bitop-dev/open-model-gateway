@@ -60,6 +60,8 @@ mod deployment_image_input_tests;
 mod deployment_preview_tests;
 #[path = "deployment_restore_tests.rs"]
 mod deployment_restore_tests;
+#[path = "deployment_video_tests.rs"]
+mod deployment_video_tests;
 #[path = "description_control_tests.rs"]
 mod description_control_tests;
 #[path = "directory/tests.rs"]

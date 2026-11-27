@@ -96,7 +96,7 @@ impl Metrics {
             key_issuance_refused: Family::default(),
             egress_denied: Family::default(),
             guardrails: GuardrailMetrics::new(),
-            image_input: ImageInputFamilies::default(),
+            bodies: BodyFamilies::default(),
             upstream_connection_lost: every_client(),
             upstream_connections_opened: every_client(),
             job_lease_renewals: renewal_outcomes(),
@@ -445,17 +445,22 @@ impl Metrics {
         registry.register(
             "image_input_buffer_in_use_bytes",
             "Bytes of this replica's image input buffer held by large request bodies right now (each body's declared length, rounded up to whole MiB)",
-            self.image_input.in_use.clone(),
+            self.bodies.in_use.clone(),
         );
         registry.register(
             "image_input_buffer_bytes",
             "Configured size of this replica's image input buffer (GATEWAY_IMAGE_INPUT_BUFFER_BYTES, in whole MiB)",
-            self.image_input.size.clone(),
+            self.bodies.size.clone(),
         );
         registry.register(
             "image_input_refusals",
-            "Large image input bodies refused, by reason (busy: the buffer is spent, 503; too_large: over the route cap or the buffer, longer than declared, or more than 2 MiB outside image data, 413; timeout: the body stopped arriving, 408)",
-            self.image_input.refusals.clone(),
+            "Large image input bodies refused, by reason (busy: the buffer is spent, 503; key_share: the key holds half the buffer, 503; too_large: over the route cap or the buffer, longer than declared, or more than 2 MiB outside image data, 413; timeout: the body stopped arriving, 408)",
+            self.bodies.refusals.clone(),
+        );
+        registry.register(
+            "json_structure_refusals",
+            "JSON request bodies, batch lines and realtime client frames refused before parsing because they would parse into more than 16 MiB of structure, by route family",
+            self.bodies.structure_refusals.clone(),
         );
         registry.register(
             "egress_denied",

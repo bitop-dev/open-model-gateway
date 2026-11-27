@@ -117,6 +117,7 @@ classes! {
     "gateway_inference_attempt_errors" => (Traffic, Counter, "1", ["code", "provider"]),
     "gateway_inference_attempts" => (Traffic, Counter, "1", ["model", "outcome", "provider"]),
     "gateway_inference_tokens" => (Traffic, Counter, "1", ["direction", "model", "provider"]),
+    "gateway_json_structure_refusals" => (Traffic, Counter, "1", ["route"]),
     "gateway_key_issuance_refused" => (Traffic, Counter, "1", ["operation", "scope"]),
     "gateway_lock_deadlock_retries" => (System, Counter, "1", ["path"]),
     "gateway_metrics_collection_errors" => (System, Counter, "1", ["collector"]),
