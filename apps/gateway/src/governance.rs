@@ -80,7 +80,8 @@ pub(crate) use proof::SharedEligibilityCommitted;
 /// Other callers wait here without a connection. Settlements never queue
 /// behind admissions in-process, so holds are released promptly.
 pub struct LockGates {
-    admission: tokio::sync::Semaphore,
+    /// Shared fairly between workspaces (`gate`, #876).
+    admission: gate::FairGate,
     settlement: tokio::sync::Semaphore,
 }
 impl LockGates {
@@ -90,7 +91,7 @@ impl LockGates {
         // settlements queued in process (2 permits of 10).
         let (admission, settlement) = (pool / 2, pool * 3 / 10);
         Self {
-            admission: tokio::sync::Semaphore::new(admission.max(1)),
+            admission: gate::FairGate::new(admission.max(1)),
             settlement: tokio::sync::Semaphore::new(settlement.max(1)),
         }
     }
@@ -102,15 +103,20 @@ impl LockGates {
 fn admission_deadline(store: &Store) -> tokio::time::Instant {
     tokio::time::Instant::now() + store.admission_lock_wait
 }
-/// The replica's admission gate, waited for until `deadline`; past it the
+/// The replica's admission gate for an admission of `workspace`, waited for
+/// until `deadline` (shared fairly between workspaces: `gate`); past it the
 /// admission is shed (`ScopeBusy`) before it has a connection or a lock.
 async fn admission_gate(
     store: &Store,
+    workspace: Uuid,
     deadline: tokio::time::Instant,
-) -> Result<tokio::sync::SemaphorePermit<'_>, InferenceError> {
-    tokio::time::timeout_at(deadline, gate(&store.lock_gates.admission))
+) -> Result<gate::GatePermit<'_>, InferenceError> {
+    store
+        .lock_gates
+        .admission
+        .acquire(workspace, deadline)
         .await
-        .map_err(|_| {
+        .ok_or_else(|| {
             crate::metrics::METRICS.observe_admission_shed();
             InferenceError::ScopeBusy
         })
@@ -249,6 +255,10 @@ pub(crate) use totals::budget_consumption;
 mod admission;
 /// Batch admission, line admission and closing (`crate::jobs::batch`, 0021).
 pub mod batch;
+/// The admission gate, shared fairly between workspaces (#876).
+mod gate;
+#[cfg(test)]
+mod gate_tests;
 /// Lease extension and bound preview for async jobs (`crate::jobs`).
 pub mod jobs;
 /// Canonical lock order, authority scope locks and the admission setting.
@@ -307,7 +317,7 @@ async fn admit_unobserved(
     let workspace = record.principal.workspace_id;
     let key = record.principal.key_id;
     let deadline = admission_deadline(store);
-    let _queued = admission_gate(store, deadline).await?;
+    let _queued = admission_gate(store, workspace, deadline).await?;
     timer.phase("queue");
     crate::telemetry::mark_phase(crate::telemetry::SpanName::AdmissionQueue);
     let mut tx = crate::db::begin(&store.pool).await.map_err(begin_storage)?;

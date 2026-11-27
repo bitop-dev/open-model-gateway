@@ -136,7 +136,7 @@ impl Outcome {
 
 async fn drive(
     base: &str,
-    key: &str,
+    keys: &[String],
     total: usize,
     concurrency: usize,
     stream_every: usize,
@@ -151,7 +151,7 @@ async fn drive(
         .map(|_| {
             let (client, next) = (client.clone(), next.clone());
             let url = format!("{base}/v1/chat/completions");
-            let key = key.to_owned();
+            let keys = keys.to_vec();
             tokio::spawn(async move {
                 let mut outcome = Outcome::default();
                 loop {
@@ -160,10 +160,11 @@ async fn drive(
                         break;
                     }
                     let stream = stream_every > 0 && i % stream_every == 0;
+                    let key = &keys[i % keys.len()];
                     let body = json!({"model":"company/smart","max_completion_tokens":10,"stream":stream,
                         "messages":[{"role":"user","content":"synthetic load"}]});
                     let began = Instant::now();
-                    let response = client.post(&url).bearer_auth(&key).json(&body).send().await;
+                    let response = client.post(&url).bearer_auth(key).json(&body).send().await;
                     let (status, complete) = match response {
                         Ok(response) => {
                             let status = response.status().as_u16();
@@ -212,6 +213,94 @@ fn report(name: &str, outcome: &Outcome, elapsed: Duration) {
         outcome.statuses,
         outcome.incomplete,
     );
+}
+
+/// The cumulative `gateway_admission_seconds{phase="total",outcome="admitted"}`
+/// buckets of this process: (upper bound in seconds, count).
+async fn admission_buckets(store: &Store) -> Vec<(f64, u64)> {
+    let exposition = open_model_gateway::metrics::METRICS
+        .render(Some(store))
+        .await;
+    exposition
+        .lines()
+        .filter(|l| {
+            l.starts_with("gateway_admission_seconds_bucket{")
+                && l.contains(r#"phase="total""#)
+                && l.contains(r#"outcome="admitted""#)
+        })
+        .filter_map(|l| {
+            let le = l.split(r#"le=""#).nth(1)?.split('"').next()?;
+            let le = if le == "+Inf" {
+                f64::INFINITY
+            } else {
+                le.parse().ok()?
+            };
+            Some((le, l.rsplit(' ').next()?.parse().ok()?))
+        })
+        .collect()
+}
+
+/// A quantile (ms) of the admissions between two bucket snapshots,
+/// interpolated within its bucket as `histogram_quantile` does: the buckets
+/// double, so it is within a factor of two.
+fn admission_quantile(before: &[(f64, u64)], after: &[(f64, u64)], q: f64) -> f64 {
+    let delta: Vec<(f64, u64)> = after
+        .iter()
+        .map(|(le, n)| {
+            let was = before.iter().find(|(b, _)| b == le).map_or(0, |(_, c)| *c);
+            (*le, n - was)
+        })
+        .collect();
+    let total = delta.last().map_or(0, |(_, n)| *n);
+    if total == 0 {
+        return 0.0;
+    }
+    let rank = q * total as f64;
+    let mut lower = (0.0, 0u64);
+    for (le, n) in delta {
+        if n as f64 >= rank {
+            if le.is_infinite() {
+                return lower.0 * 1000.0;
+            }
+            let span = (n - lower.1).max(1) as f64;
+            return (lower.0 + (le - lower.0) * (rank - lower.1 as f64) / span) * 1000.0;
+        }
+        lower = (le, n);
+    }
+    lower.0 * 1000.0
+}
+
+/// `n` keys of new team workspaces for the scope scenarios: all in one
+/// workspace, or (`spread`) one in each of `n` workspaces. Their owner is the
+/// development user, with a direct grant of the load model.
+async fn scope_keys(pool: &sqlx::PgPool, n: usize, spread: bool) -> (Vec<String>, uuid::Uuid) {
+    let (user, model): (uuid::Uuid, uuid::Uuid) = sqlx::query_as(
+        "SELECT (SELECT owner_user_id FROM workspaces WHERE kind='personal' LIMIT 1),(SELECT id FROM models WHERE public_name='company/smart')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let (mut tokens, mut workspace) = (Vec::with_capacity(n), uuid::Uuid::nil());
+    for i in 0..n {
+        if spread || i == 0 {
+            workspace = uuid::Uuid::new_v4();
+            sqlx::query("INSERT INTO workspaces(id,name,kind) VALUES($1,$2,'team')")
+                .bind(workspace)
+                .bind(format!("Load scope {workspace}"))
+                .execute(pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO workspace_membership_grants(workspace_id,user_id,role,source) VALUES($1,$2,'owner','manual')")
+                .bind(workspace).bind(user).execute(pool).await.unwrap();
+            sqlx::query("INSERT INTO workspace_model_grants(workspace_id,model_id,source) VALUES($1,$2,'direct')")
+                .bind(workspace).bind(model).execute(pool).await.unwrap();
+        }
+        let key = open_model_gateway::auth::NewApiKey::generate().unwrap();
+        sqlx::query("INSERT INTO api_keys(id,workspace_id,issued_to_user_id,name,secret_hash) VALUES($1,$2,$3,'Load scope',$4)")
+            .bind(key.id).bind(workspace).bind(user).bind(key.digest.as_slice()).execute(pool).await.unwrap();
+        tokens.push(key.token);
+    }
+    (tokens, workspace)
 }
 
 struct Ledger {
@@ -400,7 +489,14 @@ async fn run(options: PgConnectOptions) {
     let mut expected_ok = 0i64;
     for &c in &concurrency {
         // Half streaming, half non-streaming (personal workspace).
-        let (outcome, elapsed) = drive(&base, &keys.personal_key.token, total, c, 2).await;
+        let (outcome, elapsed) = drive(
+            &base,
+            std::slice::from_ref(&keys.personal_key.token),
+            total,
+            c,
+            2,
+        )
+        .await;
         report(&format!("mixed c={c}"), &outcome, elapsed);
         assert_eq!(outcome.ok(), total, "every request should succeed");
         expected_ok += outcome.ok() as i64;
@@ -419,7 +515,107 @@ async fn run(options: PgConnectOptions) {
         .await
         .unwrap();
     let c = concurrency.iter().copied().max().unwrap_or(200);
-    let (outcome, elapsed) = drive(&base, &keys.team_key.token, total, c, 2).await;
+    // Admission across scopes on one replica (#876): one hot key, many keys
+    // of one workspace, and many workspaces, each at the highest concurrency,
+    // non-streaming, with the admission phase quantiles of each.
+    let scopes = env("LOAD_TEST_SCOPES", 32usize);
+    let (many_keys, many_keys_workspace) = scope_keys(&pool, scopes, false).await;
+    let (many_workspaces, _) = scope_keys(&pool, scopes, true).await;
+    let metrics = Store::new(pool.clone());
+    let mut admission = Vec::new();
+    for (name, tokens) in [
+        (
+            "one hot key".to_owned(),
+            vec![keys.personal_key.token.clone()],
+        ),
+        (format!("{scopes} keys, one workspace"), many_keys),
+        (format!("{scopes} workspaces"), many_workspaces),
+    ] {
+        let before = admission_buckets(&metrics).await;
+        let (outcome, elapsed) = drive(&base, &tokens, total, c, 0).await;
+        let after = admission_buckets(&metrics).await;
+        report(&format!("{name} c={c}"), &outcome, elapsed);
+        assert_eq!(outcome.ok(), total, "every request should succeed");
+        expected_ok += outcome.ok() as i64;
+        admission.push((
+            name,
+            admission_quantile(&before, &after, 0.5),
+            admission_quantile(&before, &after, 0.99),
+        ));
+    }
+    let l = ledger(&pool, many_keys_workspace).await;
+    assert_exact("keys", &l, total as i64);
+
+    // One workspace bursting while another sends a low steady rate (#876):
+    // what the steady workspace waits, and whether it is shed. Its requests
+    // are counted, not asserted: a shed one (503 `scope_busy`) is the
+    // measurement.
+    let (steady_keys, _) = scope_keys(&pool, 1, false).await;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let steady = {
+        let (stop, url, key) = (
+            stop.clone(),
+            format!("{base}/v1/chat/completions"),
+            steady_keys[0].clone(),
+        );
+        tokio::spawn(async move {
+            // One request every 100 ms, each on its own (not waiting for the
+            // previous one's answer), until the burst ends.
+            let client = reqwest::Client::new();
+            let mut sends = tokio::task::JoinSet::new();
+            let mut tick = tokio::time::interval(Duration::from_millis(100));
+            while !stop.load(Ordering::SeqCst) {
+                tick.tick().await;
+                let (client, url, key) = (client.clone(), url.clone(), key.clone());
+                sends.spawn(async move {
+                    let body = json!({"model":"company/smart","max_completion_tokens":10,
+                        "messages":[{"role":"user","content":"steady load"}]});
+                    let began = Instant::now();
+                    let status = match client.post(&url).bearer_auth(&key).json(&body).send().await
+                    {
+                        Ok(response) => {
+                            let status = response.status().as_u16();
+                            let _ = response.text().await;
+                            status
+                        }
+                        Err(_) => 0,
+                    };
+                    (began.elapsed(), status)
+                });
+            }
+            let mut outcome = Outcome::default();
+            while let Some(sent) = sends.join_next().await {
+                let (latency, status) = sent.unwrap();
+                outcome.latencies.push(latency);
+                *outcome.statuses.entry(status).or_default() += 1;
+            }
+            outcome
+        })
+    };
+    // Let the steady stream start before the burst.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (burst, elapsed) = drive(
+        &base,
+        std::slice::from_ref(&keys.personal_key.token),
+        total,
+        c,
+        0,
+    )
+    .await;
+    stop.store(true, Ordering::SeqCst);
+    let steady = steady.await.unwrap();
+    report(&format!("bursting workspace c={c}"), &burst, elapsed);
+    report("steady workspace (10/s) beside it", &steady, elapsed);
+    expected_ok += (burst.ok() + steady.ok()) as i64;
+
+    let (outcome, elapsed) = drive(
+        &base,
+        std::slice::from_ref(&keys.team_key.token),
+        total,
+        c,
+        2,
+    )
+    .await;
     report(&format!("budget c={c}"), &outcome, elapsed);
     let ok = outcome.ok() as i64;
     let denied = outcome.statuses.get(&429).copied().unwrap_or(0);
@@ -445,6 +641,10 @@ async fn run(options: PgConnectOptions) {
         expected_ok + ok,
         "upstream calls equal admitted attempts"
     );
+    println!("\n| scope scenario c={c} | admission p50 ms | admission p99 ms |\n|---|---|---|");
+    for (name, p50, p99) in &admission {
+        println!("| {name} | {p50:.2} | {p99:.2} |");
+    }
     println!(
         "\nBudget scenario: {ok} admitted, {denied} denied, settled {} of {budget} µUSD.",
         l.actual_sum

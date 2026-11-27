@@ -162,7 +162,7 @@ pub async fn reserve_window(
     armed: Option<ResponseBound>,
 ) -> Result<(), InferenceError> {
     let deadline = admission_deadline(store);
-    let _queued = admission_gate(store, deadline).await?;
+    let _queued = admission_gate(store, principal.workspace_id, deadline).await?;
     locks::retry_deadlocks!(
         "admission",
         reserve_window_once(store, principal, id, model, window, armed, deadline).await

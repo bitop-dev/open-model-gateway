@@ -313,7 +313,7 @@ async fn admit_batch_unobserved(
         .ok_or(InferenceError::Configuration)?;
     let workspace = record.principal.workspace_id;
     let admit_by = admission_deadline(store);
-    let _queued = admission_gate(store, admit_by).await?;
+    let _queued = admission_gate(store, workspace, admit_by).await?;
     let mut tx = crate::db::begin(&store.pool).await.map_err(begin_storage)?;
     admission_prefix(&mut tx, &record.principal).await?;
     let (lineage, _shared) = authorize(store, &mut tx, &record.principal).await?;
@@ -519,7 +519,7 @@ async fn admit_line_unobserved(
     }
     let workspace = record.principal.workspace_id;
     let admit_by = admission_deadline(store);
-    let _queued = admission_gate(store, admit_by).await?;
+    let _queued = admission_gate(store, workspace, admit_by).await?;
     let mut tx = crate::db::begin(&store.pool).await.map_err(begin_storage)?;
     admission_prefix(&mut tx, &record.principal).await?;
     let (lineage, _shared) = authorize(store, &mut tx, &record.principal).await?;
