@@ -6595,6 +6595,7 @@
                   "template_reference_unavailable",
                   "template_version_stale",
                   "unsupported_capability",
+                  "video_options_invalid",
                   "workspace_wide_visibility_required"
                 ],
                 "type": "string"
@@ -36817,6 +36818,39 @@
           "upstream_model": {
             "type": "string"
           },
+          "video": {
+            "description": "The route's video options (#52): the clip lengths it accepts (the first is the default) and the sizes (`null`: none may be named, none is sent); `null` when it serves no video.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "seconds": {
+                    "items": {
+                      "type": "integer"
+                    },
+                    "type": "array"
+                  },
+                  "sizes": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": [
+                      "array",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "seconds",
+                  "sizes"
+                ],
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "workload": {
             "enum": [
               "generation",
@@ -36841,6 +36875,7 @@
           "upstream_model",
           "enabled",
           "image_input",
+          "video",
           "provider",
           "connection_enabled",
           "region",
@@ -37042,6 +37077,39 @@
           },
           "upstream_model": {
             "type": "string"
+          },
+          "video": {
+            "description": "The route's video options (#52): the clip lengths it accepts (the first is the default) and the sizes (`null`: none may be named, none is sent); `null` when it serves no video.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "seconds": {
+                    "items": {
+                      "type": "integer"
+                    },
+                    "type": "array"
+                  },
+                  "sizes": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": [
+                      "array",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "seconds",
+                  "sizes"
+                ],
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -37052,12 +37120,13 @@
           "provider_name",
           "upstream_model",
           "enabled",
-          "image_input"
+          "image_input",
+          "video"
         ],
         "type": "object"
       },
       "SetupDeploymentUpdate": {
-        "description": "Closed serde object or existing positional struct array in declared field order. Handler semantic validation is additional: at least one of `enabled` and `image_input` must be set; `enabled` changes the route's enablement (with its revision and history), `image_input` its image-input opt-in (#24).",
+        "description": "Closed serde object, or the existing positional struct array `[enabled, image_input]` (the video options are set only in the object form). Handler semantic validation is additional: at least one of `enabled`, `image_input` and `video` must be set; `enabled` changes the route's enablement (with its revision and history), `image_input` its image-input opt-in (#24), `video` its video options (#52).",
         "oneOf": [
           {
             "additionalProperties": false,
@@ -37072,6 +37141,17 @@
                 "type": [
                   "boolean",
                   "null"
+                ]
+              },
+              "video": {
+                "description": "The route's video options; `null` clears them (the route then serves no video request); absent leaves them unchanged.",
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/SetupVideoOptions"
+                  },
+                  {
+                    "type": "null"
+                  }
                 ]
               }
             },
@@ -45094,6 +45174,43 @@
             "type": "array"
           }
         ]
+      },
+      "SetupVideoOptions": {
+        "additionalProperties": false,
+        "description": "A route's video options (0097, #52): a closed object (no positional form).",
+        "properties": {
+          "seconds": {
+            "description": "Clip lengths (seconds) the route accepts; the first is used when a request names none.",
+            "items": {
+              "maximum": 3600,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "maxItems": 32,
+            "minItems": 1,
+            "type": "array",
+            "uniqueItems": true
+          },
+          "sizes": {
+            "description": "Sizes the route accepts, `WIDTHxHEIGHT`; `null` or absent: a request may not name a size, and none is sent upstream.",
+            "items": {
+              "pattern": "^[1-9][0-9]{0,3}x[1-9][0-9]{0,3}$",
+              "type": "string",
+              "x-omg-pattern-boundaries": "WIDTHxHEIGHT, each 1 to 9999 without a leading zero (3 to 9 characters). Bounds and refusals (an empty list, a repeated size, `1280*720`, `01280x720`, `12800x720`) are pinned by management::tests::deployment_video_tests."
+            },
+            "maxItems": 32,
+            "minItems": 1,
+            "type": [
+              "array",
+              "null"
+            ],
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "seconds"
+        ],
+        "type": "object"
       },
       "SetupVisibleBudgetWindow": {
         "additionalProperties": false,
