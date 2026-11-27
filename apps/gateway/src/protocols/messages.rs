@@ -135,6 +135,11 @@ pub async fn count_tokens(
         Ok(v) => v,
         Err(response) => return *response,
     };
+    // A large body's bytes beyond its image sources are refused before the
+    // request is normalized (its copies), then checked exactly after it.
+    if let Some(refused) = beyond_image_sources(large.as_ref(), wire.image_data_bytes()) {
+        return refused;
+    }
     let mut request = match wire.normalize() {
         Ok(v) => v,
         Err(e) => return error_response(e),
@@ -187,6 +192,11 @@ pub async fn handle(
     }
     let labels = crate::inference::client::current()
         .with_body_session([wire.metadata.as_ref().and_then(|m| m.user_id.as_deref())]);
+    // A large body's bytes beyond its image sources are refused before the
+    // request is normalized (its copies), then checked exactly after it.
+    if let Some(refused) = beyond_image_sources(large.as_ref(), wire.image_data_bytes()) {
+        return refused;
+    }
     let mut request = match wire.normalize() {
         Ok(v) => v,
         Err(e) => return error_response(e),
@@ -453,6 +463,19 @@ pub(crate) fn large_body_refusal(response: Response) -> Response {
             .insert(axum::http::header::RETRY_AFTER, retry.clone());
     }
     shaped
+}
+/// A large body whose bytes outside its image sources' base64 already
+/// exceed the text limit, refused before it is normalized.
+fn beyond_image_sources(
+    large: Option<&Extension<crate::inference::image_buffer::LargeBody>>,
+    sources: usize,
+) -> Option<Response> {
+    let Extension(large) = large?;
+    if large.0.saturating_sub(sources) <= crate::inference::image_buffer::TEXT_BODY_BYTES {
+        return None;
+    }
+    crate::metrics::METRICS.image_input_refused("too_large");
+    Some(http_error(StatusCode::PAYLOAD_TOO_LARGE))
 }
 /// A large body may hold at most the text limit outside its validated
 /// images (`LargeBody::allows`): a long base64 string anywhere else (a text

@@ -233,7 +233,12 @@ async fn image_input_body(
                     return shaped(response);
                 }
             };
-            if image_body_scan::outside_images(&bytes) > TEXT_BODY_BYTES {
+            let outside = if anthropic {
+                image_body_scan::outside_messages_images(&bytes)
+            } else {
+                image_body_scan::outside_images(&bytes)
+            };
+            if outside > TEXT_BODY_BYTES {
                 METRICS.image_input_refused("too_large");
                 return shaped(crate::protocols::payload_too_large());
             }

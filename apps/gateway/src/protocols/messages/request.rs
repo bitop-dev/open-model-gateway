@@ -330,23 +330,32 @@ fn native_messages(wire: &[WireMessage]) -> Vec<Value> {
 fn native_block(block: &Value, images: &mut usize) -> Value {
     match block["type"].as_str() {
         Some("image") => without_data(block, images),
-        Some("tool_result") => match block.get("content") {
-            Some(Value::Array(inner)) => {
-                let mut block = block.clone();
-                block["content"] = Value::Array(
-                    inner
-                        .iter()
-                        .map(|b| {
-                            if b["type"] == "image" {
-                                without_data(b, images)
-                            } else {
-                                b.clone()
-                            }
-                        })
-                        .collect(),
-                );
-                block
-            }
+        // Built field by field, so the content's images are never cloned.
+        Some("tool_result") => match (block.as_object(), block.get("content")) {
+            (Some(fields), Some(Value::Array(inner))) => Value::Object(
+                fields
+                    .iter()
+                    .map(|(key, value)| {
+                        let value = if key == "content" {
+                            Value::Array(
+                                inner
+                                    .iter()
+                                    .map(|b| {
+                                        if b["type"] == "image" {
+                                            without_data(b, images)
+                                        } else {
+                                            b.clone()
+                                        }
+                                    })
+                                    .collect(),
+                            )
+                        } else {
+                            value.clone()
+                        };
+                        (key.clone(), value)
+                    })
+                    .collect(),
+            ),
             _ => block.clone(),
         },
         _ => block.clone(),
@@ -379,6 +388,30 @@ fn without_data(block: &Value, images: &mut usize) -> Value {
     }
     *images += 1;
     Value::Object(out)
+}
+/// The bytes of the image sources' base64 in `messages`, at the two places
+/// the parser takes images, read without a copy: what a large body may
+/// hold beyond the text limit, checked before the request is normalized.
+fn image_data_bytes(messages: &[WireMessage]) -> usize {
+    let data = |block: &Value| {
+        if block["type"] == "image" {
+            block["source"]["data"].as_str().map_or(0, str::len)
+        } else {
+            0
+        }
+    };
+    messages
+        .iter()
+        .filter_map(|m| m.content.as_array())
+        .flatten()
+        .map(|block| {
+            data(block)
+                + block["content"]
+                    .as_array()
+                    .filter(|_| block["type"] == "tool_result")
+                    .map_or(0, |inner| inner.iter().map(data).sum())
+        })
+        .sum()
 }
 fn system_messages(
     system: Option<Value>,
@@ -641,6 +674,10 @@ impl Request {
         }
         Ok(())
     }
+    /// See [`image_data_bytes`].
+    pub(super) fn image_data_bytes(&self) -> usize {
+        image_data_bytes(&self.messages)
+    }
     pub(super) fn normalize(self) -> Result<ChatRequest> {
         let temperature = self.temperature.flatten();
         let top_p = self.top_p.flatten();
@@ -731,6 +768,10 @@ impl CountRequest {
     /// A count has no output bound: the grammar runs with the largest
     /// maximum (so `thinking.budget_tokens` needs only its own lower bound),
     /// and the result has none, so no adapter sends one.
+    /// See [`image_data_bytes`].
+    pub(super) fn image_data_bytes(&self) -> usize {
+        image_data_bytes(&self.messages)
+    }
     pub(super) fn normalize(self) -> Result<ChatRequest> {
         let mut request = Request {
             model: self.model,

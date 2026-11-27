@@ -31,8 +31,18 @@ use crate::{
 };
 
 /// The body's length less the raw lengths of at most [`MAX_IMAGES`] of its
-/// longest string literals that are image URLs.
+/// longest string literals that are image URLs (Chat Completions, Responses).
 pub(super) fn outside_images(body: &[u8]) -> usize {
+    scan(body, false)
+}
+
+/// [`outside_images`] for a Messages body, whose image data is also the
+/// padded base64 value of a `data` key (an image source's).
+pub(super) fn outside_messages_images(body: &[u8]) -> usize {
+    scan(body, true)
+}
+
+fn scan(body: &[u8], data_values: bool) -> usize {
     let mut longest = [0usize; MAX_IMAGES];
     let mut at = 0;
     // Where the string value of the last `data` key opens, if it is one.
@@ -52,7 +62,7 @@ pub(super) fn outside_images(body: &[u8]) -> usize {
         if let Some(colon) = colon {
             // A key: remember where its value opens when that value is a
             // string, so only that literal is read as the key's value.
-            data_value = (literal == b"data")
+            data_value = (data_values && literal == b"data")
                 .then(|| {
                     body[colon + 1..]
                         .iter()
@@ -327,5 +337,39 @@ mod tests {
         assert_eq!(outside_images(&body), TEXT_BODY_BYTES);
         body.push(b' ');
         assert_eq!(outside_images(&body), TEXT_BODY_BYTES + 1);
+    }
+
+    #[test]
+    fn a_data_value_is_image_data_only_in_a_messages_body() {
+        let base64 = "A".repeat(4096);
+        // A Messages source: its `data` is set aside, whatever whitespace
+        // stands around the colon.
+        for body in [
+            format!(r#"{{"source":{{"type":"base64","data":"{base64}"}}}}"#),
+            format!("{{\"data\" :\n \"{base64}\"}}"),
+        ] {
+            assert_eq!(
+                outside_messages_images(body.as_bytes()),
+                body.len() - base64.len(),
+                "{body}"
+            );
+            // On Chat and Responses a `data` key is no image (a tool
+            // schema's, an audio part's): it counts in full.
+            assert_eq!(outside_images(body.as_bytes()), body.len(), "{body}");
+        }
+        // Only the key's own string value: not a nested one, not a value
+        // spelled "data", not base64 that is unpadded or not base64.
+        for body in [
+            format!(r#"{{"data":{{"x":"{base64}"}}}}"#),
+            format!(r#"{{"k":"data","v":"{base64}"}}"#),
+            format!(r#"{{"data":"{}"}}"#, "A".repeat(4097)),
+            format!(r#"{{"data":"{base64}!"}}"#),
+        ] {
+            assert_eq!(
+                outside_messages_images(body.as_bytes()),
+                body.len(),
+                "{body}"
+            );
+        }
     }
 }

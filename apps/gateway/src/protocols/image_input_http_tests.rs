@@ -761,6 +761,15 @@ async fn structure_past_the_text_limit_is_refused_before_any_parse(pool: PgPool)
                 repeated(r#""data:image/png;base64,AAAA""#, size)
             )),
         ),
+        // Base64 under a tool schema's `data` key: a `data` value is image
+        // data only in a Messages body, so on Chat it counts in full.
+        (
+            "/v1/chat/completions",
+            chat(format!(
+                r#""tools":[{{"type":"function","function":{{"name":"f","parameters":{{"data":"{}"}}}}}}]"#,
+                "A".repeat(size)
+            )),
+        ),
         // An image prefix over bytes outside base64, in a field of another
         // type: a parser's error would echo it escaped at six times its size,
         // so it is not set aside.
@@ -1405,9 +1414,10 @@ async fn translated_messages_images(pool: PgPool, provider: &str) {
 
 /// A Messages body above 2 MiB is admitted as Chat and Responses bodies are:
 /// for its images. Base64 anywhere else is refused with 413 in Anthropic's
-/// shape: in a text block before any parse, under a tool input's `data`
-/// key (set aside by the scan as a Messages source would be) once the parse
-/// shows it is no image; a document block is outside the grammar (400).
+/// shape: in a text block before any parse; under a tool input's or a
+/// document block's `data` key (set aside by the scan as a Messages image
+/// source would be) once the parsed wire shows it is no image source, before
+/// the request is normalized.
 #[dbtest::test]
 async fn a_large_messages_body_is_admitted_only_for_its_images(pool: PgPool) {
     use base64::Engine as _;
@@ -1441,8 +1451,8 @@ async fn a_large_messages_body_is_admitted_only_for_its_images(pool: PgPool) {
             messages_body(vec![
                 json!({"type":"document","source":{"type":"base64","media_type":"application/pdf","data":base64}}),
             ]),
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
         ),
     ];
     let executed = executions(&w).await;

@@ -788,9 +788,9 @@ fn text_delta(delta: &Value, events: &mut Vec<ChatEvent>) -> Result<()> {
 }
 /// Native Message Batches (`jobs::native`).
 mod batches;
-mod images;
 #[cfg(test)]
 mod fidelity_tests;
+mod images;
 #[cfg(test)]
 mod stream_property_tests;
 #[cfg(all(test, feature = "integration-tests"))]
