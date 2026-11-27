@@ -58,9 +58,9 @@ describe("Guardrails: wording and bodies (#840)", () => {
     expect(inspectionSentence(codes)).toContain("refuses a request that has one");
     expect(inspectionSentence(codes)).toContain("If the rule can't run, the request is refused.");
     // A Block rule also refuses what it can't read.
-    expect(inspectionSentence(codes)).toContain("It also refuses a request it can't read (one with an image, audio or a document), and a native batch when it is created.");
+    expect(inspectionSentence(codes)).toContain("It also refuses a request it can't read (one with an image, audio or a document that isn't plain text), and a native batch when it is created.");
     expect(inspectionSentence(secrets)).not.toContain("can't read");
-    expect(inspectedSentence(["generation", "embeddings"])).toContain("refuses it with a retryable error (503) under any rule, Monitor included");
+    expect(inspectedSentence(["generation", "embeddings"])).toContain("the request is refused with a 503 under any rule, Monitor included");
     expect(inspectionSentence({ ...secrets, input: { action: "off" } })).toBe("Off: checks nothing on input.");
     expect(inspectionSentence({ ...codes, workloads: ["embeddings"], detector: { ...codes.detector, patterns: undefined, pattern_count: 3 } })).toContain("3 custom patterns in the input of embeddings requests");
   });
@@ -125,7 +125,7 @@ describe("Workspace › Settings › Guardrails", () => {
     await user.click(await screen.findByRole("button", { name: "Edit Code names" }));
     // Block's own default: shown as the default, so a change of action takes the new action's.
     expect((screen.getByLabelText("If the rule can't run") as HTMLSelectElement).value).toBe("");
-    expect(screen.getByText(/A busy gateway never lets a request through unchecked/)).toBeTruthy();
+    expect(screen.getByText(/A request is never let through unchecked/)).toBeTruthy();
     await user.clear(screen.getByLabelText("Name"));
     await user.type(screen.getByLabelText("Name"), "Project codes");
     await user.click(screen.getByRole("button", { name: "Save rule" }));
@@ -148,6 +148,9 @@ describe("Workspace › Settings › Guardrails", () => {
     expect(sent.detector).toEqual(toInput(both).detector);
     expect(sent.protection).toBe("secrets");
     expect(sent.name).toBe("Both renamed");
+    // A pattern stored through the API with a leading space is kept as stored.
+    const spaced = { ...toInput({ ...codes, detector: { ...codes.detector, patterns: [" ACME-[0-9]{4}"] } }) };
+    expect((ruleInput({ name: "Code names", protection: "custom", action: "block", patterns: "ACME-[0-9]{4}", workloads: '["generation","embeddings"]' }, spaced).detector as { patterns: string[] }).patterns).toEqual([" ACME-[0-9]{4}"]);
   });
   it("shows a chosen on_error that is not its action's default", async () => {
     const strict: StoredRule = { ...secrets, on_error: "fail_closed" };
@@ -194,17 +197,20 @@ describe("Workspace › Settings › Guardrails", () => {
     await user.click(screen.getByRole("button", { name: "Remove" }));
     await waitFor(() => expect(writes(fetch)).toEqual([["PUT", guardrailsPath(team.id), { rules: [old] }]]));
   });
-  it("leaves out what a tightening no longer adds once the platform rule is as strict, and marks it", async () => {
-    // The platform raised Secrets to Block; the workspace's Monitor tightening of it (once from Off) adds nothing.
+  it("leaves out what a tightening is now weaker than, keeps what equals the platform rule, and marks it", async () => {
+    // The platform raised Secrets to Block; the workspace's Monitor tightening of it (once from Off) is weaker.
     const raised: StoredRule = { ...secrets, input: { action: "block", redact_scope: "user_text" } };
     const weak = { id: "t-weak", tightens: "r-secrets", input: { action: "monitor" as const } };
     const fetch = serve({ [guardrailsPath(team.id)]: () => view({ platform: { source: "type_default", rule_set: { ...platformSet, rules: [raised] } }, local: { ...localSet, rules: [codes, weak] }, effective: [{ ...effective(raised, "type_default", "set-p"), tightened_by: ["t-weak"] }, effective(codes, "workspace_local", "set-l")] }) });
     const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
-    expect(await screen.findByText(/“Secrets” is now at least as strict: this adds nothing/)).toBeTruthy();
+    expect(await screen.findByText(/“Secrets” is now stricter than this: it no longer applies/)).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Remove Code names" }));
     await user.click(screen.getByRole("button", { name: "Remove" }));
     await waitFor(() => expect(writes(fetch)).toEqual([["PUT", guardrailsPath(team.id), { rules: [] }]]));
-    expect(stricterPart({ id: "t", tightens: "r-secrets", input: { action: "block" }, on_error: "fail_closed" }, { ...secrets, input: { action: "block" } })).toEqual({ id: "t", tightens: "r-secrets", on_error: "fail_closed" });
+    // Equal is kept (the server accepts it, and it holds the level if the platform lowers its rule); weaker goes.
+    expect(stricterPart({ id: "t", tightens: "r-secrets", input: { action: "block" }, on_error: "fail_closed" }, { ...secrets, input: { action: "block" } })).toEqual({ id: "t", tightens: "r-secrets", input: { action: "block" }, on_error: "fail_closed" });
+    expect(stricterPart({ id: "t", tightens: "r-secrets", input: { action: "monitor" }, on_error: "fail_closed" }, { ...secrets, input: { action: "block" }, on_error: "fail_closed" })).toEqual({ id: "t", tightens: "r-secrets", on_error: "fail_closed" });
+    expect(stricterPart({ id: "t", tightens: "r-secrets", input: { action: "monitor" } }, { ...secrets, input: { action: "block" } })).toBeNull();
   });
   it("names the platform rule when the server still refuses a tightening as loosening", async () => {
     serve({ [guardrailsPath(team.id)]: init => init?.method === "PUT"

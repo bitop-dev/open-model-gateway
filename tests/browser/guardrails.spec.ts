@@ -142,19 +142,21 @@ test("a workspace rule blocks a request and the admin pages show the layers", as
     expect((await (await api(alex.page, "GET", local)).json()).local.rules).toEqual([]);
     await expectAccessible(operator.page, "admin team guardrails");
 
-    // A tightening the platform rule later outgrows: the workspace tightens a
-    // Monitor rule to Block, a Platform Admin then raises the rule itself to
-    // Block. The tightening is marked as adding nothing, and the next local
-    // save leaves it out instead of being refused.
-    expect((await api(operator.page, "PUT", platform, { local_only: false, rules: [{ name: "Secrets", protection: "secrets", detector: { kind: "pattern", categories: ["secret"] }, input: { action: "monitor" } }] })).status()).toBe(200);
+    // A tightening the platform rule later outgrows: the workspace tightens an
+    // Off rule to Monitor, a Platform Admin then raises the rule itself to
+    // Block. The tightening is marked as weaker, and the next local save
+    // leaves it out instead of being refused.
+    expect((await api(operator.page, "PUT", platform, { local_only: false, rules: [{ name: "Secrets", protection: "secrets", detector: { kind: "pattern", categories: ["secret"] }, input: { action: "off" } }] })).status()).toBe(200);
     const secretsRule = (await (await api(operator.page, "GET", platform)).json()).override.rules[0];
     await alex.page.reload();
     await alex.page.getByRole("button", { name: "Tighten Secrets" }).click();
-    await alex.page.getByRole("dialog", { name: "Tighten Secrets" }).getByRole("button", { name: "Tighten" }).click();
+    const tightenOff = alex.page.getByRole("dialog", { name: "Tighten Secrets" });
+    await tightenOff.getByRole("combobox", { name: "On input" }).selectOption("monitor");
+    await tightenOff.getByRole("button", { name: "Tighten" }).click();
     await expect(effective.getByText("Tightened by this workspace")).toBeVisible();
     expect((await api(operator.page, "PUT", platform, { local_only: false, rules: [{ id: secretsRule.id, name: "Secrets", protection: "secrets", detector: { kind: "pattern", categories: ["secret"] }, input: { action: "block" } }] })).status()).toBe(200);
     await alex.page.reload();
-    await expect(alex.page.getByText(/“Secrets” is now at least as strict: this adds nothing/)).toBeVisible();
+    await expect(alex.page.getByText(/“Secrets” is now stricter than this: it no longer applies/)).toBeVisible();
     await alex.page.getByRole("button", { name: "Add rule" }).click();
     const late = alex.page.getByRole("dialog", { name: "Add a rule to this workspace's rules" });
     await late.getByRole("textbox", { name: "Name" }).fill(`Late rule ${unique}`);

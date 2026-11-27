@@ -76,8 +76,8 @@ const platformRules = (g: WorkspaceGuardrails) => new Map((g.platform.rule_set?.
 /**
  * The local layer's entries as the server will accept them against the live
  * platform layer: a tightening whose platform rule is gone is left out, and
- * one keeps only the settings still stricter than its rule (left out when
- * none is; the server refuses a weaker one as loosening).
+ * one keeps only the settings not weaker than its rule (left out when none
+ * is; the server refuses a weaker one as loosening).
  */
 function liveEntries(rules: Record<string, unknown>[], g: WorkspaceGuardrails): Record<string, unknown>[] {
   const base = platformRules(g);
@@ -94,8 +94,8 @@ function tighteningMarks(g: WorkspaceGuardrails): Map<string, string> {
     if (!isTightening(e)) continue;
     const rule = base.get(e.tightens), stored = toInput(e), part = rule ? stricterPart(stored, rule) : null;
     if (!rule) marks.set(e.id, "Its platform rule was removed: it no longer applies, and the next save of this layer removes it.");
-    else if (!part) marks.set(e.id, `“${rule.name}” is now at least as strict: this adds nothing, and the next save of this layer removes it.`);
-    else if (Object.keys(part).length < Object.keys(stored).length) marks.set(e.id, `“${rule.name}” is now at least as strict in part: the next save of this layer keeps only what is still stricter.`);
+    else if (!part) marks.set(e.id, `“${rule.name}” is now stricter than this: it no longer applies, and the next save of this layer removes it.`);
+    else if (Object.keys(part).length < Object.keys(stored).length) marks.set(e.id, `“${rule.name}” is now stricter than part of this: the next save of this layer keeps only the rest.`);
   }
   return marks;
 }
