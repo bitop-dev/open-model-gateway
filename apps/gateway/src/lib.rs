@@ -49,6 +49,7 @@ pub mod legal_holds;
 pub mod lifecycle;
 #[cfg(test)]
 pub(crate) mod log_capture_test;
+pub mod log_policy;
 pub mod maintenance;
 pub mod management;
 pub mod metrics;

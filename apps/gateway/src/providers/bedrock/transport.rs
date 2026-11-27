@@ -12,6 +12,15 @@ use std::time::Duration;
 
 // Includes JSON envelope / event framing overhead, not just normalized model output.
 pub(super) const WIRE_LIMIT: usize = 8 * 1024 * 1024;
+/// The largest request body sent. Encoding holds a request with images to
+/// Bedrock's 20 MB (`images::LIMITS`), counted over the raw text, tool
+/// arguments, schemas and the images' base64; the SDK then writes its own
+/// JSON, whose envelope and re-serialised tool arguments and schemas
+/// (numbers can grow) add to that, and a large body carries at most 2 MiB
+/// outside its images. So the wire body stays under this. A body over it is
+/// refused here, before the request is built, so nothing is sent: the
+/// attempt ends as unsent (`inference::dispatch`), its hold released.
+const REQUEST_LIMIT: usize = 26 * 1024 * 1024;
 
 #[derive(Clone)]
 struct Connector {
@@ -29,18 +38,32 @@ fn failure() -> ConnectorError {
         None,
     )
 }
+/// The request's signed body. It is one in-memory buffer, and taking it
+/// moves that buffer into the outgoing request without a copy (a body with
+/// images can be most of `REQUEST_LIMIT`).
+async fn signed_body(request: &mut HttpRequest) -> Result<bytes::Bytes, ConnectorError> {
+    let body = request.take_body();
+    if body.bytes().is_none() {
+        return Err(failure());
+    }
+    let bytes = http_body_util::BodyExt::collect(body)
+        .await
+        .map_err(|_| failure())?
+        .to_bytes();
+    if bytes.len() > REQUEST_LIMIT {
+        return Err(failure());
+    }
+    Ok(bytes)
+}
 impl HttpConnector for Connector {
-    fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+    fn call(&self, mut request: HttpRequest) -> HttpConnectorFuture {
         let client = self.client.clone();
         let streaming_read = self.streaming_read;
         HttpConnectorFuture::new(async move {
             let method =
                 reqwest::Method::from_bytes(request.method().as_bytes()).map_err(|_| failure())?;
-            let bytes = request.body().bytes().ok_or_else(failure)?;
-            if bytes.len() > WIRE_LIMIT {
-                return Err(failure());
-            }
-            let mut builder = client.request(method, request.uri()).body(bytes.to_vec());
+            let bytes = signed_body(&mut request).await?;
+            let mut builder = client.request(method, request.uri()).body(bytes);
             for (name, value) in request.headers().iter() {
                 let mut value =
                     reqwest::header::HeaderValue::from_str(value).map_err(|_| failure())?;
@@ -187,4 +210,39 @@ pub(super) fn for_test(client: crate::egress::HttpClient) -> SharedHttpClient {
         streaming_read: None,
     });
     http_client_fn(move |_, _| connector.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A body over [`REQUEST_LIMIT`] is refused before the outgoing request is
+    /// built, so the attempt is unsent (`inference::dispatch`); a body within
+    /// it is built (and here fails to connect: nothing listens).
+    #[tokio::test]
+    async fn a_body_over_the_request_limit_is_refused_before_anything_is_built() {
+        let client = crate::egress::client_builder(crate::egress::resolver(
+            crate::egress::Purpose::Provider,
+        ))
+        .build()
+        .unwrap();
+        let connector = Connector {
+            client,
+            streaming_read: None,
+        };
+        let request = |length: usize| {
+            let mut request = HttpRequest::new(SdkBody::from(vec![b' '; length]));
+            request.set_method("POST").unwrap();
+            request
+                .set_uri("http://127.0.0.1:9/model/m/converse")
+                .unwrap();
+            request
+        };
+        for (length, sent) in [(REQUEST_LIMIT + 1, false), (16, true)] {
+            let (result, nothing_sent) =
+                crate::inference::dispatch::observe(connector.call(request(length))).await;
+            assert!(result.is_err(), "{length}");
+            assert_eq!(nothing_sent, !sent, "{length}");
+        }
+    }
 }

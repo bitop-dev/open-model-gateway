@@ -1265,7 +1265,230 @@ async fn structured_output_sdk_bedrock_model_refusal(pool: sqlx::PgPool) {
 }
 
 #[tokio::test]
-async fn images_are_refused_before_anything_is_sent() {
+async fn inline_images_reach_converse_as_image_blocks_of_their_bytes() {
+    use super::super::contract::{IMAGE_URL, image_request_with};
+    let data = IMAGE_URL.split_once(',').unwrap().1;
+    let blocks = json!([
+        {"text":"what is"},
+        {"image":{"format":"png","source":{"bytes":data}}},
+        {"text":"this?"}
+    ]);
+    for stream in [false, true] {
+        let mock = Mock::serve(complete(false), wire(events(false)), 200).await;
+        let adapter = mock.adapter();
+        assert!(adapter.capabilities().image_input);
+        let request = image_request_with(stream, None);
+        assert!(adapter.supports_chat_request(&request));
+        adapter.validate_chat_request(&request).unwrap();
+        drop(adapter.execute(&target(), request).await.unwrap());
+        let captured = mock.requests.lock().unwrap();
+        assert_eq!(
+            captured[0].body["messages"][0]["content"], blocks,
+            "stream {stream}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn images_across_turns_keep_their_order_and_blank_text_is_not_sent() {
+    let (request, data) = super::super::contract::multi_image_request();
+    let mock = Mock::serve(complete(false), wire(events(false)), 200).await;
+    mock.adapter().execute(&target(), request).await.unwrap();
+    let sent = mock.requests.lock().unwrap()[0].body.clone();
+    let image = |k: usize| json!({"image":{"format":"png","source":{"bytes":data[k]}}});
+    assert_eq!(sent["system"], json!([{"text":"be brief"}]));
+    assert_eq!(
+        sent["messages"],
+        json!([
+            {"role":"user","content":[{"text":"compare"}, image(0), image(1)]},
+            {"role":"assistant","content":[{"text":"two images"}]},
+            {"role":"user","content":[image(2), {"text":"and this"}]}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn the_request_size_counts_images_and_everything_else_sent() {
+    use base64::Engine as _;
+    // Five images of 3.7 MB pass one by one (under 3.75 MB) but are 24.7 MB
+    // of base64 together; four are 19.7 MB, under the 20 MB, until a tool
+    // description takes the rest of it.
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.resize(3_700_000, 7);
+    let url = format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    );
+    let request = |count: usize, description: usize| {
+        let mut images = crate::protocols::image_input::Images::default();
+        let mut r = super::super::contract::image_request_with(false, None);
+        r.messages[0].content = Some(Content::Parts(
+            (0..count)
+                .map(|_| Part::Image(images.take(url.clone(), None, "image").unwrap()))
+                .collect(),
+        ));
+        r.tools = vec![FunctionTool {
+            name: "lookup".into(),
+            description: Some("d".repeat(description)),
+            parameters: serde_json::json!({"type":"object"}),
+            strict: None,
+        }];
+        r
+    };
     let adapter = BedrockAdapter::for_test("http://127.0.0.1:9");
-    super::super::contract::assert_images_refused(&adapter, &target()).await;
+    let refused = Err(InferenceError::InvalidField("image"));
+    assert_eq!(adapter.validate_chat_request(&request(5, 1)), refused);
+    assert_eq!(adapter.validate_chat_request(&request(4, 1)), Ok(()));
+    assert_eq!(adapter.validate_chat_request(&request(4, 300_000)), refused);
+    // Refused in the encoder too, before anything is sent.
+    assert_eq!(
+        adapter.execute(&target(), request(4, 300_000)).await.err(),
+        refused.err()
+    );
+}
+
+#[tokio::test]
+async fn images_converse_cannot_carry_are_refused_before_anything_is_sent() {
+    use super::super::contract::image_request_with;
+    // Nothing listens at the target, so a request that was sent would fail
+    // with a transport error instead of the named field.
+    let adapter = BedrockAdapter::for_test("http://127.0.0.1:9");
+    for detail in ["low", "high"] {
+        let request = image_request_with(false, Some(detail));
+        assert_eq!(
+            adapter.validate_chat_request(&request).err(),
+            Some(InferenceError::InvalidField("detail"))
+        );
+        assert_eq!(
+            adapter.execute(&target(), request).await.err(),
+            Some(InferenceError::InvalidField("detail"))
+        );
+    }
+}
+
+/// An image's bytes reach no log line, even with every target at TRACE.
+/// What was found: the SDK as locked writes its requests at TRACE but prints
+/// no body (the transmitted body is boxed and shown as `BoxBody`, and
+/// `aws_sigv4` redacts the signed body unless `LOG_SIGNABLE_BODY=true`).
+/// The process subscriber (`log_policy::subscriber`, which `main::run`
+/// installs) never records TRACE from the `aws_*` crates, which covers that
+/// switch and an SDK version that prints more: an event there carrying the
+/// bytes is dropped by it and written without it.
+#[tokio::test]
+async fn an_image_reaches_no_log_line_whatever_rust_log_enables() {
+    use base64::Engine as _;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::{EnvFilter, fmt::MakeWriter};
+    #[derive(Clone, Default)]
+    struct Lines(Arc<StdMutex<Vec<u8>>>);
+    impl std::io::Write for Lines {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> MakeWriter<'a> for Lines {
+        type Writer = Lines;
+        fn make_writer(&'a self) -> Lines {
+            self.clone()
+        }
+    }
+    // The process subscriber with every target enabled, or the same
+    // subscriber without the policy.
+    let capture = |policy: bool| {
+        let lines = Lines::default();
+        let dispatch = if policy {
+            tracing::Dispatch::new(crate::log_policy::subscriber(
+                lines.clone(),
+                EnvFilter::new("trace"),
+            ))
+        } else {
+            tracing::Dispatch::new(
+                tracing_subscriber::fmt()
+                    .json()
+                    .with_writer(lines.clone())
+                    .with_env_filter(EnvFilter::new("trace"))
+                    .finish(),
+            )
+        };
+        (lines, dispatch)
+    };
+    let text = |lines: &Lines| String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    while bytes.len() < 4096 {
+        bytes.extend_from_slice(b"QwImageCanaryQ");
+    }
+    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let canary = &data[40..80];
+    let image = crate::protocols::image_input::Images::default()
+        .take(format!("data:image/png;base64,{data}"), None, "image")
+        .unwrap();
+    let mut request = super::super::contract::image_request_with(false, None);
+    request.messages[0].content = Some(Content::Parts(vec![
+        Part::Text("what is this?".into()),
+        Part::Image(image),
+    ]));
+    // Served and refused by the upstream, complete and streamed.
+    for (status, stream) in [(200, false), (400, false), (200, true), (400, true)] {
+        for policy in [false, true] {
+            let mock = Mock::serve(complete(false), wire(events(false)), status).await;
+            let (lines, subscriber) = capture(policy);
+            let (adapter, deployment) = (mock.adapter(), target());
+            let mut request = request.clone();
+            request.stream = stream;
+            let result = async {
+                let output = adapter.execute(&deployment, request).await?;
+                if let ProviderOutput::Stream(events) = output {
+                    // Read to its end under the same subscriber.
+                    let events: Vec<_> = events.collect().await;
+                    events
+                        .into_iter()
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                }
+                Ok::<_, InferenceError>(())
+            }
+            .with_subscriber(subscriber)
+            .await;
+            assert_eq!(
+                result.is_ok(),
+                status == 200,
+                "status {status} stream {stream}"
+            );
+            if let Err(error) = &result {
+                assert!(!format!("{error:?}{error}").contains(canary));
+            }
+            assert!(
+                mock.requests.lock().unwrap()[0]
+                    .body
+                    .to_string()
+                    .contains(canary)
+            );
+            let logged = text(&lines);
+            // The capture was live: the SDK's TRACE events without the
+            // policy, its DEBUG events with it.
+            assert_eq!(logged.contains("transmitting request"), !policy);
+            assert!(logged.contains("beginning attempt"), "policy {policy}");
+            assert!(
+                !logged.contains(canary) && !logged.contains("ImageCanary"),
+                "status {status} policy {policy}"
+            );
+        }
+    }
+    // Those events live at TRACE under the SDK's targets, which the policy
+    // never enables: an event there carrying the bytes is dropped with the
+    // policy and written without it; DEBUG under the same target is kept.
+    for policy in [false, true] {
+        let (lines, subscriber) = capture(policy);
+        tracing::dispatcher::with_default(&subscriber, || {
+            tracing::trace!(target: "aws_sigv4::http_request::sign", body = canary, "signing request");
+            tracing::trace!(target: "aws_smithy_runtime::client::orchestrator", body = canary, "transmitting request");
+            tracing::debug!(target: "aws_smithy_runtime::client::orchestrator", "beginning attempt");
+        });
+        let logged = text(&lines);
+        assert_eq!(logged.contains(canary), !policy, "policy {policy}");
+        assert!(logged.contains("beginning attempt"));
+    }
 }

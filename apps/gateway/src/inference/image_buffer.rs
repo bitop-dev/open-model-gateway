@@ -22,8 +22,11 @@ pub const TEXT_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// The budget's unit: a large body takes its length in whole MiB.
 pub const MIB: usize = 1024 * 1024;
 /// The largest number of copies of an image's bytes in memory at once
-/// (measured; docs/operations.md "Image input memory").
-pub const COPY_FACTOR: usize = 3;
+/// (measured; docs/operations.md "Image input memory"): three on the
+/// OpenAI-shaped and Anthropic wires (the received body, the parsed request,
+/// the spliced upstream body), four on Bedrock, whose SDK takes the decoded
+/// bytes and writes its own body from them. At most [`WORST_COPIES`].
+pub const COPY_FACTOR: usize = 4;
 /// The largest number of copies of any byte of a large body: the text it
 /// may carry beside its images (at most [`TEXT_BODY_BYTES`]) is copied by
 /// the parse, each attempt, the upstream value, its serialization and the

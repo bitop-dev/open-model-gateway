@@ -6,9 +6,12 @@
 //! Each image is bounded before it is decoded (its base64 length against
 //! [`MAX_DECODED_BYTES`], the request's count against [`MAX_IMAGES`]), then
 //! decoded once into a scratch buffer that checks strict base64, the
-//! declared type's magic bytes and the decoded size, and is dropped at once.
+//! declared type's magic bytes, the decoded size and, when its header states
+//! them, its pixel dimensions (`dimensions`), and is dropped at once.
 //! The data URL itself moves into the [`ImageInput`] without a copy.
 use base64::Engine as _;
+
+mod dimensions;
 
 use crate::inference::{
     error::InferenceError,
@@ -58,9 +61,16 @@ impl Images {
             return Err(invalid);
         }
         let decoded_bytes = decoded.len();
+        let size = dimensions::dimensions(media_type, &decoded);
         drop(decoded);
         self.0 += 1;
-        Ok(ImageInput::new(url, media_type, detail, decoded_bytes))
+        Ok(ImageInput::new(
+            url,
+            media_type,
+            detail,
+            decoded_bytes,
+            size,
+        ))
     }
 }
 
