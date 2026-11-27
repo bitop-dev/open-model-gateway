@@ -202,6 +202,7 @@ REVIEWED = (
     ("0033_partition_archive.sql", "archived_budget_contributions", "api_key_id", "uuid"),
     ("0049_key_expiry_reminders.sql", "alert_events", "api_key_id", "uuid"),
     ("0080_access_review_keys.sql", "access_review_items", "api_key_id", "uuid"),
+    ("0095_guardrail_events.sql", "guardrail_events", "api_key_id", "uuid"),
     # Lookup digests for inference keys, browser sessions, invitations and admin tokens.
     ("0001_enterprise.sql", "api_keys", "secret_hash", "bytea"),
     ("0001_enterprise.sql", "browser_sessions", "token_hash", "bytea"),

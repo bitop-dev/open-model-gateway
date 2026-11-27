@@ -105,7 +105,10 @@ impl Engine {
             )
             .await
         {
-            Ok(admission) => admission,
+            Ok(admission) => {
+                scope.unadmitted.admitted();
+                admission
+            }
             Err(error) => {
                 // The timeout and the admission's
                 // own error (e.g. a team-workspace rate or budget
@@ -292,6 +295,9 @@ impl Engine {
 /// What every attempt of one request shares.
 #[derive(Clone, Copy)]
 pub(super) struct RequestScope<'a> {
+    /// Cleared when an attempt is admitted (guardrail rows of a request
+    /// never admitted count toward the key's bound).
+    pub(super) unadmitted: &'a super::guardrails::Unadmitted,
     pub(super) principal: Principal,
     pub(super) request: &'a ChatRequest,
     pub(super) request_id: Uuid,

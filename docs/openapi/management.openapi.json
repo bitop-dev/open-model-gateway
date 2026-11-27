@@ -21637,6 +21637,88 @@
         ],
         "type": "object"
       },
+      "S6GuardrailDecision": {
+        "additionalProperties": false,
+        "description": "One guardrail decision on the request: ids, codes and a count of distinct matched values, never text.",
+        "properties": {
+          "action": {
+            "enum": [
+              "monitored",
+              "redacted",
+              "blocked",
+              "stopped",
+              "detector_failed",
+              "skipped"
+            ]
+          },
+          "category": {
+            "enum": [
+              "secret",
+              "personal_data",
+              "moderation",
+              "prompt_injection",
+              "custom"
+            ]
+          },
+          "count": {
+            "maximum": 1000000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "detector": {
+            "enum": [
+              "pattern",
+              "systemone",
+              "llm_judge",
+              "external"
+            ]
+          },
+          "layer": {
+            "enum": [
+              "type_default",
+              "workspace_override",
+              "workspace_local"
+            ]
+          },
+          "refused": {
+            "type": "boolean"
+          },
+          "revision": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "rule_id": {
+            "$ref": "#/components/schemas/IdentityUuid"
+          },
+          "rule_set_id": {
+            "$ref": "#/components/schemas/IdentityUuid"
+          },
+          "stage": {
+            "enum": [
+              "input",
+              "output"
+            ]
+          }
+        },
+        "required": [
+          "rule_set_id",
+          "rule_id",
+          "revision",
+          "layer",
+          "stage",
+          "detector",
+          "category",
+          "action",
+          "count",
+          "refused",
+          "created_at"
+        ],
+        "type": "object"
+      },
       "S6Id": {
         "additionalProperties": false,
         "properties": {
@@ -23454,7 +23536,8 @@
             ]
           },
           "attempts": {
-            "minimum": 1,
+            "description": "Attempts made; 0 for a request a guardrail refused.",
+            "minimum": 0,
             "type": "integer"
           },
           "cached_input_tokens": {
@@ -23510,6 +23593,57 @@
               {
                 "minimum": 0,
                 "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "guardrail": {
+            "anyOf": [
+              {
+                "additionalProperties": false,
+                "description": "The request's guardrail decisions in brief (#840): whether one refused it, and the distinct actions and categories. Null when no rule decided anything.",
+                "properties": {
+                  "actions": {
+                    "items": {
+                      "enum": [
+                        "monitored",
+                        "redacted",
+                        "blocked",
+                        "stopped",
+                        "detector_failed",
+                        "skipped"
+                      ]
+                    },
+                    "minItems": 1,
+                    "type": "array",
+                    "uniqueItems": true
+                  },
+                  "categories": {
+                    "items": {
+                      "enum": [
+                        "secret",
+                        "personal_data",
+                        "moderation",
+                        "prompt_injection",
+                        "custom"
+                      ]
+                    },
+                    "minItems": 1,
+                    "type": "array",
+                    "uniqueItems": true
+                  },
+                  "refused": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "refused",
+                  "actions",
+                  "categories"
+                ],
+                "type": "object"
               },
               {
                 "type": "null"
@@ -23596,7 +23730,11 @@
             "$ref": "#/components/schemas/IdentityNullableDecimal"
           },
           "provider": {
-            "type": "string"
+            "description": "Null for a request a guardrail refused (no attempt reached a provider).",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "reasoning_tokens": {
             "$ref": "#/components/schemas/IdentityNullableDecimal"
@@ -23625,7 +23763,8 @@
               "succeeded",
               "failed",
               "cancelled",
-              "indeterminate"
+              "indeterminate",
+              "blocked"
             ]
           },
           "streamed": {
@@ -23723,7 +23862,8 @@
           "session_id",
           "app",
           "job",
-          "trace_id"
+          "trace_id",
+          "guardrail"
         ],
         "type": "object"
       },
@@ -23737,7 +23877,8 @@
             ]
           },
           "attempt_count": {
-            "minimum": 1,
+            "description": "Attempts made; 0 for a request a guardrail refused.",
+            "minimum": 0,
             "type": "integer"
           },
           "attempts": {
@@ -23804,6 +23945,63 @@
                 "type": "null"
               }
             ]
+          },
+          "guardrail": {
+            "anyOf": [
+              {
+                "additionalProperties": false,
+                "description": "The request's guardrail decisions in brief (#840): whether one refused it, and the distinct actions and categories. Null when no rule decided anything.",
+                "properties": {
+                  "actions": {
+                    "items": {
+                      "enum": [
+                        "monitored",
+                        "redacted",
+                        "blocked",
+                        "stopped",
+                        "detector_failed",
+                        "skipped"
+                      ]
+                    },
+                    "minItems": 1,
+                    "type": "array",
+                    "uniqueItems": true
+                  },
+                  "categories": {
+                    "items": {
+                      "enum": [
+                        "secret",
+                        "personal_data",
+                        "moderation",
+                        "prompt_injection",
+                        "custom"
+                      ]
+                    },
+                    "minItems": 1,
+                    "type": "array",
+                    "uniqueItems": true
+                  },
+                  "refused": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "refused",
+                  "actions",
+                  "categories"
+                ],
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "guardrail_decisions": {
+            "items": {
+              "$ref": "#/components/schemas/S6GuardrailDecision"
+            },
+            "type": "array"
           },
           "held_microusd": {
             "$ref": "#/components/schemas/IdentityUnsignedDecimal"
@@ -24010,7 +24208,11 @@
             "$ref": "#/components/schemas/IdentityNullableUuid"
           },
           "provider": {
-            "type": "string"
+            "description": "Null for a request a guardrail refused (no attempt reached a provider).",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "reasoning_tokens": {
             "$ref": "#/components/schemas/IdentityNullableDecimal"
@@ -24039,7 +24241,8 @@
               "succeeded",
               "failed",
               "cancelled",
-              "indeterminate"
+              "indeterminate",
+              "blocked"
             ]
           },
           "streamed": {
@@ -24144,7 +24347,9 @@
           "workspace_id",
           "attempt_count",
           "prev_id",
-          "next_id"
+          "next_id",
+          "guardrail",
+          "guardrail_decisions"
         ],
         "type": "object"
       },
@@ -24839,7 +25044,8 @@
             ]
           },
           "attempts": {
-            "minimum": 1,
+            "description": "Attempts made; 0 for a request a guardrail refused.",
+            "minimum": 0,
             "type": "integer"
           },
           "cached_input_tokens": {
@@ -24895,6 +25101,57 @@
               {
                 "minimum": 0,
                 "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "guardrail": {
+            "anyOf": [
+              {
+                "additionalProperties": false,
+                "description": "The request's guardrail decisions in brief (#840): whether one refused it, and the distinct actions and categories. Null when no rule decided anything.",
+                "properties": {
+                  "actions": {
+                    "items": {
+                      "enum": [
+                        "monitored",
+                        "redacted",
+                        "blocked",
+                        "stopped",
+                        "detector_failed",
+                        "skipped"
+                      ]
+                    },
+                    "minItems": 1,
+                    "type": "array",
+                    "uniqueItems": true
+                  },
+                  "categories": {
+                    "items": {
+                      "enum": [
+                        "secret",
+                        "personal_data",
+                        "moderation",
+                        "prompt_injection",
+                        "custom"
+                      ]
+                    },
+                    "minItems": 1,
+                    "type": "array",
+                    "uniqueItems": true
+                  },
+                  "refused": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "refused",
+                  "actions",
+                  "categories"
+                ],
+                "type": "object"
               },
               {
                 "type": "null"
@@ -24981,7 +25238,11 @@
             "$ref": "#/components/schemas/IdentityNullableDecimal"
           },
           "provider": {
-            "type": "string"
+            "description": "Null for a request a guardrail refused (no attempt reached a provider).",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "reasoning_tokens": {
             "$ref": "#/components/schemas/IdentityNullableDecimal"
@@ -25010,7 +25271,8 @@
               "succeeded",
               "failed",
               "cancelled",
-              "indeterminate"
+              "indeterminate",
+              "blocked"
             ]
           },
           "streamed": {
@@ -25112,7 +25374,8 @@
           "session_id",
           "app",
           "job",
-          "trace_id"
+          "trace_id",
+          "guardrail"
         ],
         "type": "object"
       },
@@ -25126,7 +25389,8 @@
             ]
           },
           "attempt_count": {
-            "minimum": 1,
+            "description": "Attempts made; 0 for a request a guardrail refused.",
+            "minimum": 0,
             "type": "integer"
           },
           "attempts": {
@@ -25193,6 +25457,63 @@
                 "type": "null"
               }
             ]
+          },
+          "guardrail": {
+            "anyOf": [
+              {
+                "additionalProperties": false,
+                "description": "The request's guardrail decisions in brief (#840): whether one refused it, and the distinct actions and categories. Null when no rule decided anything.",
+                "properties": {
+                  "actions": {
+                    "items": {
+                      "enum": [
+                        "monitored",
+                        "redacted",
+                        "blocked",
+                        "stopped",
+                        "detector_failed",
+                        "skipped"
+                      ]
+                    },
+                    "minItems": 1,
+                    "type": "array",
+                    "uniqueItems": true
+                  },
+                  "categories": {
+                    "items": {
+                      "enum": [
+                        "secret",
+                        "personal_data",
+                        "moderation",
+                        "prompt_injection",
+                        "custom"
+                      ]
+                    },
+                    "minItems": 1,
+                    "type": "array",
+                    "uniqueItems": true
+                  },
+                  "refused": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "refused",
+                  "actions",
+                  "categories"
+                ],
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "guardrail_decisions": {
+            "items": {
+              "$ref": "#/components/schemas/S6GuardrailDecision"
+            },
+            "type": "array"
           },
           "held_microusd": {
             "$ref": "#/components/schemas/IdentityUnsignedDecimal"
@@ -25399,7 +25720,11 @@
             "$ref": "#/components/schemas/IdentityNullableUuid"
           },
           "provider": {
-            "type": "string"
+            "description": "Null for a request a guardrail refused (no attempt reached a provider).",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "reasoning_tokens": {
             "$ref": "#/components/schemas/IdentityNullableDecimal"
@@ -25428,7 +25753,8 @@
               "succeeded",
               "failed",
               "cancelled",
-              "indeterminate"
+              "indeterminate",
+              "blocked"
             ]
           },
           "streamed": {
@@ -25537,7 +25863,9 @@
           "workspace_id",
           "attempt_count",
           "prev_id",
-          "next_id"
+          "next_id",
+          "guardrail",
+          "guardrail_decisions"
         ],
         "type": "object"
       },
@@ -45268,6 +45596,51 @@
       "delete_api_v1_platform_workspaces_by_ws_guardrailsResponse": {
         "additionalProperties": false,
         "properties": {
+          "decisions_this_month": {
+            "description": "This month's guardrail decisions on the workspace (UTC month), per action and category: totals only, never request detail, also for a personal workspace, but never of a personal workspace's local layer (#840).",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "action": {
+                  "enum": [
+                    "monitored",
+                    "redacted",
+                    "blocked",
+                    "stopped",
+                    "detector_failed",
+                    "skipped"
+                  ]
+                },
+                "category": {
+                  "enum": [
+                    "secret",
+                    "personal_data",
+                    "moderation",
+                    "prompt_injection",
+                    "custom"
+                  ]
+                },
+                "decisions": {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "findings": {
+                  "description": "Distinct matches of the decisions that found something (0 for skipped or failed rules).",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "action",
+                "category",
+                "decisions",
+                "findings"
+              ],
+              "type": "object"
+            },
+            "type": "array",
+            "x-omg-may-be-empty": "No guardrail decision this month."
+          },
           "effective": {
             "anyOf": [
               {
@@ -45346,7 +45719,8 @@
                         {
                           "enum": [
                             "egress_not_allowed",
-                            "tightened_rule_missing"
+                            "tightened_rule_missing",
+                            "not_runnable"
                           ]
                         }
                       ]
@@ -45514,7 +45888,21 @@
             "type": "object"
           },
           "enforced": {
-            "const": false
+            "const": true
+          },
+          "inspected_workloads": {
+            "const": [
+              "generation",
+              "embeddings"
+            ],
+            "description": "The workloads whose input this release inspects (also through count_tokens and gateway-run batch lines). A rule that names another workload does not cover it yet.",
+            "items": {
+              "enum": [
+                "generation",
+                "embeddings"
+              ]
+            },
+            "type": "array"
           },
           "kind": {
             "enum": [
@@ -46292,8 +46680,10 @@
           "local_visible",
           "effective",
           "enforced",
+          "inspected_workloads",
           "type_default",
-          "override"
+          "override",
+          "decisions_this_month"
         ],
         "type": "object"
       },
@@ -48409,10 +48799,25 @@
               "type": "object"
             },
             "type": "array"
+          },
+          "inspected_workloads": {
+            "const": [
+              "generation",
+              "embeddings"
+            ],
+            "description": "The workloads whose input this release inspects (also through count_tokens and gateway-run batch lines). A rule that names another workload does not cover it yet.",
+            "items": {
+              "enum": [
+                "generation",
+                "embeddings"
+              ]
+            },
+            "type": "array"
           }
         },
         "required": [
-          "detectors"
+          "detectors",
+          "inspected_workloads"
         ],
         "type": "object"
       },
@@ -49047,6 +49452,20 @@
       "get_api_v1_platform_workspace_types_by_kind_guardrailsResponse": {
         "additionalProperties": false,
         "properties": {
+          "inspected_workloads": {
+            "const": [
+              "generation",
+              "embeddings"
+            ],
+            "description": "The workloads whose input this release inspects (also through count_tokens and gateway-run batch lines). A rule that names another workload does not cover it yet.",
+            "items": {
+              "enum": [
+                "generation",
+                "embeddings"
+              ]
+            },
+            "type": "array"
+          },
           "kind": {
             "enum": [
               "personal",
@@ -49281,7 +49700,8 @@
         },
         "required": [
           "kind",
-          "rule_set"
+          "rule_set",
+          "inspected_workloads"
         ],
         "type": "object"
       },
@@ -49352,6 +49772,51 @@
       "get_api_v1_platform_workspaces_by_ws_guardrailsResponse": {
         "additionalProperties": false,
         "properties": {
+          "decisions_this_month": {
+            "description": "This month's guardrail decisions on the workspace (UTC month), per action and category: totals only, never request detail, also for a personal workspace, but never of a personal workspace's local layer (#840).",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "action": {
+                  "enum": [
+                    "monitored",
+                    "redacted",
+                    "blocked",
+                    "stopped",
+                    "detector_failed",
+                    "skipped"
+                  ]
+                },
+                "category": {
+                  "enum": [
+                    "secret",
+                    "personal_data",
+                    "moderation",
+                    "prompt_injection",
+                    "custom"
+                  ]
+                },
+                "decisions": {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "findings": {
+                  "description": "Distinct matches of the decisions that found something (0 for skipped or failed rules).",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "action",
+                "category",
+                "decisions",
+                "findings"
+              ],
+              "type": "object"
+            },
+            "type": "array",
+            "x-omg-may-be-empty": "No guardrail decision this month."
+          },
           "effective": {
             "anyOf": [
               {
@@ -49430,7 +49895,8 @@
                         {
                           "enum": [
                             "egress_not_allowed",
-                            "tightened_rule_missing"
+                            "tightened_rule_missing",
+                            "not_runnable"
                           ]
                         }
                       ]
@@ -49598,7 +50064,21 @@
             "type": "object"
           },
           "enforced": {
-            "const": false
+            "const": true
+          },
+          "inspected_workloads": {
+            "const": [
+              "generation",
+              "embeddings"
+            ],
+            "description": "The workloads whose input this release inspects (also through count_tokens and gateway-run batch lines). A rule that names another workload does not cover it yet.",
+            "items": {
+              "enum": [
+                "generation",
+                "embeddings"
+              ]
+            },
+            "type": "array"
           },
           "kind": {
             "enum": [
@@ -50603,8 +51083,10 @@
           "local_visible",
           "effective",
           "enforced",
+          "inspected_workloads",
           "type_default",
-          "override"
+          "override",
+          "decisions_this_month"
         ],
         "type": "object"
       },
@@ -50945,7 +51427,8 @@
                     {
                       "enum": [
                         "egress_not_allowed",
-                        "tightened_rule_missing"
+                        "tightened_rule_missing",
+                        "not_runnable"
                       ]
                     }
                   ]
@@ -51111,7 +51594,21 @@
             "type": "object"
           },
           "enforced": {
-            "const": false
+            "const": true
+          },
+          "inspected_workloads": {
+            "const": [
+              "generation",
+              "embeddings"
+            ],
+            "description": "The workloads whose input this release inspects (also through count_tokens and gateway-run batch lines). A rule that names another workload does not cover it yet.",
+            "items": {
+              "enum": [
+                "generation",
+                "embeddings"
+              ]
+            },
+            "type": "array"
           },
           "kind": {
             "enum": [
@@ -51668,6 +52165,7 @@
           "local_visible",
           "effective",
           "enforced",
+          "inspected_workloads",
           "can_edit"
         ],
         "type": "object"
@@ -57230,6 +57728,20 @@
       "put_api_v1_platform_workspace_types_by_kind_guardrailsResponse": {
         "additionalProperties": false,
         "properties": {
+          "inspected_workloads": {
+            "const": [
+              "generation",
+              "embeddings"
+            ],
+            "description": "The workloads whose input this release inspects (also through count_tokens and gateway-run batch lines). A rule that names another workload does not cover it yet.",
+            "items": {
+              "enum": [
+                "generation",
+                "embeddings"
+              ]
+            },
+            "type": "array"
+          },
           "kind": {
             "enum": [
               "personal",
@@ -57457,7 +57969,8 @@
         },
         "required": [
           "kind",
-          "rule_set"
+          "rule_set",
+          "inspected_workloads"
         ],
         "type": "object"
       },
@@ -57878,6 +58391,51 @@
       "put_api_v1_platform_workspaces_by_ws_guardrailsResponse": {
         "additionalProperties": false,
         "properties": {
+          "decisions_this_month": {
+            "description": "This month's guardrail decisions on the workspace (UTC month), per action and category: totals only, never request detail, also for a personal workspace, but never of a personal workspace's local layer (#840).",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "action": {
+                  "enum": [
+                    "monitored",
+                    "redacted",
+                    "blocked",
+                    "stopped",
+                    "detector_failed",
+                    "skipped"
+                  ]
+                },
+                "category": {
+                  "enum": [
+                    "secret",
+                    "personal_data",
+                    "moderation",
+                    "prompt_injection",
+                    "custom"
+                  ]
+                },
+                "decisions": {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "findings": {
+                  "description": "Distinct matches of the decisions that found something (0 for skipped or failed rules).",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "action",
+                "category",
+                "decisions",
+                "findings"
+              ],
+              "type": "object"
+            },
+            "type": "array",
+            "x-omg-may-be-empty": "No guardrail decision this month."
+          },
           "effective": {
             "anyOf": [
               {
@@ -57956,7 +58514,8 @@
                         {
                           "enum": [
                             "egress_not_allowed",
-                            "tightened_rule_missing"
+                            "tightened_rule_missing",
+                            "not_runnable"
                           ]
                         }
                       ]
@@ -58124,7 +58683,21 @@
             "type": "object"
           },
           "enforced": {
-            "const": false
+            "const": true
+          },
+          "inspected_workloads": {
+            "const": [
+              "generation",
+              "embeddings"
+            ],
+            "description": "The workloads whose input this release inspects (also through count_tokens and gateway-run batch lines). A rule that names another workload does not cover it yet.",
+            "items": {
+              "enum": [
+                "generation",
+                "embeddings"
+              ]
+            },
+            "type": "array"
           },
           "kind": {
             "enum": [
@@ -59109,8 +59682,10 @@
           "local_visible",
           "effective",
           "enforced",
+          "inspected_workloads",
           "type_default",
-          "override"
+          "override",
+          "decisions_this_month"
         ],
         "type": "object"
       },
@@ -59536,7 +60111,8 @@
                     {
                       "enum": [
                         "egress_not_allowed",
-                        "tightened_rule_missing"
+                        "tightened_rule_missing",
+                        "not_runnable"
                       ],
                       "x-omg-unobserved-branch": "A local PUT validates every tightening entry against the current platform layer and phase 1 refuses every detector that sends text out, so no entry it returns is inactive."
                     }
@@ -59703,7 +60279,21 @@
             "type": "object"
           },
           "enforced": {
-            "const": false
+            "const": true
+          },
+          "inspected_workloads": {
+            "const": [
+              "generation",
+              "embeddings"
+            ],
+            "description": "The workloads whose input this release inspects (also through count_tokens and gateway-run batch lines). A rule that names another workload does not cover it yet.",
+            "items": {
+              "enum": [
+                "generation",
+                "embeddings"
+              ]
+            },
+            "type": "array"
           },
           "kind": {
             "enum": [
@@ -60253,6 +60843,7 @@
           "local_visible",
           "effective",
           "enforced",
+          "inspected_workloads",
           "can_edit"
         ],
         "type": "object"
@@ -70588,12 +71179,12 @@
             }
           },
           {
-            "description": "Comma-separated attempt statuses (succeeded, failed, cancelled, indeterminate, in_progress); no empty items.",
+            "description": "Comma-separated statuses (succeeded, failed, cancelled, indeterminate, in_progress, blocked: a guardrail refused the request before any attempt); no empty items.",
             "in": "query",
             "name": "status",
             "required": false,
             "schema": {
-              "pattern": "^(succeeded|failed|cancelled|indeterminate|in_progress)(,(succeeded|failed|cancelled|indeterminate|in_progress))*$",
+              "pattern": "^(succeeded|failed|cancelled|indeterminate|in_progress|blocked)(,(succeeded|failed|cancelled|indeterminate|in_progress|blocked))*$",
               "type": "string"
             }
           },
@@ -70665,6 +71256,22 @@
                 "videos",
                 "batches",
                 "jobs"
+              ]
+            }
+          },
+          {
+            "description": "Requests with guardrail decisions (#840): any, refused (a guardrail refused the request), or one action.",
+            "in": "query",
+            "name": "guardrail",
+            "required": false,
+            "schema": {
+              "enum": [
+                "any",
+                "refused",
+                "monitored",
+                "blocked",
+                "detector_failed",
+                "skipped"
               ]
             }
           }
@@ -70784,12 +71391,12 @@
             }
           },
           {
-            "description": "Comma-separated attempt statuses (succeeded, failed, cancelled, indeterminate, in_progress); no empty items.",
+            "description": "Comma-separated statuses (succeeded, failed, cancelled, indeterminate, in_progress, blocked: a guardrail refused the request before any attempt); no empty items.",
             "in": "query",
             "name": "status",
             "required": false,
             "schema": {
-              "pattern": "^(succeeded|failed|cancelled|indeterminate|in_progress)(,(succeeded|failed|cancelled|indeterminate|in_progress))*$",
+              "pattern": "^(succeeded|failed|cancelled|indeterminate|in_progress|blocked)(,(succeeded|failed|cancelled|indeterminate|in_progress|blocked))*$",
               "type": "string"
             }
           },
@@ -70861,6 +71468,22 @@
                 "videos",
                 "batches",
                 "jobs"
+              ]
+            }
+          },
+          {
+            "description": "Requests with guardrail decisions (#840): any, refused (a guardrail refused the request), or one action.",
+            "in": "query",
+            "name": "guardrail",
+            "required": false,
+            "schema": {
+              "enum": [
+                "any",
+                "refused",
+                "monitored",
+                "blocked",
+                "detector_failed",
+                "skipped"
               ]
             }
           },
@@ -71010,12 +71633,12 @@
             }
           },
           {
-            "description": "Comma-separated attempt statuses (succeeded, failed, cancelled, indeterminate, in_progress); no empty items.",
+            "description": "Comma-separated statuses (succeeded, failed, cancelled, indeterminate, in_progress, blocked: a guardrail refused the request before any attempt); no empty items.",
             "in": "query",
             "name": "status",
             "required": false,
             "schema": {
-              "pattern": "^(succeeded|failed|cancelled|indeterminate|in_progress)(,(succeeded|failed|cancelled|indeterminate|in_progress))*$",
+              "pattern": "^(succeeded|failed|cancelled|indeterminate|in_progress|blocked)(,(succeeded|failed|cancelled|indeterminate|in_progress|blocked))*$",
               "type": "string"
             }
           },
@@ -71087,6 +71710,22 @@
                 "videos",
                 "batches",
                 "jobs"
+              ]
+            }
+          },
+          {
+            "description": "Requests with guardrail decisions (#840): any, refused (a guardrail refused the request), or one action.",
+            "in": "query",
+            "name": "guardrail",
+            "required": false,
+            "schema": {
+              "enum": [
+                "any",
+                "refused",
+                "monitored",
+                "blocked",
+                "detector_failed",
+                "skipped"
               ]
             }
           }
@@ -80232,7 +80871,7 @@
     },
     "/api/v1/platform/workspace-types/{kind}/guardrails": {
       "get": {
-        "description": "#840: the workspace-type default guardrail layer, with custom pattern text (Platform Admins and Auditors). rule_set is null until written. Phase 1 (#840) stores and composes policies only: nothing inspects request text yet (enforced is false).",
+        "description": "#840: the workspace-type default guardrail layer, with custom pattern text (Platform Admins and Auditors). rule_set is null until written. Input rules are enforced by the engine for generation and embeddings (enforced is true); output is not inspected in this release.",
         "operationId": "get_api_v1_platform_workspace_types_by_kind_guardrails",
         "parameters": [
           {
@@ -80312,7 +80951,7 @@
         "x-omg-token-policy": "Scope"
       },
       "put": {
-        "description": "#840: replace the type default's rules (full set) and local_only (required); moves its revision forward by one; audited as guardrail_policy.updated with ids, actions and a pattern count. An entry keeps its id when it names one of this layer's rules; new entries get new ids. Tightening entries belong to local layers (400 here). Phase 1 (#840) stores and composes policies only: nothing inspects request text yet (enforced is false).",
+        "description": "#840: replace the type default's rules (full set) and local_only (required); moves its revision forward by one; audited as guardrail_policy.updated with ids, actions and a pattern count. An entry keeps its id when it names one of this layer's rules; new entries get new ids. Tightening entries belong to local layers (400 here). Input rules are enforced by the engine for generation and embeddings (enforced is true); output is not inspected in this release.",
         "operationId": "put_api_v1_platform_workspace_types_by_kind_guardrails",
         "parameters": [
           {
@@ -81608,7 +82247,7 @@
         "x-omg-token-policy": "Scope"
       },
       "get": {
-        "description": "#840: a workspace's platform layers (type default, override) and, for a Team or Project, its local layer and effective rules. A personal workspace's local layer is the owner's own choice: platform staff get local null, local_visible false and effective null. Phase 1 (#840) stores and composes policies only: nothing inspects request text yet (enforced is false).",
+        "description": "#840: a workspace's platform layers (type default, override) and, for a Team or Project, its local layer and effective rules. A personal workspace's local layer is the owner's own choice: platform staff get local null, local_visible false and effective null. Input rules are enforced by the engine for generation and embeddings (enforced is true); output is not inspected in this release.",
         "operationId": "get_api_v1_platform_workspaces_by_ws_guardrails",
         "parameters": [
           {
@@ -81679,7 +82318,7 @@
         "x-omg-token-policy": "Scope"
       },
       "put": {
-        "description": "#840: replace the workspace's override (full set) and local_only (required); the override replaces the type default. Personal workspaces are addressable (platform-managed configuration). Phase 1 (#840) stores and composes policies only: nothing inspects request text yet (enforced is false).",
+        "description": "#840: replace the workspace's override (full set) and local_only (required); the override replaces the type default. Personal workspaces are addressable (platform-managed configuration). Input rules are enforced by the engine for generation and embeddings (enforced is true); output is not inspected in this release.",
         "operationId": "put_api_v1_platform_workspaces_by_ws_guardrails",
         "parameters": [
           {
@@ -86400,7 +87039,7 @@
     },
     "/api/v1/workspaces/{ws}/guardrails": {
       "get": {
-        "description": "#840: the workspace's effective guardrail rules with provenance: its platform layer (override or type default), its local layer and each effective entry's source, revision, tightening entries and active/inactive_reason (egress_not_allowed under local_only, tightened_rule_missing for an entry whose platform rule is gone). Custom pattern text is shown to the layer's writers and, for platform layers and a shared workspace's local layer, to platform staff; everyone else sees pattern_count. Members and, on a Team or Project, platform staff read; a personal workspace is its owner's only. Phase 1 (#840) stores and composes policies only: nothing inspects request text yet (enforced is false).",
+        "description": "#840: the workspace's effective guardrail rules with provenance: its platform layer (override or type default), its local layer and each effective entry's source, revision, tightening entries and active/inactive_reason (egress_not_allowed under local_only, tightened_rule_missing for an entry whose platform rule is gone). Custom pattern text is shown to the layer's writers and, for platform layers and a shared workspace's local layer, to platform staff; everyone else sees pattern_count. Members and, on a Team or Project, platform staff read; a personal workspace is its owner's only. Input rules are enforced by the engine for generation and embeddings (enforced is true); output is not inspected in this release.",
         "operationId": "get_api_v1_workspaces_by_ws_guardrails",
         "parameters": [
           {
@@ -86464,7 +87103,7 @@
         "x-omg-token-policy": "Scope"
       },
       "put": {
-        "description": "#840: replace the workspace's local layer (full set): rules of its own, and tightening entries ({tightens: <platform rule id>} with only input.action, output.mode, on_error or threshold) that make a platform rule stricter. Composition takes the stricter value of each field, so an entry never weakens the current platform rule. Shared owners/admins and a personal workspace's owner; browser only. local_only is a platform field (400). Phase 1 (#840) stores and composes policies only: nothing inspects request text yet (enforced is false).",
+        "description": "#840: replace the workspace's local layer (full set): rules of its own, and tightening entries ({tightens: <platform rule id>} with only input.action, output.mode, on_error or threshold) that make a platform rule stricter. Composition takes the stricter value of each field, so an entry never weakens the current platform rule. Shared owners/admins and a personal workspace's owner; browser only. local_only is a platform field (400). Input rules are enforced by the engine for generation and embeddings (enforced is true); output is not inspected in this release.",
         "operationId": "put_api_v1_workspaces_by_ws_guardrails",
         "parameters": [
           {
@@ -88277,12 +88916,12 @@
             }
           },
           {
-            "description": "Comma-separated attempt statuses (succeeded, failed, cancelled, indeterminate, in_progress); no empty items.",
+            "description": "Comma-separated statuses (succeeded, failed, cancelled, indeterminate, in_progress, blocked: a guardrail refused the request before any attempt); no empty items.",
             "in": "query",
             "name": "status",
             "required": false,
             "schema": {
-              "pattern": "^(succeeded|failed|cancelled|indeterminate|in_progress)(,(succeeded|failed|cancelled|indeterminate|in_progress))*$",
+              "pattern": "^(succeeded|failed|cancelled|indeterminate|in_progress|blocked)(,(succeeded|failed|cancelled|indeterminate|in_progress|blocked))*$",
               "type": "string"
             }
           },
@@ -88345,6 +88984,22 @@
                 "videos",
                 "batches",
                 "jobs"
+              ]
+            }
+          },
+          {
+            "description": "Requests with guardrail decisions (#840): any, refused (a guardrail refused the request), or one action.",
+            "in": "query",
+            "name": "guardrail",
+            "required": false,
+            "schema": {
+              "enum": [
+                "any",
+                "refused",
+                "monitored",
+                "blocked",
+                "detector_failed",
+                "skipped"
               ]
             }
           }
@@ -90450,12 +91105,12 @@
             }
           },
           {
-            "description": "Comma-separated attempt statuses (succeeded, failed, cancelled, indeterminate, in_progress); no empty items.",
+            "description": "Comma-separated statuses (succeeded, failed, cancelled, indeterminate, in_progress, blocked: a guardrail refused the request before any attempt); no empty items.",
             "in": "query",
             "name": "status",
             "required": false,
             "schema": {
-              "pattern": "^(succeeded|failed|cancelled|indeterminate|in_progress)(,(succeeded|failed|cancelled|indeterminate|in_progress))*$",
+              "pattern": "^(succeeded|failed|cancelled|indeterminate|in_progress|blocked)(,(succeeded|failed|cancelled|indeterminate|in_progress|blocked))*$",
               "type": "string"
             }
           },
@@ -90518,6 +91173,22 @@
                 "videos",
                 "batches",
                 "jobs"
+              ]
+            }
+          },
+          {
+            "description": "Requests with guardrail decisions (#840): any, refused (a guardrail refused the request), or one action.",
+            "in": "query",
+            "name": "guardrail",
+            "required": false,
+            "schema": {
+              "enum": [
+                "any",
+                "refused",
+                "monitored",
+                "blocked",
+                "detector_failed",
+                "skipped"
               ]
             }
           },
@@ -90674,12 +91345,12 @@
             }
           },
           {
-            "description": "Comma-separated attempt statuses (succeeded, failed, cancelled, indeterminate, in_progress); no empty items.",
+            "description": "Comma-separated statuses (succeeded, failed, cancelled, indeterminate, in_progress, blocked: a guardrail refused the request before any attempt); no empty items.",
             "in": "query",
             "name": "status",
             "required": false,
             "schema": {
-              "pattern": "^(succeeded|failed|cancelled|indeterminate|in_progress)(,(succeeded|failed|cancelled|indeterminate|in_progress))*$",
+              "pattern": "^(succeeded|failed|cancelled|indeterminate|in_progress|blocked)(,(succeeded|failed|cancelled|indeterminate|in_progress|blocked))*$",
               "type": "string"
             }
           },
@@ -90742,6 +91413,22 @@
                 "videos",
                 "batches",
                 "jobs"
+              ]
+            }
+          },
+          {
+            "description": "Requests with guardrail decisions (#840): any, refused (a guardrail refused the request), or one action.",
+            "in": "query",
+            "name": "guardrail",
+            "required": false,
+            "schema": {
+              "enum": [
+                "any",
+                "refused",
+                "monitored",
+                "blocked",
+                "detector_failed",
+                "skipped"
               ]
             }
           }

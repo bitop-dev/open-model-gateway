@@ -317,6 +317,8 @@ pub fn sniff_base64_prefix(s: &str) -> Option<ImageMediaType> {
 impl Workload for ImageRequest {
     type Response = ImageResponse;
     const PROTOCOL: ApiProtocol = ApiProtocol::Images;
+    const GUARDRAIL: crate::guardrails::policy::Workload =
+        crate::guardrails::policy::Workload::Images;
     fn model(&self) -> &str {
         &self.model
     }

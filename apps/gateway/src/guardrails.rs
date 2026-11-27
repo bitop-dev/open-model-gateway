@@ -1,11 +1,18 @@
 //! Guardrails (docs/guardrails-design.md): rules that inspect request text
 //! before it reaches a provider.
 //!
-//! This release (#840, phase 1, first part) adds the policy model only: rule
-//! storage in three layers, tighten-only composition and the management API.
-//! **Nothing inspects request text yet**: no request is monitored or blocked
-//! until the detector and the engine step land.
+//! Phase 1 (#840): rule storage in three layers, tighten-only composition and
+//! the management API; the pattern detector (built-in secret shapes and
+//! custom patterns); and input enforcement in the engine for generation and
+//! embeddings, with monitor and block, recorded in `guardrail_events`. Output
+//! is not inspected yet.
+pub mod detector;
+pub mod enforce;
+pub mod limits;
 pub mod patterns;
 pub mod policy;
+pub mod secrets;
+pub mod shared;
+pub mod stored;
 pub mod view;
 pub mod write;

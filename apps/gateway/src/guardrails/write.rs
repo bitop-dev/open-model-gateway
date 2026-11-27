@@ -293,7 +293,7 @@ fn parse_tightening(e: &EntryIn) -> Result<Tightening, Refusal> {
 }
 
 /// The refusal of a rule this release cannot run (after the egress check).
-fn availability(r: &Rule) -> Result<(), Refusal> {
+pub(crate) fn availability(r: &Rule) -> Result<(), Refusal> {
     needs(available::DETECTORS, &r.detector.kind)?;
     needs(available::PROTECTIONS, &r.protection)?;
     for c in &r.detector.categories {

@@ -773,7 +773,12 @@ fn real_body_limit_keeps_a_sorted_prefix_of_histogram_points() {
     assert!(first.body.len() <= MAX_BODY);
     assert!(first.dropped.get(DropReason::BodyLimit) > 0);
     assert_eq!(first.dropped.get(DropReason::InvalidValue), 0);
-    assert_eq!(first.points as u64 + first.dropped.total(), 1800);
+    // 300 label values per histogram family.
+    let histograms = CLASSES.iter().filter(|c| c.kind == Kind::Histogram).count() as u64;
+    assert_eq!(
+        first.points as u64 + first.dropped.total(),
+        300 * histograms
+    );
 }
 
 // Like holds_tests::queue_cursor_replica_worker, re-exec exactly one helper:

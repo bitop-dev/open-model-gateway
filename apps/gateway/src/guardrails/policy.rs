@@ -252,12 +252,17 @@ pub enum InactiveReason {
     EgressNotAllowed,
     /// A tightening entry whose platform rule no longer exists.
     TightenedRuleMissing,
+    /// A stored rule this release cannot run (written by a later release):
+    /// it is never shown active and never skipped silently; it fails like a
+    /// detector, under its own `on_error`.
+    NotRunnable,
 }
 impl InactiveReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::EgressNotAllowed => "egress_not_allowed",
             Self::TightenedRuleMissing => "tightened_rule_missing",
+            Self::NotRunnable => "not_runnable",
         }
     }
 }
@@ -316,8 +321,13 @@ pub fn compose(platform: Option<&RuleSet>, local: Option<&RuleSet>) -> Vec<Effec
     }
     let mut push = |set: &RuleSet, id: Uuid, rule: &Rule, by: Vec<(Uuid, &Tightening)>| {
         let rule = by.iter().fold(rule.clone(), |r, (_, t)| tighten(&r, t));
-        let inactive = (egress_closed && rule.detector.kind.egress() != Egress::Local)
-            .then_some(InactiveReason::EgressNotAllowed);
+        let inactive = if egress_closed && rule.detector.kind.egress() != Egress::Local {
+            Some(InactiveReason::EgressNotAllowed)
+        } else if super::write::availability(&rule).is_err() {
+            Some(InactiveReason::NotRunnable)
+        } else {
+            None
+        };
         out.push(EffectiveRule {
             id,
             rule_set_id: set.id,

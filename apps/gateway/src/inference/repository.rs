@@ -138,6 +138,18 @@ pub struct ExecutionFinish {
 
 #[async_trait]
 pub trait InferenceRepository: Send + Sync {
+    /// The workspace's compiled guardrail policy (an empty one when no rule
+    /// applies). Required, with no default: a repository that omitted it
+    /// would run requests without their guardrails.
+    async fn guardrails(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<std::sync::Arc<crate::guardrails::enforce::Policy>, InferenceError>;
+    /// Append one request's guardrail decisions. Required, like `guardrails`.
+    async fn record_guardrails(
+        &self,
+        record: &super::guardrails::GuardrailRecord<'_>,
+    ) -> Result<(), InferenceError>;
     async fn deployments(
         &self,
         principal: &Principal,
@@ -371,6 +383,18 @@ pub trait InferenceRepository: Send + Sync {
 
 #[async_trait]
 impl InferenceRepository for Store {
+    async fn guardrails(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<std::sync::Arc<crate::guardrails::enforce::Policy>, InferenceError> {
+        self.guardrail_policy(workspace_id).await
+    }
+    async fn record_guardrails(
+        &self,
+        record: &super::guardrails::GuardrailRecord<'_>,
+    ) -> Result<(), InferenceError> {
+        self.record_guardrail_events(record).await
+    }
     async fn deployments(
         &self,
         principal: &Principal,

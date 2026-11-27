@@ -252,6 +252,9 @@
           "error": {
             "additionalProperties": false,
             "properties": {
+              "guardrail": {
+                "$ref": "#/components/schemas/GuardrailRefusal"
+              },
               "message": {
                 "type": "string"
               },
@@ -3513,6 +3516,48 @@
         ],
         "type": "object"
       },
+      "GuardrailRefusal": {
+        "additionalProperties": false,
+        "description": "The guardrail rule a request was refused by (#840): the rule set (policy) and rule ids, the stage, the category family and the detector; never matched text. Present exactly on guardrail refusals (on the Anthropic shape, the only way to tell them apart).",
+        "properties": {
+          "category": {
+            "enum": [
+              "secret",
+              "personal_data",
+              "moderation",
+              "prompt_injection",
+              "custom"
+            ]
+          },
+          "detector": {
+            "enum": [
+              "pattern",
+              "systemone",
+              "llm_judge",
+              "external"
+            ]
+          },
+          "policy_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "rule_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "stage": {
+            "const": "input"
+          }
+        },
+        "required": [
+          "policy_id",
+          "rule_id",
+          "stage",
+          "category",
+          "detector"
+        ],
+        "type": "object"
+      },
       "ImageUsage": {
         "additionalProperties": false,
         "description": "Observed counters only; total_tokens only when both are known.",
@@ -3622,6 +3667,11 @@
           "authentication_error",
           "budget_exceeded",
           "context_length_exceeded",
+          "guardrail_detector_failed",
+          "guardrail_input_blocked",
+          "guardrail_not_supported",
+          "guardrail_rate_limited",
+          "guardrail_unavailable",
           "image_input_busy",
           "invalid_request_error",
           "invalid_upstream_response",
@@ -3647,13 +3697,16 @@
       },
       "OpenAiErrorEnvelope": {
         "additionalProperties": false,
-        "description": "OpenAI-shaped inference error. Never the management ErrorEnvelope: error.code is a gateway machine code, not the HTTP status, and there is no error.reason.",
+        "description": "OpenAI-shaped inference error. Never the management ErrorEnvelope: error.code is a gateway machine code, not the HTTP status, and there is no error.reason. A guardrail refusal (guardrail_* codes) adds error.guardrail.",
         "properties": {
           "error": {
             "additionalProperties": false,
             "properties": {
               "code": {
                 "$ref": "#/components/schemas/OpenAiErrorCode"
+              },
+              "guardrail": {
+                "$ref": "#/components/schemas/GuardrailRefusal"
               },
               "message": {
                 "type": "string"

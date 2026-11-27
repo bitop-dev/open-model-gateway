@@ -60,6 +60,9 @@ pub enum Group {
     History,
     Audit,
     Storage,
+    /// Guardrail decisions (#840): their own group, because they start with
+    /// migration 0095 and have no partitions for the older months.
+    Guardrails,
 }
 impl Group {
     pub fn parse(s: &str) -> Option<Self> {
@@ -67,6 +70,7 @@ impl Group {
             "history" => Self::History,
             "audit" => Self::Audit,
             "storage" => Self::Storage,
+            "guardrails" => Self::Guardrails,
             _ => return None,
         })
     }
@@ -75,6 +79,7 @@ impl Group {
             Self::History => "history",
             Self::Audit => "audit",
             Self::Storage => "storage",
+            Self::Guardrails => "guardrails",
         }
     }
     /// Parents in detach order (referencing tables first).
@@ -87,6 +92,7 @@ impl Group {
             ],
             Self::Audit => &["audit_events"],
             Self::Storage => &["storage_usage_hours"],
+            Self::Guardrails => &["guardrail_events"],
         }
     }
 }
@@ -424,6 +430,12 @@ async fn check_legal_holds(conn: &mut PgConnection, req: &Request) -> anyhow::Re
         )),
         // Storage usage hours hold no personal data.
         Group::Storage => None,
+        // A decision is held like the request it decided on.
+        Group::Guardrails => Some(format!(
+            "SELECT count(*) FROM public.guardrail_events_{} e WHERE {}",
+            req.month.suffix(),
+            crate::legal_holds::execution_held("e")
+        )),
     };
     let any_hold: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM legal_holds WHERE released_at IS NULL)")
