@@ -110,7 +110,7 @@ describe("Workspace › Settings › Guardrails", () => {
     const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
     await user.click(await screen.findByRole("button", { name: "Tighten Secrets" }));
     // The rule already refuses when it can't check: only the action is offered.
-    expect(screen.queryByLabelText("Refuse the request if the check can't run")).toBeNull();
+    expect(screen.queryByRole("switch", { name: "Refuse the request if the check can't run" })).toBeNull();
     await user.click(screen.getByRole("button", { name: "Tighten" }));
     await waitFor(() => expect(writes(fetch)).toHaveLength(1));
     expect(writes(fetch)[0]![2].rules).toEqual([toInput(codes), { id: "t-1", tightens: "r-secrets", input: { action: "block" }, on_error: "fail_closed" }]);
@@ -119,12 +119,43 @@ describe("Workspace › Settings › Guardrails", () => {
     const fetch = serve({ [guardrailsPath(team.id)]: () => view() });
     const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
     await user.click(await screen.findByRole("button", { name: "Edit Code names" }));
-    expect((screen.getByLabelText("If the check can't run") as HTMLSelectElement).value).toBe("fail_closed");
+    // Block's own default: shown as the default, so a change of action takes the new action's.
+    expect((screen.getByLabelText("If the check can't run") as HTMLSelectElement).value).toBe("");
     await user.clear(screen.getByLabelText("Name"));
     await user.type(screen.getByLabelText("Name"), "Project codes");
     await user.click(screen.getByRole("button", { name: "Save rule" }));
     await waitFor(() => expect(writes(fetch)).toHaveLength(1));
-    expect(writes(fetch)[0]![2].rules).toEqual([{ ...toInput(codes), name: "Project codes" }]);
+    const { on_error: _default, ...stored } = toInput(codes);
+    expect(writes(fetch)[0]![2].rules).toEqual([{ ...stored, name: "Project codes" }]);
+  });
+  it("shows a chosen on_error that is not its action's default", async () => {
+    const strict: StoredRule = { ...secrets, on_error: "fail_closed" };
+    serve({ [guardrailsPath(team.id)]: () => view({ local: { ...localSet, rules: [strict] }, effective: [effective(strict, "workspace_local", "set-l")] }) });
+    const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
+    await user.click(await screen.findByRole("button", { name: "Edit Secrets" }));
+    expect((screen.getByLabelText("If the check can't run") as HTMLSelectElement).value).toBe("fail_closed");
+  });
+  it("leaves out a tightening whose platform rule is gone when the layer is saved", async () => {
+    const old = { id: "t-old", tightens: "r-gone", input: { action: "block" as const } };
+    const dangling: EffectiveEntry = { id: "t-old", tightens: "r-gone", rule_set_id: "set-l", revision: 2, source: "workspace_local", active: false, inactive_reason: "tightened_rule_missing", tightened_by: [] };
+    const fetch = serve({ [guardrailsPath(team.id)]: () => view({ local: { ...localSet, rules: [codes, old] }, effective: [effective(secrets, "type_default", "set-p"), effective(codes, "workspace_local", "set-l"), dangling] }) });
+    const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
+    expect(await screen.findByText("Tightens a removed platform rule")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Remove Code names" }));
+    await user.click(screen.getByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(writes(fetch)).toEqual([["PUT", guardrailsPath(team.id), { rules: [] }]]));
+  });
+  it("offers refusing on a failed check with Block only, and never sends less than is in effect", async () => {
+    const fetch = serve({ [guardrailsPath(team.id)]: () => view() });
+    const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
+    await user.click(await screen.findByRole("button", { name: "Tighten Secrets" }));
+    expect(screen.getByRole("switch", { name: "Refuse the request if the check can't run" })).toBeTruthy();
+    await user.selectOptions(screen.getByLabelText("On input"), "monitor");
+    expect(screen.queryByRole("switch", { name: "Refuse the request if the check can't run" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Tighten" }));
+    // Keeping Monitor without refusing tightens nothing.
+    expect(await screen.findByText("Choose a stricter action, or refuse the request when the check can't run.")).toBeTruthy();
+    expect(writes(fetch)).toHaveLength(0);
   });
   it("adds a custom-pattern rule to the workspace's layer", async () => {
     const fetch = serve({ [guardrailsPath(team.id)]: () => view() });

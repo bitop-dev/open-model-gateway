@@ -286,7 +286,6 @@ impl LineRun {
                     // attempt is retried after its backoff like a failed one.
                     let cooling = matches!(e, InferenceError::RouteCoolingDown(_)) && pin.is_some();
                     let retryable = cooling || retryable(e);
-                    let reached = reached_provider(e, pin.is_some());
                     if retryable
                         && attempt <= self.job.retry_limit
                         && !self.state.should_stop(&self.job)
@@ -297,7 +296,7 @@ impl LineRun {
                         {
                             Retry::Started(next) => {
                                 attempt += 1;
-                                if reached {
+                                if self.admitted(execution).await {
                                     workers.ran = Some((execution, e));
                                 }
                                 execution = next;
@@ -326,6 +325,21 @@ impl LineRun {
         }
     }
 
+    /// Whether an attempt was admitted: it has its execution (its reservation,
+    /// and its row in Logs), so it may have reached a provider. An attempt
+    /// stopped before admission (a guardrail refusal, no route or capacity, a
+    /// deadline before admission) has none, and neither has one whose row
+    /// can't be read now: such a line is reported as not run.
+    async fn admitted(&self, execution: Uuid) -> bool {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM inference_executions WHERE id=$1)",
+        )
+        .bind(execution)
+        .fetch_one(&self.store.pool)
+        .await
+        .unwrap_or(false)
+    }
+
     /// The probe slot dispatch claimed for this line, freed if the line ends
     /// before its attempt reaches the engine (an unparseable line, or the task
     /// aborted); from the attempt on, the engine and `unpin` end it.
@@ -348,10 +362,10 @@ impl LineRun {
 
     /// A line its batch stopped while its current attempt (`execution`,
     /// number `attempt`) waited to be inspected again, never as a guardrail
-    /// refusal: one no attempt of which reached a provider is reported like
-    /// the lines the stop left unrun; one whose earlier attempt reached a
-    /// provider is reported with that attempt's execution and error, as a
-    /// retry the stop kept from starting is (`count_retry_failure`).
+    /// refusal: one no attempt of which was admitted is reported like the
+    /// lines the stop left unrun; one with an earlier admitted attempt is
+    /// reported with that attempt's execution and error, as a retry the stop
+    /// kept from starting is (`count_retry_failure`).
     async fn not_run(
         &self,
         n: i32,
@@ -709,18 +723,6 @@ const GUARDRAIL_RETRY_CAP: u32 = if cfg!(test) { 1 } else { 8 };
 /// Failures a line retries with its ordinary retries (`omg_retries`). A line
 /// nothing could be scanned for, after its free tries, spends them like a
 /// busy scope.
-/// Whether a failed attempt was sent to a provider. A Busy is upstream rate
-/// limiting only for a claimed attempt (`pinned`); a guardrail refusal, a
-/// cooling route and a busy admission scope stop the attempt before anything
-/// is sent.
-fn reached_provider(e: InferenceError, pinned: bool) -> bool {
-    match e {
-        InferenceError::UpstreamUnavailable | InferenceError::Timeout => true,
-        InferenceError::Busy => pinned,
-        _ => false,
-    }
-}
-
 fn retryable(e: InferenceError) -> bool {
     rescan_cause(e) == Some(Rescan::Busy)
         || matches!(
@@ -759,11 +761,11 @@ fn rescan_cause(e: InferenceError) -> Option<Rescan> {
 /// How a line its batch stopped while it waited to be inspected again ends.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Stopped {
-    /// No attempt of it reached a provider: reported like the lines the
-    /// stop left unrun.
+    /// No attempt of it was admitted (`LineRun::admitted`): reported like
+    /// the lines the stop left unrun.
     NeverRan(NotRun),
-    /// An earlier attempt (this execution) reached a provider and failed with
-    /// this error: the line is reported with it.
+    /// An earlier attempt (this execution) was admitted and failed with this
+    /// error: the line is reported with it.
     AfterAttempt(Uuid, InferenceError),
 }
 
@@ -773,8 +775,8 @@ pub(super) enum Stopped {
 pub(super) struct Workers {
     /// Set when the line's batch stopped while it waited.
     stopped: Option<Stopped>,
-    /// The line's latest attempt that reached a provider, and how it failed
-    /// (a later attempt is the current one).
+    /// The line's latest admitted attempt, and how it failed (a later
+    /// attempt is the current one).
     ran: Option<(Uuid, InferenceError)>,
     busy: u32,
     spent: u32,

@@ -51,12 +51,16 @@ export function EffectiveRules({ entries, caption, tighten }: { entries: Effecti
 /** A platform rule in effect that a local entry can still make stricter: a stricter action, or refusing when its check can't run. */
 const canTighten = (e: EffectiveEntry) => e.source !== "workspace_local" && e.active && (e.input?.action !== "block" || e.on_error !== "fail_closed");
 
+/** The server's `on_error` for a rule that names none. */
+const defaultOnError = (action: InputAction) => action === "block" ? "fail_closed" : "fail_open";
+
 const ruleFields = (rule?: StoredRule, actions: InputAction[] = ["monitor", "block"]): Field[] => [
   { name: "name", label: "Name", required: true, maxLength: 100, value: rule?.name ?? "" },
   { name: "protection", label: "Looks for", type: "select", required: true, value: rule?.protection ?? "secrets", options: [{ value: "secrets", label: "Secrets (keys, tokens, private keys, connection strings)" }, { value: "custom", label: "Custom patterns" }] },
   { name: "patterns", label: "Patterns", type: "textarea", value: rule?.detector.patterns?.join("\n") ?? "", visibleWhen: v => v.protection === "custom", requiredWhen: v => v.protection === "custom", help: "Regular expressions, one per line: at most 50 per layer, 512 bytes each. Use ASCII classes like [0-9].", validate: (v, all) => all.protection !== "custom" ? undefined : v.split("\n").filter(p => p.trim()).length > 50 ? "Use at most 50 patterns." : undefined },
   { name: "action", label: "On input", type: "select", required: true, value: rule?.input.action ?? "monitor", options: actions.map(a => ({ value: a, label: `${actionLabels[a]}: ${actionHelp[a]}` })) },
-  { name: "on_error", label: "If the check can't run", type: "select", value: rule?.on_error ?? "", help: "When the gateway can't check a request (it's busy, or a pattern takes too long).", options: [...(rule ? [] : [{ value: "", label: "Default: refused for Block, goes on for Monitor" }]), { value: "fail_closed", label: "Refuse the request" }, { value: "fail_open", label: "Let the request go on and record it" }] },
+  // A stored value that is its action's default shows as the default, so changing the action changes it too.
+  { name: "on_error", label: "If the check can't run", type: "select", value: rule?.on_error && rule.on_error !== defaultOnError(rule.input.action) ? rule.on_error : "", help: "When the gateway can't check a request (it's busy, or a pattern takes too long).", options: [{ value: "", label: "Default: refused for Block, goes on for Monitor" }, { value: "fail_closed", label: "Refuse the request" }, { value: "fail_open", label: "Let the request go on and record it" }] },
   { name: "workloads", label: "Requests", type: "checkboxes", required: true, value: JSON.stringify(rule?.workloads ?? ["generation", "embeddings"]), options: [{ value: "generation", label: "Generation (chat, responses, messages)" }, { value: "embeddings", label: "Embeddings" }] },
 ];
 
@@ -64,9 +68,10 @@ const ruleFields = (rule?: StoredRule, actions: InputAction[] = ["monitor", "blo
  * One layer's own entries. `save` receives the layer's full entry list.
  * Platform layers also carry `local_only` (kept text inside the gateway).
  */
-export function LayerEditor({ title, description, set, writable, save, localOnly, onLocalOnly, empty }: {
+export function LayerEditor({ title, description, set, writable, save, localOnly, onLocalOnly, empty, stale }: {
   title: string; description?: string; set: RuleSet | null; writable: boolean; save: (rules: Record<string, unknown>[], signal: AbortSignal) => Promise<unknown>;
   /** Platform layers: whether rules must keep text inside the gateway. */ localOnly?: boolean; onLocalOnly?: (value: boolean, signal: AbortSignal) => Promise<unknown>; empty?: string;
+  /** Local layers: tightenings whose platform rule is gone (the server refuses them on save, so `save` leaves them out). */ stale?: ReadonlySet<string>;
 }) {
   const ask = useAction(), entries = set?.rules ?? [], all = () => entries.map(toInput);
   const add = () => ask({ title: `Add a rule to ${title.toLowerCase()}`, fields: ruleFields(), submitLabel: "Add rule", successNotice: "Rule added.", run: (v, signal) => guardrailWrite(() => save([...all(), ruleInput(v)], signal)) });
@@ -77,7 +82,7 @@ export function LayerEditor({ title, description, set, writable, save, localOnly
     actions={writable && <Inline gap={2}>{onLocalOnly && <Button size="sm" variant="ghost" onClick={local}>Text stays inside: {localOnly ? "On" : "Off"}</Button>}<Button size="sm" variant="secondary" onClick={add}>Add rule</Button></Inline>}>
     {entries.length === 0 ? <EmptyState size="compact" icon={<ShieldCheck />} title={empty ?? "No rules."} description={writable ? "Add a rule to check requests." : undefined} /> :
       <Table caption={title} stack columns={["Rule", "On input", ...(writable ? [""] : [])]}>{entries.map(e => isTightening(e)
-        ? <Tr key={e.id}><Td><span className={s.primary}>Tightens a platform rule</span><span className={s.secondary}>{e.input?.action ? `On input: ${actionLabels[e.input.action]}` : "Fails closed"}</span></Td><Td><ActionBadge action={e.input?.action} /></Td>{writable && <Td><Button size="sm" variant="ghost" aria-label="Remove tightening" onClick={() => remove(e)}>Remove</Button></Td>}</Tr>
+        ? <Tr key={e.id}><Td><span className={s.primary}>{stale?.has(e.id) ? "Tightens a removed platform rule" : "Tightens a platform rule"}</span><span className={s.secondary}>{stale?.has(e.id) ? "No longer applies; the next save of this layer removes it." : e.input?.action ? `On input: ${actionLabels[e.input.action]}` : "Refuses the request if the check can't run"}</span></Td><Td><ActionBadge action={e.input?.action} /></Td>{writable && <Td><Button size="sm" variant="ghost" aria-label="Remove tightening" onClick={() => remove(e)}>Remove</Button></Td>}</Tr>
         : <Tr key={e.id}><Td><span className={s.primary}>{e.name}</span><span className={s.secondary}>{protectionLabels[e.protection]} · {inspectionSentence(e)}</span></Td><Td><ActionBadge action={e.input.action} /></Td>{writable && <Td><Inline gap={1}><Button size="sm" variant="ghost" aria-label={`Edit ${e.name}`} onClick={() => edit(e)}>Edit</Button><Button size="sm" variant="ghost" aria-label={`Remove ${e.name}`} onClick={() => remove(e)}>Remove</Button></Inline></Td>}</Tr>)}
       </Table>}
   </Card>;
@@ -95,16 +100,21 @@ export function tightenRule(ask: ReturnType<typeof useAction>, rule: EffectiveEn
   const others = (local?.rules ?? []).filter(e => !(isTightening(e) && e.tightens === rule.id));
   const existing = (local?.rules ?? []).find((e): e is Tightening => isTightening(e) && e.tightens === rule.id);
   const failOpen = rule.on_error !== "fail_closed";
+  // Refusing when the check can't run is offered with Block: a Monitor rule lets requests go on.
+  const refusing = (v: Record<string, string | undefined>) => failOpen && v.action === "block" && v.fail_closed === "true";
   ask({ title: `Tighten ${rule.name}`, description: "This workspace can make a platform rule stricter, never weaker.", fields: [
-    { name: "action", label: "On input", type: "select", required: true, value: options[options.length - 1] ?? "block", options: options.map(a => ({ value: a, label: `${a === current ? "Keep " : ""}${actionLabels[a]}: ${actionHelp[a]}` })), validate: (value, all) => value === current && all.fail_closed !== "true" ? "Choose a stricter action, or refuse the request when the check can't run." : undefined },
-    ...(failOpen ? [{ name: "fail_closed", label: "Refuse the request if the check can't run", type: "switch" as const, value: "true" }] : []),
+    { name: "action", label: "On input", type: "select", required: true, value: options[options.length - 1] ?? "block", options: options.map(a => ({ value: a, label: `${a === current ? "Keep " : ""}${actionLabels[a]}: ${actionHelp[a]}` })), validate: (value, all) => value === current && !refusing(all) ? "Choose a stricter action, or refuse the request when the check can't run." : undefined },
+    ...(failOpen ? [{ name: "fail_closed", label: "Refuse the request if the check can't run", type: "switch" as const, value: "true", visibleWhen: (v: Record<string, string | undefined>) => v.action === "block" }] : []),
   ],
     submitLabel: "Tighten", successNotice: "Rule tightened.",
     run: (v, signal) => {
-      // An unchanged action keeps the existing entry's (which may be what makes it `current`).
-      const { on_error: storedError, ...kept } = existing ? toInput(existing) : {};
-      const onError = failOpen ? (v.fail_closed === "true" ? "fail_closed" : undefined) : storedError;
-      const entry = { ...kept, tightens: rule.id, ...(v.action !== current ? { input: { action: v.action } } : {}), ...(onError ? { on_error: onError } : {}) };
+      // The entry states what is in effect after it, never less: the action
+      // chosen (at least `current`), and refusing when the check can't run if
+      // chosen now or already in effect through this entry. A stored setting
+      // below the platform's current one would be refused as loosening.
+      const { input: _input, on_error: storedError, ...kept } = existing ? toInput(existing) : {};
+      const onError = refusing(v) || (!failOpen && storedError === "fail_closed") ? "fail_closed" : undefined;
+      const entry = { ...kept, tightens: rule.id, input: { action: v.action }, ...(onError ? { on_error: onError } : {}) };
       return guardrailWrite(() => save([...others.map(toInput), entry], signal));
     } });
 }

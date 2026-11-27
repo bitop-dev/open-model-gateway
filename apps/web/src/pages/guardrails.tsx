@@ -14,7 +14,7 @@
 import { api, type Session, type Workspace } from "../lib/api";
 import {
   detectorsPath, guardrailsPath, inspectedSentence, isTightening, platformGuardrailsPath, toInput, typeDefaultPath, workloadLabels,
-  type Detectors, type PlatformWorkspaceGuardrails, type TypeDefault, type WorkspaceGuardrails, type WorkspaceKind,
+  type Detectors, type PlatformWorkspaceGuardrails, type RuleSet, type TypeDefault, type WorkspaceGuardrails, type WorkspaceKind,
 } from "../lib/guardrails";
 import { kindLabels } from "../lib/people";
 import { ResourcePage } from "../components/resource-page";
@@ -71,13 +71,18 @@ export function WorkspaceGuardrailsTab({ workspace }: { workspace: Workspace }) 
   const path = guardrailsPath(workspace.id), q = useApi<WorkspaceGuardrails>(path), ask = useAction();
   if (q.isPending) return <p role="status">Loading guardrails…</p>;
   if (q.isError) return <ErrorNotice error={q.error} retry={() => void q.refetch()} />;
-  const g = q.data, save = (rules: Record<string, unknown>[], signal: AbortSignal) => api(path, { method: "PUT", body: { rules }, signal });
+  const g = q.data;
+  // A tightening whose platform rule is gone (an override was created or
+  // removed) no longer applies, and the server refuses a layer that names it:
+  // every save leaves such entries out.
+  const stale = new Set(g.effective.filter(e => e.inactive_reason === "tightened_rule_missing").map(e => e.id));
+  const save = (rules: Record<string, unknown>[], signal: AbortSignal) => api(path, { method: "PUT", body: { rules: rules.filter(r => !stale.has(String(r.id))) }, signal });
   return <Stack gap={6}>
     <Alert tone="info" title="What is checked">{inspectedSentence(g.inspected_workloads)}{g.egress.local_only ? " Text never leaves the gateway to be checked." : ""}</Alert>
     <Card title="Rules in effect" titleAs="h2" description={g.platform.source === "workspace_override" ? "Set by a Platform Admin for this workspace, with this workspace's own rules." : `The ${kindLabels[g.kind].toLowerCase()} default, with this workspace's own rules.`} flush={g.effective.length > 0}>
       <EffectiveRules caption={`Guardrails in effect for ${workspace.name}`} entries={g.effective} tighten={g.can_edit ? e => tightenRule(ask, e, g.local, save) : undefined} />
     </Card>
-    {(g.can_edit || (g.local?.rules.length ?? 0) > 0) && <LayerEditor title="This workspace's rules" description={g.can_edit ? "Add rules or make the platform's stricter. They can't turn a platform rule off." : "Set by this workspace's admins."} set={g.local} writable={g.can_edit} save={save} empty="No rules of this workspace's own." />}
+    {(g.can_edit || (g.local?.rules.length ?? 0) > 0) && <LayerEditor title="This workspace's rules" description={g.can_edit ? "Add rules or make the platform's stricter. They can't turn a platform rule off." : "Set by this workspace's admins."} set={g.local} writable={g.can_edit} save={save} stale={stale} empty="No rules of this workspace's own." />}
   </Stack>;
 }
 
@@ -89,10 +94,14 @@ export function WorkspaceGuardrailsAdmin({ id, writable }: { id: string; writabl
   const g = q.data, override = g.override, localOnly = !!override?.local_only;
   // A tightening names the platform rule it tightens: the override's rules are
   // new rules, so tightenings of the rules it replaces stop applying.
-  const tightenings = g.local_visible ? (g.local?.rules ?? []).filter(isTightening).length : null;
-  const dropped = (rules: string) => tightenings === 0 ? "" : ` ${tightenings === null ? `Any tightening this workspace made of the ${rules} stops applying` : `This workspace's ${tightenings === 1 ? "tightening" : `${tightenings} tightenings`} of the ${rules} stop${tightenings === 1 ? "s" : ""} applying`}; it can tighten the rules that replace them.`;
-  const create = () => ask({ title: "Override the default for this workspace?", description: `Starts from a copy of the ${kindLabels[g.kind].toLowerCase()} default's rules. While it exists, the default no longer applies here.${dropped("default's rules")}`, submitLabel: "Create override", successNotice: "Override created.", run: (_, signal) => guardrailWrite(() => putPlatformLayer(path, !!g.type_default?.local_only, (g.type_default?.rules ?? []).map(r => { const { id: _id, ...rest } = toInput(r); return rest; }), signal)) });
-  const reset = () => ask({ title: "Reset to the default?", description: `Removes this workspace's override; the ${kindLabels[g.kind].toLowerCase()} default applies again.${dropped("override's rules")}`, danger: true, submitLabel: "Reset", successNotice: "Default restored.", run: (_, signal) => api(path, { method: "DELETE", signal }) });
+  const dropped = (replaced: RuleSet | null, rules: string) => {
+    const ids = new Set((replaced?.rules ?? []).map(r => r.id));
+    const n = g.local_visible ? (g.local?.rules ?? []).filter(e => isTightening(e) && ids.has(e.tightens)).length : null;
+    if (n === 0 || ids.size === 0) return "";
+    return ` ${n === null ? `Any tightening this workspace made of the ${rules} stops applying` : `This workspace's ${n === 1 ? "tightening" : `${n} tightenings`} of the ${rules} stop${n === 1 ? "s" : ""} applying`}; it can tighten the rules that replace them.`;
+  };
+  const create = () => ask({ title: "Override the default for this workspace?", description: `Starts from a copy of the ${kindLabels[g.kind].toLowerCase()} default's rules. While it exists, the default no longer applies here.${dropped(g.type_default, "default's rules")}`, submitLabel: "Create override", successNotice: "Override created.", run: (_, signal) => guardrailWrite(() => putPlatformLayer(path, !!g.type_default?.local_only, (g.type_default?.rules ?? []).map(r => { const { id: _id, ...rest } = toInput(r); return rest; }), signal)) });
+  const reset = () => ask({ title: "Reset to the default?", description: `Removes this workspace's override; the ${kindLabels[g.kind].toLowerCase()} default applies again.${dropped(override, "override's rules")}`, danger: true, submitLabel: "Reset", successNotice: "Default restored.", run: (_, signal) => api(path, { method: "DELETE", signal }) });
   return <Stack gap={6}>
     <Alert tone="info" title="What is checked">{inspectedSentence(g.inspected_workloads)}</Alert>
     {override
