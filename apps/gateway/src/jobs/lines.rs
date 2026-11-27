@@ -130,7 +130,9 @@ impl LineError {
                 "The model has no price with ceilings, so the batch cannot be reserved for."
             }
             Self::OutputLimit => "The output maximum exceeds the model's output ceiling.",
-            Self::LineTooLarge => "The line exceeds 4 MiB.",
+            Self::LineTooLarge => {
+                "The line exceeds 4 MiB, or would parse into more than 16 MiB of structure."
+            }
             Self::TooManyLines => "A batch may contain at most 50,000 requests.",
             Self::EmptyFile => "The file contains no requests.",
         }
@@ -179,8 +181,21 @@ pub(crate) struct InputLine {
     pub plan: Option<LinePlan>,
 }
 
+/// A line may be parsed only when its structure estimate is within the
+/// budget every JSON request body has (`inference::json_weight`), at
+/// planning and again when it runs.
+fn within_budget(raw: &[u8]) -> Result<(), LineError> {
+    if crate::inference::json_weight::within_budget(raw) {
+        Ok(())
+    } else {
+        crate::metrics::METRICS.json_structure_refused("batch_line");
+        Err(LineError::LineTooLarge)
+    }
+}
+
 /// Read an internal work line; old private copies without a plan still work.
 pub(crate) fn parse_work_line(raw: &[u8], endpoint: BatchEndpoint) -> Result<InputLine, LineError> {
+    within_budget(raw)?;
     let mut value: Value = serde_json::from_slice(raw).map_err(|_| LineError::InvalidJson)?;
     let plan = value
         .as_object_mut()
@@ -188,7 +203,7 @@ pub(crate) fn parse_work_line(raw: &[u8], endpoint: BatchEndpoint) -> Result<Inp
         .map(serde_json::from_value::<LinePlan>)
         .transpose()
         .map_err(|_| LineError::InvalidShape)?;
-    let mut line = parse_line(
+    let mut line = parse_measured_line(
         &serde_json::to_vec(&value).map_err(|_| LineError::InvalidJson)?,
         endpoint,
     )?;
@@ -199,6 +214,12 @@ pub(crate) fn parse_work_line(raw: &[u8], endpoint: BatchEndpoint) -> Result<Inp
 /// Parse and validate one input line against `endpoint`'s contract. Lines
 /// use the endpoint's optional/required maximum rules.
 pub(crate) fn parse_line(raw: &[u8], endpoint: BatchEndpoint) -> Result<InputLine, LineError> {
+    within_budget(raw)?;
+    parse_measured_line(raw, endpoint)
+}
+
+/// [`parse_line`] of a line already measured.
+fn parse_measured_line(raw: &[u8], endpoint: BatchEndpoint) -> Result<InputLine, LineError> {
     let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
     let Value::Object(mut top) =
         serde_json::from_slice::<Value>(raw).map_err(|_| LineError::InvalidJson)?
@@ -597,5 +618,31 @@ mod tests {
         let mut big = Lines::default();
         assert!(big.push(&vec![b'x'; BATCH_MAX_LINE_BYTES + 1]).is_err());
         assert!(is_blank(b"  \r"));
+    }
+
+    /// A line within 4 MiB whose body would parse into more structure than
+    /// any request body may is refused before it is parsed, at planning
+    /// (`parse_line`) and when its work line runs (`parse_work_line`); a
+    /// line of the same size made of text is not.
+    #[test]
+    fn a_line_that_parses_too_large_is_refused_before_it_is_parsed() {
+        let mut hostile = chat();
+        hostile["body"]["tool_choice"] = json!(vec![json!({"a": 0}); 200_000]);
+        let hostile = line(hostile);
+        assert!(hostile.len() < BATCH_MAX_LINE_BYTES);
+        let before = crate::metrics::METRICS.json_structure_refusal_count("batch_line");
+        for parse in [parse_line, parse_work_line] {
+            assert_eq!(
+                parse(&hostile, BatchEndpoint::ChatCompletions).err(),
+                Some(LineError::LineTooLarge)
+            );
+        }
+        assert_eq!(
+            crate::metrics::METRICS.json_structure_refusal_count("batch_line"),
+            before + 2
+        );
+        let mut text = chat();
+        text["body"]["messages"][0]["content"] = json!("x".repeat(3 * 1024 * 1024));
+        assert!(parse_line(&line(text), BatchEndpoint::ChatCompletions).is_ok());
     }
 }

@@ -120,7 +120,7 @@
             }
           },
           "413": {
-            "description": "The body is too large (invalid_request_error, code payload_too_large), always as JSON: a declared Content-Length over GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT or over this replica's whole image input buffer (refused before any body byte is read), a body without a declared length that streams past 2 MiB, or a large body with more than 2 MiB outside its images' data URLs (text cannot ride an image past the text limit).",
+            "description": "The body is too large (invalid_request_error, code payload_too_large), always as JSON: a declared Content-Length over GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT or over this replica's whole image input buffer (refused before any body byte is read), a body without a declared length that streams past 2 MiB, or a large body with more than 2 MiB outside its images' data URLs (text cannot ride an image past the text limit); and any JSON body that would parse into more than 16 MiB of structure beyond its own bytes, measured before any parser runs and never echoed.",
             "headers": {
               "x-request-id": {
                 "$ref": "#/components/headers/RequestId"
@@ -424,7 +424,7 @@
             }
           },
           "413": {
-            "description": "The body is too large (invalid_request_error, code payload_too_large), always as JSON: a declared Content-Length over GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT or over this replica's whole image input buffer (refused before any body byte is read), a body without a declared length that streams past 2 MiB, or a large body with more than 2 MiB outside its images' data URLs (text cannot ride an image past the text limit).",
+            "description": "The body is too large (invalid_request_error, code payload_too_large), always as JSON: a declared Content-Length over GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT or over this replica's whole image input buffer (refused before any body byte is read), a body without a declared length that streams past 2 MiB, or a large body with more than 2 MiB outside its images' data URLs (text cannot ride an image past the text limit); and any JSON body that would parse into more than 16 MiB of structure beyond its own bytes, measured before any parser runs and never echoed.",
             "headers": {
               "x-request-id": {
                 "$ref": "#/components/headers/RequestId"
@@ -768,7 +768,7 @@
             }
           },
           "413": {
-            "description": "The body is too large (request_too_large), always as JSON: a declared Content-Length over GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT or over this replica's whole image input buffer (refused before any body byte is read), a body without a declared length that streams past 2 MiB, or a large body with more than 2 MiB outside its images' base64 (text, tool input or any other field cannot ride an image past the text limit).",
+            "description": "The body is too large (request_too_large), always as JSON: a declared Content-Length over GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT or over this replica's whole image input buffer (refused before any body byte is read), a body without a declared length that streams past 2 MiB, or a large body with more than 2 MiB outside its images' base64 (text, tool input or any other field cannot ride an image past the text limit); and any JSON body that would parse into more than 16 MiB of structure beyond its own bytes, measured before any parser runs and never echoed.",
             "headers": {
               "x-request-id": {
                 "$ref": "#/components/headers/RequestId"
@@ -1244,7 +1244,7 @@
             }
           },
           "413": {
-            "description": "The body is too large (request_too_large), always as JSON: a declared Content-Length over GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT or over this replica's whole image input buffer (refused before any body byte is read), a body without a declared length that streams past 2 MiB, or a large body with more than 2 MiB outside its images' base64 (text, tool input or any other field cannot ride an image past the text limit).",
+            "description": "The body is too large (request_too_large), always as JSON: a declared Content-Length over GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT or over this replica's whole image input buffer (refused before any body byte is read), a body without a declared length that streams past 2 MiB, or a large body with more than 2 MiB outside its images' base64 (text, tool input or any other field cannot ride an image past the text limit); and any JSON body that would parse into more than 16 MiB of structure beyond its own bytes, measured before any parser runs and never echoed.",
             "headers": {
               "x-request-id": {
                 "$ref": "#/components/headers/RequestId"

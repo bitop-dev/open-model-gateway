@@ -207,6 +207,22 @@ impl Metrics {
             .get()
     }
 
+    /// A JSON body or batch line refused before parsing for its structure
+    /// (`inference::json_weight`), by route family.
+    pub(crate) fn json_structure_refused(&self, route: &'static str) {
+        self.json_structure_refusals
+            .get_or_create(&[("route", route.to_owned())])
+            .inc();
+    }
+
+    /// Structure refusals so far for one route family (tests).
+    #[cfg(test)]
+    pub(crate) fn json_structure_refusal_count(&self, route: &str) -> u64 {
+        self.json_structure_refusals
+            .get_or_create(&[("route", route.to_owned())])
+            .get()
+    }
+
     pub(crate) fn egress_denied(&self, purpose: &'static str) {
         self.egress_denied
             .get_or_create(&[("purpose", purpose.to_owned())])

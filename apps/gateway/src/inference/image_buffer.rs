@@ -1,5 +1,5 @@
 //! The per-replica budget of in-flight large request bodies on the image
-//! input routes (#24: Chat Completions and Responses).
+//! input routes (#24: Chat Completions, Responses and Messages).
 //!
 //! A body up to [`TEXT_BODY_BYTES`] (the shared text limit) needs nothing
 //! from the budget; neither does a body without `Content-Length`, which is
@@ -11,11 +11,23 @@
 //! nothing is read; a body larger than the whole budget is refused outright.
 //! So at most `buffer_bytes` of large bodies are in flight per replica, each
 //! held in memory by at most [`COPY_FACTOR`] copies (docs/operations.md).
-use std::{sync::Arc, time::Duration};
+//!
+//! One key holds at most half the buffer at once ([`ImageBuffer::key_share`]),
+//! across all its large bodies on every image input route (a token count's
+//! and a generation's alike): a key that declares large bodies and sends
+//! them slowly cannot turn every other key's large image requests away. A
+//! key at its share is answered as for a spent buffer (503, `Retry-After`),
+//! while other keys are still admitted.
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, ensure};
 use prometheus_client::metrics::gauge::Gauge;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use uuid::Uuid;
 
 /// Bodies up to this size are the shared text limit, outside the budget.
 pub const TEXT_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -218,10 +230,21 @@ struct Share {
     _permit: OwnedSemaphorePermit,
     bytes: i64,
     in_use: Gauge,
+    /// The key's MiB held, which this share counts in until it is returned.
+    keys: Arc<Mutex<HashMap<Uuid, usize>>>,
+    key: Uuid,
+    mib: usize,
 }
 impl Drop for Share {
     fn drop(&mut self) {
         self.in_use.dec_by(self.bytes);
+        let mut keys = self.keys.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(held) = keys.get_mut(&self.key) {
+            *held = held.saturating_sub(self.mib);
+            if *held == 0 {
+                keys.remove(&self.key);
+            }
+        }
     }
 }
 impl Drop for BufferPermit {
@@ -243,6 +266,8 @@ pub enum Admission {
     TooLarge,
     /// The budget is spent for now.
     Busy,
+    /// This key holds its whole share of the budget for now.
+    KeyShare,
 }
 
 /// The budget of one replica (shared by its routes).
@@ -252,6 +277,8 @@ pub struct ImageBuffer {
     total_mib: usize,
     limits: ImageInputLimits,
     in_use: Gauge,
+    /// MiB each key holds now; a key without large bodies has no entry.
+    keys: Arc<Mutex<HashMap<Uuid, usize>>>,
 }
 
 impl ImageBuffer {
@@ -268,7 +295,15 @@ impl ImageBuffer {
             total_mib,
             limits,
             in_use,
+            keys: Arc::default(),
         }
+    }
+    /// The MiB one key may hold at once: half the buffer, and never less
+    /// than one body at the route cap, so every key can always send one.
+    pub fn key_share(&self) -> usize {
+        (self.total_mib / 2)
+            .max(self.limits.body_bytes.div_ceil(MIB))
+            .min(self.total_mib)
     }
     pub fn limits(&self) -> ImageInputLimits {
         self.limits
@@ -277,7 +312,8 @@ impl ImageBuffer {
     pub fn available_mib(&self) -> usize {
         self.permits.available_permits()
     }
-    pub fn admit(&self, content_length: Option<u64>) -> Admission {
+    /// What a body of `content_length` sent with `key` may do.
+    pub fn admit(&self, content_length: Option<u64>, key: Uuid) -> Admission {
         let Some(length) = content_length else {
             return Admission::Text;
         };
@@ -294,20 +330,35 @@ impl ImageBuffer {
         let Ok(count) = u32::try_from(mib) else {
             return Admission::TooLarge;
         };
+        // The key's share and the buffer are taken together, under the
+        // keys' lock, so concurrent bodies of one key cannot pass its share.
+        // A spent buffer is reported as such, whatever the key holds.
+        let mut keys = self.keys.lock().unwrap_or_else(|e| e.into_inner());
         match self.permits.clone().try_acquire_many_owned(count) {
-            Ok(permit) => Admission::Large(BufferPermit {
-                slot: Arc::new(std::sync::Mutex::new(Some({
-                    let bytes = i64::try_from(mib * MIB).unwrap_or(i64::MAX);
-                    self.in_use.inc_by(bytes);
-                    Share {
-                        _permit: permit,
-                        bytes,
-                        in_use: self.in_use.clone(),
-                    }
-                }))),
-                timer: std::sync::Mutex::new(None),
-                length,
-            }),
+            Ok(permit) => {
+                let held = keys.get(&key).copied().unwrap_or(0);
+                if held + mib > self.key_share() {
+                    return Admission::KeyShare;
+                }
+                *keys.entry(key).or_insert(0) += mib;
+                drop(keys);
+                Admission::Large(BufferPermit {
+                    slot: Arc::new(std::sync::Mutex::new(Some({
+                        let bytes = i64::try_from(mib * MIB).unwrap_or(i64::MAX);
+                        self.in_use.inc_by(bytes);
+                        Share {
+                            _permit: permit,
+                            bytes,
+                            in_use: self.in_use.clone(),
+                            keys: self.keys.clone(),
+                            key,
+                            mib,
+                        }
+                    }))),
+                    timer: std::sync::Mutex::new(None),
+                    length,
+                })
+            }
             Err(_) => Admission::Busy,
         }
     }
@@ -321,6 +372,8 @@ pub(crate) static ROUTER_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::con
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const KEY: Uuid = Uuid::nil();
 
     /// A buffer on its own gauges: the process-wide ones belong to the
     /// router tests, which assert them exactly.
@@ -337,7 +390,7 @@ mod tests {
     fn text_bodies_and_undeclared_lengths_take_nothing() {
         let b = buffer(4);
         for length in [None, Some(0), Some(TEXT_BODY_BYTES as u64)] {
-            assert!(matches!(b.admit(length), Admission::Text));
+            assert!(matches!(b.admit(length, KEY), Admission::Text));
         }
         assert_eq!(b.available_mib(), 4);
     }
@@ -345,26 +398,91 @@ mod tests {
     #[test]
     fn a_large_body_takes_its_length_in_whole_mib_until_dropped() {
         let b = buffer(6);
-        let Admission::Large(first) = b.admit(Some(TEXT_BODY_BYTES as u64 + 1)) else {
+        let Admission::Large(first) = b.admit(Some(TEXT_BODY_BYTES as u64 + 1), KEY) else {
             panic!("admitted")
         };
         assert_eq!(b.available_mib(), 3, "2 MiB + 1 byte rounds up to 3 MiB");
         assert_eq!(first.length, TEXT_BODY_BYTES + 1);
-        let Admission::Large(second) = b.admit(Some(3 * MIB as u64)) else {
+        let Admission::Large(second) = b.admit(Some(3 * MIB as u64), KEY) else {
             panic!("admitted")
         };
         assert_eq!(b.available_mib(), 0);
-        assert!(matches!(b.admit(Some(3 * MIB as u64)), Admission::Busy));
+        assert!(matches!(
+            b.admit(Some(3 * MIB as u64), KEY),
+            Admission::Busy
+        ));
         drop(first);
-        assert!(matches!(b.admit(Some(3 * MIB as u64)), Admission::Large(_)));
+        assert!(matches!(
+            b.admit(Some(3 * MIB as u64), KEY),
+            Admission::Large(_)
+        ));
         drop(second);
         assert_eq!(b.available_mib(), 6);
+    }
+
+    /// One key holds at most half the buffer (here 10 of 20 MiB, the route
+    /// cap being 2 MiB): beyond it that key waits while another key is
+    /// admitted, and its share comes back with each body's permit, whether
+    /// the body was dropped or its hold limit passed.
+    #[tokio::test(start_paused = true)]
+    async fn one_key_holds_at_most_half_the_buffer() {
+        let limits = ImageInputLimits {
+            body_bytes: 2 * MIB + 1,
+            buffer_bytes: 20 * MIB,
+            ..ImageInputLimits::default()
+        };
+        let b = ImageBuffer::with_gauges(limits, Gauge::default(), &Gauge::default());
+        assert_eq!(b.key_share(), 10);
+        let (one, other) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let large = Some(TEXT_BODY_BYTES as u64 + 1);
+        let held: Vec<_> = (0..3)
+            .map(|_| match b.admit(large, one) {
+                Admission::Large(permit) => permit,
+                _ => panic!("within its share"),
+            })
+            .collect();
+        assert!(matches!(b.admit(large, one), Admission::KeyShare));
+        assert_eq!(b.available_mib(), 11, "a refusal takes nothing");
+        let Admission::Large(others) = b.admit(large, other) else {
+            panic!("another key is admitted")
+        };
+        let mut held = held.into_iter();
+        drop(held.next());
+        assert!(
+            matches!(b.admit(large, one), Admission::Large(_)),
+            "a dropped body returns its share"
+        );
+        let timed = held.next().unwrap();
+        timed.release_after(Duration::from_secs(5));
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let Admission::Large(again) = b.admit(large, one) else {
+            panic!("a body past its hold limit returns its share")
+        };
+        drop((timed, again, others, held));
+        assert_eq!(b.available_mib(), 20);
+        assert!(
+            b.keys.lock().unwrap().is_empty(),
+            "no entry outlives its shares"
+        );
+    }
+
+    #[test]
+    fn a_key_may_always_send_one_body_at_the_route_cap() {
+        // Half of 30 MiB is less than a 20 MiB body: the share is one body.
+        let b = buffer(30);
+        assert_eq!(b.key_share(), 20);
+        assert!(matches!(
+            b.admit(Some(20 * MIB as u64), KEY),
+            Admission::Large(_)
+        ));
+        // And never more than the whole buffer.
+        assert_eq!(buffer(16).key_share(), 16);
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_share_returns_at_its_hold_limit_even_while_its_permit_lives() {
         let b = buffer(4);
-        let Admission::Large(permit) = b.admit(Some(3 * MIB as u64)) else {
+        let Admission::Large(permit) = b.admit(Some(3 * MIB as u64), KEY) else {
             panic!("admitted")
         };
         permit.release_after(Duration::from_secs(5));
@@ -384,7 +502,7 @@ mod tests {
         };
         let b = ImageBuffer::with_gauges(limits, in_use.clone(), &size);
         assert_eq!(size.get(), 8 * MIB as i64);
-        let take = |length: usize| match b.admit(Some(length as u64)) {
+        let take = |length: usize| match b.admit(Some(length as u64), KEY) {
             Admission::Large(permit) => permit,
             _ => panic!("admitted"),
         };
@@ -392,7 +510,10 @@ mod tests {
         let dropped = take(3 * MIB);
         let timed = take(2 * MIB + 1);
         assert_eq!(in_use.get(), 6 * MIB as i64);
-        assert!(matches!(b.admit(Some(3 * MIB as u64)), Admission::Busy));
+        assert!(matches!(
+            b.admit(Some(3 * MIB as u64), KEY),
+            Admission::Busy
+        ));
         assert_eq!(in_use.get(), 6 * MIB as i64, "a refusal takes nothing");
         drop(dropped);
         assert_eq!(in_use.get(), 3 * MIB as i64);
@@ -407,7 +528,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_dropped_permit_ends_its_hold_timers() {
         let b = buffer(4);
-        let Admission::Large(permit) = b.admit(Some(3 * MIB as u64)) else {
+        let Admission::Large(permit) = b.admit(Some(3 * MIB as u64), KEY) else {
             panic!("admitted")
         };
         let slot = Arc::downgrade(&permit.slot);
@@ -425,21 +546,27 @@ mod tests {
     #[test]
     fn bodies_over_the_route_cap_or_the_whole_budget_are_refused_outright() {
         let b = buffer(4);
-        assert!(matches!(b.admit(Some(5 * MIB as u64)), Admission::TooLarge));
-        assert!(matches!(b.admit(Some(4 * MIB as u64)), Admission::Large(_)));
-        let b = buffer(64);
         assert!(matches!(
-            b.admit(Some(20 * MIB as u64 + 1)),
+            b.admit(Some(5 * MIB as u64), KEY),
             Admission::TooLarge
         ));
-        assert!(matches!(b.admit(Some(u64::MAX)), Admission::TooLarge));
+        assert!(matches!(
+            b.admit(Some(4 * MIB as u64), KEY),
+            Admission::Large(_)
+        ));
+        let b = buffer(64);
+        assert!(matches!(
+            b.admit(Some(20 * MIB as u64 + 1), KEY),
+            Admission::TooLarge
+        ));
+        assert!(matches!(b.admit(Some(u64::MAX), KEY), Admission::TooLarge));
         // No budget at all: only text bodies.
         let none = buffer(0);
         assert!(matches!(
-            none.admit(Some(3 * MIB as u64)),
+            none.admit(Some(3 * MIB as u64), KEY),
             Admission::TooLarge
         ));
-        assert!(matches!(none.admit(Some(MIB as u64)), Admission::Text));
+        assert!(matches!(none.admit(Some(MIB as u64), KEY), Admission::Text));
     }
 
     #[test]

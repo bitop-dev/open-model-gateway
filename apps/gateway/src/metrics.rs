@@ -256,6 +256,7 @@ pub struct Metrics {
     egress_denied: Family<L1, Counter>,
     guardrails: GuardrailMetrics,
     image_input: ImageInputFamilies,
+    json_structure_refusals: Family<L1, Counter>,
     upstream_connection_lost: Family<L1, Counter>,
     upstream_connections_opened: Family<L1, Counter>,
     job_lease_renewals: Family<L1, Counter>,

@@ -17,6 +17,7 @@ use tracing::Instrument;
 use uuid::Uuid;
 
 mod image_body_scan;
+mod json_structure;
 mod read_deadline;
 
 use crate::{
@@ -126,6 +127,7 @@ fn inference_routes(store: &Store) -> Router<Store> {
             post(realtime::unsupported_route),
         )
         .route("/v1/realtime/calls", post(realtime::unsupported_route))
+        .route_layer(middleware::from_fn(json_structure::bound))
         .route_layer(middleware::from_fn(client_labels))
         .route_layer(middleware::from_fn_with_state(
             store.clone(),
@@ -186,10 +188,24 @@ async fn image_input_body(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
     let (mut parts, body) = request.into_parts();
-    match buffer.admit(length) {
+    // Authentication ran first (`image_input_routes`): the key is known.
+    let Some(key) = parts
+        .extensions
+        .get::<crate::auth::Principal>()
+        .map(|principal| principal.key_id)
+    else {
+        return shaped(crate::protocols::invalid_request());
+    };
+    match buffer.admit(length, key) {
         Admission::Text => {
             let body = axum::body::Body::new(http_body_util::Limited::new(body, TEXT_BODY_BYTES));
-            next.run(Request::from_parts(parts, body)).await
+            if !json_content_type(&parts.headers) {
+                return next.run(Request::from_parts(parts, body)).await;
+            }
+            match json_structure::measured(parts, body).await {
+                Ok(request) => next.run(request).await,
+                Err(response) => response,
+            }
         }
         Admission::TooLarge => {
             METRICS.image_input_refused("too_large");
@@ -197,6 +213,10 @@ async fn image_input_body(
         }
         Admission::Busy => {
             METRICS.image_input_refused("busy");
+            shaped(crate::protocols::image_input_busy())
+        }
+        Admission::KeyShare => {
+            METRICS.image_input_refused("key_share");
             shaped(crate::protocols::image_input_busy())
         }
         // Refused as the handler's JSON extractor would refuse it, before a
@@ -233,14 +253,19 @@ async fn image_input_body(
                     return shaped(response);
                 }
             };
-            let outside = if anthropic {
-                image_body_scan::outside_messages_images(&bytes)
+            // One pass: the bytes outside its image data, and the structure
+            // it may parse into (`json_structure`).
+            let scan = if anthropic {
+                image_body_scan::messages_body(&bytes)
             } else {
-                image_body_scan::outside_images(&bytes)
+                image_body_scan::chat_body(&bytes)
             };
-            if outside > TEXT_BODY_BYTES {
+            if scan.outside > TEXT_BODY_BYTES {
                 METRICS.image_input_refused("too_large");
                 return shaped(crate::protocols::payload_too_large());
+            }
+            if let Some(response) = json_structure::refusal(parts.uri.path(), scan.structure) {
+                return response;
             }
             let body = axum::body::Body::from(bytes);
             next.run(Request::from_parts(parts, body))
@@ -328,6 +353,7 @@ fn workload_routes(store: &Store, engine: &Engine) -> Router<Store> {
             "/v1/audio/speech",
             capped(WorkloadKind::AudioSpeech, post(audio::speech)),
         )
+        .route_layer(middleware::from_fn(json_structure::bound))
         .route_layer(middleware::from_fn(client_labels))
         .route_layer(middleware::from_fn_with_state(
             store.clone(),
@@ -377,6 +403,7 @@ fn job_routes(store: &Store) -> Router<Store> {
         )
         .route("/v1/batches/{id}", cap(small, get(batches::retrieve)))
         .route("/v1/batches/{id}/cancel", cap(small, post(batches::cancel)))
+        .route_layer(middleware::from_fn(json_structure::bound))
         .route_layer(middleware::from_fn(client_labels))
         .route_layer(middleware::from_fn_with_state(store.clone(), authenticate))
 }

@@ -12,6 +12,7 @@ pub mod guardrails;
 mod hand_off;
 pub mod image_buffer;
 pub mod images;
+pub mod json_weight;
 pub mod realtime;
 pub mod repository;
 mod request_telemetry;
