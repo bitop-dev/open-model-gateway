@@ -702,7 +702,7 @@ async fn an_image_under_a_monitor_rule_passes_and_is_recorded_skipped(pool: PgPo
     assert_eq!(w.hits.load(Ordering::SeqCst), 2);
 }
 
-/// #841 (0098) on an installation with guardrails: rules written before the
+/// #841 (0099) on an installation with guardrails: rules written before the
 /// migration (secrets, custom, a tightening) and their decisions are kept and
 /// read as before (no kinds, no kind); a personal-data rule can then be
 /// stored with its kinds, and only with them.
@@ -717,7 +717,8 @@ async fn the_kinds_migration_keeps_earlier_rules_and_decisions(pool: PgPool) {
         locking: true,
         no_tx: false,
     };
-    through(96).run(&pool).await.unwrap();
+    // Every migration before this one.
+    through(98).run(&pool).await.unwrap();
     let f = crate::governance::tests::db::fixture(pool.clone()).await;
     let ws = f.principal.workspace_id;
     // The type default of the Team's kind, which its local layer tightens.

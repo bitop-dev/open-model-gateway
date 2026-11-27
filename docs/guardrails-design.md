@@ -479,7 +479,7 @@ Input enforcement:
 
 ### Personal-data kinds (#841)
 
-A `personal_data` rule names its kinds (migration 0098: `guardrail_rules.kinds`, at least one, each once; `guardrail_events.kind`, a fixed label set only on personal-data decisions). The kind table is `guardrails::personal::KINDS`; adding a format (another country's identifier, say) is one entry there and one value in the migration's list, which a test compares with the table.
+A `personal_data` rule names its kinds (migration 0099: `guardrail_rules.kinds`, at least one, each once; `guardrail_events.kind`, a fixed label set only on personal-data decisions). The kind table is `guardrails::personal::KINDS`; adding a format (another country's identifier, say) is one entry there and one value in the migration's list, which a test compares with the table.
 
 | Kind | Matches | Never matches |
 | --- | --- | --- |

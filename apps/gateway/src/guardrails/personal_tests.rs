@@ -45,8 +45,8 @@ fn miss(kind: Kind, text: &str) {
 
 #[test]
 fn the_kind_table_matches_the_migration() {
-    // Migration 0098's list of kinds (rules and events) is this table's.
-    let sql = include_str!("../../enterprise_migrations/0098_guardrail_personal_data_kinds.sql");
+    // Migration 0099's list of kinds (rules and events) is this table's.
+    let sql = include_str!("../../enterprise_migrations/0099_guardrail_personal_data_kinds.sql");
     let list = format!(
         "ARRAY[{}]",
         Kind::ALL
