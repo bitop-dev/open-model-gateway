@@ -25,7 +25,7 @@ async fn stream_failure(frames: Vec<u8>, messages: bool) -> (Vec<ChatEvent>, Inf
     let mut req = request();
     req.stream = true;
     if messages {
-        req.messages_options = Some(Box::default());
+        req.messages_options = Some(std::sync::Arc::default());
     }
     let Ok(ProviderOutput::Stream(mut output)) = mock.adapter().execute(&target(), req).await
     else {

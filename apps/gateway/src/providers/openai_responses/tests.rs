@@ -80,7 +80,7 @@ fn request(stream: bool) -> ChatRequest {
             tool_call_id: None,
             tool_result_is_error: false,
         }],
-        tools: vec![],
+        tools: std::sync::Arc::new(vec![]),
         tool_choice: None,
         temperature: None,
         max_output_tokens: Some(50),
@@ -332,7 +332,7 @@ fn rejects_reasoning_modalities_and_mismatched_terminal() {
 #[test]
 fn function_tools_are_native_and_incomplete_is_preserved() {
     let mut r = request(false);
-    r.tools.push(FunctionTool {
+    std::sync::Arc::make_mut(&mut r.tools).push(FunctionTool {
         name: "weather".into(),
         description: None,
         parameters: json!({"type":"object"}),

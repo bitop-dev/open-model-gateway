@@ -82,8 +82,8 @@ async fn structured_output_and_strict_tools_reach_converse_and_converse_stream()
 async fn chat_strict_tools_reach_converse() {
     let mock = Mock::serve(complete(false), wire(events(false)), 200).await;
     let mut request = request();
-    request.tools.push(tool());
-    request.tools[0].strict = Some(true);
+    std::sync::Arc::make_mut(&mut request.tools).push(tool());
+    std::sync::Arc::make_mut(&mut request.tools)[0].strict = Some(true);
     mock.adapter().validate_chat_request(&request).unwrap();
     mock.adapter().execute(&target(), request).await.unwrap();
     let capture = mock.requests.lock().unwrap();
@@ -315,8 +315,12 @@ fn the_output_schema_counts_toward_the_request_size_bound() {
         let mut request = base.clone();
         let schema = schema_of(len);
         assert_eq!(serde_json::to_string(&schema).unwrap().len(), len);
-        request.messages_options.as_mut().unwrap().output_config =
-            Some(json!({"format":{"type":"json_schema","schema":schema}}));
+        request
+            .messages_options
+            .as_mut()
+            .map(std::sync::Arc::make_mut)
+            .unwrap()
+            .output_config = Some(json!({"format":{"type":"json_schema","schema":schema}}));
         let result = encode(&request);
         assert_eq!(result.is_ok(), accepted, "{len}");
         if !accepted {

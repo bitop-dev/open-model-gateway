@@ -444,7 +444,7 @@ pub(crate) mod db {
             messages_options: None,
             model: "company/smart".into(),
             messages: vec![],
-            tools: vec![],
+            tools: std::sync::Arc::new(vec![]),
             tool_choice: None,
             temperature: None,
             max_output_tokens: Some(10),
