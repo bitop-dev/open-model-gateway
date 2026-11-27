@@ -140,9 +140,9 @@ impl Engine {
             attempt_started,
             permit.clone(),
             log_trace_id,
+            self.health_write_bound,
         );
         guard.probe = probe.and_then(super::ProbeTicket::into_epoch);
-        guard.health_write_bound = self.health_write_bound;
         let output = call_upstream(
             &mut guard, &*adapter, deployment, request, &admission, deadline, protocol,
         )
