@@ -853,7 +853,7 @@ Reports (`cost-report`, `cost-summary`, `costs`, `usage-export`), usage (`usage/
 
 ## History partitions, rollups and archival (P6)
 
-**Partitions.** `inference_executions` (by `started_at`), `governance_reservations` and `monetary_ledger` (by `admitted_at`), `audit_events` (by `created_at`) and `storage_usage_hours` (by `hour_start`) are range-partitioned by UTC month. Rows from before the upgrade stay in each table's `<table>_p_legacy` partition (everything before the month after the newest row at upgrade time); later months get `<table>_pYYYY_MM`. Partitions are reached only through their parents: the runtime has no privilege on a partition, every partition has a TRUNCATE guard, row triggers (immutability, totals, counters, rollup markers) are defined on the parents, and an UPDATE that would move a row to another month is refused. `history_partitions` lists the partitioned tables; readiness accepts their partitions (`pg_class.relispartition`) and still rejects every other unknown relation.
+**Partitions.** `inference_executions` (by `started_at`), `governance_reservations` and `monetary_ledger` (by `admitted_at`), `audit_events` (by `created_at`), `storage_usage_hours` (by `hour_start`) and `guardrail_events` (by `created_at`, from migration 0095; it has no legacy partition and is archived as the group `guardrails`) are range-partitioned by UTC month. Rows from before the upgrade stay in each table's `<table>_p_legacy` partition (everything before the month after the newest row at upgrade time); later months get `<table>_pYYYY_MM`. Partitions are reached only through their parents: the runtime has no privilege on a partition, every partition has a TRUNCATE guard, row triggers (immutability, totals, counters, rollup markers) are defined on the parents, and an UPDATE that would move a row to another month is refused. `history_partitions` lists the partitioned tables; readiness accepts their partitions (`pg_class.relispartition`) and still rejects every other unknown relation.
 
 How the upgrade converts large tables (each numbered step of 0030/0031 is its own transaction and is idempotent, so a failed or interrupted `migrate` resumes where it stopped):
 
@@ -879,6 +879,7 @@ open-model-gateway partitions ensure --ahead 3
 ```sh
 open-model-gateway archive partition history 2024-01 --to /secure/archive   # executions, reservations, ledger
 open-model-gateway archive partition audit 2019-01 --to /secure/archive --retention-months 84
+open-model-gateway archive partition guardrails 2027-01 --to /secure/archive  # guardrail decisions (from migration 0095 on)
 open-model-gateway archive verify /secure/archive/history-2024-01-<id>       # checksums, no database
 ```
 

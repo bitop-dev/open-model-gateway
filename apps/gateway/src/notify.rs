@@ -97,6 +97,16 @@ pub struct Stamp {
     generation: u64,
     versions: [u64; TOPICS],
 }
+impl Stamp {
+    /// A stamp no lookup ever returns: an entry stored with it is never a
+    /// hit, only a value to revalidate (`VersionedCache::peek`).
+    pub(crate) fn unconfirmed() -> Self {
+        Self {
+            generation: u64::MAX,
+            versions: [0; TOPICS],
+        }
+    }
+}
 
 /// This replica's view of the configuration versions.
 pub struct ConfigVersions {

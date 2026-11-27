@@ -9,6 +9,16 @@ fn upstream_buckets() -> Histogram {
     // 10 ms .. ~164 s
     Histogram::new(exponential_buckets(0.01, 2.0, 15))
 }
+impl GuardrailMetrics {
+    fn new() -> Self {
+        Self {
+            decisions: Family::default(),
+            detector: Family::new_with_constructor(phase_buckets),
+            unscanned: Family::default(),
+        }
+    }
+}
+
 fn phase_buckets() -> Histogram {
     // 100 µs .. ~52 s: admission/settlement phases are sub-millisecond when
     // uncontended and seconds when queued behind the installation lock.
@@ -85,6 +95,7 @@ impl Metrics {
             token_counts: Family::default(),
             key_issuance_refused: Family::default(),
             egress_denied: Family::default(),
+            guardrails: GuardrailMetrics::new(),
             image_input: ImageInputFamilies::default(),
             upstream_connection_lost: every_client(),
             upstream_connections_opened: every_client(),
@@ -350,7 +361,7 @@ impl Metrics {
         );
         registry.register(
             "config_changes",
-            "Configuration version changes this replica observed, by topic (access, catalog, keys, policy, settings)",
+            "Configuration version changes this replica observed, by topic (access, catalog, guardrails, keys, policy, settings)",
             self.config_changes.clone(),
         );
     }
@@ -450,6 +461,21 @@ impl Metrics {
             "egress_denied",
             "Outbound connections refused by the egress policy, by purpose (provider, oidc, storage, catalog, smtp, audit)",
             self.egress_denied.clone(),
+        );
+        registry.register(
+            "guardrail_decisions",
+            "Guardrail decisions by stage (input), detector kind, category family and action (monitored, blocked, detector_failed, skipped)",
+            self.guardrails.decisions.clone(),
+        );
+        registry.register(
+            "guardrail_unscanned",
+            "Requests the guardrail step refused without inspecting them (no decision row is written), by reason (rate_limited: the key's bound of unadmitted recorded requests; no_slot: no scan slot was free in time)",
+            self.guardrails.unscanned.clone(),
+        );
+        registry.register(
+            "guardrail_detector_seconds",
+            "Time a request's guardrail scan took, by detector kind (the scan itself: never a wait for a scan slot or a policy load)",
+            self.guardrails.detector.clone(),
         );
         registry.register(
             "upstream_connection_lost",

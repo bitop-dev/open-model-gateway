@@ -34,6 +34,8 @@ struct MemoryRepository {
     plan: Mutex<Option<crate::routing::RoutePlan>>,
     attempts: Mutex<Vec<(Uuid, i32)>>,
     health: Mutex<Vec<Option<InferenceError>>>,
+    guardrails: Mutex<std::sync::Arc<crate::guardrails::enforce::Policy>>,
+    guardrail_events: Mutex<Vec<crate::guardrails::enforce::Event>>,
     /// What a probe claim answers (`None`: the route is closed).
     probe_claim: Mutex<Option<crate::routing::ProbeClaim>>,
     /// Each route's circuit as `route_state` reports it (absent: closed).
@@ -48,6 +50,22 @@ struct MemoryRepository {
 }
 #[async_trait]
 impl InferenceRepository for MemoryRepository {
+    async fn guardrails(
+        &self,
+        _: Uuid,
+    ) -> Result<std::sync::Arc<crate::guardrails::enforce::Policy>, InferenceError> {
+        Ok(self.guardrails.lock().unwrap().clone())
+    }
+    async fn record_guardrails(
+        &self,
+        record: &crate::inference::guardrails::GuardrailRecord<'_>,
+    ) -> Result<(), InferenceError> {
+        self.guardrail_events
+            .lock()
+            .unwrap()
+            .extend_from_slice(record.events);
+        Ok(())
+    }
     async fn deployments(&self, _: &Principal, _: &str) -> Result<Vec<Deployment>, InferenceError> {
         Ok(self.deployments.lock().unwrap().clone())
     }

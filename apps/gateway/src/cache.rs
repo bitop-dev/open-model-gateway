@@ -7,6 +7,7 @@
 //! | `keys` | SHA-256 of the presented token | keys, access | inference/workload authentication only |
 //! | `candidates` | workspace, key, public model | catalog, access, keys | candidate deployments (`InferenceRepository::deployments`) |
 //! | `routes` | workspace, public model | catalog, access | routing policy and per-deployment routing rows |
+//! | `guardrails` | workspace | guardrails, access | compiled effective guardrail policy (`InferenceRepository::guardrails`); a stale entry whose rule-set revisions are unchanged is revalidated with one read, not recompiled |
 //! | `health` | deployment | TTL 1 s | passive circuit state for planning |
 //! | prices (`governance`) | price id, deployment | immutable | admission and settlement valuation |
 //!
@@ -113,6 +114,22 @@ impl<K: Eq + Hash + Clone, V: Clone> VersionedCache<K, V> {
         entries.insert(key, (value, stamp));
     }
 
+    /// The stored value whatever its stamp (to revalidate a stale entry
+    /// cheaply instead of rebuilding it).
+    pub fn peek(&self, key: &K) -> Option<V> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .map(|(v, _)| v.clone())
+    }
+
+    /// Keep a value read while the versions were unconfirmed: never a hit,
+    /// but `peek` finds it.
+    pub fn insert_unconfirmed(&self, key: K, value: V) {
+        self.insert(key, value, Stamp::unconfirmed());
+    }
+
     pub fn remove(&self, key: &K) {
         self.entries
             .lock()
@@ -179,6 +196,9 @@ pub const HEALTH_TTL: Duration = Duration::from_secs(1);
 const KEY_TOPICS: &[Topic] = &[Topic::Keys, Topic::Access];
 const CANDIDATE_TOPICS: &[Topic] = &[Topic::Catalog, Topic::Access, Topic::Keys];
 const ROUTE_TOPICS: &[Topic] = &[Topic::Catalog, Topic::Access];
+/// A workspace's guardrail policy: its rule sets and rules (`guardrails`),
+/// and its kind, which selects the type default (`access`).
+const GUARDRAIL_TOPICS: &[Topic] = &[Topic::Guardrails, Topic::Access];
 
 /// This replica's caches (shared by every clone of a `Store`).
 pub struct Caches {
@@ -186,6 +206,8 @@ pub struct Caches {
     pub(crate) keys: VersionedCache<[u8; 32], KeyEntry>,
     pub(crate) candidates: VersionedCache<(Uuid, Uuid, String), Arc<Vec<Deployment>>>,
     pub(crate) routes: VersionedCache<(Uuid, String), Arc<RouteSnapshot>>,
+    /// Compiled effective guardrail rules per workspace (empty ones too).
+    pub(crate) guardrails: VersionedCache<Uuid, Arc<crate::inference::guardrails::CachedPolicy>>,
     health: Mutex<HashMap<Uuid, HealthEntry>>,
     /// Deployments whose success observation this replica is refreshing now.
     health_refreshing: Arc<Mutex<std::collections::HashSet<Uuid>>>,
@@ -220,6 +242,7 @@ impl Caches {
             keys: VersionedCache::new("keys", KEY_TOPICS, 250_000),
             candidates: VersionedCache::new("candidates", CANDIDATE_TOPICS, 100_000),
             routes: VersionedCache::new("routes", ROUTE_TOPICS, 50_000),
+            guardrails: VersionedCache::new("guardrails", GUARDRAIL_TOPICS, 100_000),
             health: Mutex::new(HashMap::new()),
             health_refreshing: Arc::default(),
         }

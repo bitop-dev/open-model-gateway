@@ -3458,6 +3458,7 @@ mod bedrock;
 mod durable;
 mod envelope;
 mod fence;
+mod guardrails;
 mod http_support;
 mod poller;
 mod poller_concurrency;

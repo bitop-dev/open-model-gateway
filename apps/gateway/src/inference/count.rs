@@ -355,6 +355,23 @@ impl Engine {
                 .unwrap_or(InferenceError::Unsupported)
                 .into());
         }
+        // A count may send the request's text to the provider (a provider
+        // count; a local estimate sends nothing): the guardrails of a Messages
+        // request apply before any route is used.
+        let facts = super::guardrails::Guarded {
+            request_id,
+            operation: "count_tokens",
+            model: &request.model,
+            streamed: false,
+            workload: crate::guardrails::policy::Workload::Generation,
+        };
+        let inspect = || Some(crate::guardrails::enforce::chat_inspection(&request));
+        // A count is never admitted, so one whose decisions wrote rows counts
+        // toward the key's bound of unadmitted recorded requests (its own
+        // per-key bound can be set higher).
+        let _recorded = timeout_at(deadline, self.guard_input(&principal, facts, inspect))
+            .await
+            .map_err(|_| InferenceError::Timeout)??;
         let plan = timeout_at(
             deadline,
             self.repository

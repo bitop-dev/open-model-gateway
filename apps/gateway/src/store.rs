@@ -133,6 +133,8 @@ const ENTERPRISE_RELATIONS: &[&str] = &[
     // 0092 guardrails
     "guardrail_rule_sets",
     "guardrail_rules",
+    // 0095 guardrail decisions (its month partitions: PARTITIONED_RELATIONS)
+    "guardrail_events",
     "installation_settings",
     // 0011 alerts
     "alert_rules",
@@ -227,6 +229,7 @@ pub const PARTITIONED_RELATIONS: &[&str] = &[
     "monetary_ledger",
     "audit_events",
     "storage_usage_hours",
+    "guardrail_events",
 ];
 /// Relations that a later migration drops: accepted only before an explicit
 /// upgrade (`migrate`), never by readiness or serve on a current schema.
