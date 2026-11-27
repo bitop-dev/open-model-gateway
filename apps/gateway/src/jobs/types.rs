@@ -304,6 +304,20 @@ impl VideoSize {
         MeterVariant::new(self.as_str()).expect("static variant")
     }
 }
+/// A video size as `WIDTHxHEIGHT`, each 1 to 9999 without a leading zero
+/// (a route's sizes, 0097).
+pub fn valid_video_size(size: &str) -> bool {
+    let side = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 4
+            && !s.starts_with('0')
+            && s.bytes().all(|b| b.is_ascii_digit())
+    };
+    size.split_once('x')
+        .is_some_and(|(w, h)| side(w) && side(h))
+}
+/// The longest clip any route may accept (0097).
+pub const VIDEO_MAX_SECONDS: u32 = 3600;
 /// Allowed clip lengths in seconds (OpenAI: 4, 8, 12; default 4).
 pub const VIDEO_SECONDS: [u32; 3] = [4, 8, 12];
 pub const VIDEO_DEFAULT_SECONDS: u32 = 4;

@@ -66,6 +66,7 @@ pub(super) const REASONS: &[(&str, &str)] = &[
     (guardrails::EXPECTED_REQUIRED, "guardrail_expected_required"),
     (drain::REASON_INVALID, "drain_reason_invalid"),
     (drain::UNTIL_INVALID, "drain_until_invalid"),
+    (deployment_video::OPTIONS_INVALID, "video_options_invalid"),
     (INSTALLATION_LIMITS_REMOVED, "installation_limits_removed"),
     (PRECONDITION_FAILED, "precondition_failed"),
 ];

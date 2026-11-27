@@ -1221,6 +1221,50 @@ async fn slice3_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
     let model = id(&j.request("POST", "/api/v1/platform/models", Some(json!({"public_name":"contract/model","display_name":"Contract model","enabled":true}))).await);
     let unpriced = id(&j.request("POST", "/api/v1/platform/models", Some(json!({"public_name":"contract/unpriced","display_name":"Contract unpriced","enabled":true}))).await);
     let deployment = id(&j.request("POST", "/api/v1/platform/deployments", Some(json!({"model_id":model,"provider_connection_id":provider,"upstream_model":"contract/model","enabled":true}))).await);
+    // Video options (#52) on routes of a model of their own: one with sizes,
+    // one with lengths only; listed, and read on each route.
+    let video_model = id(&j.request("POST", "/api/v1/platform/models", Some(json!({"public_name":"contract/video","display_name":"Contract video","enabled":true}))).await);
+    let video_route = |upstream: &'static str| json!({"model_id":video_model,"provider_connection_id":provider,"upstream_model":upstream,"enabled":false});
+    let with_sizes = id(&j
+        .request(
+            "POST",
+            "/api/v1/platform/deployments",
+            Some(video_route("contract/video-sizes")),
+        )
+        .await);
+    let lengths_only = id(&j
+        .request(
+            "POST",
+            "/api/v1/platform/deployments",
+            Some(video_route("contract/video-lengths")),
+        )
+        .await);
+    j.request(
+        "PATCH",
+        &format!("/api/v1/platform/deployments/{with_sizes}"),
+        Some(json!({"video":{"seconds":[4,8],"sizes":["1280x720","720x1280"]}})),
+    )
+    .await;
+    j.request(
+        "PATCH",
+        &format!("/api/v1/platform/deployments/{lengths_only}"),
+        Some(json!({"video":{"seconds":[8]}})),
+    )
+    .await;
+    j.request(
+        "GET",
+        &format!("/api/v1/platform/deployments?model_id={video_model}"),
+        None,
+    )
+    .await;
+    for route in [with_sizes, lengths_only] {
+        j.request(
+            "GET",
+            &format!("/api/v1/platform/deployments/{route}"),
+            None,
+        )
+        .await;
+    }
     // Routing is configured first: `deployment` is the model's first route.
     j.request("PUT", &format!("/api/v1/platform/deployments/{deployment}/routing"), Some(json!({"priority":-1,"weight":1,"residency":null,"failure_threshold":3,"cooldown_seconds":30}))).await;
     j.request("PUT", &format!("/api/v1/platform/models/{model}/routing"), Some(json!({"strategy":"priority","max_attempts":2,"allow_ambiguous_failover":false,"required_residency":null}))).await;
@@ -3236,14 +3280,18 @@ async fn slice3_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
         .await;
     }
     // Each shape of the route PATCH: enablement alone, the image-input opt-in
-    // alone and with enablement, in both wire forms (the seed supplies the
-    // omitted second positional item). A body that sets neither field is
-    // accepted by the schema and refused by the handler (400).
+    // alone and with enablement, the video options set and cleared, in both
+    // wire forms (the seed supplies the omitted second positional item). A
+    // body that sets no field is accepted by the schema and refused by the
+    // handler (400); a `video` of `null` is a field set (it clears them).
     let neither = |b: &Value| match b {
-        Value::Object(m) => ["enabled", "image_input"]
-            .iter()
-            .all(|k| m.get(*k).is_none_or(Value::is_null)),
-        Value::Array(items) => items.iter().all(Value::is_null),
+        Value::Object(m) => {
+            ["enabled", "image_input"]
+                .iter()
+                .all(|k| m.get(*k).is_none_or(Value::is_null))
+                && !m.contains_key("video")
+        }
+        Value::Array(items) => items.len() < 3 && items.iter().all(Value::is_null),
         _ => false,
     };
     let patch_dep = format!("/api/v1/platform/deployments/{vdep}");
@@ -3251,6 +3299,11 @@ async fn slice3_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
         (json!({"enabled":true}), vec![]),
         (json!({"enabled":true,"image_input":true}), vec![]),
         (json!({"image_input":false}), vec![]),
+        (
+            json!({"video":{"seconds":[4,8],"sizes":["1280x720"]}}),
+            vec![],
+        ),
+        (json!({"video":null}), vec![]),
         (json!([true]), vec![("/1", json!(true))]),
         (json!([null, false]), vec![]),
     ] {
