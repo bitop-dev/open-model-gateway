@@ -62,6 +62,8 @@ pub(super) const REASONS: &[(&str, &str)] = &[
         guardrails::LOOSEN_NOT_ALLOWED,
         "guardrail_loosen_not_allowed",
     ),
+    (drain::REASON_INVALID, "drain_reason_invalid"),
+    (drain::UNTIL_INVALID, "drain_until_invalid"),
     (INSTALLATION_LIMITS_REMOVED, "installation_limits_removed"),
     (PRECONDITION_FAILED, "precondition_failed"),
 ];

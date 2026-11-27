@@ -3455,6 +3455,7 @@ async fn memoized_refusal_classification_stays_per_line(pool: PgPool) {
 }
 
 mod bedrock;
+mod drain;
 mod durable;
 mod envelope;
 mod fence;

@@ -102,6 +102,11 @@ pub enum InferenceError {
     /// the carried number of seconds (at least 1). The model exists; this is
     /// never reported as `model_not_found`.
     RouteCoolingDown(u32),
+    /// Every route that could serve the model is drained by an operator
+    /// (`routing::drain`). Transient, as a cooldown is, and never
+    /// `model_not_found`; `Retry-After` only for a drain that ends soon. The
+    /// operator's reason is never part of it.
+    RouteDrained(Option<u32>),
     Timeout,
     UpstreamRejected,
     UpstreamUnavailable,
@@ -139,7 +144,7 @@ impl InferenceError {
             Self::UnresolvedUsage(_) => "unresolved_usage",
             Self::TokenReservationExceedsLimit(_) => "token_reservation_exceeds_limit",
             Self::JobLimitExceeded(_) => "job_limit_exceeded",
-            Self::RouteCoolingDown(_) => "model_temporarily_unavailable",
+            Self::RouteCoolingDown(_) | Self::RouteDrained(_) => "model_temporarily_unavailable",
             Self::Timeout => "timeout_error",
             Self::UpstreamRejected => "upstream_rejected",
             Self::UpstreamUnavailable => "upstream_unavailable",
@@ -181,6 +186,7 @@ impl InferenceError {
     pub fn retry_after_seconds(self) -> Option<u32> {
         match self {
             Self::RouteCoolingDown(seconds) => Some(seconds.max(1)),
+            Self::RouteDrained(seconds) => seconds.map(|s| s.max(1)),
             Self::ScopeBusy => Some(SCOPE_BUSY_RETRY_SECONDS),
             Self::GuardrailUnavailable => Some(GUARDRAIL_RETRY_SECONDS),
             Self::Guardrail(r)
@@ -237,6 +243,9 @@ impl InferenceError {
             }
             Self::RouteCoolingDown(_) => {
                 "The model is temporarily unavailable after repeated provider failures; retry after the indicated delay"
+            }
+            Self::RouteDrained(_) => {
+                "The model is temporarily unavailable: its routes are paused for maintenance; retry later"
             }
             Self::Timeout => "Inference deadline exceeded",
             Self::UpstreamRejected => "The provider rejected the request",

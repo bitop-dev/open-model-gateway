@@ -13,6 +13,15 @@ use crate::{inference::error::InferenceError, store::Store};
 /// remaining cooldown.
 pub const PROBE_RETRY_AFTER_SECONDS: i32 = 5;
 
+/// The health row's route (`deployment_health.deployment_id`) is not
+/// drained now (`routing::drain`).
+static NOT_DRAINED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "NOT EXISTS(SELECT 1 FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id WHERE d.id=deployment_health.deployment_id AND {})",
+        super::drain::ROUTE_DRAINED
+    )
+});
+
 /// The outcome of [`claim_probe`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProbeClaim {
@@ -35,18 +44,22 @@ pub async fn claim_probe(
     holder: Uuid,
     hold: std::time::Duration,
 ) -> Result<ProbeClaim, InferenceError> {
-    let claimed: Option<i64> = sqlx::query_scalar(
+    // A drained route is never claimed (`routing::drain`); it reads as busy.
+    let sql = format!(
         "UPDATE deployment_health SET probe_holder=$2, probe_until=clock_timestamp()+make_interval(secs => $3), probe_epoch=probe_epoch+1
          WHERE deployment_id=$1 AND open_until <= statement_timestamp()
            AND (probe_until IS NULL OR probe_until <= statement_timestamp())
+           AND {not_drained}
          RETURNING probe_epoch",
-    )
-    .bind(deployment)
-    .bind(holder)
-    .bind(hold.as_secs_f64())
-    .fetch_optional(&store.pool)
-    .await
-    .map_err(|_| InferenceError::Storage)?;
+        not_drained = NOT_DRAINED.as_str()
+    );
+    let claimed: Option<i64> = sqlx::query_scalar(&sql)
+        .bind(deployment)
+        .bind(holder)
+        .bind(hold.as_secs_f64())
+        .fetch_optional(&store.pool)
+        .await
+        .map_err(|_| InferenceError::Storage)?;
     store.caches.forget_health(deployment);
     if let Some(epoch) = claimed {
         return Ok(ProbeClaim::Claimed(epoch));
@@ -80,18 +93,21 @@ pub async fn renew_probe(
     epoch: i64,
     hold: std::time::Duration,
 ) -> Result<bool, InferenceError> {
-    let renewed = sqlx::query(
+    // A route drained since the claim is no longer the caller's to send on.
+    let sql = format!(
         "UPDATE deployment_health SET probe_until=clock_timestamp()+make_interval(secs => $3)
          WHERE deployment_id=$1 AND probe_epoch=$2 AND probe_holder IS NOT NULL
-           AND probe_until > statement_timestamp()",
-    )
-    .bind(deployment)
-    .bind(epoch)
-    .bind(hold.as_secs_f64())
-    .execute(&store.pool)
-    .await
-    .map_err(|_| InferenceError::Storage)?
-    .rows_affected()
+           AND probe_until > statement_timestamp() AND {not_drained}",
+        not_drained = NOT_DRAINED.as_str()
+    );
+    let renewed = sqlx::query(&sql)
+        .bind(deployment)
+        .bind(epoch)
+        .bind(hold.as_secs_f64())
+        .execute(&store.pool)
+        .await
+        .map_err(|_| InferenceError::Storage)?
+        .rows_affected()
         == 1;
     store.caches.forget_health(deployment);
     Ok(renewed)
@@ -106,15 +122,19 @@ pub async fn close_probe(
     deployment: Uuid,
     epoch: i64,
 ) -> Result<(), InferenceError> {
-    sqlx::query(
+    // On a drained route the first content decides nothing either; the slot
+    // is freed when the probe ends.
+    let sql = format!(
         "UPDATE deployment_health SET consecutive_failures=0, open_until=NULL, probe_holder=NULL, probe_until=NULL, last_observed_at=clock_timestamp()
-         WHERE deployment_id=$1 AND probe_epoch=$2 AND probe_holder IS NOT NULL",
-    )
-    .bind(deployment)
-    .bind(epoch)
-    .execute(&store.pool)
-    .await
-    .map_err(|_| InferenceError::Storage)?;
+         WHERE deployment_id=$1 AND probe_epoch=$2 AND probe_holder IS NOT NULL AND {not_drained}",
+        not_drained = NOT_DRAINED.as_str()
+    );
+    sqlx::query(&sql)
+        .bind(deployment)
+        .bind(epoch)
+        .execute(&store.pool)
+        .await
+        .map_err(|_| InferenceError::Storage)?;
     store.caches.forget_health(deployment);
     Ok(())
 }

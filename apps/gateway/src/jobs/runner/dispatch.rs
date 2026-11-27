@@ -195,7 +195,7 @@ impl Runner {
                     Ok(ProbeClaim::Busy(_)) | Err(_) => None,
                 }
             }
-            Ok(RouteState::Open(_)) | Err(_) => None,
+            Ok(RouteState::Open(_) | RouteState::Drained(_)) | Err(_) => None,
         };
         if usable.is_none() {
             head.cooling = true;

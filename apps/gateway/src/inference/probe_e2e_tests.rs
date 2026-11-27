@@ -155,12 +155,26 @@ async fn after_a_cooldown_one_request_across_replicas_decides(pool: PgPool) {
     };
     // (the cooldown the last opening set, from the same statement's clock;
     // reopen count; probe held).
-    let circuit = || async {
-        sqlx::query_as::<_, (Option<i64>, i32, bool)>("SELECT round(EXTRACT(EPOCH FROM open_until-last_observed_at))::int8, reopen_count, probe_holder IS NOT NULL FROM deployment_health WHERE deployment_id=$1")
-            .bind(deployment)
-            .fetch_one(&pool)
-            .await
-            .unwrap()
+    // The health write is advisory (bounded at 250 ms in the request): under
+    // load it may land just after the answer, so each check waits (up to
+    // 10 s) for the row to read as expected, and reports what it last read.
+    let circuit = |expected: (Option<i64>, i32, bool)| {
+        let pool = pool.clone();
+        async move {
+            let mut last = None;
+            for _ in 0..100 {
+                last = sqlx::query_as::<_, (Option<i64>, i32, bool)>("SELECT round(EXTRACT(EPOCH FROM open_until-last_observed_at))::int8, reopen_count, probe_holder IS NOT NULL FROM deployment_health WHERE deployment_id=$1")
+                    .bind(deployment)
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap();
+                if last == Some(expected) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            last
+        }
     };
     // The cooldown passes now, for both gateways (their health caches too).
     let expire = || async {
@@ -182,7 +196,10 @@ async fn after_a_cooldown_one_request_across_replicas_decides(pool: PgPool) {
     // A counted failure opens the circuit for 60 s.
     assert!(!ask(gateways[0].clone()).await.0.is_success());
     assert_eq!(hits.load(Ordering::SeqCst), 1);
-    assert_eq!(circuit().await, (Some(60), 1, false));
+    assert_eq!(
+        circuit((Some(60), 1, false)).await,
+        Some((Some(60), 1, false))
+    );
     // While it is open, neither gateway sends anything; each reports the
     // remaining cooldown.
     for base in &gateways {
@@ -195,7 +212,10 @@ async fn after_a_cooldown_one_request_across_replicas_decides(pool: PgPool) {
     expire().await;
     assert!(!ask(gateways[1].clone()).await.0.is_success());
     assert_eq!(hits.load(Ordering::SeqCst), 2);
-    assert_eq!(circuit().await, (Some(120), 2, false));
+    assert_eq!(
+        circuit((Some(120), 2, false)).await,
+        Some((Some(120), 2, false))
+    );
 
     // Half-open again, the upstream recovered and holds its answer: six
     // requests on both gateways; one is the probe, and the five others are
@@ -246,7 +266,7 @@ async fn after_a_cooldown_one_request_across_replicas_decides(pool: PgPool) {
     // The probe's success closed the circuit and forgot the openings: traffic
     // resumes (on the other gateway once its health cache, at most
     // `HEALTH_TTL` old, is read again; the test does not wait for that).
-    assert_eq!(circuit().await, (None, 0, false));
+    assert_eq!(circuit((None, 0, false)).await, Some((None, 0, false)));
     for store in &stores {
         store.caches.forget_health(deployment);
     }

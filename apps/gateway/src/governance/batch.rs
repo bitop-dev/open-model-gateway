@@ -29,6 +29,9 @@ use crate::jobs::{
     insert_batch,
 };
 
+mod end;
+pub use end::EnvelopeEnd;
+
 /// The price list a batch reservation is valued with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PriceTier {
@@ -80,16 +83,40 @@ pub struct BatchHold {
 }
 
 /// The deployment of `id` serving `model` to this workspace/key right now
-/// (live catalog, key restrictions, enabled route and connection).
+/// (live catalog, key restrictions, enabled route and connection). With
+/// `sends`, the admission sends to it now (a line, a native batch's
+/// submission), so a drained route is refused; a gateway-run batch's
+/// envelope sends nothing, and its lines wait out a drain at dispatch.
 async fn current_deployment(
     tx: &mut Tx<'_>,
     workspace: Uuid,
     lineage: Uuid,
     id: Uuid,
     model: &str,
+    sends: bool,
 ) -> Result<Deployment, InferenceError> {
-    sqlx::query_as::<_,Deployment>("SELECT d.id,p.provider,d.upstream_model,p.credential_ref,p.endpoint,p.region,m.supported_protocols FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id JOIN models m ON m.id=d.model_id WHERE d.id=$2 AND m.public_name=$3 AND workspace_model_allowed($1,m.id) AND d.enabled AND p.enabled AND (NOT EXISTS(SELECT 1 FROM key_model_restrictions WHERE workspace_id=$1 AND governance_key_id=$4) OR EXISTS(SELECT 1 FROM key_model_selections WHERE workspace_id=$1 AND governance_key_id=$4 AND model_id=m.id))")
-        .bind(workspace).bind(id).bind(model).bind(lineage).fetch_optional(&mut **tx).await.map_err(storage)?.ok_or(InferenceError::ModelUnavailable)
+    // A drained route admits nothing that sends (`routing::drain`); a line
+    // is retried after its backoff, as for an open circuit.
+    let sql = format!(
+        "SELECT d.id,p.provider,d.upstream_model,p.credential_ref,p.endpoint,p.region,m.supported_protocols,{} AS drained,{} AS drain_retry_after FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id JOIN models m ON m.id=d.model_id WHERE d.id=$2 AND m.public_name=$3 AND workspace_model_allowed($1,m.id) AND d.enabled AND p.enabled AND (NOT EXISTS(SELECT 1 FROM key_model_restrictions WHERE workspace_id=$1 AND governance_key_id=$4) OR EXISTS(SELECT 1 FROM key_model_selections WHERE workspace_id=$1 AND governance_key_id=$4 AND model_id=m.id))",
+        crate::routing::drain::ROUTE_DRAINED,
+        crate::routing::drain::DRAIN_RETRY_AFTER.as_str()
+    );
+    let row = sqlx::query(&sql)
+        .bind(workspace)
+        .bind(id)
+        .bind(model)
+        .bind(lineage)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(storage)?
+        .ok_or(InferenceError::ModelUnavailable)?;
+    if sends && sqlx::Row::try_get::<bool, _>(&row, "drained").map_err(storage)? {
+        let retry =
+            sqlx::Row::try_get::<Option<i32>, _>(&row, "drain_retry_after").map_err(storage)?;
+        return Err(InferenceError::RouteDrained(retry.map(i32::unsigned_abs)));
+    }
+    <Deployment as sqlx::FromRow<_>>::from_row(&row).map_err(storage)
 }
 fn same_target(current: &Deployment, expected: &Deployment) -> bool {
     current.id == expected.id
@@ -293,8 +320,15 @@ async fn admit_batch_unobserved(
     let (mut tokens, mut held) = (0i64, 0i64);
     let mut pinned: Option<(Uuid, PriceTier)> = None;
     for g in groups {
-        let current =
-            current_deployment(&mut tx, workspace, lineage, g.deployment.id, &g.model).await?;
+        let current = current_deployment(
+            &mut tx,
+            workspace,
+            lineage,
+            g.deployment.id,
+            &g.model,
+            native,
+        )
+        .await?;
         if !same_target(&current, &g.deployment) || !serves(&current, g.protocol, native) {
             return Err(InferenceError::Configuration);
         }
@@ -513,6 +547,7 @@ async fn admit_line_unobserved(
         lineage,
         record.deployment_id,
         &record.model,
+        true,
     )
     .await?;
     if current.provider != record.provider
@@ -612,16 +647,17 @@ async fn admit_line_unobserved(
 
 /// Settle a batch reservation at zero: a gateway-run batch's envelope when
 /// the batch ends (the part of the ceiling no line used is released), or a
-/// native batch cancelled before anything was submitted (`cancelled`).
+/// native batch that ended before anything was submitted (cancelled, or its
+/// submission expired); `end` is how its execution reads.
 /// Callers guarantee no upstream work is covered by it. Idempotent; a
 /// reservation that is no longer pending (lease reconciled) keeps its hold.
 pub async fn close_batch(
     store: &Store,
     envelope: Uuid,
     elapsed_ms: u64,
-    cancelled: bool,
+    end: EnvelopeEnd,
 ) -> Result<bool, InferenceError> {
-    Ok(close(store, envelope, elapsed_ms, cancelled, None).await? == Closed::Settled)
+    Ok(close(store, envelope, elapsed_ms, end, None).await? == Closed::Settled)
 }
 
 /// [`close_batch`] for a gateway-run batch's runner: only while it still holds
@@ -632,7 +668,14 @@ pub(crate) async fn close_gateway_batch(
     elapsed_ms: u64,
     fence: &BatchFence,
 ) -> Result<Closed, InferenceError> {
-    close(store, envelope, elapsed_ms, false, Some(fence)).await
+    close(
+        store,
+        envelope,
+        elapsed_ms,
+        EnvelopeEnd::Succeeded,
+        Some(fence),
+    )
+    .await
 }
 
 /// What closing a batch envelope did.
@@ -649,20 +692,20 @@ async fn close(
     store: &Store,
     envelope: Uuid,
     elapsed_ms: u64,
-    cancelled: bool,
+    end: EnvelopeEnd,
     fence: Option<&BatchFence>,
 ) -> Result<Closed, InferenceError> {
     let _queued = gate(&store.lock_gates.settlement).await;
     locks::retry_deadlocks!(
         "settlement",
-        close_batch_once(store, envelope, elapsed_ms, cancelled, fence).await
+        close_batch_once(store, envelope, elapsed_ms, end, fence).await
     )
 }
 async fn close_batch_once(
     store: &Store,
     envelope: Uuid,
     elapsed_ms: u64,
-    cancelled: bool,
+    end: EnvelopeEnd,
     fence: Option<&BatchFence>,
 ) -> Result<Closed, InferenceError> {
     let mut tx = crate::db::begin(&store.pool).await.map_err(begin_storage)?;
@@ -704,10 +747,10 @@ async fn close_batch_once(
         tx.commit().await.map_err(storage)?;
         return Ok(Closed::NotPending);
     }
-    let changed = sqlx::query("UPDATE inference_executions SET state=$3,input_tokens=0,output_tokens=0,elapsed_ms=$2,completed_at=clock_timestamp(),finish_reason=CASE WHEN $3='cancelled' THEN 'cancelled' ELSE 'stop' END WHERE id=$1 AND state='started' AND workload_kind='batches'")
+    let changed = sqlx::query("UPDATE inference_executions SET state=$3,input_tokens=0,output_tokens=0,elapsed_ms=$2,completed_at=clock_timestamp(),finish_reason=CASE $3 WHEN 'cancelled' THEN 'cancelled' WHEN 'failed' THEN 'error' ELSE 'stop' END,error_code=CASE $3 WHEN 'failed' THEN 'submission_expired' ELSE error_code END WHERE id=$1 AND state='started' AND workload_kind='batches'")
         .bind(envelope)
         .bind(elapsed_ms.min(i64::MAX as u64) as i64)
-        .bind(if cancelled { "cancelled" } else { "succeeded" })
+        .bind(end.state())
         .execute(&mut *tx)
         .await
         .map_err(storage)?

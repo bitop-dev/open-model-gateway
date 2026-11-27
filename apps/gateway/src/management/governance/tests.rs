@@ -95,6 +95,7 @@ mod db {
             .merge(platform_routes())
             .merge(resources::platform_routes())
             .merge(crate::management::logs::routes())
+            .merge(crate::management::drain::routes())
             .route(
                 "/api/v1/workspaces/{ws}/keys/{key}",
                 axum::routing::get(crate::management::keys::key),
@@ -599,6 +600,262 @@ mod db {
             (status, v["health"]["observation"].as_str()),
             (StatusCode::OK, Some("stale"))
         );
+    }
+    /// Operator drains (#49 D3): a Platform Admin sets, changes and clears
+    /// them, each audited with its reason; an Auditor reads them and changes
+    /// nothing; a user without a platform role reaches none of it. The reason
+    /// is bounded text, refused with a control character, and returned
+    /// verbatim as a JSON string.
+    #[dbtest::test]
+    async fn drains_are_set_changed_and_cleared_by_a_platform_admin_and_audited(pool: PgPool) {
+        let f = fixture(pool).await;
+        let admin = user(f.owner, true);
+        let path = format!("/api/v1/platform/deployments/{}/drain", f.deployment);
+        let audits = || async {
+            sqlx::query_as::<_, (String, Value)>("SELECT action,metadata FROM audit_events WHERE action LIKE 'routing.drain_%' ORDER BY created_at,id")
+                .fetch_all(&f.store.pool)
+                .await
+                .unwrap()
+        };
+        let (status, v) = call(&f, &admin, "GET", &path, Value::Null).await;
+        assert_eq!(
+            (status, &v["drain"], &v["drained"]),
+            (StatusCode::OK, &Value::Null, &json!(false))
+        );
+        // Refused, each with its own status and machine reason: the body's
+        // shape (422), the schema's length (400, no reason), and what the
+        // schema cannot state (400 with a reason).
+        for (body, status, reason) in [
+            (json!({"until":null}), 422, None),
+            (
+                json!({"reason":"ok","until":null,"state":"active"}),
+                422,
+                None,
+            ),
+            (json!({"reason":"","until":null}), 400, None),
+            (json!({"reason":"x".repeat(501),"until":null}), 400, None),
+            (
+                json!({"reason":"   ","until":null}),
+                400,
+                Some("drain_reason_invalid"),
+            ),
+            (
+                json!({"reason":"line one\nline two","until":null}),
+                400,
+                Some("drain_reason_invalid"),
+            ),
+            (
+                json!({"reason":"tab\there","until":null}),
+                400,
+                Some("drain_reason_invalid"),
+            ),
+            (
+                json!({"reason":"\u{200B}","until":null}),
+                400,
+                Some("drain_reason_invalid"),
+            ),
+            (
+                json!({"reason":"ok \u{202E}kcatta","until":null}),
+                400,
+                Some("drain_reason_invalid"),
+            ),
+            (
+                json!({"reason":"\u{3164}","until":null}),
+                400,
+                Some("drain_reason_invalid"),
+            ),
+            (
+                json!({"reason":"ok\u{E0041}x","until":null}),
+                400,
+                Some("drain_reason_invalid"),
+            ),
+            (
+                json!({"reason":"ok\u{FE01}","until":null}),
+                400,
+                Some("drain_reason_invalid"),
+            ),
+            (
+                json!({"reason":"ok\u{180B}","until":null}),
+                400,
+                Some("drain_reason_invalid"),
+            ),
+            (
+                json!({"reason":"ok","until":"2000-01-01T00:00:00Z"}),
+                400,
+                Some("drain_until_invalid"),
+            ),
+            (
+                json!({"reason":"ok","until":"2999-01-01T00:00:00Z"}),
+                400,
+                Some("drain_until_invalid"),
+            ),
+        ] {
+            let (got, v) = call(&f, &admin, "PUT", &path, body.clone()).await;
+            assert_eq!(got.as_u16(), status, "{body}");
+            assert_eq!(v["error"]["reason"].as_str(), reason, "{body}");
+        }
+        assert!(audits().await.is_empty());
+        // An emoji's presentation selector (U+FE0F in "⚠️") is allowed.
+        let reason = "⚠️ Replacing the node: \"=HYPERLINK(1)\" <b>soon</b>";
+        assert_eq!(
+            call(
+                &f,
+                &admin,
+                "PUT",
+                &path,
+                json!({"reason":reason,"until":null})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let (_, v) = call(&f, &admin, "GET", &path, Value::Null).await;
+        assert_eq!(
+            v["drain"]["reason"], reason,
+            "returned verbatim, as a JSON string"
+        );
+        assert_eq!(
+            (v["drain"]["state"].as_str(), v["drained"].as_bool()),
+            (Some("active"), Some(true))
+        );
+        assert_eq!(v["drain"]["drained_by"]["id"], json!(f.owner));
+        assert!(v["drain"]["drained_by"]["label"].is_string());
+        // Changed: a new reason and an `until`.
+        let later: String = sqlx::query_scalar("SELECT to_char((now()+interval '2 days') AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')").fetch_one(&f.store.pool).await.unwrap();
+        assert_eq!(
+            call(
+                &f,
+                &admin,
+                "PUT",
+                &path,
+                json!({"reason":"Back on Thursday","until":later})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        // Ended: `until` passed, still shown, no longer applied.
+        sqlx::query("UPDATE deployments SET drain_until=now()-interval '1 second' WHERE id=$1")
+            .bind(f.deployment)
+            .execute(&f.store.pool)
+            .await
+            .unwrap();
+        let (_, v) = call(&f, &admin, "GET", &path, Value::Null).await;
+        assert_eq!(
+            (v["drain"]["state"].as_str(), v["drained"].as_bool()),
+            (Some("ended"), Some(false))
+        );
+        // Cleared; clearing again changes nothing.
+        assert_eq!(
+            call(&f, &admin, "DELETE", &path, Value::Null).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(&f, &admin, "DELETE", &path, Value::Null).await.0,
+            StatusCode::OK
+        );
+        let (_, v) = call(&f, &admin, "GET", &path, Value::Null).await;
+        assert!(v["drain"].is_null());
+        let actions: Vec<(String, Value)> = audits().await;
+        assert_eq!(
+            actions.iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>(),
+            [
+                "routing.drain_set",
+                "routing.drain_changed",
+                "routing.drain_cleared"
+            ]
+        );
+        assert_eq!(actions[0].1["drain_reason"], reason);
+        assert_eq!(actions[1].1["drain_reason"], "Back on Thursday");
+        let audited_until: bool =
+            sqlx::query_scalar("SELECT ($1::text)::timestamptz = ($2::text)::timestamptz")
+                .bind(actions[1].1["drain_until"].as_str())
+                .bind(&later)
+                .fetch_one(&f.store.pool)
+                .await
+                .unwrap();
+        assert!(
+            audited_until,
+            "the audited until is the one set: {:?}",
+            actions[1].1
+        );
+        assert_eq!(actions[2].1["drain_reason"], "Back on Thursday");
+        // A connection drain takes out each enabled route on it.
+        let connection: Uuid =
+            sqlx::query_scalar("SELECT provider_connection_id FROM deployments WHERE id=$1")
+                .bind(f.deployment)
+                .fetch_one(&f.store.pool)
+                .await
+                .unwrap();
+        let cpath = format!("/api/v1/platform/providers/{connection}/drain");
+        assert_eq!(
+            call(
+                &f,
+                &admin,
+                "PUT",
+                &cpath,
+                json!({"reason":"Provider incident","until":null})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let (_, v) = call(&f, &admin, "GET", &cpath, Value::Null).await;
+        assert_eq!(v["drain"]["reason"], "Provider incident");
+        assert!(v["routes"].as_i64().is_some_and(|n| n >= 1), "{v}");
+        let (_, v) = call(&f, &admin, "GET", &path, Value::Null).await;
+        assert_eq!(
+            (v["drain"].is_null(), v["drained"].as_bool()),
+            (true, Some(true))
+        );
+        assert_eq!(v["connection"]["drain"]["reason"], "Provider incident");
+        // An Auditor reads and changes nothing; a user without a platform
+        // role reaches none of it.
+        sqlx::query("UPDATE platform_role_grants SET role='auditor' WHERE user_id=$1")
+            .bind(f.other)
+            .execute(&f.store.pool)
+            .await
+            .unwrap();
+        let mut auditor = user(f.other, false);
+        auditor.platform_auditor = true;
+        assert_eq!(
+            call(&f, &auditor, "GET", &cpath, Value::Null).await.0,
+            StatusCode::OK
+        );
+        let before = audits().await.len();
+        for (method, target) in [
+            ("PUT", &path),
+            ("DELETE", &path),
+            ("PUT", &cpath),
+            ("DELETE", &cpath),
+        ] {
+            let body = if method == "PUT" {
+                json!({"reason":"no","until":null})
+            } else {
+                Value::Null
+            };
+            assert_eq!(
+                call(&f, &auditor, method, target, body).await.0,
+                StatusCode::FORBIDDEN,
+                "{method} {target}"
+            );
+        }
+        let nobody = user(Uuid::new_v4(), false);
+        for (method, target) in [("GET", &path), ("PUT", &path), ("DELETE", &cpath)] {
+            let body = if method == "PUT" {
+                json!({"reason":"no","until":null})
+            } else {
+                Value::Null
+            };
+            assert_ne!(
+                call(&f, &nobody, method, target, body).await.0,
+                StatusCode::OK,
+                "{method} {target}"
+            );
+        }
+        assert_eq!(audits().await.len(), before);
+        let (_, v) = call(&f, &admin, "GET", &cpath, Value::Null).await;
+        assert_eq!(v["drain"]["reason"], "Provider incident");
     }
     #[dbtest::test]
     async fn monthly_member_scope_unknown_is_not_zero_and_csv_formula_safe(pool: PgPool) {

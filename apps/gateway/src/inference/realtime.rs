@@ -612,12 +612,11 @@ impl Engine {
         if !(1..=3).contains(&plan.max_attempts) {
             return Err(InferenceError::Configuration);
         }
-        for (attempt, id) in plan
-            .deployment_ids
-            .iter()
-            .take(plan.max_attempts)
-            .enumerate()
-        {
+        let (mut attempt, mut passed, mut failed_over) = (0usize, super::Passed::default(), None);
+        for id in &plan.deployment_ids {
+            if attempt == plan.max_attempts {
+                break;
+            }
             let target = candidates
                 .iter()
                 .find(|d| d.id == *id)
@@ -642,7 +641,7 @@ impl Engine {
             if !(1..=MAX_RESPONSE_OUTPUT_TOKENS).contains(&window) {
                 return Err(InferenceError::Configuration);
             }
-            timeout_at(
+            let admitted = timeout_at(
                 deadline,
                 self.repository.admit_workload(
                     &ExecutionStart {
@@ -670,7 +669,17 @@ impl Engine {
                 ),
             )
             .await
-            .map_err(|_| InferenceError::Timeout)??;
+            .map_err(|_| InferenceError::Timeout)
+            .and_then(|admitted| admitted);
+            // Refused as drained since the plan was read: nothing was admitted
+            // or sent; the next route is tried without spending an attempt.
+            match admitted {
+                Err(InferenceError::RouteDrained(seconds)) => {
+                    passed.drain(seconds);
+                    continue;
+                }
+                other => other?,
+            };
             // From here the attempt is durable: every exit records it.
             let mut session = RealtimeSession {
                 repository: self.repository.clone(),
@@ -719,13 +728,15 @@ impl Engine {
                         && attempt + 1 < plan.deployment_ids.len()
                         && crate::routing::may_failover(&plan, error)
                     {
+                        attempt += 1;
+                        failed_over = Some(error);
                         continue;
                     }
                     return Err(error);
                 }
             }
         }
-        Err(InferenceError::Busy)
+        Err(super::exhausted(passed, attempt, failed_over))
     }
 }
 

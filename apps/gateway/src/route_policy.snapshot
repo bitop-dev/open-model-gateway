@@ -299,6 +299,10 @@ GET	/api/v1/platform/models/{model}/routing	PlatformRead	scope:platform:read
 PUT	/api/v1/platform/models/{model}/routing	PlatformWrite	scope:catalog:write
 GET	/api/v1/platform/deployments/{deployment}/routing	PlatformRead	scope:platform:read
 PUT	/api/v1/platform/deployments/{deployment}/routing	PlatformWrite	scope:catalog:write
+GET	/api/v1/platform/deployments/{deployment}/drain	PlatformRead	scope:platform:read
+PUT DELETE	/api/v1/platform/deployments/{deployment}/drain	PlatformWrite	scope:catalog:write
+GET	/api/v1/platform/providers/{id}/drain	PlatformRead	scope:platform:read
+PUT DELETE	/api/v1/platform/providers/{id}/drain	PlatformWrite	scope:catalog:write
 GET	/api/v1/platform/cost-report	PlatformRead	scope:platform:read
 GET POST	/api/v1/platform/admin-tokens	PlatformWrite	browser-admin-only
 DELETE	/api/v1/platform/admin-tokens/{token}	PlatformWrite	browser-admin-only
