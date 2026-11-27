@@ -59,9 +59,10 @@ mod tests {
         // #81 is complete: zero placeholders (a new route fails until its fragment is complete).
         // 289 operations: #804 adds the resolution of one unknown realtime response
         // and of a realtime session; #481 the five access review schedule operations;
-        // #840 the eight guardrail policy operations.
+        // #840 the eight guardrail policy operations; #49 the six drain
+        // operations (295).
         assert_eq!(
-            operations, 289,
+            operations, 295,
             "review route additions and update this progress baseline"
         );
         assert_eq!(

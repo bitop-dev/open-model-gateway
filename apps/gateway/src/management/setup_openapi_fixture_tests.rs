@@ -1560,6 +1560,60 @@ async fn slice3_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
         None,
     )
     .await;
+    // An operator drain (#49): none, active without and with an end, ended,
+    // through the connection, then cleared.
+    let drain = format!("/api/v1/platform/deployments/{deployment}/drain");
+    let connection: Uuid =
+        sqlx::query_scalar("SELECT provider_connection_id FROM deployments WHERE id=$1")
+            .bind(deployment)
+            .fetch_one(&f.s.pool)
+            .await
+            .unwrap();
+    let connection_drain = format!("/api/v1/platform/providers/{connection}/drain");
+    j.request("GET", &drain, None).await;
+    j.request("GET", &connection_drain, None).await;
+    j.request(
+        "PUT",
+        &drain,
+        Some(json!({"reason":"Replacing the node","until":null})),
+    )
+    .await;
+    j.request("GET", &drain, None).await;
+    let later: String = sqlx::query_scalar("SELECT to_char((now()+interval '2 days') AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')")
+        .fetch_one(&f.s.pool)
+        .await
+        .unwrap();
+    j.request(
+        "PUT",
+        &drain,
+        Some(json!({"reason":"Back on Thursday","until":later})),
+    )
+    .await;
+    j.request("GET", &drain, None).await;
+    sqlx::query("UPDATE deployments SET drain_until=now()-interval '1 second' WHERE id=$1")
+        .bind(deployment)
+        .execute(&f.s.pool)
+        .await
+        .unwrap();
+    j.request("GET", &drain, None).await;
+    j.request(
+        "PUT",
+        &connection_drain,
+        Some(json!({"reason":"Provider incident","until":null})),
+    )
+    .await;
+    j.request("GET", &drain, None).await;
+    j.request("GET", &connection_drain, None).await;
+    j.request(
+        "PUT",
+        &connection_drain,
+        Some(json!({"reason":"Provider incident, extended","until":later})),
+    )
+    .await;
+    j.request("GET", &drain, None).await;
+    j.request("GET", &connection_drain, None).await;
+    j.request("DELETE", &connection_drain, None).await;
+    j.request("DELETE", &drain, None).await;
     j.request("PUT", &format!("/api/v1/platform/deployments/{deployment}/batch-scheduling"), Some(json!({"max_concurrency":3,"yield_live_threshold":5,"window":{"timezone":"UTC","days":["mon","fri"],"start":"23:00","end":"06:00"}}))).await;
     // A vLLM-compatible route: defaults, then a priority and window, then
     // server-load gates (written by the production writer: the metrics URL needs
@@ -3279,6 +3333,74 @@ async fn slice3_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
         )
         .await;
     }
+    // A drain's reason and `until` carry rules a schema cannot state (trimmed,
+    // no control characters; in the future, within 366 days).
+    let vconnection = vprov;
+    // A valid body carries an `until` two days ahead (the vectors send null too).
+    let ahead = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 2 * 86_400;
+    let until = serde_json::to_value(
+        gateway_datetime_compat::UtcInstant::from_unix_parts(ahead, 0).unwrap(),
+    )
+    .unwrap();
+    let drain_valid = json!({"reason":"Planned maintenance","until":until});
+    body_set(
+        &mut j,
+        a,
+        "PUT",
+        "/api/v1/platform/deployments/{deployment}/drain",
+        &format!("/api/v1/platform/deployments/{vdep}/drain"),
+        drain_valid.clone(),
+        &["drain_reason_invalid", "drain_until_invalid"],
+    )
+    .await;
+    body_set(
+        &mut j,
+        a,
+        "PUT",
+        "/api/v1/platform/providers/{id}/drain",
+        &format!("/api/v1/platform/providers/{vconnection}/drain"),
+        drain_valid,
+        &["drain_reason_invalid", "drain_until_invalid"],
+    )
+    .await;
+    // And one without an end (the union's null arm).
+    let drain_valid = json!({"reason":"Planned maintenance","until":null});
+    body_set(
+        &mut j,
+        a,
+        "PUT",
+        "/api/v1/platform/deployments/{deployment}/drain",
+        &format!("/api/v1/platform/deployments/{vdep}/drain"),
+        drain_valid.clone(),
+        &["drain_reason_invalid", "drain_until_invalid"],
+    )
+    .await;
+    body_set(
+        &mut j,
+        a,
+        "PUT",
+        "/api/v1/platform/providers/{id}/drain",
+        &format!("/api/v1/platform/providers/{vconnection}/drain"),
+        drain_valid,
+        &["drain_reason_invalid", "drain_until_invalid"],
+    )
+    .await;
+    j.request(
+        "DELETE",
+        &format!("/api/v1/platform/deployments/{vdep}/drain"),
+        None,
+    )
+    .await;
+    j.request(
+        "DELETE",
+        &format!("/api/v1/platform/providers/{vconnection}/drain"),
+        None,
+    )
+    .await;
     body_set(&mut j, a, "PUT", "/api/v1/platform/deployments/{deployment}/routing", &format!("/api/v1/platform/deployments/{vdep}/routing"), json!({"priority":1,"weight":2,"residency":"eu","failure_threshold":3,"cooldown_seconds":30}), &[]).await;
     body_set(&mut j, a, "PUT", "/api/v1/platform/models/{model}/routing", &format!("/api/v1/platform/models/{vmodel}/routing"), json!({"strategy":"priority","max_attempts":2,"allow_ambiguous_failover":false,"required_residency":"eu"}), &[]).await;
     // An IANA zone must be known to the server: another length-valid name is a domain refusal.

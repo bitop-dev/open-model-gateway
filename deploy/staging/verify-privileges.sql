@@ -561,6 +561,28 @@ BEGIN
  BEGIN DELETE FROM configuration_changes WHERE deployment_id=d; RAISE EXCEPTION 'history deletion allowed'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
  BEGIN TRUNCATE configuration_changes; RAISE EXCEPTION 'history truncation allowed'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
  BEGIN UPDATE deployments SET revision=0 WHERE id=d; RAISE EXCEPTION 'revision rewrite allowed'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+ -- #49 (0096): an operator drain is set, changed and cleared as the
+ -- management path does it (the row locked, the four columns together, the
+ -- change audited), on a deployment and on its connection. It is no
+ -- configuration change (the revision stays), and nothing else of either
+ -- table becomes writable.
+ PERFORM 1 FROM deployments WHERE id=d FOR UPDATE;
+ UPDATE deployments SET drain_reason='ACL drain',drain_until=NULL,drained_by=u,drained_at=statement_timestamp() WHERE id=d;
+ UPDATE deployments SET drain_reason='ACL drain, changed',drain_until=now()+interval '1 hour',drained_by=u,drained_at=statement_timestamp() WHERE id=d;
+ INSERT INTO audit_events(id,actor_user_id,action,resource_type,resource_id,metadata) VALUES(gen_random_uuid(),u,'routing.drain_changed','deployment',d,'{"drain_reason":"ACL drain, changed"}');
+ PERFORM 1 FROM provider_connections WHERE id=pc FOR UPDATE;
+ UPDATE provider_connections SET drain_reason='ACL connection drain',drain_until=NULL,drained_by=u,drained_at=statement_timestamp() WHERE id=pc;
+ INSERT INTO audit_events(id,actor_user_id,action,resource_type,resource_id,metadata) VALUES(gen_random_uuid(),u,'routing.drain_set','provider_connection',pc,'{"drain_reason":"ACL connection drain"}');
+ IF (SELECT revision FROM deployments WHERE id=d)<>2 THEN RAISE EXCEPTION 'a drain changed the deployment revision'; END IF;
+ UPDATE deployments SET drain_reason=NULL,drain_until=NULL,drained_by=NULL,drained_at=NULL WHERE id=d;
+ UPDATE provider_connections SET drain_reason=NULL,drain_until=NULL,drained_by=NULL,drained_at=NULL WHERE id=pc;
+ IF EXISTS(SELECT FROM information_schema.columns c WHERE c.table_schema='public' AND c.table_name='deployments' AND has_column_privilege('gateway_runtime','public.deployments',c.column_name,'UPDATE') AND c.column_name NOT IN ('enabled','image_input','drain_reason','drain_until','drained_by','drained_at'))
+  OR EXISTS(SELECT FROM information_schema.columns c WHERE c.table_schema='public' AND c.table_name='provider_connections' AND has_column_privilege('gateway_runtime','public.provider_connections',c.column_name,'UPDATE') AND c.column_name NOT IN ('enabled','credential_ref','endpoint','drain_reason','drain_until','drained_by','drained_at'))
+  OR NOT has_column_privilege('gateway_runtime','public.deployments','drained_by','UPDATE')
+  OR NOT has_column_privilege('gateway_runtime','public.provider_connections','drain_until','UPDATE') THEN
+  RAISE EXCEPTION 'deployment or connection columns writable beyond enabled, image input, its references and the drain';
+ END IF;
+ BEGIN UPDATE provider_connections SET name='renamed' WHERE id=pc; RAISE EXCEPTION 'connection rename allowed'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
  -- #87: restore links under the runtime role. Revision 1 recorded false,
  -- revision 2 true; the link is consumed by the change that records it.
  PERFORM set_config('omg.configuration_restore',(SELECT id::text FROM configuration_changes WHERE deployment_id=d AND revision=1),true);

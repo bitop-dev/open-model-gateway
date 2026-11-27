@@ -78,13 +78,17 @@ enum Recorder {
     Unclaimed,
 }
 
-/// A result may change the circuit: it is closed; or this is the probe's
-/// result, under the slot's latest claim while the slot is not freed; or it
-/// is a never-claiming kind's, on a half-open circuit with no unexpired slot.
+/// A result may change the circuit: it is closed; or, while the route is not
+/// drained (`routing::drain`), this is the probe's result, under the slot's
+/// latest claim while the slot is not freed, or a never-claiming kind's, on
+/// a half-open circuit with no unexpired slot. On a drained route an open or
+/// half-open circuit stays as it is: a probe that was in flight when the
+/// drain was set ends without deciding (its slot is freed).
 const AUTHORITY: &str = "(h.open_until IS NULL
-    OR ($3::bigint IS NOT NULL AND h.probe_epoch=$3 AND h.probe_holder IS NOT NULL)
-    OR ($4 AND h.open_until <= statement_timestamp()
-        AND (h.probe_holder IS NULL OR h.probe_until <= statement_timestamp())))";
+    OR (NOT (SELECT drained FROM policy) AND (
+        ($3::bigint IS NOT NULL AND h.probe_epoch=$3 AND h.probe_holder IS NOT NULL)
+        OR ($4 AND h.open_until <= statement_timestamp()
+            AND (h.probe_holder IS NULL OR h.probe_until <= statement_timestamp())))))";
 /// A failure that reaches the threshold while the circuit is closed or
 /// half-open opens it (one statement time for every column).
 const OPENING: &str = "($2 AND h.consecutive_failures::bigint+1 >= (SELECT threshold FROM policy) AND (h.open_until IS NULL OR h.open_until <= statement_timestamp()))";
@@ -92,10 +96,11 @@ const OPENING: &str = "($2 AND h.consecutive_failures::bigint+1 >= (SELECT thres
 static RECORD_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
         r#"WITH policy AS (
-            SELECT COALESCE(p.failure_threshold,3) AS threshold,
-                   COALESCE(p.cooldown_seconds,30) AS cooldown
-            FROM deployments d LEFT JOIN deployment_routing p
-              ON p.deployment_id=d.id
+            SELECT COALESCE(r.failure_threshold,3) AS threshold,
+                   COALESCE(r.cooldown_seconds,30) AS cooldown,
+                   {drained} AS drained
+            FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id
+            LEFT JOIN deployment_routing r ON r.deployment_id=d.id
             WHERE d.id=$1
         )
         INSERT INTO deployment_health AS h
@@ -121,7 +126,8 @@ static RECORD_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
                 ELSE h.reopen_count END,
             probe_holder=CASE WHEN {AUTHORITY} AND (NOT $2 OR {OPENING} OR h.open_until IS NOT NULL) THEN NULL ELSE h.probe_holder END,
             probe_until=CASE WHEN {AUTHORITY} AND (NOT $2 OR {OPENING} OR h.open_until IS NOT NULL) THEN NULL ELSE h.probe_until END,
-            last_observed_at=clock_timestamp()"#
+            last_observed_at=clock_timestamp()"#,
+        drained = super::drain::ROUTE_DRAINED,
     )
 });
 

@@ -55,6 +55,12 @@ pub(super) fn encode_native_line(
     if !endpoint.is_generation() || r.stream {
         return Err(InferenceError::InvalidRequest);
     }
+    // Batch lines refuse images when parsed; a line is serialized without
+    // `image_body`'s splice, so an image here could only leave a
+    // placeholder in the file. Refused, never written.
+    if r.has_images() {
+        return Err(InferenceError::InvalidField("image"));
+    }
     // Native batch plans aggregate maxima, not request TTL requirements. Force
     // cache-enabled lines onto the gateway-run path, whose per-line admission
     // checks the pinned TTL price before creating a reservation or dispatching.

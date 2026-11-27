@@ -415,13 +415,35 @@ impl Jobs {
             .store
             .route_plan(principal, model, &candidates, request_id)
             .await?;
-        let id = plan
-            .deployment_ids
-            .first()
-            .ok_or(InferenceError::ModelUnavailable)?;
+        // The plan's health may be up to `HEALTH_TTL` old: each route is read
+        // again (its drain as it is now) before it is chosen, and a drained
+        // one is passed over, as an interactive request passes over a route
+        // admission refuses as drained.
+        let mut drained = None;
+        let mut chosen = None;
+        for id in &plan.deployment_ids {
+            self.store.caches.forget_health(*id);
+            match crate::routing::route_state(&self.store, *id).await? {
+                crate::routing::RouteState::Drained(seconds) => {
+                    drained = Some(match (drained.flatten(), seconds) {
+                        (Some(a), Some(b)) => Some(std::cmp::min(a, b)),
+                        (a, b) => a.or(b),
+                    });
+                }
+                _ => {
+                    chosen = Some(*id);
+                    break;
+                }
+            }
+        }
+        let id = match (chosen, drained) {
+            (Some(id), _) => id,
+            (None, Some(seconds)) => return Err(InferenceError::RouteDrained(seconds)),
+            (None, None) => return Err(InferenceError::ModelUnavailable),
+        };
         let target = candidates
             .into_iter()
-            .find(|d| d.id == *id)
+            .find(|d| d.id == id)
             .ok_or(InferenceError::Configuration)?;
         let adapter = self
             .registry

@@ -672,7 +672,118 @@ async fn empty_signature_sdk_anthropic_is_refused_before_admission(pool: sqlx::P
 }
 
 #[tokio::test]
-async fn images_are_refused_before_anything_is_sent() {
+async fn inline_images_reach_messages_as_base64_image_blocks() {
+    use super::super::contract::{IMAGE_URL, image_request_with};
+    let data = IMAGE_URL.split_once(',').unwrap().1;
+    let blocks = json!([
+        {"type":"text","text":"what is"},
+        {"type":"image","source":{"type":"base64","media_type":"image/png","data":data}},
+        {"type":"text","text":"this?"}
+    ]);
+    for stream in [false, true] {
+        let mock = Mock::new(200, None).await;
+        assert!(mock.adapter.capabilities().image_input);
+        let request = image_request_with(stream, Some("auto"));
+        assert!(mock.adapter.supports_chat_request(&request));
+        mock.adapter.validate_chat_request(&request).unwrap();
+        drop(mock.adapter.execute(&target(), request).await.unwrap());
+        let captured = mock.capture.lock().unwrap();
+        assert_eq!(
+            captured[0].0[reqwest::header::CONTENT_TYPE],
+            "application/json"
+        );
+        assert_eq!(
+            captured[0].2["messages"][0]["content"], blocks,
+            "stream {stream}"
+        );
+    }
+    // The provider's own count sees the same blocks.
+    let mock = Mock::new(200, Some(br#"{"input_tokens":12}"#.to_vec())).await;
+    let counted = mock
+        .adapter
+        .count_input_tokens(&target(), &image_request_with(false, None))
+        .await
+        .unwrap();
+    assert_eq!(counted, Some(12));
+    assert_eq!(
+        mock.capture.lock().unwrap()[0].2["messages"][0]["content"],
+        blocks
+    );
+}
+
+#[tokio::test]
+async fn images_across_turns_keep_their_order_and_blank_text_is_not_sent() {
+    let (request, data) = super::super::contract::multi_image_request();
+    let mock = Mock::new(200, None).await;
+    mock.adapter.execute(&target(), request).await.unwrap();
+    let sent = mock.capture.lock().unwrap()[0].2.clone();
+    let image = |k: usize| json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":data[k]}});
+    assert_eq!(sent["system"], json!([{"type":"text","text":"be brief"}]));
+    assert_eq!(
+        sent["messages"],
+        json!([
+            {"role":"user","content":[{"type":"text","text":"compare"}, image(0), image(1)]},
+            {"role":"assistant","content":[{"type":"text","text":"two images"}]},
+            {"role":"user","content":[image(2), {"type":"text","text":"and this"}]}
+        ])
+    );
+}
+
+#[test]
+fn the_request_size_counts_images_and_the_rest_of_the_body() {
+    use super::super::{contract::image_request_with, image_body::ImageLimits};
+    let request = image_request_with(false, None);
+    let image = super::super::image_body::images(&request)
+        .map(|i| i.base64().len())
+        .sum::<usize>();
+    let other = serde_json::to_vec(&encode("private-model", &request).unwrap())
+        .unwrap()
+        .len();
+    let limits = |request_bytes| ImageLimits {
+        per_image: usize::MAX,
+        per_image_base64: usize::MAX,
+        count: 100,
+        side: 8000,
+        request_bytes,
+        detail: false,
+    };
+    // The images' base64 and the body around them, exactly at the limit,
+    // and one byte over it.
+    assert!(encode_within("private-model", &request, &limits(image + other)).is_ok());
+    assert_eq!(
+        encode_within("private-model", &request, &limits(image + other - 1)).err(),
+        Some(InferenceError::InvalidField("image"))
+    );
+}
+
+#[tokio::test]
+async fn images_the_messages_wire_cannot_carry_are_refused_before_anything_is_sent() {
+    use super::super::contract::image_request_with;
+    // Nothing listens at the target, so a request that was sent would fail
+    // with a transport error instead of the named field.
     let adapter = AnthropicAdapter::for_test(Arc::new(Resolver), "http://127.0.0.1:9/v1".into());
-    super::super::contract::assert_images_refused(&adapter, &target()).await;
+    for detail in ["low", "high"] {
+        let request = image_request_with(false, Some(detail));
+        assert_eq!(
+            adapter.validate_chat_request(&request).err(),
+            Some(InferenceError::InvalidField("detail"))
+        );
+        assert_eq!(
+            adapter.execute(&target(), request).await.err(),
+            Some(InferenceError::InvalidField("detail"))
+        );
+    }
+    // A native batch line never carries an image or its placeholder.
+    let line = crate::jobs::types::BatchRequest::Chat(image_request_with(false, None));
+    assert_eq!(
+        adapter
+            .encode_native_line(
+                &target(),
+                crate::jobs::types::BatchEndpoint::Messages,
+                "l0",
+                &line
+            )
+            .err(),
+        Some(InferenceError::InvalidField("image"))
+    );
 }

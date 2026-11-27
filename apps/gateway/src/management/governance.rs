@@ -109,7 +109,7 @@ pub(super) fn platform_routes() -> Router<Store> {
             get(reports::platform_report),
         )
 }
-fn nullable<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+pub(super) fn nullable<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Deserialize<'de>,

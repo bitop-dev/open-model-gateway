@@ -273,7 +273,7 @@
             }
           }
         },
-        "description": "Not a Platform Admin; or guardrail_egress_not_allowed (a rule's detector sends text out while local_only is set)",
+        "description": "Not a Platform Admin",
         "headers": {
           "Cache-Control": {
             "schema": {
@@ -309,6 +309,63 @@
         ]
       },
       "ManagementMiddleware403Variant5": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ManagementAuth403"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorEnvelope"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "description": "Not a Platform Admin; or guardrail_egress_not_allowed (a rule's detector sends text out while local_only is set)",
+        "headers": {
+          "Cache-Control": {
+            "schema": {
+              "const": "no-store"
+            }
+          },
+          "Referrer-Policy": {
+            "schema": {
+              "const": "no-referrer"
+            }
+          }
+        },
+        "x-omg-body-header-requirements": [
+          {
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "Referrer-Policy": {
+                "required": true,
+                "schema": {
+                  "const": "no-referrer"
+                }
+              }
+            },
+            "schema": {
+              "$ref": "#/components/schemas/ManagementAuth403"
+            }
+          }
+        ]
+      },
+      "ManagementMiddleware403Variant6": {
         "content": {
           "application/json": {
             "schema": {
@@ -6484,6 +6541,8 @@
                   "alert_rule_limit",
                   "bulk_incomplete",
                   "credential_reference_not_allowed",
+                  "drain_reason_invalid",
+                  "drain_until_invalid",
                   "email_not_configured",
                   "email_test_rate_limited",
                   "exceeds_parent_budget",
@@ -45551,6 +45610,10 @@
       "delete_api_v1_platform_cost_centers_by_idResponse": {
         "$ref": "#/components/schemas/MoneyOk"
       },
+      "delete_api_v1_platform_deployments_by_deployment_drainRequest": false,
+      "delete_api_v1_platform_deployments_by_deployment_drainResponse": {
+        "$ref": "#/components/schemas/SetupOk"
+      },
       "delete_api_v1_platform_deployments_by_idRequest": false,
       "delete_api_v1_platform_deployments_by_idResponse": {
         "$ref": "#/components/schemas/SetupOk"
@@ -45565,6 +45628,10 @@
       },
       "delete_api_v1_platform_providers_by_idRequest": false,
       "delete_api_v1_platform_providers_by_idResponse": {
+        "$ref": "#/components/schemas/SetupOk"
+      },
+      "delete_api_v1_platform_providers_by_id_drainRequest": false,
+      "delete_api_v1_platform_providers_by_id_drainResponse": {
         "$ref": "#/components/schemas/SetupOk"
       },
       "delete_api_v1_platform_report_schedules_by_idRequest": false,
@@ -48499,6 +48566,178 @@
       "get_api_v1_platform_deployments_by_deployment_batch_schedulingResponse": {
         "$ref": "#/components/schemas/SetupScheduling"
       },
+      "get_api_v1_platform_deployments_by_deployment_drainRequest": false,
+      "get_api_v1_platform_deployments_by_deployment_drainResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "as_of": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "connection": {
+            "additionalProperties": false,
+            "properties": {
+              "drain": {
+                "anyOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "description": "An operator drain: the route takes no new attempt while `state` is `active`. `ended` once `until` has passed (it no longer applies; it stays shown until cleared or set again).",
+                    "properties": {
+                      "drained_at": {
+                        "format": "date-time",
+                        "type": "string"
+                      },
+                      "drained_by": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "id": {
+                            "$ref": "#/components/schemas/IdentityUuid"
+                          },
+                          "label": {
+                            "description": "The governing user's display name or email, without control characters.",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "label"
+                        ],
+                        "type": "object"
+                      },
+                      "reason": {
+                        "description": "Operator text, returned verbatim as a JSON string; never shown to inference clients.",
+                        "maxLength": 500,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "state": {
+                        "enum": [
+                          "active",
+                          "ended"
+                        ],
+                        "type": "string"
+                      },
+                      "until": {
+                        "anyOf": [
+                          {
+                            "format": "date-time",
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "description": "When the drain lifts on its own; null until someone ends it."
+                      }
+                    },
+                    "required": [
+                      "reason",
+                      "until",
+                      "state",
+                      "drained_at",
+                      "drained_by"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              },
+              "id": {
+                "$ref": "#/components/schemas/IdentityUuid"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "name",
+              "drain"
+            ],
+            "type": "object"
+          },
+          "drain": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "additionalProperties": false,
+                "description": "An operator drain: the route takes no new attempt while `state` is `active`. `ended` once `until` has passed (it no longer applies; it stays shown until cleared or set again).",
+                "properties": {
+                  "drained_at": {
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "drained_by": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "id": {
+                        "$ref": "#/components/schemas/IdentityUuid"
+                      },
+                      "label": {
+                        "description": "The governing user's display name or email, without control characters.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "label"
+                    ],
+                    "type": "object"
+                  },
+                  "reason": {
+                    "description": "Operator text, returned verbatim as a JSON string; never shown to inference clients.",
+                    "maxLength": 500,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "state": {
+                    "enum": [
+                      "active",
+                      "ended"
+                    ],
+                    "type": "string"
+                  },
+                  "until": {
+                    "anyOf": [
+                      {
+                        "format": "date-time",
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "When the drain lifts on its own; null until someone ends it."
+                  }
+                },
+                "required": [
+                  "reason",
+                  "until",
+                  "state",
+                  "drained_at",
+                  "drained_by"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "drained": {
+            "description": "The route's own drain or its connection's applies now: it takes no new attempt.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "drain",
+          "connection",
+          "drained",
+          "as_of"
+        ],
+        "type": "object"
+      },
       "get_api_v1_platform_deployments_by_deployment_price_suggestionRequest": false,
       "get_api_v1_platform_deployments_by_deployment_price_suggestionResponse": {
         "$ref": "#/components/schemas/SetupSuggestion"
@@ -49292,6 +49531,94 @@
       "get_api_v1_platform_providers_by_idRequest": false,
       "get_api_v1_platform_providers_by_idResponse": {
         "$ref": "#/components/schemas/SetupProvider"
+      },
+      "get_api_v1_platform_providers_by_id_drainRequest": false,
+      "get_api_v1_platform_providers_by_id_drainResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "as_of": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "drain": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "additionalProperties": false,
+                "description": "An operator drain: the route takes no new attempt while `state` is `active`. `ended` once `until` has passed (it no longer applies; it stays shown until cleared or set again).",
+                "properties": {
+                  "drained_at": {
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "drained_by": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "id": {
+                        "$ref": "#/components/schemas/IdentityUuid"
+                      },
+                      "label": {
+                        "description": "The governing user's display name or email, without control characters.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "label"
+                    ],
+                    "type": "object"
+                  },
+                  "reason": {
+                    "description": "Operator text, returned verbatim as a JSON string; never shown to inference clients.",
+                    "maxLength": 500,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "state": {
+                    "enum": [
+                      "active",
+                      "ended"
+                    ],
+                    "type": "string"
+                  },
+                  "until": {
+                    "anyOf": [
+                      {
+                        "format": "date-time",
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "When the drain lifts on its own; null until someone ends it."
+                  }
+                },
+                "required": [
+                  "reason",
+                  "until",
+                  "state",
+                  "drained_at",
+                  "drained_by"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "routes": {
+            "description": "The connection's enabled deployments: the routes its drain takes out while active.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "drain",
+          "routes",
+          "as_of"
+        ],
+        "type": "object"
       },
       "get_api_v1_platform_report_schedulesRequest": false,
       "get_api_v1_platform_report_schedulesResponse": {
@@ -57522,6 +57849,37 @@
       "put_api_v1_platform_deployments_by_deployment_batch_schedulingResponse": {
         "$ref": "#/components/schemas/SetupOk"
       },
+      "put_api_v1_platform_deployments_by_deployment_drainRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "reason": {
+            "description": "1–500 characters after trimming, without control characters.",
+            "maxLength": 500,
+            "minLength": 1,
+            "type": "string"
+          },
+          "until": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "In the future and at most 366 days ahead; null to drain until someone ends it."
+          }
+        },
+        "required": [
+          "reason",
+          "until"
+        ],
+        "type": "object"
+      },
+      "put_api_v1_platform_deployments_by_deployment_drainResponse": {
+        "$ref": "#/components/schemas/SetupOk"
+      },
       "put_api_v1_platform_deployments_by_deployment_routingRequest": {
         "$ref": "#/components/schemas/SetupDeploymentRouting"
       },
@@ -57542,6 +57900,37 @@
         "$ref": "#/components/schemas/SetupModelRouting"
       },
       "put_api_v1_platform_models_by_model_routingResponse": {
+        "$ref": "#/components/schemas/SetupOk"
+      },
+      "put_api_v1_platform_providers_by_id_drainRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "reason": {
+            "description": "1–500 characters after trimming, without control characters.",
+            "maxLength": 500,
+            "minLength": 1,
+            "type": "string"
+          },
+          "until": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "In the future and at most 366 days ahead; null to drain until someone ends it."
+          }
+        },
+        "required": [
+          "reason",
+          "until"
+        ],
+        "type": "object"
+      },
+      "put_api_v1_platform_providers_by_id_drainResponse": {
         "$ref": "#/components/schemas/SetupOk"
       },
       "put_api_v1_platform_settings_emailRequest": {
@@ -68731,6 +69120,270 @@
         "x-omg-token-policy": "Scope"
       }
     },
+    "/api/v1/platform/deployments/{deployment}/drain": {
+      "delete": {
+        "description": "#49: end the deployment's drain, active or ended (Platform Admin; audited routing.drain_cleared with the reason). Clearing none changes nothing.",
+        "operationId": "delete_api_v1_platform_deployments_by_deployment_drain",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "deployment",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/IdentityUuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/delete_api_v1_platform_deployments_by_deployment_drainResponse"
+                }
+              }
+            },
+            "description": "Successful handler representation"
+          },
+          "401": {
+            "$ref": "#/components/responses/ManagementMiddleware401Variant2"
+          },
+          "403": {
+            "$ref": "#/components/responses/ManagementMiddleware403Variant4"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing resource"
+          },
+          "413": {
+            "$ref": "#/components/responses/ManagementMiddleware413Variant1"
+          },
+          "429": {
+            "$ref": "#/components/responses/ManagementMiddleware429Variant1"
+          },
+          "503": {
+            "$ref": "#/components/responses/ManagementMiddleware503Variant4"
+          }
+        },
+        "security": [
+          {
+            "browserSession": [],
+            "csrfToken": [],
+            "origin": []
+          },
+          {
+            "adminToken": []
+          }
+        ],
+        "x-omg-access": "PlatformWrite",
+        "x-omg-middleware-responses": {
+          "$ref": "#/x-omg-middleware-contracts/management"
+        },
+        "x-omg-request-schema": {
+          "$ref": "#/components/schemas/delete_api_v1_platform_deployments_by_deployment_drainRequest"
+        },
+        "x-omg-required-scope": "catalog:write",
+        "x-omg-response-schema": {
+          "$ref": "#/components/schemas/delete_api_v1_platform_deployments_by_deployment_drainResponse"
+        },
+        "x-omg-token-policy": "Scope"
+      },
+      "get": {
+        "description": "#49: the deployment's operator drain (Platform Admins and Auditors).",
+        "operationId": "get_api_v1_platform_deployments_by_deployment_drain",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "deployment",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/IdentityUuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/get_api_v1_platform_deployments_by_deployment_drainResponse"
+                }
+              }
+            },
+            "description": "Successful handler representation"
+          },
+          "401": {
+            "$ref": "#/components/responses/ManagementMiddleware401Variant2"
+          },
+          "403": {
+            "$ref": "#/components/responses/ManagementMiddleware403Variant3"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing resource"
+          },
+          "413": {
+            "$ref": "#/components/responses/ManagementMiddleware413Variant1"
+          },
+          "429": {
+            "$ref": "#/components/responses/ManagementMiddleware429Variant1"
+          },
+          "503": {
+            "$ref": "#/components/responses/ManagementMiddleware503Variant4"
+          }
+        },
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "adminToken": []
+          }
+        ],
+        "x-omg-access": "PlatformRead",
+        "x-omg-middleware-responses": {
+          "$ref": "#/x-omg-middleware-contracts/management"
+        },
+        "x-omg-request-schema": {
+          "$ref": "#/components/schemas/get_api_v1_platform_deployments_by_deployment_drainRequest"
+        },
+        "x-omg-required-scope": "platform:read",
+        "x-omg-response-schema": {
+          "$ref": "#/components/schemas/get_api_v1_platform_deployments_by_deployment_drainResponse"
+        },
+        "x-omg-token-policy": "Scope"
+      },
+      "put": {
+        "description": "#49: set or change the deployment's drain (Platform Admin; audited routing.drain_set or routing.drain_changed with the reason). A drained route takes no new attempt; it stays enabled, listed and selectable.",
+        "operationId": "put_api_v1_platform_deployments_by_deployment_drain",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "deployment",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/IdentityUuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/put_api_v1_platform_deployments_by_deployment_drainRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/put_api_v1_platform_deployments_by_deployment_drainResponse"
+                }
+              }
+            },
+            "description": "Successful handler representation"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Invalid request (a reason of 0 or more than 500 characters); drain_reason_invalid (the reason is blank after trimming, or has a control, invisible or bidirectional character or a line separator); drain_until_invalid (until is not in the future, or more than 366 days ahead)"
+          },
+          "401": {
+            "$ref": "#/components/responses/ManagementMiddleware401Variant2"
+          },
+          "403": {
+            "$ref": "#/components/responses/ManagementMiddleware403Variant4"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing resource"
+          },
+          "413": {
+            "$ref": "#/components/responses/ManagementMiddleware413Variant1"
+          },
+          "415": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "JSON media type required"
+          },
+          "422": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Unknown field or JSON deserialization refusal"
+          },
+          "429": {
+            "$ref": "#/components/responses/ManagementMiddleware429Variant1"
+          },
+          "503": {
+            "$ref": "#/components/responses/ManagementMiddleware503Variant4"
+          }
+        },
+        "security": [
+          {
+            "browserSession": [],
+            "csrfToken": [],
+            "origin": []
+          },
+          {
+            "adminToken": []
+          }
+        ],
+        "x-omg-access": "PlatformWrite",
+        "x-omg-middleware-responses": {
+          "$ref": "#/x-omg-middleware-contracts/management"
+        },
+        "x-omg-request-schema": {
+          "$ref": "#/components/schemas/put_api_v1_platform_deployments_by_deployment_drainRequest"
+        },
+        "x-omg-required-scope": "catalog:write",
+        "x-omg-response-schema": {
+          "$ref": "#/components/schemas/put_api_v1_platform_deployments_by_deployment_drainResponse"
+        },
+        "x-omg-token-policy": "Scope"
+      }
+    },
     "/api/v1/platform/deployments/{deployment}/price-suggestion": {
       "get": {
         "description": "Requires a live Platform Admin: the route's declared minimum boundary is PlatformRead (so an Auditor passes authentication and route policy), but the handler requires platform_write and answers 403 to an Auditor. OpenRouter connections only: the server then fetches a public fixed-origin catalog without sending credentials, after releasing its database transaction. Errors: 400 if the model's workload is unrecognised; 404 for an unknown deployment, or a model absent from the OpenRouter public catalog; 409 if the connection is not OpenRouter or the upstream model is not a catalog slug; 502 if the catalog fetch or its response is unavailable; 503 if management storage is unavailable. The draft needs review; publishing remains a separate immutable price POST.",
@@ -75934,6 +76587,270 @@
         "x-omg-token-policy": "Scope"
       }
     },
+    "/api/v1/platform/providers/{id}/drain": {
+      "delete": {
+        "description": "#49: end the provider connection's drain, active or ended (Platform Admin; audited routing.drain_cleared with the reason). Clearing none changes nothing.",
+        "operationId": "delete_api_v1_platform_providers_by_id_drain",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/IdentityUuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/delete_api_v1_platform_providers_by_id_drainResponse"
+                }
+              }
+            },
+            "description": "Successful handler representation"
+          },
+          "401": {
+            "$ref": "#/components/responses/ManagementMiddleware401Variant2"
+          },
+          "403": {
+            "$ref": "#/components/responses/ManagementMiddleware403Variant4"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing resource"
+          },
+          "413": {
+            "$ref": "#/components/responses/ManagementMiddleware413Variant1"
+          },
+          "429": {
+            "$ref": "#/components/responses/ManagementMiddleware429Variant1"
+          },
+          "503": {
+            "$ref": "#/components/responses/ManagementMiddleware503Variant4"
+          }
+        },
+        "security": [
+          {
+            "browserSession": [],
+            "csrfToken": [],
+            "origin": []
+          },
+          {
+            "adminToken": []
+          }
+        ],
+        "x-omg-access": "PlatformWrite",
+        "x-omg-middleware-responses": {
+          "$ref": "#/x-omg-middleware-contracts/management"
+        },
+        "x-omg-request-schema": {
+          "$ref": "#/components/schemas/delete_api_v1_platform_providers_by_id_drainRequest"
+        },
+        "x-omg-required-scope": "catalog:write",
+        "x-omg-response-schema": {
+          "$ref": "#/components/schemas/delete_api_v1_platform_providers_by_id_drainResponse"
+        },
+        "x-omg-token-policy": "Scope"
+      },
+      "get": {
+        "description": "#49: the provider connection's operator drain (Platform Admins and Auditors).",
+        "operationId": "get_api_v1_platform_providers_by_id_drain",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/IdentityUuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/get_api_v1_platform_providers_by_id_drainResponse"
+                }
+              }
+            },
+            "description": "Successful handler representation"
+          },
+          "401": {
+            "$ref": "#/components/responses/ManagementMiddleware401Variant2"
+          },
+          "403": {
+            "$ref": "#/components/responses/ManagementMiddleware403Variant3"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing resource"
+          },
+          "413": {
+            "$ref": "#/components/responses/ManagementMiddleware413Variant1"
+          },
+          "429": {
+            "$ref": "#/components/responses/ManagementMiddleware429Variant1"
+          },
+          "503": {
+            "$ref": "#/components/responses/ManagementMiddleware503Variant4"
+          }
+        },
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "adminToken": []
+          }
+        ],
+        "x-omg-access": "PlatformRead",
+        "x-omg-middleware-responses": {
+          "$ref": "#/x-omg-middleware-contracts/management"
+        },
+        "x-omg-request-schema": {
+          "$ref": "#/components/schemas/get_api_v1_platform_providers_by_id_drainRequest"
+        },
+        "x-omg-required-scope": "platform:read",
+        "x-omg-response-schema": {
+          "$ref": "#/components/schemas/get_api_v1_platform_providers_by_id_drainResponse"
+        },
+        "x-omg-token-policy": "Scope"
+      },
+      "put": {
+        "description": "#49: set or change the provider connection's drain (Platform Admin; audited routing.drain_set or routing.drain_changed with the reason). A drained route takes no new attempt; it stays enabled, listed and selectable.",
+        "operationId": "put_api_v1_platform_providers_by_id_drain",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/IdentityUuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/put_api_v1_platform_providers_by_id_drainRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/put_api_v1_platform_providers_by_id_drainResponse"
+                }
+              }
+            },
+            "description": "Successful handler representation"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Invalid request (a reason of 0 or more than 500 characters); drain_reason_invalid (the reason is blank after trimming, or has a control, invisible or bidirectional character or a line separator); drain_until_invalid (until is not in the future, or more than 366 days ahead)"
+          },
+          "401": {
+            "$ref": "#/components/responses/ManagementMiddleware401Variant2"
+          },
+          "403": {
+            "$ref": "#/components/responses/ManagementMiddleware403Variant4"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing resource"
+          },
+          "413": {
+            "$ref": "#/components/responses/ManagementMiddleware413Variant1"
+          },
+          "415": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "JSON media type required"
+          },
+          "422": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Unknown field or JSON deserialization refusal"
+          },
+          "429": {
+            "$ref": "#/components/responses/ManagementMiddleware429Variant1"
+          },
+          "503": {
+            "$ref": "#/components/responses/ManagementMiddleware503Variant4"
+          }
+        },
+        "security": [
+          {
+            "browserSession": [],
+            "csrfToken": [],
+            "origin": []
+          },
+          {
+            "adminToken": []
+          }
+        ],
+        "x-omg-access": "PlatformWrite",
+        "x-omg-middleware-responses": {
+          "$ref": "#/x-omg-middleware-contracts/management"
+        },
+        "x-omg-request-schema": {
+          "$ref": "#/components/schemas/put_api_v1_platform_providers_by_id_drainRequest"
+        },
+        "x-omg-required-scope": "catalog:write",
+        "x-omg-response-schema": {
+          "$ref": "#/components/schemas/put_api_v1_platform_providers_by_id_drainResponse"
+        },
+        "x-omg-token-policy": "Scope"
+      }
+    },
     "/api/v1/platform/report-schedules": {
       "get": {
         "description": "Browser-only, live-authorized schedule scope. Foreign personal scopes are hidden with 404. Deleted schedules disappear; expired runs retain metadata and null snapshot; CSV expires with 410.",
@@ -81007,7 +81924,7 @@
             "$ref": "#/components/responses/ManagementMiddleware401Variant2"
           },
           "403": {
-            "$ref": "#/components/responses/ManagementMiddleware403Variant4"
+            "$ref": "#/components/responses/ManagementMiddleware403Variant5"
           },
           "413": {
             "$ref": "#/components/responses/ManagementMiddleware413Variant1"
@@ -82370,7 +83287,7 @@
             "$ref": "#/components/responses/ManagementMiddleware401Variant2"
           },
           "403": {
-            "$ref": "#/components/responses/ManagementMiddleware403Variant4"
+            "$ref": "#/components/responses/ManagementMiddleware403Variant5"
           },
           "404": {
             "content": {
@@ -87155,7 +88072,7 @@
             "$ref": "#/components/responses/ManagementMiddleware401Variant2"
           },
           "403": {
-            "$ref": "#/components/responses/ManagementMiddleware403Variant5"
+            "$ref": "#/components/responses/ManagementMiddleware403Variant6"
           },
           "404": {
             "$ref": "#/components/responses/ManagementMiddleware404Variant1"

@@ -461,8 +461,70 @@ pub const IMAGE_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==";
 /// A user turn of text, an inline image (detail `low`) and more text, as the
 /// Chat Completions and Responses parsers produce it.
 pub fn image_request(stream: bool) -> ChatRequest {
+    image_request_with(stream, Some("low"))
+}
+
+/// A system message, then images across turns: a user turn of text, image
+/// 0, a blank text part and image 1; an assistant turn; a user turn of
+/// image 2 and text. Each image is a distinct PNG, so its place in a wire
+/// shows the order was kept. Returns the request and the images' base64.
+pub fn multi_image_request() -> (ChatRequest, Vec<String>) {
+    use base64::Engine as _;
+    let mut images = crate::protocols::image_input::Images::default();
+    let mut data = Vec::new();
+    let mut image = |k: u8| {
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode([0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', k, k, k]);
+        data.push(encoded.clone());
+        Part::Image(
+            images
+                .take(format!("data:image/png;base64,{encoded}"), None, "image")
+                .expect("valid"),
+        )
+    };
+    let parts = |parts: Vec<Part>| Message {
+        role: Role::User,
+        content: Some(Content::Parts(parts)),
+        tool_calls: vec![],
+        tool_call_id: None,
+        tool_result_is_error: false,
+    };
+    let first = parts(vec![
+        Part::Text("compare".into()),
+        image(0),
+        Part::Text(" ".into()),
+        image(1),
+    ]);
+    let last = parts(vec![image(2), Part::Text("and this".into())]);
+    let text = |role, text: &str| Message {
+        role,
+        content: Some(text.into()),
+        tool_calls: vec![],
+        tool_call_id: None,
+        tool_result_is_error: false,
+    };
+    let request = ChatRequest {
+        messages_options: None,
+        model: "public".into(),
+        messages: vec![
+            text(Role::System, "be brief"),
+            first,
+            text(Role::Assistant, "two images"),
+            last,
+        ],
+        tools: vec![],
+        tool_choice: None,
+        temperature: None,
+        max_output_tokens: Some(16),
+        stream: false,
+    };
+    (request, data)
+}
+
+/// [`image_request`] with another `detail` hint, or none.
+pub fn image_request_with(stream: bool, detail: Option<&str>) -> ChatRequest {
     let image = crate::protocols::image_input::Images::default()
-        .take(IMAGE_URL.into(), Some("low"), "image")
+        .take(IMAGE_URL.into(), detail, "image")
         .expect("the fixture image is valid");
     ChatRequest {
         messages_options: None,
@@ -483,26 +545,5 @@ pub fn image_request(stream: bool) -> ChatRequest {
         temperature: None,
         max_output_tokens: Some(16),
         stream,
-    }
-}
-
-/// An adapter whose wire carries no images (`Capabilities::image_input`
-/// false) refuses an image request at the capability check, so the engine
-/// skips its routes before admission, and, executed anyway, in its encoder
-/// with `InvalidField("image")` before any request is built: `target` points
-/// at an address nothing listens on, so a request that was sent would fail
-/// with a transport error instead.
-pub async fn assert_images_refused(adapter: &dyn ProviderAdapter, target: &Deployment) {
-    assert!(!adapter.capabilities().image_input);
-    for stream in [false, true] {
-        let request = image_request(stream);
-        assert!(!adapter.supports_chat_request(&request), "capability check");
-        assert_eq!(
-            adapter.execute(target, request).await.err(),
-            Some(crate::inference::error::InferenceError::InvalidField(
-                "image"
-            )),
-            "encoder backstop (stream {stream})"
-        );
     }
 }

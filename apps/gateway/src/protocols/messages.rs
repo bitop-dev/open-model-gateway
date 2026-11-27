@@ -479,7 +479,8 @@ fn error_body(e: InferenceError) -> Value {
         InferenceError::UpstreamUnavailable
         | InferenceError::Overloaded
         | InferenceError::ScopeBusy
-        | InferenceError::RouteCoolingDown(_) => "overloaded_error",
+        | InferenceError::RouteCoolingDown(_)
+        | InferenceError::RouteDrained(_) => "overloaded_error",
         _ => "api_error",
     };
     let message = match e {

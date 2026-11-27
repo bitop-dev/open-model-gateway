@@ -588,7 +588,9 @@ impl Runner {
             .await
         {
             Ok(Some(d)) => Planned::Route(d),
-            Err(InferenceError::RouteCoolingDown(_)) => Planned::CoolingDown,
+            Err(InferenceError::RouteCoolingDown(_) | InferenceError::RouteDrained(_)) => {
+                Planned::CoolingDown
+            }
             // A transient planning failure is not "no route serves this line":
             // wait and plan again instead of dispatching it ungated, because an
             // ungated attempt may only be refused at admission (#243), which

@@ -632,6 +632,7 @@ fn text_parts_are_read_alone_and_joined_and_an_image_part_is_uninspectable() {
             ImageType::Png,
             None,
             8,
+            None,
         )),
         ContentPart::Text(tail.to_owned()),
     ]));
