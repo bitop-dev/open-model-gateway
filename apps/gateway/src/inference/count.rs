@@ -123,15 +123,11 @@ pub fn estimate(request: &ChatRequest) -> u64 {
 }
 
 /// The gateway estimate as a count. The estimate counts text only, so a
-/// request with an image (inline or a native Messages block) is refused
-/// with the field named rather than given a number that leaves it out; only
-/// a provider's own counter counts images.
+/// request with an image (a Messages image block is a canonical image too)
+/// is refused with the field named rather than given a number that leaves
+/// it out; only a provider's own counter counts images.
 pub(crate) fn estimated(request: &ChatRequest) -> Result<TokenCount, InferenceError> {
-    let native = request
-        .messages_options
-        .as_ref()
-        .is_some_and(|o| !o.images.is_empty());
-    if request.has_images() || native {
+    if request.has_images() {
         return Err(InferenceError::InvalidField("image"));
     }
     Ok(TokenCount {

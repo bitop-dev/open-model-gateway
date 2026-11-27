@@ -136,6 +136,13 @@ pub trait ProviderAdapter: Send + Sync {
     fn counts_input_tokens(&self) -> bool {
         false
     }
+    /// A Messages request reaches this provider as its own validated
+    /// envelope (native Messages). Its image blocks have always gone there
+    /// without the deployment's `image_input` opt-in, which governs the
+    /// images an adapter translates into its own wire.
+    fn forwards_native_messages(&self) -> bool {
+        false
+    }
     // Non-generation workloads (see `inference::workload`). Each is gated by
     // `supports_protocol` and defaults to an explicit `Unsupported`. Dropping
     // the future MUST cancel upstream work; never retry internally.

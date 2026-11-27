@@ -319,3 +319,16 @@ assert.equal(countResponse.headers.get("x-omg-token-count"), "estimate; method=u
 await assert.rejects(anthropic.messages.countTokens({ ...countBody, model: "company/unknown" }), (e) => e instanceof Anthropic.NotFoundError);
 await assert.rejects(anthropic.messages.countTokens({ ...countBody, max_tokens: 5 }), (e) => e instanceof Anthropic.BadRequestError && e.message.includes("max_tokens"));
 console.log("Token counting SDK contracts passed");
+
+// Inline images through each official client (#24): a Chat Completions
+// image_url part, a Responses input_image item and a Messages image block
+// reach the fixture route as the same canonical image (checked by the Rust
+// caller).
+const png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+const seenChat = await ordinaryOpenai.chat.completions.create({ model: "company/smart", messages: [{ role: "user", content: [{ type: "text", text: "what is this?" }, { type: "image_url", image_url: { url: png } }] }] });
+assert.equal(seenChat.choices[0].message.content, "Hello from fixture");
+const seenResponse = await ordinaryOpenai.responses.create({ model: "company/smart", input: [{ role: "user", content: [{ type: "input_text", text: "what is this?" }, { type: "input_image", image_url: png, detail: "auto" }] }] });
+assert.equal(seenResponse.output_text, "Hello from fixture");
+const seenMessage = await ordinaryAnthropic.messages.create({ model: "company/smart", max_tokens: 32, messages: [{ role: "user", content: [{ type: "text", text: "what is this?" }, { type: "image", source: { type: "base64", media_type: "image/png", data: png.split(",")[1] } }] }] });
+assert.equal(seenMessage.content[0].text, "Hello from fixture");
+console.log("Image input SDK contracts passed");

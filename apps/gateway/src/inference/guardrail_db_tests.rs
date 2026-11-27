@@ -531,6 +531,82 @@ async fn blocking_rule_with_an_image_on(pool: PgPool, provider: &str) {
     );
 }
 
+#[dbtest::test]
+async fn a_messages_image_is_refused_by_a_blocking_rule_on_a_native_route(pool: PgPool) {
+    blocking_rule_with_a_messages_image_on(pool, "anthropic").await;
+}
+
+#[dbtest::test]
+async fn a_messages_image_is_refused_by_a_blocking_rule_on_a_translated_route(pool: PgPool) {
+    blocking_rule_with_a_messages_image_on(pool, "openai").await;
+}
+
+/// A Messages image block is uninspectable on a native route (forwarded in
+/// its own envelope) and on a translated one alike: a blocking rule refuses
+/// it (`guardrail_not_supported`) before anything is admitted or sent, and
+/// a secret in the text beside it is still found.
+async fn blocking_rule_with_a_messages_image_on(pool: PgPool, provider: &str) {
+    let w = world_on(pool, "'messages'", provider).await;
+    images_on(&w).await;
+    type_default(&w, "block", "{secret}", &[]).await;
+    let before = snapshot(&w.f.store.pool).await;
+    let data = PNG.split_once(',').unwrap().1;
+    let body = |text: &str| {
+        json!({"model":"company/smart","max_tokens":16,"messages":[{"role":"user","content":[
+            {"type":"text","text":text},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":data}}]}]})
+    };
+    let (status, _, value) = send(&w, "/v1/messages", body("what is this?")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{provider}: {value}");
+    assert_eq!(
+        value["error"]["type"], "invalid_request_error",
+        "{provider}"
+    );
+    assert_eq!(
+        value["error"]["guardrail"]["category"], "secret",
+        "{provider}: {value}"
+    );
+    let refused: Vec<String> = sqlx::query_scalar(
+        "SELECT action FROM guardrail_events WHERE refused ORDER BY created_at,id",
+    )
+    .fetch_all(&w.f.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        refused,
+        ["skipped"],
+        "{provider}: the image could not be read"
+    );
+    let (status, _, value) = send(
+        &w,
+        "/v1/messages",
+        body(&format!("deploy with {}", secret())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{provider}: {value}");
+    assert!(
+        !value.to_string().contains("iVBOR"),
+        "the image is never echoed"
+    );
+    let refused: Vec<String> = sqlx::query_scalar(
+        "SELECT action FROM guardrail_events WHERE refused ORDER BY created_at,id",
+    )
+    .fetch_all(&w.f.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        refused,
+        ["skipped", "blocked"],
+        "{provider}: the text beside it was read"
+    );
+    assert_eq!(w.hits.load(Ordering::SeqCst), 0, "{provider}: nothing sent");
+    assert_eq!(
+        snapshot(&w.f.store.pool).await,
+        before,
+        "{provider}: nothing admitted"
+    );
+}
+
 /// Under a rule that does not block, an image passes and the rule records
 /// `skipped` (it could not read the request); a secret beside the image is
 /// still found and recorded `monitored`.

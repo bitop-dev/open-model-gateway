@@ -192,6 +192,9 @@ impl ProviderAdapter for AnthropicAdapter {
     fn counts_input_tokens(&self) -> bool {
         true
     }
+    fn forwards_native_messages(&self) -> bool {
+        true
+    }
     async fn execute(&self, target: &Deployment, request: ChatRequest) -> Result<ProviderOutput> {
         let payload = encode(&target.upstream_model, &request)?;
         let response = self.send(target, &request, "/messages", &payload).await?;
@@ -357,20 +360,8 @@ fn set_tool_choice(value: &mut Value, request: &ChatRequest) {
         };
     }
 }
-/// Anthropic's limits for inline images (Claude API vision documentation):
-/// 10 MB of base64 per image, 100 images and 128 MB per request, 8000 px per
-/// side. The gateway's own bounds (`protocols::image_input`) are tighter
-/// except for the side, which the image's header states.
-const IMAGE_LIMITS: super::image_body::ImageLimits = super::image_body::ImageLimits {
-    per_image: usize::MAX,
-    per_image_base64: 10_000_000,
-    count: 100,
-    side: 8000,
-    request_bytes: 128_000_000,
-    detail: false,
-};
 fn encode(model: &str, request: &ChatRequest) -> Result<Value> {
-    encode_within(model, request, &IMAGE_LIMITS)
+    encode_within(model, request, &images::LIMITS)
 }
 /// [`encode`] against the image `limits` given.
 fn encode_within(
@@ -381,7 +372,18 @@ fn encode_within(
     super::messages::validate(request, super::messages::ProviderClass::Anthropic)?;
     check_supported(request)?;
     super::image_body::check_limits(request, limits)?;
-    let (system, messages) = system_and_messages(request)?;
+    // A native Messages request is sent as its own validated envelope
+    // (`set_native_overrides`), whose image blocks hold the placeholders the
+    // body splices; its canonical turns are not encoded.
+    let native = request
+        .messages_options
+        .as_ref()
+        .is_some_and(|o| !o.native_messages.is_empty());
+    let (system, messages) = if native {
+        (vec![], vec![])
+    } else {
+        system_and_messages(request)?
+    };
     let mut value = json!({"model":model,"messages":messages,"max_tokens":request.max_output_tokens.unwrap_or(1024),"stream":request.stream});
     if !system.is_empty() {
         value["system"] = system.into();
@@ -786,6 +788,7 @@ fn text_delta(delta: &Value, events: &mut Vec<ChatEvent>) -> Result<()> {
 }
 /// Native Message Batches (`jobs::native`).
 mod batches;
+mod images;
 #[cfg(test)]
 mod fidelity_tests;
 #[cfg(test)]

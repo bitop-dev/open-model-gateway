@@ -94,6 +94,9 @@ fn upstream(state: Arc<Upstream>) -> Router {
                 )
                     .into_response();
             }
+            if uri.path().ends_with("/count_tokens") {
+                return axum::Json(json!({"input_tokens":42})).into_response();
+            }
             if uri.path().ends_with("/messages") {
                 return axum::Json(json!({"id":"msg_1","type":"message","role":"assistant","model":"private","content":[{"type":"text","text":"a cat"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":2}})).into_response();
             }
@@ -153,10 +156,12 @@ async fn world_at(
     let counters = crate::inference::image_buffer::ROUTER_TESTS.lock().await;
     let mut f = fixture(pool).await;
     let token = issue_key(&mut f).await;
-    sqlx::query("UPDATE models SET supported_protocols=ARRAY['chat_completions','responses']")
-        .execute(&f.store.pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE models SET supported_protocols=ARRAY['chat_completions','responses','messages']",
+    )
+    .execute(&f.store.pool)
+    .await
+    .unwrap();
     sqlx::query("UPDATE deployments SET enabled=false WHERE model_id=$1")
         .bind(f.model)
         .execute(&f.store.pool)
@@ -251,7 +256,9 @@ async fn send(
     declared: bool,
 ) -> (StatusCode, Option<String>, Value, usize) {
     let pulled = Arc::new(AtomicUsize::new(0));
-    let mut request = Request::post(path).header(header::CONTENT_TYPE, "application/json");
+    let mut request = Request::post(path)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("anthropic-version", "2023-06-01");
     if declared {
         request = request.header(header::CONTENT_LENGTH, body.len());
     }
@@ -1249,4 +1256,286 @@ async fn an_image_over_bedrocks_size_is_refused_there_and_served_by_another_rout
     assert_eq!(paths.len(), 1, "{paths:?}");
     assert!(paths[0].ends_with("/chat/completions"), "{paths:?}");
     assert_eq!(executions(&w).await, 1);
+}
+
+/// A Messages request carrying `blocks` in its one user turn.
+fn messages_body(blocks: Vec<Value>) -> Value {
+    json!({"model":"company/smart","max_tokens":16,"messages":[{"role":"user","content":blocks}]})
+}
+
+/// A Messages image block of the base64 in `url` (a data URL).
+fn image_block(url: &str) -> Value {
+    let (head, data) = url.split_once(',').unwrap();
+    let media = head.trim_start_matches("data:").trim_end_matches(";base64");
+    json!({"type":"image","source":{"type":"base64","media_type":media,"data":data}})
+}
+
+#[dbtest::test]
+async fn a_messages_image_reaches_a_native_anthropic_route_without_the_opt_in(pool: PgPool) {
+    let w = world_for(pool, ImageInputLimits::default(), true, "anthropic").await;
+    let url = png_url(64, "m");
+    let data = url.split_once(',').unwrap().1.to_owned();
+    let body = messages_body(vec![
+        json!({"type":"text","text":"what is this?"}),
+        image_block(&url),
+    ]);
+    // Native Messages images never needed the deployment's opt-in.
+    let (status, _, value, _) = send(
+        &w,
+        "/v1/messages",
+        Some(&w.token),
+        serde_json::to_vec(&body).unwrap(),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let sent = w.upstream.bodies.lock().unwrap().last().unwrap().clone();
+    assert_eq!(
+        sent["messages"][0]["content"][1],
+        json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":data}})
+    );
+    // Anthropic's own count receives the image too.
+    let (status, _, value, _) = send(
+        &w,
+        "/v1/messages/count_tokens",
+        Some(&w.token),
+        serde_json::to_vec(&json!({"model":"company/smart","messages":body["messages"]})).unwrap(),
+        true,
+    )
+    .await;
+    assert_eq!(
+        (status, value["input_tokens"].as_u64()),
+        (StatusCode::OK, Some(42)),
+        "{value}"
+    );
+    let counted = w.upstream.bodies.lock().unwrap().last().unwrap().clone();
+    assert_eq!(counted["messages"][0]["content"][1]["source"]["data"], data);
+}
+
+#[dbtest::test]
+async fn a_messages_image_reaches_a_bedrock_route_as_converse_blocks(pool: PgPool) {
+    translated_messages_images(pool, "bedrock").await;
+}
+
+#[dbtest::test]
+async fn a_messages_image_reaches_an_openai_route_as_an_image_url_part(pool: PgPool) {
+    translated_messages_images(pool, "openai").await;
+}
+
+/// On a translated route a Messages image needs the opt-in, reaches the
+/// provider in its own wire, and an estimated count refuses it; a tool
+/// result's image goes where a tool result takes one (Bedrock) and is
+/// refused, naming it, where it cannot (OpenAI).
+async fn translated_messages_images(pool: PgPool, provider: &str) {
+    let w = world_for(pool, ImageInputLimits::default(), true, provider).await;
+    let url = png_url(64, "t");
+    let data = url.split_once(',').unwrap().1.to_owned();
+    let body = messages_body(vec![
+        json!({"type":"text","text":"what is this?"}),
+        image_block(&url),
+    ]);
+    let bytes = serde_json::to_vec(&body).unwrap();
+    let (status, _, value, _) = send(&w, "/v1/messages", Some(&w.token), bytes.clone(), true).await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{provider}: {value}");
+    assert_eq!(value["type"], "error", "Anthropic's error shape");
+    allow_images(&w, true).await;
+    let (status, _, value, _) = send(&w, "/v1/messages", Some(&w.token), bytes, true).await;
+    assert_eq!(status, StatusCode::OK, "{provider}: {value}");
+    let sent = w.upstream.bodies.lock().unwrap().last().unwrap().clone();
+    let image = match provider {
+        "bedrock" => json!({"image":{"format":"png","source":{"bytes":data}}}),
+        _ => json!({"type":"image_url","image_url":{"url":url}}),
+    };
+    let content = sent["messages"].as_array().unwrap().last().unwrap()["content"].clone();
+    assert!(
+        content.as_array().unwrap().contains(&image),
+        "{provider}: {content}"
+    );
+    // The gateway's estimate counts text only: it refuses the image.
+    let (status, _, value, _) = send(
+        &w,
+        "/v1/messages/count_tokens",
+        Some(&w.token),
+        serde_json::to_vec(&json!({"model":"company/smart","messages":body["messages"]})).unwrap(),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{provider}: {value}");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("image"),
+        "{value}"
+    );
+    // A tool result's image.
+    let tool = json!({"model":"company/smart","max_tokens":16,"messages":[
+        {"role":"user","content":"look"},
+        {"role":"assistant","content":[{"type":"tool_use","id":"c","name":"shot","input":{}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"c","content":[{"type":"text","text":"here"}, image_block(&url)]}]}
+    ],"tools":[{"name":"shot","input_schema":{"type":"object"}}]});
+    let (status, _, value, _) = send(
+        &w,
+        "/v1/messages",
+        Some(&w.token),
+        serde_json::to_vec(&tool).unwrap(),
+        true,
+    )
+    .await;
+    if provider == "bedrock" {
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let sent = w.upstream.bodies.lock().unwrap().last().unwrap().clone();
+        let result = &sent["messages"][2]["content"][0]["toolResult"]["content"];
+        assert_eq!(
+            result[1],
+            json!({"image":{"format":"png","source":{"bytes":data}}}),
+            "{result}"
+        );
+    } else {
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("tool_result.content.image"),
+            "{value}"
+        );
+    }
+}
+
+/// A Messages body above 2 MiB is admitted as Chat and Responses bodies are:
+/// for its images. Base64 anywhere else is refused with 413 in Anthropic's
+/// shape: in a text block before any parse, under a tool input's `data`
+/// key (set aside by the scan as a Messages source would be) once the parse
+/// shows it is no image; a document block is outside the grammar (400).
+#[dbtest::test]
+async fn a_large_messages_body_is_admitted_only_for_its_images(pool: PgPool) {
+    use base64::Engine as _;
+    let w = world_for(pool, ImageInputLimits::default(), true, "anthropic").await;
+    let image = png_url(4_000_000, "l");
+    let body = serde_json::to_vec(&messages_body(vec![
+        json!({"type":"text","text":"what?"}),
+        image_block(&image),
+    ]))
+    .unwrap();
+    assert!(body.len() > 2 * MIB);
+    let (status, _, value, _) = send(&w, "/v1/messages", Some(&w.token), body, true).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let base64 = base64::engine::general_purpose::STANDARD.encode(vec![7u8; 3 * MIB]);
+    let refusals = [
+        (
+            messages_body(vec![json!({"type":"text","text":base64})]),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+        ),
+        (
+            json!({"model":"company/smart","max_tokens":16,"messages":[
+                {"role":"user","content":"go"},
+                {"role":"assistant","content":[{"type":"tool_use","id":"c","name":"store","input":{"data":base64}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"c","content":"ok"}]}
+            ],"tools":[{"name":"store","input_schema":{"type":"object"}}]}),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+        ),
+        (
+            messages_body(vec![
+                json!({"type":"document","source":{"type":"base64","media_type":"application/pdf","data":base64}}),
+            ]),
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+        ),
+    ];
+    let executed = executions(&w).await;
+    for (body, want, kind) in refusals {
+        let (status, _, value, _) = send(
+            &w,
+            "/v1/messages",
+            Some(&w.token),
+            serde_json::to_vec(&body).unwrap(),
+            true,
+        )
+        .await;
+        assert_eq!(status, want, "{value}");
+        assert_eq!(
+            (value["type"].as_str(), value["error"]["type"].as_str()),
+            (Some("error"), Some(kind)),
+            "{value}"
+        );
+        assert_eq!(in_use(), 0, "the share is back");
+    }
+    assert_eq!(executions(&w).await, executed, "nothing admitted");
+}
+
+#[dbtest::test]
+async fn a_messages_image_reaches_no_log_table_metric_or_error_body_natively(pool: PgPool) {
+    messages_canary(pool, "anthropic").await;
+}
+
+#[dbtest::test]
+async fn a_messages_image_reaches_no_log_table_metric_or_error_body_translated(pool: PgPool) {
+    messages_canary(pool, "bedrock").await;
+}
+
+/// Served, refused before admission (bytes that are not the declared type)
+/// and refused by the upstream: a Messages image's bytes reach the upstream
+/// body and nothing else.
+async fn messages_canary(pool: PgPool, provider: &'static str) {
+    let capture = crate::log_capture_test::Capture::start();
+    let w = world_for(pool, ImageInputLimits::default(), true, provider).await;
+    allow_images(&w, true).await;
+    let url = png_url(4096, "QwImageCanaryQ");
+    let data = url.split_once(',').unwrap().1.to_owned();
+    let mut answers = String::new();
+    for (url, want) in [
+        (url.clone(), StatusCode::OK),
+        (
+            url.replace("image/png", "image/jpeg"),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let body = messages_body(vec![
+            json!({"type":"text","text":"what?"}),
+            image_block(&url),
+        ]);
+        let (status, _, value, _) = send(
+            &w,
+            "/v1/messages",
+            Some(&w.token),
+            serde_json::to_vec(&body).unwrap(),
+            true,
+        )
+        .await;
+        assert_eq!(status, want, "{provider}: {value}");
+        answers.push_str(&value.to_string());
+    }
+    w.upstream
+        .failing
+        .lock()
+        .unwrap()
+        .push(if provider == "anthropic" {
+            "/messages"
+        } else {
+            "/converse"
+        });
+    let body = messages_body(vec![
+        json!({"type":"text","text":"what?"}),
+        image_block(&url),
+    ]);
+    let (status, _, value, _) = send(
+        &w,
+        "/v1/messages",
+        Some(&w.token),
+        serde_json::to_vec(&body).unwrap(),
+        true,
+    )
+    .await;
+    assert!(!status.is_success(), "{provider}: {status} {value}");
+    answers.push_str(&value.to_string());
+    assert!(!answers.contains(&data[40..80]) && !answers.contains("ImageCanary"));
+    assert!(
+        w.upstream.bodies.lock().unwrap()[0]
+            .to_string()
+            .contains(&data[40..80])
+    );
+    assert_nowhere(&w, &data, &capture).await;
 }

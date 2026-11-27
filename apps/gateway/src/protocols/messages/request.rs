@@ -1,7 +1,6 @@
 //! Explicit Claude Code field grammar. Nothing here is a passthrough payload.
 use super::super::responses::{message, name, string, validate};
 use super::*;
-use base64::Engine as _;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -72,7 +71,7 @@ fn cache(block: &Value, options: &mut MessagesOptions) -> Result<()> {
 // Version note (#430): `document`, `search_result` and `citations` are not in
 // this grammar. anthropic-version 2026-10-21 changes their meaning, so adding
 // any of them needs a version-aware rule (see `Request::check_version`).
-fn text_blocks(value: &Value, options: &mut MessagesOptions, images: bool) -> Result<Vec<String>> {
+fn text_blocks(value: &Value, options: &mut MessagesOptions) -> Result<Vec<String>> {
     if let Value::String(s) = value {
         return Ok(vec![s.clone()]);
     }
@@ -88,56 +87,61 @@ fn text_blocks(value: &Value, options: &mut MessagesOptions, images: bool) -> Re
                 cache(block, options)?;
                 text.push(string(&block["text"])?);
             }
-            Some("image") if images => image(block, options)?,
             _ => return Err(invalid("content.type")),
         }
     }
     Ok(text)
 }
-fn image(block: &Value, options: &mut MessagesOptions) -> Result<()> {
+/// A base64 image block as the canonical image, validated as Chat and
+/// Responses images are (`image_input::Images::take`: strict base64, the
+/// declared type's signature, the decoded size, the header's dimensions).
+/// No remote URL sources: neither gateway nor upstream fetches caller URLs.
+fn image(block: &Value, options: &mut MessagesOptions) -> Result<ImageInput> {
     object(block, &["type", "source", "cache_control"], "image")?;
     cache(block, options)?;
     let source = &block["source"];
-    match source["type"].as_str() {
-        Some("base64") => {
-            object(source, &["type", "media_type", "data"], "image.source")?;
-            if !matches!(
-                source["media_type"].as_str(),
-                Some("image/png" | "image/jpeg" | "image/gif" | "image/webp")
-            ) {
-                return Err(invalid("image.source"));
-            }
-            let data = source["data"]
-                .as_str()
-                .ok_or_else(|| invalid("image.source.data"))?;
-            // Bound before decoding; the outer 2 MiB HTTP limit still applies.
-            if data.is_empty() || data.len() > (5 * 1024 * 1024_usize).div_ceil(3) * 4 {
-                return Err(invalid("image.source.data"));
-            }
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(data)
-                .map_err(|_| invalid("image.source.data"))?;
-            let valid = match source["media_type"].as_str() {
-                Some("image/png") => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-                Some("image/jpeg") => bytes.starts_with(&[0xff, 0xd8, 0xff]),
-                Some("image/gif") => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
-                Some("image/webp") => {
-                    bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP")
-                }
-                _ => false,
-            };
-            if !valid || bytes.len() > 5 * 1024 * 1024 {
-                return Err(invalid("image.source"));
-            }
-        }
-        _ => return Err(invalid("image.source")),
+    if source["type"].as_str() != Some("base64") {
+        return Err(invalid("image.source"));
     }
-    // No remote URL sources: neither gateway nor upstream may fetch caller URLs.
-    if options.images.len() >= 20 {
+    object(source, &["type", "media_type", "data"], "image.source")?;
+    let media_type = match source["media_type"].as_str() {
+        Some(t @ ("image/png" | "image/jpeg" | "image/gif" | "image/webp")) => t,
+        _ => return Err(invalid("image.source")),
+    };
+    let data = source["data"]
+        .as_str()
+        .ok_or_else(|| invalid("image.source.data"))?;
+    if options.image_count >= crate::protocols::image_input::MAX_IMAGES {
         return Err(invalid("image"));
     }
-    options.images.push(block.clone());
-    Ok(())
+    let image = crate::protocols::image_input::Images::default().take(
+        format!("data:{media_type};base64,{data}"),
+        None,
+        "image.source",
+    )?;
+    options.image_count += 1;
+    Ok(image)
+}
+/// Appends text to a canonical content, joined to the text before it.
+fn push_text(content: &mut Option<Content>, text: String) {
+    match content.get_or_insert_with(|| Content::Text(String::new())) {
+        Content::Text(joined) => joined.push_str(&text),
+        Content::Parts(parts) => match parts.last_mut() {
+            Some(Part::Text(joined)) => joined.push_str(&text),
+            _ => parts.push(Part::Text(text)),
+        },
+    }
+}
+/// Appends an image to a canonical content, which then holds parts.
+fn push_image(content: &mut Option<Content>, image: ImageInput) {
+    let mut parts = match content.take() {
+        None => vec![],
+        Some(Content::Text(text)) if text.is_empty() => vec![],
+        Some(Content::Text(text)) => vec![Part::Text(text)],
+        Some(Content::Parts(parts)) => parts,
+    };
+    parts.push(Part::Image(image));
+    *content = Some(Content::Parts(parts));
 }
 fn thinking(value: &Value, maximum: u32) -> Result<()> {
     object(value, &["type", "budget_tokens", "display"], "thinking")?;
@@ -291,11 +295,23 @@ fn check_metadata(metadata: Option<WireMetadata>) -> Result<()> {
     }
     Ok(())
 }
+/// The native envelope of the messages. An image block's base64 is not
+/// copied: its `data` is the placeholder of that image (numbered in wire
+/// order, as the parser takes images), and the body sent splices the
+/// canonical image's base64 in (`image_body::json_body_base64`), so an
+/// image's bytes are held once.
 fn native_messages(wire: &[WireMessage]) -> Vec<Value> {
+    let mut images = 0;
     wire.iter()
         .map(|m| {
             let mut content = match &m.content {
                 Value::String(text) => json!([{"type":"text","text":text}]),
+                Value::Array(blocks) => Value::Array(
+                    blocks
+                        .iter()
+                        .map(|block| native_block(block, &mut images))
+                        .collect(),
+                ),
                 other => other.clone(),
             };
             if let Some(blocks) = content.as_array_mut() {
@@ -309,13 +325,68 @@ fn native_messages(wire: &[WireMessage]) -> Vec<Value> {
         })
         .collect()
 }
+/// One content block of the native envelope, at the two places the parser
+/// takes images: a message's content and a tool result's content.
+fn native_block(block: &Value, images: &mut usize) -> Value {
+    match block["type"].as_str() {
+        Some("image") => without_data(block, images),
+        Some("tool_result") => match block.get("content") {
+            Some(Value::Array(inner)) => {
+                let mut block = block.clone();
+                block["content"] = Value::Array(
+                    inner
+                        .iter()
+                        .map(|b| {
+                            if b["type"] == "image" {
+                                without_data(b, images)
+                            } else {
+                                b.clone()
+                            }
+                        })
+                        .collect(),
+                );
+                block
+            }
+            _ => block.clone(),
+        },
+        _ => block.clone(),
+    }
+}
+/// An image block with its source's `data` replaced by the next placeholder.
+fn without_data(block: &Value, images: &mut usize) -> Value {
+    let Some(fields) = block.as_object() else {
+        return block.clone();
+    };
+    let mut out = serde_json::Map::new();
+    for (key, value) in fields {
+        let value = match (key.as_str(), value.as_object()) {
+            ("source", Some(source)) => Value::Object(
+                source
+                    .iter()
+                    .map(|(k, v)| {
+                        let v = if k == "data" {
+                            json!(crate::providers::image_body::placeholder(*images))
+                        } else {
+                            v.clone()
+                        };
+                        (k.clone(), v)
+                    })
+                    .collect(),
+            ),
+            _ => value.clone(),
+        };
+        out.insert(key.clone(), value);
+    }
+    *images += 1;
+    Value::Object(out)
+}
 fn system_messages(
     system: Option<Value>,
     options: &mut MessagesOptions,
     messages: &mut Vec<Message>,
 ) -> Result<()> {
     if let Some(system) = system {
-        for text in text_blocks(&system, options, false)? {
+        for text in text_blocks(&system, options)? {
             messages.push(message(Role::System, text));
         }
     }
@@ -372,16 +443,12 @@ fn content_block(
         Some("text") => {
             object(block, &["type", "text", "cache_control"], "text")?;
             cache(block, options)?;
-            match turn
-                .content
-                .get_or_insert_with(|| Content::Text(String::new()))
-            {
-                Content::Text(text) => text.push_str(&string(&block["text"])?),
-                // A native turn's images stay in the validated envelope.
-                Content::Parts(_) => return Err(InferenceError::InvalidRequest),
-            }
+            push_text(&mut turn.content, string(&block["text"])?);
         }
-        Some("image") => image(block, options)?,
+        // In any turn, as native Anthropic always took them; a translated
+        // route refuses an image outside a user turn or tool result
+        // (`providers::messages::validate`).
+        Some("image") => push_image(&mut turn.content, image(block, options)?),
         Some("thinking") if role == Role::Assistant => {
             object(block, &["type", "thinking", "signature"], "thinking")?;
             string(&block["thinking"])?;
@@ -453,9 +520,10 @@ fn tool_result(
         .unwrap_or(false);
     let content = block
         .get("content")
-        .map(|v| text_blocks(v, options, true).map(|v| v.concat()))
+        .map(|v| tool_content(v, options))
         .transpose()?
-        .unwrap_or_default();
+        .flatten()
+        .unwrap_or_else(|| Content::Text(String::new()));
     // Canonical tool results each carry one correlation id.
     // Keep any preceding user text in its original order;
     // adapters retain their normal correlation validation.
@@ -467,12 +535,35 @@ fn tool_result(
     }
     messages.push(Message {
         role: Role::Tool,
-        content: Some(Content::Text(content)),
+        content: Some(content),
         tool_call_id: Some(id),
         tool_result_is_error: is_error,
         tool_calls: vec![],
     });
     Ok(())
+}
+/// A tool result's content: a string, or text and image blocks in order.
+fn tool_content(value: &Value, options: &mut MessagesOptions) -> Result<Option<Content>> {
+    if let Value::String(s) = value {
+        return Ok(Some(Content::Text(s.clone())));
+    }
+    let blocks = value.as_array().ok_or_else(|| invalid("content"))?;
+    if blocks.len() > 256 {
+        return Err(invalid("content"));
+    }
+    let mut content = None;
+    for block in blocks {
+        match block["type"].as_str() {
+            Some("text") => {
+                object(block, &["type", "text", "cache_control"], "text")?;
+                cache(block, options)?;
+                push_text(&mut content, string(&block["text"])?);
+            }
+            Some("image") => push_image(&mut content, image(block, options)?),
+            _ => return Err(invalid("content.type")),
+        }
+    }
+    Ok(content)
 }
 fn function_tool(t: &Value, options: &mut MessagesOptions) -> Result<FunctionTool> {
     if t.get("type").is_some_and(|v| v != "custom") {
@@ -583,8 +674,7 @@ impl Request {
         }
         // Native image/thinking-only turns have no text representation, but
         // still need a canonical envelope for capability/admission validation.
-        if messages.is_empty()
-            && (!options.images.is_empty() || !options.history_thinking.is_empty())
+        if messages.is_empty() && (options.image_count > 0 || !options.history_thinking.is_empty())
         {
             messages.push(Message {
                 role: Role::User,

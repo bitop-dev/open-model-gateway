@@ -6,10 +6,12 @@
 //! ordinary strings) must fit the text limit, or parsing it could build a
 //! tree many times its size. [`outside_images`] walks the JSON string
 //! literals with no allocation and sets aside the raw length of at most
-//! [`MAX_IMAGES`] of the longest literals that are whole image URLs as
-//! `image_input::Images::take` accepts them (a PNG, JPEG, WebP or GIF
-//! `data:` prefix, then only base64 characters, at most its length bound);
-//! whatever is left is what parsing may turn into structure. Capping the
+//! [`MAX_IMAGES`] of the longest literals that are an image's data: a whole
+//! image URL as `image_input::Images::take` accepts it (a PNG, JPEG, WebP or
+//! GIF `data:` prefix, then only base64 characters, at most its length
+//! bound), or a Messages image source's `data` (the value of a `data` key
+//! that is only padded base64, within the same bound); whatever is left is
+//! what parsing may turn into structure. Capping the
 //! set-aside at the image limit means many small image strings cannot lift
 //! the bound, and holding it to the image grammar means what is set aside is
 //! printable ASCII: a parser that echoes one in an error (an image URL in a
@@ -33,17 +35,38 @@ use crate::{
 pub(super) fn outside_images(body: &[u8]) -> usize {
     let mut longest = [0usize; MAX_IMAGES];
     let mut at = 0;
+    // Where the string value of the last `data` key opens, if it is one.
+    let mut data_value = None;
     while let Some(open) = body[at..].iter().position(|&b| b == b'"') {
         let start = at + open + 1;
         let end = string_end(body, start);
         let literal = &body[start..end];
         // An image is always a value; a key is structure, which parsers copy
         // more often than a value (the error path keeps each key on it).
-        let key = body[(end + 1).min(body.len())..]
+        let after = (end + 1).min(body.len());
+        let colon = body[after..]
             .iter()
-            .find(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
-            == Some(&b':');
-        if !key && is_image_url(literal) {
+            .position(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+            .map(|i| after + i)
+            .filter(|&i| body[i] == b':');
+        if let Some(colon) = colon {
+            // A key: remember where its value opens when that value is a
+            // string, so only that literal is read as the key's value.
+            data_value = (literal == b"data")
+                .then(|| {
+                    body[colon + 1..]
+                        .iter()
+                        .position(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+                        .map(|i| colon + 1 + i)
+                        .filter(|&i| body[i] == b'"')
+                        .map(|i| i + 1)
+                })
+                .flatten();
+            at = after;
+            continue;
+        }
+        let source_data = data_value.take() == Some(start) && is_base64(literal);
+        if source_data || is_image_url(literal) {
             // Keep the longest: replace the shortest held so far.
             let (shortest, held) = longest
                 .iter_mut()
@@ -133,19 +156,31 @@ fn is_image_url(literal: &[u8]) -> bool {
     {
         return false;
     }
+    base64_length(chars).is_some()
+}
+
+/// Whether a raw literal decodes to padded base64 alone, one to
+/// [`MAX_BASE64_BYTES`] characters (a Messages image source's `data`).
+fn is_base64(literal: &[u8]) -> bool {
+    base64_length(decoded(literal)).is_some_and(|n| n % 4 == 0)
+}
+
+/// The count of decoded characters when all are base64, at most
+/// [`MAX_BASE64_BYTES`] and at least one.
+fn base64_length(chars: impl Iterator<Item = Option<u8>>) -> Option<usize> {
     let mut data = 0usize;
     for c in chars {
         match c {
             Some(b) if b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=') => {
                 data += 1;
                 if data > MAX_BASE64_BYTES {
-                    return false;
+                    return None;
                 }
             }
-            _ => return false,
+            _ => return None,
         }
     }
-    data > 0
+    (data > 0).then_some(data)
 }
 
 /// Four hex digits, exactly as JSON writes them (no sign).

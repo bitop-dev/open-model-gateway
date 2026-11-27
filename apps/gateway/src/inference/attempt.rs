@@ -223,19 +223,24 @@ impl Engine {
             std::collections::HashMap::new();
         // An image goes only to a route whose operator allows image input
         // (0094), before the route plan, so failover never lands it elsewhere.
+        // A Messages request to an adapter that forwards its native envelope
+        // needs no opt-in, as native Messages images never have.
         let images = request.has_images();
         for deployment in deployments {
             if !deployment
                 .supported_protocols
                 .iter()
                 .any(|p| p == protocol.as_str())
-                || (images && !deployment.image_input)
             {
                 continue;
             }
             let Some(adapter) = self.registry.get(&deployment.provider) else {
                 continue;
             };
+            let native = protocol == ApiProtocol::Messages && adapter.forwards_native_messages();
+            if images && !deployment.image_input && !native {
+                continue;
+            }
             if !(adapter.supports_protocol(protocol) && adapter.supports_chat_request(request)) {
                 continue;
             }

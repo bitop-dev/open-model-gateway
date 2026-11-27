@@ -773,17 +773,27 @@ async fn images_the_messages_wire_cannot_carry_are_refused_before_anything_is_se
             Some(InferenceError::InvalidField("detail"))
         );
     }
-    // A native batch line never carries an image or its placeholder.
-    let line = crate::jobs::types::BatchRequest::Chat(image_request_with(false, None));
+    // A native batch line carries an image's base64 where it belongs, spliced
+    // as in a request body: never a placeholder.
+    let request = image_request_with(false, None);
+    let data = super::super::image_body::images(&request)
+        .next()
+        .unwrap()
+        .base64()
+        .to_owned();
+    let line = crate::jobs::types::BatchRequest::Chat(request);
+    let encoded = adapter
+        .encode_native_line(
+            &target(),
+            crate::jobs::types::BatchEndpoint::Messages,
+            "l0",
+            &line,
+        )
+        .unwrap();
+    let line: Value = serde_json::from_slice(&encoded).unwrap();
     assert_eq!(
-        adapter
-            .encode_native_line(
-                &target(),
-                crate::jobs::types::BatchEndpoint::Messages,
-                "l0",
-                &line
-            )
-            .err(),
-        Some(InferenceError::InvalidField("image"))
+        line["params"]["messages"][0]["content"][1]["source"]["data"],
+        data
     );
+    assert!(!String::from_utf8(encoded).unwrap().contains("omg-image-"));
 }
