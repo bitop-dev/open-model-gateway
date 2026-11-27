@@ -77,7 +77,7 @@ export function inspectionSentence(e: Partial<StoredRule>): string {
   if (e.input?.action === "off") return "Off: checks nothing on input.";
   const count = e.detector?.pattern_count ?? e.detector?.patterns?.length ?? 0, looks = looksFor(e);
   const secrets = "secrets (keys, tokens, private keys, connection strings)", custom = `matches of ${count === 1 ? "1 custom pattern" : `${count} custom patterns`}`;
-  const personal = `personal data: ${list((e.detector?.kinds ?? []).map(k => kindNouns[k]))}`;
+  const personal = `personal data: ${list((e.detector?.kinds ?? []).map(kindNoun))}`;
   // Every category the rule checks (a rule written through the API may have several).
   const cats = e.detector?.categories ?? [];
   const parts = cats.length ? [...(cats.includes("personal_data") ? [personal] : []), ...(cats.includes("secret") ? [secrets] : []), ...(cats.includes("custom") ? [custom] : [])] : [];
@@ -109,12 +109,15 @@ export const looksForLabels: Record<LooksFor, string> = { secrets: "Secrets", cu
 /** Each kind as a noun phrase (rule sentences) and what it matches (the rule dialog), as the gateway's kind table says (`guardrails::personal::KINDS`). */
 export const kindNouns: Record<Kind, string> = { email: "email addresses", phone: "phone numbers", card: "payment card numbers", iban: "IBANs", us_ssn: "US Social Security numbers", ip: "public IP addresses" };
 export const personalKindLabels: Record<Kind, string> = { email: "Email", phone: "Phone", card: "Payment card", iban: "IBAN", us_ssn: "US SSN", ip: "IP address" };
+/** A kind's label, or the kind itself when this dashboard does not know it (a newer server). */
+export const kindLabel = (k: string) => (personalKindLabels as Record<string, string | undefined>)[k] ?? k;
+const kindNoun = (k: string) => (kindNouns as Record<string, string | undefined>)[k] ?? k;
 export const kindMatches: Record<Kind, string> = {
-  email: "Email addresses, except at reserved example domains (example.com, .test, .invalid, .localhost) and SSH remotes (git@host:repo).",
-  phone: "Phone numbers in international form (+ and 8 to 15 digits) or North American form with separators ((415) 555-2671, 415-555-2671, 1-415-555-2671); fictional 555-01xx numbers excepted.",
-  card: "Payment card numbers of the major networks: 13 to 19 digits, whole or in groups, with a valid check digit (Luhn).",
+  email: "Email addresses (local parts in Latin, Greek or Cyrillic letters), except at reserved example domains (example.com, .test, .invalid, .localhost), file names (logo@2x.png) and SSH remotes (git@host:org/repo, …/repo.git).",
+  phone: "Phone numbers in international form (+ or 00, then 8 to 15 digits) or North American form with dashes, dots or parentheses ((415) 555-2671, 415-555-2671, 1-415-555-2671); fictional 555-01xx numbers and dates after a + (+2026-11-27) excepted. National formats outside North America are not covered.",
+  card: "Payment card numbers of the major networks (Visa, Mastercard, Maestro, American Express, Discover, JCB, Diners Club, UnionPay, Mir): 13 to 19 digits, whole or in groups, with a valid check digit (Luhn).",
   iban: "International bank account numbers (IBAN), in either case, with the length of their country and a valid check (mod 97).",
-  us_ssn: "US Social Security numbers written with dashes or spaces (123-45-6789), within the issued ranges. Other countries' identifiers are not built in: use a custom pattern.",
+  us_ssn: "US Social Security numbers written with dashes (123-45-6789), within the issued ranges. Other countries' identifiers are not built in: use a custom pattern.",
   ip: "Public IP addresses (IPv4, IPv6 and IPv4 written as IPv6) only: never loopback, private, link-local, shared, multicast, reserved or documentation addresses.",
 };
 

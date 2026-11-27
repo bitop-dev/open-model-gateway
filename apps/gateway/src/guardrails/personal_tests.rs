@@ -160,6 +160,101 @@ fn values_next_to_other_text_are_still_found() {
         "2001:4860:4860::8888",
     );
     holds(Kind::Ip, "id:2606:4700::1111", "2606:4700::1111");
+    // A card after a date, a table row or an order line: each later group
+    // of the candidate is a start.
+    for text in [
+        "2024-01-15 4111111111111111 $12.00",
+        "12 34 56 78 4111111111111111",
+        "order 778812 qty 2 on 2026-11-27 4111111111111111",
+    ] {
+        holds(Kind::Card, text, "4111111111111111");
+    }
+    holds(
+        Kind::Card,
+        "10 20 30 40 50 4111 1111 1111 1111",
+        "4111 1111 1111 1111",
+    );
+    // An IBAN after a token that reads as its start.
+    for (text, iban) in [
+        (
+            "Ref12 DE89 3704 0044 0532 0130 00",
+            "DE89 3704 0044 0532 0130 00",
+        ),
+        (
+            "FY24 DE89 3704 0044 0532 0130 00",
+            "DE89 3704 0044 0532 0130 00",
+        ),
+        (
+            "ID99 GB82 WEST 1234 5698 7654 32",
+            "GB82 WEST 1234 5698 7654 32",
+        ),
+    ] {
+        holds(Kind::Iban, text, iban);
+    }
+}
+
+#[test]
+fn a_letter_underscore_or_punctuation_beside_a_checksummed_value_does_not_hide_it() {
+    for text in [
+        "x4111111111111111",
+        "id_4111111111111111",
+        "ref-4111111111111111",
+        "4111111111111111_x",
+        "card:4111111111111111.",
+    ] {
+        holds(Kind::Card, text, "4111111111111111");
+    }
+    holds(Kind::Card, "cc-4111-1111-1111-1111", "4111-1111-1111-1111");
+    holds(
+        Kind::Iban,
+        "refDE89370400440532013000",
+        "DE89370400440532013000",
+    );
+    holds(
+        Kind::Iban,
+        "IDDE89370400440532013000",
+        "DE89370400440532013000",
+    );
+    holds(
+        Kind::Iban,
+        "_DE89370400440532013000.",
+        "DE89370400440532013000",
+    );
+    // An address: leading dots and characters beyond the 64 a local part
+    // holds are trimmed; a `:` after it is an SSH remote only when what
+    // follows is a repository path.
+    holds(Kind::Email, ".alice@acme.com", "alice@acme.com");
+    holds(Kind::Email, "...alice@acme.com", "alice@acme.com");
+    let long = format!("{}alice@acme.com", "a".repeat(65));
+    holds(
+        Kind::Email,
+        &long,
+        &long[long.len() - "@acme.com".len() - 64..],
+    );
+    holds(Kind::Email, "alice@acme.com:x/y", "alice@acme.com");
+    holds(Kind::Email, "alice@acme.com:8080", "alice@acme.com");
+}
+
+/// What design §14 says still evades, and what it says matches although it
+/// may not be personal data: kept true by these.
+#[test]
+fn what_is_documented_as_evading_or_matching_holds() {
+    holds(Kind::Phone, "tel:+1 415 555 2671", "+1 415 555 2671");
+    holds(Kind::Ip, "ip:8.8.8.8", "8.8.8.8");
+    miss(Kind::Phone, "x415-555-2671");
+    miss(Kind::Phone, "415 555 2671");
+    miss(Kind::UsSsn, "ssn_512-34-5678");
+    miss(Kind::UsSsn, "id-512-34-5678");
+    miss(Kind::Ip, "ip_8.8.8.8");
+    holds(Kind::Ip, "4.0.0.0", "4.0.0.0");
+    holds(Kind::Card, "4242 4242 4242 4242", "4242 4242 4242 4242");
+    holds(
+        Kind::Iban,
+        "GB82 WEST 1234 5698 7654 32",
+        "GB82 WEST 1234 5698 7654 32",
+    );
+    holds(Kind::Phone, "+1712345678", "+1712345678");
+    holds(Kind::Email, "a@b.zip", "a@b.zip");
 }
 
 #[test]
@@ -196,6 +291,19 @@ fn one_kind_never_hides_or_crowds_out_another() {
     let mut input = Inspection::default();
     input.push(&many, Part::Content);
     assert_eq!(findings(&input).distinct_kind(&input, Kind::Email), 51);
+    // At the cap: more distinct addresses than a kind keeps, then a card.
+    // Email stops at its cap; the card is still found.
+    let full = format!(
+        "{}4111 1111 1111 1111",
+        (0..MAX_FINDINGS + 50)
+            .map(|i| format!("u{i}@acme.io "))
+            .collect::<String>()
+    );
+    let mut input = Inspection::default();
+    input.push(&full, Part::Content);
+    let f = findings(&input);
+    assert_eq!(f.distinct_kind(&input, Kind::Email), MAX_FINDINGS);
+    assert_eq!(f.distinct_kind(&input, Kind::Card), 1);
 }
 
 #[test]
@@ -211,9 +319,13 @@ fn emails() {
         "left-pad@1.3.0",
         "@types/node",
         "git@github.com:acme/repo.git",
+        "git@github.com:acme/repo",
+        "deploy@build.acme.io:infra.git",
         "nginx@sha256:abc",
-        ".dot@acme.io",
         "a..b@acme.io",
+        "logo@2x.png",
+        "icon@3x.png",
+        "spinner@2x.svg",
     ] {
         miss(Kind::Email, text);
     }
@@ -222,6 +334,8 @@ fn emails() {
 #[test]
 fn phones() {
     hit(Kind::Phone, "+1 415 555 2671");
+    hit(Kind::Phone, "0044 20 7946 0958");
+    hit(Kind::Phone, "0049 30 1234567");
     hit(Kind::Phone, "+44 20 7946 0958");
     hit(Kind::Phone, "+4915112345678");
     hit(Kind::Phone, "(415) 555-2671");
@@ -237,6 +351,12 @@ fn phones() {
         "call +12  345 678 90",
         "id 1415-555-2671",
         "123-456-7890",
+        "+2026-11-27",
+        "+20240101",
+        "512 256 1024",
+        "415 555 2671",
+        "00441234567890",
+        "DE89 3704 0044 0532 0130 00",
     ] {
         miss(Kind::Phone, text);
     }
@@ -248,14 +368,19 @@ fn cards() {
     hit(Kind::Card, "5555555555554444");
     hit(Kind::Card, "3782 822463 10005");
     hit(Kind::Card, "6011-1111-1111-1117");
+    // Maestro and Mir.
+    hit(Kind::Card, "6759649826438453");
+    hit(Kind::Card, "2200000000000004");
     for text in [
         "4111111111111112",
         "1234567890123456",
         "4111-1111 1111-1111",
         "41111 1111 1111 111",
         "94111111111111111",
-        "ref-4111111111111111",
-        "4111111111111111_x",
+        "41111111111111110",
+        "+4111111111111111",
+        // A digest's digits are no card, however they read.
+        "0a1b4111111111111111c2d3e4f5a6b7c8d9e0f1",
     ] {
         miss(Kind::Card, text);
     }
@@ -271,7 +396,8 @@ fn ibans() {
         "XX89370400440532013000",
         "DE8937040044053201300",
         "DE89 370 40044 0532 0130 00",
-        "IDDE89370400440532013000",
+        "DE89370400440532013000X",
+        "DE893704004405320130001",
     ] {
         miss(Kind::Iban, text);
     }
@@ -280,8 +406,9 @@ fn ibans() {
 #[test]
 fn us_ssns() {
     hit(Kind::UsSsn, "512-34-5678");
-    hit(Kind::UsSsn, "512 34 5678");
     for text in [
+        "512 34 5678",
+        "128 64 2048",
         "000-12-3456",
         "666-12-3456",
         "912-34-5678",
@@ -449,6 +576,20 @@ fn seeded() -> Vec<(&'static str, Vec<String>)> {
             200 + r.below(400),
             r.below(100000)
         ));
+        // Added lines of a diff: a date, a compact date, a diffstat.
+        numeric.push(format!(
+            "+{}-{:02}-{:02}",
+            1990 + r.below(60),
+            1 + r.below(12),
+            1 + r.below(28)
+        ));
+        numeric.push(format!(
+            "+{}{:02}{:02}",
+            1990 + r.below(60),
+            1 + r.below(12),
+            1 + r.below(28)
+        ));
+        numeric.push(format!("+{} -{}", r.below(5000), r.below(5000)));
     }
     let digit_runs = (0..10_000)
         .map(|_| {
@@ -488,7 +629,7 @@ fn measure(items: &[String]) -> std::collections::BTreeMap<Kind, usize> {
 /// The asserted bounds: false positives per 10,000 items, per kind and
 /// corpus. Zero everywhere except card numbers among random digit runs,
 /// where an issuer prefix at an issued length and a valid check digit happen
-/// by chance (measured 118 in 10,000).
+/// by chance (measured 158 in 10,000, Maestro's short prefixes included).
 fn bound(corpus: &str, kind: Kind) -> usize {
     match (corpus, kind) {
         ("digit runs (13-19 digits)", Kind::Card) => 200,
@@ -531,8 +672,10 @@ fn false_positives_stay_within_their_bounds_on_the_seeded_corpora() {
 
 /// This repository's source and docs, measured and reported (per MB), never
 /// bounded: real text where an example address or a version string may
-/// appear at any time.
+/// appear at any time. Report only, and ignored: it reads about 20 MB and
+/// needs the whole tree (docs/guardrails-design.md §14 has the command).
 #[test]
+#[ignore = "report only: reads the repository's source and docs"]
 fn the_repository_source_and_docs_are_measured() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut sources = Vec::new();

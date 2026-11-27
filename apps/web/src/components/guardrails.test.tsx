@@ -10,7 +10,7 @@ import { AdminGuardrails, WorkspaceGuardrailsAdmin, WorkspaceGuardrailsTab } fro
 import { GuardrailDecisions } from "../pages/request-detail";
 import {
   guardrailsPath, inspectedSentence, inspectionSentence, platformGuardrailsPath, ruleInput, stricterActions, stricterPart, toInput, typeDefaultPath,
-  type EffectiveEntry, type PlatformWorkspaceGuardrails, type RuleSet, type StoredRule, type TypeDefault, type WorkspaceGuardrails,
+  type EffectiveEntry, type Kind, type PlatformWorkspaceGuardrails, type RuleSet, type StoredRule, type TypeDefault, type WorkspaceGuardrails,
 } from "../lib/guardrails";
 import { attemptFilters, logsSearch, requestFilters, requestQuery } from "../lib/requests";
 import { dashboardHref, parseDashboardLocation } from "../lib/locations";
@@ -369,7 +369,7 @@ describe("Personal data (#841)", () => {
     await user.selectOptions(screen.getByLabelText("Looks for"), "personal");
     const boxes = screen.getAllByRole("checkbox").filter(b => /^(Email|Phone|Payment card|IBAN|US SSN|IP address):/.test(b.getAttribute("aria-label") ?? b.closest("label")?.textContent ?? ""));
     expect(boxes).toHaveLength(6);
-    expect(boxes.every(b => !(b as HTMLInputElement).checked)).toBe(true);
+    expect(boxes.every(b => b.getAttribute("aria-checked") === "false")).toBe(true);
     expect(screen.getByText(/Public IP addresses .*only: never loopback/)).toBeTruthy();
     // Nothing ticked: nothing to look for, so the dialog refuses.
     await user.click(screen.getByRole("button", { name: "Add rule" }));
@@ -383,6 +383,62 @@ describe("Personal data (#841)", () => {
   it("shows a decision's kind", () => {
     const html = markup(<GuardrailDecisions decisions={[{ rule_set_id: "set-p", rule_id: "11111111-2222-4333-8444-555555555555", revision: 3, layer: "type_default", stage: "input", detector: "pattern", category: "personal_data", kind: "card", action: "blocked", count: 1, refused: true, created_at: "2026-11-26T00:00:00Z" }]} />);
     expect(html).toContain("Personal data · Payment card");
+  });
+  it("names a kind this dashboard does not know by its value, never \"undefined\"", async () => {
+    const newer = { ...personal, detector: { ...personal.detector, kinds: ["email", "passport"] as Kind[] } };
+    expect(inspectionSentence(newer)).toContain("personal data: email addresses and passport in the input");
+    const html = markup(<GuardrailDecisions decisions={[{ rule_set_id: "set-p", rule_id: "11111111-2222-4333-8444-555555555555", revision: 3, layer: "type_default", stage: "input", detector: "pattern", category: "personal_data", kind: "passport", action: "monitored", count: 1, refused: false, created_at: "2026-11-26T00:00:00Z" }]} />);
+    expect(html).toContain("Personal data · passport");
+    serve({ [platformGuardrailsPath(team.id)]: () => platformView({ decisions_this_month: [{ action: "monitored", category: "personal_data", kind: "passport" as Kind, decisions: 2, findings: 3 }] }) });
+    mount(<WorkspaceGuardrailsAdmin id={team.id} writable />);
+    const table = await screen.findByRole("table", { name: "Guardrail decisions this month" });
+    expect(table.textContent).toContain("passport");
+    expect(table.textContent).not.toContain("undefined");
+  });
+  const local = (rule: StoredRule) => view({ local: { ...localSet, rules: [rule] }, effective: [effective(rule, "workspace_local", "set-l")] });
+  it("renames a personal-data rule and changes its kinds", async () => {
+    const fetch = serve({ [guardrailsPath(team.id)]: () => local(personal) });
+    const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
+    await user.click(await screen.findByRole("button", { name: "Edit Personal data" }));
+    expect((screen.getByLabelText("Looks for") as HTMLSelectElement).value).toBe("personal");
+    expect(screen.getByRole("checkbox", { name: /^Email:/ }).getAttribute("aria-checked")).toBe("true");
+    expect(screen.getByRole("checkbox", { name: /^IP address:/ }).getAttribute("aria-checked")).toBe("true");
+    await user.clear(screen.getByLabelText("Name"));
+    await user.type(screen.getByLabelText("Name"), "No cards or mail");
+    await user.click(screen.getByRole("checkbox", { name: /^IP address:/ }));
+    await user.click(screen.getByRole("checkbox", { name: /^Payment card:/ }));
+    await user.click(screen.getByRole("button", { name: "Save rule" }));
+    await waitFor(() => expect(writes(fetch)).toHaveLength(1));
+    const sent = writes(fetch)[0]![2].rules[0];
+    expect(sent).toMatchObject({ id: "r-pd", name: "No cards or mail", protection: "personal_data", input: { action: "block" } });
+    expect(sent.detector.categories).toEqual(["personal_data"]);
+    expect([...sent.detector.kinds].sort()).toEqual(["card", "email"]);
+  });
+  it("turns a personal-data rule into a secrets rule without its kinds", async () => {
+    const fetch = serve({ [guardrailsPath(team.id)]: () => local(personal) });
+    const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
+    await user.click(await screen.findByRole("button", { name: "Edit Personal data" }));
+    await user.selectOptions(screen.getByLabelText("Looks for"), "secrets");
+    await user.click(screen.getByRole("button", { name: "Save rule" }));
+    await waitFor(() => expect(writes(fetch)).toHaveLength(1));
+    const sent = writes(fetch)[0]![2].rules[0];
+    expect(sent.protection).toBe("secrets");
+    expect(sent.detector).toEqual({ kind: "pattern", categories: ["secret"] });
+  });
+  it("turns a secrets rule into a personal-data rule only with a kind ticked", async () => {
+    const fetch = serve({ [guardrailsPath(team.id)]: () => local(secrets) });
+    const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
+    await user.click(await screen.findByRole("button", { name: "Edit Secrets" }));
+    await user.selectOptions(screen.getByLabelText("Looks for"), "personal");
+    expect(screen.getAllByRole("checkbox").filter(b => /^(Email|Phone|Payment card|IBAN|US SSN|IP address):/.test(b.getAttribute("aria-label") ?? b.closest("label")?.textContent ?? "")).every(b => b.getAttribute("aria-checked") === "false")).toBe(true);
+    await user.click(screen.getByRole("button", { name: "Save rule" }));
+    expect(writes(fetch)).toHaveLength(0);
+    await user.click(screen.getByRole("checkbox", { name: /^Phone:/ }));
+    await user.click(screen.getByRole("button", { name: "Save rule" }));
+    await waitFor(() => expect(writes(fetch)).toHaveLength(1));
+    const sent = writes(fetch)[0]![2].rules[0];
+    expect(sent.protection).toBe("personal_data");
+    expect(sent.detector).toEqual({ kind: "pattern", categories: ["personal_data"], kinds: ["phone"] });
   });
 });
 

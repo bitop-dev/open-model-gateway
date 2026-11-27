@@ -788,5 +788,120 @@ async fn the_kinds_migration_keeps_earlier_rules_and_decisions(pool: PgPool) {
         .bind(Uuid::now_v7()).bind(set).execute(&mut *tx).await.unwrap();
     let missing = sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable) VALUES($1,$2,3,'All','personal_data','pattern','{personal_data}','block','user_text','off','fail_closed','{generation}','deny')")
         .bind(Uuid::now_v7()).bind(set).execute(&mut *tx).await;
-    assert!(missing.is_err(), "a personal-data rule without kinds");
+    assert_eq!(
+        sqlstate(missing.map(|_| ())),
+        "23514",
+        "a personal-data rule without kinds"
+    );
+    drop(tx);
+    // A decision's kind is checked in the month partition that existed
+    // before the migration and in one created after it: only a known kind,
+    // and only on a personal-data decision.
+    let created: Vec<(String, String)> = sqlx::query_as(
+        "SELECT parent,partition FROM omg_ensure_partitions(0,clock_timestamp()+interval '14 months')",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(
+        created
+            .iter()
+            .any(|(parent, _)| parent == "guardrail_events"),
+        "{created:?}"
+    );
+    for at in [
+        "clock_timestamp()",
+        "clock_timestamp()+interval '14 months'",
+    ] {
+        let insert = |category: &'static str, kind: &'static str| {
+            let pool = pool.clone();
+            let sql = format!(
+                "INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,kind,action,count,created_at) VALUES($1,$2,$3,$4,'chat_completions','company/smart','input',$5,$6,1,'type_default','pattern',$7,$8,'monitored',1,{at})"
+            );
+            async move {
+                sqlx::query(&sql)
+                    .bind(Uuid::now_v7())
+                    .bind(Uuid::now_v7())
+                    .bind(ws)
+                    .bind(f.principal.key_id)
+                    .bind(set)
+                    .bind(secrets)
+                    .bind(category)
+                    .bind(kind)
+                    .execute(&pool)
+                    .await
+                    .map(|_| ())
+            }
+        };
+        assert_eq!(sqlstate(insert("secret", "email").await), "23514", "{at}");
+        assert_eq!(
+            sqlstate(insert("personal_data", "passport").await),
+            "23514",
+            "{at}"
+        );
+        insert("personal_data", "email").await.expect(at);
+    }
+}
+
+/// 0099 on a database where a rule already looks for personal data (no
+/// release wrote one: it was written directly) stops and names the rows,
+/// and applies once they are gone.
+#[sqlx::test(migrations = false)]
+async fn the_kinds_migration_stops_on_a_personal_data_rule_written_directly(pool: PgPool) {
+    let all = sqlx::migrate!("./enterprise_migrations");
+    let through = |last: i64| sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            all.iter().filter(|m| m.version <= last).cloned().collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    through(98).run(&pool).await.unwrap();
+    let f = crate::governance::tests::db::fixture(pool.clone()).await;
+    let kind: String = sqlx::query_scalar("SELECT kind FROM workspaces WHERE id=$1")
+        .bind(f.team.workspace_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let set = Uuid::now_v7();
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("INSERT INTO guardrail_rule_sets(id,layer,kind,local_only,updated_by) VALUES($1,'type_default',$2,false,$3)")
+        .bind(set).bind(&kind).bind(f.owner).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable) VALUES($1,$2,0,'PII','personal_data','pattern','{personal_data}','block','user_text','off','fail_closed','{generation}','deny')")
+        .bind(Uuid::now_v7()).bind(set).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    let err = through(i64::MAX).run(&pool).await.unwrap_err().to_string();
+    assert!(
+        err.contains("1 guardrail rule(s) already look for personal_data"),
+        "{err}"
+    );
+    let version: i64 =
+        sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations WHERE success")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(version, 98, "nothing of 0099 applied");
+    // Removed (by the set's writer, which moves its revision), it applies.
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("UPDATE guardrail_rule_sets SET revision=revision+1,updated_by=$2 WHERE id=$1")
+        .bind(set)
+        .bind(f.owner)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM guardrail_rules WHERE rule_set_id=$1")
+        .bind(set)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    through(i64::MAX).run(&pool).await.unwrap();
+}
+
+fn sqlstate(r: Result<(), sqlx::Error>) -> String {
+    match r {
+        Err(sqlx::Error::Database(e)) => e.code().map(|c| c.into_owned()).unwrap_or_default(),
+        other => format!("{other:?}"),
+    }
 }

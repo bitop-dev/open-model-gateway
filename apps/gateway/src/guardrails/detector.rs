@@ -135,12 +135,12 @@ impl Findings {
 }
 
 /// What one detector found in a request: distinct matched values per
-/// category (per kind for personal data), and whether it read everything
-/// (`false`: its budget ran out first; the counts found until then still
+/// category (per kind for personal data), and the category whose scan the
+/// request's budget ran out in, if any (the counts found until then still
 /// stand).
 pub struct Inspected {
     pub counts: Vec<(Category, Option<Kind>, usize)>,
-    pub complete: bool,
+    pub spent: Option<Category>,
 }
 
 /// Why a detector gave no verdict at all (it cannot run in this release).
@@ -195,7 +195,9 @@ pub struct BudgetSpent;
 pub struct DetectContext<'a> {
     pub budget: &'a Budget,
     pub builtin: &'a std::cell::OnceCell<Findings>,
-    pub personal: &'a std::cell::RefCell<std::collections::HashMap<Kind, Findings>>,
+    /// Per kind: its findings, and whether the budget ran out before the
+    /// end of its scan.
+    pub personal: &'a std::cell::RefCell<std::collections::HashMap<Kind, (Findings, bool)>>,
 }
 
 /// Implemented by the built-in detectors (and, in later phases, model and

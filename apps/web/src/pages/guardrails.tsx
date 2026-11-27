@@ -13,7 +13,7 @@
  */
 import { api, type Session, type Workspace } from "../lib/api";
 import {
-  detectorsPath, guardrailsPath, inspectedSentence, isTightening, personalKindLabels, platformGuardrailsPath, stricterPart, toInput, typeDefaultPath, workloadLabels,
+  detectorsPath, guardrailsPath, inspectedSentence, isTightening, kindLabel, platformGuardrailsPath, stricterPart, toInput, typeDefaultPath, workloadLabels,
   type Detectors, type PlatformWorkspaceGuardrails, type RuleSet, type StoredRule, type TypeDefault, type WorkspaceGuardrails, type WorkspaceKind,
 } from "../lib/guardrails";
 import { kindLabels } from "../lib/people";
@@ -160,7 +160,7 @@ export function WorkspaceGuardrailsAdmin({ id, writable }: { id: string; writabl
     <Card title="Decisions this month" titleAs="h2" description="Counts recorded by the gateway (UTC month). Findings are distinct matched values; no text is kept. A request refused because no check could run then (the gateway was busy) writes no row and is not counted here." flush={g.decisions_this_month.length > 0}>
       {g.decisions_this_month.length === 0 ? <p className={s.note}>No decisions this month.</p> :
         <Table caption="Guardrail decisions this month" columns={["Outcome", "Looked for", { label: "Decisions", numeric: true }, { label: "Findings", numeric: true }]}>{g.decisions_this_month.map(t => <Tr key={`${t.action}:${t.category}:${t.kind ?? ""}`}>
-          <Td>{actionNames[t.action] ?? t.action}</Td><Td>{categoryNames[t.category] ?? t.category}{t.kind ? ` · ${personalKindLabels[t.kind]}` : ""}</Td><Td>{t.decisions}</Td><Td>{matching.has(t.action) ? t.findings : "—"}</Td>
+          <Td>{actionNames[t.action] ?? t.action}</Td><Td>{categoryNames[t.category] ?? t.category}{t.kind ? ` · ${kindLabel(t.kind)}` : ""}</Td><Td>{t.decisions}</Td><Td>{matching.has(t.action) ? t.findings : "—"}</Td>
         </Tr>)}</Table>}
     </Card>
   </Stack>;

@@ -45,6 +45,10 @@ pub struct CompiledRule {
     /// The rule has custom patterns from a local layer (user-written).
     local_custom: bool,
     custom: bool,
+    /// The rule looks for personal data (its scan's cost is the input's,
+    /// like custom patterns'); `local_personal` when a local layer wrote it.
+    personal: bool,
+    local_personal: bool,
 }
 
 /// A workspace's effective input rules. Empty when nothing applies, which is
@@ -97,6 +101,7 @@ impl Policy {
                 _ => None,
             };
             let custom = !rule.detector.patterns.is_empty();
+            let personal = !rule.detector.kinds.is_empty();
             rules.push(CompiledRule {
                 id: e.id,
                 rule_set_id: e.rule_set_id,
@@ -112,6 +117,8 @@ impl Policy {
                 detector,
                 local_custom: custom && e.layer == Layer::WorkspaceLocal,
                 custom,
+                personal,
+                local_personal: personal && e.layer == Layer::WorkspaceLocal,
             });
         }
         Self { rules }
@@ -138,6 +145,15 @@ impl Policy {
     /// (their scans use their own slots).
     pub fn has_local_custom(&self) -> bool {
         self.rules.iter().any(|r| r.local_custom)
+    }
+    /// Whether any rule looks for personal data.
+    pub fn has_personal(&self) -> bool {
+        self.rules.iter().any(|r| r.personal)
+    }
+    /// Whether a local layer's writer chose a personal-data rule (its scans
+    /// use the local slots, as local custom patterns do).
+    pub fn has_local_personal(&self) -> bool {
+        self.rules.iter().any(|r| r.local_personal)
     }
 }
 
@@ -364,10 +380,11 @@ impl Policy {
                     failed(&mut decision, r, r.first(), RefusalKind::DetectorFailed);
                     continue;
                 };
-                if !inspected.complete {
-                    // The budget ran out: the custom patterns gave no verdict
-                    // now (what they found until then still counts below).
-                    failed(&mut decision, r, Category::Custom, RefusalKind::Unavailable);
+                if let Some(category) = inspected.spent {
+                    // The budget ran out: the custom patterns or the
+                    // personal-data scan gave no verdict now (what they
+                    // found until then still counts below).
+                    failed(&mut decision, r, category, RefusalKind::Unavailable);
                 }
                 for (category, kind, count) in inspected.counts {
                     if count == 0 {

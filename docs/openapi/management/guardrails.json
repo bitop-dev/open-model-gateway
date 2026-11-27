@@ -750,7 +750,7 @@
       "additionalProperties": false,
       "properties": {
         "decisions_this_month": {
-          "description": "This month's guardrail decisions on the workspace (UTC month), per action and category: totals only, never request detail, also for a personal workspace, but never of a personal workspace's local layer (#840).",
+          "description": "This month's guardrail decisions on the workspace (UTC month), per action, category and personal-data kind: totals only, never request detail, also for a personal workspace (per action and category only), but never of a personal workspace's local layer (#840, #841).",
           "items": {
             "additionalProperties": false,
             "properties": {
@@ -783,7 +783,7 @@
                 "type": "integer"
               },
               "kind": {
-                "description": "#841: the personal-data kind of a personal_data total that found something; null for other categories and for skipped or failed decisions.",
+                "description": "#841: the personal-data kind of a personal_data total that found something; null for other categories, for skipped or failed decisions, and for every total of a personal workspace (whose totals are per action and category only).",
                 "oneOf": [
                   {
                     "enum": [
@@ -2315,7 +2315,7 @@
       "additionalProperties": false,
       "properties": {
         "decisions_this_month": {
-          "description": "This month's guardrail decisions on the workspace (UTC month), per action and category: totals only, never request detail, also for a personal workspace, but never of a personal workspace's local layer (#840).",
+          "description": "This month's guardrail decisions on the workspace (UTC month), per action, category and personal-data kind: totals only, never request detail, also for a personal workspace (per action and category only), but never of a personal workspace's local layer (#840, #841).",
           "items": {
             "additionalProperties": false,
             "properties": {
@@ -2348,7 +2348,7 @@
                 "type": "integer"
               },
               "kind": {
-                "description": "#841: the personal-data kind of a personal_data total that found something; null for other categories and for skipped or failed decisions.",
+                "description": "#841: the personal-data kind of a personal_data total that found something; null for other categories, for skipped or failed decisions, and for every total of a personal workspace (whose totals are per action and category only).",
                 "oneOf": [
                   {
                     "enum": [
@@ -4967,7 +4967,7 @@
       "additionalProperties": false,
       "properties": {
         "decisions_this_month": {
-          "description": "This month's guardrail decisions on the workspace (UTC month), per action and category: totals only, never request detail, also for a personal workspace, but never of a personal workspace's local layer (#840).",
+          "description": "This month's guardrail decisions on the workspace (UTC month), per action, category and personal-data kind: totals only, never request detail, also for a personal workspace (per action and category only), but never of a personal workspace's local layer (#840, #841).",
           "items": {
             "additionalProperties": false,
             "properties": {
@@ -5000,7 +5000,7 @@
                 "type": "integer"
               },
               "kind": {
-                "description": "#841: the personal-data kind of a personal_data total that found something; null for other categories and for skipped or failed decisions.",
+                "description": "#841: the personal-data kind of a personal_data total that found something; null for other categories, for skipped or failed decisions, and for every total of a personal workspace (whose totals are per action and category only).",
                 "oneOf": [
                   {
                     "enum": [

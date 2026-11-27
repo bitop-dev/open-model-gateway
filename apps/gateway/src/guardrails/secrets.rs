@@ -376,15 +376,21 @@ impl Detector for PatternDetector {
             .has_custom()
             .then(|| self.custom_findings(input, ctx.budget));
         let mut counts = Vec::new();
+        let mut spent = custom
+            .as_ref()
+            .is_some_and(|c| c.spent)
+            .then_some(Category::Custom);
         for &category in &self.categories {
             if category == Category::PersonalData {
                 let mut found = ctx.personal.borrow_mut();
                 for &kind in &self.kinds {
-                    let n = found
+                    let (findings, kind_spent) = found
                         .entry(kind)
-                        .or_insert_with(|| super::personal::findings_of(input, kind))
-                        .distinct_kind(input, kind);
-                    counts.push((category, Some(kind), n));
+                        .or_insert_with(|| super::personal::findings_of(input, kind, ctx.budget));
+                    if *kind_spent {
+                        spent = spent.or(Some(Category::PersonalData));
+                    }
+                    counts.push((category, Some(kind), findings.distinct_kind(input, kind)));
                 }
                 continue;
             }
@@ -399,10 +405,7 @@ impl Detector for PatternDetector {
             };
             counts.push((category, None, n));
         }
-        Ok(Inspected {
-            counts,
-            complete: custom.is_none_or(|c| !c.spent),
-        })
+        Ok(Inspected { counts, spent })
     }
 }
 

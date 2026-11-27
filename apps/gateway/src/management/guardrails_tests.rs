@@ -940,4 +940,60 @@ async fn a_personal_data_rule_is_written_and_read_with_its_kinds(pool: PgPool) {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {v}");
     }
+    // Redaction is not available in this release, for personal data too.
+    let mut redact = personal(json!(["email"]));
+    redact["input"]["action"] = json!("redact");
+    let (status, v) = put(
+        &f.s,
+        &f.admin,
+        TYPE_TEAM,
+        json!({"local_only":false,"rules":[redact]}),
+    )
+    .await;
+    assert_eq!(
+        (status, reason(&v)),
+        (StatusCode::BAD_REQUEST, "guardrail_detector_unavailable"),
+        "{v}"
+    );
+    // A tightening names only what it tightens: never kinds, which would
+    // change what the platform rule looks for.
+    let (_, platform) = put(
+        &f.s,
+        &f.admin,
+        TYPE_TEAM,
+        json!({"local_only":false,"rules":[personal(json!(["card"]))]}),
+    )
+    .await;
+    let target = platform["rule_set"]["rules"][0]["id"].clone();
+    for tightening in [
+        json!({"tightens":target,"kinds":["email"]}),
+        json!({"tightens":target,"detector":{"kind":"pattern","categories":["personal_data"],"kinds":["email"]}}),
+    ] {
+        let (status, v) = put(
+            &f.s,
+            &f.owner,
+            &local(f.team),
+            json!({"rules":[tightening.clone()]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{tightening}: {v}");
+    }
+    // A rule may look for personal data and secrets at once (through the
+    // API): it keeps both, with its kinds.
+    let both = json!({"name":"Both","protection":"personal_data","detector":{"kind":"pattern","categories":["personal_data","secret"],"kinds":["email"]},"input":{"action":"block"}});
+    let (status, v) = put(
+        &f.s,
+        &f.admin,
+        TYPE_TEAM,
+        json!({"local_only":false,"rules":[both]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let detector = &v["rule_set"]["rules"][0]["detector"];
+    assert_eq!(
+        detector["categories"],
+        json!(["personal_data", "secret"]),
+        "{v}"
+    );
+    assert_eq!(detector["kinds"], json!(["email"]), "{v}");
 }

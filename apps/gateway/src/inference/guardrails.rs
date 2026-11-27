@@ -95,6 +95,9 @@ impl Drop for Load {
 /// Inputs above this many bytes, and any input a custom pattern scans (its
 /// cost may be any user's), are scanned off the async workers in scan slots.
 const LARGE_INPUT: usize = 64 * 1024;
+/// A personal-data scan costs up to six passes of the input: one above this
+/// many bytes is scanned in a slot too.
+const PERSONAL_INLINE: usize = 4 * 1024;
 
 impl Store {
     /// A workspace's compiled guardrail policy (empty ones too): a cache hit
@@ -383,8 +386,12 @@ impl super::Engine {
             // Off the async workers, in a bounded slot that moves into the
             // scan (held until the scan ends even when the request is
             // dropped). No slot in time: every rule is unavailable.
-            Some(input) if input.len() > LARGE_INPUT || policy.has_custom() => {
-                let slots = if policy.has_local_custom() {
+            Some(input)
+                if input.len() > LARGE_INPUT
+                    || policy.has_custom()
+                    || (policy.has_personal() && input.len() > PERSONAL_INLINE) =>
+            {
+                let slots = if policy.has_local_custom() || policy.has_local_personal() {
                     &LOCAL_SCANS
                 } else {
                     &SHARED_SCANS
