@@ -77,7 +77,7 @@ DO $$ DECLARE r record; t text; BEGIN
  END LOOP;
  IF has_column_privilege('gateway_runtime','public.governance_reservations','request_count','UPDATE') OR has_column_privilege('gateway_runtime','public.governance_reservations','admitted_at','UPDATE') THEN RAISE EXCEPTION 'mutable reservation admission snapshot'; END IF;
  IF (SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'async_job%' AND tgenabled='O' AND NOT tgisinternal)<>9
-  OR NOT EXISTS(SELECT FROM pg_trigger WHERE tgname='async_jobs_output_failure_final' AND tgrelid='public.async_jobs'::regclass AND tgenabled='O') THEN RAISE EXCEPTION 'async job guards missing or disabled'; END IF;
+  OR NOT EXISTS(SELECT FROM pg_trigger WHERE tgname='async_jobs_output_state' AND tgrelid='public.async_jobs'::regclass AND tgenabled='O') THEN RAISE EXCEPTION 'async job guards missing or disabled'; END IF;
  IF has_table_privilege('gateway_runtime','public.installation_settings','INSERT,DELETE,TRUNCATE') OR has_column_privilege('gateway_runtime','public.installation_settings','singleton','UPDATE') THEN RAISE EXCEPTION 'installation settings row replaceable'; END IF;
  -- Installation logo (0023): a reviewed column set, guarded by a trigger.
  IF NOT has_column_privilege('gateway_runtime','public.installation_settings','branding_logo_file_id','UPDATE') THEN RAISE EXCEPTION 'installation logo not maintainable by runtime'; END IF;
@@ -558,6 +558,7 @@ BEGIN
  UPDATE deployments SET video_seconds='{4,8}',video_sizes='{1280x720}' WHERE id=d;
  BEGIN UPDATE deployments SET video_sizes='{"1x1,2x2"}' WHERE id=d; RAISE EXCEPTION 'joined video sizes allowed'; EXCEPTION WHEN check_violation THEN NULL; END;
  BEGIN UPDATE deployments SET video_seconds='{4,4}' WHERE id=d; RAISE EXCEPTION 'repeated video length allowed'; EXCEPTION WHEN check_violation THEN NULL; END;
+ BEGIN UPDATE deployments SET video_seconds='[0:0]={4}' WHERE id=d; RAISE EXCEPTION 'non-1-based video lengths allowed'; EXCEPTION WHEN check_violation THEN NULL; END;
  IF (SELECT revision FROM deployments WHERE id=d)<>2 THEN RAISE EXCEPTION 'video options change touched enablement history'; END IF;
  UPDATE deployments SET video_seconds=NULL,video_sizes=NULL WHERE id=d;
  IF NOT EXISTS(SELECT FROM configuration_changes c JOIN audit_events a ON (a.id,a.created_at)=(c.audit_event_id,c.audit_created_at) WHERE c.deployment_id=d AND c.revision=2 AND NOT c.before_enabled AND c.after_enabled) THEN RAISE EXCEPTION 'history audit identity or values missing'; END IF;
@@ -725,6 +726,10 @@ BEGIN
   BEGIN UPDATE async_jobs SET state='in_progress' WHERE id=j; RAISE EXCEPTION 'async job regression allowed'; EXCEPTION WHEN raise_exception THEN IF SQLERRM NOT LIKE 'invalid async job transition%' THEN RAISE; END IF; END;
   BEGIN UPDATE async_jobs SET workspace_id=personal WHERE id=j; RAISE EXCEPTION 'async job re-own allowed'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
   BEGIN DELETE FROM async_jobs WHERE id=j; RAISE EXCEPTION 'async job removal allowed'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+  -- A video's output state (0098) is the poller's: never written at insert, and not writable by this role (yet).
+  IF has_column_privilege('gateway_runtime','public.async_jobs','output_failure','UPDATE') OR has_column_privilege('gateway_runtime','public.async_jobs','output_pending','UPDATE') THEN RAISE EXCEPTION 'video output state writable'; END IF;
+  BEGIN INSERT INTO async_jobs(id,kind,workspace_id,api_key_id,deployment_id,execution_id,public_model,provider,upstream_id,state,poll_deadline_at,video_seconds,completed_at,output_failure) VALUES(gen_random_uuid(),'video',ws,k,d,e,'rollback','openai_compatible','video_out_'||replace(j::text,'-',''),'completed',now(),4,now(),'too_large'); RAISE EXCEPTION 'output failure at insert allowed'; EXCEPTION WHEN check_violation THEN IF SQLERRM NOT LIKE 'a video output state%' THEN RAISE; END IF; END;
+  BEGIN INSERT INTO async_jobs(id,kind,workspace_id,api_key_id,deployment_id,execution_id,public_model,provider,upstream_id,state,poll_deadline_at,video_seconds,completed_at,output_pending) VALUES(gen_random_uuid(),'video',ws,k,d,e,'rollback','openai_compatible','video_pend_'||replace(j::text,'-',''),'completed',now(),4,now(),true); RAISE EXCEPTION 'awaited output at insert allowed'; EXCEPTION WHEN check_violation THEN IF SQLERRM NOT LIKE 'a video output state%' THEN RAISE; END IF; END;
   BEGIN UPDATE async_job_files SET upstream_id='x' WHERE id=fi; RAISE EXCEPTION 'async job file rewrite allowed'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
   BEGIN UPDATE async_job_files SET job_id=NULL WHERE id=fi; RAISE EXCEPTION 'consumed batch file released'; EXCEPTION WHEN raise_exception THEN IF SQLERRM<>'async job files are immutable' THEN RAISE; END IF; END;
   BEGIN INSERT INTO async_jobs(id,kind,workspace_id,api_key_id,deployment_id,execution_id,public_model,provider,upstream_id,poll_deadline_at,video_seconds,video_size) VALUES(gen_random_uuid(),'video',personal,k,d,e,'rollback','openai','video_x',now(),4,'720x1280'); RAISE EXCEPTION 'cross-workspace job allowed'; EXCEPTION WHEN foreign_key_violation OR unique_violation THEN NULL; END;

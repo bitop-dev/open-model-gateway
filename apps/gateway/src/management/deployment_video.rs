@@ -4,12 +4,15 @@
 //! through the route's PATCH, under the exclusive catalog transaction, and
 //! audited.
 use super::*;
+use crate::jobs::types::valid_video_size as valid_size;
 use resources::audit;
 
 pub(super) const OPTIONS_INVALID: &str = "Video options are 1 to 32 distinct clip lengths of 1 to 3600 seconds (the first is the default), and optionally 1 to 32 distinct sizes written WIDTHxHEIGHT (each 1 to 9999)";
 
 /// A route's video options as the API reads and writes them: a closed
-/// object (no positional form).
+/// object (no positional form). Reading checks the shape only; the values
+/// are checked by [`set_video_options`], which refuses them with `400`
+/// `video_options_invalid`.
 #[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
 pub(crate) struct VideoOptions {
     /// Clip lengths (seconds) the route accepts; the first is used when a
@@ -49,15 +52,10 @@ impl<'de> Deserialize<'de> for VideoOptions {
                         }
                     }
                 }
-                let options = VideoOptions {
+                Ok(VideoOptions {
                     seconds: seconds.ok_or_else(|| serde::de::Error::missing_field("seconds"))?,
                     sizes: sizes.flatten(),
-                };
-                // Refused as it is read, as its schema refuses it.
-                if !options.valid() {
-                    return Err(serde::de::Error::custom(OPTIONS_INVALID));
-                }
-                Ok(options)
+                })
             }
         }
         // A struct with these fields: a map, never a sequence (no
@@ -65,8 +63,6 @@ impl<'de> Deserialize<'de> for VideoOptions {
         d.deserialize_struct("VideoOptions", &["seconds", "sizes"], Visit)
     }
 }
-
-use crate::jobs::types::valid_video_size as valid_size;
 
 impl VideoOptions {
     fn validate(&self) -> Result<(), ManagementError> {
@@ -78,7 +74,7 @@ impl VideoOptions {
     }
     /// 1 to 32 distinct lengths of 1 to 3600 seconds, and optionally 1 to 32
     /// distinct `WIDTHxHEIGHT` sizes.
-    fn valid(&self) -> bool {
+    pub(super) fn valid(&self) -> bool {
         let distinct = |n: usize, unique: usize| (1..=32).contains(&n) && unique == n;
         let seconds: std::collections::BTreeSet<_> = self.seconds.iter().collect();
         let ok_seconds = distinct(self.seconds.len(), seconds.len())
@@ -145,8 +141,7 @@ pub(super) fn audit_field(action: &str, key: &str, value: &Value) -> bool {
     action == "deployment.video_options_changed"
         && key == "video"
         && (value.is_null()
-            || serde_json::from_value::<VideoOptions>(value.clone())
-                .is_ok_and(|o| o.validate().is_ok()))
+            || serde_json::from_value::<VideoOptions>(value.clone()).is_ok_and(|o| o.valid()))
 }
 
 /// The route's video options as the API renders them: `null` when it serves
