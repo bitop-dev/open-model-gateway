@@ -82,12 +82,55 @@ fn a_secrets_rule_gets_the_designs_defaults() {
 }
 
 #[test]
+fn personal_data_rules_name_their_kinds_each_once() {
+    let personal = |kinds: Value| json!({"name":"Personal data","protection":"personal_data","detector":{"kind":"pattern","categories":["personal_data"],"kinds":kinds},"input":{"action":"block"}});
+    let ok = write(
+        Layer::TypeDefault,
+        None,
+        None,
+        body(Some(false), json!([personal(json!(["email", "ip"]))])),
+    )
+    .unwrap();
+    let Entry::Rule(rule) = &ok.1[0].entry else {
+        panic!("a rule")
+    };
+    assert_eq!(rule.detector.kinds, BTreeSet::from([Kind::Email, Kind::Ip]));
+    // No "all kinds": a personal-data rule names at least one; each once,
+    // from the known set; no other rule names any.
+    let mut no_kinds = personal(json!([]));
+    for bad in [
+        no_kinds.clone(),
+        {
+            no_kinds["detector"]
+                .as_object_mut()
+                .unwrap()
+                .remove("kinds");
+            no_kinds
+        },
+        personal(json!(["email", "email"])),
+        personal(json!(["passport"])),
+        json!({"name":"Secrets","protection":"secrets","detector":{"kind":"pattern","categories":["secret"],"kinds":["email"]},"input":{"action":"block"}}),
+    ] {
+        assert_eq!(
+            write(
+                Layer::TypeDefault,
+                None,
+                None,
+                body(Some(false), json!([bad.clone()]))
+            )
+            .unwrap_err(),
+            Refusal::Invalid,
+            "{bad}"
+        );
+    }
+}
+
+#[test]
 fn rules_that_need_a_later_phase_are_refused_not_stored() {
     let variants = [
         json!({"detector":{"kind":"systemone","categories":["moderation"]},"protection":"moderation"}),
         json!({"detector":{"kind":"llm_judge","categories":["moderation"]},"protection":"moderation"}),
         json!({"detector":{"kind":"external","categories":["secret"]}}),
-        json!({"detector":{"kind":"pattern","categories":["personal_data"]},"protection":"personal_data"}),
         json!({"input":{"action":"redact"}}),
         json!({"output":{"mode":"monitor"}}),
         json!({"output":{"mode":"block"}}),

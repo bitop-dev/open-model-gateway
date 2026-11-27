@@ -899,3 +899,45 @@ async fn of_two_writes_built_from_one_revision_one_lands(pool: PgPool) {
         );
     }
 }
+
+/// #841: a personal-data rule is written with the kinds it looks for and
+/// read back with them (labels, for every reader); one that names none, or
+/// names kinds on another category, is refused.
+#[dbtest::test]
+async fn a_personal_data_rule_is_written_and_read_with_its_kinds(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let personal = |kinds: Value| json!({"name":"Personal data","protection":"personal_data","detector":{"kind":"pattern","categories":["personal_data"],"kinds":kinds},"input":{"action":"block"}});
+    let (status, v) = put(
+        &f.s,
+        &f.admin,
+        TYPE_TEAM,
+        json!({"local_only":false,"rules":[personal(json!(["card","us_ssn"]))]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(
+        v["rule_set"]["rules"][0]["detector"]["kinds"],
+        json!(["card", "us_ssn"])
+    );
+    let (status, read) = call(&f.s, &f.member, "GET", &local(f.team), Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    assert_eq!(
+        read["effective"][0]["detector"]["kinds"],
+        json!(["card", "us_ssn"])
+    );
+    for bad in [
+        personal(json!([])),
+        personal(json!(["card", "card"])),
+        personal(json!(["passport"])),
+        json!({"name":"Secrets","protection":"secrets","detector":{"kind":"pattern","categories":["secret"],"kinds":["email"]},"input":{"action":"block"}}),
+    ] {
+        let (status, v) = put(
+            &f.s,
+            &f.admin,
+            TYPE_TEAM,
+            json!({"local_only":false,"rules":[bad.clone()]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {v}");
+    }
+}

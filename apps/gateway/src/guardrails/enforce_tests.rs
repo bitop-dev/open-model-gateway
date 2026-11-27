@@ -21,6 +21,7 @@ fn rule(categories: &[Category], patterns: &[&str], action: InputAction) -> Rule
             kind: DetectorKind::Pattern,
             categories: categories.iter().copied().collect(),
             patterns: patterns.iter().map(|p| (*p).to_owned()).collect(),
+            kinds: Default::default(),
             reference: None,
         },
         input_action: action,

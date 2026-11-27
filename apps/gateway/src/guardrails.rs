@@ -10,6 +10,7 @@ pub mod detector;
 pub mod enforce;
 pub mod limits;
 pub mod patterns;
+pub mod personal;
 pub mod policy;
 pub mod secrets;
 pub mod shared;

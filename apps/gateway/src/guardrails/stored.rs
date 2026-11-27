@@ -11,25 +11,28 @@ use super::policy::{Layer, RuleSet, StoredRule};
 #[derive(Clone, Copy, Debug)]
 pub struct Unreadable;
 
-type RuleRow = (
-    Uuid,
-    Option<Uuid>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<Vec<String>>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<i32>,
-    Option<String>,
-    Option<i32>,
-    Option<Vec<String>>,
-    Option<String>,
-    Vec<String>,
-);
-const RULE_COLUMNS: &str = "id,tightens_rule_id,name,protection,detector_kind,detector_ref,categories,input_action,redact_scope,output_mode,(threshold*1000)::int,on_error,timeout_ms,workloads,uninspectable,patterns";
+/// A stored `guardrail_rules` row (the columns of `RULE_COLUMNS`).
+#[derive(sqlx::FromRow)]
+struct RuleRow {
+    id: Uuid,
+    tightens_rule_id: Option<Uuid>,
+    name: Option<String>,
+    protection: Option<String>,
+    detector_kind: Option<String>,
+    detector_ref: Option<String>,
+    categories: Option<Vec<String>>,
+    input_action: Option<String>,
+    redact_scope: Option<String>,
+    output_mode: Option<String>,
+    threshold: Option<i32>,
+    on_error: Option<String>,
+    timeout_ms: Option<i32>,
+    workloads: Option<Vec<String>>,
+    uninspectable: Option<String>,
+    patterns: Vec<String>,
+    kinds: Vec<String>,
+}
+const RULE_COLUMNS: &str = "id,tightens_rule_id,name,protection,detector_kind,detector_ref,categories,input_action,redact_scope,output_mode,(threshold*1000)::int AS threshold,on_error,timeout_ms,workloads,uninspectable,patterns,kinds";
 
 fn names<T: Copy + Ord>(
     parse: fn(&str) -> Option<T>,
@@ -42,24 +45,25 @@ fn names<T: Copy + Ord>(
 fn decode(row: RuleRow) -> Result<StoredRule, Unreadable> {
     use super::policy::*;
     let bad = || Unreadable;
-    let (
+    let RuleRow {
         id,
-        tightens,
+        tightens_rule_id: tightens,
         name,
         protection,
-        kind,
-        reference,
+        detector_kind: kind,
+        detector_ref: reference,
         categories,
-        input,
-        scope,
-        output,
+        input_action: input,
+        redact_scope: scope,
+        output_mode: output,
         threshold,
         on_error,
-        timeout,
+        timeout_ms: timeout,
         workloads,
         uninspectable,
-        pats,
-    ) = row;
+        patterns: pats,
+        kinds,
+    } = row;
     let threshold = threshold
         .map(|t| u16::try_from(t).map_err(|_| bad()))
         .transpose()?;
@@ -98,6 +102,7 @@ fn decode(row: RuleRow) -> Result<StoredRule, Unreadable> {
                     .and_then(|c| names(Category::parse, c))
                     .ok_or_else(bad)?,
                 patterns: pats,
+                kinds: names(Kind::parse, &kinds).ok_or_else(bad)?,
                 reference,
             },
             input_action: input

@@ -18,7 +18,10 @@ export type Workload = "generation" | "embeddings" | "rerank" | "systemone" | "a
 export type InactiveReason = "egress_not_allowed" | "tightened_rule_missing" | "not_runnable";
 export type Egress = "local" | "model" | "service";
 
-export type Detector = { kind: "pattern" | "systemone" | "llm_judge" | "external"; categories: Category[]; patterns?: string[]; pattern_count?: number; egress?: Egress };
+/** #841: the personal-data kinds a personal-data rule looks for (it names at least one). */
+export type Kind = "email" | "phone" | "card" | "iban" | "us_ssn" | "ip";
+export const kinds: Kind[] = ["email", "phone", "card", "iban", "us_ssn", "ip"];
+export type Detector = { kind: "pattern" | "systemone" | "llm_judge" | "external"; categories: Category[]; patterns?: string[]; pattern_count?: number; kinds?: Kind[]; egress?: Egress };
 /** A stored rule of a layer. */
 export type StoredRule = {
   id: string; name: string; protection: Protection; detector: Detector;
@@ -39,7 +42,7 @@ export type WorkspaceGuardrails = {
   platform: { source: "type_default" | "workspace_override"; rule_set: RuleSet | null }; egress: { local_only: boolean };
   local: RuleSet | null; effective: EffectiveEntry[];
 };
-export type DecisionTotal = { action: string; category: Category; decisions: number; findings: number };
+export type DecisionTotal = { action: string; category: Category; kind?: Kind | null; decisions: number; findings: number };
 export type PlatformWorkspaceGuardrails = Omit<WorkspaceGuardrails, "can_edit" | "effective"> & {
   type_default: RuleSet | null; override: RuleSet | null; local_visible: boolean; effective: EffectiveEntry[] | null; decisions_this_month: DecisionTotal[];
 };
@@ -74,7 +77,8 @@ export function inspectionSentence(e: Partial<StoredRule>): string {
   if (e.input?.action === "off") return "Off: checks nothing on input.";
   const count = e.detector?.pattern_count ?? e.detector?.patterns?.length ?? 0, looks = looksFor(e);
   const secrets = "secrets (keys, tokens, private keys, connection strings)", custom = `matches of ${count === 1 ? "1 custom pattern" : `${count} custom patterns`}`;
-  const what = looks === "both" ? `${secrets} and ${custom}` : looks === "custom" ? custom : secrets;
+  const personal = `personal data: ${list((e.detector?.kinds ?? []).map(k => kindNouns[k]))}`;
+  const what = looks === "personal" ? personal : looks === "both" ? `${secrets} and ${custom}` : looks === "custom" ? custom : secrets;
   const where = list((e.workloads ?? ["generation", "embeddings"]).map(w => workloadLabels[w]?.toLowerCase() ?? w.replace(/_/g, " ")));
   const how = e.input?.action === "block" ? "and refuses a request that has one" : e.input?.action === "monitor" ? "and records what it finds; the request goes on" : "";
   const unreadable = e.input?.action === "block" ? " It also refuses a request it can't read (one with an image, audio or a document that isn't plain text), and a native batch when it is created." : "";
@@ -92,12 +96,24 @@ export const inspectedSentence = (workloads: Workload[]) => `Guardrails check th
  */
 export const onErrorHelp = "Applies only when the rule can't run at all: a stored pattern that no longer compiles, or a rule that needs a later release. A request is never let through unchecked: when the gateway is too busy to check it, or a custom pattern takes too long on it, it is refused with a 503 under any rule, Monitor included.";
 /** What a rule looks for, from its detector's categories (a rule written through the API may have both). */
-export type LooksFor = "secrets" | "custom" | "both";
+export type LooksFor = "secrets" | "custom" | "both" | "personal";
 export function looksFor(e: Partial<StoredRule>): LooksFor {
+  if ((e.detector?.categories ?? []).includes("personal_data") || e.protection === "personal_data") return "personal";
   const c = e.detector?.categories ?? [], secret = c.includes("secret"), custom = c.includes("custom");
   return secret && custom ? "both" : custom ? "custom" : secret ? "secrets" : e.protection === "custom" ? "custom" : "secrets";
 }
-export const looksForLabels: Record<LooksFor, string> = { secrets: "Secrets", custom: "Custom patterns", both: "Secrets and custom patterns" };
+export const looksForLabels: Record<LooksFor, string> = { secrets: "Secrets", custom: "Custom patterns", both: "Secrets and custom patterns", personal: "Personal data" };
+/** Each kind as a noun phrase (rule sentences) and what it matches (the rule dialog), as the gateway's kind table says (`guardrails::personal::KINDS`). */
+export const kindNouns: Record<Kind, string> = { email: "email addresses", phone: "phone numbers", card: "payment card numbers", iban: "IBANs", us_ssn: "US Social Security numbers", ip: "public IP addresses" };
+export const personalKindLabels: Record<Kind, string> = { email: "Email", phone: "Phone", card: "Payment card", iban: "IBAN", us_ssn: "US SSN", ip: "IP address" };
+export const kindMatches: Record<Kind, string> = {
+  email: "Email addresses, except at reserved example domains (example.com, .test, .invalid, .localhost).",
+  phone: "Phone numbers in international form (+ and 8 to 15 digits) or North American form with separators; fictional 555-01xx numbers excepted.",
+  card: "Payment card numbers of the major networks, whole or in groups, with a valid check digit.",
+  iban: "Bank account numbers (IBAN) with their country's length and a valid check.",
+  us_ssn: "US Social Security numbers written with dashes or spaces, within the issued ranges. Other countries' identifiers are not built in: use a custom pattern.",
+  ip: "Public IP addresses only: never loopback, private, link-local, multicast, reserved or documentation addresses.",
+};
 
 const present = <T,>(key: string, value: T | null | undefined) => value === null || value === undefined ? {} : { [key]: value };
 /**
@@ -111,7 +127,7 @@ export function toInput(e: Entry): Record<string, unknown> {
   const rule = e as StoredRule;
   return {
     id: rule.id, name: rule.name, protection: rule.protection,
-    detector: { kind: rule.detector.kind, categories: rule.detector.categories, ...(rule.detector.patterns?.length ? { patterns: rule.detector.patterns } : {}) },
+    detector: { kind: rule.detector.kind, categories: rule.detector.categories, ...(rule.detector.patterns?.length ? { patterns: rule.detector.patterns } : {}), ...(rule.detector.kinds?.length ? { kinds: rule.detector.kinds } : {}) },
     input: { action: rule.input.action, ...present("redact_scope", rule.input.redact_scope) }, ...present("output", rule.output), ...present("on_error", rule.on_error), ...present("workloads", rule.workloads),
     ...present("uninspectable", rule.uninspectable), ...present("threshold", rule.threshold), ...present("timeout_ms", rule.timeout_ms),
   };
@@ -130,11 +146,18 @@ export function ruleInput(v: Record<string, string | undefined>, base?: Record<s
   // categories independently, and a rebuilt detector could drop either.
   // Stored patterns are compared as the dialog shows them (trimmed, one per
   // line), so a pattern stored through the API with spaces is kept as stored.
-  const stored = base?.detector as { categories?: Category[]; patterns?: string[] } | undefined;
+  const stored = base?.detector as { categories?: Category[]; patterns?: string[]; kinds?: Kind[] } | undefined;
+  const chosen = looks === "personal" && v.kinds ? (parseCheckboxValues(v.kinds) as Kind[]) : [];
+  const ordered = kinds.filter(k => chosen.includes(k));
   const same = !!stored && looksFor({ detector: stored as Detector, protection: base?.protection as Protection }) === looks
-    && (looks === "secrets" || JSON.stringify((stored.patterns ?? []).map(p => p.trim()).filter(Boolean)) === JSON.stringify(patterns));
-  const detector = same ? stored : { kind: "pattern", categories: looks === "both" ? ["secret", "custom"] : [looks === "custom" ? "custom" : "secret"], ...(looks !== "secrets" ? { patterns } : {}) };
-  const protection = same ? base!.protection : looks === "secrets" ? "secrets" : looks === "custom" ? "custom" : (base?.protection ?? "custom");
+    && (looks === "personal" ? JSON.stringify(kinds.filter(k => (stored.kinds ?? []).includes(k))) === JSON.stringify(ordered)
+      : looks === "secrets" || JSON.stringify((stored.patterns ?? []).map(p => p.trim()).filter(Boolean)) === JSON.stringify(patterns));
+  // A personal-data rule written through the API with other categories too
+  // keeps them: only its kinds change.
+  const detector = same ? stored
+    : looks === "personal" ? { ...(stored?.categories?.includes("personal_data") ? stored : { kind: "pattern", categories: ["personal_data"] }), kinds: ordered }
+      : { kind: "pattern", categories: looks === "both" ? ["secret", "custom"] : [looks === "custom" ? "custom" : "secret"], ...(looks !== "secrets" ? { patterns } : {}) };
+  const protection = same ? base!.protection : looks === "personal" ? (stored?.categories?.includes("personal_data") ? base!.protection : "personal_data") : looks === "secrets" ? "secrets" : looks === "custom" ? "custom" : (base?.protection ?? "custom");
   return {
     ...kept, name: (v.name ?? "").trim(), protection, detector,
     input: { ...(base?.input as object | undefined), action: v.action }, ...(v.on_error ? { on_error: v.on_error } : {}), ...(workloads.length ? { workloads } : {}),

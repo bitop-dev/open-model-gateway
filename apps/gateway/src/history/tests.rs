@@ -497,6 +497,7 @@ async fn concurrent_guardrail_events_lock_no_parent_rows(pool: PgPool) {
         layer: crate::guardrails::policy::Layer::TypeDefault,
         detector: crate::guardrails::policy::DetectorKind::Pattern,
         category: crate::guardrails::policy::Category::Secret,
+        kind: None,
         action: crate::guardrails::enforce::Action::Monitored,
         count: 1,
         refused: false,

@@ -112,7 +112,7 @@ fn found(text: &str) -> usize {
     builtin(&input(text)).0.len()
 }
 fn custom(pattern: &str) -> PatternDetector {
-    PatternDetector::new(&[Category::Custom], &[pattern.to_owned()]).unwrap()
+    PatternDetector::new(&[Category::Custom], &[], &[pattern.to_owned()]).unwrap()
 }
 fn spans(d: &PatternDetector, text: &str) -> Vec<String> {
     let input = input(text);
@@ -326,7 +326,7 @@ fn custom_patterns_match_only_for_their_rule() {
     );
     // A custom-only rule never runs the built-in shapes.
     assert!(spans(&d, &format!("{}_{}", "ghp", alnum(36))).is_empty());
-    assert!(PatternDetector::new(&[Category::Custom], &["(unclosed".to_owned()]).is_none());
+    assert!(PatternDetector::new(&[Category::Custom], &[], &["(unclosed".to_owned()]).is_none());
 }
 
 #[test]

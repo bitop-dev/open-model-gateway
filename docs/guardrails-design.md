@@ -476,3 +476,34 @@ Input enforcement:
 - **What enforcement covers.** Every guardrail response says `inspected_workloads: ["generation","embeddings"]`: the workloads whose input this release inspects. A blocking rule does not cover any other workload (rerank, System One, speech, images, transcription, realtime, video), even where its `workloads` could name one in a later phase.
 - **Local tightenings in platform totals.** A decision of a platform rule that a local tightening entry made stricter is recorded `tightened`, because its outcome may be an owner-made choice. A personal workspace's platform totals leave those out, like decisions of its local layer; a shared workspace's totals count them.
 - **`guardrail_events` references its parents by trigger.** Migration 0095 checks at insert time that the key belongs to the event's workspace, raising SQLSTATE 23503 like a foreign key (the pattern of migration 0034). It has no foreign keys to `workspaces` or `api_keys`, so concurrent decisions never take `FOR KEY SHARE` on those rows and never create MultiXacts there.
+
+### Personal-data kinds (#841)
+
+A `personal_data` rule names its kinds (migration 0098: `guardrail_rules.kinds`, at least one, each once; `guardrail_events.kind`, a fixed label set only on personal-data decisions). The kind table is `guardrails::personal::KINDS`; adding a format (another country's identifier, say) is one entry there and one value in the migration's list, which a test compares with the table.
+
+| Kind | Matches | Never matches |
+| --- | --- | --- |
+| `email` | `local@domain.tld`, local part without leading, trailing or doubled dots | the reserved example domains (`example.com`/`.net`/`.org`, `.example`, `.test`, `.invalid`, `.localhost`); an SSH remote (`git@host:repo`) |
+| `phone` | `+` and 8 to 15 digits with single separators and at most one parenthesised group; North American `(415) 555-2671`, `415-555-2671` with one kind of separator | bare digit runs; the fictional `555-0100`–`555-0199` |
+| `card` | 13 to 19 digits, whole or in groups (4-4-4-4…, 4-6-5, 4-6-4) with one separator, a major network's issuer prefix at a length it issues, and a valid Luhn digit | mixed separators, other groupings, numbers inside longer ones |
+| `iban` | country code, check digits, the country's registry length, groups of four when spaced, mod 97 = 1 | unknown countries, wrong lengths or checks |
+| `us_ssn` | `AAA-GG-SSSS` or with spaces (one separator), area not 000, 666 or 900–999, group not 00, serial not 0000 | nine bare digits; the voided advertised samples (`078-05-1120`, `219-09-9999`) |
+| `ip` | globally routable IPv4 and IPv6 (2000::/3) addresses, a port or prefix length may follow | loopback, private (RFC 1918, unique local), link-local, shared (100.64/10), benchmarking, multicast, broadcast, reserved, 6to4, IETF and documentation ranges (192.0.2/24, 198.51.100/24, 203.0.113/24, 2001:db8::/32); versions (`v1.2.3.4`, `1.2.3.4.5`, `1.2.3.4-rc1`) |
+
+A match stands alone: no letter, digit or joining character touches it on either side, so a value inside an identifier, a hash or a longer number is not one. Other countries' national identifiers are not built in; a custom pattern covers them.
+
+**False positives** (`personal_tests.rs`; per 10,000 items on the seeded, deterministic corpora, where the bounds are asserted):
+
+| Corpus | Items | email | phone | card | iban | us_ssn | ip |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| UUIDs | 20,000 | 0 | 0 | 0 | 0 | 0 | 0 |
+| hex digests (SHA-1/256/512) | 10,000 | 0 | 0 | 0 | 0 | 0 | 0 |
+| base64 and base64url | 10,000 | 0 | 0 | 0 | 0 | 0 | 0 |
+| JWT shapes | 2,000 | 0 | 0 | 0 | 0 | 0 | 0 |
+| numeric text (timestamps, ISO dates, versions, amounts, ports, file:line, status lines) | 16,000 | 0 | 0 | 0 | 0 | 0 | 0 |
+| random digit runs of 13–19 digits | 10,000 | 0 | 0 | 118 | 0 | 0 | 0 |
+
+The bound is 0 everywhere except cards among random digit runs (200 per 10,000): an issuer prefix at an issued length with a valid check digit occurs by chance in about one random run in eighty-five. This repository's own text is measured and reported, never bounded (an address added to a doc must not fail a build); per MB: `apps/gateway/src` (13.9 MB) email 0.4, phone 0.6, card 0.3, iban 0.2, us_ssn 0.2, ip 12.5, all of them real public addresses in the egress tests or the tests' own synthetic values; `apps/web/src` (3.5 MB) email 0.8, nothing else; `docs` (2.3 MB) ip 5.7, nothing else.
+
+**For coding traffic** (agents' prompts carry git authors, licence headers, addresses and long numbers), start a personal-data rule with Monitor, read its decisions per kind in Logs, then block the kinds that must never leave (card, IBAN, US SSN). The dashboard ticks no kind by default.
+

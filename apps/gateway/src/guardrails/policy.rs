@@ -66,6 +66,17 @@ names!(Category {
     PromptInjection = "prompt_injection",
     Custom = "custom",
 });
+// The personal-data kinds a rule of category `personal_data` looks for
+// (`super::personal::KINDS` says what each matches). A rule names its kinds
+// explicitly, so adding a kind never changes what an existing rule looks for.
+names!(Kind {
+    Email = "email",
+    Phone = "phone",
+    Card = "card",
+    Iban = "iban",
+    UsSsn = "us_ssn",
+    Ip = "ip",
+});
 // Ordered weakest to strictest.
 names!(InputAction {
     Off = "off",
@@ -135,16 +146,21 @@ impl DetectorKind {
     }
 }
 
-/// What this release can enforce (phase 1, #840): the pattern detector, on
-/// input only, for secrets and custom patterns, with monitor and block, for
-/// generation and embeddings, refusing uninspectable content. A rule that needs
+/// What this release can enforce: the pattern detector, on input only, for
+/// secrets, personal data (#841) and custom patterns, with monitor and block,
+/// for generation and embeddings, refusing uninspectable content. A rule that needs
 /// more is refused on write (`guardrail_detector_unavailable`), never stored and
 /// ignored.
 pub mod available {
     use super::*;
     pub const DETECTORS: &[DetectorKind] = &[DetectorKind::Pattern];
-    pub const PROTECTIONS: &[Protection] = &[Protection::Secrets, Protection::Custom];
-    pub const CATEGORIES: &[Category] = &[Category::Secret, Category::Custom];
+    pub const PROTECTIONS: &[Protection] = &[
+        Protection::Secrets,
+        Protection::PersonalData,
+        Protection::Custom,
+    ];
+    pub const CATEGORIES: &[Category] =
+        &[Category::Secret, Category::PersonalData, Category::Custom];
     pub const INPUT_ACTIONS: &[InputAction] =
         &[InputAction::Off, InputAction::Monitor, InputAction::Block];
     pub const OUTPUT_MODES: &[OutputMode] = &[OutputMode::Off];
@@ -161,6 +177,8 @@ pub struct Detector {
     pub categories: BTreeSet<Category>,
     /// Custom patterns (category `custom` only): configuration, never matched text.
     pub patterns: Vec<String>,
+    /// Personal-data kinds (category `personal_data` only, at least one).
+    pub kinds: BTreeSet<Kind>,
     /// A later phase's detector model or service.
     pub reference: Option<String>,
 }

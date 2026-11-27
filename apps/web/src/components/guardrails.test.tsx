@@ -353,6 +353,37 @@ describe("Admin › Guardrails: every platform write names the layer as loaded",
   });
 });
 
+describe("Personal data (#841)", () => {
+  const personal: StoredRule = { ...secrets, id: "r-pd", name: "Personal data", protection: "personal_data", detector: { kind: "pattern", categories: ["personal_data"], kinds: ["email", "ip"], pattern_count: 0, egress: "local" }, input: { action: "block", redact_scope: "user_text" }, on_error: "fail_closed" };
+  it("says which kinds a rule looks for, and sends them back", () => {
+    expect(inspectionSentence(personal)).toContain("Looks for personal data: email addresses and public IP addresses in the input");
+    expect(toInput(personal)).toMatchObject({ protection: "personal_data", detector: { kind: "pattern", categories: ["personal_data"], kinds: ["email", "ip"] } });
+  });
+  it("adds a personal-data rule with only the kinds ticked, none to begin with", async () => {
+    const fetch = serve({ [guardrailsPath(team.id)]: () => view() });
+    const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
+    await user.click(await screen.findByRole("button", { name: "Add rule" }));
+    await user.type(screen.getByLabelText("Name"), "No cards");
+    await user.selectOptions(screen.getByLabelText("Looks for"), "personal");
+    const boxes = screen.getAllByRole("checkbox").filter(b => /^(Email|Phone|Payment card|IBAN|US SSN|IP address):/.test(b.getAttribute("aria-label") ?? b.closest("label")?.textContent ?? ""));
+    expect(boxes).toHaveLength(6);
+    expect(boxes.every(b => !(b as HTMLInputElement).checked)).toBe(true);
+    expect(screen.getByText(/Public IP addresses only/)).toBeTruthy();
+    // Nothing ticked: nothing to look for, so the dialog refuses.
+    await user.click(screen.getByRole("button", { name: "Add rule" }));
+    expect(writes(fetch)).toHaveLength(0);
+    await user.click(screen.getByRole("checkbox", { name: /^Payment card:/ }));
+    await user.selectOptions(screen.getByLabelText("On input"), "block");
+    await user.click(screen.getByRole("button", { name: "Add rule" }));
+    await waitFor(() => expect(writes(fetch)).toHaveLength(1));
+    expect(writes(fetch)[0]![2].rules[1]).toEqual({ name: "No cards", protection: "personal_data", detector: { kind: "pattern", categories: ["personal_data"], kinds: ["card"] }, input: { action: "block" }, workloads: ["generation", "embeddings"] });
+  });
+  it("shows a decision's kind", () => {
+    const html = markup(<GuardrailDecisions decisions={[{ rule_set_id: "set-p", rule_id: "11111111-2222-4333-8444-555555555555", revision: 3, layer: "type_default", stage: "input", detector: "pattern", category: "personal_data", kind: "card", action: "blocked", count: 1, refused: true, created_at: "2026-11-26T00:00:00Z" }]} />);
+    expect(html).toContain("Personal data · Payment card");
+  });
+});
+
 describe("Logs: guardrail filters and decisions", () => {
   it("keeps the guardrail filter in the URL and across the log tabs", () => {
     const search = { page: "requests" as const, ws: team.id, status: "blocked", guardrail: "refused" as const };

@@ -103,9 +103,10 @@ pub(super) async fn detail(
         .bind(ws)
         .fetch_optional(&mut *tx)
         .await?;
-    // Guardrail decisions on this request (#840): ids, codes and counts
-    // only; visibility is the root's.
-    let (decisions,): (Value,) = sqlx::query_as("SELECT coalesce(jsonb_agg(jsonb_build_object('rule_set_id',g.rule_set_id,'rule_id',g.rule_id,'revision',g.revision,'layer',g.layer,'stage',g.stage,'detector',g.detector_kind,'category',g.category,'action',g.action,'count',g.count,'refused',g.refused,'created_at',g.created_at) ORDER BY g.created_at,g.id),'[]'::jsonb) FROM guardrail_events g WHERE g.root_request_id=$1 AND g.workspace_id=$2 AND g.created_at>=$3-interval '10 minutes' AND g.created_at<$3+interval '10 minutes'")
+    // Guardrail decisions on this request (#840): ids, codes, a
+    // personal-data kind's label (#841) and counts only; visibility is the
+    // root's.
+    let (decisions,): (Value,) = sqlx::query_as("SELECT coalesce(jsonb_agg(jsonb_build_object('rule_set_id',g.rule_set_id,'rule_id',g.rule_id,'revision',g.revision,'layer',g.layer,'stage',g.stage,'detector',g.detector_kind,'category',g.category,'kind',g.kind,'action',g.action,'count',g.count,'refused',g.refused,'created_at',g.created_at) ORDER BY g.created_at,g.id),'[]'::jsonb) FROM guardrail_events g WHERE g.root_request_id=$1 AND g.workspace_id=$2 AND g.created_at>=$3-interval '10 minutes' AND g.created_at<$3+interval '10 minutes'")
         .bind(root)
         .bind(ws)
         .bind(started)

@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use super::detector::{Budget, DetectContext, Detector, Findings, Inspection, Part};
 use super::policy::{
-    Category, DetectorKind, EffectiveRule, InactiveReason, InputAction, Layer, OnError,
+    Category, DetectorKind, EffectiveRule, InactiveReason, InputAction, Kind, Layer, OnError,
     Uninspectable, Workload,
 };
 use super::secrets::PatternDetector;
@@ -88,6 +88,7 @@ impl Policy {
                     Some(shared) => shared.clone().map(|d| d as std::sync::Arc<dyn Detector>),
                     None => PatternDetector::within(
                         &categories,
+                        &rule.detector.kinds.iter().copied().collect::<Vec<_>>(),
                         &rule.detector.patterns,
                         super::patterns::Limit::of(e.layer),
                     )
@@ -191,6 +192,8 @@ pub struct Event {
     pub layer: Layer,
     pub detector: DetectorKind,
     pub category: Category,
+    /// The personal-data kind of a personal-data finding; `None` otherwise.
+    pub kind: Option<Kind>,
     pub action: Action,
     pub count: u32,
     /// The decision the client was refused with.
@@ -269,6 +272,7 @@ impl CompiledRule {
             layer: self.layer,
             detector: self.kind,
             category,
+            kind: None,
             action,
             count,
             refused: false,
@@ -339,9 +343,11 @@ impl Policy {
     ) -> Decision {
         let mut decision = Decision::default();
         let builtin: OnceCell<Findings> = OnceCell::new();
+        let personal: OnceCell<Findings> = OnceCell::new();
         let ctx = DetectContext {
             budget,
             builtin: &builtin,
+            personal: &personal,
         };
         for r in self
             .rules
@@ -363,7 +369,7 @@ impl Policy {
                     // now (what they found until then still counts below).
                     failed(&mut decision, r, Category::Custom, RefusalKind::Unavailable);
                 }
-                for (category, count) in inspected.counts {
+                for (category, kind, count) in inspected.counts {
                     if count == 0 {
                         continue;
                     }
@@ -373,7 +379,10 @@ impl Policy {
                         Action::Monitored
                     };
                     let count = u32::try_from(count).unwrap_or(u32::MAX).min(1_000_000);
-                    decision.events.push(r.event(category, action, count));
+                    decision.events.push(Event {
+                        kind,
+                        ..r.event(category, action, count)
+                    });
                     if blocking {
                         refuse(&mut decision, r, RefusalKind::InputBlocked, category);
                     }

@@ -154,7 +154,7 @@ async fn refused_requests_are_listed_as_blocked_with_logs_visibility(pool: PgPoo
     assert_eq!(status, StatusCode::OK, "{totals}");
     assert_eq!(
         totals["decisions_this_month"],
-        json!([{"action":"monitored","category":"secret","decisions":1,"findings":3}])
+        json!([{"action":"monitored","category":"secret","kind":null,"decisions":1,"findings":3}])
     );
     // A shared workspace's totals count every layer and tightening.
     sqlx::query(tightened)

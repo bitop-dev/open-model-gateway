@@ -167,7 +167,7 @@ export function modalityText(text: string | null, audio: string | null, cached?:
 }
 export type RequestDetail = Omit<RequestRow, "attempts" | "job"> & { workspace_id: string; attempt_count: number; attempts: RequestAttempt[]; prev_id: string | null; next_id: string | null; job?: JobDetail | null; guardrail_decisions?: GuardrailDecision[] };
 /** One guardrail decision of a request: ids, codes and a count of distinct matched values, never text. */
-export type GuardrailDecision = { rule_set_id: string; rule_id: string; revision: number; layer: string; stage: string; detector: string; category: string; action: string; count: number; refused: boolean; created_at: string };
+export type GuardrailDecision = { rule_set_id: string; rule_id: string; revision: number; layer: string; stage: string; detector: string; category: string; kind?: string | null; action: string; count: number; refused: boolean; created_at: string };
 /** Filters the Generations and Sessions tabs take: they have no refused request (it has no attempt), so not the guardrail filters. */
 export function attemptFilters(filters: RequestFilters): RequestFilters {
   const status = filters.status?.split(",").filter(s => s !== "blocked").join(",") || undefined;

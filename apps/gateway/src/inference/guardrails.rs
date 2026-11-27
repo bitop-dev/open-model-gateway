@@ -239,10 +239,10 @@ impl Store {
             })
             .collect();
         sqlx::query(
-            "INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,streamed,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,tightened,omitted)
-             SELECT id,$2,$3,$4,$5,$6,$16,'input',rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,tightened,omitted
-             FROM unnest($1::uuid[],$7::uuid[],$8::uuid[],$9::bigint[],$10::text[],$11::text[],$12::text[],$13::text[],$14::int[],$15::boolean[],$17::boolean[],$18::int[])
-              AS t(id,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,tightened,omitted)",
+            "INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,streamed,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,tightened,omitted,kind)
+             SELECT id,$2,$3,$4,$5,$6,$16,'input',rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,tightened,omitted,kind
+             FROM unnest($1::uuid[],$7::uuid[],$8::uuid[],$9::bigint[],$10::text[],$11::text[],$12::text[],$13::text[],$14::int[],$15::boolean[],$17::boolean[],$18::int[],$19::text[])
+              AS t(id,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,tightened,omitted,kind)",
         )
         .bind(e.iter().map(|_| Uuid::now_v7()).collect::<Vec<_>>())
         .bind(record.root_request_id)
@@ -266,6 +266,8 @@ impl Store {
         .bind(record.streamed)
         .bind(e.iter().map(|v| v.tightened).collect::<Vec<_>>())
         .bind(omitted)
+        // A personal-data kind's label (never matched text), else null.
+        .bind(e.iter().map(|v| v.kind.map(|k| k.as_str())).collect::<Vec<_>>())
         .execute(&self.pool)
         .await
         .map_err(route_lookup_storage)?;
