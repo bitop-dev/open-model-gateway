@@ -1,7 +1,7 @@
 //! Which route a video request goes to, and why none does: the caller's
 //! routes of the model whose video options (0097) take its length and
 //! size, and the explicit refusals naming what none of them takes.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use uuid::Uuid;
 
@@ -44,6 +44,10 @@ fn refusal(routes: &HashMap<Uuid, VideoRoute>, request: &VideoRequest) -> JobErr
     }
 }
 
+fn price_missing() -> JobError {
+    JobError::Conflict("video_price_missing", super::video::VIDEO_PRICE_MISSING)
+}
+
 impl Jobs {
     /// The route a video request goes to, among the caller's routes of the
     /// model whose options (0097) take its length and size, and the request
@@ -57,18 +61,14 @@ impl Jobs {
     ) -> JobResult<(Deployment, Arc<dyn ProviderAdapter>, VideoRequest)> {
         let candidates = self.video_candidates(principal, request, false).await?;
         let routes = self.video_routes(&candidates).await?;
+        let priced = self.priced_routes(&routes, request).await?;
         let selected = self
             .select(
                 principal,
                 &request.model,
                 ApiProtocol::Videos,
                 request_id,
-                |a, d| {
-                    routes
-                        .get(&d.id)
-                        .is_some_and(|r| r.accepts(request).is_ok())
-                        && a.supports_video_request(d, request)
-                },
+                |a, d| priced.contains(&d.id) && a.supports_video_request(d, request),
             )
             .await;
         let (target, adapter) = match selected {
@@ -86,12 +86,13 @@ impl Jobs {
 
     /// Admit the video under the catalog lock. A route changed between its
     /// choice and the locked admission is answered as it would have been
-    /// before admission.
+    /// before admission, classified on the request as the caller sent it
+    /// (`original`: a length it did not name is never blamed).
     pub(super) async fn admit_video(
         &self,
         principal: Principal,
         request_id: Uuid,
-        request: &VideoRequest,
+        original: &VideoRequest,
         target: &Deployment,
         admission: &WorkloadAdmission,
         check: &crate::governance::VideoCheck,
@@ -100,7 +101,7 @@ impl Jobs {
             .admit(
                 principal,
                 request_id,
-                &request.model,
+                &original.model,
                 target,
                 admission,
                 Some(check),
@@ -108,12 +109,30 @@ impl Jobs {
             .await
         {
             Ok(attempt) => Ok(attempt),
-            Err(InferenceError::PriceUnbounded) => Err(JobError::Conflict(
-                "video_price_missing",
-                super::video::VIDEO_PRICE_MISSING,
-            )),
+            // The route's price stopped valuing the request after its choice
+            // (`governance::video::admit_check`); any other unbounded price
+            // (a budget over an unbounded meter) is answered as for every
+            // workload.
+            Err(InferenceError::PriceUnbounded) => {
+                match crate::governance::video_route_priced(
+                    &self.store,
+                    target.id,
+                    check.size.as_deref(),
+                )
+                .await
+                {
+                    Ok(false) => Err(price_missing()),
+                    Ok(true) => Err(InferenceError::PriceUnbounded.into()),
+                    Err(e) => Err(e.into()),
+                }
+            }
             Err(InferenceError::Unsupported) => Err(self
-                .refusal_of(&principal, request, request_id, InferenceError::Unsupported)
+                .refusal_of(
+                    &principal,
+                    original,
+                    request_id,
+                    InferenceError::Unsupported,
+                )
                 .await),
             Err(e) => Err(e.into()),
         }
@@ -163,6 +182,11 @@ impl Jobs {
         request_id: Uuid,
         outcome: InferenceError,
     ) -> JobError {
+        // A name that can never match is an unknown model (it would break
+        // the live query).
+        if !crate::inference::types::model_name_is_queryable(&request.model) {
+            return InferenceError::ModelUnavailable.into();
+        }
         let candidates = match self.video_candidates(principal, request, true).await {
             Ok(candidates) if candidates.is_empty() => {
                 return InferenceError::ModelUnavailable.into();
@@ -170,21 +194,67 @@ impl Jobs {
             Ok(candidates) => candidates,
             Err(e) => return e,
         };
-        let plan = match self
-            .store
-            .route_plan(principal, &request.model, &candidates, request_id)
-            .await
-        {
-            Ok(plan) => plan,
-            Err(e) => return e.into(),
-        };
-        match self.video_routes_by_id(&plan.deployment_ids).await {
-            Ok(routes) => match refusal(&routes, request) {
-                JobError::Inference(InferenceError::Unsupported) => outcome.into(),
-                refused => refused,
-            },
-            Err(e) => e,
+        // Each route planned on its own: routing's filters (residency,
+        // operator disablement) decide whether it could take a request,
+        // never another route's place in a plan.
+        let mut eligible = Vec::new();
+        let mut planned = None;
+        for candidate in candidates {
+            match self
+                .store
+                .route_plan(
+                    principal,
+                    &request.model,
+                    std::slice::from_ref(&candidate),
+                    request_id,
+                )
+                .await
+            {
+                Ok(_) => eligible.push(candidate.id),
+                Err(e) => planned = planned.or(Some(e)),
+            }
         }
+        if eligible.is_empty() {
+            return planned.unwrap_or(InferenceError::ModelUnavailable).into();
+        }
+        let routes = match self.video_routes_by_id(&eligible).await {
+            Ok(routes) => routes,
+            Err(e) => return e,
+        };
+        match refusal(&routes, request) {
+            // A route takes the request; none of them prices it.
+            JobError::Inference(InferenceError::Unsupported) => {
+                match self.priced_routes(&routes, request).await {
+                    Ok(priced) if priced.is_empty() => price_missing(),
+                    Ok(_) => outcome.into(),
+                    Err(e) => e,
+                }
+            }
+            refused => refused,
+        }
+    }
+
+    /// The routes that take the request and whose latest price values it
+    /// as settlement will ([`crate::governance::video_route_priced`]): only
+    /// these are chosen, so a priced route is never passed over for an
+    /// unpriced one (admission checks the price again under its lock).
+    async fn priced_routes(
+        &self,
+        routes: &HashMap<Uuid, VideoRoute>,
+        request: &VideoRequest,
+    ) -> JobResult<HashSet<Uuid>> {
+        let mut priced = HashSet::new();
+        for (id, route) in routes {
+            let Ok(resolved) = route.accepts(request) else {
+                continue;
+            };
+            if crate::governance::video_route_priced(&self.store, *id, resolved.size.as_deref())
+                .await?
+            {
+                priced.insert(*id);
+            }
+        }
+        Ok(priced)
     }
 
     /// The video options (0097) of these routes; a route without them is not

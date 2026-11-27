@@ -76,10 +76,15 @@ pub(in crate::providers::openai) fn parse_video(value: &Value) -> Result<Upstrea
         }
         .filter(|n| (1..=VIDEO_MAX_SECONDS).contains(n))
     };
-    // The generated duration: the usage the server reports when it does,
-    // else the video's length.
-    let mut seconds =
-        whole(&value["usage"]["output_video_seconds"]).or_else(|| whole(&value["seconds"]));
+    // The generated duration: the usage the server reports when it does
+    // (then only that: an unusable usage value is an unknown duration, never
+    // replaced by the requested length), else the video's length.
+    let usage = &value["usage"]["output_video_seconds"];
+    let mut seconds = if usage.is_null() {
+        whole(&value["seconds"])
+    } else {
+        whole(usage)
+    };
     // A size the gateway cannot read makes the report unusable for billing:
     // its duration counts as unknown (the hold is kept), never billed at
     // another size.
@@ -145,6 +150,12 @@ pub(crate) async fn create_video(
         .send()
         .await
         .map_err(|e| lost(wire.kind, &e))?;
+    // Redirects are not followed; one after a create may follow its
+    // success, so its outcome is unknown (the job keeps its hold), never a
+    // create that left nothing upstream.
+    if response.status().is_redirection() {
+        return Err(InferenceError::InvalidUpstream);
+    }
     parse_video(&read_object(response).await?)
 }
 
@@ -237,7 +248,7 @@ pub(crate) async fn video_content(
     }
     let media = match asset {
         // The video's own type, as the server labels it, when it is one the
-        // gateway stores ([`VIDEO_OUTPUT_TYPES`]); any other label (none, a
+        // gateway serves ([`VIDEO_OUTPUT_TYPES`]); any other label (none, a
         // generic binary type, a non-video type) is reported as
         // `application/octet-stream`.
         VideoAsset::Video => media_type(&response)

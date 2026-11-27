@@ -30,12 +30,12 @@ pub(super) const MP4: &[u8] = b"\x00\x00\x00\x18ftypmp42 mock video";
 /// A mock video: its status, the seconds it was made with, the size it reports.
 pub(super) type Video = (&'static str, String, Option<String>);
 
-/// A server of the OpenAI video contract: it remembers each create's form,
-/// answers each video's status as set, serves (or fails) the content and
-/// offers no delete (`405`).
 /// A content answer: status, content type, body, and a declared
 /// `Content-Length` other than the body's.
 pub(super) type Content = (u16, &'static str, Vec<u8>, Option<u64>);
+/// A server of the OpenAI video contract: it remembers each create's form,
+/// answers each video's status as set, serves (or fails) the content and
+/// offers no delete (`405`) unless told otherwise.
 #[derive(Default)]
 pub(super) struct Contract {
     pub(super) forms: Mutex<Vec<String>>,
@@ -529,9 +529,10 @@ async fn one_upstream_video_belongs_to_one_job(pool: PgPool) {
     let (status, first) = create(&mine, "company/mine").await;
     assert_eq!(status, StatusCode::OK, "{first}");
     let (status, body) = create(&theirs, "company/theirs").await;
-    assert!(
-        status.is_server_error(),
-        "the second create is not recorded: {status} {body}"
+    assert_eq!(
+        (status, body["error"]["code"].clone()),
+        (StatusCode::BAD_GATEWAY, json!("invalid_upstream_response")),
+        "the second create is not recorded: {body}"
     );
     let recorded: Vec<(Uuid, Option<String>)> =
         sqlx::query_as("SELECT workspace_id,upstream_id FROM async_jobs ORDER BY created_at")
@@ -545,18 +546,19 @@ async fn one_upstream_video_belongs_to_one_job(pool: PgPool) {
             (f.team.workspace_id, None)
         ]
     );
-    // The second job ends without an id; deleting it says the provider's
-    // copy may remain (its create's outcome is unknown), and sends nothing.
-    let second: Uuid = sqlx::query_scalar("SELECT id FROM async_jobs WHERE workspace_id=$1")
-        .bind(f.team.workspace_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    sqlx::query("UPDATE async_jobs SET state='failed',error_code='create_unconfirmed',completed_at=now() WHERE id=$1")
-        .bind(second)
-        .execute(&pool)
-        .await
-        .unwrap();
+    // The second job ends at once without an id, its hold kept; deleting
+    // it says the provider's copy may remain, and sends nothing.
+    let (second, state, code, held): (Uuid, String, String, String) = sqlx::query_as(
+        "SELECT j.id,j.state,j.error_code,r.state FROM async_jobs j JOIN governance_reservations r ON r.execution_id=j.execution_id WHERE j.workspace_id=$1",
+    )
+    .bind(f.team.workspace_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (state.as_str(), code.as_str(), held.as_str()),
+        ("failed", "upstream_id_reused", "unknown")
+    );
     let response = client
         .delete(format!("{gateway}/v1/videos/video_{}", second.simple()))
         .header("authorization", &theirs)
@@ -574,11 +576,75 @@ async fn one_upstream_video_belongs_to_one_job(pool: PgPool) {
         0,
         "nothing sent for a job without an id"
     );
-    // The first job's video, completed: its content as the server labels it
-    // (a type outside the allowlist as `application/octet-stream`), never
-    // sniffed; its delete answered `404` (already gone) counts as gone.
+    // The server gave the first job's id to the second create, so it may
+    // hold another workspace's video behind it: the first job is never asked
+    // about again (its content is an upstream error, its delete local only).
     set_status(&mock, "vid_same", "completed");
     let path = format!("{gateway}/v1/videos/{}", first["id"].as_str().unwrap());
+    let reused: String =
+        sqlx::query_scalar("SELECT error_code FROM async_jobs WHERE upstream_id='vid_same'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(reused, "upstream_id_reused");
+    let (contents, retrieves) = (
+        mock.contents.load(Ordering::SeqCst),
+        mock.retrieves.load(Ordering::SeqCst),
+    );
+    let read = client
+        .get(&path)
+        .header("authorization", &mine)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read.status(), StatusCode::BAD_GATEWAY);
+    let deleted: Value = client
+        .delete(&path)
+        .header("authorization", &mine)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            deleted["deleted"].clone(),
+            deleted["upstream_deleted"].clone()
+        ),
+        (json!(true), json!(false))
+    );
+    assert_eq!(
+        (
+            mock.contents.load(Ordering::SeqCst),
+            mock.retrieves.load(Ordering::SeqCst),
+            mock.deletes.load(Ordering::SeqCst)
+        ),
+        (contents, retrieves, 0),
+        "nothing sent for a reused id"
+    );
+    // A fresh video: its content as the server labels it (a type outside
+    // the allowlist as `application/octet-stream`), never sniffed; its
+    // delete answered `404` (already gone) counts as gone.
+    *mock.fixed_id.lock().unwrap() = None;
+    let (status, fresh) = create(&mine, "company/mine").await;
+    assert_eq!(status, StatusCode::OK, "{fresh}");
+    let upstream: String = sqlx::query_scalar("SELECT upstream_id FROM async_jobs WHERE id=$1")
+        .bind(
+            Uuid::parse_str(
+                fresh["id"]
+                    .as_str()
+                    .unwrap()
+                    .strip_prefix("video_")
+                    .unwrap(),
+            )
+            .unwrap(),
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    set_status(&mock, &upstream, "completed");
+    let path = format!("{gateway}/v1/videos/{}", fresh["id"].as_str().unwrap());
     let read: Value = client
         .get(&path)
         .header("authorization", &mine)
@@ -589,6 +655,16 @@ async fn one_upstream_video_belongs_to_one_job(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(read["status"], "completed", "{read}");
+    // A route without sizes under a flat price: the size the server reports
+    // (1280x720) is billed at the line without a size (4 s × $0.10).
+    let settled: (String, Option<i64>) = sqlx::query_as(
+        "SELECT r.state,r.actual_microusd FROM governance_reservations r JOIN async_jobs j ON j.execution_id=r.execution_id WHERE j.upstream_id=$1",
+    )
+    .bind(&upstream)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(settled, ("settled".to_owned(), Some(400_000)));
     for (media, served) in [
         ("video/webm", "video/webm"),
         ("video/quicktime", "video/quicktime"),

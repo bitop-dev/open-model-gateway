@@ -64,6 +64,8 @@ pub(crate) fn job_columns() -> &'static str {
 use types::*;
 
 /// Video jobs are polled (and their lease kept) for at most this long.
+/// The mark of a job whose provider id the server gave another job too.
+pub(crate) const UPSTREAM_ID_REUSED: &str = "upstream_id_reused";
 pub const VIDEO_POLL_WINDOW: TimeDelta = TimeDelta::hours(6);
 /// Batches: the 24 h completion window plus finalization.
 pub const BATCH_POLL_WINDOW: TimeDelta = TimeDelta::hours(26);
@@ -526,6 +528,12 @@ impl Jobs {
         &self,
         job: &JobRow,
     ) -> Result<(Deployment, Arc<dyn ProviderAdapter>), InferenceError> {
+        // The server answered another job's create with this job's id: what
+        // it holds behind the id may be another workspace's video, so it is
+        // never asked about it again (`store::record_video_upstream`).
+        if job.error_code.as_deref() == Some(UPSTREAM_ID_REUSED) {
+            return Err(InferenceError::InvalidUpstream);
+        }
         let target = store::target(&self.store, job.deployment_id)
             .await
             .map_err(|_| InferenceError::Storage)?

@@ -53,8 +53,23 @@ fn size_named(lines: &crate::billing::v3::PriceLines, size: &str) -> bool {
     }) && size_rated(lines, Some(size))
 }
 
+/// Whether `lines` have one video rate for every size: no size-specific
+/// line, and the lines without a size rated ([`size_rated`]).
+fn flat(lines: &crate::billing::v3::PriceLines) -> bool {
+    !lines
+        .0
+        .iter()
+        .any(|l| l.meter == Meter::OutputVideoSecondsMs && l.variant.is_some())
+        && size_rated(lines, None)
+}
+
 /// Whether `price` values a video request naming `size` (or none) on a
-/// route accepting `sizes`.
+/// route accepting `sizes`, as settlement will bill it
+/// (`jobs::video::settlement`): a named size at its own lines or the lines
+/// without a size; with no size named, the size the server reports only
+/// where the price names it or rates every size alike, so each size the
+/// route lists must be named by the price, unless the price is flat, and a
+/// route without sizes needs a flat price.
 pub(super) fn video_priced(
     price: Option<&Price>,
     sizes: Option<&[String]>,
@@ -68,8 +83,8 @@ pub(super) fn video_priced(
     };
     match (size, sizes) {
         (Some(s), _) => size_rated(&lines, Some(s)),
-        (None, Some(sizes)) => sizes.iter().all(|s| size_rated(&lines, Some(s))),
-        (None, None) => size_rated(&lines, None),
+        (None, Some(sizes)) => flat(&lines) || sizes.iter().all(|s| size_named(&lines, s)),
+        (None, None) => flat(&lines),
     }
 }
 
@@ -116,13 +131,9 @@ pub async fn pinned_video_size_rate(
     Ok(rate)
 }
 fn reported_rate(lines: &crate::billing::v3::PriceLines, size: &str) -> ReportedSizeRate {
-    let sized = lines
-        .0
-        .iter()
-        .any(|l| l.meter == Meter::OutputVideoSecondsMs && l.variant.is_some());
     if size_named(lines, size) {
         ReportedSizeRate::Named
-    } else if !sized && size_rated(lines, None) {
+    } else if flat(lines) {
         ReportedSizeRate::Flat
     } else {
         ReportedSizeRate::Unpriced
@@ -254,9 +265,9 @@ mod tests {
             reported_rate(&lines, "720x1280"),
             ReportedSizeRate::Unpriced
         );
-        let (flat, _) = default.lines().unwrap();
+        let (flat_lines, _) = default.lines().unwrap();
         assert_eq!(
-            reported_rate(&flat, "1280x720"),
+            reported_rate(&flat_lines, "1280x720"),
             ReportedSizeRate::Flat,
             "one rate for any size"
         );
@@ -271,6 +282,23 @@ mod tests {
         assert!(
             !size_named(&lines, "1280x720"),
             "only the line without a size"
+        );
+        // With no size named, admission takes only what settlement bills:
+        // each listed size named by the price, or one rate for all.
+        let other = vec!["640x360".to_owned()];
+        let listed = vec!["1280x720".to_owned()];
+        assert!(
+            !video_priced(Some(&both), Some(&other), None),
+            "640x360 only by the fallback"
+        );
+        assert!(video_priced(Some(&both), Some(&listed), None));
+        assert!(
+            !video_priced(Some(&both), None, None),
+            "a route without sizes needs one rate"
+        );
+        assert!(
+            video_priced(Some(&both), Some(&other), Some("640x360")),
+            "a named size takes the fallback"
         );
         let mut v2 = default.clone();
         v2.pricing_version = 2;

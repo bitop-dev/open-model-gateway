@@ -1,7 +1,8 @@
 //! Explicitly approved local profiles: Chat and embeddings on every profile,
 //! rerank on the compatible/vLLM/SGLang profiles, System One on the compatible
-//! and Ollama profiles (see `workloads`). Ollama uses compatible Chat and
-//! native /api/embed with truncation disabled.
+//! and Ollama profiles, video jobs on the compatible profile (see
+//! `workloads`). Ollama uses compatible Chat and native /api/embed with
+//! truncation disabled.
 use super::{ProviderAdapter, embeddings, framing, openai, secrets::SecretResolver};
 use crate::inference::{error::InferenceError, types::*};
 use async_trait::async_trait;

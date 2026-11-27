@@ -242,7 +242,8 @@ async fn error_statuses_map_without_reading_bodies_or_following_redirects() {
         InferenceError::Busy,
         InferenceError::UpstreamUnavailable,
         InferenceError::UpstreamRejected,
-        InferenceError::Configuration,
+        // A redirect to a create may follow its success: an unknown outcome.
+        InferenceError::InvalidUpstream,
     ] {
         assert_eq!(
             a.create_video(&t, video_request()).await.err(),
@@ -745,6 +746,13 @@ fn the_reported_duration_and_size_are_read_or_left_unknown() {
     assert_eq!(parse_video(&v).unwrap().seconds, Some(8));
     v["usage"] = json!({"output_video_seconds": 4, "cost": "0.288"});
     assert_eq!(parse_video(&v).unwrap().seconds, Some(4), "usage first");
+    // A usage value the gateway cannot use is an unknown duration, never
+    // the video's length in its place.
+    for bad in [json!(3601), json!(0), json!(4.5), json!("four"), json!(-4)] {
+        let mut w = v.clone();
+        w["usage"]["output_video_seconds"] = bad.clone();
+        assert_eq!(parse_video(&w).unwrap().seconds, None, "{bad}");
+    }
     for size in [json!("1920×1080"), json!("1280 x 720"), json!(1920)] {
         v["size"] = size.clone();
         let p = parse_video(&v).unwrap();
@@ -779,4 +787,23 @@ async fn video_content_is_only_a_complete_answer() {
             Some(InferenceError::InvalidUpstream)
         );
     }
+}
+
+/// A redirect after a create may follow its success: its outcome is unknown
+/// (`InvalidUpstream`, so the job keeps its hold), never a refused create.
+#[tokio::test]
+async fn a_redirected_create_has_an_unknown_outcome() {
+    let mock = Mock::new(vec![Reply {
+        status: 303,
+        content_type: "text/plain",
+        body: Vec::new(),
+    }])
+    .await;
+    assert_eq!(
+        mock.adapter()
+            .create_video(&target("sora-2"), video_request())
+            .await
+            .err(),
+        Some(InferenceError::InvalidUpstream)
+    );
 }

@@ -271,6 +271,14 @@ async fn a_video_route_serves_only_with_options_and_a_video_rate(pool: PgPool) {
         (json!(0), json!(1)),
         "options, no video rate"
     );
+    // Only a size-specific rate, on a route without sizes: nothing it can
+    // take is priced.
+    let mut sized = lines.clone();
+    let mut hd = line(Meter::OutputVideoSecondsMs, "100000", 1000);
+    hd["variant"] = json!("1280x720");
+    sized.push(hd);
+    price(json!(sized)).await;
+    assert_eq!(readiness().await, (json!(0), json!(1)), "a sized rate only");
     lines.push(line(Meter::OutputVideoSecondsMs, "100000", 1000));
     price(json!(lines)).await;
     assert_eq!(readiness().await, (json!(1), json!(0)), "set up");

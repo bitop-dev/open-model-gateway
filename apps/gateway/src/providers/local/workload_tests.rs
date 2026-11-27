@@ -624,7 +624,7 @@ async fn dropping_rerank_or_systemone_cancels_the_upstream_body() {
         server.abort();
     }
 }
-/// The rerank wire and System One routing agree with the shared capability
+/// The rerank and video wires and System One routing agree with the shared capability
 /// table that `supports_protocol`, route validation and readiness use.
 #[test]
 fn local_workload_wires_match_the_capability_table() {

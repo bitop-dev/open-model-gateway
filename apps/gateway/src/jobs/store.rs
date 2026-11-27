@@ -157,27 +157,51 @@ pub(crate) async fn insert_job(conn: &mut sqlx::PgConnection, job: &NewJob<'_>) 
 /// Fill in the provider id of a video recorded before its create (#662).
 /// `None` when the row is no longer a queued video without an id (the
 /// create-grace rule already failed it), or when another job of the same
-/// connection already has that id: one upstream object is never reachable
-/// through two jobs (their routes may serve different workspaces), so the
-/// id is not recorded and the create-grace rule ends the row with its hold
-/// kept. The check runs under an advisory lock of (connection, id), so two
-/// creates answered with one id cannot both record it. The provider has
-/// accepted the job at this point, so a failure is counted at
-/// `job_settlement`.
+/// upstream account (provider, endpoint and credential: two connection
+/// records may name one server) already has that id. One upstream object is
+/// never reachable through two jobs (their routes may serve different
+/// workspaces): the id is not recorded for this job, which ends `failed`
+/// `upstream_id_reused` (hold kept), and every earlier job with that id is
+/// marked `upstream_id_reused` (and ended `failed` if still running, its
+/// hold kept), after which the gateway never contacts the server for it
+/// again ([`super::Jobs::target`]); the server may have put another
+/// workspace's video behind it. The check runs under an advisory
+/// lock of (account, id), so two creates answered with one id cannot both
+/// record it. The provider has accepted the job at this point, so a failure
+/// is counted at `job_settlement`.
 pub(crate) async fn record_video_upstream(
     store: &Store,
     id: Uuid,
     upstream: &UpstreamId,
 ) -> Result<Option<JobRow>> {
+    // The upstream account of a job: its connection's provider, endpoint
+    // and credential reference.
+    const ACCOUNT: &str = "(SELECT p.provider||':'||coalesce(p.endpoint,'')||':'||p.credential_ref FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id WHERE d.id=j.deployment_id)";
     let mut tx = crate::db::begin(&store.pool)
         .await
         .map_err(job_settlement)?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('video_upstream:'||d.provider_connection_id::text||':'||$2,0)) FROM async_jobs j JOIN deployments d ON d.id=j.deployment_id WHERE j.id=$1")
+    sqlx::query(&format!("SELECT pg_advisory_xact_lock(hashtextextended('video_upstream:'||{ACCOUNT}||':'||$2,0)) FROM async_jobs j WHERE j.id=$1"))
         .bind(id).bind(upstream.as_str())
         .execute(&mut *tx).await.map_err(job_settlement)?;
-    let recorded: Option<JobRow> = sqlx::query_as(&format!("UPDATE async_jobs SET upstream_id=$2 WHERE id=$1 AND kind='video' AND upstream_id IS NULL AND state='queued' AND NOT EXISTS(SELECT 1 FROM async_jobs o JOIN deployments od ON od.id=o.deployment_id JOIN deployments d ON d.provider_connection_id=od.provider_connection_id WHERE d.id=async_jobs.deployment_id AND o.upstream_id=$2 AND o.id<>$1) RETURNING {JOB_COLUMNS}"))
+    let others: Vec<Uuid> = sqlx::query_scalar(&format!("SELECT o.id FROM async_jobs o JOIN async_jobs j ON j.id=$1 WHERE o.upstream_id=$2 AND o.id<>$1 AND o.kind='video' AND {} = {ACCOUNT}", ACCOUNT.replace("j.deployment_id", "o.deployment_id")))
         .bind(id).bind(upstream.as_str())
-        .fetch_optional(&mut *tx).await.map_err(job_settlement)?;
+        .fetch_all(&mut *tx).await.map_err(job_settlement)?;
+    let recorded: Option<JobRow> = if others.is_empty() {
+        sqlx::query_as(&format!("UPDATE async_jobs SET upstream_id=$2 WHERE id=$1 AND kind='video' AND upstream_id IS NULL AND state='queued' RETURNING {JOB_COLUMNS}"))
+            .bind(id).bind(upstream.as_str())
+            .fetch_optional(&mut *tx).await.map_err(job_settlement)?
+    } else {
+        // Marked for good, and ended if still running (its hold is kept: no
+        // settlement is ever read from the server for it).
+        sqlx::query("UPDATE async_jobs SET error_code='upstream_id_reused',state=CASE WHEN state IN('queued','in_progress') THEN 'failed' ELSE state END,completed_at=CASE WHEN state IN('queued','in_progress') THEN coalesce(completed_at,clock_timestamp()) ELSE completed_at END WHERE id=ANY($1)")
+            .bind(&others)
+            .execute(&mut *tx).await.map_err(job_settlement)?;
+        // This job too: the server's answer gives it no object of its own.
+        sqlx::query("UPDATE async_jobs SET state='failed',upstream_status='failed',error_code='upstream_id_reused',completed_at=clock_timestamp() WHERE id=$1 AND kind='video' AND upstream_id IS NULL AND state='queued'")
+            .bind(id)
+            .execute(&mut *tx).await.map_err(job_settlement)?;
+        None
+    };
     tx.commit().await.map_err(job_settlement)?;
     Ok(recorded)
 }

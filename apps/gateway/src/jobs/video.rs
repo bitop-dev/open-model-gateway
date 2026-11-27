@@ -155,25 +155,18 @@ impl Jobs {
         request_id: Uuid,
     ) -> JobResult<JobRow> {
         request.validate()?;
-        // No registered adapter offers video generation (OpenAI retired its
-        // Videos API): refuse explicitly before admission, never a job.
+        // No registered adapter offers video generation: refuse explicitly
+        // before admission, never a job.
         if !self.registry.supports(ApiProtocol::Videos) {
             return Err(JobError::Conflict(
                 "unsupported_capability",
                 NO_VIDEO_PROVIDER,
             ));
         }
+        let original = request.clone();
         let (target, adapter, request) = self.video_route(&principal, &request, request_id).await?;
         let model = request.model.clone();
         let seconds = request.seconds.ok_or(InferenceError::Configuration)?;
-        if !crate::governance::video_route_priced(&self.store, target.id, request.size.as_deref())
-            .await?
-        {
-            return Err(JobError::Conflict(
-                "video_price_missing",
-                VIDEO_PRICE_MISSING,
-            ));
-        }
         let admission = WorkloadAdmission {
             kind: WorkloadKind::Videos,
             output: OutputReservation::None,
@@ -184,7 +177,9 @@ impl Jobs {
             size: request.size.clone(),
         };
         let attempt = self
-            .admit_video(principal, request_id, &request, &target, &admission, &check)
+            .admit_video(
+                principal, request_id, &original, &target, &admission, &check,
+            )
             .await?;
         let deadline = UtcInstant::now() + VIDEO_POLL_WINDOW;
         let grace = self.video_create_grace();
@@ -253,8 +248,7 @@ impl Jobs {
                 tracing::error!(execution_id = %request_id, "video provider id not recorded after upstream acceptance; the job ends interrupted with its hold kept");
             })?;
         let Some(job) = recorded else {
-            tracing::error!(execution_id = %request_id, "video provider id arrived after the job ended, or another job of the connection has it; hold kept");
-            return Err(InferenceError::Storage.into());
+            return Err(self.unrecorded_upstream(job.id, request_id).await);
         };
         // The creator's first observation (`Observer::Creator`): inside the
         // create grace no poller can hold the row (it is first due at the
@@ -365,6 +359,31 @@ impl Jobs {
     #[cfg(test)]
     pub(crate) fn video_create_grace(&self) -> TimeDelta {
         self.video_create_grace
+    }
+
+    /// The provider accepted a create whose id could not be recorded. The
+    /// id was another job's (`store::record_video_upstream` ended this job
+    /// `upstream_id_reused`): the server's answer is invalid, so this job
+    /// settles now as interrupted, hold kept. Otherwise the job had already
+    /// ended, or the write failed: a gateway failure, the hold kept by the
+    /// create-grace rule.
+    async fn unrecorded_upstream(&self, id: Uuid, execution: Uuid) -> JobError {
+        let job = match store::reload(&self.store, id).await {
+            Ok(job) => job,
+            Err(e) => return e.into(),
+        };
+        if job.error_code.as_deref() != Some(super::UPSTREAM_ID_REUSED) {
+            tracing::error!(execution_id = %execution, "video provider id arrived after the job ended; hold kept");
+            return InferenceError::Storage.into();
+        }
+        tracing::error!(execution_id = %execution, "the video provider answered with another job's id; neither job is served from it, holds kept");
+        match self
+            .settle_as(&job, interrupted(), store::Observer::Creator)
+            .await
+        {
+            Ok(_) => InferenceError::InvalidUpstream.into(),
+            Err(e) => e,
+        }
     }
 
     /// A video recorded before its create that has no provider id. It is
@@ -608,9 +627,12 @@ impl Jobs {
         // A video that never got a provider id has no provider assets only
         // when its create is known to have left none (`create_failed`: nothing
         // sent, or refused); after an unknown outcome (`create_unconfirmed`,
-        // `create_interrupted`) the server may still have it.
+        // `create_interrupted`) the server may still have it. A job whose id
+        // the server gave another job is never asked about again
+        // (`Jobs::target`): only the record goes, and the copy may remain.
         let mut upstream_deleted = job.error_code.as_deref() == Some("create_failed");
-        if job.upstream_id.is_some() {
+        if job.upstream_id.is_some() && job.error_code.as_deref() != Some(super::UPSTREAM_ID_REUSED)
+        {
             let (target, adapter) = self.target(&job).await?;
             let upstream_id = job.upstream().ok_or(InferenceError::Storage)?;
             upstream_deleted =

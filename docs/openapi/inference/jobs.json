@@ -227,11 +227,45 @@
           "401": {
             "$ref": "#/components/responses/OpenAiUnauthorized"
           },
+          "404": {
+            "description": "The model is not available to this key (unknown, not offered, or no route the caller may use).",
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "cache-control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/JobErrorEnvelope"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OpenAiErrorEnvelope"
+                    }
+                  ]
+                }
+              }
+            }
+          },
           "413": {
             "$ref": "#/components/responses/OpenAiPayloadTooLarge"
           },
+          "429": {
+            "$ref": "#/components/responses/OpenAiTooManyRequests"
+          },
+          "502": {
+            "$ref": "#/components/responses/OpenAiBadGateway"
+          },
           "503": {
             "$ref": "#/components/responses/OpenAiUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/OpenAiGatewayTimeout"
           }
         },
         "requestBody": {
