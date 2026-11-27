@@ -3,6 +3,9 @@ use super::super::responses::{message, name, string, validate};
 use super::*;
 use serde::Deserialize;
 
+mod native;
+use native::native_messages;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
@@ -295,100 +298,6 @@ fn check_metadata(metadata: Option<WireMetadata>) -> Result<()> {
     }
     Ok(())
 }
-/// The native envelope of the messages. An image block's base64 is not
-/// copied: its `data` is the placeholder of that image (numbered in wire
-/// order, as the parser takes images), and the body sent splices the
-/// canonical image's base64 in (`image_body::json_body_base64`), so an
-/// image's bytes are held once.
-fn native_messages(wire: &[WireMessage]) -> Vec<Value> {
-    let mut images = 0;
-    wire.iter()
-        .map(|m| {
-            let mut content = match &m.content {
-                Value::String(text) => json!([{"type":"text","text":text}]),
-                Value::Array(blocks) => Value::Array(
-                    blocks
-                        .iter()
-                        .map(|block| native_block(block, &mut images))
-                        .collect(),
-                ),
-                other => other.clone(),
-            };
-            if let Some(blocks) = content.as_array_mut() {
-                for block in blocks {
-                    if block["type"] == "tool_result" && block.get("content").is_none() {
-                        block["content"] = json!("");
-                    }
-                }
-            }
-            json!({"role":m.role,"content":content})
-        })
-        .collect()
-}
-/// One content block of the native envelope, at the two places the parser
-/// takes images: a message's content and a tool result's content.
-fn native_block(block: &Value, images: &mut usize) -> Value {
-    match block["type"].as_str() {
-        Some("image") => without_data(block, images),
-        // Built field by field, so the content's images are never cloned.
-        Some("tool_result") => match (block.as_object(), block.get("content")) {
-            (Some(fields), Some(Value::Array(inner))) => Value::Object(
-                fields
-                    .iter()
-                    .map(|(key, value)| {
-                        let value = if key == "content" {
-                            Value::Array(
-                                inner
-                                    .iter()
-                                    .map(|b| {
-                                        if b["type"] == "image" {
-                                            without_data(b, images)
-                                        } else {
-                                            b.clone()
-                                        }
-                                    })
-                                    .collect(),
-                            )
-                        } else {
-                            value.clone()
-                        };
-                        (key.clone(), value)
-                    })
-                    .collect(),
-            ),
-            _ => block.clone(),
-        },
-        _ => block.clone(),
-    }
-}
-/// An image block with its source's `data` replaced by the next placeholder.
-fn without_data(block: &Value, images: &mut usize) -> Value {
-    let Some(fields) = block.as_object() else {
-        return block.clone();
-    };
-    let mut out = serde_json::Map::new();
-    for (key, value) in fields {
-        let value = match (key.as_str(), value.as_object()) {
-            ("source", Some(source)) => Value::Object(
-                source
-                    .iter()
-                    .map(|(k, v)| {
-                        let v = if k == "data" {
-                            json!(crate::providers::image_body::placeholder(*images))
-                        } else {
-                            v.clone()
-                        };
-                        (k.clone(), v)
-                    })
-                    .collect(),
-            ),
-            _ => value.clone(),
-        };
-        out.insert(key.clone(), value);
-    }
-    *images += 1;
-    Value::Object(out)
-}
 /// The bytes of the image sources' base64 in `messages`, at the two places
 /// the parser takes images, read without a copy: what a large body may
 /// hold beyond the text limit, checked before the request is normalized.
@@ -414,12 +323,12 @@ fn image_data_bytes(messages: &[WireMessage]) -> usize {
         .sum()
 }
 fn system_messages(
-    system: Option<Value>,
+    system: Option<&Value>,
     options: &mut MessagesOptions,
     messages: &mut Vec<Message>,
 ) -> Result<()> {
     if let Some(system) = system {
-        for text in text_blocks(&system, options)? {
+        for text in text_blocks(system, options)? {
             messages.push(message(Role::System, text));
         }
     }
@@ -598,7 +507,12 @@ fn tool_content(value: &Value, options: &mut MessagesOptions) -> Result<Option<C
     }
     Ok(content)
 }
-fn function_tool(t: &Value, options: &mut MessagesOptions) -> Result<FunctionTool> {
+/// The canonical tool of a validated tool definition. Its `input_schema`
+/// moves into the canonical tool (`parameters`), leaving `null` in the
+/// definition when it was present, so the definition, kept as the native
+/// envelope, holds no second copy of the schema; the native encoder puts it
+/// back from the canonical tool (#872).
+fn function_tool(t: &mut Value, options: &mut MessagesOptions) -> Result<FunctionTool> {
     if t.get("type").is_some_and(|v| v != "custom") {
         return Err(invalid("tools.type"));
     }
@@ -624,7 +538,10 @@ fn function_tool(t: &Value, options: &mut MessagesOptions) -> Result<FunctionToo
     Ok(FunctionTool {
         name: string(&t["name"])?,
         description: t.get("description").map(string).transpose()?,
-        parameters: t["input_schema"].clone(),
+        parameters: t
+            .get_mut("input_schema")
+            .map(std::mem::take)
+            .unwrap_or(Value::Null),
         strict: t
             .get("strict")
             .map(|v| v.as_bool().ok_or_else(|| invalid("strict")))
@@ -693,7 +610,6 @@ impl Request {
             top_p,
             top_k,
             stop_sequences: self.stop_sequences,
-            system: self.system.clone(),
             thinking: self.thinking,
             output_config: self.output_config,
             context_management: self.context_management,
@@ -701,11 +617,12 @@ impl Request {
             // These envelopes are used only after every nested field below has
             // passed the explicit grammar. Never retain top-level caller JSON.
             native_messages: native_messages(&self.messages),
-            native_tools: self.tools.clone(),
             ..Default::default()
         };
         let mut messages = vec![];
-        system_messages(self.system, &mut options, &mut messages)?;
+        system_messages(self.system.as_ref(), &mut options, &mut messages)?;
+        // Kept as the native envelope: moved, not copied (#872).
+        options.system = self.system;
         for wire in self.messages {
             wire_message(wire, &mut options, &mut messages)?;
         }
@@ -721,21 +638,24 @@ impl Request {
                 tool_result_is_error: false,
             });
         }
-        let tools = self
-            .tools
-            .iter()
+        let mut native_tools = self.tools;
+        let tools = native_tools
+            .iter_mut()
             .map(|t| function_tool(t, &mut options))
             .collect::<Result<Vec<_>>>()?;
+        // The validated tool definitions become the native envelope, their
+        // schemas held once, by the canonical tools (#872).
+        options.native_tools = native_tools;
         let tool_choice = self.tool_choice.as_ref().map(tool_choice).transpose()?;
         validate(ChatRequest {
             model: self.model,
             messages,
-            tools,
+            tools: std::sync::Arc::new(tools),
             tool_choice,
             max_output_tokens: Some(self.max_tokens),
             temperature,
             stream: self.stream,
-            messages_options: Some(Box::new(options)),
+            messages_options: Some(std::sync::Arc::new(options)),
         })
     }
 }

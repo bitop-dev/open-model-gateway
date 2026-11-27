@@ -179,7 +179,7 @@ fn wire_strict_presence_does_not_reinterpret_shared_adapter_tool_settings() {
     let mut r =
         request(json!({"tools":[{"name":"lookup","input_schema":{"type":"object"}}]})).unwrap();
     for strict in [None, Some(false), Some(true)] {
-        r.tools[0].strict = strict;
+        std::sync::Arc::make_mut(&mut r.tools)[0].strict = strict;
         for class in [
             ProviderClass::Anthropic,
             ProviderClass::OpenAi,
@@ -283,7 +283,11 @@ fn beta_is_accepted_with_bounded_verbatim_values() {
     );
     assert!(valid_version(&headers));
     let mut r = request(json!({})).unwrap();
-    r.messages_options.as_mut().unwrap().beta_headers = beta_headers(&headers).unwrap();
+    r.messages_options
+        .as_mut()
+        .map(std::sync::Arc::make_mut)
+        .unwrap()
+        .beta_headers = beta_headers(&headers).unwrap();
     assert!(crate::providers::messages::validate(&r, ProviderClass::Anthropic).is_ok());
     assert_eq!(
         r.messages_options.as_ref().unwrap().beta_headers,
@@ -342,8 +346,11 @@ fn beta_denylist_checks_every_token_across_repeated_headers() {
                 "{beta}"
             );
             let mut r = request(json!({})).unwrap();
-            r.messages_options.as_mut().unwrap().beta_headers =
-                vec![format!("context-management-2025-06-27, {beta}")];
+            r.messages_options
+                .as_mut()
+                .map(std::sync::Arc::make_mut)
+                .unwrap()
+                .beta_headers = vec![format!("context-management-2025-06-27, {beta}")];
             assert!(matches!(
                 crate::providers::messages::validate(&r, ProviderClass::Anthropic),
                 Err(InferenceError::InvalidField("anthropic-beta"))

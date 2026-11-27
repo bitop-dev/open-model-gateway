@@ -356,7 +356,7 @@ fn request(stream: bool) -> ChatRequest {
             tool_call_id: None,
             tool_result_is_error: false,
         }],
-        tools: vec![],
+        tools: std::sync::Arc::new(vec![]),
         tool_choice: None,
         temperature: None,
         max_output_tokens: None,
@@ -719,7 +719,7 @@ async fn new_provider_runs_without_engine_or_database_enum_changes() {
 async fn inaccessible_models_and_unsupported_capabilities_never_call_adapter() {
     let (engine, repository, adapter) = fixture(Mode::Complete, EngineLimits::default());
     let mut req = request(false);
-    req.tools.push(FunctionTool {
+    std::sync::Arc::make_mut(&mut req.tools).push(FunctionTool {
         name: "f".into(),
         description: None,
         parameters: serde_json::json!({}),

@@ -138,7 +138,7 @@ fn request(stream: bool) -> ChatRequest {
             tool_call_id: None,
             tool_result_is_error: false,
         }],
-        tools: vec![],
+        tools: std::sync::Arc::new(vec![]),
         tool_choice: None,
         temperature: None,
         max_output_tokens: None,
@@ -322,7 +322,7 @@ async fn messages_embedded_error_codes_override_quoted_context_phrases() {
     )
     .await;
     let mut r = request(false);
-    r.messages_options = Some(Box::default());
+    r.messages_options = Some(std::sync::Arc::default());
     assert_error(
         mock.adapter().execute(&target(), r).await,
         InferenceError::Busy,
@@ -335,7 +335,7 @@ async fn no_argument_tool_defaults_preserve_openai_wire_and_explicit_strict() {
     for request in super::super::contract::no_argument_tool_requests() {
         for strict in [None, Some(false), Some(true)] {
             let mut r = request.clone();
-            r.tools[0].strict = strict;
+            std::sync::Arc::make_mut(&mut r.tools)[0].strict = strict;
             mock.adapter().execute(&target(), r).await.unwrap();
         }
     }
@@ -453,12 +453,12 @@ async fn translates_payload_and_owns_authentication() {
             tool_result_is_error: false,
         },
     ];
-    req.tools = vec![FunctionTool {
+    req.tools = std::sync::Arc::new(vec![FunctionTool {
         name: "weather".into(),
         description: Some("Get weather".into()),
         parameters: json!({"type":"object"}),
         strict: Some(true),
-    }];
+    }]);
     req.tool_choice = Some(ToolChoice::Function("weather".into()));
     req.temperature = Some(0.25);
     req.max_output_tokens = Some(123);

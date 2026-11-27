@@ -271,7 +271,7 @@ impl Kind {
 /// The ChatRequest a client of `messages` or chat completions sends.
 pub(crate) fn request(messages: bool) -> ChatRequest {
     ChatRequest {
-        messages_options: messages.then(Box::default),
+        messages_options: messages.then(std::sync::Arc::default),
         model: "public".into(),
         messages: vec![Message {
             role: Role::User,
@@ -280,7 +280,7 @@ pub(crate) fn request(messages: bool) -> ChatRequest {
             tool_call_id: None,
             tool_result_is_error: false,
         }],
-        tools: vec![],
+        tools: std::sync::Arc::new(vec![]),
         tool_choice: None,
         temperature: None,
         max_output_tokens: Some(50),

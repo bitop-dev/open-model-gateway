@@ -141,7 +141,7 @@ fn chat(stream: bool) -> ChatRequest {
             tool_call_id: None,
             tool_result_is_error: false,
         }],
-        tools: vec![],
+        tools: std::sync::Arc::new(vec![]),
         tool_choice: None,
         temperature: None,
         max_output_tokens: Some(16),
@@ -167,7 +167,7 @@ async fn named_200_errors_have_one_class_for_every_client() {
         let mock = Mock::json(value.clone()).await;
         let mut request = chat(false);
         if messages {
-            request.messages_options = Some(Box::default());
+            request.messages_options = Some(std::sync::Arc::default());
         }
         // A named rate limit is `Busy` in a 200 body as in a stream (#665).
         let expected = InferenceError::Busy;
@@ -177,7 +177,7 @@ async fn named_200_errors_have_one_class_for_every_client() {
         let mock = Mock::sse(format!("data: {value}\n\n"), 1).await;
         let mut request = chat(true);
         if messages {
-            request.messages_options = Some(Box::default());
+            request.messages_options = Some(std::sync::Arc::default());
         }
         let ProviderOutput::Stream(mut stream) = mock
             .adapter()
@@ -252,7 +252,7 @@ async fn named_errors_are_classified_like_the_same_http_error() {
             let mock = Mock::sse(format!("data: {value}\n\n"), 1).await;
             let mut request = chat(true);
             if messages {
-                request.messages_options = Some(Box::default());
+                request.messages_options = Some(std::sync::Arc::default());
             }
             let ProviderOutput::Stream(mut stream) = mock
                 .adapter()
@@ -279,7 +279,7 @@ async fn messages_openrouter_status_meanings_survive_body_classification() {
     ] {
         let mock = Mock::raw(status, r#"{"error":{"code":"context_length_exceeded","message":"prompt is too long: SECRET"}}"#).await;
         let mut request = chat(false);
-        request.messages_options = Some(Box::default());
+        request.messages_options = Some(std::sync::Arc::default());
         assert!(
             matches!(mock.adapter().execute(&target("private"), request).await, Err(error) if error == expected)
         );
@@ -296,7 +296,7 @@ async fn messages_openrouter_status_meanings_survive_body_classification() {
         )
         .await;
         let mut request = chat(false);
-        request.messages_options = Some(Box::default());
+        request.messages_options = Some(std::sync::Arc::default());
         assert!(
             matches!(mock.adapter().execute(&target("private"), request).await, Err(error) if error == expected)
         );
@@ -309,7 +309,7 @@ async fn no_argument_tool_defaults_preserve_openrouter_wire_and_explicit_strict(
     for request in super::super::contract::no_argument_tool_requests() {
         for strict in [None, Some(false), Some(true)] {
             let mut r = request.clone();
-            r.tools[0].strict = strict;
+            std::sync::Arc::make_mut(&mut r.tools)[0].strict = strict;
             mock.adapter().execute(&target("private"), r).await.unwrap();
         }
     }
@@ -1503,12 +1503,12 @@ async fn messages_refusal_on_openrouter_ends_the_reply_without_its_text() {
 async fn chat_strict_tools_require_parameter_support() {
     let mock = Mock::json(glm_complete()).await;
     let mut request = chat(false);
-    request.tools = vec![FunctionTool {
+    request.tools = std::sync::Arc::new(vec![FunctionTool {
         name: "lookup".into(),
         description: Some("Look it up".into()),
         parameters: json!({"type":"object","properties":{"q":{"type":"string"}},"required":["q"],"additionalProperties":false}),
         strict: Some(true),
-    }];
+    }]);
     mock.adapter()
         .execute(&target("private"), request.clone())
         .await
