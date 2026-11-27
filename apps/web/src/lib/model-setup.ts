@@ -8,8 +8,8 @@ import type { CatalogType } from "./permissions";
 // Readiness (contract §2). The server returns counts; this derivation is UI-only.
 // Missing readiness is unknown, never "not ready" or "ready".
 // ---------------------------------------------------------------------------
-export type ReadinessWarning = "disabled" | "no_route" | "unsupported_route" | "no_video_options" | "unpriced" | "not_offered" | "token_ceiling" | "free_blocked" | "provider_retired";
-export const readinessLabels: Record<ReadinessWarning, string> = { disabled: "Disabled", no_route: "No enabled route", unsupported_route: "A route's connection can't serve this model", no_video_options: "A route has no video options", unpriced: "Unpriced route", not_offered: "Not offered", token_ceiling: "Token ceilings exceed a tokens-per-minute default", free_blocked: "Free OpenRouter route blocked by the data-collection policy", provider_retired: "Provider API retired" };
+export type ReadinessWarning = "disabled" | "no_route" | "unsupported_route" | "video_not_set_up" | "unpriced" | "not_offered" | "token_ceiling" | "free_blocked" | "provider_retired";
+export const readinessLabels: Record<ReadinessWarning, string> = { disabled: "Disabled", no_route: "No enabled route", unsupported_route: "A route's connection can't serve this model", video_not_set_up: "A video route has no video options or no video rate", unpriced: "Unpriced route", not_offered: "Not offered", token_ceiling: "Token ceilings exceed a tokens-per-minute default", free_blocked: "Free OpenRouter route blocked by the data-collection policy", provider_retired: "Provider API retired" };
 export type Readiness = { state: "ready" | "needs_attention" | "needs_setup" | "not_serving" | "retired" | "unknown"; warnings: ReadinessWarning[] };
 /**
  * Workloads whose provider API no longer exists, with the reason. None today: video generation, which OpenAI's
@@ -31,7 +31,7 @@ export const readinessText: Record<Readiness["state"], string> = { ready: "Ready
  * OpenRouter `:free` endpoints may train on prompts, so they are unavailable when data collection is denied.
  */
 export function modelReadiness(model: Pick<Model, "enabled"> & { supported_protocols?: readonly string[]; readiness?: ModelReadiness | null }, policy?: ServerPolicy): Readiness {
-  // A retired provider API can never serve, whatever the routes say (video: OpenAI Videos API, shut down 2026-09-24).
+  // A retired provider API can never serve, whatever the routes say (none today: `retiredWorkloads`).
   if (model.supported_protocols?.length && retiredWorkloads[workloadOf(model.supported_protocols as ModelProtocol[])]) return { state: "retired", warnings: ["provider_retired"] };
   const r = model.readiness;
   if (!r) return { state: "unknown", warnings: [] };
@@ -43,15 +43,16 @@ export function modelReadiness(model: Pick<Model, "enabled"> & { supported_proto
   if (r.enabled_routes <= 0) warnings.push("no_route");
   else if (r.priced_enabled_routes < r.enabled_routes) warnings.push("unpriced");
   if ((r.unsupported_routes ?? 0) > 0) warnings.push("unsupported_route");
-  // A video route serves only once a Platform Admin set the clip lengths and sizes it accepts (not counted as serving).
-  if ((r.routes_without_video_options ?? 0) > 0) warnings.push("no_video_options");
+  // A video route serves only with video options and a video-seconds rate (not counted as serving until then).
+  if ((r.video_routes_not_set_up ?? 0) > 0) warnings.push("video_not_set_up");
   const offered = r.catalogs > 0 || r.direct_workspaces > 0;
   if (!offered) warnings.push("not_offered");
   if ((r.routes_over_token_limit ?? 0) > 0) warnings.push("token_ceiling");
   if (policy?.openrouter.data_collection === "deny" && (r.openrouter_free_routes ?? 0) > 0) warnings.push("free_blocked");
-  // Pricing is a warning, not a readiness requirement: unpriced usage is recorded as unknown cost.
+  // Pricing is a warning, not a readiness requirement (unpriced usage is recorded as unknown cost), except for video:
+  // a video route without a video-seconds rate serves nothing and is not counted as serving.
   const ready = model.enabled && serving > 0 && offered;
-  return { state: model.enabled && serving <= 0 ? "not_serving" : !ready ? "needs_setup" : warnings.some(w => w === "token_ceiling" || w === "free_blocked" || w === "unsupported_route" || w === "no_video_options") ? "needs_attention" : "ready", warnings };
+  return { state: model.enabled && serving <= 0 ? "not_serving" : !ready ? "needs_setup" : warnings.some(w => w === "token_ceiling" || w === "free_blocked" || w === "unsupported_route" || w === "video_not_set_up") ? "needs_attention" : "ready", warnings };
 }
 /**
  * "Not serving: <reason>" for an enabled model that cannot serve, else undefined. Names the connection profiles whose
@@ -61,7 +62,7 @@ export function notServingReason(model: Pick<Model, "enabled"> & { supported_pro
   const r = model.readiness;
   if (!model.enabled || !r || (r.serving_routes ?? r.enabled_routes) > 0) return;
   if (r.enabled_routes <= 0) return "Not serving: no enabled route to a provider, so requests fail.";
-  if ((r.routes_without_video_options ?? 0) > 0 && (r.unsupported_routes ?? 0) === 0) return "Not serving: no route has video options (the clip lengths and sizes it accepts), so requests fail. A Platform Admin sets them on each route (PATCH /api/v1/platform/deployments/{id}, `video`).";
+  if ((r.video_routes_not_set_up ?? 0) > 0) return "Not serving: no route is set up for video, so requests fail. Each video route needs its video options (the clip lengths and sizes it accepts: PATCH /api/v1/platform/deployments/{id}, `video`) and a price with a video-seconds rate.";
   const profiles = r.unsupported_profiles ?? [], workload = workloadLabels[workloadOf((model.supported_protocols ?? []) as ModelProtocol[])] ?? "this model";
   const on = profiles.length ? `${profiles.join(", ")} connection${profiles.length === 1 ? "" : "s"}` : "its connection";
   return `Not serving: ${on} can't serve ${workload}, so requests fail. Add a route on a connection that serves it, then disable the unsupported route.`;

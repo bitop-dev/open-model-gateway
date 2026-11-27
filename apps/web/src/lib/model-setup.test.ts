@@ -39,12 +39,11 @@ describe("model readiness derivation (contract §2)", () => {
     expect(modelReadiness({ enabled: true, supported_protocols: ["videos"], readiness: counts }).state).toBe("ready");
     expect(modelReadiness({ enabled: true, supported_protocols: ["videos"] }).state).toBe("unknown");
     // A video route without video options serves nothing: the server does not count it as serving.
-    const unset = { enabled: true, supported_protocols: ["videos"], readiness: { ...counts, serving_routes: 0, routes_without_video_options: 1 } };
-    expect(modelReadiness(unset)).toEqual({ state: "not_serving", warnings: ["no_video_options"] });
-    expect(notServingReason(unset)).toMatch(/^Not serving: no route has video options/);
+    const unset = { enabled: true, supported_protocols: ["videos"], readiness: { ...counts, serving_routes: 0, video_routes_not_set_up: 1 } };
+    expect(modelReadiness(unset)).toEqual({ state: "not_serving", warnings: ["video_not_set_up"] });
+    expect(notServingReason(unset)).toMatch(/^Not serving: no route is set up for video/);
     const one = { ...unset, readiness: { ...unset.readiness, enabled_routes: 2, priced_enabled_routes: 2, serving_routes: 1 } };
-    expect(modelReadiness(one)).toEqual({ state: "needs_attention", warnings: ["no_video_options"] });
-    expect(readinessText.retired).toBe("Provider API retired");
+    expect(modelReadiness(one)).toEqual({ state: "needs_attention", warnings: ["video_not_set_up"] });
     expect(modelReadiness({ enabled: true, supported_protocols: ["batches"], readiness: counts }).state).toBe("ready");
   });
   it("never infers readiness from a missing server value", () => { expect(modelReadiness({ enabled: true })).toEqual({ state: "unknown", warnings: [] }); expect(modelReadiness({ enabled: true, readiness: null })).toEqual({ state: "unknown", warnings: [] }); });

@@ -834,12 +834,12 @@ pub(super) const ENABLED_ROUTE: &str = "d.enabled AND EXISTS(SELECT 1 FROM provi
 /// model's protocols (`providers::capabilities`, the table the inference path
 /// and route validation use). Routes accepted before that validation existed
 /// may be enabled yet unable to serve; they count as not serving, and so does
-/// a video model's route without video options (0097).
+/// a video model's route not set up for video (no options or no video rate).
 pub(super) static SERVING_ROUTE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
         "({ENABLED_ROUTE} AND {} AND NOT {})",
         crate::providers::capabilities::route_serves_sql(),
-        super::deployment_video::WITHOUT_OPTIONS
+        super::deployment_video::NOT_SET_UP
     )
 });
 /// Any immutable price version makes a route priced; the latest version is pinned at admission.

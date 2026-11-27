@@ -148,6 +148,9 @@ pub(super) fn audit_field(action: &str, key: &str, value: &Value) -> bool {
 /// no video.
 pub(super) const VIDEO_JSON: &str = "CASE WHEN d.video_seconds IS NULL THEN NULL ELSE jsonb_build_object('seconds',to_jsonb(d.video_seconds),'sizes',to_jsonb(d.video_sizes)) END";
 
-/// A route (`d`) of a video model without video options: it serves no video
-/// request, so it is not counted as serving (`resources::SERVING_ROUTE`).
-pub(super) const WITHOUT_OPTIONS: &str = "(d.video_seconds IS NULL AND EXISTS(SELECT 1 FROM models vm WHERE vm.id=d.model_id AND 'videos'=ANY(vm.supported_protocols)))";
+/// A route (`d`) of a video model that is not set up for video: without
+/// video options, or whose latest price states no video-seconds rate (a
+/// pricing-v3 line with a rate, and none not applicable or unknown). It
+/// serves no video request, so it is not counted as serving
+/// (`resources::SERVING_ROUTE`). Admission checks the rate for each size.
+pub(super) const NOT_SET_UP: &str = "(EXISTS(SELECT 1 FROM models vm WHERE vm.id=d.model_id AND 'videos'=ANY(vm.supported_protocols)) AND (d.video_seconds IS NULL OR NOT coalesce((SELECT vp.pricing_version=3 AND EXISTS(SELECT 1 FROM jsonb_array_elements(vp.price_lines) vl WHERE vl->>'meter'='output_video_seconds_ms' AND vl ? 'microusd_per_batch') AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements(vp.price_lines) vl WHERE vl->>'meter'='output_video_seconds_ms' AND NOT vl ? 'microusd_per_batch') FROM deployment_prices vp WHERE vp.deployment_id=d.id ORDER BY vp.created_at DESC,vp.id DESC LIMIT 1),false)))";

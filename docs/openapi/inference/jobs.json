@@ -121,7 +121,7 @@
             }
           }
         },
-        "description": "Inference-key scoped legacy video objects. The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
+        "description": "Inference-key scoped video objects (servers of the OpenAI video contract on openai_compatible connections; jobs created before OpenAI shut down its Videos API stay readable). The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
         "parameters": [
           {
             "in": "query",
@@ -181,8 +181,26 @@
       "scope": null,
       "operation": {
         "responses": {
+          "200": {
+            "description": "The created video job.",
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "cache-control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/post_v1_videosResponse"
+                }
+              }
+            }
+          },
           "400": {
-            "description": "Validation or explicit no-provider refusal; video creation never succeeds with the current provider registry.",
+            "description": "Validation or an explicit refusal before admission: a length or size none of the caller's routes takes, or an option the gateway does not take (unsupported_video_parameter, param names it), no video route (unsupported_capability), or a route without a video rate for the request (video_price_missing).",
             "headers": {
               "x-request-id": {
                 "$ref": "#/components/headers/RequestId"
@@ -204,8 +222,7 @@
                   ]
                 }
               }
-            },
-            "x-omg-positive-kind": "refusal"
+            }
           },
           "401": {
             "$ref": "#/components/responses/OpenAiUnauthorized"
@@ -278,13 +295,25 @@
             }
           }
         },
-        "description": "Inference-key scoped legacy video objects. The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
+        "description": "Inference-key scoped video jobs on servers of the OpenAI video contract (openai_compatible connections). The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
         "x-omg-refusals": [
           {
             "status": 400,
             "envelope": "JobErrorEnvelope",
             "code": "unsupported_capability",
-            "trigger": "Validated create; no video provider is supported. input_reference is also unsupported. Decimal seconds strings such as 08 or +8 that parse to an allowed duration also reach this unsupported_capability refusal; they are not invalid_request_error merely for that spelling."
+            "trigger": "No route of the caller's for the model has video options (or no adapter serves video)."
+          },
+          {
+            "status": 400,
+            "envelope": "JobErrorEnvelope",
+            "code": "unsupported_video_parameter",
+            "trigger": "A length or size none of the caller's routes takes (param seconds or size), or a field other than model, prompt, seconds and size (param names it; input_reference unless null)."
+          },
+          {
+            "status": 400,
+            "envelope": "JobErrorEnvelope",
+            "code": "video_price_missing",
+            "trigger": "The chosen route's price has no video-seconds rate for every size the request may produce."
           }
         ],
         "x-omg-limits": {
@@ -416,7 +445,7 @@
             }
           }
         },
-        "description": "Inference-key scoped legacy video objects. The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
+        "description": "Inference-key scoped video objects (servers of the OpenAI video contract on openai_compatible connections; jobs created before OpenAI shut down its Videos API stay readable). The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
         "x-omg-refusals": [
           {
             "status": 404,
@@ -548,7 +577,7 @@
             }
           }
         },
-        "description": "Inference-key scoped legacy video objects. The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
+        "description": "Inference-key scoped video objects (servers of the OpenAI video contract on openai_compatible connections; jobs created before OpenAI shut down its Videos API stay readable). The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
         "x-omg-refusals": [
           {
             "status": 404,
@@ -736,7 +765,7 @@
             }
           }
         },
-        "description": "Inference-key scoped legacy video objects. The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
+        "description": "Inference-key scoped video objects (servers of the OpenAI video contract on openai_compatible connections; jobs created before OpenAI shut down its Videos API stay readable). The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
         "x-omg-binary-stream": {
           "late_error": "truncated",
           "positive_requires": "clean transport EOF"
@@ -3009,8 +3038,7 @@
       ]
     },
     "post_v1_videosResponse": {
-      "type": "null",
-      "description": "No successful video create representation; legacy read operations remain available."
+      "$ref": "#/components/schemas/VideoObject"
     },
     "get_v1_videos_by_idRequest": {
       "type": "null",
@@ -3038,7 +3066,7 @@
         },
         "upstream_deleted": {
           "type": "boolean",
-          "description": "Whether the provider's copy is gone: `false` when the provider offers no delete (it answered `405`), whose copy then stays until the provider's own expiry. The gateway's stored copy is deleted either way."
+          "description": "Whether the provider's copy is gone: `false` when the provider offers no delete (it answered `405`), or a create whose outcome is unknown left no provider id to delete; the copy then stays until the provider's own expiry. A `404` counts as gone."
         }
       },
       "required": [

@@ -96,7 +96,7 @@ async fn model_setup_is_one_audited_transaction(pool: PgPool) {
     assert_eq!(m["enabled"], false);
     assert_eq!(
         m["readiness"],
-        json!({"routes":1,"enabled_routes":0,"priced_enabled_routes":0,"serving_routes":0,"unsupported_routes":0,"unsupported_profiles":[],"routes_without_video_options":0,"type_tokens_per_minute":null,"routes_over_token_limit":0,"openrouter_free_routes":0,"catalogs":2,"direct_workspaces":0,"connections":[{"id":conn,"name":"Cloud"}]})
+        json!({"routes":1,"enabled_routes":0,"priced_enabled_routes":0,"serving_routes":0,"unsupported_routes":0,"unsupported_profiles":[],"video_routes_not_set_up":0,"type_tokens_per_minute":null,"routes_over_token_limit":0,"openrouter_free_routes":0,"catalogs":2,"direct_workspaces":0,"connections":[{"id":conn,"name":"Cloud"}]})
     );
     let deployment: (Uuid, Uuid, String, bool) = sqlx::query_as(
         "SELECT model_id,provider_connection_id,upstream_model,enabled FROM deployments WHERE id=$1",
@@ -403,15 +403,15 @@ async fn readiness_counts_routes_connections_pricing_and_offer_sources(pool: PgP
     let data = list["data"].as_array().unwrap();
     assert_eq!(
         data[0]["readiness"],
-        json!({"routes":4,"enabled_routes":2,"priced_enabled_routes":1,"serving_routes":2,"unsupported_routes":0,"unsupported_profiles":[],"routes_without_video_options":0,"type_tokens_per_minute":null,"routes_over_token_limit":0,"openrouter_free_routes":0,"catalogs":1,"direct_workspaces":0,"connections":[{"id":off,"name":"Alpha"},{"id":on,"name":"Zulu"}]})
+        json!({"routes":4,"enabled_routes":2,"priced_enabled_routes":1,"serving_routes":2,"unsupported_routes":0,"unsupported_profiles":[],"video_routes_not_set_up":0,"type_tokens_per_minute":null,"routes_over_token_limit":0,"openrouter_free_routes":0,"catalogs":1,"direct_workspaces":0,"connections":[{"id":off,"name":"Alpha"},{"id":on,"name":"Zulu"}]})
     );
     assert_eq!(
         data[1]["readiness"],
-        json!({"routes":1,"enabled_routes":0,"priced_enabled_routes":0,"serving_routes":0,"unsupported_routes":0,"unsupported_profiles":[],"routes_without_video_options":0,"type_tokens_per_minute":null,"routes_over_token_limit":0,"openrouter_free_routes":0,"catalogs":0,"direct_workspaces":2,"connections":[{"id":off,"name":"Alpha"}]})
+        json!({"routes":1,"enabled_routes":0,"priced_enabled_routes":0,"serving_routes":0,"unsupported_routes":0,"unsupported_profiles":[],"video_routes_not_set_up":0,"type_tokens_per_minute":null,"routes_over_token_limit":0,"openrouter_free_routes":0,"catalogs":0,"direct_workspaces":2,"connections":[{"id":off,"name":"Alpha"}]})
     );
     assert_eq!(
         data[2]["readiness"],
-        json!({"routes":0,"enabled_routes":0,"priced_enabled_routes":0,"serving_routes":0,"unsupported_routes":0,"unsupported_profiles":[],"routes_without_video_options":0,"type_tokens_per_minute":null,"routes_over_token_limit":0,"openrouter_free_routes":0,"catalogs":0,"direct_workspaces":0,"connections":[]})
+        json!({"routes":0,"enabled_routes":0,"priced_enabled_routes":0,"serving_routes":0,"unsupported_routes":0,"unsupported_profiles":[],"video_routes_not_set_up":0,"type_tokens_per_minute":null,"routes_over_token_limit":0,"openrouter_free_routes":0,"catalogs":0,"direct_workspaces":0,"connections":[]})
     );
     // Disabled workspaces no longer count as direct offers.
     sqlx::query("UPDATE workspaces SET disabled_at=now() WHERE id=$1")

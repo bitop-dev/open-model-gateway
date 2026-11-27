@@ -33,6 +33,9 @@ pub(super) type Video = (&'static str, String, Option<String>);
 /// A server of the OpenAI video contract: it remembers each create's form,
 /// answers each video's status as set, serves (or fails) the content and
 /// offers no delete (`405`).
+/// A content answer: status, content type, body, and a declared
+/// `Content-Length` other than the body's.
+pub(super) type Content = (u16, &'static str, Vec<u8>, Option<u64>);
 #[derive(Default)]
 pub(super) struct Contract {
     pub(super) forms: Mutex<Vec<String>>,
@@ -41,9 +44,11 @@ pub(super) struct Contract {
     pub(super) content_fails: AtomicBool,
     /// Instead of the MP4: (status, content type, body, a declared
     /// `Content-Length` other than the body's).
-    pub(super) content: Mutex<Option<(u16, &'static str, Vec<u8>, Option<u64>)>>,
+    pub(super) content: Mutex<Option<Content>>,
     /// The delete's status (`405` when unset).
     pub(super) delete_status: Mutex<Option<u16>>,
+    /// The id every create answers with (`vid_<n>` when unset).
+    pub(super) fixed_id: Mutex<Option<String>>,
     pub(super) retrieves: AtomicUsize,
     pub(super) contents: AtomicUsize,
     pub(super) deletes: AtomicUsize,
@@ -63,7 +68,10 @@ pub(super) fn contract(state: Arc<Contract>) -> Router {
             axum::routing::post(
                 async |State(c): State<Arc<Contract>>, body: axum::body::Bytes| {
                     let form = String::from_utf8_lossy(&body).into_owned();
-                    let id = format!("vid_{}", c.forms.lock().unwrap().len() + 1);
+                    let id =
+                        c.fixed_id.lock().unwrap().clone().unwrap_or_else(|| {
+                            format!("vid_{}", c.forms.lock().unwrap().len() + 1)
+                        });
                     let seconds = field(&form, "seconds").unwrap_or_default();
                     // The server picks 1280x720 when no size is named.
                     let size = field(&form, "size").or_else(|| Some("1280x720".into()));
@@ -385,7 +393,7 @@ async fn the_openai_video_contract_on_a_compatible_connection_end_to_end(pool: P
     assert_eq!((state.as_str(), actual), ("unknown", None));
     assert!(held.is_some_and(|h| h > 0), "the hold is kept");
 
-    // A server without a delete (405): the gateway's copy and the record go,
+    // A server without a delete (405): the record goes,
     // and the answer says the provider's copy stays.
     let response = client
         .delete(format!("{gateway}/v1/videos/video_{}", a_id.simple()))
@@ -404,5 +412,214 @@ async fn the_openai_video_contract_on_a_compatible_connection_end_to_end(pool: P
         read.status(),
         StatusCode::NOT_FOUND,
         "a deleted video is gone"
+    );
+}
+
+/// One upstream object is never reachable through two jobs: a server that
+/// answers two creates (two routes of one connection, two workspaces) with
+/// one id gets it recorded for the first only; the second job keeps no id,
+/// so it can neither read nor delete the first's video. A delete reports
+/// the provider's copy as gone only when the create is known to have left
+/// none.
+#[dbtest::test]
+async fn one_upstream_video_belongs_to_one_job(pool: PgPool) {
+    let f = fixture(pool.clone()).await;
+    let mock = Arc::new(Contract::default());
+    let (upstream, _upstream) = serve(contract(mock.clone())).await;
+    let base = format!("{upstream}/v1");
+    let connection = Uuid::new_v4();
+    sqlx::query("INSERT INTO provider_connections(id,name,provider,credential_ref,endpoint,enabled) VALUES($1,'Clip server','openai_compatible','none',$2,true)")
+        .bind(connection).bind(&base).execute(&pool).await.unwrap();
+    let mut lines: Vec<Value> = Meter::ALL
+        .into_iter()
+        .filter(|m| *m != Meter::Requests)
+        .map(na)
+        .collect();
+    lines.push(line(Meter::Requests, "0", 1));
+    lines.push(line(Meter::OutputVideoSecondsMs, "100000", 1000));
+    // One model per workspace, each with its own route on the connection.
+    for (name, workspace) in [
+        ("company/mine", f.principal.workspace_id),
+        ("company/theirs", f.team.workspace_id),
+    ] {
+        let (model, route) = (Uuid::new_v4(), Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO models(id,public_name,supported_protocols) VALUES($1,$2,ARRAY['videos'])",
+        )
+        .bind(model)
+        .bind(name)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO workspace_model_grants(workspace_id,model_id,source) VALUES($1,$2,'direct')")
+            .bind(workspace).bind(model).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO deployments(id,model_id,provider_connection_id,upstream_model,enabled,video_seconds) VALUES($1,$2,$3,'clip-1',true,'{4}')")
+            .bind(route).bind(model).bind(connection).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO deployment_prices(id,deployment_id,input_token_limit,output_token_limit,pricing_version,price_lines,max_units) VALUES($1,$2,0,1,3,$3,'{}')")
+            .bind(Uuid::new_v4()).bind(route).bind(json!(lines)).execute(&pool).await.unwrap();
+    }
+    let mut registry = ProviderRegistry::default();
+    for adapter in crate::providers::local::adapters(
+        Arc::new(EnvSecrets::new([])),
+        ApprovedEndpoints::for_test(&base),
+    ) {
+        registry.register(adapter).unwrap();
+    }
+    let engine = Engine::new(Arc::new(f.store.clone()), registry, EngineLimits::default()).unwrap();
+    let (gateway, _gateway) = serve(crate::http::router_with_engine(
+        f.store.clone(),
+        None,
+        engine,
+    ))
+    .await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let (mine, theirs) = (
+        bearer(&f, f.principal.workspace_id).await,
+        bearer(&f, f.team.workspace_id).await,
+    );
+    let create = async |auth: &str, model: &str| {
+        let response = client
+            .post(format!("{gateway}/v1/videos"))
+            .header("authorization", auth)
+            .json(&json!({"model": model, "prompt": "a lake"}))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        (
+            status,
+            response.json::<Value>().await.unwrap_or(Value::Null),
+        )
+    };
+    // A route whose price has no video rate: refused before admission,
+    // nothing sent, no job.
+    let (model, route) = (Uuid::new_v4(), Uuid::new_v4());
+    sqlx::query("INSERT INTO models(id,public_name,supported_protocols) VALUES($1,'company/unpriced',ARRAY['videos'])")
+        .bind(model).execute(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO workspace_model_grants(workspace_id,model_id,source) VALUES($1,$2,'direct')",
+    )
+    .bind(f.principal.workspace_id)
+    .bind(model)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO deployments(id,model_id,provider_connection_id,upstream_model,enabled,video_seconds) VALUES($1,$2,$3,'clip-1',true,'{4}')")
+        .bind(route).bind(model).bind(connection).execute(&pool).await.unwrap();
+    let mut tokens_only = lines.clone();
+    tokens_only.pop();
+    sqlx::query("INSERT INTO deployment_prices(id,deployment_id,input_token_limit,output_token_limit,pricing_version,price_lines,max_units) VALUES($1,$2,0,1,3,$3,'{}')")
+        .bind(Uuid::new_v4()).bind(route).bind(json!(tokens_only)).execute(&pool).await.unwrap();
+    let (status, body) = create(&mine, "company/unpriced").await;
+    assert_eq!(
+        (status, body["error"]["code"].clone()),
+        (StatusCode::BAD_REQUEST, json!("video_price_missing")),
+        "{body}"
+    );
+    let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM async_jobs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        (jobs, mock.forms.lock().unwrap().len()),
+        (0, 0),
+        "nothing sent, no job"
+    );
+    *mock.fixed_id.lock().unwrap() = Some("vid_same".into());
+    let (status, first) = create(&mine, "company/mine").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let (status, body) = create(&theirs, "company/theirs").await;
+    assert!(
+        status.is_server_error(),
+        "the second create is not recorded: {status} {body}"
+    );
+    let recorded: Vec<(Uuid, Option<String>)> =
+        sqlx::query_as("SELECT workspace_id,upstream_id FROM async_jobs ORDER BY created_at")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        recorded,
+        [
+            (f.principal.workspace_id, Some("vid_same".into())),
+            (f.team.workspace_id, None)
+        ]
+    );
+    // The second job ends without an id; deleting it says the provider's
+    // copy may remain (its create's outcome is unknown), and sends nothing.
+    let second: Uuid = sqlx::query_scalar("SELECT id FROM async_jobs WHERE workspace_id=$1")
+        .bind(f.team.workspace_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE async_jobs SET state='failed',error_code='create_unconfirmed',completed_at=now() WHERE id=$1")
+        .bind(second)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let response = client
+        .delete(format!("{gateway}/v1/videos/video_{}", second.simple()))
+        .header("authorization", &theirs)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let deleted: Value = response.json().await.unwrap();
+    assert_eq!(
+        deleted["upstream_deleted"], false,
+        "the provider may still have it"
+    );
+    assert_eq!(
+        mock.deletes.load(Ordering::SeqCst),
+        0,
+        "nothing sent for a job without an id"
+    );
+    // The first job's video, completed: its content as the server labels it
+    // (a type outside the allowlist as `application/octet-stream`), never
+    // sniffed; its delete answered `404` (already gone) counts as gone.
+    set_status(&mock, "vid_same", "completed");
+    let path = format!("{gateway}/v1/videos/{}", first["id"].as_str().unwrap());
+    let read: Value = client
+        .get(&path)
+        .header("authorization", &mine)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(read["status"], "completed", "{read}");
+    for (media, served) in [
+        ("video/webm", "video/webm"),
+        ("video/quicktime", "video/quicktime"),
+        ("text/plain", "application/octet-stream"),
+    ] {
+        *mock.content.lock().unwrap() = Some((200, media, MP4.to_vec(), None));
+        let response = client
+            .get(format!("{path}/content"))
+            .header("authorization", &mine)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{media}");
+        assert_eq!(response.headers()["content-type"], served, "{media}");
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+    }
+    *mock.delete_status.lock().unwrap() = Some(404);
+    let deleted: Value = client
+        .delete(&path)
+        .header("authorization", &mine)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            deleted["deleted"].clone(),
+            deleted["upstream_deleted"].clone()
+        ),
+        (json!(true), json!(true))
     );
 }

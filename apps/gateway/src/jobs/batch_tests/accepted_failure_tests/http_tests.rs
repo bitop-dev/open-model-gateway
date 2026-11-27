@@ -69,10 +69,11 @@ async fn running_gateway_accepted_video_failure_and_refusals(pool: PgPool) {
     let mut registry = ProviderRegistry::default();
     registry.register(Arc::new(fake)).unwrap();
     let engine = Engine::new(Arc::new(f.store.clone()), registry, EngineLimits::default()).unwrap();
-    let gateway = Server::start(
-        crate::http::router_with_engine(f.store.clone(), None, engine)
-            .layer(axum::Extension(db_tests::test_files().await)),
-    )
+    let gateway = Server::start(crate::http::router_with_engine(
+        f.store.clone(),
+        None,
+        engine,
+    ))
     .await;
     let auth = db_tests::bearer(&f, f.principal.workspace_id).await;
     let theirs = db_tests::bearer(&f, f.team.workspace_id).await;

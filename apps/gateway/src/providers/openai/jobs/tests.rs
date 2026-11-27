@@ -1,5 +1,6 @@
 //! Mock-upstream contract tests for OpenAI videos, files and batches (no
 //! network beyond 127.0.0.1, no paid calls).
+use super::video::parse_video;
 use super::*;
 use crate::providers::{
     ProviderAdapter,
@@ -732,5 +733,50 @@ async fn a_batch_status_body_with_a_duplicate_member_is_refused() {
         .await;
         let result = mock.adapter().retrieve_batch(&t, &upstream.id).await;
         assert_eq!(result.is_ok(), ok, "duplicate refused: {}", !ok);
+    }
+}
+
+/// The generated duration is the usage the server reports when it does,
+/// else the video's length; a size the gateway cannot read leaves the
+/// duration unknown (the hold is then kept), never billed at another size.
+#[test]
+fn the_reported_duration_and_size_are_read_or_left_unknown() {
+    let mut v = video("completed");
+    assert_eq!(parse_video(&v).unwrap().seconds, Some(8));
+    v["usage"] = json!({"output_video_seconds": 4, "cost": "0.288"});
+    assert_eq!(parse_video(&v).unwrap().seconds, Some(4), "usage first");
+    for size in [json!("1920×1080"), json!("1280 x 720"), json!(1920)] {
+        v["size"] = size.clone();
+        let p = parse_video(&v).unwrap();
+        assert_eq!((p.seconds, p.size), (None, None), "{size}");
+    }
+    v["size"] = Value::Null;
+    assert_eq!(parse_video(&v).unwrap().seconds, Some(4));
+}
+
+/// Only a complete answer is content: an empty (`204`) or partial (`206`)
+/// one is an upstream error, never passed on as a whole video.
+#[tokio::test]
+async fn video_content_is_only_a_complete_answer() {
+    let mock = Mock::new(vec![
+        Reply {
+            status: 204,
+            content_type: "video/mp4",
+            body: Vec::new(),
+        },
+        Reply {
+            status: 206,
+            content_type: "video/mp4",
+            body: b"\x00\x00".to_vec(),
+        },
+    ])
+    .await;
+    let a = mock.adapter();
+    let (t, id) = (target("sora-2"), UpstreamId::parse("video_abc123").unwrap());
+    for _ in 0..2 {
+        assert_eq!(
+            a.video_content(&t, &id, VideoAsset::Video).await.err(),
+            Some(InferenceError::InvalidUpstream)
+        );
     }
 }

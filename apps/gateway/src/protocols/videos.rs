@@ -135,8 +135,10 @@ fn parse(headers: &HeaderMap, body: &[u8]) -> Result<VideoRequest, JobError> {
         .trim()
         .to_ascii_lowercase();
     if media == "application/json" {
-        let value: Value =
-            serde_json::from_slice(body).map_err(|_| InferenceError::InvalidRequest)?;
+        // A field named twice is ambiguous (a reader keeps one of the
+        // values), so the body is refused, never read last-wins.
+        let value =
+            crate::providers::framing::json(body).map_err(|_| InferenceError::InvalidRequest)?;
         if let Value::Object(fields) = &value
             && let Some(other) = fields
                 .keys()
@@ -191,7 +193,6 @@ fn parse(headers: &HeaderMap, body: &[u8]) -> Result<VideoRequest, JobError> {
 pub async fn create(
     State(store): State<Store>,
     Extension(engine): Extension<Engine>,
-    files: Option<Extension<crate::filestore::FileStoreRuntime>>,
     Extension(principal): Extension<Principal>,
     Extension(request_id): Extension<RequestId>,
     headers: HeaderMap,
@@ -207,7 +208,7 @@ pub async fn create(
         Err(e) => return job_error(e),
     };
     drop(body);
-    let jobs = Jobs::new(store, &engine).with_files(files.map(|Extension(f)| f));
+    let jobs = Jobs::new(store, &engine);
     match jobs.create_video(principal, request, request_id.0).await {
         Ok(job) => Json(render(&job)).into_response(),
         Err(e) => job_error(e),
@@ -217,15 +218,10 @@ pub async fn create(
 pub async fn retrieve(
     State(store): State<Store>,
     Extension(engine): Extension<Engine>,
-    files: Option<Extension<crate::filestore::FileStoreRuntime>>,
     Extension(principal): Extension<Principal>,
     Path(id): Path<String>,
 ) -> Response {
-    match Jobs::new(store, &engine)
-        .with_files(files.map(|Extension(f)| f))
-        .get_video(&principal, &id)
-        .await
-    {
+    match Jobs::new(store, &engine).get_video(&principal, &id).await {
         Ok(job) => Json(render(&job)).into_response(),
         Err(e) => job_error(e),
     }
@@ -262,7 +258,6 @@ pub(crate) fn list_page(mut data: Vec<Value>, limit: i64) -> Value {
 pub async fn list(
     State(store): State<Store>,
     Extension(engine): Extension<Engine>,
-    files: Option<Extension<crate::filestore::FileStoreRuntime>>,
     Extension(principal): Extension<Principal>,
     query: Result<Query<ListQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
@@ -274,7 +269,6 @@ pub async fn list(
         Err(e) => return job_error(e),
     };
     match Jobs::new(store, &engine)
-        .with_files(files.map(|Extension(f)| f))
         .list_videos(&principal, q.after.as_deref(), limit + 1, ascending)
         .await
     {
@@ -300,7 +294,7 @@ pub(crate) fn stream_response(content: crate::jobs::types::ContentStream) -> Res
             .headers_mut()
             .insert(header::CONTENT_LENGTH, HeaderValue::from(n));
     }
-    // The body is the provider's or a stored copy of it: never sniffed into
+    // The body is the provider's: never sniffed into
     // another type than the one stated.
     response.headers_mut().insert(
         header::X_CONTENT_TYPE_OPTIONS,
@@ -312,7 +306,6 @@ pub(crate) fn stream_response(content: crate::jobs::types::ContentStream) -> Res
 pub async fn content(
     State(store): State<Store>,
     Extension(engine): Extension<Engine>,
-    files: Option<Extension<crate::filestore::FileStoreRuntime>>,
     Extension(principal): Extension<Principal>,
     Path(id): Path<String>,
     query: Result<Query<ContentQuery>, axum::extract::rejection::QueryRejection>,
@@ -326,7 +319,6 @@ pub async fn content(
         Some(None) => return job_error(InferenceError::InvalidRequest.into()),
     };
     match Jobs::new(store, &engine)
-        .with_files(files.map(|Extension(f)| f))
         .video_content(&principal, &id, asset)
         .await
     {
@@ -338,18 +330,16 @@ pub async fn content(
 pub async fn delete(
     State(store): State<Store>,
     Extension(engine): Extension<Engine>,
-    files: Option<Extension<crate::filestore::FileStoreRuntime>>,
     Extension(principal): Extension<Principal>,
     Path(id): Path<String>,
 ) -> Response {
     match Jobs::new(store, &engine)
-        .with_files(files.map(|Extension(f)| f))
         .delete_video(&principal, &id)
         .await
     {
         // `upstream_deleted`: whether the provider's copy is gone (`false`
-        // when its delete was not offered, failed or could not be sent; the
-        // copy then stays until the provider's expiry).
+        // when it offers no delete, or a create of unknown outcome left no
+        // id to delete; the copy then stays until the provider's expiry).
         Ok((job, upstream_deleted)) => Json(json!({
             "id": client_id(JobKind::Video.prefix(), job.id),
             "object": "video.deleted",
@@ -425,6 +415,18 @@ mod tests {
         assert!(invalid(
             json(json!({"model":"vid","prompt":"a","bad-name":1})).err()
         ));
+        // A field named twice, on the wire, is refused (never last-wins).
+        let raw = |body: &str| parse(&headers("application/json"), body.as_bytes());
+        for body in [
+            r#"{"model":"vid","prompt":"a","seconds":"6","seconds":"8"}"#,
+            r#"{"model":"vid","prompt":"a","input_reference":{"image_url":"x"},"input_reference":null}"#,
+        ] {
+            assert!(invalid(raw(body).err()), "{body}");
+        }
+        assert!(
+            raw(r#"{"model":"vid","prompt":"a","input_reference":null}"#).is_ok(),
+            "null is absent"
+        );
         let multipart =
             |form: &str| parse(&headers("multipart/form-data; boundary=B"), form.as_bytes());
         let form = "--B\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nvid\r\n--B\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\na dog\r\n--B\r\nContent-Disposition: form-data; name=\"seconds\"\r\n\r\n8\r\n--B\r\nContent-Disposition: form-data; name=\"size\"\r\n\r\n1280x720\r\n--B--\r\n";

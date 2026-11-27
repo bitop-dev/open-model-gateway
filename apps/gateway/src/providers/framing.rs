@@ -73,7 +73,7 @@ async fn body_bytes(response: reqwest::Response, limit: usize) -> Result<Vec<u8>
 /// A complete JSON body. A member name that appears twice in one object, at
 /// any depth, makes the body ambiguous (a reader keeps one of the values, so
 /// output or usage could hide behind an empty duplicate): it is invalid.
-pub(super) fn json(bytes: &[u8]) -> Result<Value> {
+pub(crate) fn json(bytes: &[u8]) -> Result<Value> {
     serde_json::from_slice::<Strict>(bytes)
         .map(|strict| strict.0)
         .map_err(|_| InferenceError::InvalidUpstream)

@@ -30,6 +30,7 @@ pub mod schedule;
 mod store;
 pub mod types;
 pub mod video;
+mod video_route;
 
 use gateway_datetime_compat::UtcInstant;
 use std::{

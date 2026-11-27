@@ -156,16 +156,30 @@ pub(crate) async fn insert_job(conn: &mut sqlx::PgConnection, job: &NewJob<'_>) 
 }
 /// Fill in the provider id of a video recorded before its create (#662).
 /// `None` when the row is no longer a queued video without an id (the
-/// create-grace rule already failed it). The provider has accepted the job
-/// at this point, so a failure is counted at `job_settlement`.
+/// create-grace rule already failed it), or when another job of the same
+/// connection already has that id: one upstream object is never reachable
+/// through two jobs (their routes may serve different workspaces), so the
+/// id is not recorded and the create-grace rule ends the row with its hold
+/// kept. The check runs under an advisory lock of (connection, id), so two
+/// creates answered with one id cannot both record it. The provider has
+/// accepted the job at this point, so a failure is counted at
+/// `job_settlement`.
 pub(crate) async fn record_video_upstream(
     store: &Store,
     id: Uuid,
     upstream: &UpstreamId,
 ) -> Result<Option<JobRow>> {
-    sqlx::query_as(&format!("UPDATE async_jobs SET upstream_id=$2 WHERE id=$1 AND kind='video' AND upstream_id IS NULL AND state='queued' RETURNING {JOB_COLUMNS}"))
+    let mut tx = crate::db::begin(&store.pool)
+        .await
+        .map_err(job_settlement)?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('video_upstream:'||d.provider_connection_id::text||':'||$2,0)) FROM async_jobs j JOIN deployments d ON d.id=j.deployment_id WHERE j.id=$1")
         .bind(id).bind(upstream.as_str())
-        .fetch_optional(&store.pool).await.map_err(job_settlement)
+        .execute(&mut *tx).await.map_err(job_settlement)?;
+    let recorded: Option<JobRow> = sqlx::query_as(&format!("UPDATE async_jobs SET upstream_id=$2 WHERE id=$1 AND kind='video' AND upstream_id IS NULL AND state='queued' AND NOT EXISTS(SELECT 1 FROM async_jobs o JOIN deployments od ON od.id=o.deployment_id JOIN deployments d ON d.provider_connection_id=od.provider_connection_id WHERE d.id=async_jobs.deployment_id AND o.upstream_id=$2 AND o.id<>$1) RETURNING {JOB_COLUMNS}"))
+        .bind(id).bind(upstream.as_str())
+        .fetch_optional(&mut *tx).await.map_err(job_settlement)?;
+    tx.commit().await.map_err(job_settlement)?;
+    Ok(recorded)
 }
 /// End a video that has no provider id as `failed` with `code`, only while it
 /// is still queued without one, with `older_than` only once its create

@@ -205,6 +205,81 @@ async fn a_route_s_video_options_are_set_validated_audited_and_cleared(pool: PgP
     );
 }
 
+/// A video model's route serves only when it is set up for video: with
+/// video options and a latest price stating a video-seconds rate.
+#[dbtest::test]
+async fn a_video_route_serves_only_with_options_and_a_video_rate(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let m = model(&pool, "readiness-clips").await;
+    sqlx::query("UPDATE models SET supported_protocols=ARRAY['videos'] WHERE id=$1")
+        .bind(m)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let p = connection(&pool).await;
+    sqlx::query("UPDATE provider_connections SET enabled=true WHERE id=$1")
+        .bind(p)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let d = Uuid::new_v4();
+    sqlx::query("INSERT INTO deployments(id,model_id,provider_connection_id,upstream_model,enabled) VALUES($1,$2,$3,'clips',true)")
+        .bind(d).bind(m).bind(p).execute(&pool).await.unwrap();
+    let readiness = async || {
+        let (status, body) = call(
+            &f.s,
+            &f.admin,
+            "GET",
+            &format!("/api/v1/platform/models/{m}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        (
+            body["readiness"]["serving_routes"].clone(),
+            body["readiness"]["video_routes_not_set_up"].clone(),
+        )
+    };
+    assert_eq!(
+        readiness().await,
+        (json!(0), json!(1)),
+        "no options, no price"
+    );
+    sqlx::query("UPDATE deployments SET video_seconds='{4}' WHERE id=$1")
+        .bind(d)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let price = |lines: Value| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query("INSERT INTO deployment_prices(id,deployment_id,input_token_limit,output_token_limit,pricing_version,price_lines,max_units,created_at) VALUES($1,$2,0,1,3,$3,'{}',clock_timestamp())")
+                .bind(Uuid::new_v4()).bind(d).bind(lines).execute(&pool).await.unwrap();
+        }
+    };
+    use crate::billing::v3::Meter;
+    use crate::jobs::db_tests::{line, na};
+    let mut lines: Vec<Value> = Meter::ALL
+        .into_iter()
+        .filter(|m| *m != Meter::Requests)
+        .map(na)
+        .collect();
+    lines.push(line(Meter::Requests, "0", 1));
+    price(json!(lines.clone())).await;
+    assert_eq!(
+        readiness().await,
+        (json!(0), json!(1)),
+        "options, no video rate"
+    );
+    lines.push(line(Meter::OutputVideoSecondsMs, "100000", 1000));
+    price(json!(lines)).await;
+    assert_eq!(readiness().await, (json!(1), json!(0)), "set up");
+    // A second route without options: one serving, one not set up.
+    sqlx::query("INSERT INTO deployments(id,model_id,provider_connection_id,upstream_model,enabled) VALUES($1,$2,$3,'clips-2',true)")
+        .bind(Uuid::new_v4()).bind(m).bind(p).execute(&pool).await.unwrap();
+    assert_eq!(readiness().await, (json!(1), json!(1)), "mixed");
+}
+
 /// The database checks a route's options exactly as the gateway does.
 #[dbtest::test]
 async fn the_database_checks_video_options_as_the_gateway_does(pool: PgPool) {

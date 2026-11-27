@@ -290,7 +290,7 @@ use settlement::{
 };
 pub use settlement::{finish, finish_with_telemetry};
 pub(crate) use settlement::{finish_accepted_job, validate_token_usage};
-pub use video::{VideoCheck, video_route_priced};
+pub use video::{ReportedSizeRate, VideoCheck, pinned_video_size_rate, video_route_priced};
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(test), expect(clippy::too_many_lines, reason = "#499"))]
 async fn admit_unobserved(

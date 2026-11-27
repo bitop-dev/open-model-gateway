@@ -4,19 +4,13 @@ use gateway_datetime_compat::UtcInstant;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use std::collections::HashMap;
-
 use super::{store::Observation, *};
 use crate::inference::{types::WorkloadKind, workload::OutputReservation};
 
 /// `POST /v1/videos` when no adapter offers video generation.
 pub const NO_VIDEO_PROVIDER: &str =
     "Video generation needs a route on a provider connection that serves the OpenAI video contract";
-/// `POST /v1/videos` for a model none of whose routes has video options.
-const NO_VIDEO_ROUTE: &str = "No route of this model is set up for video generation";
-const SECONDS_NOT_TAKEN: &str = "No route of this model accepts this clip length";
-const SIZE_NOT_TAKEN: &str = "No route of this model accepts this size";
-const VIDEO_PRICE_MISSING: &str = "This route has no video rate for this request (a Platform Admin must price its video seconds for every size it may produce)";
+pub(super) const VIDEO_PRICE_MISSING: &str = "This route has no video rate for this request (a Platform Admin must price its video seconds for every size it may produce)";
 
 fn observation(v: &UpstreamVideo) -> Observation<'_> {
     Observation {
@@ -30,58 +24,61 @@ fn observation(v: &UpstreamVideo) -> Observation<'_> {
     }
 }
 
-/// Accounting of a terminal video observation. `sizes` are the route's
-/// sizes now (0097), which a size the provider reports must be among when
-/// the request named none.
+/// Accounting of a terminal video observation. `reported`: how the job's
+/// pinned price values a size the provider reports for a request that named
+/// none (`governance::pinned_video_size_rate`).
 ///
 /// The size billed is the one the request named, or the one the provider
-/// reports when the request named none. A reported size that differs from
-/// the named one, or that the route does not list, keeps the hold (cost
-/// unknown), as a longer clip than requested does: neither is what was
-/// admitted, and the price line without a size is never used in its place.
-/// A shorter clip than requested is billed as reported.
+/// reports when the request named none, and then only when the job's price,
+/// fixed at admission, names that size itself or has one rate for every size
+/// (so a later change of the route's sizes never changes it). A reported
+/// size that differs from the named one, or that the price neither names
+/// nor rates flat, keeps the hold (cost unknown), as a longer clip than
+/// requested and an unknown duration do: none is what was admitted or can
+/// be valued, and the price line without a size is never used in place of a
+/// size's own. A shorter clip is billed as reported.
 pub(crate) fn settlement(
     job: &JobRow,
     v: &UpstreamVideo,
-    sizes: Option<&[String]>,
+    reported: crate::governance::ReportedSizeRate,
 ) -> Option<Settlement> {
+    use crate::governance::ReportedSizeRate as Rate;
     let requested = job.video_seconds.and_then(|s| u32::try_from(s).ok())?;
     match v.state {
         JobState::Completed => {
             let named = job.video_size.as_deref();
-            let reported = v.size.as_ref().map(|s| s.as_str());
-            let off_size = match (named, reported) {
+            let reported_size = v.size.as_ref().map(|s| s.as_str());
+            let off_size = match (named, reported_size) {
                 (Some(n), Some(r)) => n != r,
-                (None, Some(r)) => !sizes.is_some_and(|sizes| sizes.iter().any(|s| s == r)),
+                (None, Some(_)) => reported == Rate::Unpriced,
                 (_, None) => false,
             };
-            let variant = v
-                .size
-                .or_else(|| named.and_then(crate::billing::MeterVariant::new));
+            // A flat rate values any size: billed without one.
+            let variant = match (named, reported) {
+                (None, Rate::Flat) => None,
+                _ => v
+                    .size
+                    .or_else(|| named.and_then(crate::billing::MeterVariant::new)),
+            };
             let usage = |ms: Option<u64>| Usage {
                 meters: Some(video_meters(ms)),
                 output_image_variant: variant,
                 ..Usage::default()
             };
+            let kept = |ms: Option<u64>| Settlement {
+                outcome: Outcome::Failed,
+                error: Some(InferenceError::InvalidUpstream),
+                usage: usage(ms),
+            };
             Some(match v.seconds {
-                // A longer clip than requested, or a size that was not
-                // admitted, is not covered by the hold: keep the evidence and
-                // the hold (never settle it).
-                Some(s) if s > requested || off_size => Settlement {
-                    outcome: Outcome::Failed,
-                    error: Some(InferenceError::InvalidUpstream),
-                    usage: usage(Some(u64::from(s) * 1000)),
-                },
-                None if off_size => Settlement {
-                    outcome: Outcome::Failed,
-                    error: Some(InferenceError::InvalidUpstream),
-                    usage: usage(None),
-                },
-                // Unknown duration stays unknown (hold retained).
-                seconds => Settlement {
+                // Not what was admitted, or not known: keep the evidence and
+                // the hold (never settle it), whatever the rates.
+                Some(s) if s > requested || off_size => kept(Some(u64::from(s) * 1000)),
+                None => kept(None),
+                Some(s) => Settlement {
                     outcome: Outcome::Succeeded,
                     error: None,
-                    usage: usage(seconds.map(|s| u64::from(s) * 1000)),
+                    usage: usage(Some(u64::from(s) * 1000)),
                 },
             })
         }
@@ -128,37 +125,6 @@ fn interrupted() -> Settlement {
         outcome: Outcome::Cancelled,
         error: None,
         usage: Usage::default(),
-    }
-}
-
-/// Why none of the caller's routes of the model (enabled, allowed to its
-/// workspace and key, serving video) took a video request: none is set up
-/// for video, none takes its length, or none takes its size. When some route
-/// takes both, the request was refused for another reason (its routes do not
-/// serve it), reported as before.
-fn refusal(routes: &HashMap<Uuid, VideoRoute>, request: &VideoRequest) -> JobError {
-    if routes.is_empty() {
-        return JobError::Conflict("unsupported_capability", NO_VIDEO_ROUTE);
-    }
-    let answers: Vec<_> = routes.values().map(|r| r.accepts(request)).collect();
-    if answers.iter().any(Result::is_ok) {
-        return InferenceError::Unsupported.into();
-    }
-    if answers
-        .iter()
-        .all(|a| matches!(a, Err(VideoParameter::Seconds)))
-    {
-        JobError::InvalidParameter(
-            "unsupported_video_parameter",
-            SECONDS_NOT_TAKEN,
-            VideoParameter::Seconds.field(),
-        )
-    } else {
-        JobError::InvalidParameter(
-            "unsupported_video_parameter",
-            SIZE_NOT_TAKEN,
-            VideoParameter::Size.field(),
-        )
     }
 }
 
@@ -218,14 +184,7 @@ impl Jobs {
             size: request.size.clone(),
         };
         let attempt = self
-            .admit(
-                principal,
-                request_id,
-                &model,
-                &target,
-                &admission,
-                Some(&check),
-            )
+            .admit_video(principal, request_id, &request, &target, &admission, &check)
             .await?;
         let deadline = UtcInstant::now() + VIDEO_POLL_WINDOW;
         let grace = self.video_create_grace();
@@ -294,7 +253,7 @@ impl Jobs {
                 tracing::error!(execution_id = %request_id, "video provider id not recorded after upstream acceptance; the job ends interrupted with its hold kept");
             })?;
         let Some(job) = recorded else {
-            tracing::error!(execution_id = %request_id, "video provider id arrived after the job ended; hold kept");
+            tracing::error!(execution_id = %request_id, "video provider id arrived after the job ended, or another job of the connection has it; hold kept");
             return Err(InferenceError::Storage.into());
         };
         // The creator's first observation (`Observer::Creator`): inside the
@@ -303,80 +262,6 @@ impl Jobs {
         // itself.
         self.apply_video(&job, &upstream, store::Observer::Creator)
             .await
-    }
-
-    /// The route a video request goes to, among the caller's routes of the
-    /// model whose options (0097) take its length and size, and the request
-    /// as that route sends it (its length resolved); otherwise the refusal
-    /// naming what none of the caller's routes takes.
-    async fn video_route(
-        &self,
-        principal: &Principal,
-        request: &VideoRequest,
-        request_id: Uuid,
-    ) -> JobResult<(Deployment, Arc<dyn ProviderAdapter>, VideoRequest)> {
-        let candidates: Vec<Uuid> = self
-            .store
-            .deployments(principal, &request.model)
-            .await?
-            .into_iter()
-            .filter(|d| {
-                d.supported_protocols
-                    .iter()
-                    .any(|p| p == ApiProtocol::Videos.as_str())
-                    && self
-                        .registry
-                        .get(&d.provider)
-                        .is_some_and(|a| a.supports_protocol(ApiProtocol::Videos))
-            })
-            .map(|d| d.id)
-            .collect();
-        let routes = self.video_routes(&candidates).await?;
-        let selected = self
-            .select(
-                principal,
-                &request.model,
-                ApiProtocol::Videos,
-                request_id,
-                |a, d| {
-                    routes
-                        .get(&d.id)
-                        .is_some_and(|r| r.accepts(request).is_ok())
-                        && a.supports_video_request(d, request)
-                },
-            )
-            .await;
-        let (target, adapter) = match selected {
-            Err(InferenceError::Unsupported) => return Err(refusal(&routes, request)),
-            other => other?,
-        };
-        let resolved = routes
-            .get(&target.id)
-            .and_then(|r| r.accepts(request).ok())
-            .ok_or(InferenceError::Configuration)?;
-        Ok((target, adapter, resolved))
-    }
-
-    /// The video options (0097) of these routes; a route without them is not
-    /// listed.
-    async fn video_routes(&self, ids: &[Uuid]) -> JobResult<HashMap<Uuid, VideoRoute>> {
-        let rows: Vec<(Uuid, Vec<i32>, Option<Vec<String>>)> = sqlx::query_as(
-            "SELECT id,video_seconds,video_sizes FROM deployments WHERE id=ANY($1) AND video_seconds IS NOT NULL",
-        )
-        .bind(ids)
-        .fetch_all(&self.store.pool)
-        .await
-        .map_err(|_| InferenceError::Storage)?;
-        Ok(rows
-            .into_iter()
-            .map(|(id, seconds, sizes)| {
-                let seconds = seconds
-                    .into_iter()
-                    .filter_map(|s| u32::try_from(s).ok())
-                    .collect();
-                (id, VideoRoute { seconds, sizes })
-            })
-            .collect())
     }
 
     /// Record first (#662): the job row, without a provider id, and the
@@ -545,7 +430,11 @@ impl Jobs {
         if recorded
             && job.job_state().is_terminal()
             && job.settled_at.is_none()
-            && let Some(s) = settlement(&job, upstream, self.route_sizes(&job).await?.as_deref())
+            && let Some(s) = settlement(
+                &job,
+                upstream,
+                self.reported_size_rate(&job, upstream).await?,
+            )
         {
             self.settle_as(&job, s, observer).await?;
             return Ok(store::reload(&self.store, job.id).await?);
@@ -553,20 +442,22 @@ impl Jobs {
         Ok(job)
     }
 
-    /// The job's route's sizes now (0097), read only when a size the
-    /// provider reports must be checked against them.
-    async fn route_sizes(&self, job: &JobRow) -> JobResult<Option<Vec<String>>> {
-        if job.video_size.is_some() {
-            return Ok(None);
+    /// For a request that named no size and a reported size: how the job's
+    /// pinned price values it ([`settlement`]).
+    async fn reported_size_rate(
+        &self,
+        job: &JobRow,
+        upstream: &UpstreamVideo,
+    ) -> JobResult<crate::governance::ReportedSizeRate> {
+        match (&job.video_size, &upstream.size) {
+            (None, Some(size)) => Ok(crate::governance::pinned_video_size_rate(
+                &self.store,
+                job.execution_id,
+                size.as_str(),
+            )
+            .await?),
+            _ => Ok(crate::governance::ReportedSizeRate::Unpriced),
         }
-        Ok(
-            sqlx::query_scalar("SELECT video_sizes FROM deployments WHERE id=$1")
-                .bind(job.deployment_id)
-                .fetch_optional(&self.store.pool)
-                .await
-                .map_err(|_| InferenceError::Storage)?
-                .flatten(),
-        )
     }
 
     /// Settle `job` while `observer` holds its row (`store::hold_writer`), so
@@ -609,7 +500,7 @@ impl Jobs {
         self.limits.poll_interval.map_or(30.0, |d| d.as_secs_f64())
     }
 
-    pub(crate) async fn own_video(&self, principal: &Principal, id: &str) -> JobResult<JobRow> {
+    async fn own_video(&self, principal: &Principal, id: &str) -> JobResult<JobRow> {
         let id = parse_client_id(JobKind::Video.prefix(), id).ok_or(JobError::NotFound)?;
         store::job(
             &self.store,
@@ -690,8 +581,9 @@ impl Jobs {
     /// Delete a finished video's provider assets. In-progress jobs cannot be
     /// deleted (their accounting is still open). Returns whether the
     /// provider's copy is gone: `false` when the provider offers no delete
-    /// (`405`), whose copy then stays until its own expiry; a `404` counts as
-    /// gone.
+    /// (`405`), whose copy then stays until its own expiry, or when a create
+    /// whose outcome is unknown left no provider id to delete; a `404` counts
+    /// as gone.
     pub async fn delete_video(&self, principal: &Principal, id: &str) -> JobResult<(JobRow, bool)> {
         let job = self.own_video(principal, id).await?;
         if !crate::visibility::may_modify_job(
@@ -713,8 +605,11 @@ impl Jobs {
                 "A video can be deleted once it is completed or failed",
             ));
         }
-        // A video that never got a provider id has no provider assets.
-        let mut upstream_deleted = true;
+        // A video that never got a provider id has no provider assets only
+        // when its create is known to have left none (`create_failed`: nothing
+        // sent, or refused); after an unknown outcome (`create_unconfirmed`,
+        // `create_interrupted`) the server may still have it.
+        let mut upstream_deleted = job.error_code.as_deref() == Some("create_failed");
         if job.upstream_id.is_some() {
             let (target, adapter) = self.target(&job).await?;
             let upstream_id = job.upstream().ok_or(InferenceError::Storage)?;

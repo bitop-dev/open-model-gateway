@@ -319,7 +319,7 @@ impl VideoRequest {
     }
 }
 
-/// The video types the gateway stores and serves as received.
+/// The video types the gateway serves as the server labels them.
 pub const VIDEO_OUTPUT_TYPES: [&str; 3] = ["video/mp4", "video/webm", "video/quicktime"];
 
 /// What a provider did with a delete of its copy of a video.
@@ -347,12 +347,6 @@ pub enum VideoParameter {
     Size,
 }
 impl VideoParameter {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Seconds => "seconds",
-            Self::Size => "size",
-        }
-    }
     pub const fn field(self) -> crate::inference::error::FieldName {
         match self {
             Self::Seconds => crate::inference::error::FieldName::from_static("seconds"),

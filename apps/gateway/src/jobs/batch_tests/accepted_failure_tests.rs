@@ -90,7 +90,7 @@ async fn accepted_failed_video_preserves_unknown_usage(pool: PgPool) {
     let f = fixture(pool).await;
     video_setup(&f).await;
     let fake = Fake::default();
-    let jobs = db_tests::jobs(&f, &fake, false).await;
+    let jobs = db_tests::jobs(&f, &fake, false);
     // The NA-token price also must not invent observations for a failed job.
     for free in [true, false] {
         if free {
@@ -115,8 +115,12 @@ async fn accepted_failed_video_preserves_unknown_usage(pool: PgPool) {
         // Stale settlement replay and terminal retrieval cannot append evidence.
         jobs.settle(
             &job,
-            super::super::video::settlement(&job, &upstream_video(JobState::Failed, None), None)
-                .unwrap(),
+            super::super::video::settlement(
+                &job,
+                &upstream_video(JobState::Failed, None),
+                crate::governance::ReportedSizeRate::Unpriced,
+            )
+            .unwrap(),
         )
         .await
         .unwrap();
