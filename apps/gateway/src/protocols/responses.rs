@@ -1,4 +1,5 @@
 //! Stateless Responses frontend. Streaming snapshots are bounded and committed only on Engine Done.
+use crate::http::json_body::JsonBodyRejection;
 use crate::{
     auth::Principal,
     http::RequestId,
@@ -6,7 +7,6 @@ use crate::{
 };
 use axum::{
     Extension, Json,
-    extract::rejection::JsonRejection,
     http::StatusCode,
     response::{
         IntoResponse, Response, Sse,
@@ -375,10 +375,10 @@ pub async fn handle(
     Extension(principal): Extension<Principal>,
     Extension(request_id): Extension<RequestId>,
     large: Option<Extension<crate::inference::image_buffer::LargeBody>>,
-    input: std::result::Result<Json<Request>, JsonRejection>,
+    input: std::result::Result<crate::http::json_body::JsonBody<Request>, JsonBodyRejection>,
 ) -> Response {
     let wire = match input {
-        Ok(Json(v)) => v,
+        Ok(crate::http::json_body::JsonBody(v)) => v,
         Err(e) => return rejection(e),
     };
     if !client::valid_openai_metadata(wire.metadata.as_ref()) {
@@ -672,7 +672,7 @@ fn error_body(e: InferenceError) -> Value {
 fn error_response(e: InferenceError) -> Response {
     super::error_with_body(e, error_body(e))
 }
-fn rejection(e: JsonRejection) -> Response {
+fn rejection(e: JsonBodyRejection) -> Response {
     if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
         super::payload_too_large()
     } else {

@@ -70,7 +70,7 @@ fn scan(body: &[u8], data_values: bool) -> Scan {
         // more often than a value (the error path keeps each key on it).
         if string.key {
             data_key = (data_values && literal == b"data").then_some(string.end);
-            return;
+            return false;
         }
         // Only the key's own string value: nothing but the colon and
         // whitespace between the key's closing quote and this one's opening.
@@ -90,7 +90,12 @@ fn scan(body: &[u8], data_values: bool) -> Scan {
             if literal.len() > held {
                 longest[shortest] = literal.len();
             }
+            // Image data, whatever is set aside: its copies, the parser's
+            // scratch copy of an escaped one included, are the image input
+            // buffer's (`inference::image_buffer`), not structure.
+            return true;
         }
+        false
     });
     Scan {
         outside: body.len() - longest.iter().sum::<usize>(),

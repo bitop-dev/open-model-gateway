@@ -183,9 +183,11 @@ pub(crate) struct InputLine {
 
 /// A line may be parsed only when its structure estimate is within the
 /// budget every JSON request body has (`inference::json_weight`), at
-/// planning and again when it runs.
-fn within_budget(raw: &[u8]) -> Result<(), LineError> {
-    if crate::inference::json_weight::within_budget(raw) {
+/// planning and again when it runs, its work line then also holding the
+/// gateway's plan (`allowance`).
+fn within_budget(raw: &[u8], allowance: usize) -> Result<(), LineError> {
+    use crate::inference::json_weight::{BUDGET, estimate};
+    if estimate(raw) <= BUDGET + allowance {
         Ok(())
     } else {
         crate::metrics::METRICS.json_structure_refused("batch_line");
@@ -195,7 +197,7 @@ fn within_budget(raw: &[u8]) -> Result<(), LineError> {
 
 /// Read an internal work line; old private copies without a plan still work.
 pub(crate) fn parse_work_line(raw: &[u8], endpoint: BatchEndpoint) -> Result<InputLine, LineError> {
-    within_budget(raw)?;
+    within_budget(raw, crate::inference::json_weight::PLAN_ALLOWANCE)?;
     let mut value: Value = serde_json::from_slice(raw).map_err(|_| LineError::InvalidJson)?;
     let plan = value
         .as_object_mut()
@@ -212,7 +214,7 @@ pub(crate) fn parse_work_line(raw: &[u8], endpoint: BatchEndpoint) -> Result<Inp
 /// Parse and validate one input line against `endpoint`'s contract. Lines
 /// use the endpoint's optional/required maximum rules.
 pub(crate) fn parse_line(raw: &[u8], endpoint: BatchEndpoint) -> Result<InputLine, LineError> {
-    within_budget(raw)?;
+    within_budget(raw, 0)?;
     let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
     parse_line_value(
         serde_json::from_slice::<Value>(raw).map_err(|_| LineError::InvalidJson)?,

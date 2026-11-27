@@ -17,6 +17,7 @@ use tracing::Instrument;
 use uuid::Uuid;
 
 mod image_body_scan;
+pub(crate) mod json_body;
 mod json_structure;
 mod read_deadline;
 

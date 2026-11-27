@@ -3,9 +3,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use crate::http::json_body::JsonBodyRejection;
 use axum::{
     Extension, Json,
-    extract::rejection::JsonRejection,
     http::StatusCode,
     response::{
         IntoResponse, Response, Sse,
@@ -344,10 +344,10 @@ pub async fn handle(
     Extension(principal): Extension<Principal>,
     Extension(request_id): Extension<RequestId>,
     large: Option<Extension<crate::inference::image_buffer::LargeBody>>,
-    input: Result<Json<Request>, JsonRejection>,
+    input: Result<crate::http::json_body::JsonBody<Request>, JsonBodyRejection>,
 ) -> Response {
     let wire = match input {
-        Ok(Json(request)) => request,
+        Ok(crate::http::json_body::JsonBody(request)) => request,
         Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
             return super::payload_too_large();
         }

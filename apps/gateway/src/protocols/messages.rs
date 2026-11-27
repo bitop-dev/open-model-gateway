@@ -1,5 +1,6 @@
 //! Anthropic Messages / Claude Code frontend; adapter-specific field rules.
 use super::responses::{Accumulator, Result, event};
+use crate::http::json_body::JsonBodyRejection;
 use crate::{
     auth::Principal,
     http::RequestId,
@@ -8,7 +9,6 @@ use crate::{
 };
 use axum::{
     Extension, Json,
-    extract::rejection::JsonRejection,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response, Sse, sse::KeepAlive},
 };
@@ -104,10 +104,10 @@ fn protocol_headers(
 /// The decoded body, or the Anthropic-shaped refusal (413 for a streamed
 /// body over the cap, the unknown field's name, else the generic 400).
 fn body<T>(
-    input: std::result::Result<Json<T>, JsonRejection>,
+    input: std::result::Result<crate::http::json_body::JsonBody<T>, JsonBodyRejection>,
 ) -> std::result::Result<T, Box<Response>> {
     match input {
-        Ok(Json(v)) => Ok(v),
+        Ok(crate::http::json_body::JsonBody(v)) => Ok(v),
         Err(e) if e.status() == StatusCode::PAYLOAD_TOO_LARGE => {
             Err(Box::new(http_error(StatusCode::PAYLOAD_TOO_LARGE)))
         }
@@ -125,7 +125,7 @@ pub async fn count_tokens(
     Extension(request_id): Extension<RequestId>,
     headers: HeaderMap,
     large: Option<Extension<crate::inference::image_buffer::LargeBody>>,
-    input: std::result::Result<Json<CountRequest>, JsonRejection>,
+    input: std::result::Result<crate::http::json_body::JsonBody<CountRequest>, JsonBodyRejection>,
 ) -> Response {
     let (betas, _version) = match protocol_headers(&headers) {
         Ok(v) => v,
@@ -168,7 +168,7 @@ pub async fn handle(
     Extension(request_id): Extension<RequestId>,
     headers: HeaderMap,
     large: Option<Extension<crate::inference::image_buffer::LargeBody>>,
-    input: std::result::Result<Json<Request>, JsonRejection>,
+    input: std::result::Result<crate::http::json_body::JsonBody<Request>, JsonBodyRejection>,
 ) -> Response {
     let (betas, version) = match protocol_headers(&headers) {
         Ok(v) => v,
@@ -504,7 +504,7 @@ pub(crate) fn http_error(status: StatusCode) -> Response {
     )
         .into_response()
 }
-fn rejection(e: JsonRejection) -> Response {
+fn rejection(e: JsonBodyRejection) -> Response {
     // Never echo serde's value/type diagnostics (they may include prompt text).
     // Only an identifier from its unknown-field diagnostic is safe to expose.
     let diagnostic = e.body_text();

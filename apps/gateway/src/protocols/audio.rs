@@ -18,12 +18,13 @@
 //! Filenames, uploads, transcripts and speech text are never logged or echoed.
 pub mod multipart;
 
+use crate::http::json_body::JsonBodyRejection;
 use std::sync::Arc;
 
 use axum::{
     Extension, Json,
     body::{Body, Bytes},
-    extract::rejection::{BytesRejection, JsonRejection},
+    extract::rejection::BytesRejection,
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -277,10 +278,10 @@ pub async fn speech(
     Extension(engine): Extension<Engine>,
     Extension(principal): Extension<Principal>,
     Extension(request_id): Extension<RequestId>,
-    input: Result<Json<SpeechWire>, JsonRejection>,
+    input: Result<crate::http::json_body::JsonBody<SpeechWire>, JsonBodyRejection>,
 ) -> Response {
     let request = match input {
-        Ok(Json(wire)) => match wire.normalize() {
+        Ok(crate::http::json_body::JsonBody(wire)) => match wire.normalize() {
             Ok(request) => request,
             Err(e) => return error(e),
         },

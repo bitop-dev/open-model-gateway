@@ -303,3 +303,74 @@ async fn a_body_is_measured_whatever_its_content_type(pool: PgPool) {
         );
     }
 }
+
+/// An image written with escaped slashes (as some encoders write every
+/// `/`), near the per-image limit, beside a full set of described tools, is
+/// served: the parser's scratch copy of the image is the image input
+/// buffer's, so only the tools count as structure. Charged as structure, the
+/// same body would be over the budget.
+#[dbtest::test]
+async fn an_escaped_image_near_its_limit_is_served(pool: PgPool) {
+    let w = world(pool, ImageInputLimits::default(), true).await;
+    allow_images(&w, true).await;
+    let mut body = chat_body(&png_url(5 * MIB - 1024, "s"), false);
+    body["tools"] = json!((0..128).map(|i| tool(i, 24, 80, false)).collect::<Vec<_>>());
+    let escaped = serde_json::to_string(&body).unwrap().replace('/', r"\/");
+    assert!(
+        escaped.contains(r"data:image\/png"),
+        "the image's slashes are escaped"
+    );
+    assert!(
+        json_weight::estimate(escaped.as_bytes()) > json_weight::BUDGET,
+        "charged as structure, the image's scratch copy would refuse it"
+    );
+    let (status, _, value, _) = send(
+        &w,
+        "/v1/chat/completions",
+        Some(&w.token),
+        escaped.into_bytes(),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+}
+
+/// A multipart form is not measured: it reaches its handler, which reads it
+/// as the form it is, whatever its parts hold.
+#[dbtest::test]
+async fn a_multipart_form_is_not_measured(pool: PgPool) {
+    let w = world(pool, ImageInputLimits::default(), true).await;
+    let objects = vec![r#"{"a":0}"#; 200_000].join(",");
+    let form = format!(
+        "--x\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n[{objects}]\r\n--x--\r\n"
+    );
+    assert!(json_weight::estimate(form.as_bytes()) > json_weight::BUDGET);
+    for content_type in [
+        "multipart/form-data; boundary=x",
+        " Multipart/Form-Data; boundary=x",
+    ] {
+        let before = METRICS.json_structure_refusal_count("videos");
+        let response = w
+            .router
+            .clone()
+            .oneshot(
+                Request::post("/v1/videos")
+                    .header(header::AUTHORIZATION, format!("Bearer {}", w.token))
+                    .header(header::CONTENT_TYPE, content_type)
+                    .body(Body::from(form.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "{content_type}"
+        );
+        assert_eq!(
+            METRICS.json_structure_refusal_count("videos"),
+            before,
+            "{content_type}"
+        );
+    }
+}

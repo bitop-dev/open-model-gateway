@@ -6,6 +6,7 @@
 //! `unsupported_capability` because the gateway never hosts files. Unknown
 //! fields (`output_format`, `background`, `style`, `user`, ...) are rejected.
 //! Prompts and images are never logged.
+use crate::http::json_body::JsonBodyRejection;
 use crate::{
     auth::Principal,
     http::RequestId,
@@ -17,7 +18,6 @@ use crate::{
 };
 use axum::{
     Extension, Json,
-    extract::rejection::JsonRejection,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -74,11 +74,11 @@ pub async fn handle(
     Extension(engine): Extension<Engine>,
     Extension(principal): Extension<Principal>,
     Extension(request_id): Extension<RequestId>,
-    input: Result<Json<Request>, JsonRejection>,
+    input: Result<crate::http::json_body::JsonBody<Request>, JsonBodyRejection>,
 ) -> Response {
     let cap = engine.limits().workloads.images_response_bytes;
     let request = match input {
-        Ok(Json(wire)) => match wire.normalize(cap) {
+        Ok(crate::http::json_body::JsonBody(wire)) => match wire.normalize(cap) {
             Ok(request) => request,
             Err(e) => return error(e),
         },

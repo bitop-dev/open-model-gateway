@@ -197,11 +197,93 @@ fn the_estimate_covers_hostile_shapes() {
             &long[..1000],
             &long[..(1 << 19)]
         ),
-        format!(r#"["{}é"]"#, "é".repeat(1 << 18)),
+        format!(r#"["{}"]"#, r"\u00e9".repeat(1 << 18)),
+        format!(
+            r#"["{}","{}"]"#,
+            r"\ud83d\ude00".repeat(1 << 16),
+            r"\n".repeat(1 << 19)
+        ),
         format!(r#"["{}","{long}\n"]"#, r"\n".repeat(1 << 18)),
     ]);
+    // Long numbers (with `float_roundtrip`, which dev-dependencies enable,
+    // their digits go through the same scratch buffer).
+    bodies.extend([
+        format!("[0.{}]", "1".repeat(1 << 20)),
+        format!("[{}]", "9".repeat(1 << 20)),
+        format!("[-1.{}e-5,{}]", "3".repeat(1 << 19), "7".repeat(1 << 18)),
+    ]);
+    // Long keys nested deep: the shape that a path-tracking parser (Axum's
+    // `Json`) copies per level, which the gateway's extractor does not use.
+    let key = "k".repeat(17_000);
+    bodies.push(format!(
+        "{{\"model\":\"m\",\"input\":{}0{}}}",
+        format!("{{\"{key}\":").repeat(120),
+        "}".repeat(120)
+    ));
     for body in bodies {
         holds(body.as_bytes()).unwrap();
+        holds_typed(body.as_bytes()).unwrap();
+    }
+}
+
+/// A request type of the shape the generation routes deserialize: typed
+/// fields beside open `Value` ones, unknown fields refused.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct Request {
+    model: Option<String>,
+    input: Option<Value>,
+    tool_choice: Option<Value>,
+}
+
+/// The raw length of the longest string literal of `body` (by the same
+/// boundaries every JSON parser reads).
+fn longest_string(body: &[u8]) -> usize {
+    let (mut i, mut longest) = (0, 0);
+    while i < body.len() {
+        if body[i] == b'"' {
+            let start = i + 1;
+            let mut j = start;
+            while j < body.len() && body[j] != b'"' {
+                j += if body[j] == b'\\' { 2 } else { 1 };
+            }
+            longest = longest.max(j.min(body.len()) - start);
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    longest
+}
+
+/// [`holds`] for a parse into [`Request`] with `serde_json::from_slice`, as
+/// the gateway's JSON extractor parses (`http::json_body`). A parse that
+/// fails builds its error message too, which can hold one decoded string
+/// (an unknown field's name, or an invalid value), escaped for display (at
+/// most three bytes per byte) in a message that grows by doubling: at most
+/// eight times the longest string, for a moment. The estimate leaves it out
+/// (it is bounded by the body and never sent), so this check allows it.
+fn holds_typed(body: &[u8]) -> Result<(), String> {
+    LIVE.set(0);
+    PEAK.set(0);
+    ON.set(true);
+    let parsed = serde_json::from_slice::<Request>(body);
+    ON.set(false);
+    let echo = if parsed.is_err() {
+        8 * longest_string(body) + 1024
+    } else {
+        0
+    };
+    drop(parsed);
+    let peak = usize::try_from(PEAK.get()).unwrap();
+    let estimate = body.len() + estimate(body) + echo;
+    if estimate >= peak {
+        Ok(())
+    } else {
+        Err(format!(
+            "typed: estimate {estimate} below the parse's peak {peak}"
+        ))
     }
 }
 
@@ -249,6 +331,7 @@ proptest! {
             body = body.replace('/', "\\/").replace('a', "\\u0061");
         }
         prop_assert!(holds(body.as_bytes()).is_ok(), "{}", holds(body.as_bytes()).unwrap_err());
+        prop_assert!(holds_typed(body.as_bytes()).is_ok(), "{}", holds_typed(body.as_bytes()).unwrap_err());
     }
 }
 

@@ -4,6 +4,7 @@
 //! `{id, model, answers, usage:{input_tokens, output_tokens}}` with numeric
 //! answer fields. Validation failures are 422 like TypeSafe. Gateway billing
 //! stays in the financial APIs, never in this body.
+use crate::http::json_body::JsonBodyRejection;
 use std::collections::BTreeMap;
 
 use crate::{
@@ -17,7 +18,6 @@ use crate::{
 };
 use axum::{
     Extension, Json,
-    extract::rejection::JsonRejection,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -73,10 +73,10 @@ pub async fn handle(
     Extension(engine): Extension<Engine>,
     Extension(principal): Extension<Principal>,
     Extension(request_id): Extension<RequestId>,
-    input: Result<Json<Request>, JsonRejection>,
+    input: Result<crate::http::json_body::JsonBody<Request>, JsonBodyRejection>,
 ) -> Response {
     let request = match input {
-        Ok(Json(wire)) => match wire.normalize() {
+        Ok(crate::http::json_body::JsonBody(wire)) => match wire.normalize() {
             Ok(request) => request,
             Err(e) => return error(e),
         },

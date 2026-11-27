@@ -1,4 +1,5 @@
 //! String-only, non-streaming /v1/embeddings frontend. No arbitrary passthrough.
+use crate::http::json_body::JsonBodyRejection;
 use crate::{
     auth::Principal,
     http::RequestId,
@@ -13,7 +14,6 @@ use crate::{
 use async_trait::async_trait;
 use axum::{
     Extension, Json,
-    extract::rejection::JsonRejection,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -147,10 +147,10 @@ pub async fn handle(
     Extension(engine): Extension<Engine>,
     Extension(principal): Extension<Principal>,
     Extension(request_id): Extension<RequestId>,
-    input: Result<Json<Request>, JsonRejection>,
+    input: Result<crate::http::json_body::JsonBody<Request>, JsonBodyRejection>,
 ) -> Response {
     let request = match input {
-        Ok(Json(wire)) => match wire.normalize() {
+        Ok(crate::http::json_body::JsonBody(wire)) => match wire.normalize() {
             Ok(request) => request,
             Err(e) => return super::chat_completions::error_response(e),
         },

@@ -197,7 +197,7 @@ metrics/jobs.rs :: impl Metrics::set_batch_route_lines :: family :: self . batch
 metrics/jobs.rs :: impl Metrics::set_batch_route_lines :: family :: self . batch_route_lines . get_or_create (& [("provider" , provider . clone ()) , ("state" , state . to_owned ())]) :: provider from provider = seen . iter () :: state from state = ["waiting" , "running"]
 metrics/jobs.rs :: impl Metrics::set_batch_workers :: family :: self . batch_workers . get_or_create (& [("state" , "busy" . to_owned ())])
 metrics/jobs.rs :: impl Metrics::set_batch_workers :: family :: self . batch_workers . get_or_create (& [("state" , "capacity" . to_owned ())])
-metrics/operations.rs :: impl Metrics::image_input_refused :: family :: self . image_input . refusals . get_or_create (& [("reason" , reason . to_owned ())])
+metrics/operations.rs :: impl Metrics::image_input_refused :: family :: self . bodies . refusals . get_or_create (& [("reason" , reason . to_owned ())])
 metrics/operations.rs :: impl Metrics::audit_export_delivery :: family :: self . audit_export_deliveries . get_or_create (& [("outcome" , outcome . to_owned ())])
 metrics/operations.rs :: impl Metrics::audit_export_skipped :: family :: self . audit_export_deliveries . get_or_create (& [("outcome" , "skipped" . to_owned ())])
 metrics/operations.rs :: impl Metrics::auth_throttled :: family :: self . auth_throttled . get_or_create (& [("endpoint" , endpoint . to_owned ()) , ("reason" , reason . to_owned ())])
@@ -205,7 +205,7 @@ metrics/operations.rs :: impl Metrics::auth_throttled_count :: family :: self . 
 metrics/operations.rs :: impl Metrics::cache_lookups :: family :: self . cache_lookups . get_or_create (& [("cache" , cache . to_owned ()) , ("result" , result . to_owned ())])
 metrics/operations.rs :: impl Metrics::egress_denied :: family :: self . egress_denied . get_or_create (& [("purpose" , purpose . to_owned ())])
 metrics/operations.rs :: impl Metrics::egress_denied_count :: family :: self . egress_denied . get_or_create (& [("purpose" , purpose . to_owned ())])
-metrics/operations.rs :: impl Metrics::json_structure_refused :: family :: self . json_structure_refusals . get_or_create (& [("route" , route . to_owned ())])
+metrics/operations.rs :: impl Metrics::json_structure_refused :: family :: self . bodies . structure_refusals . get_or_create (& [("route" , route . to_owned ())])
 metrics/operations.rs :: impl Metrics::key_issuance_refused :: family :: self . key_issuance_refused . get_or_create (& [("scope" , scope . to_owned ()) , ("operation" , operation . to_owned ())])
 metrics/operations.rs :: impl Metrics::key_issuance_refused_count :: family :: self . key_issuance_refused . get_or_create (& [("scope" , scope . to_owned ()) , ("operation" , operation . to_owned ())])
 metrics/operations.rs :: impl Metrics::observe_background_run :: family :: self . background_runs . get_or_create (& [("job" , job . to_owned ()) , ("result" , result . to_owned ())])
