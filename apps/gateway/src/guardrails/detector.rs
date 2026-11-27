@@ -191,11 +191,11 @@ pub struct BudgetSpent;
 
 /// What a detector shares within one request: the budget, and the built-in
 /// secret and personal-data findings (each scanned once for every rule that
-/// uses them).
+/// uses them; personal data per kind, only for the kinds some rule names).
 pub struct DetectContext<'a> {
     pub budget: &'a Budget,
     pub builtin: &'a std::cell::OnceCell<Findings>,
-    pub personal: &'a std::cell::OnceCell<Findings>,
+    pub personal: &'a std::cell::RefCell<std::collections::HashMap<Kind, Findings>>,
 }
 
 /// Implemented by the built-in detectors (and, in later phases, model and

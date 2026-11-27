@@ -145,6 +145,21 @@ fn values_next_to_other_text_are_still_found() {
         "write to alice@acme.com: now",
         "alice@acme.com",
     );
+    holds(Kind::Email, "user@gmail.com:hunter2", "user@gmail.com");
+    holds(Kind::Email, "请联系alice@acme.io", "alice@acme.io");
+    holds(
+        Kind::Card,
+        "Order 12345 4111 1111 1111 1111",
+        "4111 1111 1111 1111",
+    );
+    holds(Kind::Card, "12345 4111111111111111", "4111111111111111");
+    holds(Kind::Ip, "ip:2606:4700::1111", "2606:4700::1111");
+    holds(
+        Kind::Ip,
+        "X-Forwarded-For:2001:4860:4860::8888",
+        "2001:4860:4860::8888",
+    );
+    holds(Kind::Ip, "id:2606:4700::1111", "2606:4700::1111");
 }
 
 #[test]
@@ -166,10 +181,21 @@ fn one_kind_never_hides_or_crowds_out_another() {
     input.push(&text, Part::Content);
     let f = findings(&input);
     assert_eq!(f.distinct_kind(&input, Kind::Card), 1);
+    // A repeated value counts once and takes no room from distinct ones.
     assert_eq!(
         f.0.iter().filter(|x| x.kind == Some(Kind::Email)).count(),
-        MAX_FINDINGS
+        1
     );
+    let many = format!(
+        "{}{}",
+        "x@acme.io ".repeat(MAX_FINDINGS + 5),
+        (0..50)
+            .map(|i| format!("u{i}@acme.io "))
+            .collect::<String>()
+    );
+    let mut input = Inspection::default();
+    input.push(&many, Part::Content);
+    assert_eq!(findings(&input).distinct_kind(&input, Kind::Email), 51);
 }
 
 #[test]

@@ -378,11 +378,13 @@ impl Detector for PatternDetector {
         let mut counts = Vec::new();
         for &category in &self.categories {
             if category == Category::PersonalData {
-                let found = ctx
-                    .personal
-                    .get_or_init(|| super::personal::findings(input));
+                let mut found = ctx.personal.borrow_mut();
                 for &kind in &self.kinds {
-                    counts.push((category, Some(kind), found.distinct_kind(input, kind)));
+                    let n = found
+                        .entry(kind)
+                        .or_insert_with(|| super::personal::findings_of(input, kind))
+                        .distinct_kind(input, kind);
+                    counts.push((category, Some(kind), n));
                 }
                 continue;
             }

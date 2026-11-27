@@ -343,7 +343,7 @@ impl Policy {
     ) -> Decision {
         let mut decision = Decision::default();
         let builtin: OnceCell<Findings> = OnceCell::new();
-        let personal: OnceCell<Findings> = OnceCell::new();
+        let personal = std::cell::RefCell::new(std::collections::HashMap::new());
         let ctx = DetectContext {
             budget,
             builtin: &builtin,

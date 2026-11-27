@@ -41,6 +41,8 @@ pub struct KindDef {
     /// followed by an expiry, an IBAN followed by a word): byte ranges of the
     /// segment, around the failed candidate's span.
     shorter: fn(&str, &Range<usize>) -> Vec<Range<usize>>,
+    /// Where the search resumes after a candidate that is no value.
+    resume: fn(&str, &Range<usize>) -> usize,
 }
 
 fn alnum(b: u8) -> bool {
@@ -61,16 +63,20 @@ pub const KINDS: &[KindDef] = &[
         kind: Kind::Email,
         label: "EMAIL",
         matches: "Email addresses, except at reserved example domains (example.com, .test, .invalid, .localhost) and SSH remotes (git@host:repo).",
-        // The local part may hold any letter (`andré.dupont@…`); the domain
+        // The local part may hold the letters of scripts written with spaces
+        // between words (`andré.dupont@…`, Greek, Cyrillic), not those
+        // written without (CJK text glued to an address is not part of
+        // it); the domain
         // is ASCII (international names are sent as punycode). Lengths are
         // checked by the validator: counted repetitions of these classes
         // would make the automaton too large to search in linear time
         // without falling back to a slower engine.
-        pattern: r"[\p{L}\p{N}._%+\-]+@(?:[A-Za-z0-9](?:[A-Za-z0-9\-]*[A-Za-z0-9])?\.)+[A-Za-z]+",
+        pattern: r"[\p{Latin}\p{Greek}\p{Cyrillic}\p{N}._%+\-]+@(?:[A-Za-z0-9](?:[A-Za-z0-9\-]*[A-Za-z0-9])?\.)+[A-Za-z]+",
         before: |b| alnum(b) || b".%+-_".contains(&b),
         after: |b| alnum(b) || b"-_".contains(&b),
         valid: email,
         shorter: none,
+        resume: after,
     },
     KindDef {
         kind: Kind::Phone,
@@ -81,6 +87,7 @@ pub const KINDS: &[KindDef] = &[
         after: |b| alnum(b) || b"-/_".contains(&b),
         valid: phone,
         shorter: prefixes_at_separators,
+        resume: after,
     },
     KindDef {
         kind: Kind::Card,
@@ -92,6 +99,7 @@ pub const KINDS: &[KindDef] = &[
         after: |b| word(b) || b == b'-',
         valid: card,
         shorter: group_runs,
+        resume: next_group,
     },
     KindDef {
         kind: Kind::Iban,
@@ -102,6 +110,7 @@ pub const KINDS: &[KindDef] = &[
         after: alnum,
         valid: iban,
         shorter: iban_prefix,
+        resume: after,
     },
     KindDef {
         kind: Kind::UsSsn,
@@ -112,6 +121,7 @@ pub const KINDS: &[KindDef] = &[
         after: |b| word(b) || b == b'-',
         valid: ssn,
         shorter: none,
+        resume: after,
     },
     KindDef {
         kind: Kind::Ip,
@@ -125,6 +135,7 @@ pub const KINDS: &[KindDef] = &[
         after: |b| word(b) || b == b'-',
         valid: ip,
         shorter: ip_parts,
+        resume: past_colon,
     },
 ];
 
@@ -152,14 +163,18 @@ fn standalone(text: &[u8], span: &Range<usize>, d: &KindDef) -> bool {
     if before.is_some_and(d.before) || after.is_some_and(d.after) {
         return false;
     }
-    if d.kind == Kind::Email
-        && after == Some(b':')
-        && text
-            .get(span.end + 1)
-            .is_some_and(|b| !b.is_ascii_whitespace())
-    {
-        // `git@github.com:org/repo`: an SSH remote, not an address.
-        return false;
+    if d.kind == Kind::Email && after == Some(b':') {
+        // `git@github.com:org/repo(.git)`: an SSH remote, not an address
+        // (`user@acme.io:secret`, a credential line, is one).
+        let tail: Vec<u8> = text[span.end + 1..]
+            .iter()
+            .copied()
+            .take_while(|b| !b.is_ascii_whitespace())
+            .take(512)
+            .collect();
+        if tail.contains(&b'/') || tail.ends_with(b".git") {
+            return false;
+        }
     }
     !(after == Some(b'.') && text.get(span.end + 1).is_some_and(u8::is_ascii_digit))
 }
@@ -185,23 +200,61 @@ fn accepted(text: &str, span: Range<usize>, d: &KindDef, re: &Regex) -> Option<R
     (d.shorter)(text, &span).into_iter().find(ok)
 }
 
-/// Every personal-data finding of every kind in `input` (shared by every
-/// personal-data rule of one request; each counts only its own kinds). Each
-/// kind keeps at most `MAX_FINDINGS` matches of its own, so a request full
-/// of one kind's values never hides another kind's.
+/// Every personal-data finding of every kind in `input`. Each kind keeps
+/// at most `MAX_FINDINGS` distinct values of its own, so a request full of
+/// one kind's values never hides another kind's.
 pub fn findings(input: &Inspection<'_>) -> Findings {
+    Findings(
+        Kind::ALL
+            .iter()
+            .flat_map(|k| findings_of(input, *k).0)
+            .collect(),
+    )
+}
+
+/// The findings of one kind in `input`: a request is scanned only for the
+/// kinds its rules name (each scanned once, `DetectContext::personal`).
+pub fn findings_of(input: &Inspection<'_>, kind: Kind) -> Findings {
     let mut found = Vec::new();
-    for (d, re) in KINDS.iter().zip(COMPILED.iter()) {
-        let mut kept = 0usize;
+    let (d, re) = KINDS
+        .iter()
+        .zip(COMPILED.iter())
+        .find(|(d, _)| d.kind == kind)
+        .expect("every kind has an entry");
+    {
+        // Each kind keeps its first occurrence of at most MAX_FINDINGS
+        // distinct values: repeating one value costs nothing and never
+        // understates the count of distinct ones.
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         'kind: for (index, segment) in input.segments.iter().enumerate() {
-            for m in re.find_iter(&segment.text) {
-                let Some(span) = accepted(&segment.text, m.range(), d, re) else {
+            let text: &str = &segment.text;
+            let mut pos = 0;
+            // Whether the search resumed inside the last failed candidate.
+            let mut resumed = false;
+            while let Some(m) = re.find_at(text, pos) {
+                let Some(span) = accepted(text, m.range(), d, re) else {
+                    // A failed candidate may have cut a value short (a card
+                    // after a longer number, an address after a label): the
+                    // search resumes inside it, at its next part, once; a
+                    // candidate found from there that fails too is skipped
+                    // whole, so each byte is searched at most twice.
+                    pos = if resumed {
+                        m.end()
+                    } else {
+                        (d.resume)(text, &m.range())
+                    };
+                    pos = boundary_up(text, pos.max(m.start() + 1));
+                    resumed = !resumed;
                     continue;
                 };
-                if kept == MAX_FINDINGS {
+                resumed = false;
+                pos = span.end.max(m.start() + 1);
+                if !seen.insert(&text[span.clone()]) {
+                    continue;
+                }
+                if seen.len() > MAX_FINDINGS {
                     break 'kind;
                 }
-                kept += 1;
                 found.push(Finding {
                     category: Category::PersonalData,
                     kind: Some(d.kind),
@@ -212,6 +265,30 @@ pub fn findings(input: &Inspection<'_>) -> Findings {
         }
     }
     Findings(found)
+}
+
+/// The char boundary at or after `i`.
+fn boundary_up(text: &str, mut i: usize) -> usize {
+    while i < text.len() && !text.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+/// Where a search resumes after a failed candidate: its end.
+fn after(_: &str, span: &Range<usize>) -> usize {
+    span.end
+}
+/// After a failed card candidate: its second group (the first may belong to
+/// a longer number before the card).
+fn next_group(text: &str, span: &Range<usize>) -> usize {
+    groups(text, span).get(1).map_or(span.end, |g| g.start)
+}
+/// After a failed IP candidate: past its first `:` (a label glued to an
+/// IPv6 address, `ip:2606:4700::1111`), else its end.
+fn past_colon(text: &str, span: &Range<usize>) -> usize {
+    text[span.clone()]
+        .find(':')
+        .map_or(span.end, |i| span.start + i + 1)
 }
 
 // --- Shorter spans -----------------------------------------------------------------
