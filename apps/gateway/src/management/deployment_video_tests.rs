@@ -93,6 +93,8 @@ async fn a_route_s_video_options_are_set_validated_audited_and_cleared(pool: PgP
         json!({"seconds":[4],"other":1}),
         json!({"sizes":["1280x720"]}),
         json!({"seconds":["4"]}),
+        // Not a 32-bit integer: not read as a length at all.
+        json!({"seconds":[2_147_483_648_i64]}),
     ] {
         let (status, body) = call(&f.s, &f.admin, "PATCH", &path, json!({"video": bad})).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{bad}: {body}");
@@ -123,7 +125,7 @@ async fn a_route_s_video_options_are_set_validated_audited_and_cleared(pool: PgP
         &f.admin,
         "PATCH",
         &path,
-        json!({"image_input":true,"video":{"seconds":[8]}}),
+        json!({"image_input":true,"video":{"seconds":[12,8]}}),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -135,9 +137,18 @@ async fn a_route_s_video_options_are_set_validated_audited_and_cleared(pool: PgP
     assert!(image);
     assert_eq!(
         video(&pool, d).await,
-        (Some(vec![8]), None, 1),
-        "the unchanged options are a no-op"
+        (Some(vec![12, 8]), None, 1),
+        "both change"
     );
+    let (status, _) = call(
+        &f.s,
+        &f.admin,
+        "PATCH",
+        &path,
+        json!({"video": {"seconds":[8]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
     // Sizes need lengths, in the database too.
     assert!(
         sqlx::query("UPDATE deployments SET video_seconds=NULL,video_sizes='{1x1}' WHERE id=$1")
@@ -186,6 +197,8 @@ async fn a_route_s_video_options_are_set_validated_audited_and_cleared(pool: PgP
         audits,
         [
             json!({"video": options}),
+            json!({"video": {"seconds":[8],"sizes":null}}),
+            json!({"video": {"seconds":[12,8],"sizes":null}}),
             json!({"video": {"seconds":[8],"sizes":null}}),
             json!({"video": null}),
         ]
@@ -490,6 +503,12 @@ async fn migration_0098_validates_the_video_checks_and_guards_the_output_state(p
         .await
         .unwrap();
     assert_eq!(pending, 0, "videos completed before 0098 await nothing");
+    let index: String =
+        sqlx::query_scalar("SELECT pg_get_indexdef('async_jobs_video_output_due'::regclass)")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(index.ends_with("WHERE output_pending"), "{index}");
     // A video has a length and maybe a size; a batch has neither.
     job(&pool, ids, "video", "completed", Some(8), None)
         .await
@@ -510,35 +529,71 @@ async fn migration_0098_validates_the_video_checks_and_guards_the_output_state(p
     let running = job(&pool, ids, "video", "in_progress", Some(4), None)
         .await
         .unwrap();
-    // Awaiting an output: a completed, undeleted video without one.
-    set(&pool, videos[1], "output_pending=true").await.unwrap();
-    for (id, label) in [(running, "a running video"), (batch, "a batch")] {
-        assert!(
-            set(&pool, id, "output_pending=true").await.is_err(),
-            "{label} awaits an output"
-        );
-        assert!(
-            set(&pool, id, "output_failure='too_large'").await.is_err(),
-            "{label} fails an output"
-        );
-    }
+    // Awaiting an output starts only with the update recording completion.
+    let complete = "state='completed',completed_at=now(),output_pending=true";
     assert!(
-        set(&pool, videos[1], "deleted_at=now()").await.is_err(),
-        "deleted while awaited"
+        set(&pool, videos[1], "output_pending=true").await.is_err(),
+        "an old completed video"
     );
     assert!(
-        set(&pool, videos[1], "output_failure='too_large'")
+        set(&pool, batch, "output_pending=true").await.is_err(),
+        "a batch"
+    );
+    assert!(
+        set(&pool, running, "output_pending=true").await.is_err(),
+        "a running video"
+    );
+    let awaiting = job(&pool, ids, "video", "in_progress", Some(4), None)
+        .await
+        .unwrap();
+    set(&pool, awaiting, complete).await.unwrap();
+    assert!(
+        set(&pool, running, "output_failure='too_large'")
             .await
             .is_err(),
-        "failed while awaited"
+        "a running video fails an output"
+    );
+    assert!(
+        set(&pool, batch, "output_failure='too_large'")
+            .await
+            .is_err(),
+        "a batch fails an output"
+    );
+    // ... and ends only with an outcome, or a delete (which ends it itself).
+    assert!(
+        set(&pool, awaiting, "output_pending=false").await.is_err(),
+        "no outcome"
+    );
+    assert!(
+        set(&pool, awaiting, "output_failure='too_large'")
+            .await
+            .is_err(),
+        "a reason while still awaited"
     );
     set(
         &pool,
-        videos[1],
+        awaiting,
         "output_pending=false,output_failure='too_large'",
     )
     .await
     .unwrap();
+    let deleting = job(&pool, ids, "video", "in_progress", Some(4), None)
+        .await
+        .unwrap();
+    set(&pool, deleting, complete).await.unwrap();
+    set(&pool, deleting, "deleted_at=now()")
+        .await
+        .expect("a delete that does not know the column");
+    let still: bool = sqlx::query_scalar("SELECT output_pending FROM async_jobs WHERE id=$1")
+        .bind(deleting)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!still, "a delete ends the wait");
+    assert!(
+        set(&pool, deleting, "output_pending=true").await.is_err(),
+        "a deleted video"
+    );
     // A recorded failure is final, and excludes an output file.
     assert!(
         set(&pool, videos[0], "output_failure='Not A Code'")
@@ -573,10 +628,10 @@ async fn migration_0098_validates_the_video_checks_and_guards_the_output_state(p
             .is_err(),
         "a file after a failure"
     );
-    let fresh = job(&pool, ids, "video", "completed", Some(4), None)
+    let fresh = job(&pool, ids, "video", "in_progress", Some(4), None)
         .await
         .unwrap();
-    set(&pool, fresh, "output_pending=true").await.unwrap();
+    set(&pool, fresh, complete).await.unwrap();
     assert!(
         set(&pool, fresh, &format!("output_file_id='{file}'"))
             .await
@@ -630,8 +685,9 @@ async fn migration_0098_stops_on_a_job_the_0016_check_allowed(pool: PgPool) {
         .expect_err("a batch with a length")
         .to_string();
     assert!(
-        error.contains("1 non-video job(s) carry a video length or size"),
-        "{error}"
+        error.contains("1 non-video job(s) carry a video length or size")
+            && error.contains("find them with: SELECT id FROM async_jobs"),
+        "the count and the query reach the operator: {error}"
     );
     assert_eq!(checks(&pool).await, before, "nothing applied");
     let column: Option<String> = sqlx::query_scalar("SELECT column_name::text FROM information_schema.columns WHERE table_name='async_jobs' AND column_name='output_pending'")
@@ -639,12 +695,56 @@ async fn migration_0098_stops_on_a_job_the_0016_check_allowed(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(column, None);
-    // The length is immutable (0016 guard) and jobs are never deleted: the
-    // operator sets the row aside.
-    sqlx::raw_sql(&format!("ALTER TABLE async_jobs DISABLE TRIGGER async_jobs_no_delete; DELETE FROM async_jobs WHERE id='{}'; ALTER TABLE async_jobs ENABLE TRIGGER async_jobs_no_delete;", stray.unwrap()))
+    // The remedy the release notes give: the owner clears the stray
+    // fields (the 0016 guard keeps a job's length fixed, so it is set aside
+    // for the statement).
+    sqlx::raw_sql(REMEDY).execute(&pool).await.unwrap();
+    let kept: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM async_jobs WHERE id=$1 AND video_seconds IS NULL")
+            .bind(stray.unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(kept, 1, "the batch is kept, without the stray length");
+    migrator_through(98).run(&pool).await.unwrap();
+    assert!(checks(&pool).await.iter().all(|(.., valid)| *valid));
+}
+
+/// The stray-row remedy of the release notes (0098), as the owner runs it.
+const REMEDY: &str = "BEGIN; ALTER TABLE async_jobs DISABLE TRIGGER async_jobs_guard; UPDATE async_jobs SET video_seconds=NULL,video_size=NULL WHERE kind<>'video' AND (video_seconds IS NOT NULL OR video_size IS NOT NULL); ALTER TABLE async_jobs ENABLE TRIGGER async_jobs_guard; COMMIT;";
+
+/// A route option 0097 accepted and the gateway cannot read (a non-1-based
+/// array) stops 0098 with the count and the query, nothing applied; once
+/// the route is set again, 0098 applies, and the re-added CHECK holds.
+#[sqlx::test(migrations = false)]
+async fn migration_0098_stops_on_route_options_the_gateway_cannot_read(pool: PgPool) {
+    let (.., (_, _, deployment)) = at_0097(&pool, false).await;
+    sqlx::query("UPDATE deployments SET video_seconds='[0:0]={4}' WHERE id=$1")
+        .bind(deployment)
+        .execute(&pool)
+        .await
+        .expect("0097 takes a non-1-based array");
+    let before = checks(&pool).await;
+    let error = migrator_through(98)
+        .run(&pool)
+        .await
+        .expect_err("a route 0098 refuses")
+        .to_string();
+    assert!(
+        error.contains("1 route(s) have video options the gateway cannot read")
+            && error.contains("find them with: SELECT id FROM deployments"),
+        "{error}"
+    );
+    assert_eq!(checks(&pool).await, before, "nothing applied");
+    sqlx::query("UPDATE deployments SET video_seconds='{4}' WHERE id=$1")
+        .bind(deployment)
         .execute(&pool)
         .await
         .unwrap();
     migrator_through(98).run(&pool).await.unwrap();
-    assert!(checks(&pool).await.iter().all(|(.., valid)| *valid));
+    let def: String = sqlx::query_scalar("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname='deployments_video_options'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(def.contains("video_seconds_valid"), "{def}");
 }

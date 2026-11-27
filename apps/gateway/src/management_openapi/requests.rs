@@ -445,6 +445,19 @@ pub(super) fn refined_pointers_exist(
         .find_map(|arm| arm["properties"].as_object())
         .context("the object form of the request schema is missing")?;
     let positional = arms.iter().find_map(|arm| arm["prefixItems"].as_array());
+    // Fields the positional form declares it does not carry
+    // (`x-omg-object-only`), with its documented `maxItems`.
+    let (object_only, positional_len) = arms
+        .iter()
+        .find(|arm| arm["prefixItems"].is_array())
+        .map(|arm| {
+            let listed: Vec<&str> = arm["x-omg-object-only"]
+                .as_array()
+                .map(|names| names.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            (listed, arm["maxItems"].as_u64())
+        })
+        .unwrap_or_default();
     for pointer in refined {
         let field = pointer
             .strip_prefix('/')
@@ -457,19 +470,14 @@ pub(super) fn refined_pointers_exist(
             .iter()
             .position(|name| *name == field)
             .with_context(|| format!("refined pointer {pointer} is not a DTO field"))?;
-        // A field past the positional form's documented length is
-        // object-only by that schema (serde refuses it positionally), so it
-        // has no item to check; any other must have one.
-        let positional_len = arms
-            .iter()
-            .find_map(|arm| {
-                arm["prefixItems"]
-                    .is_array()
-                    .then(|| arm["maxItems"].as_u64())
-            })
-            .flatten();
+        // A field the positional form lists as object-only, past its
+        // `maxItems` (serde refuses it positionally), has no item to check;
+        // any other must have one, so a truncated positional form is still
+        // caught.
+        let declared_object_only = object_only.contains(&field)
+            && positional_len.is_some_and(|max| (max as usize) <= index);
         if let Some(items) = positional
-            && positional_len.is_none_or(|max| index < max as usize)
+            && !declared_object_only
         {
             ensure!(
                 items.len() > index,
@@ -894,12 +902,20 @@ fn management_openapi_request_refinements_are_reviewed_and_one_directional() {
             .iter()
             .find_map(|a| a["properties"].as_object())
             .unwrap();
-        let positional = arms
-            .iter()
-            .find_map(|a| a["prefixItems"].as_array())
-            .unwrap();
+        let arm = arms.iter().find(|a| a["prefixItems"].is_array()).unwrap();
+        let positional = arm["prefixItems"].as_array().unwrap();
+        // Fields the positional form declares object-only are not in it,
+        // and its `maxItems` stops before them.
+        let object_only = arm["x-omg-object-only"].as_array().map_or(0, Vec::len);
+        if object_only > 0 {
+            assert_eq!(
+                arm["maxItems"].as_u64(),
+                Some(positional.len() as u64),
+                "{method} {template}: an object-only field must be past the positional form's maxItems"
+            );
+        }
         assert!(
-            positional.len() >= object.len(),
+            positional.len() + object_only >= object.len(),
             "{method} {template}: the positional form is shorter than the object form"
         );
         for pointer in *pointers {
@@ -941,17 +957,27 @@ fn management_openapi_refined_pointers_must_exist_in_the_request_schema() {
         refined_pointers_exist(&short, &["a", "b"], &["/b"]).unwrap_err()
     );
     assert!(text.contains("/b") && text.contains("positional"), "{text}");
-    // A field the positional form documents it does not carry (`maxItems`
-    // below its index) is object-only: nothing positional to check. A
-    // `maxItems` that does reach it still needs the item.
+    // A field the positional form lists as object-only, past its
+    // `maxItems`, has nothing positional to check.
     let object_only = json!({"oneOf":[
         {"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}}},
-        {"type":"array","prefixItems":[{"type":"string"}],"maxItems":1}]});
+        {"type":"array","prefixItems":[{"type":"string"}],"maxItems":1,"x-omg-object-only":["b"]}]});
     refined_pointers_exist(&object_only, &["a", "b"], &["/b"]).unwrap();
-    let reaching = json!({"oneOf":[
-        {"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}}},
-        {"type":"array","prefixItems":[{"type":"string"}],"maxItems":2}]});
-    assert!(refined_pointers_exist(&reaching, &["a", "b"], &["/b"]).is_err());
+    // A truncated positional form is still caught: a `maxItems` that
+    // excludes the field without listing it, or a listing that `maxItems`
+    // does not back.
+    for arm in [
+        json!({"type":"array","prefixItems":[{"type":"string"}],"maxItems":1}),
+        json!({"type":"array","prefixItems":[{"type":"string"}],"maxItems":2,"x-omg-object-only":["b"]}),
+        json!({"type":"array","prefixItems":[{"type":"string"}],"x-omg-object-only":["b"]}),
+    ] {
+        let schema = json!({"oneOf":[
+            {"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}}}, arm]});
+        assert!(
+            refined_pointers_exist(&schema, &["a", "b"], &["/b"]).is_err(),
+            "{schema}"
+        );
+    }
 }
 
 #[derive(serde::Deserialize)]
