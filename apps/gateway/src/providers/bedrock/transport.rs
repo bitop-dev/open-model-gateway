@@ -12,9 +12,14 @@ use std::time::Duration;
 
 // Includes JSON envelope / event framing overhead, not just normalized model output.
 pub(super) const WIRE_LIMIT: usize = 8 * 1024 * 1024;
-/// The largest request body sent: Bedrock's 20 MB request size, which
-/// encoding holds images and text to (`images::LIMITS`), plus the 4 MiB the
-/// rest of a request may take (`OUTPUT_LIMIT`) and its JSON envelope.
+/// The largest request body sent. Encoding holds a request with images to
+/// Bedrock's 20 MB (`images::LIMITS`), counted over the raw text, tool
+/// arguments, schemas and the images' base64; the SDK then writes its own
+/// JSON, whose envelope and re-serialised tool arguments and schemas
+/// (numbers can grow) add to that, and a large body carries at most 2 MiB
+/// outside its images. So the wire body stays under this. A body over it is
+/// refused here, before the request is built, so nothing is sent: the
+/// attempt ends as unsent (`inference::dispatch`), its hold released.
 const REQUEST_LIMIT: usize = 26 * 1024 * 1024;
 
 #[derive(Clone)]

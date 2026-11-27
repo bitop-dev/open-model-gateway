@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use open_model_gateway::{config::Config, providers::secrets::EnvSecrets, store::Store};
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _, util::SubscriberInitExt as _};
+use tracing_subscriber::{EnvFilter, util::SubscriberInitExt as _};
 
 mod commands;
 
@@ -352,20 +352,13 @@ async fn wait_for_database(config: &Config, schema: bool, timeout_seconds: u64) 
 const DEFAULT_LOG_FILTER: &str = "open_model_gateway=info";
 
 async fn run(cli: Cli, process_start_unix_nano: u64) -> Result<()> {
-    // `log_policy::allowed` holds whatever `RUST_LOG` enables: the AWS
-    // SDK's request bodies (prompts, images) never reach the log.
-    tracing_subscriber::fmt()
-        .json()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER)),
-        )
-        .finish()
-        .with(tracing_subscriber::filter::filter_fn(
-            open_model_gateway::log_policy::allowed,
-        ))
-        .init();
+    // The policy beside `RUST_LOG` (`log_policy`): no filter lets an AWS SDK
+    // request body (prompts, images) into the log.
+    open_model_gateway::log_policy::subscriber(
+        std::io::stderr,
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER)),
+    )
+    .init();
     let config = Config::from_env()?;
     if matches!(cli.command, Some(Command::BootstrapDemo { .. }))
         || std::env::var("GATEWAY_OIDC_ISSUER").as_deref() == Ok("http://127.0.0.1:18084")

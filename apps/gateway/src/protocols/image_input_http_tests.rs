@@ -1170,3 +1170,83 @@ async fn image_memory_harness(pool: PgPool) {
     .await
     .unwrap();
 }
+
+/// A PNG data URL whose header states `width` × `height`.
+fn png_sized(width: u32, height: u32) -> String {
+    let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+    bytes.extend_from_slice(&width.to_be_bytes());
+    bytes.extend_from_slice(&height.to_be_bytes());
+    bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+    bytes.resize(256, 0);
+    format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )
+}
+
+#[dbtest::test]
+async fn a_png_over_8000_px_a_side_is_refused_before_admission_on_anthropic(pool: PgPool) {
+    over_the_pixel_limit(pool, "anthropic").await;
+}
+
+#[dbtest::test]
+async fn a_png_over_8000_px_a_side_is_refused_before_admission_on_bedrock(pool: PgPool) {
+    over_the_pixel_limit(pool, "bedrock").await;
+}
+
+/// The size the image's header states reaches the provider's limit: 8001 px
+/// on one side is refused naming `image`, with nothing sent and no
+/// execution; 8000 px is served.
+async fn over_the_pixel_limit(pool: PgPool, provider: &str) {
+    let w = world_for(pool, ImageInputLimits::default(), true, provider).await;
+    allow_images(&w, true).await;
+    for (width, height) in [(8001, 16), (16, 8001)] {
+        let body = serde_json::to_vec(&chat_body(&png_sized(width, height), false)).unwrap();
+        let (status, _, value, _) =
+            send(&w, "/v1/chat/completions", Some(&w.token), body, true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{provider}: {value}");
+        assert_eq!(value["error"]["message"], "image", "{provider}");
+    }
+    assert!(w.upstream.bodies.lock().unwrap().is_empty(), "{provider}");
+    assert_eq!(executions(&w).await, 0, "{provider}");
+    let body = serde_json::to_vec(&chat_body(&png_sized(8000, 8000), false)).unwrap();
+    let (status, _, value, _) = send(&w, "/v1/chat/completions", Some(&w.token), body, true).await;
+    assert_eq!(status, StatusCode::OK, "{provider}: {value}");
+    assert_eq!(executions(&w).await, 1, "{provider}");
+}
+
+/// An image of about 4 MB decoded: within the gateway's 5 MiB, over
+/// Bedrock's 3.75 MB. On a model whose only route is Bedrock it is refused
+/// before admission; with an OpenAI route second, that route serves it in
+/// one upstream request (Bedrock is skipped before the plan, not tried).
+#[dbtest::test]
+async fn an_image_over_bedrocks_size_is_refused_there_and_served_by_another_route(pool: PgPool) {
+    let w = world_for(pool, ImageInputLimits::default(), true, "bedrock").await;
+    allow_images(&w, true).await;
+    let body = serde_json::to_vec(&chat_body(&png_url(4_000_000, "b"), false)).unwrap();
+    assert!(body.len() > 2 * MIB);
+    let (status, _, value, _) = send(
+        &w,
+        "/v1/chat/completions",
+        Some(&w.token),
+        body.clone(),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+    assert_eq!(value["error"]["message"], "image");
+    assert!(w.upstream.bodies.lock().unwrap().is_empty());
+    assert_eq!(executions(&w).await, 0);
+    let openai = route(&w.f, "openai", 1, true).await;
+    sqlx::query("UPDATE deployments SET image_input=true WHERE id=$1")
+        .bind(openai)
+        .execute(&w.f.store.pool)
+        .await
+        .unwrap();
+    let (status, _, value, _) = send(&w, "/v1/chat/completions", Some(&w.token), body, true).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let paths = w.upstream.paths.lock().unwrap().clone();
+    assert_eq!(paths.len(), 1, "{paths:?}");
+    assert!(paths[0].ends_with("/chat/completions"), "{paths:?}");
+    assert_eq!(executions(&w).await, 1);
+}

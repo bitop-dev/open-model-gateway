@@ -370,9 +370,17 @@ const IMAGE_LIMITS: super::image_body::ImageLimits = super::image_body::ImageLim
     detail: false,
 };
 fn encode(model: &str, request: &ChatRequest) -> Result<Value> {
+    encode_within(model, request, &IMAGE_LIMITS)
+}
+/// [`encode`] against the image `limits` given.
+fn encode_within(
+    model: &str,
+    request: &ChatRequest,
+    limits: &super::image_body::ImageLimits,
+) -> Result<Value> {
     super::messages::validate(request, super::messages::ProviderClass::Anthropic)?;
     check_supported(request)?;
-    super::image_body::check_limits(request, &IMAGE_LIMITS)?;
+    super::image_body::check_limits(request, limits)?;
     let (system, messages) = system_and_messages(request)?;
     let mut value = json!({"model":model,"messages":messages,"max_tokens":request.max_output_tokens.unwrap_or(1024),"stream":request.stream});
     if !system.is_empty() {
@@ -385,7 +393,7 @@ fn encode(model: &str, request: &ChatRequest) -> Result<Value> {
     if request.has_images() {
         // The body without its images' data (each still a placeholder).
         let other = serde_json::to_vec(&value).map_or(usize::MAX, |b| b.len());
-        super::image_body::check_request_size(request, other, &IMAGE_LIMITS)?;
+        super::image_body::check_request_size(request, other, limits)?;
     }
     Ok(value)
 }

@@ -729,6 +729,33 @@ async fn images_across_turns_keep_their_order_and_blank_text_is_not_sent() {
     );
 }
 
+#[test]
+fn the_request_size_counts_images_and_the_rest_of_the_body() {
+    use super::super::{contract::image_request_with, image_body::ImageLimits};
+    let request = image_request_with(false, None);
+    let image = super::super::image_body::images(&request)
+        .map(|i| i.base64().len())
+        .sum::<usize>();
+    let other = serde_json::to_vec(&encode("private-model", &request).unwrap())
+        .unwrap()
+        .len();
+    let limits = |request_bytes| ImageLimits {
+        per_image: usize::MAX,
+        per_image_base64: usize::MAX,
+        count: 100,
+        side: 8000,
+        request_bytes,
+        detail: false,
+    };
+    // The images' base64 and the body around them, exactly at the limit,
+    // and one byte over it.
+    assert!(encode_within("private-model", &request, &limits(image + other)).is_ok());
+    assert_eq!(
+        encode_within("private-model", &request, &limits(image + other - 1)).err(),
+        Some(InferenceError::InvalidField("image"))
+    );
+}
+
 #[tokio::test]
 async fn images_the_messages_wire_cannot_carry_are_refused_before_anything_is_sent() {
     use super::super::contract::image_request_with;

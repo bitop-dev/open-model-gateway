@@ -1366,17 +1366,19 @@ async fn images_converse_cannot_carry_are_refused_before_anything_is_sent() {
     }
 }
 
-/// An image's bytes reach no log line, even with every target at TRACE:
-/// the SDK as locked writes a request's body nowhere (its "transmitting
-/// request" event shows a boxed body, `aws_sigv4` redacts it unless
-/// `LOG_SIGNABLE_BODY=true`), and the process's log policy
-/// (`log_policy::allowed`, installed by `main` beside `RUST_LOG`) never
-/// enables TRACE from the `aws_*` crates, where those events live.
+/// An image's bytes reach no log line, even with every target at TRACE.
+/// What was found: the SDK as locked writes its requests at TRACE but prints
+/// no body (the transmitted body is boxed and shown as `BoxBody`, and
+/// `aws_sigv4` redacts the signed body unless `LOG_SIGNABLE_BODY=true`).
+/// The process subscriber (`log_policy::subscriber`, which every subcommand
+/// installs) never records TRACE from the `aws_*` crates, which covers that
+/// switch and an SDK version that prints more: an event there carrying the
+/// bytes is dropped by it and written without it.
 #[tokio::test]
 async fn an_image_reaches_no_log_line_whatever_rust_log_enables() {
     use base64::Engine as _;
     use tracing::instrument::WithSubscriber as _;
-    use tracing_subscriber::{EnvFilter, fmt::MakeWriter, layer::SubscriberExt as _};
+    use tracing_subscriber::{EnvFilter, fmt::MakeWriter};
     #[derive(Clone, Default)]
     struct Lines(Arc<StdMutex<Vec<u8>>>);
     impl std::io::Write for Lines {
@@ -1394,17 +1396,25 @@ async fn an_image_reaches_no_log_line_whatever_rust_log_enables() {
             self.clone()
         }
     }
+    // The process subscriber with every target enabled, or the same
+    // subscriber without the policy.
     let capture = |policy: bool| {
         let lines = Lines::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(lines.clone())
-            .with_ansi(false)
-            .with_env_filter(EnvFilter::new("trace"))
-            .finish()
-            .with(tracing_subscriber::filter::filter_fn(move |m| {
-                !policy || crate::log_policy::allowed(m)
-            }));
-        (lines, subscriber)
+        let dispatch = if policy {
+            tracing::Dispatch::new(crate::log_policy::subscriber(
+                lines.clone(),
+                EnvFilter::new("trace"),
+            ))
+        } else {
+            tracing::Dispatch::new(
+                tracing_subscriber::fmt()
+                    .json()
+                    .with_writer(lines.clone())
+                    .with_env_filter(EnvFilter::new("trace"))
+                    .finish(),
+            )
+        };
+        (lines, dispatch)
     };
     let text = |lines: &Lines| String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
     let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
@@ -1472,7 +1482,7 @@ async fn an_image_reaches_no_log_line_whatever_rust_log_enables() {
     // policy and written without it; DEBUG under the same target is kept.
     for policy in [false, true] {
         let (lines, subscriber) = capture(policy);
-        tracing::subscriber::with_default(subscriber, || {
+        tracing::dispatcher::with_default(&subscriber, || {
             tracing::trace!(target: "aws_sigv4::http_request::sign", body = canary, "signing request");
             tracing::trace!(target: "aws_smithy_runtime::client::orchestrator", body = canary, "transmitting request");
             tracing::debug!(target: "aws_smithy_runtime::client::orchestrator", "beginning attempt");
