@@ -35,14 +35,42 @@ pub(super) fn blocks(
     parts: &[Part],
     decode: bool,
 ) -> Result<Vec<aws::ContentBlock>, InferenceError> {
+    each(
+        parts,
+        decode,
+        aws::ContentBlock::Text,
+        aws::ContentBlock::Image,
+    )
+}
+
+/// A tool result's text and image blocks, in order (Converse carries images
+/// in a tool result, as Messages does).
+pub(super) fn tool_result_blocks(
+    parts: &[Part],
+    decode: bool,
+) -> Result<Vec<aws::ToolResultContentBlock>, InferenceError> {
+    each(
+        parts,
+        decode,
+        aws::ToolResultContentBlock::Text,
+        aws::ToolResultContentBlock::Image,
+    )
+}
+
+fn each<B>(
+    parts: &[Part],
+    decode: bool,
+    text: fn(String) -> B,
+    image_block: fn(aws::ImageBlock) -> B,
+) -> Result<Vec<B>, InferenceError> {
     let refuse = || InferenceError::InvalidField("image");
     let mut blocks = Vec::new();
     for part in parts {
         match part {
             // Converse refuses a blank text block; beside an image it
             // carries nothing.
-            Part::Text(text) if text.trim().is_empty() => {}
-            Part::Text(text) => blocks.push(aws::ContentBlock::Text(text.clone())),
+            Part::Text(t) if t.trim().is_empty() => {}
+            Part::Text(t) => blocks.push(text(t.clone())),
             Part::Image(image) => {
                 let bytes = if decode {
                     base64::engine::general_purpose::STANDARD
@@ -56,7 +84,7 @@ pub(super) fn blocks(
                     .source(aws::ImageSource::Bytes(Blob::new(bytes)))
                     .build()
                     .map_err(|_| refuse())?;
-                blocks.push(aws::ContentBlock::Image(block));
+                blocks.push(image_block(block));
             }
         }
     }

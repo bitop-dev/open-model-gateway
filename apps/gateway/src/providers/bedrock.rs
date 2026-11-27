@@ -510,17 +510,18 @@ impl Turns {
         if !self.pending.remove(id) {
             return Err(invalid());
         }
-        // Canonical tool result content is a string. Preserve it verbatim, including JSON
-        // strings; parsing/re-emitting would alter its semantics. Tool-use input is JSON.
-        let text = message
-            .content
-            .as_ref()
-            .ok_or_else(invalid)?
-            .require_text()?;
+        // Canonical tool result content is a string, preserved verbatim (JSON
+        // strings included; re-emitting would alter them), or text and images.
+        let blocks = match message.content.as_ref().ok_or_else(invalid)? {
+            Content::Parts(parts) => images::tool_result_blocks(parts, self.decode)?,
+            text => vec![aws::ToolResultContentBlock::Text(
+                text.require_text()?.to_owned(),
+            )],
+        };
         content.push(aws::ContentBlock::ToolResult(
             aws::ToolResultBlock::builder()
                 .tool_use_id(id)
-                .content(aws::ToolResultContentBlock::Text(text.to_owned()))
+                .set_content(Some(blocks))
                 // Bedrock evaluates status support for the selected model or profile.
                 .set_status(
                     message

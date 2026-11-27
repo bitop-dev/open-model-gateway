@@ -19,7 +19,12 @@ pub(super) const CANCELLATION_TESTS: &[(&str, &str)] = &[
 
 /// The generation routes whose inline images may take a body past the
 /// shared text limit (`http.rs` `image_input_routes`).
-pub(super) const IMAGE_INPUT_PATHS: &[&str] = &["/v1/chat/completions", "/v1/responses"];
+pub(super) const IMAGE_INPUT_PATHS: &[&str] = &[
+    "/v1/chat/completions",
+    "/v1/responses",
+    "/v1/messages",
+    "/v1/messages/count_tokens",
+];
 
 pub(super) fn validate_request(
     document: &serde_json::Value,

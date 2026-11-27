@@ -316,6 +316,8 @@ otlp.rs :: endpoint :: metrics call :: crate :: metrics :: METRICS . egress_deni
 otlp.rs :: resource_attributes :: statement 1 :: json ! ([{ "key" : "service.name" , "value" : { "stringValue" : "open-model-gateway" } } , { "key" : "service.version" , "value" : { "stringValue" : version } } , { "key" : "deployment.environment.name" , "value" : { "stringValue" : environment . as_str () } } , { "key" : "service.instance.id" , "value" : { "stringValue" : instance . to_string () } }])
 partitions.rs :: run_job :: metrics call :: crate :: metrics :: METRICS . set_partition_months (table , c . months_ahead)
 protocols/chat_completions.rs :: handle :: metrics call :: crate :: metrics :: METRICS . image_input_refused ("too_large")
+protocols/messages.rs :: beyond_image_sources :: metrics call :: crate :: metrics :: METRICS . image_input_refused ("too_large")
+protocols/messages.rs :: beyond_images :: metrics call :: crate :: metrics :: METRICS . image_input_refused ("too_large")
 protocols/responses.rs :: handle :: metrics call :: crate :: metrics :: METRICS . image_input_refused ("too_large")
 rollups.rs :: run_once :: metrics call :: crate :: metrics :: METRICS . observe_rollup_hours ("changed" , report . changed_hours)
 rollups.rs :: run_once :: metrics call :: crate :: metrics :: METRICS . observe_rollup_hours ("new" , report . new_hours)

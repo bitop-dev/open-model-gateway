@@ -621,7 +621,7 @@ impl Runner {
                     && self.jobs.registry.get(&d.provider).is_some_and(|a| {
                         a.supports_protocol(protocol)
                             && match request {
-                                BatchRequest::Chat(r) => a.supports_chat_request(r),
+                                BatchRequest::Chat(r) => a.route_takes(d, protocol, r),
                                 BatchRequest::Embeddings(r) => a.supports_embedding_target(d, r),
                             }
                     })

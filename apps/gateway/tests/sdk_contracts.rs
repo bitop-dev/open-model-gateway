@@ -18,7 +18,7 @@ impl ProviderAdapter for Fixture {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
-            image_input: false,
+            image_input: true,
             text_chat: true,
             streaming: true,
             tools: true,
@@ -134,7 +134,7 @@ async fn real_client_sdks_accept_all_three_protocols(pool: sqlx::PgPool) {
     .execute(&pool)
     .await
     .unwrap();
-    sqlx::query("UPDATE deployments SET enabled=true")
+    sqlx::query("UPDATE deployments SET enabled=true,image_input=true")
         .execute(&pool)
         .await
         .unwrap();
@@ -192,11 +192,23 @@ async fn real_client_sdks_accept_all_three_protocols(pool: sqlx::PgPool) {
         "SDK contracts failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    // Thirty-nine priced calls, including beta/cache/thinking SDK grammar
+    // Forty-two priced calls (the last three carry images), including beta/cache/thinking SDK grammar
     // and the four anthropic-version calls (#430). Malformed/stateful/
     // version refusals leave no attempts or dispatch.
     let recorded = recorded.lock().unwrap().clone();
-    assert_eq!(recorded.len(), 39);
+    assert_eq!(recorded.len(), 42);
+    // The three image calls, last: each one canonical image, intact.
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    for (i, r) in recorded.iter().enumerate().skip(39) {
+        let images: Vec<&str> = r
+            .messages
+            .iter()
+            .filter_map(|m| m.content.as_ref())
+            .flat_map(open_model_gateway::inference::types::Content::images)
+            .map(|image| image.base64())
+            .collect();
+        assert_eq!(images, [png], "request {i}");
+    }
     // 2026-10-21 (create, stream), pinned 2023-06-01, then 2023-06-01 with
     // temperature: only the last carries a sampling parameter.
     for (i, r) in recorded.iter().enumerate().take(37).skip(33) {
@@ -342,18 +354,20 @@ async fn real_client_sdks_accept_all_three_protocols(pool: sqlx::PgPool) {
         assert_eq!(result.tool_call_id.as_deref(), Some("ping-call"));
     }
     let attempts: (i64, i64) = sqlx::query_as("SELECT count(*),count(*) FILTER(WHERE state='succeeded') FROM inference_executions WHERE workload_kind='generation'").fetch_one(&pool).await.unwrap();
-    assert_eq!(attempts, (39, 39));
+    assert_eq!(attempts, (42, 42));
     let holds: Vec<(i64, i64, i64)> = sqlx::query_as("SELECT r.reserved_tokens,l.amount_microusd,p.output_token_limit FROM governance_reservations r JOIN deployment_prices p ON p.id=r.price_id JOIN monetary_ledger l ON l.execution_id=r.execution_id JOIN inference_executions e ON e.id=r.execution_id WHERE l.kind='hold' AND e.workload_kind='generation' ORDER BY r.admitted_at").fetch_all(&pool).await.unwrap();
-    assert_eq!(holds.len(), 39);
+    assert_eq!(holds.len(), 42);
     for (i, (tokens, amount, ceiling)) in holds.into_iter().enumerate() {
         let cap = [
             100, 100, 7, 7, 7, 7, 7, 100, 100, 100, 100, 100, 100, 100, 100, 100, 32, 32, 100, 100,
             100, 100, 32, 32, 32, 32, 32, 32, 100, 100, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+            // The image calls: Chat and Responses at the route's bound, Messages at 32.
+            100, 100, 32,
         ][i];
         assert_eq!((tokens, amount, ceiling), (1000 + cap, 1000 + cap, 100));
     }
     let settlements: Vec<(i64, i64, i64)> = sqlx::query_as("SELECT r.actual_microusd,r.input_tokens,r.output_tokens FROM governance_reservations r JOIN inference_executions e ON e.id=r.execution_id WHERE r.state='settled' AND e.workload_kind='generation'").fetch_all(&pool).await.unwrap();
-    assert_eq!(settlements, vec![(7, 3, 4); 39]);
+    assert_eq!(settlements, vec![(7, 3, 4); 42]);
     let ledger: (i64, i64) = sqlx::query_as("SELECT count(*),sum(l.amount_microusd)::bigint FROM monetary_ledger l JOIN inference_executions e ON e.id=l.execution_id WHERE l.kind='settlement' AND e.workload_kind='generation'").fetch_one(&pool).await.unwrap();
-    assert_eq!(ledger, (39, 39 * 7));
+    assert_eq!(ledger, (42, 42 * 7));
 }

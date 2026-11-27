@@ -223,7 +223,7 @@ fn inference_openapi_documents_every_status_the_renderers_produce() {
             expected.insert(405);
         }
         // A large image input body that stalls (`protocols::body_timeout`).
-        if ["/v1/chat/completions", "/v1/responses"].contains(&path) {
+        if ["/v1/chat/completions", "/v1/responses", "/v1/messages"].contains(&path) {
             expected.insert(408);
         }
         assert_eq!(
@@ -345,9 +345,12 @@ async fn inference_openapi_real_transport_errors_match_their_envelopes() {
     assert!(validate_value(&doc, &schema("OpenAiErrorEnvelope"), &body).is_err());
 }
 
-/// The documented exception of /v1/messages: the outer layer answers an
-/// oversized body in Anthropic's shape (`request_too_large`), while every other
-/// route answers in its own (http.rs request_context, protocols/messages.rs).
+/// The documented exception of /v1/messages: its refusals outside the
+/// handler are Anthropic-shaped (`request_too_large` for a body over a cap,
+/// http.rs `request_context` and `image_input_body`), while every other route
+/// answers in its own. A body over 2 MiB is judged after authentication, as
+/// on every image input route; the keyed 413s are in the fixture journeys
+/// (`fixtures_tests`, the image input transport).
 #[tokio::test]
 async fn inference_openapi_documents_the_messages_transport_exception() {
     let doc = generated();
@@ -363,7 +366,8 @@ async fn inference_openapi_documents_the_messages_transport_exception() {
         responses["405"]["headers"]["allow"]["schema"],
         json!({"const":"POST"})
     );
-    // The real 413 (a declared length over the cap, before any credential).
+    // A body past the shared limit without a credential: authentication
+    // answers first, in Anthropic's shape.
     let too_large = 2 * 1024 * 1024 + 1;
     let (status, headers, bytes) = send(
         Request::builder()
@@ -374,9 +378,16 @@ async fn inference_openapi_documents_the_messages_transport_exception() {
             .unwrap(),
     )
     .await;
-    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
     validate_documented(&doc, "POST", "/v1/messages", status, &headers, &bytes).unwrap();
     let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"]["type"], "authentication_error");
+    // The 413 body itself (`messages::http_error`, also what
+    // `large_body_refusal` writes) is the documented Anthropic shape.
+    let refused = crate::protocols::messages::http_error(StatusCode::PAYLOAD_TOO_LARGE);
+    let bytes = to_bytes(refused.into_body(), 4096).await.unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    validate_value(&doc, &schema("AnthropicErrorEnvelope"), &body).unwrap();
     assert_eq!(body["error"]["type"], "request_too_large");
     // The real 405 body (the status rewrite keeps Allow; the stack adds the rest).
     let method_not_allowed = crate::protocols::messages::http_error(StatusCode::METHOD_NOT_ALLOWED);

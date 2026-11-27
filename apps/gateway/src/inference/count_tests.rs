@@ -73,16 +73,8 @@ fn an_estimate_is_never_given_for_a_request_with_images() {
         estimated(&inline).err(),
         Some(InferenceError::InvalidField("image"))
     );
-    // A native Messages image block likewise.
-    let mut native = text.clone();
-    native.messages_options = Some(Box::new(crate::inference::types::MessagesOptions {
-        images: vec![serde_json::json!({"type":"image"})],
-        ..Default::default()
-    }));
-    assert_eq!(
-        estimated(&native).err(),
-        Some(InferenceError::InvalidField("image"))
-    );
+    // A Messages image block is a canonical image, so it is refused the
+    // same way (`protocols::messages` parses it into one).
 }
 
 #[test]

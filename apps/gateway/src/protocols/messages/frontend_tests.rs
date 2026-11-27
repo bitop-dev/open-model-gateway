@@ -68,7 +68,7 @@ fn claude_code_field_rules_by_provider_class() {
         ),
         (
             json!({"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"c","name":"lookup","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"c","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}}]}]}]}),
-            "image",
+            "tool_result.content.image",
             true,
         ),
         (
@@ -86,10 +86,15 @@ fn claude_code_field_rules_by_provider_class() {
                     field,
                     "cache_control" | "thinking" | "context_management" | "defer_loading"
                 );
-            // Anthropic forwards images. Anthropic forwards structured output
-            // and strict tools; OpenAI-style and Bedrock routes map them to
-            // their own JSON-schema controls. Only local profiles refuse them.
-            let supported = (field == "image" && class == ProviderClass::Anthropic)
+            // Every class carries a user turn's image (a canonical image the
+            // adapter writes in its own wire); a tool result's image only
+            // where a tool result takes one (Anthropic, Bedrock). Anthropic
+            // forwards structured output and strict tools; OpenAI-style and
+            // Bedrock routes map them to their own JSON-schema controls.
+            // Only local profiles refuse them.
+            let supported = field == "image"
+                || (field == "tool_result.content.image"
+                    && matches!(class, ProviderClass::Anthropic | ProviderClass::Bedrock))
                 || (matches!(field, "output_config.format" | "strict")
                     && class != ProviderClass::Local);
             if bedrock_refuses || (always_refuse && !supported) {
@@ -990,4 +995,115 @@ fn a_translated_refusal_renders_without_an_empty_text_block() {
     };
     let value = super::batch_response("msg_x", "m", &response).unwrap();
     assert_eq!(value["content"], json!([{"type":"text","text":""}]));
+}
+
+/// A Messages image block becomes the canonical image Chat and Responses
+/// images are (one validator, one set of adapters), in wire order, in the
+/// user turn or tool result that held it; the native envelope keeps each
+/// image's place with a placeholder, not a copy of its bytes.
+#[test]
+fn image_blocks_become_canonical_images_and_the_native_envelope_holds_placeholders() {
+    use crate::inference::types::Part;
+    let png = |k: u8| {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .encode([0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', k])
+    };
+    let image = |k: u8| json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":png(k)}});
+    let r = request(json!({"messages":[
+        {"role":"user","content":[{"type":"text","text":"compare"}, image(0), {"type":"text","text":"with"}, image(1)]},
+        {"role":"assistant","content":[{"type":"tool_use","id":"c","name":"lookup","input":{}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"c","content":[{"type":"text","text":"shot"}, image(2)]}, image(3)]}
+    ]}))
+    .unwrap();
+    let data: Vec<String> = crate::providers::image_body::images(&r)
+        .map(|i| i.base64().to_owned())
+        .collect();
+    assert_eq!(data, [png(0), png(1), png(2), png(3)]);
+    let kinds = |m: &Message| match &m.content {
+        Some(Content::Parts(parts)) => parts
+            .iter()
+            .map(|p| match p {
+                Part::Text(t) => t.clone(),
+                Part::Image(_) => "<image>".into(),
+            })
+            .collect::<Vec<_>>(),
+        Some(Content::Text(t)) => vec![t.clone()],
+        None => vec![],
+    };
+    assert_eq!(
+        kinds(&r.messages[0]),
+        ["compare", "<image>", "with", "<image>"]
+    );
+    let tool = r.messages.iter().find(|m| m.role == Role::Tool).unwrap();
+    assert_eq!(kinds(tool), ["shot", "<image>"]);
+    // The native envelope: every image's data is the placeholder of its
+    // place, never its bytes.
+    let native =
+        serde_json::to_string(&r.messages_options.as_ref().unwrap().native_messages).unwrap();
+    for (k, data) in data.iter().enumerate() {
+        assert!(!native.contains(data.as_str()), "image {k}");
+        assert!(
+            native.contains(&crate::providers::image_body::placeholder(k)),
+            "image {k}"
+        );
+    }
+    // An image in an assistant turn is native Anthropic's alone: every
+    // translated class refuses it, naming it.
+    let assistant = request(json!({"messages":[{"role":"user","content":"look"},{"role":"assistant","content":[image(0)]}]})).unwrap();
+    assert!(crate::providers::messages::validate(&assistant, ProviderClass::Anthropic).is_ok());
+    for class in [
+        ProviderClass::OpenAi,
+        ProviderClass::Bedrock,
+        ProviderClass::Local,
+    ] {
+        assert_eq!(
+            crate::providers::messages::validate(&assistant, class),
+            Err(InferenceError::InvalidField("messages.content.image"))
+        );
+    }
+    // A twenty-first image and a declared type the bytes do not match are
+    // refused.
+    for messages in [
+        json!([{"role":"user","content":(0..21).map(|k| image(k as u8)).collect::<Vec<_>>()}]),
+        json!([{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":png(0)}}]}]),
+    ] {
+        assert!(request(json!({"messages":messages})).is_err(), "{messages}");
+    }
+}
+
+/// The native envelope's placeholders follow the order of the canonical
+/// images the body is spliced from, wherever the parser moves an image (a
+/// tool result's content becomes its own message): the spliced envelope is
+/// the wire's messages, each image back in its own place.
+#[test]
+fn the_spliced_native_envelope_is_the_wire_with_every_image_in_its_place() {
+    let png = |k: u8| {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .encode([0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', k, k, k])
+    };
+    let image = |k: u8| json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":png(k)}});
+    let text = |t: &str| json!({"type":"text","text":t});
+    let messages = json!([
+        {"role":"user","content":[text("start"), image(0)]},
+        {"role":"assistant","content":[text("drawn"), image(1),
+            {"type":"tool_use","id":"a","name":"shoot","input":{}},
+            {"type":"tool_use","id":"b","name":"shoot","input":{}}]},
+        {"role":"user","content":[
+            text("look"),
+            image(2),
+            {"type":"tool_result","tool_use_id":"a","content":[image(3)]},
+            image(4),
+            {"type":"tool_result","tool_use_id":"b","content":[text("second"), image(5)]},
+            text("and"),
+            image(6)]},
+        {"role":"assistant","content":[text("seen")]},
+        {"role":"user","content":[image(7), text("last")]}
+    ]);
+    let r = request(json!({ "messages": messages })).unwrap();
+    assert_eq!(crate::providers::image_body::images(&r).count(), 8);
+    let native = Value::Array(r.messages_options.as_ref().unwrap().native_messages.clone());
+    let spliced = crate::providers::image_body::json_body_base64(&native, &r).unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&spliced).unwrap(), messages);
 }
