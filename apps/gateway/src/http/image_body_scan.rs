@@ -34,7 +34,8 @@ pub(super) struct Scan {
     /// The body's length less the raw lengths of at most [`MAX_IMAGES`] of
     /// its longest string literals that are image data.
     pub outside: usize,
-    /// The structure the body may parse into beyond its own bytes.
+    /// What the body may parse into beyond its own bytes (both parts of
+    /// `json_weight::Weight`).
     pub structure: usize,
 }
 
@@ -103,7 +104,7 @@ fn scan(body: &[u8], data_values: bool) -> Scan {
     });
     Scan {
         outside: body.len() - longest.iter().sum::<usize>(),
-        structure,
+        structure: structure.total(),
     }
 }
 

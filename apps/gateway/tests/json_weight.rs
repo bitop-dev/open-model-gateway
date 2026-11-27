@@ -10,7 +10,7 @@ use std::{
     cell::Cell,
 };
 
-use open_model_gateway::inference::json_weight::estimate;
+use open_model_gateway::inference::json_weight::{estimate, weight};
 use proptest::prelude::*;
 use serde_json::{Value, json};
 
@@ -222,6 +222,16 @@ fn the_estimate_covers_hostile_shapes() {
         shown(&"字".repeat(1 << 19)),
         shown(&"x".repeat(1 << 20)),
     ]);
+    // Large open values inside a request, which a batch line converts from
+    // its tree into the request while the tree is held.
+    bodies.extend([
+        format!(r#"{{"tool_choice":[{}]}}"#, vec!["0"; 65_537].join(",")),
+        format!(r#"{{"input":[{}]}}"#, vec![r#"{"a":0}"#; 20_000].join(",")),
+        format!(
+            r#"{{"input":[{}],"tool_choice":[[0]]}}"#,
+            vec!["[0]"; 40_000].join(",")
+        ),
+    ]);
     // Long numbers (with `float_roundtrip`, which dev-dependencies enable,
     // their digits go through the same scratch buffer).
     bodies.extend([
@@ -240,6 +250,7 @@ fn the_estimate_covers_hostile_shapes() {
     for body in bodies {
         holds(body.as_bytes()).unwrap();
         holds_typed(body.as_bytes()).unwrap();
+        holds_line(body.as_bytes()).unwrap();
     }
 }
 
@@ -253,6 +264,32 @@ struct Request {
     max_tokens: Option<u32>,
     input: Option<Value>,
     tool_choice: Option<Value>,
+}
+
+/// The bound of a batch line (`json_weight::line_within_budget`): parsed
+/// into a `Value`, then converted into its request with the tree still
+/// held, so twice the structure, and the strings part once.
+fn holds_line(body: &[u8]) -> Result<(), String> {
+    LIVE.set(0);
+    PEAK.set(0);
+    ON.set(true);
+    // As `jobs::lines` does: the tree is consumed into the request.
+    let parsed = serde_json::from_slice::<Value>(body)
+        .map(|value| serde_json::from_value::<Request>(value).is_ok());
+    ON.set(false);
+    drop(parsed);
+    let peak = usize::try_from(PEAK.get()).unwrap();
+    let w = weight(body);
+    let bound = body.len() + 2 * w.structure + w.strings;
+    if bound >= peak {
+        Ok(())
+    } else {
+        Err(format!(
+            "line: bound {bound} below the parse's peak {peak} for a body of {} bytes: {}",
+            body.len(),
+            String::from_utf8_lossy(&body[..body.len().min(80)])
+        ))
+    }
 }
 
 /// [`holds`] for a parse into [`Request`] with `serde_json::from_slice`, as
@@ -324,6 +361,7 @@ proptest! {
         }
         prop_assert!(holds(body.as_bytes()).is_ok(), "{}", holds(body.as_bytes()).unwrap_err());
         prop_assert!(holds_typed(body.as_bytes()).is_ok(), "{}", holds_typed(body.as_bytes()).unwrap_err());
+        prop_assert!(holds_line(body.as_bytes()).is_ok(), "{}", holds_line(body.as_bytes()).unwrap_err());
     }
 }
 

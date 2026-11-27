@@ -43,11 +43,11 @@ pub const COPY_FACTOR: usize = 4;
 /// The largest number of copies of any byte of a large body: the text it
 /// may carry beside its images (at most [`TEXT_BODY_BYTES`]) is copied by
 /// the parse, each attempt, the upstream value, its serialization and the
-/// spliced body; and a body refused by its parse can hold, beside itself,
-/// the parser's scratch copy of an escaped image literal (up to twice it)
-/// and an error message that shows it (up to twice it, as the message
-/// grows), about five and a half times that literal (#872). The buffer's
-/// worst case counts every byte at this.
+/// spliced body; and a body refused by its parse can hold, beside itself
+/// (one copy), the parser's scratch copy of an escaped image literal (up to
+/// two) and an error message that shows it (up to three, as the message
+/// grows by doubling): six (#872). The buffer's worst case counts every byte
+/// at this.
 pub const WORST_COPIES: usize = 6;
 /// `Retry-After` of a request refused because the budget is spent.
 pub const BUSY_RETRY_SECONDS: u32 = 1;
@@ -113,7 +113,7 @@ pub const MAX_BODY_BYTES: usize = TEXT_BODY_BYTES
 
 /// The default budget. The buffer is a hard bound on large bodies only: at
 /// [`WORST_COPIES`] copies its worst case with a [`BASELINE_BYTES`] process
-/// (100 + 48 × 5 = 340 MiB) stays within half the chart's 1 GiB memory
+/// (100 + 48 × 6 = 388 MiB) stays within half the chart's 1 GiB memory
 /// limit, leaving the rest for text bodies, which no buffer bounds
 /// (docs/operations.md "Image input memory"; tests/helm-chart.test.mjs).
 pub const DEFAULT_BUFFER_BYTES: usize = 48 * MIB;

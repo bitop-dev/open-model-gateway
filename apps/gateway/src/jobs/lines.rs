@@ -186,8 +186,7 @@ pub(crate) struct InputLine {
 /// planning and again when it runs, its work line then also holding the
 /// gateway's plan (`allowance`).
 fn within_budget(raw: &[u8], allowance: usize) -> Result<(), LineError> {
-    use crate::inference::json_weight::{BUDGET, estimate};
-    if estimate(raw) <= BUDGET + allowance {
+    if crate::inference::json_weight::line_within_budget(raw, allowance) {
         Ok(())
     } else {
         crate::metrics::METRICS.json_structure_refused("batch_line");
@@ -645,5 +644,13 @@ mod tests {
         let mut text = chat();
         text["body"]["messages"][0]["content"] = json!("x".repeat(3 * 1024 * 1024));
         assert!(parse_line(&line(text), BatchEndpoint::ChatCompletions).is_ok());
+        // A long string with escapes: its scratch and message copies are
+        // bounded by the line's own 4 MiB, not compared with the budget.
+        let mut escaped = chat();
+        escaped["body"]["messages"][0]["content"] = json!("line\n".repeat(600 * 1024));
+        let escaped = line(escaped);
+        assert!(escaped.len() > 3 * 1024 * 1024 && escaped.len() < BATCH_MAX_LINE_BYTES);
+        assert!(!crate::inference::json_weight::within_budget(&escaped));
+        assert!(parse_line(&escaped, BatchEndpoint::ChatCompletions).is_ok());
     }
 }

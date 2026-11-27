@@ -44,13 +44,16 @@
 /// 16 MiB, eight times the shared 2 MiB body limit, beyond the body's own
 /// bytes. Measured (#872) with these constants: 2 MiB of real Claude Code
 /// conversation history (32.6 MiB of it, nine sessions over 200 KB)
-/// estimates at 3.5 MiB on average and 4.8 MiB for the densest session.
+/// estimates at about 3.5 MiB on average and 4.9 MiB for the densest session (its strings part 0.2 MiB: its longest string is 32 KiB).
 /// Tool definitions are denser: with five properties each, those with an
 /// 80-character description per property reach the budget at about 1.5 MiB,
 /// those with 20 characters at about 1 MiB, and bare schemas of ten
 /// properties at about 0.7 MiB. A refused legitimate request costs more than
 /// the memory the budget allows, so it is set above the densest real
-/// requests, not the average. Revisit it with the same measurement
+/// requests, not the average. Text an error message shows escaped is
+/// charged at that length (combining marks, as in fully vocalized Arabic,
+/// about eight times), so one such string over about 1.9 MiB is refused.
+/// Revisit it with the same measurement
 /// (`docs/operations.md`, "Request body structure").
 pub const BUDGET: usize = 16 * 1024 * 1024;
 
@@ -66,6 +69,23 @@ const SCRATCH_MIN: usize = 64;
 /// expected: a type, or the names of a type's fields).
 const MESSAGE_MIN: usize = 4096;
 
+/// A body's estimate in two parts: its `structure` (values, keys, objects
+/// and arrays), and its `strings`: the parser's scratch copy of its longest
+/// string with an escape or number and a refused body's error message,
+/// which hold one string each and so are at most about five times the
+/// body's own length, whatever its structure.
+#[derive(Clone, Copy)]
+pub struct Weight {
+    pub structure: usize,
+    pub strings: usize,
+}
+impl Weight {
+    /// Both parts: what the parse may allocate beyond the body's bytes.
+    pub fn total(self) -> usize {
+        self.structure.saturating_add(self.strings)
+    }
+}
+
 /// A string literal the walk passed, for a caller that reads them (the image
 /// scan): `start..end` is its content between the quotes, and `key` is true
 /// when a `:` follows it.
@@ -80,7 +100,7 @@ pub(crate) struct Literal {
 /// `on_string` returns true is image data the image input buffer accounts
 /// for (`inference::image_buffer`, its copies counted there, the parser's
 /// scratch copy of it included), so its scratch is not charged here.
-pub(crate) fn walk(body: &[u8], mut on_string: impl FnMut(&Literal) -> bool) -> usize {
+pub(crate) fn walk(body: &[u8], mut on_string: impl FnMut(&Literal) -> bool) -> Weight {
     let mut tokens = 0usize;
     let mut containers = 0usize;
     let mut longest_scratch = 0usize;
@@ -152,16 +172,18 @@ pub(crate) fn walk(body: &[u8], mut on_string: impl FnMut(&Literal) -> bool) -> 
             }
         }
     }
-    tokens
-        .saturating_mul(TOKEN)
-        .saturating_add(containers)
-        .saturating_add(longest_scratch.saturating_mul(2))
-        .saturating_add(if longest_scratch > 0 { SCRATCH_MIN } else { 0 })
-        // A refused body's error message, which holds one of its strings
-        // shown for display, in a message that grows by doubling (each step
-        // holds the old and the new buffer: up to three times its length).
-        .saturating_add(longest_shown.saturating_mul(3))
-        .saturating_add(MESSAGE_MIN)
+    Weight {
+        structure: tokens.saturating_mul(TOKEN).saturating_add(containers),
+        strings: longest_scratch
+            .saturating_mul(2)
+            .saturating_add(if longest_scratch > 0 { SCRATCH_MIN } else { 0 })
+            // A refused body's error message, which holds one of its
+            // strings shown for display, in a message that grows by
+            // doubling (each step holds the old and the new buffer: up to
+            // three times its length).
+            .saturating_add(longest_shown.saturating_mul(3))
+            .saturating_add(MESSAGE_MIN),
+    }
 }
 
 /// The most bytes a string literal's decoded text takes when an error
@@ -238,14 +260,31 @@ fn utf8_width(lead: u8) -> usize {
     }
 }
 
-/// The structure estimate of `body` ([`walk`] without a reader).
+/// The estimate of `body` ([`walk`] without a reader), both parts.
 pub fn estimate(body: &[u8]) -> usize {
+    weight(body).total()
+}
+
+/// The two parts of `body`'s estimate.
+pub fn weight(body: &[u8]) -> Weight {
     walk(body, |_| false)
 }
 
-/// Whether `body` may be parsed: its structure estimate is within [`BUDGET`].
+/// Whether `body` may be parsed: its estimate is within [`BUDGET`].
 pub fn within_budget(body: &[u8]) -> bool {
     estimate(body) <= BUDGET
+}
+
+/// Whether a batch line may be parsed: twice its structure within
+/// [`BUDGET`] and `allowance`. A line is parsed into a tree and then
+/// converted into its request (`jobs::lines`), the tree still held while the
+/// request is built: two structures at once. Its strings part is not
+/// compared: it is at most about five times the line, which
+/// `BATCH_MAX_LINE_BYTES` bounds (4 MiB), and lines are parsed one at a
+/// time, so a line holding one long escaped string (an image written with
+/// `\/`) is not refused for it.
+pub fn line_within_budget(line: &[u8], allowance: usize) -> bool {
+    weight(line).structure.saturating_mul(2) <= BUDGET.saturating_add(allowance)
 }
 
 /// What the gateway's own plan adds to a batch work line: one object of a
