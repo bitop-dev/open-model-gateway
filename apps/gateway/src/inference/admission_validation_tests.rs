@@ -147,6 +147,46 @@ pub(crate) async fn start_gateway(f: &Fixture, registry: ProviderRegistry) -> (S
     serve(app).await
 }
 
+/// How long a test that reads routing health after a request waits for the
+/// request's observation (`Engine::with_health_write_bound`); a write still
+/// running after this is a failure of its own.
+pub(crate) const AWAITED_HEALTH_WRITE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// [`start_gateway`] for a test that reads routing health once a reply has
+/// ended: each request ends only after its health observation committed.
+pub(crate) async fn start_gateway_awaiting_health(
+    f: &Fixture,
+    registry: ProviderRegistry,
+) -> (String, Server) {
+    let engine = Engine::new(Arc::new(f.store.clone()), registry, EngineLimits::default())
+        .unwrap()
+        .with_health_write_bound(AWAITED_HEALTH_WRITE);
+    let app = crate::http::router_with_engine(f.store.clone(), None, engine);
+    serve(app).await
+}
+
+/// Makes the first routing-health insert of the test database take `ms`
+/// milliseconds on the server (a trigger, once per database): a health write
+/// slower than its advisory bound (`ExecutionGuard::finish`), as on a loaded
+/// host.
+pub(crate) async fn slow_first_health_write(pool: &sqlx::PgPool, ms: u32) {
+    sqlx::raw_sql(&format!(
+        "CREATE SEQUENCE slow_health_once;
+         CREATE FUNCTION slow_health_once() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+          IF nextval('slow_health_once') = 1 THEN
+           PERFORM pg_sleep({ms}::double precision / 1000);
+          END IF;
+          RETURN NEW;
+         END $$;
+         CREATE TRIGGER slow_health_once BEFORE INSERT ON deployment_health
+          FOR EACH ROW EXECUTE FUNCTION slow_health_once();"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 fn strict_tool_body(model: &str, stream: bool) -> Value {
     json!({
         "model": model,

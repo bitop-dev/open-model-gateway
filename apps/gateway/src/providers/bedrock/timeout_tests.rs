@@ -117,7 +117,9 @@ impl TimedMock {
         output
     }
     async fn cancelled(&mut self) {
-        tokio::time::timeout(Duration::from_secs(2), &mut self.dropped)
+        // A guard of its own: the close is awaited as an event, at whatever
+        // deadline the test set.
+        tokio::time::timeout(Duration::from_secs(10), &mut self.dropped)
             .await
             .expect("dropping the receiver closes the upstream body")
             .unwrap();

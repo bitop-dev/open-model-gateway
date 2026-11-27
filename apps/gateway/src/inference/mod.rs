@@ -116,7 +116,17 @@ pub struct Engine {
     /// gateway-run batch lines: their batch was accepted with a bounded line
     /// count, and a clean line never fails because others were refused).
     per_key_bound: bool,
+    /// How long a request waits for its routing-health observation
+    /// ([`HEALTH_WRITE_BOUND`]; only tests change it).
+    health_write_bound: Duration,
 }
+
+/// The routing-health observation of an attempt is advisory: its request
+/// waits for it at most this long, so a slow database never delays a reply.
+/// A write that took longer is abandoned by the request; a statement already
+/// on the server may still commit after the reply, and one not yet sent never
+/// happens.
+const HEALTH_WRITE_BOUND: Duration = Duration::from_millis(250);
 
 impl Engine {
     /// How long a half-open route's probe slot is held at most: the
@@ -184,6 +194,7 @@ impl Engine {
             recorder: None,
             counts: Arc::new(count::Counts::new(limits.count_concurrency)),
             per_key_bound: true,
+            health_write_bound: HEALTH_WRITE_BOUND,
         })
     }
 
@@ -224,7 +235,19 @@ impl Engine {
             recorder: None,
             counts: self.counts.clone(),
             per_key_bound: false,
+            health_write_bound: self.health_write_bound,
         }
+    }
+
+    /// A test that reads a route's health right after a request ended makes
+    /// the request wait this long for its observation instead of
+    /// [`HEALTH_WRITE_BOUND`]: the request (a stream: its end) then finishes
+    /// only after the observation committed, so the test reads the event
+    /// itself rather than racing the advisory bound on a loaded host.
+    #[cfg(all(test, feature = "integration-tests"))]
+    pub(crate) fn with_health_write_bound(mut self, bound: Duration) -> Self {
+        self.health_write_bound = bound;
+        self
     }
 
     pub async fn execute(
@@ -520,6 +543,8 @@ struct ExecutionGuard {
     telemetry: AttemptTelemetry,
     finished: bool,
     health_observation: bool,
+    /// How long `finish` waits for the routing-health observation.
+    health_write_bound: Duration,
     /// The epoch of the half-open route's probe slot this attempt holds
     /// (`routing::claim_probe`); `None` once freed or when it holds none.
     probe: Option<i64>,
@@ -559,6 +584,7 @@ impl ExecutionGuard {
             telemetry: AttemptTelemetry::default(),
             finished: false,
             health_observation: true,
+            health_write_bound: HEALTH_WRITE_BOUND,
             probe: None,
             probe_closing: None,
             _permit: permit,
@@ -645,7 +671,7 @@ impl ExecutionGuard {
         };
         if self.health_observation
             && outcome != Outcome::Cancelled
-            && !matches!(timeout(Duration::from_millis(250), write).await, Ok(Ok(())))
+            && !matches!(timeout(self.health_write_bound, write).await, Ok(Ok(())))
         {
             tracing::warn!(execution_id=%self.id, trace_id = self.log_trace_id.as_ref().map(LogTraceId::as_str), "routing health update failed");
         }

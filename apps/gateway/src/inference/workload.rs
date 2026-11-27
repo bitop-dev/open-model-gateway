@@ -519,6 +519,7 @@ impl Engine {
                 None,
             );
             guard.probe = probe.and_then(super::ProbeTicket::into_epoch);
+            guard.health_write_bound = self.health_write_bound;
             let evidence_ok =
                 |u: Usage| valid_usage(u) && (!input_only || u.output_tokens == Some(0));
             // As for generation (`attempt::call_upstream`): the dispatch scope

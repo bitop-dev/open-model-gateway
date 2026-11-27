@@ -400,9 +400,26 @@ async fn run_case(pool: PgPool, case: Case) {
             );
         })
     });
+    // Serial lines on one route slot: a line must give its slot back when it
+    // ends, not when its results are published. A line that held the slot
+    // until its segment flushed would make the next line wait for the
+    // segment's age, and one released late would make the next dispatch pass
+    // wait for the runner's poll. Both are set far beyond `SERIAL_DRAIN`, so
+    // either wait fails the drain below however fast the host is, and the
+    // lines' own work (seconds on a loaded runner) never does.
+    let group = matches!(case, Case::Group);
+    if group {
+        w.jobs.segment_age = Some(SERIAL_TIMERS);
+    }
     let started = std::time::Instant::now();
     let mut process = crash.then(|| start_process(&w, dir.path(), &upstream));
-    let old = (!crash).then(|| start(&w));
+    let old = (!crash).then(|| {
+        let mut runner = Runner::new(w.jobs.clone());
+        if group {
+            runner.poll = SERIAL_TIMERS;
+        }
+        tokio::spawn(async move { runner.run_next().await })
+    });
     if let Case::FinalizeCancel { cancel_first } = case {
         tokio::time::timeout(Duration::from_secs(20), w.jobs.finalize_hold.reached())
             .await
@@ -557,13 +574,13 @@ async fn run_case(pool: PgPool, case: Case) {
             }
             hold.rollback().await.unwrap();
         }
-        let limit = if matches!(case, Case::Measure(_)) {
-            300
-        } else {
-            9
+        let limit = match case {
+            Case::Measure(_) => Duration::from_secs(300),
+            Case::Group => SERIAL_DRAIN,
+            _ => Duration::from_secs(9),
         };
         assert!(
-            tokio::time::timeout(Duration::from_secs(limit), old.unwrap())
+            tokio::time::timeout(limit, old.unwrap())
                 .await
                 .expect("one-slot dispatch should drain")
                 .unwrap()
@@ -810,6 +827,12 @@ async fn crash_after(pool: PgPool) {
 async fn takeover_after(pool: PgPool) {
     run_case(pool, Case::Fault(Boundary::AfterCommit, Loss::Takeover)).await;
 }
+/// How long [`serial_results`]' 32 lines on one slot may take: their own work
+/// takes seconds even on a loaded runner. Its segment age and runner poll
+/// ([`SERIAL_TIMERS`]) are far longer, so a line that waits for either fails.
+const SERIAL_DRAIN: Duration = Duration::from_secs(60);
+const SERIAL_TIMERS: Duration = Duration::from_secs(120);
+
 #[sqlx::test(migrations = "./enterprise_migrations")]
 async fn serial_results(pool: PgPool) {
     run_case(pool, Case::Group).await;
