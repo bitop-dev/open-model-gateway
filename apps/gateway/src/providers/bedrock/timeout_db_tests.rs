@@ -272,8 +272,8 @@ async fn engine_deadline_shorter_than_old_cap_is_neutral(pool: PgPool) {
 }
 #[dbtest::test]
 async fn engine_deadline_longer_than_old_cap_is_neutral(pool: PgPool) {
-    // The read and total caps (200 and 450 ms) end well before the deadline.
-    assert!(TOTAL < UNPOLLED_DEADLINE);
+    // The transport's read and total caps both end before the deadline.
+    assert!(READ < TOTAL && TOTAL < UNPOLLED_DEADLINE);
     deadline(pool, timeouts()).await;
 }
 
