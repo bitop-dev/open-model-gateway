@@ -24,6 +24,7 @@ test("a schedule is created, paused, resumed, read by the auditor and deleted", 
   const operator = await signIn(browser, "operator");
   const { page } = operator;
   let id: string | undefined;
+  let failed = false;
   try {
     await page.goto("/admin/access-reviews");
     await page.getByRole("button", { name: "New schedule" }).click();
@@ -88,11 +89,18 @@ test("a schedule is created, paused, resumed, read by the auditor and deleted", 
     await expect(row).toHaveCount(0);
     expect((await api(page, "GET", `/platform/access-review-schedules/${id}`)).status()).toBe(404);
     id = undefined;
+  } catch (error) {
+    failed = true;
+    throw error;
   } finally {
-    // Only removes what a failed step left behind, and never replaces that step's error: a
-    // schedule the dialog already deleted answers 404, and that is the outcome wanted here.
+    // Only removes what a failed step left behind. A schedule the dialog already deleted answers
+    // 404, the outcome wanted here. Any other cleanup failure is the test's error only when no
+    // step failed; after a failed step it is reported beside that step's error, never instead.
     try {
       if (id) expect([200, 404]).toContain((await api(page, "DELETE", `/platform/access-review-schedules/${id}`)).status());
+    } catch (cleanup) {
+      if (!failed) throw cleanup;
+      test.info().annotations.push({ type: "cleanup failed", description: String(cleanup) });
     } finally { await operator.context.close(); }
   }
 });
