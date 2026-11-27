@@ -49,3 +49,4 @@ jobs/schedule.rs :: impl Scheduler::record_signal :: warn :: deployment_id=%depl
 jobs/video.rs :: impl Jobs::create_video :: error :: execution_id=%request_id
 jobs/video.rs :: impl Jobs::create_video :: error :: execution_id=%request_id
 protocols/realtime.rs :: handle :: error :: -
+providers/anthropic.rs :: encode_within :: error :: -

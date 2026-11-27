@@ -419,6 +419,8 @@ fn encode_within(
     // The native definitions take their schemas from the canonical tools,
     // one for one: a request where the two differ is not encoded.
     if native_tools > 0 && native_tools != request.tools.len() {
+        // Only a change to the request after it was normalized can do this.
+        tracing::error!("native and canonical tool definitions differ in count");
         return Err(InferenceError::InvalidRequest);
     }
     if native_tools == 0 {
