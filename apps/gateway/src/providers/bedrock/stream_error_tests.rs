@@ -5,6 +5,11 @@
 //! stream is returned); what the exception type decides is the class: the
 //! terminal error each client protocol sees, the recorded execution, the
 //! reservation, and the routing health observation.
+//!
+//! Each case reads routing health right after its reply ended, so its
+//! gateway waits for each request's health observation to commit before the
+//! reply ends (`start_gateway_awaiting_health`), instead of the 250 ms
+//! advisory bound a loaded host can exceed.
 use std::sync::{Arc, Mutex};
 
 use axum::{Router, body::Body, http::Response, http::Uri};
@@ -17,7 +22,8 @@ use crate::{
     billing::v3::Meter,
     governance::tests::db::{Fixture, fixture},
     inference::admission_validation_tests::{
-        add_deployment, add_unpriced_deployment, issue_key, serve, start_gateway,
+        add_deployment, add_unpriced_deployment, issue_key, serve, slow_first_health_write,
+        start_gateway_awaiting_health,
     },
     providers::{ProviderRegistry, bedrock::BedrockAdapter},
 };
@@ -139,7 +145,7 @@ async fn gateway(pool: PgPool, free: bool, frames: Vec<u8>) -> Gateway {
     registry
         .register(Arc::new(BedrockAdapter::for_test(&upstream)))
         .unwrap();
-    let (base, server) = start_gateway(&f, registry).await;
+    let (base, server) = start_gateway_awaiting_health(&f, registry).await;
     Gateway {
         f,
         deployment,
@@ -225,6 +231,40 @@ fn frames_of(kind: &str, shape: Shape) -> Vec<u8> {
     frames
 }
 
+/// A health write slower than its advisory bound still counts for its own
+/// request: the stream ends only once the write has landed, so the next
+/// request's reset (and read) never precedes it.
+#[dbtest::test]
+async fn a_slow_health_write_counts_for_its_own_request(pool: PgPool) {
+    slow_first_health_write(&pool, 400).await;
+    let mut g = gateway(pool, false, Vec::new()).await;
+    let (upstream, _upstream) = serve(mock(frames_of(
+        "serviceUnavailableException",
+        Shape::BeforeContent,
+    )))
+    .await;
+    let mut registry = ProviderRegistry::default();
+    registry
+        .register(Arc::new(BedrockAdapter::for_test(&upstream)))
+        .unwrap();
+    let (base, _server) = start_gateway_awaiting_health(&g.f, registry).await;
+    g.base = base;
+    let mut counted = Vec::new();
+    for messages in [false, true] {
+        sqlx::query("DELETE FROM deployment_health")
+            .execute(&g.f.store.pool)
+            .await
+            .unwrap();
+        let (_, request, _) = stream(&g.base, &g.token, messages).await;
+        counted.push(
+            recorded(&g.f.store.pool, g.deployment, request)
+                .await
+                .health_failures,
+        );
+    }
+    assert_eq!(counted, [1, 1], "each request counts its own failure once");
+}
+
 /// Every exception type, each protocol, each place in the stream: the 200
 /// response ends in the type's own error, the execution failed, the
 /// reservation is `unknown` with nothing settled, usage the stream did not
@@ -283,7 +323,7 @@ async fn matrix(pool: PgPool, free: bool) {
             registry
                 .register(Arc::new(BedrockAdapter::for_test(&upstream)))
                 .unwrap();
-            let (base, _server) = start_gateway(&g.f, registry).await;
+            let (base, _server) = start_gateway_awaiting_health(&g.f, registry).await;
             g.base = base;
             for messages in [false, true] {
                 sqlx::query("DELETE FROM deployment_health")
@@ -433,7 +473,7 @@ async fn a_failed_stream_is_never_failed_over(pool: PgPool) {
             registry
                 .register(Arc::new(BedrockAdapter::for_test(&upstream)))
                 .unwrap();
-            let (base, _gateway) = start_gateway(&f, registry).await;
+            let (base, _gateway) = start_gateway_awaiting_health(&f, registry).await;
             let before: i64 = sqlx::query_scalar("SELECT count(*) FROM inference_executions")
                 .fetch_one(&f.store.pool)
                 .await
@@ -536,7 +576,7 @@ async fn any_adapters_in_stream_rejection_on_a_free_price_stays_unknown(pool: Pg
                     as_stream,
                 }))
                 .unwrap();
-            let (base, _gateway) = start_gateway(&f, registry).await;
+            let (base, _gateway) = start_gateway_awaiting_health(&f, registry).await;
             let (_, request, _) = stream(&base, &token, false).await;
             let got = recorded(&f.store.pool, deployment, request).await;
             // Known zero only for a rejection before any stream.
@@ -598,7 +638,7 @@ async fn scripted(pool: PgPool) -> Scripted {
     registry
         .register(Arc::new(BedrockAdapter::for_test(&upstream)))
         .unwrap();
-    let (base, server) = start_gateway(&f, registry).await;
+    let (base, server) = start_gateway_awaiting_health(&f, registry).await;
     Scripted {
         f,
         deployment,
@@ -941,7 +981,7 @@ async fn a_stream_that_breaks_in_transport_is_never_failed_over(pool: PgPool) {
             registry
                 .register(Arc::new(BedrockAdapter::for_test(&upstream)))
                 .unwrap();
-            let (base, _gateway) = start_gateway(&f, registry).await;
+            let (base, _gateway) = start_gateway_awaiting_health(&f, registry).await;
             let before: i64 = sqlx::query_scalar("SELECT count(*) FROM inference_executions")
                 .fetch_one(&f.store.pool)
                 .await

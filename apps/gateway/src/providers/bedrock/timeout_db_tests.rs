@@ -4,7 +4,9 @@ use crate::{
     governance::tests::db::{Fixture, fixture},
     inference::{
         Engine, EngineLimits,
-        admission_validation_tests::{add_deployment, issue_key, serve},
+        admission_validation_tests::{
+            AWAITED_HEALTH_WRITE, add_deployment, issue_key, serve, slow_first_health_write,
+        },
     },
     providers::ProviderRegistry,
 };
@@ -63,7 +65,9 @@ async fn world_with_timeouts(
             ..EngineLimits::default()
         },
     )
-    .unwrap();
+    .unwrap()
+    // Each test reads routing health once its request ended.
+    .with_health_write_bound(AWAITED_HEALTH_WRITE);
     World {
         f,
         deployment,
@@ -200,6 +204,18 @@ async fn paused_engine_reader_beyond_both_timers_records_success(pool: PgPool) {
     first(&mut output).await;
     tokio::time::sleep(PAUSE).await;
     w.mock.gate.notify_one();
+    done(&mut output).await;
+    w.recorded(id, "succeeded", None, Some(0)).await;
+}
+
+/// A success whose health write is slower than its advisory bound is still
+/// recorded by the time its stream has ended.
+#[dbtest::test]
+async fn a_slow_success_health_write_is_recorded_when_the_stream_ends(pool: PgPool) {
+    slow_first_health_write(&pool, 400).await;
+    let w = world(pool, Script::Healthy, Duration::from_secs(5)).await;
+    let id = Uuid::now_v7();
+    let mut output = w.stream(id).await;
     done(&mut output).await;
     w.recorded(id, "succeeded", None, Some(0)).await;
 }
