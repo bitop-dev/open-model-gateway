@@ -72,6 +72,106 @@ fn the_kind_table_matches_the_migration() {
     }
 }
 
+/// `text` holds `value` as a `kind` finding (among others it may hold).
+#[track_caller]
+fn holds(kind: Kind, text: &str, value: &str) {
+    assert!(
+        found(text).contains(&(kind, value.to_owned())),
+        "{kind:?} {value:?} in {text:?}: {:?}",
+        found(text)
+    );
+}
+
+#[test]
+fn the_dashboard_says_what_each_kind_matches_in_the_same_words() {
+    let ts = include_str!("../../../web/src/lib/guardrails.ts");
+    for d in KINDS {
+        assert!(
+            ts.contains(&format!("\"{}\"", d.matches)),
+            "{:?}: {}",
+            d.kind,
+            d.matches
+        );
+    }
+}
+
+#[test]
+fn values_next_to_other_text_are_still_found() {
+    holds(
+        Kind::Card,
+        "4111 1111 1111 1111 12/27",
+        "4111 1111 1111 1111",
+    );
+    holds(Kind::Card, "4242 4242 4242 4242 123", "4242 4242 4242 4242");
+    holds(Kind::Card, "4111111111111111 12/27", "4111111111111111");
+    holds(Kind::Card, "2 4111 1111 1111 1111", "4111 1111 1111 1111");
+    holds(
+        Kind::Phone,
+        "+44 20 7946 0958. 3 people",
+        "+44 20 7946 0958",
+    );
+    holds(Kind::Phone, "call 1-415-555-2671", "1-415-555-2671");
+    holds(Kind::Phone, "or 1.415.555.2671", "1.415.555.2671");
+    holds(
+        Kind::Iban,
+        "BE68 5390 0754 7034 SWIFT",
+        "BE68 5390 0754 7034",
+    );
+    holds(
+        Kind::Iban,
+        "ES91 2100 0418 4502 0005 1332 BIC CAIXESBBXXX",
+        "ES91 2100 0418 4502 0005 1332",
+    );
+    holds(
+        Kind::Iban,
+        "de89 3704 0044 0532 0130 00",
+        "de89 3704 0044 0532 0130 00",
+    );
+    holds(Kind::Ip, "ip:8.8.8.8", "8.8.8.8");
+    holds(Kind::Ip, "X-Forwarded-For:8.8.4.4", "8.8.4.4");
+    holds(Kind::Ip, "client ::ffff:8.8.8.8 connected", "8.8.8.8");
+    holds(
+        Kind::Ip,
+        "2001:4860:4860::8888: down",
+        "2001:4860:4860::8888",
+    );
+    holds(
+        Kind::Email,
+        "andré.dupont@gmail.com",
+        "andré.dupont@gmail.com",
+    );
+    holds(
+        Kind::Email,
+        "write to alice@acme.com: now",
+        "alice@acme.com",
+    );
+}
+
+#[test]
+fn one_kind_never_hides_or_crowds_out_another() {
+    // A value two kinds match counts for both.
+    holds(Kind::Card, "4111111111111111@pay.io", "4111111111111111");
+    holds(
+        Kind::Email,
+        "4111111111111111@pay.io",
+        "4111111111111111@pay.io",
+    );
+    // Each kind has its own cap: a request full of one kind's values still
+    // has the other kinds' found.
+    let text = format!(
+        "{}4111 1111 1111 1111",
+        "x@acme.io ".repeat(MAX_FINDINGS + 5)
+    );
+    let mut input = Inspection::default();
+    input.push(&text, Part::Content);
+    let f = findings(&input);
+    assert_eq!(f.distinct_kind(&input, Kind::Card), 1);
+    assert_eq!(
+        f.0.iter().filter(|x| x.kind == Some(Kind::Email)).count(),
+        MAX_FINDINGS
+    );
+}
+
 #[test]
 fn emails() {
     hit(Kind::Email, "alice.smith@acme-corp.io");
@@ -201,6 +301,8 @@ fn ips_are_public_addresses_only() {
         "fd00::1",
         "ff02::1",
         "2001:db8::1",
+        "3fff::1",
+        "3fff:0fff::1",
         "2002:c000:0204::1",
         "v8.8.8.8",
         "8.8.8.8.5",

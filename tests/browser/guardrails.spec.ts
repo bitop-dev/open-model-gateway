@@ -179,7 +179,7 @@ test("a workspace rule blocks a request and the admin pages show the layers", as
     const boxes = pd.getByRole("checkbox", { name: /^(Email|Phone|Payment card|IBAN|US SSN|IP address):/ });
     await expect(boxes).toHaveCount(6);
     for (const box of await boxes.all()) await expect(box).not.toBeChecked();
-    await expect(pd.getByText(/Public IP addresses only/)).toBeVisible();
+    await expect(pd.getByText(/Public IP addresses .*only: never loopback/)).toBeVisible();
     await pd.getByRole("checkbox", { name: /^Payment card:/ }).check();
     await pd.getByRole("combobox", { name: "On input" }).selectOption("block");
     await pd.getByRole("button", { name: "Add rule" }).click();

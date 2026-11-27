@@ -357,6 +357,8 @@ describe("Personal data (#841)", () => {
   const personal: StoredRule = { ...secrets, id: "r-pd", name: "Personal data", protection: "personal_data", detector: { kind: "pattern", categories: ["personal_data"], kinds: ["email", "ip"], pattern_count: 0, egress: "local" }, input: { action: "block", redact_scope: "user_text" }, on_error: "fail_closed" };
   it("says which kinds a rule looks for, and sends them back", () => {
     expect(inspectionSentence(personal)).toContain("Looks for personal data: email addresses and public IP addresses in the input");
+    // A rule written through the API with another category too says both.
+    expect(inspectionSentence({ ...personal, detector: { ...personal.detector, categories: ["personal_data", "secret"] } })).toContain("personal data: email addresses and public IP addresses and secrets (keys");
     expect(toInput(personal)).toMatchObject({ protection: "personal_data", detector: { kind: "pattern", categories: ["personal_data"], kinds: ["email", "ip"] } });
   });
   it("adds a personal-data rule with only the kinds ticked, none to begin with", async () => {
@@ -368,7 +370,7 @@ describe("Personal data (#841)", () => {
     const boxes = screen.getAllByRole("checkbox").filter(b => /^(Email|Phone|Payment card|IBAN|US SSN|IP address):/.test(b.getAttribute("aria-label") ?? b.closest("label")?.textContent ?? ""));
     expect(boxes).toHaveLength(6);
     expect(boxes.every(b => !(b as HTMLInputElement).checked)).toBe(true);
-    expect(screen.getByText(/Public IP addresses only/)).toBeTruthy();
+    expect(screen.getByText(/Public IP addresses .*only: never loopback/)).toBeTruthy();
     // Nothing ticked: nothing to look for, so the dialog refuses.
     await user.click(screen.getByRole("button", { name: "Add rule" }));
     expect(writes(fetch)).toHaveLength(0);

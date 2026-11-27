@@ -78,7 +78,10 @@ export function inspectionSentence(e: Partial<StoredRule>): string {
   const count = e.detector?.pattern_count ?? e.detector?.patterns?.length ?? 0, looks = looksFor(e);
   const secrets = "secrets (keys, tokens, private keys, connection strings)", custom = `matches of ${count === 1 ? "1 custom pattern" : `${count} custom patterns`}`;
   const personal = `personal data: ${list((e.detector?.kinds ?? []).map(k => kindNouns[k]))}`;
-  const what = looks === "personal" ? personal : looks === "both" ? `${secrets} and ${custom}` : looks === "custom" ? custom : secrets;
+  // Every category the rule checks (a rule written through the API may have several).
+  const cats = e.detector?.categories ?? [];
+  const parts = cats.length ? [...(cats.includes("personal_data") ? [personal] : []), ...(cats.includes("secret") ? [secrets] : []), ...(cats.includes("custom") ? [custom] : [])] : [];
+  const what = parts.length ? list(parts) : looks === "personal" ? personal : looks === "both" ? `${secrets} and ${custom}` : looks === "custom" ? custom : secrets;
   const where = list((e.workloads ?? ["generation", "embeddings"]).map(w => workloadLabels[w]?.toLowerCase() ?? w.replace(/_/g, " ")));
   const how = e.input?.action === "block" ? "and refuses a request that has one" : e.input?.action === "monitor" ? "and records what it finds; the request goes on" : "";
   const unreadable = e.input?.action === "block" ? " It also refuses a request it can't read (one with an image, audio or a document that isn't plain text), and a native batch when it is created." : "";
@@ -107,12 +110,12 @@ export const looksForLabels: Record<LooksFor, string> = { secrets: "Secrets", cu
 export const kindNouns: Record<Kind, string> = { email: "email addresses", phone: "phone numbers", card: "payment card numbers", iban: "IBANs", us_ssn: "US Social Security numbers", ip: "public IP addresses" };
 export const personalKindLabels: Record<Kind, string> = { email: "Email", phone: "Phone", card: "Payment card", iban: "IBAN", us_ssn: "US SSN", ip: "IP address" };
 export const kindMatches: Record<Kind, string> = {
-  email: "Email addresses, except at reserved example domains (example.com, .test, .invalid, .localhost).",
-  phone: "Phone numbers in international form (+ and 8 to 15 digits) or North American form with separators; fictional 555-01xx numbers excepted.",
-  card: "Payment card numbers of the major networks, whole or in groups, with a valid check digit.",
-  iban: "Bank account numbers (IBAN) with their country's length and a valid check.",
-  us_ssn: "US Social Security numbers written with dashes or spaces, within the issued ranges. Other countries' identifiers are not built in: use a custom pattern.",
-  ip: "Public IP addresses only: never loopback, private, link-local, multicast, reserved or documentation addresses.",
+  email: "Email addresses, except at reserved example domains (example.com, .test, .invalid, .localhost) and SSH remotes (git@host:repo).",
+  phone: "Phone numbers in international form (+ and 8 to 15 digits) or North American form with separators ((415) 555-2671, 415-555-2671, 1-415-555-2671); fictional 555-01xx numbers excepted.",
+  card: "Payment card numbers of the major networks: 13 to 19 digits, whole or in groups, with a valid check digit (Luhn).",
+  iban: "International bank account numbers (IBAN), in either case, with the length of their country and a valid check (mod 97).",
+  us_ssn: "US Social Security numbers written with dashes or spaces (123-45-6789), within the issued ranges. Other countries' identifiers are not built in: use a custom pattern.",
+  ip: "Public IP addresses (IPv4, IPv6 and IPv4 written as IPv6) only: never loopback, private, link-local, shared, multicast, reserved or documentation addresses.",
 };
 
 const present = <T,>(key: string, value: T | null | undefined) => value === null || value === undefined ? {} : { [key]: value };

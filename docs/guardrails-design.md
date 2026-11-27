@@ -483,14 +483,16 @@ A `personal_data` rule names its kinds (migration 0098: `guardrail_rules.kinds`,
 
 | Kind | Matches | Never matches |
 | --- | --- | --- |
-| `email` | `local@domain.tld`, local part without leading, trailing or doubled dots | the reserved example domains (`example.com`/`.net`/`.org`, `.example`, `.test`, `.invalid`, `.localhost`); an SSH remote (`git@host:repo`) |
-| `phone` | `+` and 8 to 15 digits with single separators and at most one parenthesised group; North American `(415) 555-2671`, `415-555-2671` with one kind of separator | bare digit runs; the fictional `555-0100`–`555-0199` |
+| `email` | `local@domain.tld`; the local part may hold any letter (`andré.dupont@…`), without leading, trailing or doubled dots; the domain is ASCII | the reserved example domains (`example.com`/`.net`/`.org`, `.example`, `.test`, `.invalid`, `.localhost`); an SSH remote (`git@host:repo`) |
+| `phone` | `+` and 8 to 15 digits with single separators and at most one parenthesised group; North American `(415) 555-2671`, `415-555-2671`, `1-415-555-2671` with one kind of separator | bare digit runs; the fictional `555-0100`–`555-0199` |
 | `card` | 13 to 19 digits, whole or in groups (4-4-4-4…, 4-6-5, 4-6-4) with one separator, a major network's issuer prefix at a length it issues, and a valid Luhn digit | mixed separators, other groupings, numbers inside longer ones |
-| `iban` | country code, check digits, the country's registry length, groups of four when spaced, mod 97 = 1 | unknown countries, wrong lengths or checks |
+| `iban` | country code, check digits, the country's registry length, groups of four when spaced, mod 97 = 1, in either case | unknown countries, wrong lengths or checks |
 | `us_ssn` | `AAA-GG-SSSS` or with spaces (one separator), area not 000, 666 or 900–999, group not 00, serial not 0000 | nine bare digits; the voided advertised samples (`078-05-1120`, `219-09-9999`) |
-| `ip` | globally routable IPv4 and IPv6 (2000::/3) addresses, a port or prefix length may follow | loopback, private (RFC 1918, unique local), link-local, shared (100.64/10), benchmarking, multicast, broadcast, reserved, 6to4, IETF and documentation ranges (192.0.2/24, 198.51.100/24, 203.0.113/24, 2001:db8::/32); versions (`v1.2.3.4`, `1.2.3.4.5`, `1.2.3.4-rc1`) |
+| `ip` | globally routable IPv4 and IPv6 (2000::/3) addresses, also IPv4 written as IPv6 (`::ffff:8.8.8.8`); a label (`ip:`), a port or a prefix length may touch it | loopback, private (RFC 1918, unique local), link-local, shared (100.64/10), benchmarking, multicast, broadcast, reserved, 6to4, IETF and documentation ranges (192.0.2/24, 198.51.100/24, 203.0.113/24, 2001:db8::/32, 3fff::/20); versions (`v1.2.3.4`, `1.2.3.4.5`, `1.2.3.4-rc1`) |
 
-A match stands alone: no letter, digit or joining character touches it on either side, so a value inside an identifier, a hash or a longer number is not one. Other countries' national identifiers are not built in; a custom pattern covers them.
+A match stands alone: no letter, digit or joining character touches it on either side, so a value inside an identifier, a hash or a longer number is not one. A candidate that fails is tried again on its shorter whole parts, so a card followed by its expiry or security code, an IBAN followed by a word or a phone number followed by punctuation is still found. Each kind is scanned on its own and keeps at most 10,000 matches of its own, so a request full of one kind's values never hides another kind's; a value two kinds match (`4111111111111111@pay.io`) counts for both. A personal-data rule records one decision per kind it found.
+
+What the detector does not do: it reads text as sent, without normalizing it, so full-width or other non-ASCII digits, zero-width characters, a line break inside a number, percent- or base64-encoded values and a value split across two messages are not found (parts of one message are read joined). Other countries' national identifiers are not built in; a custom pattern covers them.
 
 **False positives** (`personal_tests.rs`; per 10,000 items on the seeded, deterministic corpora, where the bounds are asserted):
 
@@ -503,7 +505,9 @@ A match stands alone: no letter, digit or joining character touches it on either
 | numeric text (timestamps, ISO dates, versions, amounts, ports, file:line, status lines) | 16,000 | 0 | 0 | 0 | 0 | 0 | 0 |
 | random digit runs of 13–19 digits | 10,000 | 0 | 0 | 118 | 0 | 0 | 0 |
 
-The bound is 0 everywhere except cards among random digit runs (200 per 10,000): an issuer prefix at an issued length with a valid check digit occurs by chance in about one random run in eighty-five. This repository's own text is measured and reported, never bounded (an address added to a doc must not fail a build); per MB: `apps/gateway/src` (13.9 MB) email 0.4, phone 0.6, card 0.3, iban 0.2, us_ssn 0.2, ip 12.5, all of them real public addresses in the egress tests or the tests' own synthetic values; `apps/web/src` (3.5 MB) email 0.8, nothing else; `docs` (2.3 MB) ip 5.7, nothing else.
+The bound is 0 everywhere except cards among random digit runs (200 per 10,000): an issuer prefix at an issued length with a valid check digit occurs by chance in about one random run in eighty-five. This repository's own text is measured and reported, never bounded (an address added to a doc must not fail a build); per MB: `apps/gateway/src` (13.9 MB) email 1.2, phone 1.1, card 1.4, iban 0.7, us_ssn 0.2, ip 11.2, nearly all of them the tests' own synthetic values and the egress tests' public addresses; `apps/web/src` (3.5 MB) email 0.8, phone 0.8, us_ssn 0.3; `docs` (2.3 MB) email 0.4, phone 0.9, ip 2.6.
+
+**Cost.** The kinds run on the `regex` crate (linear time); lengths are checked by the validators, because counted repetitions of Unicode classes would make the automaton fall back to a slower engine. In a release build, scanning a request for every kind costs about 0.1 µs per byte in the worst case measured (2 MB of digit runs, IBAN-like groups or dotted numbers: 26 to 184 ms) and a few milliseconds for ordinary text.
 
 **For coding traffic** (agents' prompts carry git authors, licence headers, addresses and long numbers), start a personal-data rule with Monitor, read its decisions per kind in Logs, then block the kinds that must never leave (card, IBAN, US SSN). The dashboard ticks no kind by default.
 

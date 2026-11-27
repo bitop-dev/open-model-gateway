@@ -25,7 +25,13 @@ ALTER TABLE guardrail_rules
 -- above, never matched text. Set only on personal-data decisions that found
 -- something; null on every other row (and on rows written before this
 -- migration). Logs may show it and the totals may group by it.
-ALTER TABLE guardrail_events
- ADD COLUMN kind text CHECK (kind IN ('email','phone','card','iban','us_ssn','ip')),
- ADD CONSTRAINT guardrail_events_kind CHECK (kind IS NULL OR category = 'personal_data');
+-- The column is added without a default, so no row is rewritten, and its
+-- CHECK is NOT VALID: every row written before this migration has no kind
+-- and so meets it, and a validation would scan every partition of the
+-- decision history under this migration's exclusive lock while decisions
+-- wait to be written. The CHECK holds for every row written from now on.
+ALTER TABLE guardrail_events ADD COLUMN kind text;
+ALTER TABLE guardrail_events ADD CONSTRAINT guardrail_events_kind CHECK (
+ kind IS NULL OR (kind IN ('email','phone','card','iban','us_ssn','ip') AND category = 'personal_data')) NOT VALID;
 COMMENT ON COLUMN guardrail_events.kind IS 'The personal-data kind of a personal_data decision (a fixed label, never matched text); null otherwise.';
+RESET lock_timeout;

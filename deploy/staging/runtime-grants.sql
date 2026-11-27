@@ -241,6 +241,8 @@ GRANT INSERT(id,layer,kind,workspace_id,local_only,updated_by),UPDATE(revision,l
 -- #841 (0098): a personal-data rule's kinds are written with the rule.
 GRANT INSERT(id,rule_set_id,position,tightens_rule_id,name,protection,detector_kind,detector_ref,categories,input_action,redact_scope,output_mode,threshold,on_error,timeout_ms,workloads,uninspectable,patterns,kinds),DELETE ON public.guardrail_rules TO gateway_runtime;
 GRANT EXECUTE ON FUNCTION public.guardrail_patterns_valid(text[]) TO gateway_runtime;
+-- #841 (0098): the kinds CHECK of guardrail_rules runs as the writer.
+GRANT EXECUTE ON FUNCTION public.guardrail_kinds_valid(text[]) TO gateway_runtime;
 -- Guardrail decisions (0095): appended by the engine, read by Logs; never
 -- changed or removed (append-only history, archived by the owner).
 -- #841 (0098): a personal-data decision's kind (a fixed label) is appended with it.
