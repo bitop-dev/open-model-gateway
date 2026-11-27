@@ -268,7 +268,7 @@ impl LineRun {
                 Err(e) if self.rescan_later(e, &mut pin, &mut workers).await => {
                     if let Some(stop) = workers.stopped.take() {
                         return self
-                            .not_run(n, execution, &line.custom_id, stop, &records)
+                            .not_run(n, (execution, attempt), &line.custom_id, stop, &records)
                             .await;
                     }
                 }
@@ -286,6 +286,7 @@ impl LineRun {
                     // attempt is retried after its backoff like a failed one.
                     let cooling = matches!(e, InferenceError::RouteCoolingDown(_)) && pin.is_some();
                     let retryable = cooling || retryable(e);
+                    let reached = reached_provider(e, pin.is_some());
                     if retryable
                         && attempt <= self.job.retry_limit
                         && !self.state.should_stop(&self.job)
@@ -296,7 +297,9 @@ impl LineRun {
                         {
                             Retry::Started(next) => {
                                 attempt += 1;
-                                workers.ran = Some((execution, e));
+                                if reached {
+                                    workers.ran = Some((execution, e));
+                                }
                                 execution = next;
                                 // The dispatch's probe slot was the first
                                 // attempt's; a retry claims its own.
@@ -343,29 +346,53 @@ impl LineRun {
         })
     }
 
-    /// A line its batch stopped while it waited to be inspected again,
-    /// never as a guardrail refusal: one that never ran is reported like the
-    /// lines the stop left unrun; one whose earlier attempt ran is reported
-    /// with that attempt's error, like a line whose retry the stop kept from
-    /// starting.
+    /// A line its batch stopped while its current attempt (`execution`,
+    /// number `attempt`) waited to be inspected again, never as a guardrail
+    /// refusal: one no attempt of which reached a provider is reported like
+    /// the lines the stop left unrun; one whose earlier attempt reached a
+    /// provider is reported with that attempt's execution and error, as a
+    /// retry the stop kept from starting is (`count_retry_failure`).
     async fn not_run(
         &self,
         n: i32,
-        execution: Uuid,
+        (execution, attempt): (Uuid, i16),
         custom_id: &str,
         stopped: Stopped,
         records: &mpsc::Sender<Record>,
     ) {
-        let (status, code, value) = match stopped {
-            Stopped::NeverRan(stop) => (None, stop.code(), lines::not_run_line(custom_id, stop)),
-            Stopped::AfterAttempt(ran, error) => (
-                Some(crate::protocols::batch_line_error(false, error).0),
-                error.code(),
-                lines::failure_line(custom_id, Some(ran), self.endpoint, error),
-            ),
-        };
-        if self.finished_error(n, execution, status, Some(code)).await {
-            self.emit_error(records, n, execution, value).await;
+        match stopped {
+            Stopped::NeverRan(stop) => {
+                if self
+                    .finished_error(n, execution, None, Some(stop.code()))
+                    .await
+                {
+                    let value = lines::not_run_line(custom_id, stop);
+                    self.emit_error(records, n, execution, value).await;
+                }
+            }
+            Stopped::AfterAttempt(ran, error) => {
+                let retry = UndispatchedRetry {
+                    execution,
+                    attempt,
+                    status: crate::protocols::batch_line_error(false, error).0,
+                    code: error.code(),
+                };
+                let counted = self
+                    .state
+                    .fence
+                    .count_retry_failure(&self.store, n, ran, Some(retry))
+                    .await;
+                if self.confirmed(n, ran, counted) {
+                    crate::metrics::METRICS.observe_batch_lines(
+                        "gateway",
+                        &self.job.provider,
+                        0,
+                        1,
+                    );
+                    let value = lines::failure_line(custom_id, Some(ran), self.endpoint, error);
+                    self.emit_error(records, n, ran, value).await;
+                }
+            }
         }
     }
 
@@ -439,7 +466,7 @@ impl LineRun {
         .await;
         // A batch stopped during the wait, or while the line waited for its
         // worker, runs nothing more (cancelled, expired, its budget spent,
-        // lost): the line is reported as not run.
+        // lost): the line ends as `Stopped` says.
         workers.stopped = self
             .state
             .stop_reason(&self.job)
@@ -682,6 +709,18 @@ const GUARDRAIL_RETRY_CAP: u32 = if cfg!(test) { 1 } else { 8 };
 /// Failures a line retries with its ordinary retries (`omg_retries`). A line
 /// nothing could be scanned for, after its free tries, spends them like a
 /// busy scope.
+/// Whether a failed attempt was sent to a provider. A Busy is upstream rate
+/// limiting only for a claimed attempt (`pinned`); a guardrail refusal, a
+/// cooling route and a busy admission scope stop the attempt before anything
+/// is sent.
+fn reached_provider(e: InferenceError, pinned: bool) -> bool {
+    match e {
+        InferenceError::UpstreamUnavailable | InferenceError::Timeout => true,
+        InferenceError::Busy => pinned,
+        _ => false,
+    }
+}
+
 fn retryable(e: InferenceError) -> bool {
     rescan_cause(e) == Some(Rescan::Busy)
         || matches!(
@@ -720,9 +759,11 @@ fn rescan_cause(e: InferenceError) -> Option<Rescan> {
 /// How a line its batch stopped while it waited to be inspected again ends.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Stopped {
-    /// No attempt of it ran: reported like the lines the stop left unrun.
+    /// No attempt of it reached a provider: reported like the lines the
+    /// stop left unrun.
     NeverRan(NotRun),
-    /// An earlier attempt ran (and failed with this error): reported with it.
+    /// An earlier attempt (this execution) reached a provider and failed with
+    /// this error: the line is reported with it.
     AfterAttempt(Uuid, InferenceError),
 }
 
@@ -732,8 +773,8 @@ pub(super) enum Stopped {
 pub(super) struct Workers {
     /// Set when the line's batch stopped while it waited.
     stopped: Option<Stopped>,
-    /// The line's latest attempt that ran, and how it failed (its retry is
-    /// the current attempt).
+    /// The line's latest attempt that reached a provider, and how it failed
+    /// (a later attempt is the current one).
     ran: Option<(Uuid, InferenceError)>,
     busy: u32,
     spent: u32,

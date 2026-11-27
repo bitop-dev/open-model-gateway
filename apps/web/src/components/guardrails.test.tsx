@@ -52,16 +52,20 @@ const view = (patch: Partial<WorkspaceGuardrails> = {}): WorkspaceGuardrails => 
 
 describe("Guardrails: wording and bodies (#840)", () => {
   it("says what each rule inspects, what it does and that text stays inside the gateway", () => {
-    expect(inspectionSentence(secrets)).toBe("Looks for secrets (keys, tokens, private keys, connection strings) in the input of generation and embeddings requests and records what it finds; the request goes on. Checked inside the gateway; nothing is sent anywhere else.");
+    expect(inspectionSentence(secrets)).toBe("Looks for secrets (keys, tokens, private keys, connection strings) in the input of generation and embeddings requests and records what it finds; the request goes on. If it can't check, the request goes on. Checked inside the gateway; nothing is sent anywhere else.");
     expect(inspectionSentence(codes)).toContain("matches of 1 custom pattern");
     expect(inspectionSentence(codes)).toContain("refuses a request that has one");
+    expect(inspectionSentence(codes)).toContain("If it can't check, the request is refused.");
+    expect(inspectionSentence({ ...secrets, input: { action: "off" } })).toBe("Off: checks nothing on input.");
     expect(inspectionSentence({ ...codes, workloads: ["embeddings"], detector: { ...codes.detector, patterns: undefined, pattern_count: 3 } })).toContain("3 custom patterns in the input of embeddings requests");
   });
-  it("sends a stored rule back in the input shape (patterns, never counts or egress)", () => {
-    expect(toInput(codes)).toEqual({ id: "r-codes", name: "Code names", protection: "custom", detector: { kind: "pattern", categories: ["custom"], patterns: ["ACME-[0-9]{4}"] }, input: { action: "block" }, on_error: "fail_closed", workloads: ["generation", "embeddings"] });
+  it("sends a stored entry back with every stored setting (patterns, never counts or egress)", () => {
+    expect(toInput(codes)).toEqual({ id: "r-codes", name: "Code names", protection: "custom", detector: { kind: "pattern", categories: ["custom"], patterns: ["ACME-[0-9]{4}"] }, input: { action: "block", redact_scope: "user_text" }, output: { mode: "off" }, on_error: "fail_closed", workloads: ["generation", "embeddings"], uninspectable: "deny" });
     expect(toInput({ id: "t1", tightens: "r-secrets", input: { action: "block" } })).toEqual({ id: "t1", tightens: "r-secrets", input: { action: "block" } });
+    expect(toInput({ id: "t2", tightens: "r-secrets", output: { mode: "off" }, on_error: "fail_closed" })).toEqual({ id: "t2", tightens: "r-secrets", output: { mode: "off" }, on_error: "fail_closed" });
     expect(ruleInput({ name: " Tickets ", protection: "custom", action: "monitor", patterns: "TICKET-[0-9]+\n\n  JIRA-[A-Z]+ ", workloads: '["generation"]' })).toEqual({ name: "Tickets", protection: "custom", detector: { kind: "pattern", categories: ["custom"], patterns: ["TICKET-[0-9]+", "JIRA-[A-Z]+"] }, input: { action: "monitor" }, workloads: ["generation"] });
-    expect(ruleInput({ name: "Keys", protection: "secrets", action: "block", patterns: "ignored", workloads: '["generation","embeddings"]' }, "r-1")).toEqual({ id: "r-1", name: "Keys", protection: "secrets", detector: { kind: "pattern", categories: ["secret"] }, input: { action: "block" }, workloads: ["generation", "embeddings"] });
+    // An edit starts from the stored rule: what the dialog doesn't show keeps its value.
+    expect(ruleInput({ name: "Keys", protection: "secrets", action: "block", on_error: "fail_open", patterns: "ignored", workloads: '["generation","embeddings"]' }, toInput(secrets))).toEqual({ id: "r-secrets", name: "Keys", protection: "secrets", detector: { kind: "pattern", categories: ["secret"] }, input: { action: "block", redact_scope: "user_text" }, output: { mode: "off" }, on_error: "fail_open", workloads: ["generation", "embeddings"], uninspectable: "deny" });
   });
   it("offers only stricter actions when tightening", () => {
     expect(stricterActions("monitor")).toEqual(["monitor", "block"]);
@@ -96,7 +100,31 @@ describe("Workspace › Settings › Guardrails", () => {
     await user.click(await screen.findByRole("button", { name: "Tighten Secrets" }));
     await user.click(screen.getByRole("button", { name: "Tighten" }));
     await waitFor(() => expect(writes(fetch)).toHaveLength(1));
-    expect(writes(fetch)[0]).toEqual(["PUT", guardrailsPath(team.id), { rules: [toInput(codes), { tightens: "r-secrets", input: { action: "block" } }] }]);
+    // The platform rule lets a request go on when its check can't run: blocking also refuses then, unless switched off.
+    expect(writes(fetch)[0]).toEqual(["PUT", guardrailsPath(team.id), { rules: [toInput(codes), { tightens: "r-secrets", input: { action: "block" }, on_error: "fail_closed" }] }]);
+  });
+  it("tightening again keeps the existing tightening's other settings", async () => {
+    const tightening = { id: "t-1", tightens: "r-secrets", on_error: "fail_closed" as const };
+    const tightened = { ...effective(secrets, "type_default", "set-p"), on_error: "fail_closed" as const, tightened_by: ["t-1"] };
+    const fetch = serve({ [guardrailsPath(team.id)]: () => view({ local: { ...localSet, rules: [codes, tightening] }, effective: [tightened, effective(codes, "workspace_local", "set-l")] }) });
+    const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
+    await user.click(await screen.findByRole("button", { name: "Tighten Secrets" }));
+    // The rule already refuses when it can't check: only the action is offered.
+    expect(screen.queryByLabelText("Refuse the request if the check can't run")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Tighten" }));
+    await waitFor(() => expect(writes(fetch)).toHaveLength(1));
+    expect(writes(fetch)[0]![2].rules).toEqual([toInput(codes), { id: "t-1", tightens: "r-secrets", input: { action: "block" }, on_error: "fail_closed" }]);
+  });
+  it("edits a rule without changing the settings the dialog leaves alone", async () => {
+    const fetch = serve({ [guardrailsPath(team.id)]: () => view() });
+    const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
+    await user.click(await screen.findByRole("button", { name: "Edit Code names" }));
+    expect((screen.getByLabelText("If the check can't run") as HTMLSelectElement).value).toBe("fail_closed");
+    await user.clear(screen.getByLabelText("Name"));
+    await user.type(screen.getByLabelText("Name"), "Project codes");
+    await user.click(screen.getByRole("button", { name: "Save rule" }));
+    await waitFor(() => expect(writes(fetch)).toHaveLength(1));
+    expect(writes(fetch)[0]![2].rules).toEqual([{ ...toInput(codes), name: "Project codes" }]);
   });
   it("adds a custom-pattern rule to the workspace's layer", async () => {
     const fetch = serve({ [guardrailsPath(team.id)]: () => view() });
@@ -129,11 +157,15 @@ describe("Admin › Guardrails", () => {
     expect(write).toContain("Add rule");
   });
   it("shows a workspace's totals and creates an override from the default without its ids", async () => {
-    const fetch = serve({ [platformGuardrailsPath(team.id)]: () => platformView() });
+    const local = { ...localSet, rules: [codes, { id: "t-1", tightens: "r-secrets", input: { action: "block" as const } }] };
+    const fetch = serve({ [platformGuardrailsPath(team.id)]: () => platformView({ local, decisions_this_month: [{ action: "blocked", category: "custom", decisions: 4, findings: 5 }, { action: "detector_failed", category: "custom", decisions: 1, findings: 0 }] }) });
     const user = mount(<WorkspaceGuardrailsAdmin id={team.id} writable />);
     expect(await screen.findByText("Decisions this month")).toBeTruthy();
     expect(screen.getByText("Blocked")).toBeTruthy();
+    expect(screen.getByRole("table", { name: "Guardrail decisions this month" }).textContent).toContain("—");
     await user.click(screen.getByRole("button", { name: "Override the default" }));
+    // A tightening of a default rule stops applying under the override's new rules.
+    expect(screen.getByRole("dialog").textContent).toContain("This workspace's tightening of the default's rules stops applying");
     await user.click(screen.getByRole("button", { name: "Create override" }));
     await waitFor(() => expect(writes(fetch)).toHaveLength(1));
     const { id: _id, ...withoutId } = toInput(secrets);

@@ -13,7 +13,7 @@
  */
 import { api, type Session, type Workspace } from "../lib/api";
 import {
-  detectorsPath, guardrailsPath, inspectedSentence, platformGuardrailsPath, toInput, typeDefaultPath, workloadLabels,
+  detectorsPath, guardrailsPath, inspectedSentence, isTightening, platformGuardrailsPath, toInput, typeDefaultPath, workloadLabels,
   type Detectors, type PlatformWorkspaceGuardrails, type TypeDefault, type WorkspaceGuardrails, type WorkspaceKind,
 } from "../lib/guardrails";
 import { kindLabels } from "../lib/people";
@@ -27,6 +27,8 @@ import s from "./shared.module.css";
 
 const kinds: WorkspaceKind[] = ["team", "project", "personal"];
 const actionNames: Record<string, string> = { monitored: "Monitored", redacted: "Redacted", blocked: "Blocked", stopped: "Stopped", detector_failed: "Could not check", skipped: "Not readable" };
+/** Outcomes that count matched values; the others (could not check, not readable) have no findings. */
+const matching = new Set(["monitored", "redacted", "blocked", "stopped"]);
 const categoryNames: Record<string, string> = { secret: "Secrets", custom: "Custom patterns", personal_data: "Personal data", moderation: "Moderation", prompt_injection: "Prompt injection" };
 
 /** Admin › Settings › Guardrails. */
@@ -85,8 +87,12 @@ export function WorkspaceGuardrailsAdmin({ id, writable }: { id: string; writabl
   if (q.isPending) return <p role="status">Loading guardrails…</p>;
   if (q.isError) return <ErrorNotice error={q.error} retry={() => void q.refetch()} />;
   const g = q.data, override = g.override, localOnly = !!override?.local_only;
-  const create = () => ask({ title: "Override the default for this workspace?", description: `Starts from the ${kindLabels[g.kind].toLowerCase()} default's rules. While it exists, the default no longer applies here.`, submitLabel: "Create override", successNotice: "Override created.", run: (_, signal) => guardrailWrite(() => putPlatformLayer(path, !!g.type_default?.local_only, (g.type_default?.rules ?? []).map(r => { const { id: _id, ...rest } = toInput(r); return rest; }), signal)) });
-  const reset = () => ask({ title: "Reset to the default?", description: `Removes this workspace's override; the ${kindLabels[g.kind].toLowerCase()} default applies again.`, danger: true, submitLabel: "Reset", successNotice: "Default restored.", run: (_, signal) => api(path, { method: "DELETE", signal }) });
+  // A tightening names the platform rule it tightens: the override's rules are
+  // new rules, so tightenings of the rules it replaces stop applying.
+  const tightenings = g.local_visible ? (g.local?.rules ?? []).filter(isTightening).length : null;
+  const dropped = (rules: string) => tightenings === 0 ? "" : ` ${tightenings === null ? `Any tightening this workspace made of the ${rules} stops applying` : `This workspace's ${tightenings === 1 ? "tightening" : `${tightenings} tightenings`} of the ${rules} stop${tightenings === 1 ? "s" : ""} applying`}; it can tighten the rules that replace them.`;
+  const create = () => ask({ title: "Override the default for this workspace?", description: `Starts from a copy of the ${kindLabels[g.kind].toLowerCase()} default's rules. While it exists, the default no longer applies here.${dropped("default's rules")}`, submitLabel: "Create override", successNotice: "Override created.", run: (_, signal) => guardrailWrite(() => putPlatformLayer(path, !!g.type_default?.local_only, (g.type_default?.rules ?? []).map(r => { const { id: _id, ...rest } = toInput(r); return rest; }), signal)) });
+  const reset = () => ask({ title: "Reset to the default?", description: `Removes this workspace's override; the ${kindLabels[g.kind].toLowerCase()} default applies again.${dropped("override's rules")}`, danger: true, submitLabel: "Reset", successNotice: "Default restored.", run: (_, signal) => api(path, { method: "DELETE", signal }) });
   return <Stack gap={6}>
     <Alert tone="info" title="What is checked">{inspectedSentence(g.inspected_workloads)}</Alert>
     {override
@@ -98,7 +104,7 @@ export function WorkspaceGuardrailsAdmin({ id, writable }: { id: string; writabl
     <Card title="Decisions this month" titleAs="h2" description="Counts recorded by the gateway (UTC month). Findings are distinct matched values; no text is kept." flush={g.decisions_this_month.length > 0}>
       {g.decisions_this_month.length === 0 ? <p className={s.note}>No decisions this month.</p> :
         <Table caption="Guardrail decisions this month" columns={["Outcome", "Looked for", { label: "Decisions", numeric: true }, { label: "Findings", numeric: true }]}>{g.decisions_this_month.map(t => <Tr key={`${t.action}:${t.category}`}>
-          <Td>{actionNames[t.action] ?? t.action}</Td><Td>{categoryNames[t.category] ?? t.category}</Td><Td>{t.decisions}</Td><Td>{t.findings}</Td>
+          <Td>{actionNames[t.action] ?? t.action}</Td><Td>{categoryNames[t.category] ?? t.category}</Td><Td>{t.decisions}</Td><Td>{matching.has(t.action) ? t.findings : "—"}</Td>
         </Tr>)}</Table>}
     </Card>
   </Stack>;

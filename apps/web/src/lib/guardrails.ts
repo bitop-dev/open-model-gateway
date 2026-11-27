@@ -71,33 +71,47 @@ const list = (items: string[]) => items.length <= 1 ? items.join("") : `${items.
  * anywhere else.
  */
 export function inspectionSentence(e: Partial<StoredRule>): string {
+  if (e.input?.action === "off") return "Off: checks nothing on input.";
   const count = e.detector?.pattern_count ?? e.detector?.patterns?.length ?? 0;
   const what = e.protection === "custom" ? `matches of ${count === 1 ? "1 custom pattern" : `${count} custom patterns`}` : "secrets (keys, tokens, private keys, connection strings)";
   const where = list((e.workloads ?? ["generation", "embeddings"]).map(w => workloadLabels[w]?.toLowerCase() ?? w.replace(/_/g, " ")));
   const how = e.input?.action === "block" ? "and refuses a request that has one" : e.input?.action === "monitor" ? "and records what it finds; the request goes on" : "";
   const egress = e.detector?.egress && e.detector.egress !== "local" ? "Text is sent out of the gateway to be checked." : "Checked inside the gateway; nothing is sent anywhere else.";
-  return `Looks for ${what} in the input of ${where} requests${how ? ` ${how}` : ""}. ${egress}`;
+  const failure = e.on_error === "fail_closed" ? " If it can't check, the request is refused." : e.on_error === "fail_open" ? " If it can't check, the request goes on." : "";
+  return `Looks for ${what} in the input of ${where} requests${how ? ` ${how}` : ""}.${failure} ${egress}`;
 }
 export const inspectedSentence = (workloads: Workload[]) => `Guardrails check the input of ${list(workloads.map(w => workloadLabels[w]?.toLowerCase() ?? w))} requests (also token counts and gateway-run batch lines). Other workloads are not checked yet, and response text is never checked in this release.`;
 
-/** The PUT body entry of a stored entry: the layer is replaced whole, so every entry is sent again. */
+const present = <T,>(key: string, value: T | null | undefined) => value === null || value === undefined ? {} : { [key]: value };
+/**
+ * The PUT body entry of a stored entry. The layer is replaced whole, so every
+ * entry is sent again with every setting the server returned: a field left
+ * out would take its default (an `on_error` its action's), not its stored
+ * value.
+ */
 export function toInput(e: Entry): Record<string, unknown> {
-  if (isTightening(e)) return { id: e.id, tightens: e.tightens, ...(e.input?.action ? { input: { action: e.input.action } } : {}), ...(e.on_error ? { on_error: e.on_error } : {}) };
+  if (isTightening(e)) return { id: e.id, tightens: e.tightens, ...(e.input?.action ? { input: { action: e.input.action } } : {}), ...present("output", e.output), ...present("on_error", e.on_error), ...present("threshold", e.threshold) };
   const rule = e as StoredRule;
   return {
     id: rule.id, name: rule.name, protection: rule.protection,
     detector: { kind: rule.detector.kind, categories: rule.detector.categories, ...(rule.detector.patterns?.length ? { patterns: rule.detector.patterns } : {}) },
-    input: { action: rule.input.action }, ...(rule.on_error ? { on_error: rule.on_error } : {}), ...(rule.workloads ? { workloads: rule.workloads } : {}),
+    input: { action: rule.input.action, ...present("redact_scope", rule.input.redact_scope) }, ...present("output", rule.output), ...present("on_error", rule.on_error), ...present("workloads", rule.workloads),
+    ...present("uninspectable", rule.uninspectable), ...present("threshold", rule.threshold), ...present("timeout_ms", rule.timeout_ms),
   };
 }
-/** A new rule's PUT entry from the rule dialog's values. */
-export function ruleInput(v: Record<string, string | undefined>, id?: string): Record<string, unknown> {
+/**
+ * A rule's PUT entry from the rule dialog's values. Editing starts from the
+ * stored rule (`base`, from `toInput`), so the settings the dialog does not
+ * show keep their stored values.
+ */
+export function ruleInput(v: Record<string, string | undefined>, base?: Record<string, unknown>): Record<string, unknown> {
   const custom = v.protection === "custom", patterns = (v.patterns ?? "").split("\n").map(p => p.trim()).filter(Boolean);
   const workloads = v.workloads ? parseCheckboxValues(v.workloads) : [];
+  const { on_error: _stored, ...kept } = base ?? {};
   return {
-    ...(id ? { id } : {}), name: (v.name ?? "").trim(), protection: custom ? "custom" : "secrets",
+    ...kept, name: (v.name ?? "").trim(), protection: custom ? "custom" : "secrets",
     detector: { kind: "pattern", categories: [custom ? "custom" : "secret"], ...(custom ? { patterns } : {}) },
-    input: { action: v.action }, ...(workloads.length ? { workloads } : {}),
+    input: { ...(base?.input as object | undefined), action: v.action }, ...(v.on_error ? { on_error: v.on_error } : {}), ...(workloads.length ? { workloads } : {}),
   };
 }
 /** Plain messages for the reasons a guardrail write is refused. */

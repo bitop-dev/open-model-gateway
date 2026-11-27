@@ -637,6 +637,12 @@ async fn a_stopped_retry_of_a_line_that_ran_is_reported_with_its_attempt(pool: P
     .fetch_one(&f.store.pool)
     .await
     .unwrap();
+    let recorded: Uuid = sqlx::query_scalar("SELECT execution_id FROM batch_lines WHERE job_id=$1")
+        .bind(job.id)
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(recorded, first, "the line names the attempt that failed");
     let job = w.reload(&job).await;
     let errors = w.read(f.principal.workspace_id, job.error_file_id).await;
     assert_eq!(errors.len(), 1, "{errors:?}");
@@ -646,4 +652,44 @@ async fn a_stopped_retry_of_a_line_that_ran_is_reported_with_its_attempt(pool: P
         text.contains(&first.simple().to_string()) || text.contains(&first.to_string()),
         "{text}"
     );
+}
+
+/// A line none of whose attempts reached a provider (no scan slot through its
+/// free tries, then again on its ordinary retry) is reported as not run when
+/// its batch stops while the retry waits: nothing was sent.
+#[dbtest::test]
+async fn a_stopped_retry_of_a_line_that_never_reached_a_provider_is_not_run(pool: PgPool) {
+    let w = world_with(pool, false, false, 1, None).await;
+    let f = &w.f;
+    custom_rule(f).await;
+    let file = w
+        .upload(&f.principal, &[chat_line("a", "company/smart", "hello")])
+        .await;
+    let job = w
+        .create(
+            f.principal,
+            &file,
+            BatchEndpoint::ChatCompletions,
+            Some(json!({"omg_retries":"1"})),
+        )
+        .await
+        .unwrap();
+    let slots = &crate::guardrails::limits::SHARED_SCANS;
+    let mut held = Vec::new();
+    for _ in 0..crate::guardrails::limits::SHARE {
+        held.push(slots.acquire(f.principal.workspace_id).await.unwrap());
+    }
+    // Two free tries and the refusal that ends them, then the retry's first
+    // try: the batch is cancelled there.
+    crate::jobs::runner::tests_stop::cancel_at(job.id, 4);
+    let _ = Runner::new(w.jobs.clone()).run_next().await;
+    drop(held);
+    assert!(w.openai.executed().is_empty(), "nothing was sent");
+    let line: (String, Option<String>, i16) =
+        sqlx::query_as("SELECT state,error_code,attempts FROM batch_lines WHERE job_id=$1")
+            .bind(job.id)
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(line, ("failed".into(), Some("batch_cancelled".into()), 2));
 }
