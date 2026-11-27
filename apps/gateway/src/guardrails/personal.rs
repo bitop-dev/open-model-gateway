@@ -501,21 +501,21 @@ fn card(v: &str) -> bool {
     issued(&digits) && luhn(digits.as_bytes())
 }
 
-/// IBAN lengths by country (the SWIFT IBAN registry).
-#[rustfmt::skip]
-const IBAN_LENGTHS: &[(&str, usize)] = &[
-    ("AD", 24), ("AE", 23), ("AL", 28), ("AT", 20), ("AZ", 28), ("BA", 20), ("BE", 16), ("BG", 22),
-    ("BH", 22), ("BI", 27), ("BR", 29), ("BY", 28), ("CH", 21), ("CR", 22), ("CY", 28), ("CZ", 24),
-    ("DE", 22), ("DJ", 27), ("DK", 18), ("DO", 28), ("EE", 20), ("EG", 29), ("ES", 24), ("FI", 18),
-    ("FK", 18), ("FO", 18), ("FR", 27), ("GB", 22), ("GE", 22), ("GI", 23), ("GL", 18), ("GR", 27),
-    ("GT", 28), ("HR", 21), ("HU", 28), ("IE", 22), ("IL", 23), ("IQ", 23), ("IS", 26), ("IT", 27),
-    ("JO", 30), ("KW", 30), ("KZ", 20), ("LB", 28), ("LC", 32), ("LI", 21), ("LT", 20), ("LU", 20),
-    ("LV", 21), ("LY", 25), ("MC", 27), ("MD", 24), ("ME", 22), ("MK", 19), ("MN", 20), ("MR", 27),
-    ("MT", 31), ("MU", 30), ("NI", 28), ("NL", 18), ("NO", 15), ("OM", 23), ("PK", 24), ("PL", 28),
-    ("PS", 29), ("PT", 25), ("QA", 29), ("RO", 24), ("RS", 22), ("RU", 33), ("SA", 24), ("SC", 31),
-    ("SD", 18), ("SE", 24), ("SI", 19), ("SK", 24), ("SM", 27), ("SO", 23), ("ST", 25), ("SV", 28),
-    ("TL", 23), ("TN", 24), ("TR", 26), ("UA", 29), ("VA", 22), ("VG", 24), ("XK", 20), ("YE", 30),
-];
+/// IBAN lengths by country (the SWIFT IBAN registry), as data: a country
+/// code and its length, space-separated.
+const IBAN_REGISTRY: &str = "AD24 AE23 AL28 AT20 AZ28 BA20 BE16 BG22 BH22 BI27 BR29 BY28 CH21 CR22 \
+     CY28 CZ24 DE22 DJ27 DK18 DO28 EE20 EG29 ES24 FI18 FK18 FO18 FR27 GB22 \
+     GE22 GI23 GL18 GR27 GT28 HR21 HU28 IE22 IL23 IQ23 IS26 IT27 JO30 KW30 \
+     KZ20 LB28 LC32 LI21 LT20 LU20 LV21 LY25 MC27 MD24 ME22 MK19 MN20 MR27 \
+     MT31 MU30 NI28 NL18 NO15 OM23 PK24 PL28 PS29 PT25 QA29 RO24 RS22 RU33 \
+     SA24 SC31 SD18 SE24 SI19 SK24 SM27 SO23 ST25 SV28 TL23 TN24 TR26 UA29 \
+     VA22 VG24 XK20 YE30";
+static IBAN_LENGTHS: LazyLock<Vec<(&'static str, usize)>> = LazyLock::new(|| {
+    IBAN_REGISTRY
+        .split_whitespace()
+        .map(|e| (&e[..2], e[2..].parse().expect("an IBAN length")))
+        .collect()
+});
 fn iban(v: &str) -> bool {
     let compact: String = v
         .chars()

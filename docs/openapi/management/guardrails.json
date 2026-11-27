@@ -555,6 +555,7 @@
               "items": {
                 "enum": [
                   "secret",
+                  "personal_data",
                   "custom"
                 ]
               },
@@ -588,7 +589,6 @@
                   "ip"
                 ]
               },
-              "maxItems": 6,
               "type": "array",
               "uniqueItems": true
             }
@@ -659,6 +659,7 @@
         "protection": {
           "enum": [
             "secrets",
+            "personal_data",
             "custom"
           ]
         },
@@ -809,8 +810,7 @@
             ],
             "type": "object"
           },
-          "type": "array",
-          "x-omg-may-be-empty": "No guardrail decision this month."
+          "type": "array"
         },
         "effective": {
           "anyOf": [
@@ -2375,8 +2375,7 @@
             ],
             "type": "object"
           },
-          "type": "array",
-          "x-omg-may-be-empty": "No guardrail decision this month."
+          "type": "array"
         },
         "effective": {
           "anyOf": [
@@ -5028,8 +5027,7 @@
             ],
             "type": "object"
           },
-          "type": "array",
-          "x-omg-may-be-empty": "No guardrail decision this month."
+          "type": "array"
         },
         "effective": {
           "anyOf": [
