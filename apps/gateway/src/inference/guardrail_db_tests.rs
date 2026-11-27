@@ -80,7 +80,11 @@ pub(super) async fn world_on(pool: PgPool, protocols: &str, provider: &str) -> W
     .execute(&f.store.pool)
     .await
     .unwrap();
-    add_deployment(&f, provider, "env:NOT_RESOLVED", None, "gpt-test", 1).await;
+    let (credential, region) = match provider {
+        "bedrock" => ("aws:default", Some("us-east-1")),
+        _ => ("env:NOT_RESOLVED", None),
+    };
+    add_deployment(&f, provider, credential, region, "gpt-test", 1).await;
     let hits = Arc::new(AtomicUsize::new(0));
     let (upstream, up) = serve(mock(hits.clone())).await;
     let mut registry = ProviderRegistry::default();
@@ -90,6 +94,12 @@ pub(super) async fn world_on(pool: PgPool, protocols: &str, provider: &str) -> W
                 Arc::new(Resolver),
                 format!("{upstream}/v1"),
             )))
+            .unwrap();
+    } else if provider == "bedrock" {
+        registry
+            .register(Arc::new(
+                crate::providers::bedrock::BedrockAdapter::for_test(&upstream),
+            ))
             .unwrap();
     } else {
         registry
@@ -470,6 +480,55 @@ async fn an_image_is_refused_by_a_blocking_rule_and_the_text_beside_it_is_read(p
     .await
     .unwrap();
     assert_eq!(skipped, 2);
+}
+
+#[dbtest::test]
+async fn an_image_is_refused_by_a_blocking_rule_on_an_anthropic_route(pool: PgPool) {
+    blocking_rule_with_an_image_on(pool, "anthropic").await;
+}
+
+#[dbtest::test]
+async fn an_image_is_refused_by_a_blocking_rule_on_a_bedrock_route(pool: PgPool) {
+    blocking_rule_with_an_image_on(pool, "bedrock").await;
+}
+
+/// On the routes that carry images to Anthropic and Bedrock, as on OpenAI:
+/// a blocking rule refuses a Chat Completions request with an image
+/// (`guardrail_not_supported`) with nothing admitted or sent, and a secret
+/// in the text beside the image is still found.
+async fn blocking_rule_with_an_image_on(pool: PgPool, provider: &str) {
+    let w = world_on(pool, "'chat_completions'", provider).await;
+    images_on(&w).await;
+    type_default(&w, "block", "{secret}", &[]).await;
+    let before = snapshot(&w.f.store.pool).await;
+    let (status, _, body) =
+        send(&w, "/v1/chat/completions", chat_with_image("what is this?")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{provider}: {body}");
+    assert_eq!(
+        body["error"]["code"], "guardrail_not_supported",
+        "{provider}"
+    );
+    let (status, _, body) = send(
+        &w,
+        "/v1/chat/completions",
+        chat_with_image(&format!("deploy with {}", secret())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{provider}: {body}");
+    assert_eq!(
+        body["error"]["code"], "guardrail_input_blocked",
+        "{provider}"
+    );
+    assert!(
+        !body.to_string().contains("iVBOR"),
+        "the image is never echoed"
+    );
+    assert_eq!(w.hits.load(Ordering::SeqCst), 0, "{provider}: nothing sent");
+    assert_eq!(
+        snapshot(&w.f.store.pool).await,
+        before,
+        "{provider}: nothing admitted"
+    );
 }
 
 /// Under a rule that does not block, an image passes and the rule records
