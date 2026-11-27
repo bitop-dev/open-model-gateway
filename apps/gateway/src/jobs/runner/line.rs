@@ -4,6 +4,12 @@ use super::*;
 use crate::jobs::{fence::UndispatchedRetry, schedule::claims::RetryClaim};
 use gateway_datetime_compat::UtcInstant;
 
+mod workers;
+use workers::Stopped;
+pub(super) use workers::Workers;
+#[cfg(all(test, feature = "integration-tests"))]
+pub(crate) use workers::tests_stop;
+
 /// Why a batch stopped dispatching.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Stop {
@@ -449,7 +455,7 @@ impl LineRun {
             Some(Rescan::Spent) => (&mut workers.spent, SPENT_TRIES),
             None => return false,
         };
-        #[cfg(test)]
+        #[cfg(all(test, feature = "integration-tests"))]
         if tests_stop::now(self.job.id) {
             self.state.cancel.store(true, Ordering::SeqCst);
         }
@@ -764,100 +770,6 @@ fn rescan_cause(e: InferenceError) -> Option<Rescan> {
             ..
         }) => Some(if scanned { Rescan::Spent } else { Rescan::Busy }),
         _ => None,
-    }
-}
-
-/// How a line its batch stopped while it waited to be inspected again ends.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum Stopped {
-    /// No attempt of it was admitted (`LineRun::admitted`): reported like
-    /// the lines the stop left unrun.
-    NeverRan(NotRun),
-    /// An earlier attempt (this execution) was admitted and failed with this
-    /// error: the line is reported with it.
-    AfterAttempt(Uuid, InferenceError),
-}
-
-/// A line's per-batch and process worker permits (the process permit given
-/// back while the line waits to be inspected again), and how often it waited
-/// for each cause.
-pub(super) struct Workers {
-    /// Set when the line's batch stopped while it waited.
-    stopped: Option<Stopped>,
-    /// The line's latest admitted attempt, and how it failed (a later
-    /// attempt is the current one).
-    ran: Option<(Uuid, InferenceError)>,
-    busy: u32,
-    spent: u32,
-    _batch: tokio::sync::OwnedSemaphorePermit,
-    process: Option<tokio::sync::OwnedSemaphorePermit>,
-    pool: Arc<tokio::sync::Semaphore>,
-}
-impl Workers {
-    pub(super) fn new(
-        (batch, process): (
-            tokio::sync::OwnedSemaphorePermit,
-            tokio::sync::OwnedSemaphorePermit,
-        ),
-    ) -> Self {
-        Self {
-            stopped: None,
-            ran: None,
-            busy: 0,
-            spent: 0,
-            _batch: batch,
-            pool: Arc::clone(process.semaphore()),
-            process: Some(process),
-        }
-    }
-    /// How a line its batch stopped (`stop`) while it waited is reported.
-    fn stopped_by(&self, stop: Stop) -> Stopped {
-        match self.ran {
-            Some((ran, error)) => Stopped::AfterAttempt(ran, error),
-            None => Stopped::NeverRan(NotRun::from(stop)),
-        }
-    }
-    /// Whether a spent budget would be tried again.
-    fn spent_left(&self) -> bool {
-        self.spent < SPENT_TRIES
-    }
-    /// The process permit again; `false` if the pool closed.
-    async fn reacquire(&mut self) -> bool {
-        match Arc::clone(&self.pool).acquire_owned().await {
-            Ok(permit) => {
-                self.process = Some(permit);
-                true
-            }
-            Err(_) => false,
-        }
-    }
-}
-
-/// Tests: cancel a batch at a line's Nth guardrail wait (a cancel reaches a
-/// running batch only through its lease renewal, too late for a test).
-#[cfg(test)]
-pub(crate) mod tests_stop {
-    use std::collections::HashMap;
-    use std::sync::{LazyLock, Mutex};
-    use uuid::Uuid;
-    static AT: LazyLock<Mutex<HashMap<Uuid, u32>>> = LazyLock::new(Default::default);
-    /// Cancel batch `job` at its `nth` wait (1-based).
-    pub(crate) fn cancel_at(job: Uuid, nth: u32) {
-        AT.lock().unwrap().insert(job, nth);
-    }
-    pub(super) fn now(job: Uuid) -> bool {
-        let mut at = AT.lock().unwrap();
-        match at.get_mut(&job) {
-            Some(n) if *n > 1 => {
-                *n -= 1;
-                false
-            }
-            Some(_) => {
-                at.remove(&job);
-                true
-            }
-            None => false,
-        }
     }
 }
 
