@@ -442,8 +442,10 @@ impl LineRun {
     /// an attempt: up to `GUARDRAIL_TRIES` times for the first cause and
     /// `SPENT_TRIES` for the second, each counted on its own. `true` once the
     /// wait is over: the line holds its workers again, or its batch stopped
-    /// meanwhile (`workers.stopped`, and the line is reported as not run);
-    /// `false` when the line is not tried again.
+    /// meanwhile (`workers.stopped`: the line ends as `Stopped` says, never
+    /// as a guardrail refusal); `false` when the line is not tried again,
+    /// including the last try a spent budget gets, which was recorded and
+    /// ends the line with its guardrail error.
     async fn rescan_later(
         &self,
         e: InferenceError,
@@ -756,8 +758,9 @@ enum Rescan {
     /// loaded): the refusal says nothing about the line, and wrote no row.
     Busy,
     /// The custom-pattern budget ran out: a wall-clock budget, which a busy
-    /// replica can exhaust too, so a line gets two more tries (each writes
-    /// its decisions again).
+    /// replica can exhaust too, so a line gets two more tries. A try that
+    /// will be tried again records nothing; only the try that answers (the
+    /// one that ran, or the last) writes its decisions.
     Spent,
 }
 fn rescan_cause(e: InferenceError) -> Option<Rescan> {

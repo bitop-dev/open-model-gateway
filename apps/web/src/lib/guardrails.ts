@@ -72,15 +72,31 @@ const list = (items: string[]) => items.length <= 1 ? items.join("") : `${items.
  */
 export function inspectionSentence(e: Partial<StoredRule>): string {
   if (e.input?.action === "off") return "Off: checks nothing on input.";
-  const count = e.detector?.pattern_count ?? e.detector?.patterns?.length ?? 0;
-  const what = e.protection === "custom" ? `matches of ${count === 1 ? "1 custom pattern" : `${count} custom patterns`}` : "secrets (keys, tokens, private keys, connection strings)";
+  const count = e.detector?.pattern_count ?? e.detector?.patterns?.length ?? 0, looks = looksFor(e);
+  const secrets = "secrets (keys, tokens, private keys, connection strings)", custom = `matches of ${count === 1 ? "1 custom pattern" : `${count} custom patterns`}`;
+  const what = looks === "both" ? `${secrets} and ${custom}` : looks === "custom" ? custom : secrets;
   const where = list((e.workloads ?? ["generation", "embeddings"]).map(w => workloadLabels[w]?.toLowerCase() ?? w.replace(/_/g, " ")));
   const how = e.input?.action === "block" ? "and refuses a request that has one" : e.input?.action === "monitor" ? "and records what it finds; the request goes on" : "";
+  const unreadable = e.input?.action === "block" ? " It also refuses a request it can't read (one with an image, audio or a document), and a native batch when it is created." : "";
   const egress = e.detector?.egress && e.detector.egress !== "local" ? "Text is sent out of the gateway to be checked." : "Checked inside the gateway; nothing is sent anywhere else.";
-  const failure = e.on_error === "fail_closed" ? " If it can't check, the request is refused." : e.on_error === "fail_open" ? " If it can't check, the request goes on." : "";
-  return `Looks for ${what} in the input of ${where} requests${how ? ` ${how}` : ""}.${failure} ${egress}`;
+  // `on_error` covers only a rule that can't run at all (`onErrorHelp`).
+  const failure = e.on_error === "fail_closed" ? " If the rule can't run, the request is refused." : e.on_error === "fail_open" ? " If the rule can't run, the request goes on and that is recorded." : "";
+  return `Looks for ${what} in the input of ${where} requests${how ? ` ${how}` : ""}.${unreadable}${failure} ${egress}`;
 }
-export const inspectedSentence = (workloads: Workload[]) => `Guardrails check the input of ${list(workloads.map(w => workloadLabels[w]?.toLowerCase() ?? w))} requests (also token counts and gateway-run batch lines). Other workloads are not checked yet, and response text is never checked in this release.`;
+export const inspectedSentence = (workloads: Workload[]) => `Guardrails check the input of ${list(workloads.map(w => workloadLabels[w]?.toLowerCase() ?? w))} requests (also token counts and gateway-run batch lines). Other workloads are not checked yet, and response text is never checked in this release. A Block rule also refuses a request it can't read (one with an image, audio or a document) and a native batch when it is created. When the gateway is too busy to check a request, it refuses it with a retryable error (503) under any rule, Monitor included: nothing goes on unchecked.`;
+/**
+ * What a rule's `on_error` covers (enforce.rs `failed`, design §4): only a
+ * rule that can't run at all. A busy gateway or a spent check budget refuses
+ * the request with a retryable 503 whatever `on_error` says.
+ */
+export const onErrorHelp = "Applies only when the rule can't run at all: a stored pattern that no longer compiles, or a rule that needs a later release. A busy gateway never lets a request through unchecked: under any rule, Monitor included, it refuses the request with a retryable error (503).";
+/** What a rule looks for, from its detector's categories (a rule written through the API may have both). */
+export type LooksFor = "secrets" | "custom" | "both";
+export function looksFor(e: Partial<StoredRule>): LooksFor {
+  const c = e.detector?.categories ?? [], secret = c.includes("secret"), custom = c.includes("custom");
+  return secret && custom ? "both" : custom ? "custom" : secret ? "secrets" : e.protection === "custom" ? "custom" : "secrets";
+}
+export const looksForLabels: Record<LooksFor, string> = { secrets: "Secrets", custom: "Custom patterns", both: "Secrets and custom patterns" };
 
 const present = <T,>(key: string, value: T | null | undefined) => value === null || value === undefined ? {} : { [key]: value };
 /**
@@ -105,14 +121,40 @@ export function toInput(e: Entry): Record<string, unknown> {
  * show keep their stored values.
  */
 export function ruleInput(v: Record<string, string | undefined>, base?: Record<string, unknown>): Record<string, unknown> {
-  const custom = v.protection === "custom", patterns = (v.patterns ?? "").split("\n").map(p => p.trim()).filter(Boolean);
+  const looks = (v.protection ?? "secrets") as LooksFor, patterns = (v.patterns ?? "").split("\n").map(p => p.trim()).filter(Boolean);
   const workloads = v.workloads ? parseCheckboxValues(v.workloads) : [];
   const { on_error: _stored, ...kept } = base ?? {};
+  // The stored detector and protection are kept unless what the rule looks
+  // for, or its patterns, changed: the server stores protection and
+  // categories independently, and a rebuilt detector could drop either.
+  const stored = base?.detector as { categories?: Category[]; patterns?: string[] } | undefined;
+  const same = !!stored && looksFor({ detector: stored as Detector, protection: base?.protection as Protection }) === looks
+    && (looks === "secrets" || JSON.stringify(stored.patterns ?? []) === JSON.stringify(patterns));
+  const detector = same ? stored : { kind: "pattern", categories: looks === "both" ? ["secret", "custom"] : [looks === "custom" ? "custom" : "secret"], ...(looks !== "secrets" ? { patterns } : {}) };
+  const protection = same ? base!.protection : looks === "secrets" ? "secrets" : looks === "custom" ? "custom" : (base?.protection ?? "custom");
   return {
-    ...kept, name: (v.name ?? "").trim(), protection: custom ? "custom" : "secrets",
-    detector: { kind: "pattern", categories: [custom ? "custom" : "secret"], ...(custom ? { patterns } : {}) },
+    ...kept, name: (v.name ?? "").trim(), protection, detector,
     input: { ...(base?.input as object | undefined), action: v.action }, ...(v.on_error ? { on_error: v.on_error } : {}), ...(workloads.length ? { workloads } : {}),
   };
+}
+
+const order = <T extends string>(values: readonly T[]) => (v: T | undefined) => v === undefined ? -1 : values.indexOf(v);
+const actionRank = order(strictness), outputRank = order(["off", "monitor", "stop", "block"] as const), errorRank = order(["fail_open", "fail_closed"] as const);
+/**
+ * A tightening entry (PUT shape) against its live platform rule: only the
+ * settings still stricter than the rule's (the server refuses a weaker one,
+ * `write.rs` `loosens`), or `null` when nothing stricter is left.
+ */
+export function stricterPart(t: Record<string, unknown>, base: StoredRule): Record<string, unknown> | null {
+  const input = (t.input as { action?: InputAction } | undefined)?.action, output = (t.output as { mode?: string } | undefined)?.mode as "off" | "monitor" | "stop" | "block" | undefined;
+  const onError = t.on_error as "fail_open" | "fail_closed" | undefined, threshold = t.threshold as number | undefined;
+  const keep = {
+    ...(input !== undefined && actionRank(input) > actionRank(base.input.action) ? { input: { action: input } } : {}),
+    ...(output !== undefined && outputRank(output) > outputRank((base.output?.mode ?? "off") as "off") ? { output: { mode: output } } : {}),
+    ...(onError !== undefined && base.on_error !== undefined && errorRank(onError) > errorRank(base.on_error) ? { on_error: onError } : {}),
+    ...(threshold !== undefined && base.threshold !== null && base.threshold !== undefined && threshold < base.threshold ? { threshold } : {}),
+  };
+  return Object.keys(keep).length ? { ...(t.id ? { id: t.id } : {}), tightens: t.tightens, ...keep } : null;
 }
 /** Plain messages for the reasons a guardrail write is refused. */
 export const refusalMessages: Record<string, string> = {

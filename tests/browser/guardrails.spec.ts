@@ -38,21 +38,21 @@ test("a workspace rule blocks a request and the admin pages show the layers", as
     // entries back as stored: the server accepts them and keeps their settings.
     await alex.page.getByRole("button", { name: "Tighten Secrets" }).click();
     const tighten = alex.page.getByRole("dialog", { name: "Tighten Secrets" });
-    await expect(tighten.getByRole("switch", { name: "Refuse the request if the check can't run" })).toBeChecked();
+    await expect(tighten.getByRole("switch")).toHaveCount(0);
     await tighten.getByRole("button", { name: "Tighten" }).click();
     await expect(tighten).toBeHidden();
     await expect(effective.getByText("Tightened by this workspace")).toBeVisible();
     await alex.page.getByRole("button", { name: `Edit ${rule}` }).click();
     const edit = alex.page.getByRole("dialog", { name: `Edit ${rule}` });
     // Block's default (refuse): shown as the default.
-    await expect(edit.getByRole("combobox", { name: "If the check can't run" })).toHaveValue("");
+    await expect(edit.getByRole("combobox", { name: "If the rule can't run" })).toHaveValue("");
     await edit.getByRole("textbox", { name: "Name" }).fill(`${rule} (edited)`);
     await edit.getByRole("button", { name: "Save rule" }).click();
     await expect(edit).toBeHidden();
     const stored = (await (await api(alex.page, "GET", local)).json()).local.rules;
     expect(stored).toEqual([
       expect.objectContaining({ name: `${rule} (edited)`, on_error: "fail_closed", input: expect.objectContaining({ action: "block" }), detector: expect.objectContaining({ patterns: ["TICKET-[0-9]{4}"] }) }),
-      expect.objectContaining({ tightens: expect.any(String), input: { action: "block" }, on_error: "fail_closed" }),
+      { id: expect.any(String), tightens: expect.any(String), input: { action: "block" } },
     ]);
     await expectAccessible(alex.page, "workspace guardrails");
     await alex.page.setViewportSize({ width: 390, height: 844 });
@@ -76,7 +76,25 @@ test("a workspace rule blocks a request and the admin pages show the layers", as
     expect(JSON.stringify(await refused.json())).toContain("guardrail_input_blocked");
     expect((await send("Say hello")).status).toBe(200);
 
-    await blair.page.goto(`/workspaces/${ws}/logs?status=blocked`);
+    // Picking the Guardrails filter keeps it in the URL, and switching tabs and back keeps it too.
+    await blair.page.goto(`/workspaces/${ws}/logs`);
+    // The list and its tiles have loaded (a re-render while the filter list is open would close it).
+    await expect(blair.page.getByText("Refused by guardrails").first()).toBeVisible();
+    await blair.page.waitForLoadState("networkidle");
+    await blair.page.getByRole("button", { name: /^More filters/ }).click();
+    const facet = blair.page.getByRole("combobox", { name: "Guardrails" });
+    await facet.click();
+    await facet.pressSequentially("Refused");
+    await expect(blair.page.getByRole("option", { name: "Refused", exact: true })).toBeVisible();
+    await blair.page.keyboard.press("ArrowDown");
+    await blair.page.keyboard.press("Enter");
+    await expect(blair.page).toHaveURL(/[?&]guardrail=refused/);
+    await blair.page.keyboard.press("Escape");
+    await expect(blair.page.getByText("Refused by guardrails").first()).toBeVisible();
+    await blair.page.getByRole("tab", { name: "Generations" }).click();
+    await expect(blair.page).toHaveURL(/tab=generations/);
+    await blair.page.getByRole("tab", { name: "Requests" }).click();
+    await expect(blair.page).toHaveURL(/[?&]guardrail=refused/);
     await expect(blair.page.getByText("Refused by guardrails").first()).toBeVisible();
     const requests = await (await api(blair.page, "GET", `/workspaces/${ws}/requests?status=blocked&limit=5`)).json();
     const blocked = requests.data.find((r: { key?: { id: string } }) => r.key?.id === key.id);
@@ -117,12 +135,32 @@ test("a workspace rule blocks a request and the admin pages show the layers", as
     // The workspace's tightening names a rule that is gone: it is shown as
     // such, and the layer still saves (without it).
     await alex.page.reload();
-    await expect(alex.page.getByText("Tightens a removed platform rule")).toBeVisible();
+    await expect(alex.page.getByText(/Its platform rule was removed: it no longer applies/)).toBeVisible();
     await alex.page.getByRole("button", { name: `Remove ${rule} (edited)` }).click();
     await alex.page.getByRole("dialog", { name: `Remove ${rule} (edited)?` }).getByRole("button", { name: "Remove" }).click();
     await expect(alex.page.getByText("No rules of this workspace's own.")).toBeVisible();
     expect((await (await api(alex.page, "GET", local)).json()).local.rules).toEqual([]);
     await expectAccessible(operator.page, "admin team guardrails");
+
+    // A tightening the platform rule later outgrows: the workspace tightens a
+    // Monitor rule to Block, a Platform Admin then raises the rule itself to
+    // Block. The tightening is marked as adding nothing, and the next local
+    // save leaves it out instead of being refused.
+    expect((await api(operator.page, "PUT", platform, { local_only: false, rules: [{ name: "Secrets", protection: "secrets", detector: { kind: "pattern", categories: ["secret"] }, input: { action: "monitor" } }] })).status()).toBe(200);
+    const secretsRule = (await (await api(operator.page, "GET", platform)).json()).override.rules[0];
+    await alex.page.reload();
+    await alex.page.getByRole("button", { name: "Tighten Secrets" }).click();
+    await alex.page.getByRole("dialog", { name: "Tighten Secrets" }).getByRole("button", { name: "Tighten" }).click();
+    await expect(effective.getByText("Tightened by this workspace")).toBeVisible();
+    expect((await api(operator.page, "PUT", platform, { local_only: false, rules: [{ id: secretsRule.id, name: "Secrets", protection: "secrets", detector: { kind: "pattern", categories: ["secret"] }, input: { action: "block" } }] })).status()).toBe(200);
+    await alex.page.reload();
+    await expect(alex.page.getByText(/“Secrets” is now at least as strict: this adds nothing/)).toBeVisible();
+    await alex.page.getByRole("button", { name: "Add rule" }).click();
+    const late = alex.page.getByRole("dialog", { name: "Add a rule to this workspace's rules" });
+    await late.getByRole("textbox", { name: "Name" }).fill(`Late rule ${unique}`);
+    await late.getByRole("button", { name: "Add rule" }).click();
+    await expect(late).toBeHidden();
+    expect((await (await api(alex.page, "GET", local)).json()).local.rules).toEqual([expect.objectContaining({ name: `Late rule ${unique}` })]);
 
     // The type defaults: Platform Admins edit them, Auditors read them.
     await operator.page.goto("/admin/settings/guardrails");

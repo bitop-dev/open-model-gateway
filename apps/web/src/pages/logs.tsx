@@ -338,7 +338,7 @@ export function LogsPage({ scope }: { scope: LogsScope }) {
   const chips: ToolbarChip[] = filters.session_id ? [{ key: "session", label: "Session", text: filters.session_id, onRemove: () => go({ session_id: undefined, cursor: undefined }) }] : [];
   const periodActive = filters.range && filters.range !== "30d" ? 1 : 0;
   const viewSearch: View = { cols: search.cols, density: search.density };
-  const viewRequests = () => nav?.navigate(logsSearch(scope, filters, "requests", viewSearch));
+  const viewRequests = () => nav?.navigate(logsSearch(scope, all, "requests", viewSearch));
   // Refresh: refetch the current tab's data and its summary tiles together, for the current filters; no polling.
   const refresh = async () => {
     // A manual refetch ignores `enabled`: never fetch while the filters are invalid,
@@ -353,7 +353,7 @@ export function LogsPage({ scope }: { scope: LogsScope }) {
   return <Stack gap={6} className={s.page}>
     <Heading title="Logs" description={scope.kind === "platform" ? platformDescription : requestsDescription(scope.workspace)} />
     {tab !== "batches" && <LogMetricsTiles scope={scope} query={query} enabled={!filterError} onRefetch={registerMetricsRefetch} />}
-    <TypeTabs label="Log view" value={tab} onChange={next => nav?.navigate(next === "batches" ? { ...(scope.kind === "platform" ? { page: "platform-logs" } : { page: "requests", ws: scope.workspace.id }), tab: "batches" } : logsSearch(scope, filters, next as LogTab))}
+    <TypeTabs label="Log view" value={tab} onChange={next => nav?.navigate(next === "batches" ? { ...(scope.kind === "platform" ? { page: "platform-logs" } : { page: "requests", ws: scope.workspace.id }), tab: "batches" } : logsSearch(scope, all, next as LogTab))}
       items={[{ value: "requests", label: "Requests" }, { value: "generations", label: "Generations" }, { value: "sessions", label: "Sessions" }, { value: "batches", label: "Batches" }]}>
       {tab === "batches" ? <BatchesPanel scope={scope} /> : <div className={s.list}>
         {/* One row at 1440 (ui-principles 3): Search, Period, Model, Status, More filters (key/workspace, finish, streamed, session) … Columns, density. */}

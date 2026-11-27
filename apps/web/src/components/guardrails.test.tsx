@@ -9,10 +9,11 @@ import { DashboardNavigationProvider } from "./navigation-link";
 import { AdminGuardrails, WorkspaceGuardrailsAdmin, WorkspaceGuardrailsTab } from "../pages/guardrails";
 import { GuardrailDecisions } from "../pages/request-detail";
 import {
-  guardrailsPath, inspectionSentence, platformGuardrailsPath, ruleInput, stricterActions, toInput, typeDefaultPath,
+  guardrailsPath, inspectedSentence, inspectionSentence, platformGuardrailsPath, ruleInput, stricterActions, stricterPart, toInput, typeDefaultPath,
   type EffectiveEntry, type PlatformWorkspaceGuardrails, type RuleSet, type StoredRule, type TypeDefault, type WorkspaceGuardrails,
 } from "../lib/guardrails";
-import { attemptFilters, requestQuery } from "../lib/requests";
+import { attemptFilters, logsSearch, requestFilters, requestQuery } from "../lib/requests";
+import { dashboardHref, parseDashboardLocation } from "../lib/locations";
 import { admin, auditor, markup, member, team, testClient } from "../lib/test-fixtures";
 
 beforeEach(() => {
@@ -25,7 +26,7 @@ afterEach(() => { cleanup(); abortRequests(); vi.unstubAllGlobals(); vi.restoreA
 function serve(routes: Record<string, (init?: RequestInit) => unknown>) {
   const fetch = vi.fn().mockImplementation((path: string, init?: RequestInit) => {
     const key = Object.keys(routes).sort((a, b) => b.length - a.length).find(r => path === r || path.startsWith(`${r}?`));
-    if (key) return Promise.resolve(Response.json(routes[key]!(init)));
+    if (key) { const out = routes[key]!(init); return Promise.resolve(out instanceof Response ? out : Response.json(out)); }
     return Promise.reject(new Error(`Unexpected ${init?.method ?? "GET"} ${path}`));
   });
   vi.stubGlobal("fetch", fetch);
@@ -52,10 +53,14 @@ const view = (patch: Partial<WorkspaceGuardrails> = {}): WorkspaceGuardrails => 
 
 describe("Guardrails: wording and bodies (#840)", () => {
   it("says what each rule inspects, what it does and that text stays inside the gateway", () => {
-    expect(inspectionSentence(secrets)).toBe("Looks for secrets (keys, tokens, private keys, connection strings) in the input of generation and embeddings requests and records what it finds; the request goes on. If it can't check, the request goes on. Checked inside the gateway; nothing is sent anywhere else.");
+    expect(inspectionSentence(secrets)).toBe("Looks for secrets (keys, tokens, private keys, connection strings) in the input of generation and embeddings requests and records what it finds; the request goes on. If the rule can't run, the request goes on and that is recorded. Checked inside the gateway; nothing is sent anywhere else.");
     expect(inspectionSentence(codes)).toContain("matches of 1 custom pattern");
     expect(inspectionSentence(codes)).toContain("refuses a request that has one");
-    expect(inspectionSentence(codes)).toContain("If it can't check, the request is refused.");
+    expect(inspectionSentence(codes)).toContain("If the rule can't run, the request is refused.");
+    // A Block rule also refuses what it can't read.
+    expect(inspectionSentence(codes)).toContain("It also refuses a request it can't read (one with an image, audio or a document), and a native batch when it is created.");
+    expect(inspectionSentence(secrets)).not.toContain("can't read");
+    expect(inspectedSentence(["generation", "embeddings"])).toContain("refuses it with a retryable error (503) under any rule, Monitor included");
     expect(inspectionSentence({ ...secrets, input: { action: "off" } })).toBe("Off: checks nothing on input.");
     expect(inspectionSentence({ ...codes, workloads: ["embeddings"], detector: { ...codes.detector, patterns: undefined, pattern_count: 3 } })).toContain("3 custom patterns in the input of embeddings requests");
   });
@@ -95,13 +100,14 @@ describe("Workspace › Settings › Guardrails", () => {
     expect(html).not.toContain("Tighten");
   });
   it("tightens a platform rule as a local entry and keeps the layer's other entries", async () => {
-    const fetch = serve({ [guardrailsPath(team.id)]: init => init?.method === "PUT" ? view() : view() });
+    const fetch = serve({ [guardrailsPath(team.id)]: () => view() });
     const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
     await user.click(await screen.findByRole("button", { name: "Tighten Secrets" }));
+    // Only a stricter action: on_error covers a rule that can't run, not a busy gateway.
+    expect(screen.queryByRole("switch")).toBeNull();
     await user.click(screen.getByRole("button", { name: "Tighten" }));
     await waitFor(() => expect(writes(fetch)).toHaveLength(1));
-    // The platform rule lets a request go on when its check can't run: blocking also refuses then, unless switched off.
-    expect(writes(fetch)[0]).toEqual(["PUT", guardrailsPath(team.id), { rules: [toInput(codes), { tightens: "r-secrets", input: { action: "block" }, on_error: "fail_closed" }] }]);
+    expect(writes(fetch)[0]).toEqual(["PUT", guardrailsPath(team.id), { rules: [toInput(codes), { tightens: "r-secrets", input: { action: "block" } }] }]);
   });
   it("tightening again keeps the existing tightening's other settings", async () => {
     const tightening = { id: "t-1", tightens: "r-secrets", on_error: "fail_closed" as const };
@@ -109,8 +115,6 @@ describe("Workspace › Settings › Guardrails", () => {
     const fetch = serve({ [guardrailsPath(team.id)]: () => view({ local: { ...localSet, rules: [codes, tightening] }, effective: [tightened, effective(codes, "workspace_local", "set-l")] }) });
     const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
     await user.click(await screen.findByRole("button", { name: "Tighten Secrets" }));
-    // The rule already refuses when it can't check: only the action is offered.
-    expect(screen.queryByRole("switch", { name: "Refuse the request if the check can't run" })).toBeNull();
     await user.click(screen.getByRole("button", { name: "Tighten" }));
     await waitFor(() => expect(writes(fetch)).toHaveLength(1));
     expect(writes(fetch)[0]![2].rules).toEqual([toInput(codes), { id: "t-1", tightens: "r-secrets", input: { action: "block" }, on_error: "fail_closed" }]);
@@ -120,7 +124,8 @@ describe("Workspace › Settings › Guardrails", () => {
     const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
     await user.click(await screen.findByRole("button", { name: "Edit Code names" }));
     // Block's own default: shown as the default, so a change of action takes the new action's.
-    expect((screen.getByLabelText("If the check can't run") as HTMLSelectElement).value).toBe("");
+    expect((screen.getByLabelText("If the rule can't run") as HTMLSelectElement).value).toBe("");
+    expect(screen.getByText(/A busy gateway never lets a request through unchecked/)).toBeTruthy();
     await user.clear(screen.getByLabelText("Name"));
     await user.type(screen.getByLabelText("Name"), "Project codes");
     await user.click(screen.getByRole("button", { name: "Save rule" }));
@@ -128,19 +133,48 @@ describe("Workspace › Settings › Guardrails", () => {
     const { on_error: _default, ...stored } = toInput(codes);
     expect(writes(fetch)[0]![2].rules).toEqual([{ ...stored, name: "Project codes" }]);
   });
+  it("renaming a rule that looks for secrets and custom patterns sends its detector back unchanged", async () => {
+    const both: StoredRule = { ...codes, id: "r-both", name: "Both", protection: "secrets", detector: { kind: "pattern", categories: ["secret", "custom"], patterns: ["ACME-[0-9]{4}"], pattern_count: 1, egress: "local" } };
+    expect(inspectionSentence(both)).toContain("Looks for secrets (keys, tokens, private keys, connection strings) and matches of 1 custom pattern");
+    const fetch = serve({ [guardrailsPath(team.id)]: () => view({ local: { ...localSet, rules: [both] }, effective: [effective(both, "workspace_local", "set-l")] }) });
+    const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
+    expect(await screen.findByText(/^Secrets and custom patterns · /)).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Edit Both" }));
+    expect((screen.getByLabelText("Looks for") as HTMLSelectElement).value).toBe("both");
+    await user.type(screen.getByLabelText("Name"), " renamed");
+    await user.click(screen.getByRole("button", { name: "Save rule" }));
+    await waitFor(() => expect(writes(fetch)).toHaveLength(1));
+    const sent = writes(fetch)[0]![2].rules[0];
+    expect(sent.detector).toEqual(toInput(both).detector);
+    expect(sent.protection).toBe("secrets");
+    expect(sent.name).toBe("Both renamed");
+  });
   it("shows a chosen on_error that is not its action's default", async () => {
     const strict: StoredRule = { ...secrets, on_error: "fail_closed" };
     serve({ [guardrailsPath(team.id)]: () => view({ local: { ...localSet, rules: [strict] }, effective: [effective(strict, "workspace_local", "set-l")] }) });
     const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
     await user.click(await screen.findByRole("button", { name: "Edit Secrets" }));
-    expect((screen.getByLabelText("If the check can't run") as HTMLSelectElement).value).toBe("fail_closed");
+    expect((screen.getByLabelText("If the rule can't run") as HTMLSelectElement).value).toBe("fail_closed");
+  });
+  it("counts the layer's other patterns against its limit", async () => {
+    const many: StoredRule = { ...codes, id: "r-many", name: "Many", detector: { ...codes.detector, patterns: Array.from({ length: 49 }, (_, i) => `P${i}-[0-9]`), pattern_count: 49 } };
+    const fetch = serve({ [guardrailsPath(team.id)]: () => view({ local: { ...localSet, rules: [many] }, effective: [effective(many, "workspace_local", "set-l")] }) });
+    const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
+    await user.click(await screen.findByRole("button", { name: "Add rule" }));
+    await user.type(screen.getByLabelText("Name"), "Two more");
+    await user.selectOptions(screen.getByLabelText("Looks for"), "custom");
+    await user.click(screen.getByLabelText("Patterns"));
+    await user.paste("A-[0-9]\nB-[0-9]");
+    await user.click(screen.getByRole("button", { name: "Add rule" }));
+    expect(await screen.findByText("This layer allows 50 patterns in all; 1 are left for this rule.")).toBeTruthy();
+    expect(writes(fetch)).toHaveLength(0);
   });
   it("leaves out a tightening whose platform rule is gone when the layer is saved", async () => {
     const old = { id: "t-old", tightens: "r-gone", input: { action: "block" as const } };
     const dangling: EffectiveEntry = { id: "t-old", tightens: "r-gone", rule_set_id: "set-l", revision: 2, source: "workspace_local", active: false, inactive_reason: "tightened_rule_missing", tightened_by: [] };
     const fetch = serve({ [guardrailsPath(team.id)]: () => view({ local: { ...localSet, rules: [codes, old] }, effective: [effective(secrets, "type_default", "set-p"), effective(codes, "workspace_local", "set-l"), dangling] }) });
     const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
-    expect(await screen.findByText("Tightens a removed platform rule")).toBeTruthy();
+    expect(await screen.findByText(/Its platform rule was removed: it no longer applies/)).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Remove Code names" }));
     await user.click(screen.getByRole("button", { name: "Remove" }));
     await waitFor(() => expect(writes(fetch)).toEqual([["PUT", guardrailsPath(team.id), { rules: [] }]]));
@@ -149,27 +183,52 @@ describe("Workspace › Settings › Guardrails", () => {
     const old = { id: "t-old", tightens: "r-secrets", input: { action: "block" as const } };
     const dangling: EffectiveEntry = { id: "t-old", tightens: "r-secrets", rule_set_id: "set-l", revision: 2, source: "workspace_local", active: false, inactive_reason: "tightened_rule_missing", tightened_by: [] };
     let loads = 0;
-    // Loaded under an override (the tightening is stale); the override is then reset, so it applies again.
+    // Loaded under an override without r-secrets (the tightening is gone); the override is then reset, so it applies again.
+    const overridden = { ...platformSet, id: "set-o", layer: "workspace_override" as const, rules: [] };
     const fetch = serve({ [guardrailsPath(team.id)]: init => init?.method === "PUT" ? view() : loads++ === 0
-      ? view({ local: { ...localSet, rules: [codes, old] }, effective: [effective(codes, "workspace_local", "set-l"), dangling] })
+      ? view({ platform: { source: "workspace_override", rule_set: overridden }, local: { ...localSet, rules: [codes, old] }, effective: [effective(codes, "workspace_local", "set-l"), dangling] })
       : view({ local: { ...localSet, rules: [codes, old] }, effective: [{ ...effective(secrets, "type_default", "set-p"), input: { action: "block" }, tightened_by: ["t-old"] }, effective(codes, "workspace_local", "set-l")] }) });
     const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
-    expect(await screen.findByText("Tightens a removed platform rule")).toBeTruthy();
+    expect(await screen.findByText(/Its platform rule was removed/)).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Remove Code names" }));
     await user.click(screen.getByRole("button", { name: "Remove" }));
     await waitFor(() => expect(writes(fetch)).toEqual([["PUT", guardrailsPath(team.id), { rules: [old] }]]));
   });
-  it("offers refusing on a failed check with Block only, and never sends less than is in effect", async () => {
-    const fetch = serve({ [guardrailsPath(team.id)]: () => view() });
+  it("leaves out what a tightening no longer adds once the platform rule is as strict, and marks it", async () => {
+    // The platform raised Secrets to Block; the workspace's Monitor tightening of it (once from Off) adds nothing.
+    const raised: StoredRule = { ...secrets, input: { action: "block", redact_scope: "user_text" } };
+    const weak = { id: "t-weak", tightens: "r-secrets", input: { action: "monitor" as const } };
+    const fetch = serve({ [guardrailsPath(team.id)]: () => view({ platform: { source: "type_default", rule_set: { ...platformSet, rules: [raised] } }, local: { ...localSet, rules: [codes, weak] }, effective: [{ ...effective(raised, "type_default", "set-p"), tightened_by: ["t-weak"] }, effective(codes, "workspace_local", "set-l")] }) });
+    const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
+    expect(await screen.findByText(/“Secrets” is now at least as strict: this adds nothing/)).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Remove Code names" }));
+    await user.click(screen.getByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(writes(fetch)).toEqual([["PUT", guardrailsPath(team.id), { rules: [] }]]));
+    expect(stricterPart({ id: "t", tightens: "r-secrets", input: { action: "block" }, on_error: "fail_closed" }, { ...secrets, input: { action: "block" } })).toEqual({ id: "t", tightens: "r-secrets", on_error: "fail_closed" });
+  });
+  it("names the platform rule when the server still refuses a tightening as loosening", async () => {
+    serve({ [guardrailsPath(team.id)]: init => init?.method === "PUT"
+      ? new Response(JSON.stringify({ error: { code: "403", message: "loosen", reason: "guardrail_loosen_not_allowed", rule: "11111111-2222-4333-8444-555555555555" } }), { status: 403, headers: { "content-type": "application/json" } })
+      : view({ platform: { source: "type_default", rule_set: { ...platformSet, rules: [{ ...secrets, id: "11111111-2222-4333-8444-555555555555" }] } }, effective: [effective({ ...secrets, id: "11111111-2222-4333-8444-555555555555" }, "type_default", "set-p"), effective(codes, "workspace_local", "set-l")] }) });
     const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
     await user.click(await screen.findByRole("button", { name: "Tighten Secrets" }));
-    expect(screen.getByRole("switch", { name: "Refuse the request if the check can't run" })).toBeTruthy();
-    await user.selectOptions(screen.getByLabelText("On input"), "monitor");
-    expect(screen.queryByRole("switch", { name: "Refuse the request if the check can't run" })).toBeNull();
     await user.click(screen.getByRole("button", { name: "Tighten" }));
-    // Keeping Monitor without refusing tightens nothing.
-    expect(await screen.findByText("Choose a stricter action, or refuse the request when the check can't run.")).toBeTruthy();
+    expect(await screen.findByText("This workspace's tightening of “Secrets” is no longer stricter than the platform rule. Remove it, then try again.")).toBeTruthy();
+  });
+  it("refuses to save a layer that changed since the page loaded it", async () => {
+    let loads = 0;
+    const fetch = serve({ [guardrailsPath(team.id)]: () => loads++ === 0 ? view() : view({ local: { ...localSet, revision: 3 } }) });
+    const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
+    await user.click(await screen.findByRole("button", { name: "Remove Code names" }));
+    await user.click(screen.getByRole("button", { name: "Remove" }));
+    expect(await screen.findByText("This changed since you opened it. Reload and try again.")).toBeTruthy();
     expect(writes(fetch)).toHaveLength(0);
+  });
+  it("shows an active rule that is off as Off, never Active", () => {
+    const off: StoredRule = { ...secrets, input: { action: "off", redact_scope: "user_text" } };
+    const html = markup(<WorkspaceGuardrailsTab workspace={team} />, [[guardrailsPath(team.id), view({ local: null, effective: [effective(off, "type_default", "set-p")] })]]);
+    expect(html).not.toContain(">Active<");
+    expect(html).toContain("Off: checks nothing on input.");
   });
   it("adds a custom-pattern rule to the workspace's layer", async () => {
     const fetch = serve({ [guardrailsPath(team.id)]: () => view() });
@@ -225,7 +284,51 @@ describe("Admin › Guardrails", () => {
   });
 });
 
+describe("Admin › Guardrails: reach and fresh reads", () => {
+  it("says a type default's edit reaches every workspace of the kind", async () => {
+    const data: TypeDefault = { kind: "team", rule_set: platformSet, inspected_workloads: ["generation", "embeddings"] };
+    serve({ [typeDefaultPath("team")]: () => data });
+    const user = mount(<AdminGuardrails session={admin} tab="team" onTabChange={() => {}} />);
+    await user.click(await screen.findByRole("button", { name: "Remove Secrets" }));
+    expect(screen.getByRole("dialog").textContent).toContain("It stops applying to every team workspace without a platform override, and their tightenings of it stop applying.");
+  });
+  it("refuses to change an override that changed since the page loaded it", async () => {
+    let loads = 0;
+    const withOverride = (revision: number) => platformView({ override: { ...platformSet, id: "set-o", layer: "workspace_override", revision }, platform: { source: "workspace_override", rule_set: platformSet } });
+    const fetch = serve({ [platformGuardrailsPath(team.id)]: () => withOverride(loads++ === 0 ? 1 : 2) });
+    const user = mount(<WorkspaceGuardrailsAdmin id={team.id} writable />);
+    await user.click(await screen.findByRole("button", { name: "Reset to default" }));
+    await user.click(screen.getByRole("button", { name: "Reset" }));
+    expect(await screen.findByText("This changed since you opened it. Reload and try again.")).toBeTruthy();
+    expect(writes(fetch)).toHaveLength(0);
+  });
+  it("creates an override from the default as it is when the override is created", async () => {
+    let loads = 0;
+    const later: StoredRule = { ...secrets, id: "r-later", name: "Added since" };
+    const fetch = serve({ [platformGuardrailsPath(team.id)]: init => init?.method === "PUT" ? platformView() : loads++ === 0 ? platformView() : platformView({ type_default: { ...platformSet, revision: 4, local_only: true, rules: [secrets, later] } }) });
+    const user = mount(<WorkspaceGuardrailsAdmin id={team.id} writable />);
+    await user.click(await screen.findByRole("button", { name: "Override the default" }));
+    await user.click(screen.getByRole("button", { name: "Create override" }));
+    await waitFor(() => expect(writes(fetch)).toHaveLength(1));
+    const strip = (r: StoredRule) => { const { id: _id, ...rest } = toInput(r); return rest; };
+    expect(writes(fetch)[0]![2]).toEqual({ local_only: true, rules: [strip(secrets), strip(later)] });
+  });
+});
+
 describe("Logs: guardrail filters and decisions", () => {
+  it("keeps the guardrail filter in the URL and across the log tabs", () => {
+    const search = { page: "requests" as const, ws: team.id, status: "blocked", guardrail: "refused" as const };
+    const href = dashboardHref(search);
+    expect(href).toBe(`/workspaces/${team.id}/logs?status=blocked&guardrail=refused`);
+    expect(parseDashboardLocation(href)).toMatchObject(search);
+    const scope = { kind: "workspace" as const, workspace: team };
+    const filters = requestFilters(search);
+    // Requests → Generations → Requests keeps both, though Generations never sends them.
+    const generations = logsSearch(scope, filters, "generations");
+    expect(generations).toMatchObject({ tab: "generations", guardrail: "refused", status: "blocked" });
+    expect(logsSearch(scope, requestFilters(generations), "requests")).toMatchObject({ guardrail: "refused", status: "blocked" });
+    expect(requestQuery(attemptFilters(requestFilters(generations))).query.toString()).toBe("");
+  });
   it("sends the guardrail filter on Requests and never to the attempt tabs", () => {
     const filters = { guardrail: "refused" as const, status: "blocked,failed" };
     expect(requestQuery(filters).query.toString()).toBe("status=blocked%2Cfailed&guardrail=refused");

@@ -590,6 +590,8 @@ async fn a_recorded_try_ends_the_line_with_its_error_even_when_the_batch_stops(p
         .await
         .unwrap();
     assert_eq!(rows, [("detector_failed".into(), true)]);
+    // The line is counted failed exactly once.
+    assert_eq!(w.reload(&job).await.request_failed, Some(1));
 }
 
 /// A line whose first attempt ran and failed, and whose retry then waits to
@@ -652,6 +654,8 @@ async fn a_stopped_retry_of_a_line_that_ran_is_reported_with_its_attempt(pool: P
         text.contains(&first.simple().to_string()) || text.contains(&first.to_string()),
         "{text}"
     );
+    // The line is counted failed exactly once.
+    assert_eq!(w.reload(&job).await.request_failed, Some(1));
 }
 
 /// A line none of whose attempts reached a provider (no scan slot through its
@@ -692,4 +696,6 @@ async fn a_stopped_retry_of_a_line_that_never_reached_a_provider_is_not_run(pool
             .await
             .unwrap();
     assert_eq!(line, ("failed".into(), Some("batch_cancelled".into()), 2));
+    // The line is counted failed exactly once.
+    assert_eq!(w.reload(&job).await.request_failed, Some(1));
 }
