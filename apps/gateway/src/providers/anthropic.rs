@@ -258,12 +258,18 @@ fn content_blocks(message: &Message, images: &mut usize) -> Result<Vec<Value>> {
             None => {}
         }
         for call in &message.tool_calls {
-            let input: Value = serde_json::from_str(&call.arguments)
-                .map_err(|_| InferenceError::InvalidRequest)?;
+            let input = crate::inference::json_weight::parse_document(&call.arguments)
+                .ok_or(InferenceError::InvalidRequest)?;
             if !input.is_object() {
                 return Err(InferenceError::InvalidRequest);
             }
-            content.push(json!({"type":"tool_use","id":call.id,"name":call.name,"input":input}));
+            // The parsed input moves into the block: `json!` would copy it.
+            let mut block = serde_json::Map::new();
+            block.insert("type".into(), "tool_use".into());
+            block.insert("id".into(), call.id.clone().into());
+            block.insert("name".into(), call.name.clone().into());
+            block.insert("input".into(), input);
+            content.push(Value::Object(block));
         }
     }
     Ok(content)

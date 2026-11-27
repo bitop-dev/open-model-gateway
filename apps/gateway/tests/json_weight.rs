@@ -1,0 +1,614 @@
+//! The pre-parse structure estimate of a JSON body (`inference::json_weight`,
+//! #872), added to the body's length, is never below what parsing it
+//! allocates. This binary counts every
+//! allocation of the thread that parses (a counting global allocator, which
+//! is why it is its own test binary), and compares the peak of live bytes
+//! during `serde_json` parses of generated and adversarial bodies with the
+//! estimate of the same bytes.
+use std::{
+    alloc::{GlobalAlloc, Layout, System},
+    cell::Cell,
+};
+
+use open_model_gateway::inference::json_weight::{estimate, weight};
+use proptest::prelude::*;
+use serde_json::{Value, json};
+
+struct Counting;
+
+thread_local! {
+    static ON: Cell<bool> = const { Cell::new(false) };
+    static LIVE: Cell<isize> = const { Cell::new(0) };
+    static PEAK: Cell<isize> = const { Cell::new(0) };
+}
+
+fn count(delta: isize) {
+    let _ = ON.try_with(|on| {
+        if on.get() {
+            let live = LIVE.get() + delta;
+            LIVE.set(live);
+            PEAK.set(PEAK.get().max(live));
+        }
+    });
+}
+
+// SAFETY: every call is forwarded to `System` unchanged; the wrapper only
+// adds the sizes to thread-local counters, which allocate nothing.
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the caller's contract for `alloc`, passed on.
+        let p = unsafe { System.alloc(layout) };
+        if !p.is_null() {
+            count(layout.size().cast_signed());
+        }
+        p
+    }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the caller's contract for `alloc_zeroed`, passed on.
+        let p = unsafe { System.alloc_zeroed(layout) };
+        if !p.is_null() {
+            count(layout.size().cast_signed());
+        }
+        p
+    }
+    unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
+        // SAFETY: the caller's contract for `dealloc`, passed on.
+        unsafe { System.dealloc(p, layout) };
+        count(-layout.size().cast_signed());
+    }
+    unsafe fn realloc(&self, p: *mut u8, layout: Layout, new: usize) -> *mut u8 {
+        // SAFETY: the caller's contract for `realloc`, passed on.
+        let q = unsafe { System.realloc(p, layout, new) };
+        if !q.is_null() {
+            // Counted as a new block beside the old one, then the old one
+            // freed: a move holds both for a moment.
+            count(new.cast_signed());
+            count(-layout.size().cast_signed());
+        }
+        q
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Counting = Counting;
+
+/// The peak of bytes the parse of `body` held at once, the parsed value
+/// included, and whether it parsed.
+fn parse_peak(body: &[u8]) -> (usize, bool) {
+    LIVE.set(0);
+    PEAK.set(0);
+    ON.set(true);
+    let parsed = serde_json::from_slice::<Value>(body);
+    ON.set(false);
+    let peak = usize::try_from(PEAK.get()).unwrap();
+    let ok = parsed.is_ok();
+    drop(parsed);
+    (peak, ok)
+}
+
+fn holds(body: &[u8]) -> Result<(), String> {
+    let (peak, _) = parse_peak(body);
+    let estimate = body.len() + estimate(body);
+    if estimate >= peak {
+        Ok(())
+    } else {
+        Err(format!(
+            "estimate {estimate} below the parse's peak {peak} for a body of {} bytes: {}",
+            body.len(),
+            String::from_utf8_lossy(&body[..body.len().min(200)])
+        ))
+    }
+}
+
+/// Every array and object length around the points where a vector or a
+/// B-tree reallocates or splits, with each kind of element.
+#[test]
+fn the_estimate_covers_every_growth_point() {
+    let elements: [&str; 12] = [
+        "0",
+        "-1.5e300",
+        "true",
+        "null",
+        "\"\"",
+        "\"a\"",
+        "[]",
+        "[0]",
+        "{}",
+        "{\"a\":0}",
+        "\"\\u00e9\"",
+        "[[0]]",
+    ];
+    for element in elements {
+        for n in (0..=70).chain([127, 128, 129, 255, 256, 257, 1023, 1024, 1025, 4097]) {
+            let array = format!("[{}]", vec![element; n].join(","));
+            holds(array.as_bytes()).unwrap();
+            let object = format!(
+                "{{{}}}",
+                (0..n)
+                    .map(|k| format!("\"{k:06}\":{element}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            holds(object.as_bytes()).unwrap();
+            // Keys in descending order split the B-tree differently.
+            let reversed = format!(
+                "{{{}}}",
+                (0..n)
+                    .rev()
+                    .map(|k| format!("\"{k:06}\":{element}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            holds(reversed.as_bytes()).unwrap();
+        }
+    }
+}
+
+/// Shapes built to be large parsed: tiny containers, one-key objects,
+/// nesting to `serde_json`'s depth limit, escapes that shrink when decoded,
+/// duplicate keys, every number form, whitespace, and invalid JSON.
+#[test]
+fn the_estimate_covers_hostile_shapes() {
+    let n = 20_000;
+    let repeat = |item: &str| format!("[{}]", vec![item; n].join(","));
+    let mut bodies = vec![
+        repeat("0"),
+        repeat("[]"),
+        repeat("[0]"),
+        repeat("[[0]]"),
+        repeat("{}"),
+        repeat("{\"a\":0}"),
+        repeat("{\"\":{}}"),
+        repeat("{\"a\":[0]}"),
+        repeat("\"\\u0000\""),
+        repeat("\"\\ud83d\\ude00\""),
+        repeat("{\"\\u0061\":0}"),
+        repeat("-0.0e-0"),
+        repeat("18446744073709551615"),
+        repeat("-9223372036854775808"),
+        repeat("1e400"),
+        format!("[{}]", vec!["1"; n].join(" , \n\t")),
+        format!("{{{}}}", vec!["\"a\":0"; n].join(",")),
+        format!("{}{}", "[".repeat(127), "]".repeat(127)),
+        format!("{}0{}", "[".repeat(127), "]".repeat(127)),
+        format!(
+            "{}{}",
+            "{\"a\":".repeat(127),
+            format!("0{}", "}".repeat(127))
+        ),
+        format!("[{}", vec!["{\"a\":0}"; n].join(",")),
+        format!("[{},\"\u{1}\"]", vec!["{\"a\":0}"; n].join(",")),
+        format!("[{},]", vec!["[0]"; n].join(",")),
+        format!("[{} 0]", vec!["[0]"; n].join(",")),
+    ];
+    bodies.push(
+        serde_json::to_string(&json!({"a": vec![json!({"b": [1, 2, {"c": null}]}); n]})).unwrap(),
+    );
+    // Long strings with an escape: decoded through a reused scratch buffer
+    // that grows to twice the longest, before the string is copied out.
+    let long = "x".repeat(1 << 20);
+    bodies.extend([
+        format!(r#"["\n{long}"]"#),
+        format!(r#"["{long}\n"]"#),
+        format!(r#"{{"{long}\n":0}}"#),
+        format!(r#"["data:image/png;base64,{}\/"]"#, "A".repeat(1 << 20)),
+        format!(
+            r#"["{long}\n","{}\n","{}\n"]"#,
+            &long[..1000],
+            &long[..(1 << 19)]
+        ),
+        format!(r#"["{}"]"#, r"\u00e9".repeat(1 << 18)),
+        format!(
+            r#"["{}","{}"]"#,
+            r"\ud83d\ude00".repeat(1 << 16),
+            r"\n".repeat(1 << 19)
+        ),
+        format!(r#"["{}","{long}\n"]"#, r"\n".repeat(1 << 18)),
+    ]);
+    // Strings an error message shows escaped for display: a string where
+    // `max_tokens` takes a number, and an unknown field's own name.
+    let del = "\u{7f}".repeat(1 << 20);
+    let c1 = "\u{85}".repeat(1 << 19);
+    let shown = |text: &str| format!(r#"{{"max_tokens":"{text}"}}"#);
+    bodies.extend([
+        shown(&del),
+        shown(&c1),
+        format!(r#"{{"{del}":0}}"#),
+        format!(r#"{{"model":"m","{c1}":0}}"#),
+        shown(&r"\b".repeat(1 << 19)),
+        shown(&r"\u0001".repeat(1 << 18)),
+        shown(&r"\ud83d\ude00".repeat(1 << 16)),
+        shown(&"\u{200b}".repeat(1 << 18)),
+        shown(&"字".repeat(1 << 19)),
+        shown(&"x".repeat(1 << 20)),
+    ]);
+    // Large open values inside a request, which a batch line converts from
+    // its tree into the request while the tree is held.
+    bodies.extend([
+        format!(r#"{{"tool_choice":[{}]}}"#, vec!["0"; 65_537].join(",")),
+        format!(r#"{{"input":[{}]}}"#, vec![r#"{"a":0}"#; 20_000].join(",")),
+        format!(
+            r#"{{"input":[{}],"tool_choice":[[0]]}}"#,
+            vec!["[0]"; 40_000].join(",")
+        ),
+    ]);
+    // Long numbers (with `float_roundtrip`, which dev-dependencies enable,
+    // their digits go through the same scratch buffer).
+    bodies.extend([
+        format!("[0.{}]", "1".repeat(1 << 20)),
+        format!("[{}]", "9".repeat(1 << 20)),
+        format!("[-1.{}e-5,{}]", "3".repeat(1 << 19), "7".repeat(1 << 18)),
+    ]);
+    // Long keys nested deep: the shape that a path-tracking parser (Axum's
+    // `Json`) copies per level, which the gateway's extractor does not use.
+    let key = "k".repeat(17_000);
+    bodies.push(format!(
+        "{{\"model\":\"m\",\"input\":{}0{}}}",
+        format!("{{\"{key}\":").repeat(120),
+        "}".repeat(120)
+    ));
+    for body in bodies {
+        holds(body.as_bytes()).unwrap();
+        holds_typed(body.as_bytes()).unwrap();
+        holds_line(body.as_bytes()).unwrap();
+    }
+}
+
+/// A request type of the shape the generation routes deserialize: typed
+/// fields beside open `Value` ones, unknown fields refused.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct Request {
+    model: Option<String>,
+    max_tokens: Option<u32>,
+    input: Option<Value>,
+    tool_choice: Option<Value>,
+}
+
+/// The bound of a batch line (`json_weight::line_within_budget`): parsed
+/// into a `Value`, then converted into its request with the tree still
+/// held, so twice the structure, and the strings part once.
+fn holds_line(body: &[u8]) -> Result<(), String> {
+    LIVE.set(0);
+    PEAK.set(0);
+    ON.set(true);
+    // As `jobs::lines` does: the tree is consumed into the request.
+    let parsed = serde_json::from_slice::<Value>(body)
+        .map(|value| serde_json::from_value::<Request>(value).is_ok());
+    ON.set(false);
+    drop(parsed);
+    let peak = usize::try_from(PEAK.get()).unwrap();
+    let w = weight(body);
+    let bound = body.len() + 2 * w.structure + w.strings;
+    if bound >= peak {
+        Ok(())
+    } else {
+        Err(format!(
+            "line: bound {bound} below the parse's peak {peak} for a body of {} bytes: {}",
+            body.len(),
+            String::from_utf8_lossy(&body[..body.len().min(80)])
+        ))
+    }
+}
+
+/// [`holds`] for a parse into [`Request`] with `serde_json::from_slice`, as
+/// the gateway's JSON extractor parses (`http::json_body`), its error
+/// message included: a refused body's message can hold one of its strings,
+/// shown for display.
+fn holds_typed(body: &[u8]) -> Result<(), String> {
+    LIVE.set(0);
+    PEAK.set(0);
+    ON.set(true);
+    let parsed = serde_json::from_slice::<Request>(body);
+    ON.set(false);
+    drop(parsed);
+    let peak = usize::try_from(PEAK.get()).unwrap();
+    let estimate = body.len() + estimate(body);
+    if estimate >= peak {
+        Ok(())
+    } else {
+        Err(format!(
+            "typed: estimate {estimate} below the parse's peak {peak} for a body of {} bytes: {}",
+            body.len(),
+            String::from_utf8_lossy(&body[..body.len().min(80)])
+        ))
+    }
+}
+
+/// [`holds`] for a parse into the route's own request type `T`.
+fn holds_as<T: serde::de::DeserializeOwned>(name: &str, body: &[u8]) -> Result<(), String> {
+    LIVE.set(0);
+    PEAK.set(0);
+    ON.set(true);
+    let parsed = serde_json::from_slice::<T>(body);
+    ON.set(false);
+    let ok = parsed.is_ok();
+    drop(parsed);
+    let peak = usize::try_from(PEAK.get()).unwrap();
+    let bound = body.len() + estimate(body);
+    if bound >= peak {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name} (parsed: {ok}): bound {bound} below the parse's peak {peak}"
+        ))
+    }
+}
+
+/// The dense shapes each route's request type takes, parsed as that type:
+/// what the walk estimates is what the route's own deserializer builds.
+#[test]
+fn the_estimate_covers_each_routes_request_type() {
+    use open_model_gateway::protocols::{chat_completions, embeddings, messages, responses};
+    let n = 20_000;
+    let many = |item: &str| vec![item; n].join(",");
+    let one_key = many(r#"{"a":0}"#);
+    let empty = many("{}");
+    let texts = many(r#"{"type":"text","text":"x"}"#);
+    let users = many(r#"{"role":"user","content":"x"}"#);
+    let strings = many(r#""x""#);
+    let chat = [
+        format!(r#"{{"model":"m","messages":[{users}]}}"#),
+        format!(r#"{{"model":"m","messages":[{{"role":"user","content":[{texts}]}}]}}"#),
+        format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"x"}}],"tools":[{{"type":"function","function":{{"name":"f","parameters":{{"x":[{one_key}]}}}}}}]}}"#
+        ),
+        format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"x"}}],"tool_choice":[{empty}]}}"#
+        ),
+    ];
+    for body in &chat {
+        holds_as::<chat_completions::Request>("chat", body.as_bytes()).unwrap();
+    }
+    let responses = [
+        format!(r#"{{"model":"m","input":[{one_key}]}}"#),
+        format!(r#"{{"model":"m","input":[{empty}]}}"#),
+        format!(
+            r#"{{"model":"m","input":"x","tools":[{{"type":"function","name":"f","parameters":{{"x":[{one_key}]}}}}]}}"#
+        ),
+    ];
+    for body in &responses {
+        holds_as::<responses::Request>("responses", body.as_bytes()).unwrap();
+    }
+    let messages = [
+        format!(r#"{{"model":"m","max_tokens":1,"messages":[{users}]}}"#),
+        format!(
+            r#"{{"model":"m","max_tokens":1,"messages":[{{"role":"user","content":[{texts}]}}]}}"#
+        ),
+        format!(
+            r#"{{"model":"m","max_tokens":1,"messages":[{{"role":"user","content":"x"}}],"tools":[{{"name":"f","input_schema":{{"x":[{one_key}]}}}}]}}"#
+        ),
+        format!(
+            r#"{{"model":"m","max_tokens":1,"messages":[{{"role":"user","content":"x"}}],"system":[{texts}]}}"#
+        ),
+        format!(r#"{{"model":"m","max_tokens":1,"messages":[{empty}]}}"#),
+    ];
+    for body in &messages {
+        holds_as::<messages::Request>("messages", body.as_bytes()).unwrap();
+        let count = body.replace(r#""max_tokens":1,"#, "");
+        holds_as::<messages::CountRequest>("count_tokens", count.as_bytes()).unwrap();
+    }
+    holds_as::<embeddings::Request>(
+        "embeddings",
+        format!(r#"{{"model":"m","input":[{strings}]}}"#).as_bytes(),
+    )
+    .unwrap();
+}
+
+/// Every key and string of `value`, copied out (a guardrail's segments).
+fn segments(value: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![value];
+    while let Some(v) = stack.pop() {
+        match v {
+            Value::String(s) => out.push(s.clone()),
+            Value::Array(items) => stack.extend(items),
+            Value::Object(map) => {
+                for (k, item) in map {
+                    out.push(k.clone());
+                    stack.push(item);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A JSON document held in a string (a tool call's `arguments`), parsed by
+/// `json_weight::parse_document` while the body it came from is held, as an
+/// adapter or a guardrail does: within the body's bound plus the
+/// document's own (`json_weight::inner_documents`: its length and its
+/// estimate).
+#[test]
+fn the_estimate_covers_a_document_held_in_a_string() {
+    use open_model_gateway::inference::json_weight::parse_document;
+    for inner in [
+        json!({"k": vec![json!({"a": 0}); 15_000]}).to_string(),
+        json!({"k": vec![json!(0); 150_000]}).to_string(),
+        json!({"path": "f", "content": "line\n".repeat(100_000)}).to_string(),
+        json!({"k": vec![json!({}); 30_000]}).to_string(),
+    ] {
+        let body = json!({"arguments": inner}).to_string();
+        LIVE.set(0);
+        PEAK.set(0);
+        ON.set(true);
+        let value = serde_json::from_slice::<Value>(body.as_bytes()).unwrap();
+        let document = parse_document(value["arguments"].as_str().unwrap());
+        ON.set(false);
+        assert!(document.is_some(), "within the budget, so parsed");
+        drop((value, document));
+        let peak = usize::try_from(PEAK.get()).unwrap();
+        let bound =
+            body.len() + estimate(body.as_bytes()) + inner.len() + estimate(inner.as_bytes());
+        assert!(bound >= peak, "bound {bound} below the parse's peak {peak}");
+    }
+    // Several documents held together, as an adapter keeps every call of a
+    // request: within the body's bound plus what `inner_documents` charges
+    // (each document's length and structure, and the largest strings part,
+    // which lasts only while that one is parsed).
+    let documents = [
+        json!({"k": vec![json!({"a": 0}); 4_000]}).to_string(),
+        json!({"path": "f", "content": "line\n".repeat(40_000)}).to_string(),
+        json!({"k": vec![json!(0); 60_000]}).to_string(),
+    ];
+    let body = json!({"calls": documents}).to_string();
+    LIVE.set(0);
+    PEAK.set(0);
+    ON.set(true);
+    let value = serde_json::from_slice::<Value>(body.as_bytes()).unwrap();
+    // Each held three ways, as the sinks hold one: the parsed value, a full
+    // second form beside it (an adapter's, e.g. Bedrock's `Document`), and
+    // a guardrail's segments of its keys and strings.
+    let parsed: Vec<_> = value["calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            let document = parse_document(d.as_str().unwrap()).unwrap();
+            let copy = document.clone();
+            let segments = segments(&document);
+            (document, copy, segments)
+        })
+        .collect();
+    ON.set(false);
+    drop((value, parsed));
+    let peak = usize::try_from(PEAK.get()).unwrap();
+    let (kept, transient) = documents.iter().fold((0, 0), |(kept, transient), d| {
+        let w = weight(d.as_bytes());
+        (
+            kept + d.len() + w.structure,
+            usize::max(transient, w.strings),
+        )
+    });
+    let bound = body.len() + estimate(body.as_bytes()) + kept + transient;
+    assert!(
+        bound >= peak,
+        "several documents: bound {bound} below the parse's peak {peak}"
+    );
+    // Over the budget, the document is never parsed.
+    let over = json!({"k": vec![json!({"a": 0}); 20_000]}).to_string();
+    LIVE.set(0);
+    PEAK.set(0);
+    ON.set(true);
+    let document = parse_document(&over);
+    ON.set(false);
+    assert!(document.is_none());
+    assert!(
+        usize::try_from(PEAK.get()).unwrap() < 4096,
+        "nothing parsed"
+    );
+}
+
+fn value() -> impl Strategy<Value = Value> {
+    let leaf = prop_oneof![
+        Just(Value::Null),
+        any::<bool>().prop_map(Value::Bool),
+        any::<i64>().prop_map(|n| json!(n)),
+        any::<u64>().prop_map(|n| json!(n)),
+        any::<f64>()
+            .prop_filter("finite", |f| f.is_finite())
+            .prop_map(|f| json!(f)),
+        ".{0,12}".prop_map(Value::String),
+        "[\\x00-\\x1f\"\\\\/]{0,6}".prop_map(Value::String),
+        // Long strings with escapes anywhere in them.
+        (
+            "[a-z]{0,1500}",
+            "[\\x00-\\x1f\"\\\\/]{0,3}",
+            "[a-z]{0,1500}"
+        )
+            .prop_map(|(a, e, b)| Value::String(format!("{a}{e}{b}"))),
+    ];
+    leaf.prop_recursive(8, 400, 40, |inner| {
+        prop_oneof![
+            prop::collection::vec(inner.clone(), 0..40).prop_map(Value::Array),
+            prop::collection::vec((".{0,6}", inner), 0..40)
+                .prop_map(|entries| Value::Object(entries.into_iter().collect())),
+        ]
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2000))]
+
+    /// Any JSON, compact or pretty, with `\/` and `\uXXXX` escapes written
+    /// where an encoder may: the estimate is at least the parse's peak.
+    #[test]
+    fn the_estimate_is_never_below_the_parse(value in value(), pretty in any::<bool>(), escape in any::<bool>()) {
+        let mut body = if pretty {
+            serde_json::to_string_pretty(&value).unwrap()
+        } else {
+            serde_json::to_string(&value).unwrap()
+        };
+        if escape {
+            body = body.replace('/', "\\/").replace('a', "\\u0061");
+        }
+        prop_assert!(holds(body.as_bytes()).is_ok(), "{}", holds(body.as_bytes()).unwrap_err());
+        prop_assert!(holds_typed(body.as_bytes()).is_ok(), "{}", holds_typed(body.as_bytes()).unwrap_err());
+        prop_assert!(holds_line(body.as_bytes()).is_ok(), "{}", holds_line(body.as_bytes()).unwrap_err());
+    }
+}
+
+/// The measured cost of each element shape, beside what the estimate
+/// charges for it (run with `--ignored --nocapture` when revisiting the
+/// constants).
+#[test]
+#[ignore = "manual calibration of inference::json_weight's constants"]
+fn calibration() {
+    for item in [
+        "0",
+        "\"a\"",
+        "[]",
+        "[0]",
+        "{}",
+        "{\"a\":0}",
+        "{\"a\":{\"b\":0}}",
+        "[[0]]",
+    ] {
+        for n in [1000, 1025, 20_000, 32_769] {
+            let body = format!("[{}]", vec![item; n].join(","));
+            let (peak, _) = parse_peak(body.as_bytes());
+            let over_bytes = peak.saturating_sub(body.len());
+            println!(
+                "{item:16} n={n:6}  parse {:7.1} B/item beyond the bytes, estimate {:7.1} B/item",
+                over_bytes as f64 / n as f64,
+                estimate(body.as_bytes()) as f64 / n as f64
+            );
+        }
+    }
+}
+
+/// The walk's time per MiB on text, on dense structure and on long strings
+/// (run in a release build with `--ignored --nocapture`).
+#[test]
+#[ignore = "manual measurement of the walk's cost"]
+fn timing() {
+    let mib = 1024 * 1024;
+    let text = serde_json::to_vec(
+        &json!({"messages":[{"role":"user","content":"word ".repeat(2 * mib / 5)}]}),
+    )
+    .unwrap();
+    let numbers = format!("[{}]", vec!["0"; mib].join(",")).into_bytes();
+    let objects = format!("[{}]", vec!["{\"a\":0}"; mib / 4].join(",")).into_bytes();
+    for (name, body) in [("text", text), ("numbers", numbers), ("objects", objects)] {
+        let runs = 50;
+        let start = std::time::Instant::now();
+        let mut total = 0;
+        for _ in 0..runs {
+            total += std::hint::black_box(estimate(std::hint::black_box(&body)));
+        }
+        let size = body.len() as f64 / mib as f64;
+        let per_mib = start.elapsed().as_secs_f64() * 1e6 / runs as f64 / size;
+        let start = std::time::Instant::now();
+        for _ in 0..runs {
+            drop(std::hint::black_box(serde_json::from_slice::<Value>(
+                std::hint::black_box(&body),
+            )));
+        }
+        let parse = start.elapsed().as_secs_f64() * 1e6 / runs as f64 / size;
+        println!(
+            "{name:8} {size:.2} MiB: walk {per_mib:7.0} µs per MiB, serde_json parse {parse:7.0} µs per MiB ({total})"
+        );
+    }
+}

@@ -1549,3 +1549,6 @@ async fn messages_canary(pool: PgPool, provider: &'static str) {
     );
     assert_nowhere(&w, &data, &capture).await;
 }
+
+#[path = "json_structure_http_tests.rs"]
+mod json_structure;

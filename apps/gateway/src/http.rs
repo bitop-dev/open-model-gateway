@@ -17,6 +17,10 @@ use tracing::Instrument;
 use uuid::Uuid;
 
 mod image_body_scan;
+pub(crate) mod json_body;
+mod json_structure;
+pub use json_structure::BodyWeight;
+pub(crate) use json_structure::inner_refusal;
 mod read_deadline;
 
 use crate::{
@@ -119,7 +123,14 @@ fn build_router(
 fn inference_routes(store: &Store) -> Router<Store> {
     Router::new()
         .route("/v1/models", get(models))
-        .route("/v1/embeddings", post(embeddings::handle))
+        .route(
+            "/v1/embeddings",
+            json_post(
+                embeddings::handle,
+                crate::inference::image_buffer::TEXT_BODY_BYTES,
+                false,
+            ),
+        )
         // Explicitly unsupported realtime companions (never minted upstream).
         .route(
             "/v1/realtime/client_secrets",
@@ -186,10 +197,27 @@ async fn image_input_body(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
     let (mut parts, body) = request.into_parts();
-    match buffer.admit(length) {
+    // Authentication ran first (`image_input_routes`): the key is known.
+    let Some(key) = parts
+        .extensions
+        .get::<crate::auth::Principal>()
+        .map(|principal| principal.key_id)
+    else {
+        return shaped(crate::protocols::invalid_request());
+    };
+    match buffer.admit(length, key) {
         Admission::Text => {
+            // These routes parse only JSON, and their extractor
+            // (`http::json_body`) refuses any other type unread: such a body
+            // goes to it unmeasured.
+            if !json_content_type(&parts.headers) {
+                return next.run(Request::from_parts(parts, body)).await;
+            }
             let body = axum::body::Body::new(http_body_util::Limited::new(body, TEXT_BODY_BYTES));
-            next.run(Request::from_parts(parts, body)).await
+            match json_structure::measured(parts, body, TEXT_BODY_BYTES).await {
+                json_structure::Measured::Run(request) => next.run(request).await,
+                json_structure::Measured::Refused(response) => response,
+            }
         }
         Admission::TooLarge => {
             METRICS.image_input_refused("too_large");
@@ -197,6 +225,10 @@ async fn image_input_body(
         }
         Admission::Busy => {
             METRICS.image_input_refused("busy");
+            shaped(crate::protocols::image_input_busy())
+        }
+        Admission::KeyShare => {
+            METRICS.image_input_refused("key_share");
             shaped(crate::protocols::image_input_busy())
         }
         // Refused as the handler's JSON extractor would refuse it, before a
@@ -233,15 +265,23 @@ async fn image_input_body(
                     return shaped(response);
                 }
             };
-            let outside = if anthropic {
-                image_body_scan::outside_messages_images(&bytes)
+            // One pass: the bytes outside its image data, and the structure
+            // it may parse into (`json_structure`).
+            let scan = if anthropic {
+                image_body_scan::messages_body(&bytes)
             } else {
-                image_body_scan::outside_images(&bytes)
+                image_body_scan::chat_body(&bytes)
             };
-            if outside > TEXT_BODY_BYTES {
+            if scan.outside > TEXT_BODY_BYTES {
                 METRICS.image_input_refused("too_large");
                 return shaped(crate::protocols::payload_too_large());
             }
+            if let Some(response) = json_structure::refusal(parts.uri.path(), scan.structure) {
+                return response;
+            }
+            parts
+                .extensions
+                .insert(json_structure::BodyWeight(scan.structure));
             let body = axum::body::Body::from(bytes);
             next.run(Request::from_parts(parts, body))
                 .await
@@ -293,13 +333,31 @@ impl http_body::Body for Holding {
     }
 }
 
+/// A POST route whose handler reads a JSON body, measured first
+/// (`json_structure::bound`, given the route's byte limit and whether the
+/// handler reads a body of any type as JSON). The measure wraps the handler
+/// alone: never a method's 405 fallback, and always after the router's
+/// authentication, so no body is read for a request that is not let in or
+/// that no handler reads.
+fn json_post<H, T>(handler: H, limit: usize, any_type: bool) -> MethodRouter<Store>
+where
+    H: axum::handler::Handler<T, Store>,
+    T: 'static,
+{
+    post(axum::handler::Handler::layer(
+        handler,
+        middleware::from_fn_with_state((limit, any_type), json_structure::bound),
+    ))
+}
+
 /// The non-generation workloads, each with its own configured body cap.
 fn workload_routes(store: &Store, engine: &Engine) -> Router<Store> {
     // Non-generation workloads carry their own configured body caps instead
     // of the shared 2 MiB limit (transcriptions also cap the file part).
     let limits = engine.limits().workloads;
+    let bytes = |kind: WorkloadKind| limits.body_bytes(kind).expect("workload body cap");
     let capped = |kind: WorkloadKind, route: MethodRouter<Store>| -> MethodRouter<Store> {
-        let bytes = limits.body_bytes(kind).expect("workload body cap");
+        let bytes = bytes(kind);
         route
             .layer::<_, std::convert::Infallible>(DefaultBodyLimit::max(bytes))
             .layer(RequestBodyLimitLayer::new(bytes))
@@ -307,15 +365,24 @@ fn workload_routes(store: &Store, engine: &Engine) -> Router<Store> {
     Router::new()
         .route(
             "/v1/images/generations",
-            capped(WorkloadKind::Images, post(images::handle)),
+            capped(
+                WorkloadKind::Images,
+                json_post(images::handle, bytes(WorkloadKind::Images), false),
+            ),
         )
         .route(
             "/v1/rerank",
-            capped(WorkloadKind::Rerank, post(rerank::handle)),
+            capped(
+                WorkloadKind::Rerank,
+                json_post(rerank::handle, bytes(WorkloadKind::Rerank), false),
+            ),
         )
         .route(
             "/v1/systemone",
-            capped(WorkloadKind::Systemone, post(systemone::handle)),
+            capped(
+                WorkloadKind::Systemone,
+                json_post(systemone::handle, bytes(WorkloadKind::Systemone), false),
+            ),
         )
         .route(
             "/v1/audio/transcriptions",
@@ -326,7 +393,10 @@ fn workload_routes(store: &Store, engine: &Engine) -> Router<Store> {
         )
         .route(
             "/v1/audio/speech",
-            capped(WorkloadKind::AudioSpeech, post(audio::speech)),
+            capped(
+                WorkloadKind::AudioSpeech,
+                json_post(audio::speech, bytes(WorkloadKind::AudioSpeech), false),
+            ),
         )
         .route_layer(middleware::from_fn(client_labels))
         .route_layer(middleware::from_fn_with_state(
@@ -353,7 +423,9 @@ fn job_routes(store: &Store) -> Router<Store> {
             "/v1/videos",
             cap(
                 job_limits.video_body_bytes,
-                post(videos::create).get(videos::list),
+                // The video handler reads a loosely typed body as JSON (its
+                // media type before any `;`): measured whatever its type.
+                json_post(videos::create, job_limits.video_body_bytes, true).get(videos::list),
             ),
         )
         .route(
@@ -373,7 +445,10 @@ fn job_routes(store: &Store) -> Router<Store> {
         .route("/v1/files/{id}/content", cap(small, get(files::content)))
         .route(
             "/v1/batches",
-            cap(small, post(batches::create).get(batches::list)),
+            cap(
+                small,
+                json_post(batches::create, small, false).get(batches::list),
+            ),
         )
         .route("/v1/batches/{id}", cap(small, get(batches::retrieve)))
         .route("/v1/batches/{id}/cancel", cap(small, post(batches::cancel)))
