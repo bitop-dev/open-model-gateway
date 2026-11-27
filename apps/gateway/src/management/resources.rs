@@ -833,11 +833,13 @@ pub(super) const ENABLED_ROUTE: &str = "d.enabled AND EXISTS(SELECT 1 FROM provi
 /// An enabled route whose connection profile serves at least one of its
 /// model's protocols (`providers::capabilities`, the table the inference path
 /// and route validation use). Routes accepted before that validation existed
-/// may be enabled yet unable to serve; they count as not serving.
+/// may be enabled yet unable to serve; they count as not serving, and so does
+/// a video model's route without video options (0097).
 pub(super) static SERVING_ROUTE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
-        "({ENABLED_ROUTE} AND {})",
-        crate::providers::capabilities::route_serves_sql()
+        "({ENABLED_ROUTE} AND {} AND NOT {})",
+        crate::providers::capabilities::route_serves_sql(),
+        super::deployment_video::WITHOUT_OPTIONS
     )
 });
 /// Any immutable price version makes a route priced; the latest version is pinned at admission.
@@ -850,17 +852,6 @@ pub(super) const DIRECT_WORKSPACES: &str = "(SELECT count(*) FROM workspace_mode
 /// model `m` through their default catalogs (every type when none does).
 /// Overrides and local/key limits are not considered.
 pub(super) const APPLICABLE_TYPE_TOKENS_PER_MINUTE: &str = "(SELECT min(t) FROM (SELECT tp.tokens_per_minute t FROM workspace_type_policies tp WHERE NOT EXISTS(SELECT 1 FROM workspace_type_catalogs wtc JOIN catalog_models cm ON cm.catalog_id=wtc.catalog_id WHERE cm.model_id=m.id) OR EXISTS(SELECT 1 FROM workspace_type_catalogs wtc JOIN catalog_models cm ON cm.catalog_id=wtc.catalog_id WHERE cm.model_id=m.id AND wtc.kind=tp.kind)) limits)";
-/// The latest price version's worst-case per-attempt token reservation.
-const ROUTE_TOKEN_CEILING: &str = "(SELECT dp.input_token_limit+dp.output_token_limit FROM deployment_prices dp WHERE dp.deployment_id=d.id ORDER BY dp.created_at DESC,dp.id DESC LIMIT 1)";
-/// Model metadata plus aggregate readiness counts. Connection labels never include credential references.
-/// `serving_routes` are enabled routes whose connection profile can serve the model;
-/// `unsupported_routes`/`unsupported_profiles` are the enabled ones that cannot.
-pub(super) fn model_json() -> String {
-    let serving = &*SERVING_ROUTE;
-    format!(
-        "jsonb_build_object('id',m.id,'public_name',m.public_name,'display_name',m.display_name,'description',m.description,'supported_protocols',m.supported_protocols,'enabled',m.enabled,'created_at',m.created_at,'readiness',jsonb_build_object('routes',(SELECT count(*) FROM deployments d WHERE d.model_id=m.id),'enabled_routes',(SELECT count(*) FROM deployments d WHERE d.model_id=m.id AND {ENABLED_ROUTE}),'priced_enabled_routes',(SELECT count(*) FROM deployments d WHERE d.model_id=m.id AND {ENABLED_ROUTE} AND {PRICED_ROUTE}),'serving_routes',(SELECT count(*) FROM deployments d WHERE d.model_id=m.id AND {serving}),'unsupported_routes',(SELECT count(*) FROM deployments d WHERE d.model_id=m.id AND {ENABLED_ROUTE} AND NOT {serving}),'unsupported_profiles',(SELECT coalesce(jsonb_agg(DISTINCT p.provider ORDER BY p.provider),'[]'::jsonb) FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id WHERE d.model_id=m.id AND {ENABLED_ROUTE} AND NOT {serving}),'type_tokens_per_minute',{APPLICABLE_TYPE_TOKENS_PER_MINUTE},'routes_over_token_limit',(SELECT count(*) FROM deployments d WHERE d.model_id=m.id AND {ENABLED_ROUTE} AND {ROUTE_TOKEN_CEILING}>{APPLICABLE_TYPE_TOKENS_PER_MINUTE}),'openrouter_free_routes',(SELECT count(*) FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id WHERE d.model_id=m.id AND {ENABLED_ROUTE} AND p.provider='openrouter' AND d.upstream_model LIKE '%:free'),'catalogs',(SELECT count(*) FROM catalog_models cm WHERE cm.model_id=m.id),'direct_workspaces',{DIRECT_WORKSPACES},'connections',(SELECT coalesce(jsonb_agg(jsonb_build_object('id',c.id,'name',c.name) ORDER BY c.name,c.id),'[]'::jsonb) FROM (SELECT p.id,p.name FROM provider_connections p WHERE EXISTS(SELECT 1 FROM deployments d WHERE d.model_id=m.id AND d.provider_connection_id=p.id) ORDER BY p.name,p.id LIMIT 20) c)))"
-    )
-}
 async fn deployments(
     State(s): State<Store>,
     Extension(u): Extension<ManagementPrincipal>,
@@ -902,7 +893,10 @@ async fn model(
         &s,
         &u,
         id,
-        &format!("SELECT {} FROM models m WHERE m.id=$1", model_json()),
+        &format!(
+            "SELECT {} FROM models m WHERE m.id=$1",
+            super::models_ux::model_json()
+        ),
     )
     .await
 }

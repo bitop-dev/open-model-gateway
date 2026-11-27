@@ -117,8 +117,8 @@ fn video_request() -> VideoRequest {
     VideoRequest {
         model: "company/video".into(),
         prompt: "a calm lake".into(),
-        seconds: 8,
-        size: VideoSize::P1280x720,
+        seconds: Some(8),
+        size: Some("1280x720".into()),
     }
 }
 fn video(status: &str) -> Value {

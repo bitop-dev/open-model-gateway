@@ -627,7 +627,7 @@ mod legacy {
             &self,
             d: &Deployment,
             id: &UpstreamId,
-        ) -> Result<(), InferenceError> {
+        ) -> Result<crate::jobs::types::VideoDeletion, InferenceError> {
             self.0.delete_video(d, id).await
         }
         async fn video_content(
@@ -652,7 +652,7 @@ mod legacy {
         let f = fixture(pool).await;
         video_setup(&f).await;
         let fake = Fake::default();
-        let jobs = jobs(&f, &fake, false);
+        let jobs = jobs(&f, &fake, false).await;
         // Create historical rows through the existing test-only provider, not
         // through the refusal-only public create operation.
         fake.push_video(upstream_video(JobState::Completed, Some(8)));
@@ -662,8 +662,13 @@ mod legacy {
             .unwrap();
         let id = client_id("video_", job.id);
         fake.push_video(upstream_video(JobState::Queued, Some(8)));
+        // Named no size: none is recorded (or sent), and it reads `null`.
+        let no_size = crate::jobs::types::VideoRequest {
+            size: None,
+            ..video_request()
+        };
         let queued = jobs
-            .create_video(f.principal, video_request(), uuid::Uuid::new_v4())
+            .create_video(f.principal, no_size, uuid::Uuid::new_v4())
             .await
             .unwrap();
         let queued_id = client_id("video_", queued.id);
@@ -1007,7 +1012,8 @@ fn inference_openapi_followup_video_multipart_matches_json_bounds() {
         "valid video multipart fields rejected"
     );
     for (field, value) in [
-        ("seconds", json!("5")),
+        ("seconds", json!("0")),
+        ("seconds", json!("3601")),
         ("size", json!("auto")),
         ("model", json!("m".repeat(201))),
         ("prompt", json!("p".repeat(32769))),

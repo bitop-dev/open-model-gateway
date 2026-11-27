@@ -138,9 +138,29 @@ impl ProviderAdapter for Fake {
         self.call("retrieve_video");
         self.next_video()
     }
-    async fn delete_video(&self, _: &Deployment, _: &UpstreamId) -> Result<(), InferenceError> {
+    async fn delete_video(
+        &self,
+        _: &Deployment,
+        _: &UpstreamId,
+    ) -> Result<VideoDeletion, InferenceError> {
         self.call("delete_video");
-        Ok(())
+        Ok(VideoDeletion::Deleted)
+    }
+    /// A finished video's bytes (`FAKE_VIDEO`).
+    async fn video_content(
+        &self,
+        _: &Deployment,
+        _: &UpstreamId,
+        _: VideoAsset,
+    ) -> Result<ContentStream, InferenceError> {
+        self.call("video_content");
+        Ok(ContentStream {
+            content_type: "video/mp4",
+            content_length: Some(FAKE_VIDEO.len() as u64),
+            body: Box::pin(futures_util::stream::iter([Ok(bytes::Bytes::from_static(
+                FAKE_VIDEO,
+            ))])),
+        })
     }
     async fn retrieve_batch(
         &self,
@@ -160,7 +180,17 @@ impl ProviderAdapter for Fake {
     }
 }
 
-pub(crate) fn jobs(f: &Fixture, fake: &Fake, poll: bool) -> Jobs {
+/// What the fake provider answers for a finished video's content.
+pub(crate) const FAKE_VIDEO: &[u8] = b"fake mp4 bytes";
+/// A local, encrypted file store for job tests: one directory per test
+/// process (each test's database has its own rows and object keys).
+pub(crate) async fn test_files() -> crate::filestore::FileStoreRuntime {
+    static DIR: std::sync::LazyLock<tempfile::TempDir> =
+        std::sync::LazyLock::new(|| tempfile::tempdir().unwrap());
+    super::batch_tests::durable::local_files(DIR.path()).await
+}
+/// Jobs with `fake` as their only provider and the test file store.
+pub(crate) async fn jobs(f: &Fixture, fake: &Fake, poll: bool) -> Jobs {
     let mut registry = ProviderRegistry::default();
     registry.register(Arc::new(fake.clone())).unwrap();
     Jobs::with(
@@ -171,16 +201,28 @@ pub(crate) fn jobs(f: &Fixture, fake: &Fake, poll: bool) -> Jobs {
             ..JobLimits::default()
         },
     )
+    .with_files(Some(test_files().await))
 }
-fn line(meter: Meter, amount: &str, batch: u64) -> Value {
+pub(crate) fn line(meter: Meter, amount: &str, batch: u64) -> Value {
     json!({"meter":meter.as_str(),"microusd_per_batch":amount,"batch":batch,"unit_label":meter.unit_label(batch).unwrap(),"sku_label":"Line"})
 }
-fn na(meter: Meter) -> Value {
+pub(crate) fn na(meter: Meter) -> Value {
     json!({"meter":meter.as_str(),"not_applicable":true})
 }
-/// Per-second video price: 720p $0.10/s, 1792x1024 $0.50/s; tokens NA.
+/// Per-second video price: 720p sizes $0.10/s, the larger sizes $0.50/s; tokens NA. The
+/// route takes 4, 8 and 12 seconds (4 by default) and the four Sora sizes
+/// (its video options, 0097).
 pub(crate) async fn video_setup(f: &Fixture) {
     sqlx::query("UPDATE models SET supported_protocols=ARRAY['videos'] WHERE id=$1")
+        .bind(f.model)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE installation_settings SET file_video_enabled=true WHERE singleton")
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE deployments SET video_seconds='{4,8,12}',video_sizes='{720x1280,1280x720,1024x1792,1792x1024}' WHERE model_id=$1")
         .bind(f.model)
         .execute(&f.store.pool)
         .await
@@ -191,20 +233,25 @@ pub(crate) async fn video_setup(f: &Fixture) {
         .map(na)
         .collect();
     lines.push(line(Meter::Requests, "0", 1));
-    let mut v = line(Meter::OutputVideoSecondsMs, "100000", 1000);
-    v["variant"] = json!("720x1280");
-    lines.push(v);
-    let mut v = line(Meter::OutputVideoSecondsMs, "500000", 1000);
-    v["variant"] = json!("1792x1024");
-    lines.push(v);
+    // Every size the route lists has a rate (a video route must price each).
+    for (size, rate) in [
+        ("720x1280", "100000"),
+        ("1280x720", "100000"),
+        ("1024x1792", "500000"),
+        ("1792x1024", "500000"),
+    ] {
+        let mut v = line(Meter::OutputVideoSecondsMs, rate, 1000);
+        v["variant"] = json!(size);
+        lines.push(v);
+    }
     sqlx::query("INSERT INTO deployment_prices(id,deployment_id,input_token_limit,output_token_limit,pricing_version,price_lines,max_units) VALUES($1,$2,0,1,3,$3,'{}')").bind(Uuid::new_v4()).bind(f.deployment).bind(json!(lines)).execute(&f.store.pool).await.unwrap();
 }
 pub(crate) fn video_request() -> VideoRequest {
     VideoRequest {
         model: "company/smart".into(),
         prompt: "a calm lake".into(),
-        seconds: 8,
-        size: VideoSize::P720x1280,
+        seconds: Some(8),
+        size: Some("720x1280".into()),
     }
 }
 pub(crate) fn upstream_video(state: JobState, seconds: Option<u32>) -> UpstreamVideo {
@@ -232,7 +279,7 @@ async fn video_reserves_highest_tier_and_settles_actual_seconds_once(pool: PgPoo
     let f = fixture(pool).await;
     video_setup(&f).await;
     let fake = Fake::default();
-    let j = jobs(&f, &fake, true);
+    let j = jobs(&f, &fake, true).await;
     fake.push_video(upstream_video(JobState::Queued, Some(8)));
     let request_id = Uuid::new_v4();
     let job = j
@@ -316,7 +363,7 @@ async fn unknown_or_failed_video_keeps_the_hold(pool: PgPool) {
     let f = fixture(pool).await;
     video_setup(&f).await;
     let fake = Fake::default();
-    let j = jobs(&f, &fake, false);
+    let j = jobs(&f, &fake, false).await;
     // Completed without a reported duration: unknown, hold retained.
     fake.push_video(upstream_video(JobState::InProgress, None));
     let a = Uuid::new_v4();
@@ -381,7 +428,7 @@ async fn jobs_are_private_to_their_workspace(pool: PgPool) {
     let f = fixture(pool).await;
     video_setup(&f).await;
     let fake = Fake::default();
-    let j = jobs(&f, &fake, true);
+    let j = jobs(&f, &fake, true).await;
     fake.push_video(upstream_video(JobState::Queued, Some(8)));
     let job = j
         .create_video(f.principal, video_request(), Uuid::new_v4())
@@ -451,7 +498,7 @@ async fn the_state_machine_is_forward_only_and_identity_immutable(pool: PgPool) 
     let f = fixture(pool).await;
     video_setup(&f).await;
     let fake = Fake::default();
-    let j = jobs(&f, &fake, true);
+    let j = jobs(&f, &fake, true).await;
     fake.push_video(upstream_video(JobState::InProgress, Some(8)));
     let job = j
         .create_video(f.principal, video_request(), Uuid::new_v4())
@@ -552,7 +599,8 @@ async fn http_video_routes_render_gateway_ids_and_scope_by_key(pool: PgPool) {
         crate::inference::EngineLimits::default(),
     )
     .unwrap();
-    let app = crate::http::router_with_engine(f.store.clone(), None, engine);
+    let app = crate::http::router_with_engine(f.store.clone(), None, engine)
+        .layer(axum::Extension(test_files().await));
     let mine = bearer(&f, f.principal.workspace_id).await;
     let theirs = bearer(&f, f.team.workspace_id).await;
     fake.push_video(upstream_video(JobState::Queued, Some(8)));
@@ -617,9 +665,18 @@ async fn http_video_routes_render_gateway_ids_and_scope_by_key(pool: PgPool) {
         400
     );
     let (status, body) = send(&app, "POST", "/v1/videos", &mine, Some(json!({"model":"company/smart","prompt":"x","input_reference":{"image_url":"https://x"}}))).await;
+    // An option the gateway does not take is refused by name.
     assert_eq!(
-        (status.as_u16(), body["error"]["code"].as_str()),
-        (400, Some("unsupported_capability"))
+        (
+            status.as_u16(),
+            body["error"]["code"].as_str(),
+            body["error"]["param"].as_str()
+        ),
+        (
+            400,
+            Some("unsupported_video_parameter"),
+            Some("input_reference")
+        )
     );
     // Batch routes answer explicitly too.
     // Without the file store, batches are refused explicitly.
@@ -656,7 +713,7 @@ async fn video_jobs_are_exempt_from_per_minute_limits(pool: PgPool) {
     let f = fixture(pool).await;
     video_setup(&f).await;
     let fake = Fake::default();
-    let j = jobs(&f, &fake, false);
+    let j = jobs(&f, &fake, false).await;
     // One request per minute and at once: both videos still start (job slots).
     f.policy("workspace_local_policies", Some(1), Some(1), Some(1), None)
         .await;
@@ -709,7 +766,7 @@ async fn concurrent_job_admissions_never_exceed_the_limit(pool: PgPool) {
     let f = fixture(pool).await;
     video_setup(&f).await;
     let fake = Fake::default();
-    let j = jobs(&f, &fake, false);
+    let j = jobs(&f, &fake, false).await;
     for _ in 0..6 {
         fake.push_video(upstream_video(JobState::Queued, Some(8)));
     }
@@ -750,7 +807,7 @@ async fn video_without_a_supported_provider_is_refused_before_admission(pool: Pg
     {
         Err(JobError::Conflict(code, message)) => {
             assert_eq!(code, "unsupported_capability");
-            assert!(message.contains("2026-09-24") && message.contains("OpenRouter"));
+            assert_eq!(message, crate::jobs::video::NO_VIDEO_PROVIDER);
         }
         other => panic!("expected an explicit refusal, got {:?}", other.map(|_| ())),
     }
@@ -772,7 +829,7 @@ async fn object_visibility_matrix_for_video_jobs(pool: PgPool) {
     let f = fixture(pool).await;
     video_setup(&f).await;
     let fake = Fake::default();
-    let j = jobs(&f, &fake, false);
+    let j = jobs(&f, &fake, false).await;
     let t = team(&f).await;
     for mode in ["member", "workspace"] {
         t.mode(&f, mode).await;
@@ -907,7 +964,7 @@ async fn a_job_record_failing_before_the_provider_call_sends_nothing(pool: PgPoo
     let f = fixture(pool).await;
     video_setup(&f).await;
     let fake = Fake::default();
-    let j = jobs(&f, &fake, false);
+    let j = jobs(&f, &fake, false).await;
     sqlx::raw_sql(
         r#"CREATE FUNCTION job_record_fault_497() RETURNS trigger LANGUAGE plpgsql AS
              $$ BEGIN RAISE EXCEPTION 'job record fault'; END $$;
@@ -949,7 +1006,7 @@ async fn a_video_lease_that_cannot_be_extended_leaves_no_job_row(pool: PgPool) {
     video_setup(&f).await;
     refuse_lease_extensions(&f.store.pool).await;
     let fake = Fake::default();
-    let j = jobs(&f, &fake, false);
+    let j = jobs(&f, &fake, false).await;
     fake.push_video(upstream_video(JobState::Queued, Some(8)));
     let request_id = Uuid::new_v4();
     let handle = crate::db::diagnostics::Handle::new();
@@ -1001,7 +1058,7 @@ async fn a_failed_video_record_commit_sends_nothing_and_leaves_no_job(pool: PgPo
     sqlx::raw_sql("CREATE FUNCTION refuse_job_commit_640() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'commit refused'; END $$; CREATE CONSTRAINT TRIGGER refuse_job_commit_640 AFTER INSERT ON async_jobs DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION refuse_job_commit_640()")
         .execute(&f.store.pool).await.unwrap();
     let fake = Fake::default();
-    let j = jobs(&f, &fake, false);
+    let j = jobs(&f, &fake, false).await;
     fake.push_video(upstream_video(JobState::Queued, Some(8)));
     let request_id = Uuid::new_v4();
     let handle = crate::db::diagnostics::Handle::new();
@@ -1109,7 +1166,7 @@ async fn a_video_reconciled_during_the_provider_call_is_recorded_and_finishes(po
     let hold = Arc::new(FinalizeHold::default());
     hold.arm();
     fake.0.lock().unwrap().video_hold = Some(hold.clone());
-    let j = jobs(&f, &fake, false);
+    let j = jobs(&f, &fake, false).await;
     fake.push_video(upstream_video(JobState::Queued, Some(8)));
     let request_id = Uuid::new_v4();
     let create = j.create_video(f.principal, video_request(), request_id);
@@ -1151,7 +1208,7 @@ async fn video_observations_are_fenced_and_never_go_back(pool: PgPool) {
     let f = fixture(pool).await;
     video_setup(&f).await;
     let fake = Fake::default();
-    let j = jobs(&f, &fake, true);
+    let j = jobs(&f, &fake, true).await;
     fake.push_video(upstream_video(JobState::InProgress, Some(8)));
     let job = j
         .create_video(f.principal, video_request(), Uuid::new_v4())
@@ -1231,7 +1288,7 @@ async fn a_refused_video_observation_never_settles(pool: PgPool) {
     let f = fixture(pool).await;
     video_setup(&f).await;
     let fake = Fake::default();
-    let j = jobs(&f, &fake, true);
+    let j = jobs(&f, &fake, true).await;
     fake.push_video(upstream_video(JobState::InProgress, Some(8)));
     let job = j
         .create_video(f.principal, video_request(), Uuid::new_v4())
@@ -1335,7 +1392,7 @@ async fn a_record_failure_after_the_provider_accepts_leaves_a_tracked_job(pool: 
     .await
     .unwrap();
     let fake = Fake::default();
-    let j = jobs(&f, &fake, true);
+    let j = jobs(&f, &fake, true).await;
     fake.push_video(upstream_video(JobState::Queued, Some(8)));
     let request_id = Uuid::new_v4();
     let created = j
@@ -1424,7 +1481,7 @@ async fn a_video_create_that_sent_nothing_settles_as_a_known_zero(pool: PgPool) 
     let f = fixture(pool).await;
     video_setup(&f).await;
     let fake = Fake::default();
-    let j = jobs(&f, &fake, false);
+    let j = jobs(&f, &fake, false).await;
     fake.0
         .lock()
         .unwrap()
@@ -1488,7 +1545,7 @@ async fn a_video_create_with_an_unknown_outcome_keeps_its_hold(pool: PgPool) {
     let f = fixture(pool).await;
     video_setup(&f).await;
     let fake = Fake::default();
-    let j = jobs(&f, &fake, false);
+    let j = jobs(&f, &fake, false).await;
     fake.0
         .lock()
         .unwrap()
@@ -1534,7 +1591,7 @@ async fn an_idempotent_provider_gets_one_keyed_resend(pool: PgPool) {
             .create_failures
             .push_back((false, InferenceError::UpstreamUnavailable));
     }
-    let j = jobs(&f, &fake, false);
+    let j = jobs(&f, &fake, false).await;
     fake.push_video(upstream_video(JobState::Queued, Some(8)));
     let id = Uuid::new_v4();
     let job = j
@@ -1590,7 +1647,7 @@ async fn a_process_that_dies_during_the_create_leaves_a_job_that_ends_interrupte
     let hold = Arc::new(FinalizeHold::default());
     hold.arm();
     fake.0.lock().unwrap().video_hold = Some(hold.clone());
-    let j = jobs(&f, &fake, true);
+    let j = jobs(&f, &fake, true).await;
     fake.push_video(upstream_video(JobState::Queued, Some(8)));
     let id = Uuid::new_v4();
     let mut create = Box::pin(j.create_video(f.principal, video_request(), id));
@@ -1641,7 +1698,7 @@ async fn a_failed_create_whose_record_fails_is_settled_by_a_later_read(pool: PgP
     let f = fixture(pool).await;
     video_setup(&f).await;
     let fake = Fake::default();
-    let j = jobs(&f, &fake, false);
+    let j = jobs(&f, &fake, false).await;
     fake.0
         .lock()
         .unwrap()
@@ -1709,7 +1766,7 @@ async fn a_refused_resend_after_an_unknown_outcome_stays_unconfirmed(pool: PgPoo
             .create_failures
             .push_back((false, InferenceError::UpstreamRejected));
     }
-    let j = jobs(&f, &fake, false);
+    let j = jobs(&f, &fake, false).await;
     let id = Uuid::new_v4();
     assert_eq!(
         j.create_video(f.principal, video_request(), id).await.err(),
@@ -1835,7 +1892,7 @@ async fn no_poller_holds_a_video_while_its_create_runs(pool: PgPool) {
     let f = fixture(pool).await;
     video_setup(&f).await;
     let fake = Fake::default();
-    let j = jobs(&f, &fake, true);
+    let j = jobs(&f, &fake, true).await;
     let (execution, hold, create) =
         held_create(&f, &j, &fake, upstream_video(JobState::InProgress, Some(8))).await;
     let row = row_of(&f, execution).await;
@@ -1878,7 +1935,7 @@ async fn a_late_create_and_a_live_claim_never_both_write(pool: PgPool) {
     let f = fixture(pool).await;
     video_setup(&f).await;
     let fake = Fake::default();
-    let mut j = jobs(&f, &fake, true);
+    let mut j = jobs(&f, &fake, true).await;
     j.video_create_grace = TimeDelta::seconds(0);
     let (execution, hold, create) =
         held_create(&f, &j, &fake, upstream_video(JobState::Completed, Some(8))).await;
@@ -1929,7 +1986,7 @@ async fn a_create_answering_after_the_poller_ended_the_row_changes_nothing(pool:
     let f = fixture(pool).await;
     video_setup(&f).await;
     let fake = Fake::default();
-    let mut j = jobs(&f, &fake, true);
+    let mut j = jobs(&f, &fake, true).await;
     j.video_create_grace = TimeDelta::seconds(0);
     let (execution, hold, create) =
         held_create(&f, &j, &fake, upstream_video(JobState::InProgress, Some(8))).await;
@@ -1967,7 +2024,7 @@ async fn only_the_current_writer_ends_a_row_without_an_id(pool: PgPool) {
     let f = fixture(pool).await;
     video_setup(&f).await;
     let fake = Fake::default();
-    let mut j = jobs(&f, &fake, true);
+    let mut j = jobs(&f, &fake, true).await;
     j.video_create_grace = TimeDelta::seconds(0);
     let (execution, _hold, create) =
         held_create(&f, &j, &fake, upstream_video(JobState::InProgress, Some(8))).await;
@@ -2026,7 +2083,7 @@ async fn a_lost_settled_mark_is_restored_only_by_the_current_writer(pool: PgPool
     let f = fixture(pool).await;
     video_setup(&f).await;
     let fake = Fake::default();
-    let j = jobs(&f, &fake, true);
+    let j = jobs(&f, &fake, true).await;
     let (execution, _hold, create) =
         held_create(&f, &j, &fake, upstream_video(JobState::InProgress, Some(8))).await;
     std::mem::forget(create);
@@ -2107,7 +2164,7 @@ async fn a_writer_hold_keeps_a_takeover_out_until_it_ends(pool: PgPool) {
     let f = fixture(pool).await;
     video_setup(&f).await;
     let fake = Fake::default();
-    let mut j = jobs(&f, &fake, true);
+    let mut j = jobs(&f, &fake, true).await;
     j.video_create_grace = TimeDelta::seconds(0);
     let (_, row) = orphaned_video(&f, &j, &fake).await;
     let (_, a) = claim_due(&f.store, Uuid::new_v4(), 30.0, 60.0)
@@ -2165,7 +2222,7 @@ async fn an_expired_claim_writes_nothing_and_a_read_then_may(pool: PgPool) {
     let f = fixture(pool).await;
     video_setup(&f).await;
     let fake = Fake::default();
-    let mut j = jobs(&f, &fake, true);
+    let mut j = jobs(&f, &fake, true).await;
     j.video_create_grace = TimeDelta::seconds(0);
     let (execution, row) = orphaned_video(&f, &j, &fake).await;
     let (snapshot, a) = claim_due(&f.store, Uuid::new_v4(), 30.0, 60.0)
@@ -2201,7 +2258,7 @@ async fn a_video_without_an_id_past_its_poll_deadline_is_still_ended(pool: PgPoo
     let f = fixture(pool).await;
     video_setup(&f).await;
     let fake = Fake::default();
-    let mut j = jobs(&f, &fake, true);
+    let mut j = jobs(&f, &fake, true).await;
     j.video_create_grace = TimeDelta::seconds(0);
     let (execution, row) = orphaned_video(&f, &j, &fake).await;
     sqlx::query("UPDATE async_jobs SET poll_deadline_at=now()-interval '1 second' WHERE id=$1")
@@ -2228,7 +2285,7 @@ async fn an_observation_the_state_machine_did_not_take_settles_nothing(pool: PgP
     let f = fixture(pool).await;
     video_setup(&f).await;
     let fake = Fake::default();
-    let j = jobs(&f, &fake, true);
+    let j = jobs(&f, &fake, true).await;
     fake.push_video(upstream_video(JobState::InProgress, None));
     let created = j
         .create_video(f.principal, video_request(), Uuid::new_v4())
@@ -2266,7 +2323,7 @@ async fn concurrent_settlements_never_exhaust_the_pool(pool: PgPool) {
     let f = fixture(pool).await;
     video_setup(&f).await;
     let fake = Fake::default();
-    let mut j = jobs(&f, &fake, true);
+    let mut j = jobs(&f, &fake, true).await;
     let (execution, _hold, create) =
         held_create(&f, &j, &fake, upstream_video(JobState::InProgress, Some(8))).await;
     std::mem::forget(create);

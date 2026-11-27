@@ -35,9 +35,15 @@ describe("model readiness derivation (contract §2)", () => {
     // Older gateways without serving counts keep the enabled-route rule.
     expect(modelReadiness({ enabled: true, readiness: counts }).state).toBe("ready");
   });
-  it("shows video models as Provider API retired, whatever their routes (OpenAI Videos API shut down 2026-09-24)", () => {
-    expect(modelReadiness({ enabled: true, supported_protocols: ["videos"], readiness: counts })).toEqual({ state: "retired", warnings: ["provider_retired"] });
-    expect(modelReadiness({ enabled: true, supported_protocols: ["videos"] }).state).toBe("retired");
+  it("derives video models' readiness from their routes, like every other workload (#52)", () => {
+    expect(modelReadiness({ enabled: true, supported_protocols: ["videos"], readiness: counts }).state).toBe("ready");
+    expect(modelReadiness({ enabled: true, supported_protocols: ["videos"] }).state).toBe("unknown");
+    // A video route without video options serves nothing: the server does not count it as serving.
+    const unset = { enabled: true, supported_protocols: ["videos"], readiness: { ...counts, serving_routes: 0, routes_without_video_options: 1 } };
+    expect(modelReadiness(unset)).toEqual({ state: "not_serving", warnings: ["no_video_options"] });
+    expect(notServingReason(unset)).toMatch(/^Not serving: no route has video options/);
+    const one = { ...unset, readiness: { ...unset.readiness, enabled_routes: 2, priced_enabled_routes: 2, serving_routes: 1 } };
+    expect(modelReadiness(one)).toEqual({ state: "needs_attention", warnings: ["no_video_options"] });
     expect(readinessText.retired).toBe("Provider API retired");
     expect(modelReadiness({ enabled: true, supported_protocols: ["batches"], readiness: counts }).state).toBe("ready");
   });
@@ -105,14 +111,15 @@ describe("Add model form", () => {
     expect(protocolSupported("responses", undefined)).toBe(true); expect(protocolSupported("responses", "future-profile")).toBe(true);
     expect(workloadGroups.filter(g => workloadSupported(g.workload, "anthropic")).map(g => g.label)).toEqual(["Text"]);
     expect(workloadGroups.filter(g => !workloadSupported(g.workload, "openai")).map(g => g.label)).toEqual(["Rerank", "System One", "Video"]);
-    // Video has no supported provider on any connection, even an unknown profile.
-    expect(protocolSupported("videos", "future-profile")).toBe(false); expect(protocolSupported("videos", undefined)).toBe(false);
-    for (const profile of ["openai", "openrouter", "anthropic", undefined]) expect(workloadDisabledReason("videos", profile, "OpenAI")).toMatch(/^No supported provider yet\./);
+    // Video: only OpenAI-compatible connections serve it (OpenAI's own Videos API shut down 2026-09-24).
+    expect(protocolSupported("videos", "openai_compatible")).toBe(true); expect(protocolSupported("videos", undefined)).toBe(true);
+    for (const profile of ["openai", "openrouter", "anthropic", "vllm"]) expect(workloadDisabledReason("videos", profile, "OpenAI")).toBe("Not available on OpenAI");
+    expect(workloadDisabledReason("videos", "openai_compatible", "Video server")).toBeUndefined();
     expect(workloadDisabledReason("rerank", "openai", "OpenAI")).toBe("Not available on OpenAI"); expect(workloadDisabledReason("batches", "openai", "OpenAI")).toBeUndefined();
     expect(workloadGroups.filter(g => !workloadSupported(g.workload, "openrouter")).map(g => g.label)).toEqual(["Realtime audio", "Video", "Batch"]);
     // Local profiles: rerank where the server has a rerank API, System One where it serves TypeSafe's route.
     const local = (profile: string) => workloadGroups.filter(g => workloadSupported(g.workload, profile)).map(g => g.label);
-    expect(local("openai_compatible")).toEqual(["Text", "Embeddings", "Rerank", "System One"]);
+    expect(local("openai_compatible")).toEqual(["Text", "Embeddings", "Rerank", "System One", "Video"]);
     expect(local("vllm")).toEqual(["Text", "Embeddings", "Rerank"]); expect(local("sglang")).toEqual(["Text", "Embeddings", "Rerank"]);
     expect(local("ollama")).toEqual(["Text", "Embeddings", "System One"]);
     expect(workloadDisabledReason("rerank", "ollama", "Ollama")).toBe("Not available on Ollama"); expect(workloadDisabledReason("systemone", "vllm", "vLLM")).toBe("Not available on vLLM");

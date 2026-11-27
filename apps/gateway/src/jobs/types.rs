@@ -273,39 +273,8 @@ pub const FILE_PREFIX: &str = "file-";
 
 // ---------------------------------------------------------------- Video ----
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VideoSize {
-    P720x1280,
-    P1280x720,
-    P1024x1792,
-    P1792x1024,
-}
-impl VideoSize {
-    pub const DEFAULT: Self = Self::P720x1280;
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::P720x1280 => "720x1280",
-            Self::P1280x720 => "1280x720",
-            Self::P1024x1792 => "1024x1792",
-            Self::P1792x1024 => "1792x1024",
-        }
-    }
-    pub fn parse(s: &str) -> Option<Self> {
-        [
-            Self::P720x1280,
-            Self::P1280x720,
-            Self::P1024x1792,
-            Self::P1792x1024,
-        ]
-        .into_iter()
-        .find(|v| v.as_str() == s)
-    }
-    pub fn variant(self) -> MeterVariant {
-        MeterVariant::new(self.as_str()).expect("static variant")
-    }
-}
 /// A video size as `WIDTHxHEIGHT`, each 1 to 9999 without a leading zero
-/// (a route's sizes, 0097).
+/// (a route's sizes, 0097, and a request's `size`).
 pub fn valid_video_size(size: &str) -> bool {
     let side = |s: &str| {
         !s.is_empty()
@@ -318,19 +287,20 @@ pub fn valid_video_size(size: &str) -> bool {
 }
 /// The longest clip any route may accept (0097).
 pub const VIDEO_MAX_SECONDS: u32 = 3600;
-/// Allowed clip lengths in seconds (OpenAI: 4, 8, 12; default 4).
-pub const VIDEO_SECONDS: [u32; 3] = [4, 8, 12];
-pub const VIDEO_DEFAULT_SECONDS: u32 = 4;
 
-/// `POST /v1/videos` subset. No `Debug`: the prompt is content.
+/// `POST /v1/videos` subset, as the client sent it. No `Debug`: the prompt
+/// is content.
 #[derive(Clone)]
 pub struct VideoRequest {
     pub model: String,
     pub prompt: String,
-    /// Always explicit upstream (default applied by the frontend) so the
+    /// The clip length the client named. Once a route is chosen it is that
+    /// route's first listed length when the client named none
+    /// ([`VideoRoute::accepts`]), and it is always sent upstream, so the
     /// billed duration is known.
-    pub seconds: u32,
-    pub size: VideoSize,
+    pub seconds: Option<u32>,
+    /// The size the client named (`WIDTHxHEIGHT`); sent upstream only then.
+    pub size: Option<String>,
 }
 impl VideoRequest {
     pub fn validate(&self) -> Result<(), InferenceError> {
@@ -338,11 +308,79 @@ impl VideoRequest {
             || self.model.len() > 200
             || self.prompt.trim().is_empty()
             || self.prompt.len() > VIDEO_MAX_PROMPT_BYTES
-            || !VIDEO_SECONDS.contains(&self.seconds)
+            || self
+                .seconds
+                .is_some_and(|s| !(1..=VIDEO_MAX_SECONDS).contains(&s))
+            || self.size.as_deref().is_some_and(|s| !valid_video_size(s))
         {
             return Err(InferenceError::InvalidRequest);
         }
         Ok(())
+    }
+}
+
+/// The video types the gateway stores and serves as received.
+pub const VIDEO_OUTPUT_TYPES: [&str; 3] = ["video/mp4", "video/webm", "video/quicktime"];
+
+/// What a provider did with a delete of its copy of a video.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoDeletion {
+    /// Deleted now, or already gone (`404`).
+    Deleted,
+    /// The provider offers no delete (`405`): its copy stays until its own
+    /// expiry.
+    NotOffered,
+}
+
+/// A route's video options (deployments, 0097): the clip lengths it accepts
+/// (the first is used when a request names none) and the sizes it accepts
+/// (`None`: a request may not name one).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VideoRoute {
+    pub seconds: Vec<u32>,
+    pub sizes: Option<Vec<String>>,
+}
+/// The option of a request no route of its model takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoParameter {
+    Seconds,
+    Size,
+}
+impl VideoParameter {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Seconds => "seconds",
+            Self::Size => "size",
+        }
+    }
+    pub const fn field(self) -> crate::inference::error::FieldName {
+        match self {
+            Self::Seconds => crate::inference::error::FieldName::from_static("seconds"),
+            Self::Size => crate::inference::error::FieldName::from_static("size"),
+        }
+    }
+}
+impl VideoRoute {
+    /// The request as this route sends it (its length resolved), or the
+    /// option it does not take.
+    pub fn accepts(&self, request: &VideoRequest) -> Result<VideoRequest, VideoParameter> {
+        let seconds = match request.seconds {
+            Some(s) if self.seconds.contains(&s) => s,
+            Some(_) => return Err(VideoParameter::Seconds),
+            None => *self.seconds.first().ok_or(VideoParameter::Seconds)?,
+        };
+        if let Some(size) = &request.size
+            && !self
+                .sizes
+                .as_ref()
+                .is_some_and(|sizes| sizes.contains(size))
+        {
+            return Err(VideoParameter::Size);
+        }
+        Ok(VideoRequest {
+            seconds: Some(seconds),
+            ..request.clone()
+        })
     }
 }
 

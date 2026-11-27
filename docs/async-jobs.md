@@ -2,36 +2,40 @@
 
 The gateway proxies two kinds of long-running provider job:
 
-- **Video generation:** `POST /v1/videos`. **No supported provider at the moment** (see below).
+- **Video generation:** `POST /v1/videos`, on any server of the OpenAI video contract behind an approved OpenAI-compatible connection (see below).
 - **Batches:** `POST /v1/batches` from a gateway file (`purpose=batch`, [Files API](files-api.md)), for any model. They run natively on a provider batch API or line by line through the gateway. See [batches](batches.md); this page keeps what batches share with video jobs.
 
-A video job and a native batch are **one upstream attempt**, with one execution and one durable reservation, admitted when created and settled when the provider reports a terminal state. A gateway-run batch's lines are separate attempts with their own reservations ([batches](batches.md#pricing-and-budgets)). Migrations `0016_async_jobs.sql` and `0021_batch_engine.sql` store metadata only: never prompts, batch lines, outputs, `metadata` values, provider messages or media.
+A video job and a native batch are **one upstream attempt**, with one execution and one durable reservation, admitted when created and settled when the provider reports a terminal state. A gateway-run batch's lines are separate attempts with their own reservations ([batches](batches.md#pricing-and-budgets)). Migrations `0016_async_jobs.sql` and `0021_batch_engine.sql` store metadata only: never prompts, batch lines, `metadata` values or provider messages. Batch results are stored, encrypted, in the gateway's [file store](files-api.md), never in the database.
 
-This page describes the current source. It is mock-tested. No live video request has been made. Batches had one small capped live check (see [batches](batches.md)).
+This page describes the current source. It is mock-tested (video: a mock server of the OpenAI video contract behind a running gateway and poller). No live video request has been made. Batches had one small capped live check (see [batches](batches.md)).
 
-> **Video: no supported provider.** OpenAI shut down the Sora 2 models and the Videos API on 2026-09-24, with no replacement ([OpenAI video generation guide](https://developers.openai.com/api/docs/guides/video-generation)). The gateway's video adapter targeted that API, so OpenAI connections no longer offer the `videos` protocol:
+> **Video: the OpenAI video contract on OpenAI-compatible connections (#52).** OpenAI shut down the Sora 2 models and its own Videos API on 2026-09-24, so OpenAI connections no longer offer `videos`; jobs created before then remain readable from gateway records. Any other server of the same contract (`POST /videos`, `GET /videos/{id}`, `GET /videos/{id}/content`, `DELETE /videos/{id}`) is served through an approved `openai_compatible` connection ([providers](provider-adapters.md)):
 >
-> - `POST /v1/videos` validates the request, then returns **400 `unsupported_capability`** ("Video generation has no supported provider …") before admission. No job, execution or hold is created, and nothing is sent upstream.
-> - Add model shows the **Video** type as disabled ("No supported provider yet") on every connection. Existing video models show readiness **Provider API retired**.
-> - Jobs created before the shutdown remain readable from gateway records. Refreshing or downloading them calls the retired API and fails; their holds follow the usual lease rules (unknown, retained).
-> - The job infrastructure stays: ids, ownership, the state machine, video-seconds pricing and settlement are unchanged and covered by tests with a fake provider. **An OpenRouter video adapter is planned** (its API uses `duration`, `resolution`, `aspect_ratio` and `polling_url`).
+> - **Each route states what it accepts** (its video options, set by a Platform Admin on the route: migration 0097): the clip lengths, the first of them used when a request names none, and the sizes (none listed: a request may not name a size). A route without options serves no video, and a video model none of whose routes has them reads Not serving. Requests are matched against the caller's own routes of the model (enabled, offered to its workspace and allowed to its key): a length or size none of them takes is refused before admission with **400 `unsupported_video_parameter`** and `param` `seconds` or `size`, and a model none of whose routes has options answers **400 `unsupported_capability`**. The options are read again under the catalog lock when the request is admitted. Nothing is sent and no job or hold is created.
+> - **Other options are refused by name:** a field other than `model`, `prompt`, `seconds` and `size` (OpenAI's `input_reference`, or `quality`, `seed`, `audio`, `aspect_ratio` and the like) is refused with **400 `unsupported_video_parameter`**, `param` naming it; nothing is dropped.
+> - **A video route must price video seconds:** the route's latest price must be pricing v3 with a `output_video_seconds_ms` rate for every size the request may produce (the size it names, or each size the route lists when it names none; a line without a size covers any size). Otherwise the request is refused before admission with **400 `video_price_missing`**, budgeted or not ("missing rates are not zero").
+> - **What is sent:** the length is always sent, so the billed duration is known; `size` only when the request named one (the job then records it; otherwise its `size` reads `null`).
+> - **Settlement** is from the seconds the server reports for the finished video, priced per second at the size's rate: the size the request named, or the size the server reports when the request named none (the line without a size when it reports none). A reported size that differs from the named one, or that the route does not list, keeps the hold with the cost unknown, as a longer clip than requested does; a shorter clip is billed as reported. A server that reports no seconds leaves the cost unknown, and the hold is kept.
+> - **Content** comes from the server: `GET /v1/videos/{id}/content` streams it as the server sends it (`video/mp4`, `video/webm` or `video/quicktime` as labeled, any other label as `application/octet-stream`, with `X-Content-Type-Options: nosniff`) while the server keeps it. The gateway does not store finished videos yet.
+> - **`expires_at`** is the server's expiry of its own copy, as it reports it; content is available only until then.
+> - **Delete** asks the server to delete its copy, then removes the record: `upstream_deleted` is `true` when the server deleted it or no longer had it (`404`), and `false` when it offers no delete (`405`), whose copy then stays until its own expiry. A deleted video is `404 not_found` from then on, to `GET` as well.
 
 ## What is supported
 
 | Route | Behavior |
 | --- | --- |
-| `POST /v1/videos` | Multipart (as the official SDKs send it) or JSON. Fields: `model`, `prompt` (≤ 32 KiB), `seconds` (`4`, `8` or `12`; default 4) and `size` (`720x1280` (default), `1280x720`, `1024x1792` or `1792x1024`). The gateway always sends `seconds` and `size` upstream, so the billed duration and resolution are known. |
+| `POST /v1/videos` | Multipart (as the official SDKs send it) or JSON. Fields: `model`, `prompt` (≤ 32 KiB), `seconds` (1 to 3600, among the lengths its routes accept; default the chosen route's first) and `size` (`WIDTHxHEIGHT`, among the sizes its routes accept). `seconds` is always sent upstream, `size` only when named. |
 | `GET /v1/videos`, `GET /v1/videos/{id}` | Lists this workspace's jobs; `after`, `limit` 1–100 and `order` are supported. A single read refreshes from the provider until the job is settled. |
-| `GET /v1/videos/{id}/content?variant=video\|thumbnail\|spritesheet` | Available for completed jobs only. Streamed through unbuffered, with allowlisted media types. |
-| `DELETE /v1/videos/{id}` | Finished jobs only (completed or failed), because the accounting of a running job is still open. |
+| `GET /v1/videos/{id}/content?variant=video\|thumbnail\|spritesheet` | Completed jobs only, streamed from the server unbuffered, with allowlisted media types. |
+| `DELETE /v1/videos/{id}` | Finished jobs only (completed or failed), because the accounting of a running job is still open. Asks the server to delete its copy; `upstream_deleted` is `false` when the server offers no delete (`405`). |
 | `/v1/files` | The gateway-owned [Files API](files-api.md): `purpose=batch` uploads are stored (encrypted) in the gateway's file store; batch output and error files appear there as `batch_output`. |
 | `/v1/batches` | Create, retrieve, list and cancel for `/v1/chat/completions`, `/v1/responses`, `/v1/embeddings` and `/v1/messages` lines; see [batches](batches.md). |
 
 **Not supported** (each returns an explicit `unsupported_capability` or `invalid_request_error`):
 
-- Video: `input_reference`, remix, edits, extensions and characters.
+- Video: `input_reference` and any other option than `model`, `prompt`, `seconds` and `size` (refused by name), remix, edits, extensions and characters.
 - Batch `output_expires_after`, and batch lines the endpoint itself rejects (streaming, `n > 1`, unsupported fields): see [batches](batches.md#validation-report).
-- Video on any provider, for now (see above). OpenRouter video is planned; OpenRouter has no Batch API.
+- Video on OpenRouter: planned (its API has another shape and reports a cost, not seconds); OpenRouter has no Batch API.
 
 ## Identity, ownership and privacy
 
@@ -82,7 +86,7 @@ While its create runs, and if its outcome is never recorded, a video job has no 
 | No outcome recorded 10 minutes after the create started (the process died, the client disconnected during the create, or the id could not be written) | `failed`, `create_interrupted`, at the first refresh after the grace (the poller or a GET) | unknown, hold kept |
 | The record itself failed | no job row (a COMMIT whose acknowledgement was lost may leave one; it is ended `create_failed` at once) | settled at 0 (known zero) |
 
-The create call is bounded at 60 s, and a record that took over 2 minutes is not followed by a create (it ends `create_failed`, known zero). A failed create records its attempt before its row ends, and the row is marked settled only if that record succeeded (otherwise a later refresh settles it, as unknown). **Resend:** at most one, in the same request, only when the adapter declares that its provider makes a create with the same key the same job (`ProviderAdapter::idempotent_video_create`), and only after an outcome-unknown failure, with the same key. The key is `omg-video-<job id>`: stable for the job, generated by the gateway, never taken from the client and not a secret. Nothing is resent from the poller or after a restart (the job table stores no prompt). No adapter that creates videos is registered today, so no resend happens in practice. A finished video without a provider id is deleted without a provider call; its content is never available. Without a poller (`GATEWAY_JOB_POLL_INTERVAL_SECONDS=0`) and without reads, such a job stays `queued` and lease reconciliation keeps its hold as unknown at the poll deadline plus grace.
+The create call is bounded at 60 s, and a record that took over 2 minutes is not followed by a create (it ends `create_failed`, known zero). A failed create records its attempt before its row ends, and the row is marked settled only if that record succeeded (otherwise a later refresh settles it, as unknown). **Resend:** at most one, in the same request, only when the adapter declares that its provider makes a create with the same key the same job (`ProviderAdapter::idempotent_video_create`), and only after an outcome-unknown failure, with the same key. The key is `omg-video-<job id>`: stable for the job, generated by the gateway, never taken from the client and not a secret. Nothing is resent from the poller or after a restart (the job table stores no prompt). The OpenAI-compatible adapter does not declare idempotent creates, so its creates are never resent. A finished video without a provider id is deleted without a provider call; its content is never available. Without a poller (`GATEWAY_JOB_POLL_INTERVAL_SECONDS=0`) and without reads, such a job stays `queued` and lease reconciliation keeps its hold as unknown at the poll deadline plus grace.
 
 **Writers.** A video row has three kinds of writer (`store::Observer`), and every write to it checks its writer in the same statement:
 
@@ -142,7 +146,7 @@ Failures back off per job, up to 32 × the interval. With the poller disabled, v
 
 ## Model setup and grants
 
-- **Add model:** the **Video** and **Batch** types each have one protocol (`videos`, `batches`). A Batch model is no longer needed: any chat or embeddings model can be batched, and a Batch model runs Chat Completions natively only. Video is disabled on every connection ("No supported provider yet"). The price editor shows the video-seconds meter with resolution tiers for video models, and token meters for batch models.
+- **Add model:** the **Video** and **Batch** types each have one protocol (`videos`, `batches`). A Batch model is no longer needed: any chat or embeddings model can be batched, and a Batch model runs Chat Completions natively only. Video can be chosen on `openai_compatible` connections only. A video route serves once a Platform Admin sets its video options (the clip lengths and sizes it accepts) with the route's PATCH; until then the model reads Not serving, and there is no form for the options yet. The price editor shows the video-seconds meter with resolution tiers for video models, and token meters for batch models.
 - **Runtime grants** (`deploy/staging/runtime-grants.sql`): `SELECT`/`INSERT` on `async_jobs` and `async_job_files`, `UPDATE` of their state columns only, `UPDATE(lease_expires_at)` on reservations and `EXECUTE` on `valid_upstream_job_id`. No `DELETE` or `TRUNCATE`.
 - **Batch engine grants (0021):** see [batches](batches.md#storage-and-grants).
 - **Probes:** `verify-privileges.sql` and the ignored `runtime_privileges` test check these grants and run a video job, native batches and a gateway-run batch as the runtime role.

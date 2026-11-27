@@ -1,11 +1,12 @@
 //! OpenAI async jobs at the fixed origin (shapes from the official OpenAPI
 //! spec via openai-python, 2026-10-08):
-//! - Videos: `POST /videos` (multipart `model, prompt, seconds, size`; the
-//!   gateway builds the form itself and always sends explicit seconds/size),
-//!   `GET /videos/{id}`, `DELETE /videos/{id}`, `GET /videos/{id}/content`.
-//!   OpenAI shut down the Sora 2 models and this API on 2026-09-24, so the
-//!   adapter no longer offers the `videos` protocol: new jobs are refused
-//!   before admission. These calls remain for jobs created earlier.
+//! - Videos (the OpenAI video contract, [`VideoWire`]): `POST /videos`
+//!   (multipart `model, prompt, seconds` and `size` only when the request
+//!   named one; the gateway builds the form itself), `GET /videos/{id}`,
+//!   `DELETE /videos/{id}`, `GET /videos/{id}/content`. Served on
+//!   `openai_compatible` connections; OpenAI shut down its own API on
+//!   2026-09-24, so its adapter no longer offers `videos` and these calls
+//!   remain there only for jobs created earlier.
 //! - Native batches (`jobs::native`): `POST /files` (multipart
 //!   `purpose=batch` + a streamed JSONL `file` the gateway encodes), `POST
 //!   /batches`, `GET /batches/{id}`, `POST /batches/{id}/cancel`, `GET
@@ -110,9 +111,52 @@ fn timestamp(value: &Value) -> Option<i64> {
 
 // ---------------------------------------------------------------- Video ----
 
-/// The Sora family only; other upstream models are not this profile.
+/// The Sora family only: the OpenAI origin serves video only for jobs
+/// created before its Videos API shut down (2026-09-24). The generic contract
+/// is served by approved `openai_compatible` connections (`providers::local`).
 pub(super) fn supports_video(target: &Deployment, request: &VideoRequest) -> bool {
     target.upstream_model.starts_with("sora-") && request.validate().is_ok()
+}
+
+/// An OpenAI-contract video server: the OpenAI origin, or an approved
+/// `openai_compatible` connection. Requests carry its credential (when it
+/// has one) and are counted against its client.
+pub(crate) struct VideoWire<'a> {
+    pub client: &'a crate::egress::HttpClient,
+    /// The API base, ending in `/v1` (no trailing slash).
+    pub base: &'a str,
+    pub auth: Option<HeaderValue>,
+    pub kind: crate::egress::UpstreamClient,
+}
+impl VideoWire<'_> {
+    fn authorized(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.auth {
+            Some(auth) => request.header(header::AUTHORIZATION, auth.clone()),
+            None => request,
+        }
+    }
+}
+/// A transport failure of `kind`'s client, counted before any response.
+fn lost(kind: crate::egress::UpstreamClient, error: &reqwest::Error) -> InferenceError {
+    kind.lost_before_response(error);
+    if error.is_timeout() {
+        InferenceError::Timeout
+    } else {
+        InferenceError::UpstreamUnavailable
+    }
+}
+
+/// The OpenAI origin's wire for `target`.
+pub(super) fn openai_wire<'a>(
+    adapter: &'a OpenAiAdapter,
+    target: &Deployment,
+) -> Result<VideoWire<'a>> {
+    Ok(VideoWire {
+        client: &adapter.client,
+        base: &adapter.base,
+        auth: Some(authorization(adapter, target)?),
+        kind: crate::egress::UpstreamClient::Openai,
+    })
 }
 
 pub(super) fn parse_video(value: &Value) -> Result<UpstreamVideo> {
@@ -134,7 +178,7 @@ pub(super) fn parse_video(value: &Value) -> Result<UpstreamVideo> {
         Value::Number(n) => n.as_u64().and_then(|n| u32::try_from(n).ok()),
         _ => None,
     }
-    .filter(|n| (1..=3600).contains(n));
+    .filter(|n| (1..=VIDEO_MAX_SECONDS).contains(n));
     let error = match &value["error"] {
         Value::Null => None,
         Value::Object(e) => Some(ErrorCode::parse(
@@ -157,46 +201,47 @@ pub(super) fn parse_video(value: &Value) -> Result<UpstreamVideo> {
     })
 }
 
-pub(super) async fn create_video(
-    adapter: &OpenAiAdapter,
+/// `POST /videos`: the route's resolved length is always sent (the billed
+/// duration is then known); `size` only when the request named one.
+pub(crate) async fn create_video(
+    wire: &VideoWire<'_>,
     target: &Deployment,
     request: VideoRequest,
 ) -> Result<UpstreamVideo> {
-    if !supports_video(target, &request) {
-        return Err(InferenceError::Unsupported);
+    let seconds = request.seconds.ok_or(InferenceError::Configuration)?;
+    if target.upstream_model.trim().is_empty() {
+        return Err(InferenceError::Configuration);
     }
-    let auth = authorization(adapter, target)?;
     let mut form = Multipart::new(request.prompt.len());
     form.text("model", &target.upstream_model);
     form.text("prompt", &request.prompt);
-    form.text("seconds", &request.seconds.to_string());
-    form.text("size", request.size.as_str());
+    form.text("seconds", &seconds.to_string());
+    if let Some(size) = &request.size {
+        form.text("size", size);
+    }
     let (content_type, body) = form.finish();
-    let response = adapter
-        .client
-        .post(format!("{}/videos", adapter.base))
-        .header(header::AUTHORIZATION, auth)
+    let response = wire
+        .authorized(wire.client.post(format!("{}/videos", wire.base)))
         .header(header::CONTENT_TYPE, content_type)
         .body(body)
         .send()
         .await
-        .map_err(transport_error)?;
+        .map_err(|e| lost(wire.kind, &e))?;
     parse_video(&read_object(response).await?)
 }
 
-pub(super) async fn retrieve_video(
-    adapter: &OpenAiAdapter,
-    target: &Deployment,
+pub(crate) async fn retrieve_video(
+    wire: &VideoWire<'_>,
     video: &UpstreamId,
 ) -> Result<UpstreamVideo> {
-    let auth = authorization(adapter, target)?;
-    let response = adapter
-        .client
-        .get(format!("{}/videos/{}", adapter.base, video.as_str()))
-        .header(header::AUTHORIZATION, auth)
+    let response = wire
+        .authorized(
+            wire.client
+                .get(format!("{}/videos/{}", wire.base, video.as_str())),
+        )
         .send()
         .await
-        .map_err(transport_error)?;
+        .map_err(|e| lost(wire.kind, &e))?;
     let parsed = parse_video(&read_object(response).await?)?;
     if &parsed.id != video {
         return Err(InferenceError::InvalidUpstream);
@@ -204,25 +249,34 @@ pub(super) async fn retrieve_video(
     Ok(parsed)
 }
 
-pub(super) async fn delete_video(
-    adapter: &OpenAiAdapter,
-    target: &Deployment,
+/// `DELETE /videos/{id}`. A server that answers `405 Method Not Allowed`
+/// offers no delete: its copy is left to its own expiry, and that is
+/// reported, never a pretended deletion.
+pub(crate) async fn delete_video(
+    wire: &VideoWire<'_>,
     video: &UpstreamId,
-) -> Result<()> {
-    let auth = authorization(adapter, target)?;
-    let response = adapter
-        .client
-        .delete(format!("{}/videos/{}", adapter.base, video.as_str()))
-        .header(header::AUTHORIZATION, auth)
+) -> Result<VideoDeletion> {
+    let response = wire
+        .authorized(
+            wire.client
+                .delete(format!("{}/videos/{}", wire.base, video.as_str())),
+        )
         .send()
         .await
-        .map_err(transport_error)?;
+        .map_err(|e| lost(wire.kind, &e))?;
+    if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+        return Ok(VideoDeletion::NotOffered);
+    }
+    // The server no longer has it (expired or deleted before): gone.
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(VideoDeletion::Deleted);
+    }
     let value = read_object(response).await?;
     object_kind(&value, "video.deleted")?;
     if value["deleted"] != json!(true) || &id(&value["id"])? != video {
         return Err(InferenceError::InvalidUpstream);
     }
-    Ok(())
+    Ok(VideoDeletion::Deleted)
 }
 
 /// Allowlisted pass-through media types (normalized).
@@ -234,61 +288,66 @@ fn content_type(response: &reqwest::Response, allowed: &[&'static str]) -> Resul
         .find(|t| *t == actual)
         .ok_or(InferenceError::InvalidUpstream)
 }
-fn stream(response: reqwest::Response, media: &'static str) -> ContentStream {
+fn stream(
+    kind: crate::egress::UpstreamClient,
+    response: reqwest::Response,
+    media: &'static str,
+) -> ContentStream {
     ContentStream {
         content_type: media,
         content_length: response.content_length(),
         body: Box::pin(
             response
                 .bytes_stream()
-                .map(|chunk| chunk.map_err(transport_error)),
+                .map(move |chunk| chunk.map_err(|e| lost(kind, &e))),
         ),
     }
 }
 
-pub(super) async fn video_content(
-    adapter: &OpenAiAdapter,
-    target: &Deployment,
+pub(crate) async fn video_content(
+    wire: &VideoWire<'_>,
     video: &UpstreamId,
     asset: VideoAsset,
 ) -> Result<ContentStream> {
-    let auth = authorization(adapter, target)?;
-    let response = adapter
-        .client
-        .get(format!(
+    let response = wire
+        .authorized(wire.client.get(format!(
             "{}/videos/{}/content?variant={}",
-            adapter.base,
+            wire.base,
             video.as_str(),
             asset.as_str()
-        ))
-        .header(header::AUTHORIZATION, auth)
+        )))
         .header(header::ACCEPT, "application/binary")
         .send()
         .await
-        .map_err(transport_error)?;
+        .map_err(|e| lost(wire.kind, &e))?;
     check_status(response.status())?;
-    let allowed: &[&'static str] = match asset {
-        VideoAsset::Video => &[
-            "video/mp4",
-            "application/octet-stream",
-            "application/binary",
-        ],
-        VideoAsset::Thumbnail | VideoAsset::Spritesheet => &[
-            "image/webp",
-            "image/jpeg",
-            "image/png",
-            "application/octet-stream",
-            "application/binary",
-        ],
+    let media = match asset {
+        // The video's own type, as the server labels it, when it is one the
+        // gateway stores ([`VIDEO_OUTPUT_TYPES`]); any other label (none, a
+        // generic binary type, a non-video type) is reported as
+        // `application/octet-stream`, which the gateway never stores.
+        VideoAsset::Video => media_type(&response)
+            .and_then(|m| VIDEO_OUTPUT_TYPES.iter().copied().find(|t| *t == m))
+            .unwrap_or("application/octet-stream"),
+        VideoAsset::Thumbnail | VideoAsset::Spritesheet => {
+            let media = content_type(
+                &response,
+                &[
+                    "image/webp",
+                    "image/jpeg",
+                    "image/png",
+                    "application/octet-stream",
+                    "application/binary",
+                ],
+            )?;
+            if media == "application/binary" {
+                "application/octet-stream"
+            } else {
+                media
+            }
+        }
     };
-    let media = content_type(&response, allowed)?;
-    // Generic binary types are labeled by the requested asset.
-    let media = match (media, asset) {
-        ("application/octet-stream" | "application/binary", VideoAsset::Video) => "video/mp4",
-        ("application/octet-stream" | "application/binary", _) => "application/octet-stream",
-        (m, _) => m,
-    };
-    Ok(stream(response, media))
+    Ok(stream(wire.kind, response, media))
 }
 
 // ---------------------------------------------------------------- Batch ----

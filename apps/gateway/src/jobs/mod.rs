@@ -189,6 +189,13 @@ pub enum JobError {
     Conflict(&'static str, &'static str),
     /// A client error with a specific code and fixed message (HTTP 400).
     Invalid(&'static str, &'static str),
+    /// A client error naming the request parameter it is about (HTTP 400):
+    /// code, message, parameter.
+    InvalidParameter(
+        &'static str,
+        &'static str,
+        crate::inference::error::FieldName,
+    ),
     /// Visible but not the caller's to change: delete or cancel needs the
     /// creating user, a workspace owner/admin or a service-account key (HTTP 403).
     Forbidden(&'static str, &'static str),
@@ -461,31 +468,48 @@ impl Jobs {
         model: &str,
         target: &Deployment,
         admission: &WorkloadAdmission,
+        video: Option<&crate::governance::VideoCheck>,
     ) -> Result<Attempt, InferenceError> {
         let upstream_model = (1..=512)
             .contains(&target.upstream_model.chars().count())
             .then(|| target.upstream_model.clone());
         // Covers the create call; extended to the poll deadline on acceptance.
         let lease_seconds = CALL_TIMEOUT.as_secs() as i64 + 60;
-        crate::governance::admit_workload_for_deployment(
-            &self.store,
-            &ExecutionStart {
-                id: execution,
-                root_request_id: execution,
-                attempt_number: 1,
-                principal,
-                deployment_id: target.id,
-                provider: target.provider.clone(),
-                model: model.to_owned(),
-                streamed: false,
-                upstream_model,
-                client: crate::inference::client::current(),
-            },
-            admission,
-            lease_seconds,
-            target,
-        )
-        .await?;
+        let start = ExecutionStart {
+            id: execution,
+            root_request_id: execution,
+            attempt_number: 1,
+            principal,
+            deployment_id: target.id,
+            provider: target.provider.clone(),
+            model: model.to_owned(),
+            streamed: false,
+            upstream_model,
+            client: crate::inference::client::current(),
+        };
+        match video {
+            Some(check) => {
+                crate::governance::admit_video_for_deployment(
+                    &self.store,
+                    &start,
+                    admission,
+                    lease_seconds,
+                    target,
+                    check,
+                )
+                .await?
+            }
+            None => {
+                crate::governance::admit_workload_for_deployment(
+                    &self.store,
+                    &start,
+                    admission,
+                    lease_seconds,
+                    target,
+                )
+                .await?
+            }
+        }
         Ok(Attempt {
             store: self.store.clone(),
             id: execution,
@@ -681,3 +705,5 @@ pub(crate) mod db_tests;
 mod schedule_db_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, feature = "integration-tests"))]
+mod video_contract_tests;

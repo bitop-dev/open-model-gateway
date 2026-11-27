@@ -147,3 +147,7 @@ pub(super) fn audit_field(action: &str, key: &str, value: &Value) -> bool {
 /// The route's video options as the API renders them: `null` when it serves
 /// no video.
 pub(super) const VIDEO_JSON: &str = "CASE WHEN d.video_seconds IS NULL THEN NULL ELSE jsonb_build_object('seconds',to_jsonb(d.video_seconds),'sizes',to_jsonb(d.video_sizes)) END";
+
+/// A route (`d`) of a video model without video options: it serves no video
+/// request, so it is not counted as serving (`resources::SERVING_ROUTE`).
+pub(super) const WITHOUT_OPTIONS: &str = "(d.video_seconds IS NULL AND EXISTS(SELECT 1 FROM models vm WHERE vm.id=d.model_id AND 'videos'=ANY(vm.supported_protocols)))";

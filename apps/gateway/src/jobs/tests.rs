@@ -94,7 +94,7 @@ fn upstream(state: JobState, seconds: Option<u32>) -> UpstreamVideo {
         state,
         progress: Some(100),
         seconds,
-        size: MeterVariant::new("1792x1024"),
+        size: MeterVariant::new("720x1280"),
         completed_at: None,
         expires_at: None,
         error: None,
@@ -104,26 +104,83 @@ fn upstream(state: JobState, seconds: Option<u32>) -> UpstreamVideo {
 #[test]
 fn video_settlement_is_exact_or_unknown() {
     let job = row("completed");
-    let s = video::settlement(&job, &upstream(JobState::Completed, Some(8))).unwrap();
+    let s = video::settlement(&job, &upstream(JobState::Completed, Some(8)), None).unwrap();
     assert_eq!(s.outcome, Outcome::Succeeded);
     let m = s.usage.meters.unwrap();
     assert_eq!(m.output_video_seconds_ms, Some(8000));
     assert_eq!((m.requests, m.output_images), (Some(1), Some(0)));
-    // The reported resolution is the billed variant.
-    assert_eq!(s.usage.output_image_variant.unwrap().as_str(), "1792x1024");
+    // The named size is the billed variant.
+    assert_eq!(s.usage.output_image_variant.unwrap().as_str(), "720x1280");
     // Unknown duration: settled as unknown (hold kept), never zero.
-    let s = video::settlement(&job, &upstream(JobState::Completed, None)).unwrap();
+    let s = video::settlement(&job, &upstream(JobState::Completed, None), None).unwrap();
     assert_eq!(s.usage.meters.unwrap().output_video_seconds_ms, None);
     // Longer than requested: evidence kept, attempt failed (hold kept).
-    let s = video::settlement(&job, &upstream(JobState::Completed, Some(12))).unwrap();
+    let s = video::settlement(&job, &upstream(JobState::Completed, Some(12)), None).unwrap();
     assert_eq!(
         (s.outcome, s.error),
         (Outcome::Failed, Some(InferenceError::InvalidUpstream))
     );
-    let s = video::settlement(&job, &upstream(JobState::Failed, None)).unwrap();
+    let s = video::settlement(&job, &upstream(JobState::Failed, None), None).unwrap();
     assert_eq!(s.outcome, Outcome::Failed);
     assert_eq!(s.usage, Usage::default());
-    assert!(video::settlement(&job, &upstream(JobState::InProgress, None)).is_none());
+    assert!(video::settlement(&job, &upstream(JobState::InProgress, None), None).is_none());
+}
+
+/// A size the provider reports that was not admitted keeps the hold; a
+/// shorter clip is billed as reported.
+#[test]
+fn a_video_is_billed_only_at_an_admitted_size() {
+    let failed = |s: Settlement| {
+        (s.outcome, s.error) == (Outcome::Failed, Some(InferenceError::InvalidUpstream))
+    };
+    let reported = |size: Option<&str>, seconds| UpstreamVideo {
+        size: size.and_then(MeterVariant::new),
+        ..upstream(JobState::Completed, seconds)
+    };
+    let named = row("completed");
+    // Another size than the one named: never the line without a size.
+    assert!(failed(
+        video::settlement(&named, &reported(Some("1792x1024"), Some(8)), None).unwrap()
+    ));
+    assert!(failed(
+        video::settlement(&named, &reported(Some("1792x1024"), None), None).unwrap()
+    ));
+    // The named size, or none reported: billed at the named size.
+    for size in [Some("720x1280"), None] {
+        let s = video::settlement(&named, &reported(size, Some(8)), None).unwrap();
+        assert_eq!(s.outcome, Outcome::Succeeded);
+        assert_eq!(s.usage.output_image_variant.unwrap().as_str(), "720x1280");
+    }
+    // Shorter than requested: billed as reported.
+    let s = video::settlement(&named, &reported(None, Some(4)), None).unwrap();
+    assert_eq!(
+        (s.outcome, s.usage.meters.unwrap().output_video_seconds_ms),
+        (Outcome::Succeeded, Some(4000))
+    );
+    // None named: a size the route lists is billed at its rate, another
+    // keeps the hold, and so does any size on a route without sizes.
+    let unnamed = JobRow {
+        video_size: None,
+        ..row("completed")
+    };
+    let sizes = vec!["1280x720".to_owned(), "720x1280".to_owned()];
+    let s =
+        video::settlement(&unnamed, &reported(Some("1280x720"), Some(8)), Some(&sizes)).unwrap();
+    assert_eq!(
+        (s.outcome, s.usage.output_image_variant.unwrap().as_str()),
+        (Outcome::Succeeded, "1280x720")
+    );
+    assert!(failed(
+        video::settlement(&unnamed, &reported(Some("640x360"), Some(8)), Some(&sizes)).unwrap()
+    ));
+    assert!(failed(
+        video::settlement(&unnamed, &reported(Some("1280x720"), Some(8)), None).unwrap()
+    ));
+    let s = video::settlement(&unnamed, &reported(None, Some(8)), None).unwrap();
+    assert_eq!(
+        (s.outcome, s.usage.output_image_variant),
+        (Outcome::Succeeded, None)
+    );
 }
 
 #[test]

@@ -78,6 +78,34 @@ impl LocalAdapter {
         base.strip_suffix("/v1")
             .ok_or(InferenceError::Configuration)
     }
+    /// The OpenAI video contract on this connection (`openai_compatible`
+    /// only, `capabilities`): its approved base, and its credential as a
+    /// bearer token when it has one (an environment reference). The
+    /// credential is resolved before anything is sent.
+    fn video_wire(&self, target: &Deployment) -> Result<openai::jobs::VideoWire<'_>> {
+        if !matches!(self.profile, Profile::OpenAiCompatible) {
+            return Err(InferenceError::Unsupported);
+        }
+        let (client, base) = self.connection(target)?;
+        let auth = match target.credential_ref.as_str() {
+            "none" => None,
+            reference if reference.starts_with("env:") => {
+                let secret = self.resolver.resolve(reference)?;
+                let mut header =
+                    reqwest::header::HeaderValue::from_str(&format!("Bearer {}", secret.expose()))
+                        .map_err(|_| InferenceError::Configuration)?;
+                header.set_sensitive(true);
+                Some(header)
+            }
+            _ => return Err(InferenceError::Configuration),
+        };
+        Ok(openai::jobs::VideoWire {
+            client,
+            base,
+            auth,
+            kind: crate::egress::UpstreamClient::Local,
+        })
+    }
     /// Rerank wire of this profile; Ollama serves no rerank API.
     fn rerank_wire(&self) -> Option<RerankWire> {
         match self.profile {
@@ -214,9 +242,47 @@ impl ProviderAdapter for LocalAdapter {
                 && request.dimensions.is_some())
     }
     /// The shared capability table (`providers::capabilities`); the rerank
-    /// wire and System One support below must agree with it (tested).
+    /// wire, System One and video support below must agree with it (tested).
     fn supports_protocol(&self, protocol: ApiProtocol) -> bool {
         super::capabilities::serves(self.id(), protocol)
+    }
+    /// The route's own options (0097) decide which lengths and sizes it
+    /// takes; the adapter only requires a well-formed request.
+    fn supports_video_request(
+        &self,
+        _target: &Deployment,
+        request: &crate::jobs::types::VideoRequest,
+    ) -> bool {
+        matches!(self.profile, Profile::OpenAiCompatible) && request.validate().is_ok()
+    }
+    async fn create_video(
+        &self,
+        target: &Deployment,
+        request: crate::jobs::types::VideoRequest,
+    ) -> Result<crate::jobs::types::UpstreamVideo> {
+        openai::jobs::create_video(&self.video_wire(target)?, target, request).await
+    }
+    async fn retrieve_video(
+        &self,
+        target: &Deployment,
+        video: &crate::jobs::types::UpstreamId,
+    ) -> Result<crate::jobs::types::UpstreamVideo> {
+        openai::jobs::retrieve_video(&self.video_wire(target)?, video).await
+    }
+    async fn delete_video(
+        &self,
+        target: &Deployment,
+        video: &crate::jobs::types::UpstreamId,
+    ) -> Result<crate::jobs::types::VideoDeletion> {
+        openai::jobs::delete_video(&self.video_wire(target)?, video).await
+    }
+    async fn video_content(
+        &self,
+        target: &Deployment,
+        video: &crate::jobs::types::UpstreamId,
+        asset: crate::jobs::types::VideoAsset,
+    ) -> Result<crate::jobs::types::ContentStream> {
+        openai::jobs::video_content(&self.video_wire(target)?, video, asset).await
     }
     async fn execute(&self, target: &Deployment, request: ChatRequest) -> Result<ProviderOutput> {
         let payload = self.encode_chat(target, &request)?;

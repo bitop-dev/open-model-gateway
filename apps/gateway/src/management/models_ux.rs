@@ -2,7 +2,10 @@
 //! per-workload counts, route detail with data policy and prices, and a
 //! workspace-visible catalog with eligibility. Rates are exact decimal strings
 //! derived from integer micro-USD price lines (never floats).
-use super::resources::{ENABLED_ROUTE, PRICED_ROUTE, model_json, search};
+use super::resources::{
+    APPLICABLE_TYPE_TOKENS_PER_MINUTE, DIRECT_WORKSPACES, ENABLED_ROUTE, PRICED_ROUTE,
+    SERVING_ROUTE, search,
+};
 use super::*;
 use crate::providers::openrouter::DataCollection;
 
@@ -273,5 +276,21 @@ pub(super) fn workspace_catalog_sql(sort: PlatformModelSort) -> String {
         "WITH page AS MATERIALIZED (SELECT m.id,row_number() OVER (ORDER BY {order}) n FROM models m CROSS JOIN workspaces w WHERE w.id=$1 AND m.enabled AND ({eligible} OR workspace_model_allowed(w.id,m.id)) AND ($2::text IS NULL OR strpos(lower(m.public_name),lower($2))>0 OR strpos(lower(m.display_name),lower($2))>0) AND ($3::text IS NULL OR {WORKLOAD}=$3) ORDER BY n LIMIT $4 OFFSET $5) SELECT jsonb_build_object('model_id',m.id,'public_name',m.public_name,'display_name',m.display_name,'description',m.description,'protocols',m.supported_protocols,'workload',{WORKLOAD},'eligibility',CASE WHEN workspace_model_allowed(w.id,m.id) AND EXISTS(SELECT 1 FROM workspace_model_grants g WHERE g.workspace_id=w.id AND g.model_id=m.id AND g.source='direct') THEN 'direct' WHEN workspace_model_allowed(w.id,m.id) THEN 'selected' ELSE 'available_from_catalog' END,'reason',CASE WHEN workspace_model_allowed(w.id,m.id) AND EXISTS(SELECT 1 FROM workspace_model_grants g WHERE g.workspace_id=w.id AND g.model_id=m.id AND g.source='direct') THEN 'Assigned to this workspace by a Platform Admin' WHEN workspace_model_allowed(w.id,m.id) THEN 'Added to this workspace from an available catalog' ELSE 'In a catalog available to this workspace; not added yet' END,'min_input_microusd_per_million',{},'min_output_microusd_per_million',{},'routes',(SELECT count(*) FROM deployments d WHERE d.model_id=m.id AND {serving}),'priced_routes',(SELECT count(*) FROM deployments d WHERE d.model_id=m.id AND {serving} AND {PRICED_ROUTE}),'created_at',m.created_at) FROM page JOIN models m ON m.id=page.id CROSS JOIN workspaces w WHERE w.id=$1 ORDER BY page.n",
         min_input,
         min_rate("output_tokens", "output_microusd_per_million")
+    )
+}
+
+/// The latest price version's worst-case per-attempt token reservation.
+const ROUTE_TOKEN_CEILING: &str = "(SELECT dp.input_token_limit+dp.output_token_limit FROM deployment_prices dp WHERE dp.deployment_id=d.id ORDER BY dp.created_at DESC,dp.id DESC LIMIT 1)";
+/// Model metadata plus aggregate readiness counts. Connection labels never include credential references.
+/// `serving_routes` are enabled routes that serve the model ([`SERVING_ROUTE`]);
+/// `unsupported_*` the enabled ones whose profile cannot, `routes_without_video_options` the rest.
+pub(super) fn model_json() -> String {
+    let (serving, capable) = (
+        &*SERVING_ROUTE,
+        crate::providers::capabilities::route_serves_sql(),
+    );
+    let without_options = super::deployment_video::WITHOUT_OPTIONS;
+    format!(
+        "jsonb_build_object('id',m.id,'public_name',m.public_name,'display_name',m.display_name,'description',m.description,'supported_protocols',m.supported_protocols,'enabled',m.enabled,'created_at',m.created_at,'readiness',jsonb_build_object('routes',(SELECT count(*) FROM deployments d WHERE d.model_id=m.id),'enabled_routes',(SELECT count(*) FROM deployments d WHERE d.model_id=m.id AND {ENABLED_ROUTE}),'priced_enabled_routes',(SELECT count(*) FROM deployments d WHERE d.model_id=m.id AND {ENABLED_ROUTE} AND {PRICED_ROUTE}),'serving_routes',(SELECT count(*) FROM deployments d WHERE d.model_id=m.id AND {serving}),'unsupported_routes',(SELECT count(*) FROM deployments d WHERE d.model_id=m.id AND {ENABLED_ROUTE} AND NOT {capable}),'unsupported_profiles',(SELECT coalesce(jsonb_agg(DISTINCT p.provider ORDER BY p.provider),'[]'::jsonb) FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id WHERE d.model_id=m.id AND {ENABLED_ROUTE} AND NOT {capable}),'routes_without_video_options',(SELECT count(*) FROM deployments d WHERE d.model_id=m.id AND {ENABLED_ROUTE} AND {capable} AND {without_options}),'type_tokens_per_minute',{APPLICABLE_TYPE_TOKENS_PER_MINUTE},'routes_over_token_limit',(SELECT count(*) FROM deployments d WHERE d.model_id=m.id AND {ENABLED_ROUTE} AND {ROUTE_TOKEN_CEILING}>{APPLICABLE_TYPE_TOKENS_PER_MINUTE}),'openrouter_free_routes',(SELECT count(*) FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id WHERE d.model_id=m.id AND {ENABLED_ROUTE} AND p.provider='openrouter' AND d.upstream_model LIKE '%:free'),'catalogs',(SELECT count(*) FROM catalog_models cm WHERE cm.model_id=m.id),'direct_workspaces',{DIRECT_WORKSPACES},'connections',(SELECT coalesce(jsonb_agg(jsonb_build_object('id',c.id,'name',c.name) ORDER BY c.name,c.id),'[]'::jsonb) FROM (SELECT p.id,p.name FROM provider_connections p WHERE EXISTS(SELECT 1 FROM deployments d WHERE d.model_id=m.id AND d.provider_connection_id=p.id) ORDER BY p.name,p.id LIMIT 20) c)))"
     )
 }

@@ -12,9 +12,10 @@ use crate::inference::types::{ApiProtocol as P, WorkloadKind};
 
 /// Registered profiles and the client protocols their adapters serve.
 pub const PROFILES: &[(&str, &[P])] = &[
-    // OpenAI shut down the Sora 2 models and the Videos API on 2026-09-24
-    // (no replacement), so no profile serves `videos`; the OpenAI video wire
-    // code remains only for jobs created before the shutdown.
+    // OpenAI shut down the Sora 2 models and the Videos API on 2026-09-24,
+    // so its origin serves no `videos`; its video wire code remains for jobs
+    // created before the shutdown. Any other server of the OpenAI video
+    // contract is an approved `openai_compatible` connection (#52).
     (
         "openai",
         &[
@@ -56,6 +57,7 @@ pub const PROFILES: &[(&str, &[P])] = &[
             P::Embeddings,
             P::Rerank,
             P::Systemone,
+            P::Videos,
         ],
     ),
     (
@@ -181,8 +183,14 @@ mod tests {
             let distinct: BTreeSet<_> = protocols.iter().map(|p| p.as_str()).collect();
             assert_eq!(distinct.len(), protocols.len(), "{id}");
         }
-        // Video has no supported provider (OpenAI shut down its Videos API).
-        assert!(PROFILES.iter().all(|(_, p)| !p.contains(&P::Videos)));
+        // Video: only OpenAI-compatible connections (OpenAI's own Videos API
+        // shut down on 2026-09-24).
+        let video: Vec<_> = PROFILES
+            .iter()
+            .filter(|(_, p)| p.contains(&P::Videos))
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(video, ["openai_compatible"]);
     }
 
     #[test]
