@@ -258,8 +258,8 @@ fn content_blocks(message: &Message, images: &mut usize) -> Result<Vec<Value>> {
             None => {}
         }
         for call in &message.tool_calls {
-            let input: Value = serde_json::from_str(&call.arguments)
-                .map_err(|_| InferenceError::InvalidRequest)?;
+            let input = crate::inference::json_weight::parse_document(&call.arguments)
+                .ok_or(InferenceError::InvalidRequest)?;
             if !input.is_object() {
                 return Err(InferenceError::InvalidRequest);
             }

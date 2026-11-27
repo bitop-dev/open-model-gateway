@@ -101,6 +101,7 @@ inference/guardrails.rs :: impl Engine::guard_input :: metrics call :: crate :: 
 inference/guardrails.rs :: throttled :: metrics call :: crate :: metrics :: METRICS . guardrail_unscanned ("rate_limited")
 inference/guardrails.rs :: timed :: metrics call :: crate :: metrics :: METRICS . guardrail_detector_seconds ("pattern" , started . elapsed ())
 jobs/batch.rs :: impl Jobs::create_batch :: metrics call :: crate :: metrics :: METRICS . observe_batch_created (mode . as_str ())
+jobs/lines.rs :: inner_within_budget :: metrics call :: crate :: metrics :: METRICS . json_structure_refused ("batch_line")
 jobs/lines.rs :: within_budget :: metrics call :: crate :: metrics :: METRICS . json_structure_refused ("batch_line")
 jobs/mod.rs :: impl Attempt::drop :: event :: crate :: ops_log :: emit (crate :: ops_log :: OpsEvent :: FinalizationNeedsReconciliation { finalizer : crate :: ops_log :: Finalizer :: JobCancel , trace : None })
 jobs/mod.rs :: impl Attempt::fail :: event :: crate :: ops_log :: emit (crate :: ops_log :: OpsEvent :: FinalizationNeedsReconciliation { finalizer : crate :: ops_log :: Finalizer :: JobFail , trace : None })

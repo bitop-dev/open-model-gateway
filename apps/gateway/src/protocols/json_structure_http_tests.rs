@@ -190,7 +190,11 @@ async fn one_key_holds_at_most_half_the_image_buffer(pool: PgPool) {
     // A large body that takes exactly 3 MiB of the buffer: two of them are
     // the key's whole share (6 of 12 MiB).
     let body = serde_json::to_vec(&chat_body(&png_url(2 * MIB + 128 * 1024, "k"), false)).unwrap();
-    assert!(body.len() > 2 * MIB && body.len() <= 3 * MIB, "{}", body.len());
+    assert!(
+        body.len() > 2 * MIB && body.len() <= 3 * MIB,
+        "{}",
+        body.len()
+    );
     // A large body that sends half of itself and waits. The server reads a
     // body only once it holds its share, so the first read is the signal
     // that the share is taken.
@@ -219,9 +223,13 @@ async fn one_key_holds_at_most_half_the_image_buffer(pool: PgPool) {
     };
     let before = in_use();
     let (generation, generation_admitted) = held("/v1/chat/completions", first.clone());
-    generation_admitted.await.expect("the generation is admitted");
+    generation_admitted
+        .await
+        .expect("the generation is admitted");
     let (counting, counting_admitted) = held("/v1/messages/count_tokens", first.clone());
-    counting_admitted.await.expect("the count is admitted beside it");
+    counting_admitted
+        .await
+        .expect("the count is admitted beside it");
     assert_eq!(in_use() - before, 6 * MIB as i64, "both hold their share");
     // The first key holds 6 of 12 MiB: its share.
     let shares = count("key_share");
@@ -235,15 +243,25 @@ async fn one_key_holds_at_most_half_the_image_buffer(pool: PgPool) {
     assert_eq!(value["error"]["code"], "image_input_busy");
     assert_eq!(count("key_share"), shares + 1);
     // Another key's large body is admitted and served meanwhile.
-    let (status, _, value, _) =
-        send(&w, "/v1/chat/completions", Some(&second), body.clone(), true).await;
+    let (status, _, value, _) = send(
+        &w,
+        "/v1/chat/completions",
+        Some(&second),
+        body.clone(),
+        true,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{value}");
     // The client goes away: once its request is dropped (the join below
     // returns after the task's future is dropped), its share is back, and
     // the first key may send again.
     generation.abort();
     assert!(generation.await.unwrap_err().is_cancelled());
-    assert_eq!(in_use() - before, 3 * MIB as i64, "the dropped body's share is back");
+    assert_eq!(
+        in_use() - before,
+        3 * MIB as i64,
+        "the dropped body's share is back"
+    );
     let (status, _, value, _) =
         send(&w, "/v1/chat/completions", Some(&first), body.clone(), true).await;
     assert_eq!(status, StatusCode::OK, "{value}");
@@ -282,37 +300,27 @@ async fn an_undeclared_body_past_its_route_cap_is_read_only_to_the_cap(pool: PgP
     }
 }
 
-/// A body is measured whatever its `Content-Type` claims on a route whose
-/// handler may read the bytes as JSON anyway (`/v1/videos` compares only
-/// the media type before the first `;`). The image input routes take only a
-/// JSON type and refuse any other unread (400), never parsing it.
+/// A body is measured whatever its `Content-Type` claims only on the route
+/// whose handler reads a loosely typed body as JSON (`/v1/videos` compares
+/// only the media type before the first `;`). Every other JSON route refuses
+/// a body that is not JSON by its type unread, as before the bound.
 #[dbtest::test]
-async fn a_body_is_measured_whatever_its_content_type(pool: PgPool) {
+async fn only_the_videos_route_measures_a_body_whatever_its_content_type(pool: PgPool) {
     let w = world(pool, ImageInputLimits::default(), true).await;
     let body = hostile(r#"{"a":0}"#, TEXT_BODY_BYTES);
-    for (path, content_type, status) in [
-        (
-            "/v1/videos",
-            Some("application/json; charset"),
-            StatusCode::PAYLOAD_TOO_LARGE,
-        ),
-        (
-            "/v1/videos",
-            Some("application/json;=x"),
-            StatusCode::PAYLOAD_TOO_LARGE,
-        ),
-        (
-            "/v1/rerank",
-            Some("text/plain"),
-            StatusCode::PAYLOAD_TOO_LARGE,
-        ),
+    for (path, content_type, measured) in [
+        ("/v1/videos", Some("application/json; charset"), true),
+        ("/v1/videos", Some("application/json;=x"), true),
+        ("/v1/rerank", Some("text/plain"), false),
+        ("/v1/embeddings", Some("application/json; charset"), false),
         (
             "/v1/chat/completions",
             Some("application/json; charset"),
-            StatusCode::BAD_REQUEST,
+            false,
         ),
-        ("/v1/messages", None, StatusCode::BAD_REQUEST),
+        ("/v1/messages", None, false),
     ] {
+        let pulled = Arc::new(AtomicUsize::new(0));
         let mut request = Request::post(path)
             .header(header::AUTHORIZATION, format!("Bearer {}", w.token))
             .header("anthropic-version", "2023-06-01");
@@ -322,10 +330,85 @@ async fn a_body_is_measured_whatever_its_content_type(pool: PgPool) {
         let response = w
             .router
             .clone()
-            .oneshot(request.body(Body::from(body.clone())).unwrap())
+            .oneshot(request.body(counted(body.clone(), pulled.clone())).unwrap())
             .await
             .unwrap();
-        assert_eq!(response.status(), status, "{path} {content_type:?}");
+        if measured {
+            assert_eq!(
+                response.status(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "{path} {content_type:?}"
+            );
+        } else {
+            assert_ne!(
+                response.status(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "{path} {content_type:?}"
+            );
+            assert!(
+                response.status().is_client_error(),
+                "{path} {content_type:?}"
+            );
+            assert_eq!(
+                pulled.load(Ordering::SeqCst),
+                0,
+                "{path} {content_type:?}: unread"
+            );
+        }
+    }
+}
+
+/// The measure wraps only the handlers that read a JSON body, inside
+/// authentication: a method no handler takes is answered 405 with no body
+/// byte read, authenticated or not, and a GET with a body does not have it
+/// read.
+#[dbtest::test]
+async fn a_body_is_read_only_for_a_handler_that_reads_it(pool: PgPool) {
+    let w = world(pool, ImageInputLimits::default(), true).await;
+    let body = hostile(r#"{"a":0}"#, TEXT_BODY_BYTES);
+    let send_with = |method: &str, path: &str, token: Option<&str>| {
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = token {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let request = request.body(counted(body.clone(), pulled.clone())).unwrap();
+        let router = w.router.clone();
+        async move {
+            (
+                router.oneshot(request).await.unwrap().status(),
+                pulled.load(Ordering::SeqCst),
+            )
+        }
+    };
+    for path in [
+        "/v1/embeddings",
+        "/v1/rerank",
+        "/v1/systemone",
+        "/v1/images/generations",
+        "/v1/audio/speech",
+        "/v1/videos",
+        "/v1/batches",
+    ] {
+        // Without a key, the route answers 401 (where authentication wraps
+        // every method) or 405; with one, 405. No body byte is read.
+        let (status, pulled) = send_with("PUT", path, None).await;
+        assert!(
+            [StatusCode::UNAUTHORIZED, StatusCode::METHOD_NOT_ALLOWED].contains(&status),
+            "{path}: {status}"
+        );
+        assert_eq!(pulled, 0, "{path}: no body byte read without a key");
+        let (status, pulled) = send_with("PUT", path, Some(w.token.as_str())).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{path}");
+        assert_eq!(pulled, 0, "{path}: no body byte read for a 405");
+    }
+    for path in ["/v1/batches", "/v1/videos"] {
+        let (status, pulled) = send_with("GET", path, Some(&w.token)).await;
+        assert_ne!(status, StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+        assert_eq!(pulled, 0, "{path}: a listing reads no body");
     }
 }
 

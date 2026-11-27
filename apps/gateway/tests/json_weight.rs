@@ -316,6 +316,128 @@ fn holds_typed(body: &[u8]) -> Result<(), String> {
     }
 }
 
+/// [`holds`] for a parse into the route's own request type `T`.
+fn holds_as<T: serde::de::DeserializeOwned>(name: &str, body: &[u8]) -> Result<(), String> {
+    LIVE.set(0);
+    PEAK.set(0);
+    ON.set(true);
+    let parsed = serde_json::from_slice::<T>(body);
+    ON.set(false);
+    let ok = parsed.is_ok();
+    drop(parsed);
+    let peak = usize::try_from(PEAK.get()).unwrap();
+    let bound = body.len() + estimate(body);
+    if bound >= peak {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name} (parsed: {ok}): bound {bound} below the parse's peak {peak}"
+        ))
+    }
+}
+
+/// The dense shapes each route's request type takes, parsed as that type:
+/// what the walk estimates is what the route's own deserializer builds.
+#[test]
+fn the_estimate_covers_each_routes_request_type() {
+    use open_model_gateway::protocols::{chat_completions, embeddings, messages, responses};
+    let n = 20_000;
+    let many = |item: &str| vec![item; n].join(",");
+    let one_key = many(r#"{"a":0}"#);
+    let empty = many("{}");
+    let texts = many(r#"{"type":"text","text":"x"}"#);
+    let users = many(r#"{"role":"user","content":"x"}"#);
+    let strings = many(r#""x""#);
+    let chat = [
+        format!(r#"{{"model":"m","messages":[{users}]}}"#),
+        format!(r#"{{"model":"m","messages":[{{"role":"user","content":[{texts}]}}]}}"#),
+        format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"x"}}],"tools":[{{"type":"function","function":{{"name":"f","parameters":{{"x":[{one_key}]}}}}}}]}}"#
+        ),
+        format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"x"}}],"tool_choice":[{empty}]}}"#
+        ),
+    ];
+    for body in &chat {
+        holds_as::<chat_completions::Request>("chat", body.as_bytes()).unwrap();
+    }
+    let responses = [
+        format!(r#"{{"model":"m","input":[{one_key}]}}"#),
+        format!(r#"{{"model":"m","input":[{empty}]}}"#),
+        format!(
+            r#"{{"model":"m","input":"x","tools":[{{"type":"function","name":"f","parameters":{{"x":[{one_key}]}}}}]}}"#
+        ),
+    ];
+    for body in &responses {
+        holds_as::<responses::Request>("responses", body.as_bytes()).unwrap();
+    }
+    let messages = [
+        format!(r#"{{"model":"m","max_tokens":1,"messages":[{users}]}}"#),
+        format!(
+            r#"{{"model":"m","max_tokens":1,"messages":[{{"role":"user","content":[{texts}]}}]}}"#
+        ),
+        format!(
+            r#"{{"model":"m","max_tokens":1,"messages":[{{"role":"user","content":"x"}}],"tools":[{{"name":"f","input_schema":{{"x":[{one_key}]}}}}]}}"#
+        ),
+        format!(
+            r#"{{"model":"m","max_tokens":1,"messages":[{{"role":"user","content":"x"}}],"system":[{texts}]}}"#
+        ),
+        format!(r#"{{"model":"m","max_tokens":1,"messages":[{empty}]}}"#),
+    ];
+    for body in &messages {
+        holds_as::<messages::Request>("messages", body.as_bytes()).unwrap();
+        let count = body.replace(r#""max_tokens":1,"#, "");
+        holds_as::<messages::CountRequest>("count_tokens", count.as_bytes()).unwrap();
+    }
+    holds_as::<embeddings::Request>(
+        "embeddings",
+        format!(r#"{{"model":"m","input":[{strings}]}}"#).as_bytes(),
+    )
+    .unwrap();
+}
+
+/// A JSON document held in a string (a tool call's `arguments`), parsed by
+/// `json_weight::parse_document` while the body it came from is held, as an
+/// adapter or a guardrail does: within the body's bound plus the
+/// document's own (`json_weight::inner_documents`: its length and its
+/// estimate).
+#[test]
+fn the_estimate_covers_a_document_held_in_a_string() {
+    use open_model_gateway::inference::json_weight::parse_document;
+    for inner in [
+        json!({"k": vec![json!({"a": 0}); 15_000]}).to_string(),
+        json!({"k": vec![json!(0); 150_000]}).to_string(),
+        json!({"path": "f", "content": "line\n".repeat(100_000)}).to_string(),
+        json!({"k": vec![json!({}); 30_000]}).to_string(),
+    ] {
+        let body = json!({"arguments": inner}).to_string();
+        LIVE.set(0);
+        PEAK.set(0);
+        ON.set(true);
+        let value = serde_json::from_slice::<Value>(body.as_bytes()).unwrap();
+        let document = parse_document(value["arguments"].as_str().unwrap());
+        ON.set(false);
+        assert!(document.is_some(), "within the budget, so parsed");
+        drop((value, document));
+        let peak = usize::try_from(PEAK.get()).unwrap();
+        let bound =
+            body.len() + estimate(body.as_bytes()) + inner.len() + estimate(inner.as_bytes());
+        assert!(bound >= peak, "bound {bound} below the parse's peak {peak}");
+    }
+    // Over the budget, the document is never parsed.
+    let over = json!({"k": vec![json!({"a": 0}); 20_000]}).to_string();
+    LIVE.set(0);
+    PEAK.set(0);
+    ON.set(true);
+    let document = parse_document(&over);
+    ON.set(false);
+    assert!(document.is_none());
+    assert!(
+        usize::try_from(PEAK.get()).unwrap() < 4096,
+        "nothing parsed"
+    );
+}
+
 fn value() -> impl Strategy<Value = Value> {
     let leaf = prop_oneof![
         Just(Value::Null),

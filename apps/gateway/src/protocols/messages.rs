@@ -125,6 +125,7 @@ pub async fn count_tokens(
     Extension(request_id): Extension<RequestId>,
     headers: HeaderMap,
     large: Option<Extension<crate::inference::image_buffer::LargeBody>>,
+    weight: Option<Extension<crate::http::BodyWeight>>,
     input: std::result::Result<crate::http::json_body::JsonBody<CountRequest>, JsonBodyRejection>,
 ) -> Response {
     let (betas, _version) = match protocol_headers(&headers) {
@@ -145,6 +146,10 @@ pub async fn count_tokens(
         Err(e) => return error_response(e),
     };
     if let Some(refused) = beyond_images(large, &request) {
+        return refused;
+    }
+    if let Some(refused) = crate::http::inner_refusal("/v1/messages/count_tokens", weight, &request)
+    {
         return refused;
     }
     if let Some(options) = &mut request.messages_options {
@@ -168,6 +173,7 @@ pub async fn handle(
     Extension(request_id): Extension<RequestId>,
     headers: HeaderMap,
     large: Option<Extension<crate::inference::image_buffer::LargeBody>>,
+    weight: Option<Extension<crate::http::BodyWeight>>,
     input: std::result::Result<crate::http::json_body::JsonBody<Request>, JsonBodyRejection>,
 ) -> Response {
     let (betas, version) = match protocol_headers(&headers) {
@@ -202,6 +208,9 @@ pub async fn handle(
         Err(e) => return error_response(e),
     };
     if let Some(refused) = beyond_images(large, &request) {
+        return refused;
+    }
+    if let Some(refused) = crate::http::inner_refusal("/v1/messages", weight, &request) {
         return refused;
     }
     if let Some(options) = &mut request.messages_options {

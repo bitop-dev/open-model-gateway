@@ -344,6 +344,7 @@ pub async fn handle(
     Extension(principal): Extension<Principal>,
     Extension(request_id): Extension<RequestId>,
     large: Option<Extension<crate::inference::image_buffer::LargeBody>>,
+    weight: Option<Extension<crate::http::BodyWeight>>,
     input: Result<crate::http::json_body::JsonBody<Request>, JsonBodyRejection>,
 ) -> Response {
     let wire = match input {
@@ -372,6 +373,9 @@ pub async fn handle(
     if large.is_some_and(|Extension(large)| !large.allows(&request)) {
         crate::metrics::METRICS.image_input_refused("too_large");
         return super::payload_too_large();
+    }
+    if let Some(refused) = crate::http::inner_refusal("/v1/chat/completions", weight, &request) {
+        return refused;
     }
     let model = request.model.clone();
     let id = format!("chatcmpl-{}", request_id.0.simple());

@@ -84,6 +84,10 @@ impl Methods {
             "any" => {
                 self.0.insert("*".to_owned());
             }
+            // `http::json_post`: a POST whose handler is measured first.
+            "json_post" => {
+                self.0.insert("POST".to_owned());
+            }
             "on" | "on_service" | "any_service" => panic!("unresolved method registration"),
             _ => (),
         }

@@ -743,6 +743,8 @@ mod drain_e2e_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod guardrail_db_tests;
 #[cfg(all(test, feature = "integration-tests"))]
+mod guardrail_inner_tests;
+#[cfg(all(test, feature = "integration-tests"))]
 mod guardrail_limits_db_tests;
 mod route_use;
 use route_use::after;

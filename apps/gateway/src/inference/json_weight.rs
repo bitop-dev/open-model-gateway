@@ -4,7 +4,7 @@
 //! A JSON value can be far larger parsed than written: `0,` is two bytes and
 //! a `serde_json::Value` of at least 32, and a one-key object such as
 //! `{"a":0}` (eight bytes) allocates a whole B-tree node of about 630. A
-//! 2 MiB body of such values parsed into 180 MiB, before any validation
+//! 2 MiB body of such values parsed into up to 178 MiB, before any validation
 //! refused it and before admission bounds how many requests run at once.
 //! [`walk`] reads the body once, with no allocation, and returns the structure
 //! estimate: together with the body's own length it is never below what the
@@ -280,27 +280,68 @@ pub fn within_budget(body: &[u8]) -> bool {
 /// Whether a batch line may be parsed. A line is parsed into a tree and then
 /// converted into its request (`jobs::lines`), the tree still held while the
 /// request is built: two structures at once, which with its strings part
-/// must be within [`BUDGET`] and `allowance`, plus [`LINE_STRINGS`] times the
-/// line. That excess is what one long escaped plain string costs (twice it
-/// for the scratch copy, three times for a refused line's message), which
-/// `BATCH_MAX_LINE_BYTES` bounds (4 MiB), so a line holding one (an image
-/// written with `\/`) is not refused for it; text an error message shows
-/// escaped, which costs more, is still charged beyond it.
-pub fn line_within_budget(line: &[u8], allowance: usize) -> bool {
-    let weight = weight(line);
+/// and the JSON documents its strings hold (`inner`, [`inner_documents`],
+/// zero before it is parsed) must be within [`BUDGET`] and `allowance`. Its
+/// strings part may exceed that by [`LINE_STRINGS`] times the line, no more:
+/// what one long escaped plain string costs (twice it for the scratch copy,
+/// three times for a refused line's message), which `BATCH_MAX_LINE_BYTES`
+/// bounds (4 MiB), so a line holding one (an image written with `\/`) is
+/// not refused for it, while text an error message shows escaped, which
+/// costs more, is still charged beyond it.
+pub fn line_fits(weight: Weight, len: usize, inner: usize, allowance: usize) -> bool {
     weight
         .structure
         .saturating_mul(2)
-        .saturating_add(weight.strings)
-        <= BUDGET
-            .saturating_add(allowance)
-            .saturating_add(line.len().saturating_mul(LINE_STRINGS))
+        .saturating_add(inner)
+        .saturating_add(
+            weight
+                .strings
+                .saturating_sub(len.saturating_mul(LINE_STRINGS)),
+        )
+        <= BUDGET.saturating_add(allowance)
 }
 
 /// How many times its own length a batch line's strings part may take
 /// beyond the budget: one long escaped plain string's scratch copy (two)
 /// and a refused line's message showing it (three).
 pub const LINE_STRINGS: usize = 5;
+
+/// A JSON document held in a string of a request (a tool call's
+/// `arguments`), parsed only when it is within [`BUDGET`]; `None` when it
+/// is over it or is not JSON. Every parse of such a string goes through
+/// this (a test keeps it so), and the request it came from was refused
+/// before admission when its documents, summed with its body, were over the
+/// budget ([`inner_documents`]), so this refuses only what that let through
+/// by a change of the budget.
+pub fn parse_document(text: &str) -> Option<serde_json::Value> {
+    if within_budget(text.as_bytes()) {
+        serde_json::from_str(text).ok()
+    } else {
+        None
+    }
+}
+
+/// What the JSON documents held in a request's strings may parse into,
+/// their own decoded bytes included: every tool call's `arguments`, which
+/// an adapter or a guardrail parses ([`parse_document`]) and keeps beside
+/// the request. Each document's bytes and structure stay; its strings part
+/// (the scratch buffer, a refused parse's message) lasts only while it is
+/// parsed, one at a time, so only the largest counts. Added to the body's
+/// estimate and compared with [`BUDGET`] before admission.
+pub fn inner_documents(request: &crate::inference::types::ChatRequest) -> usize {
+    let (kept, transient) = request
+        .messages
+        .iter()
+        .flat_map(|m| &m.tool_calls)
+        .map(|call| (call.arguments.len(), weight(call.arguments.as_bytes())))
+        .fold((0usize, 0usize), |(kept, transient), (len, w)| {
+            (
+                kept.saturating_add(len).saturating_add(w.structure),
+                transient.max(w.strings),
+            )
+        });
+    kept.saturating_add(transient)
+}
 
 /// What the gateway's own plan adds to a batch work line: one object of a
 /// few fields (`jobs::lines::LinePlan`), well within this, so a line within

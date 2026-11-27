@@ -1,16 +1,19 @@
 //! Every JSON body of an inference route is measured before any parser runs
-//! (#872): a body whose structure estimate exceeds
-//! `inference::json_weight::BUDGET` is refused with 413, its bytes never
-//! parsed or echoed.
+//! (#872): a body whose estimate exceeds `inference::json_weight::BUDGET`
+//! is refused with 413, its bytes never parsed or echoed.
 //!
-//! The body is read whole here, never past the route's own byte limit
-//! (this layer is given it and reads through it, whatever stands outside),
-//! as the handler's JSON extractor would read it; the handler then parses
-//! these same bytes, uncopied. A multipart form, or the body of a route
-//! that ignores its body, passes through unread: the handler reads it as the
-//! form it is, or never reads it. Every other body is measured, whatever its
-//! `Content-Type`. The image input routes take the same measure inside
-//! `image_input_body`, in the same pass as their image scan.
+//! The measure wraps each POST handler that reads a JSON body
+//! (`http::json_post`), inside authentication: never a method's 405
+//! fallback, never a handler that reads no body. The body is read whole
+//! there, never past the route's own byte limit (the layer is given it and
+//! reads through it), as the handler's JSON extractor would read it; the
+//! handler then parses these same bytes, uncopied. A body that is not JSON by
+//! its `Content-Type` passes through unread, and the handler refuses it,
+//! except on the route whose handler reads a loosely typed body as JSON
+//! (`any_type`), where only a multipart form passes. The image input routes
+//! take the same measure inside `image_input_body`, in the same pass as
+//! their image scan. Each handler then adds the JSON documents its request
+//! holds in strings ([`inner_refusal`]).
 use axum::{
     body::{Body, Bytes},
     extract::{Request, State},
@@ -40,6 +43,30 @@ pub(super) fn family(path: &str) -> Option<&'static str> {
     })
 }
 
+/// The estimate of the body a request was parsed from (both parts of
+/// `json_weight::Weight`), for the handler's check of the JSON documents its
+/// strings hold ([`inner_refusal`]).
+#[derive(Clone, Copy)]
+pub struct BodyWeight(pub usize);
+
+/// The refusal of a request of `path` whose body, with the JSON documents
+/// its strings hold (`json_weight::inner_documents`: tool calls'
+/// `arguments`, which adapters and guardrails parse), would parse into more
+/// than the budget: the same 413 and counter as a body over it. Checked by
+/// every generation handler once its request is normalized, before
+/// admission.
+pub(crate) fn inner_refusal(
+    path: &str,
+    body: Option<axum::Extension<BodyWeight>>,
+    request: &crate::inference::types::ChatRequest,
+) -> Option<Response> {
+    let body = body.map_or(0, |axum::Extension(BodyWeight(weight))| weight);
+    refusal(
+        path,
+        body.saturating_add(json_weight::inner_documents(request)),
+    )
+}
+
 /// The refusal of a body of `path` whose structure estimate is `structure`,
 /// if it exceeds the budget: 413 in the route's own shape.
 pub(super) fn refusal(path: &str, structure: usize) -> Option<Response> {
@@ -56,8 +83,20 @@ pub(super) fn refusal(path: &str, structure: usize) -> Option<Response> {
 
 /// The middleware of the inference routes outside the image input routes,
 /// given the route's byte limit.
-pub(super) async fn bound(State(limit): State<usize>, request: Request, next: Next) -> Response {
-    if multipart(request.headers()) || family(request.uri().path()).is_none() {
+pub(super) async fn bound(
+    State((limit, any_type)): State<(usize, bool)>,
+    request: Request,
+    next: Next,
+) -> Response {
+    // A handler that reads only a JSON type refuses any other unread; one
+    // that reads a loosely typed body as JSON (`any_type`) is measured
+    // whatever the type says, but a multipart form, which it reads as one.
+    let skip = if any_type {
+        multipart(request.headers())
+    } else {
+        !super::json_content_type(request.headers())
+    };
+    if skip {
         return next.run(request).await;
     }
     let (parts, body) = request.into_parts();
@@ -99,9 +138,12 @@ pub(super) async fn measured(parts: Parts, body: Body, limit: usize) -> Measured
             return Measured::Run(Request::from_parts(parts, failed));
         }
     };
-    if let Some(response) = refusal(parts.uri.path(), json_weight::estimate(&bytes)) {
+    let weight = json_weight::estimate(&bytes);
+    if let Some(response) = refusal(parts.uri.path(), weight) {
         return Measured::Refused(response);
     }
+    let mut parts = parts;
+    parts.extensions.insert(BodyWeight(weight));
     Measured::Run(Request::from_parts(parts, Body::from(bytes)))
 }
 
@@ -182,6 +224,65 @@ mod tests {
         ] {
             assert!(buffering_items(source).is_empty(), "{source}");
         }
+    }
+
+    /// A tool call's `arguments` from a request is parsed only through
+    /// `json_weight::parse_document`, which refuses one over the budget. The
+    /// parses listed here read a provider's output (a response or a stream),
+    /// never a request.
+    #[test]
+    fn request_arguments_are_parsed_only_when_measured() {
+        const UPSTREAM: [(&str, &str); 3] = [
+            (
+                "providers/anthropic.rs",
+                "serde_json::from_str::<Value>(&self.arguments)",
+            ),
+            (
+                "providers/bedrock/stream.rs",
+                "serde_json::from_str(&block.arguments)",
+            ),
+            (
+                "protocols/messages.rs",
+                "serde_json::from_str(&call.arguments)",
+            ),
+        ];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![root.clone()];
+        let mut found = Vec::new();
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if !name.ends_with(".rs") || name.contains("test") {
+                    continue;
+                }
+                // This file holds the list above.
+                if path.ends_with("http/json_structure.rs") {
+                    continue;
+                }
+                let relative = path
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                for line in std::fs::read_to_string(&path).unwrap().lines() {
+                    let parses = line.contains("from_str") || line.contains("from_slice");
+                    if parses
+                        && line.contains("arguments")
+                        && !UPSTREAM
+                            .iter()
+                            .any(|(file, call)| relative == *file && line.contains(call))
+                    {
+                        found.push(format!("{relative}: {}", line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(found.is_empty(), "{found:#?}");
     }
 
     /// The request wire types deserialize directly: none of the serde shapes
