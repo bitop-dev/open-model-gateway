@@ -203,10 +203,8 @@ pub(crate) fn parse_work_line(raw: &[u8], endpoint: BatchEndpoint) -> Result<Inp
         .map(serde_json::from_value::<LinePlan>)
         .transpose()
         .map_err(|_| LineError::InvalidShape)?;
-    let mut line = parse_measured_line(
-        &serde_json::to_vec(&value).map_err(|_| LineError::InvalidJson)?,
-        endpoint,
-    )?;
+    // The one parsed tree, without a second serialization and parse.
+    let mut line = parse_line_value(value, endpoint)?;
     line.plan = plan;
     Ok(line)
 }
@@ -215,15 +213,16 @@ pub(crate) fn parse_work_line(raw: &[u8], endpoint: BatchEndpoint) -> Result<Inp
 /// use the endpoint's optional/required maximum rules.
 pub(crate) fn parse_line(raw: &[u8], endpoint: BatchEndpoint) -> Result<InputLine, LineError> {
     within_budget(raw)?;
-    parse_measured_line(raw, endpoint)
+    let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+    parse_line_value(
+        serde_json::from_slice::<Value>(raw).map_err(|_| LineError::InvalidJson)?,
+        endpoint,
+    )
 }
 
-/// [`parse_line`] of a line already measured.
-fn parse_measured_line(raw: &[u8], endpoint: BatchEndpoint) -> Result<InputLine, LineError> {
-    let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
-    let Value::Object(mut top) =
-        serde_json::from_slice::<Value>(raw).map_err(|_| LineError::InvalidJson)?
-    else {
+/// [`parse_line`] of a line already parsed.
+fn parse_line_value(value: Value, endpoint: BatchEndpoint) -> Result<InputLine, LineError> {
+    let Value::Object(mut top) = value else {
         return Err(LineError::InvalidShape);
     };
     if top.len() != 4

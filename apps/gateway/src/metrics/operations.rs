@@ -184,15 +184,12 @@ impl Metrics {
     /// The image input buffer's in-use gauge and its configured size
     /// (`inference::image_buffer::ImageBuffer`).
     pub(crate) fn image_input_buffer(&self) -> (Gauge, Gauge) {
-        (
-            self.image_input.in_use.clone(),
-            self.image_input.size.clone(),
-        )
+        (self.bodies.in_use.clone(), self.bodies.size.clone())
     }
 
     /// One large image input body refused: `busy`, `too_large` or `timeout`.
     pub(crate) fn image_input_refused(&self, reason: &'static str) {
-        self.image_input
+        self.bodies
             .refusals
             .get_or_create(&[("reason", reason.to_owned())])
             .inc();
@@ -201,7 +198,7 @@ impl Metrics {
     /// Large image input bodies refused so far for one reason (tests).
     #[cfg(all(test, feature = "integration-tests"))]
     pub(crate) fn image_input_refusal_count(&self, reason: &str) -> u64 {
-        self.image_input
+        self.bodies
             .refusals
             .get_or_create(&[("reason", reason.to_owned())])
             .get()
@@ -210,7 +207,8 @@ impl Metrics {
     /// A JSON body or batch line refused before parsing for its structure
     /// (`inference::json_weight`), by route family.
     pub(crate) fn json_structure_refused(&self, route: &'static str) {
-        self.json_structure_refusals
+        self.bodies
+            .structure_refusals
             .get_or_create(&[("route", route.to_owned())])
             .inc();
     }
@@ -218,7 +216,8 @@ impl Metrics {
     /// Structure refusals so far for one route family (tests).
     #[cfg(test)]
     pub(crate) fn json_structure_refusal_count(&self, route: &str) -> u64 {
-        self.json_structure_refusals
+        self.bodies
+            .structure_refusals
             .get_or_create(&[("route", route.to_owned())])
             .get()
     }

@@ -127,7 +127,10 @@ fn inference_routes(store: &Store) -> Router<Store> {
             post(realtime::unsupported_route),
         )
         .route("/v1/realtime/calls", post(realtime::unsupported_route))
-        .route_layer(middleware::from_fn(json_structure::bound))
+        .route_layer(middleware::from_fn_with_state(
+            crate::inference::image_buffer::TEXT_BODY_BYTES,
+            json_structure::bound,
+        ))
         .route_layer(middleware::from_fn(client_labels))
         .route_layer(middleware::from_fn_with_state(
             store.clone(),
@@ -198,13 +201,11 @@ async fn image_input_body(
     };
     match buffer.admit(length, key) {
         Admission::Text => {
-            let body = axum::body::Body::new(http_body_util::Limited::new(body, TEXT_BODY_BYTES));
-            if !json_content_type(&parts.headers) {
-                return next.run(Request::from_parts(parts, body)).await;
-            }
-            match json_structure::measured(parts, body).await {
-                Ok(request) => next.run(request).await,
-                Err(response) => response,
+            // Measured whatever its `Content-Type`: these routes parse only
+            // JSON, and their extractor refuses any other type unread.
+            match json_structure::measured(parts, body, TEXT_BODY_BYTES).await {
+                json_structure::Measured::Run(request) => next.run(request).await,
+                json_structure::Measured::Refused(response) => response,
             }
         }
         Admission::TooLarge => {
@@ -326,6 +327,10 @@ fn workload_routes(store: &Store, engine: &Engine) -> Router<Store> {
     let capped = |kind: WorkloadKind, route: MethodRouter<Store>| -> MethodRouter<Store> {
         let bytes = limits.body_bytes(kind).expect("workload body cap");
         route
+            .layer::<_, std::convert::Infallible>(middleware::from_fn_with_state(
+                bytes,
+                json_structure::bound,
+            ))
             .layer::<_, std::convert::Infallible>(DefaultBodyLimit::max(bytes))
             .layer(RequestBodyLimitLayer::new(bytes))
     };
@@ -353,7 +358,6 @@ fn workload_routes(store: &Store, engine: &Engine) -> Router<Store> {
             "/v1/audio/speech",
             capped(WorkloadKind::AudioSpeech, post(audio::speech)),
         )
-        .route_layer(middleware::from_fn(json_structure::bound))
         .route_layer(middleware::from_fn(client_labels))
         .route_layer(middleware::from_fn_with_state(
             store.clone(),
@@ -369,6 +373,10 @@ fn job_routes(store: &Store) -> Router<Store> {
     let job_limits = crate::jobs::limits();
     let cap = |bytes: usize, route: MethodRouter<Store>| -> MethodRouter<Store> {
         route
+            .layer::<_, std::convert::Infallible>(middleware::from_fn_with_state(
+                bytes,
+                json_structure::bound,
+            ))
             .layer::<_, std::convert::Infallible>(DefaultBodyLimit::max(bytes))
             .layer(RequestBodyLimitLayer::new(bytes))
     };
@@ -403,7 +411,6 @@ fn job_routes(store: &Store) -> Router<Store> {
         )
         .route("/v1/batches/{id}", cap(small, get(batches::retrieve)))
         .route("/v1/batches/{id}/cancel", cap(small, post(batches::cancel)))
-        .route_layer(middleware::from_fn(json_structure::bound))
         .route_layer(middleware::from_fn(client_labels))
         .route_layer(middleware::from_fn_with_state(store.clone(), authenticate))
 }

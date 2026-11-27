@@ -19,7 +19,11 @@
 //! and key (each holds a `Value` or `String` in a vector, which grows to up
 //! to twice its length, and a string's own allocation), plus [`OBJECT`] for
 //! each non-empty object (its first B-tree node) and [`ARRAY`] for each
-//! non-empty array (a vector's first allocation holds four values).
+//! non-empty array (a vector's first allocation holds four values), plus
+//! twice the longest string literal with an escape: `serde_json` decodes
+//! such a string into a scratch buffer, which it reuses for every string and
+//! which grows to up to twice the longest it held, before the string is
+//! copied out.
 //!
 //! The walk agrees with any JSON parser on where strings begin and end: from
 //! the first byte, outside a string a `"` opens one; inside, a `\` escapes
@@ -51,6 +55,8 @@ pub(crate) const TOKEN: usize = 96;
 pub(crate) const OBJECT: usize = 640;
 /// Bytes charged for each non-empty array: its first allocation.
 pub(crate) const ARRAY: usize = 128;
+/// The scratch buffer's smallest allocation, once a string has an escape.
+const SCRATCH_MIN: usize = 64;
 
 /// A string literal the walk passed, for a caller that reads them (the image
 /// scan): `start..end` is its content between the quotes, and `key` is true
@@ -66,13 +72,17 @@ pub(crate) struct Literal {
 pub(crate) fn walk(body: &[u8], mut on_string: impl FnMut(&Literal)) -> usize {
     let mut tokens = 0usize;
     let mut containers = 0usize;
+    let mut longest_escaped = 0usize;
     let mut i = 0;
     while i < body.len() {
         match body[i] {
             b' ' | b'\t' | b'\n' | b'\r' | b',' | b':' | b']' | b'}' => i += 1,
             b'"' => {
                 let start = i + 1;
-                let end = string_end(body, start);
+                let (end, escaped) = string_end(body, start);
+                if escaped {
+                    longest_escaped = longest_escaped.max(end - start);
+                }
                 let after = (end + 1).min(body.len());
                 let key = next_byte(body, after).is_some_and(|at| body[at] == b':');
                 on_string(&Literal { start, end, key });
@@ -113,7 +123,11 @@ pub(crate) fn walk(body: &[u8], mut on_string: impl FnMut(&Literal)) -> usize {
             }
         }
     }
-    tokens.saturating_mul(TOKEN).saturating_add(containers)
+    tokens
+        .saturating_mul(TOKEN)
+        .saturating_add(containers)
+        .saturating_add(longest_escaped.saturating_mul(2))
+        .saturating_add(if longest_escaped > 0 { SCRATCH_MIN } else { 0 })
 }
 
 /// The structure estimate of `body` ([`walk`] without a reader).
@@ -127,9 +141,11 @@ pub fn within_budget(body: &[u8]) -> bool {
 }
 
 /// The index of the `"` that closes the string whose content starts at
-/// `start`, or the body's end when it is unterminated.
-pub(crate) fn string_end(body: &[u8], start: usize) -> usize {
+/// `start`, or the body's end when it is unterminated, and whether the
+/// string holds an escape.
+pub(crate) fn string_end(body: &[u8], start: usize) -> (usize, bool) {
     let mut i = start;
+    let mut escaped = false;
     loop {
         // Eight bytes at a time while none of them is a quote or a
         // backslash: string content, which only those two bytes can end.
@@ -141,9 +157,12 @@ pub(crate) fn string_end(body: &[u8], start: usize) -> usize {
             i += 8;
         }
         match body.get(i) {
-            None => return body.len(),
-            Some(b'\\') => i += 2,
-            Some(b'"') => return i,
+            None => return (body.len(), escaped),
+            Some(b'\\') => {
+                escaped = true;
+                i += 2;
+            }
+            Some(b'"') => return (i, escaped),
             Some(_) => i += 1,
         }
     }

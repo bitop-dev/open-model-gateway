@@ -184,6 +184,22 @@ fn the_estimate_covers_hostile_shapes() {
     bodies.push(
         serde_json::to_string(&json!({"a": vec![json!({"b": [1, 2, {"c": null}]}); n]})).unwrap(),
     );
+    // Long strings with an escape: decoded through a reused scratch buffer
+    // that grows to twice the longest, before the string is copied out.
+    let long = "x".repeat(1 << 20);
+    bodies.extend([
+        format!(r#"["\n{long}"]"#),
+        format!(r#"["{long}\n"]"#),
+        format!(r#"{{"{long}\n":0}}"#),
+        format!(r#"["data:image/png;base64,{}\/"]"#, "A".repeat(1 << 20)),
+        format!(
+            r#"["{long}\n","{}\n","{}\n"]"#,
+            &long[..1000],
+            &long[..(1 << 19)]
+        ),
+        format!(r#"["{}é"]"#, "é".repeat(1 << 18)),
+        format!(r#"["{}","{long}\n"]"#, r"\n".repeat(1 << 18)),
+    ]);
     for body in bodies {
         holds(body.as_bytes()).unwrap();
     }
@@ -200,6 +216,13 @@ fn value() -> impl Strategy<Value = Value> {
             .prop_map(|f| json!(f)),
         ".{0,12}".prop_map(Value::String),
         "[\\x00-\\x1f\"\\\\/]{0,6}".prop_map(Value::String),
+        // Long strings with escapes anywhere in them.
+        (
+            "[a-z]{0,1500}",
+            "[\\x00-\\x1f\"\\\\/]{0,3}",
+            "[a-z]{0,1500}"
+        )
+            .prop_map(|(a, e, b)| Value::String(format!("{a}{e}{b}"))),
     ];
     leaf.prop_recursive(8, 400, 40, |inner| {
         prop_oneof![

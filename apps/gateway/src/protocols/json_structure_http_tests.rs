@@ -238,3 +238,68 @@ async fn one_key_holds_at_most_half_the_image_buffer(pool: PgPool) {
     counting.abort();
     let _ = counting.await;
 }
+
+/// A body without a declared length is read only up to its route's cap:
+/// past it the request is refused with 413, as before the structure bound,
+/// with no more of the body pulled than the cap and one frame.
+#[dbtest::test]
+async fn an_undeclared_body_past_its_route_cap_is_read_only_to_the_cap(pool: PgPool) {
+    let w = world(pool, ImageInputLimits::default(), true).await;
+    let text = format!(
+        r#"{{"model":"company/smart","input":"{}"}}"#,
+        "x".repeat(3 * MIB)
+    );
+    for path in [
+        "/v1/embeddings",
+        "/v1/rerank",
+        "/v1/systemone",
+        "/v1/images/generations",
+        "/v1/audio/speech",
+        "/v1/batches",
+        "/v1/chat/completions",
+        "/v1/messages",
+    ] {
+        let (status, _, value, pulled) =
+            send(&w, path, Some(&w.token), text.clone().into_bytes(), false).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{path}: {value}");
+        assert!(
+            pulled <= TEXT_BODY_BYTES + 64 * 1024,
+            "{path}: pulled {pulled}"
+        );
+    }
+}
+
+/// A body is measured whatever its `Content-Type` claims: a JSON type the
+/// `mime` parser cannot read, or none at all, still reaches a handler that
+/// may read the bytes as JSON (`/v1/videos` compares only the media type
+/// before the first `;`), so it is measured like any other.
+#[dbtest::test]
+async fn a_body_is_measured_whatever_its_content_type(pool: PgPool) {
+    let w = world(pool, ImageInputLimits::default(), true).await;
+    let body = hostile(r#"{"a":0}"#, TEXT_BODY_BYTES);
+    for (path, content_type) in [
+        ("/v1/videos", Some("application/json; charset")),
+        ("/v1/videos", Some("application/json;=x")),
+        ("/v1/rerank", Some("text/plain")),
+        ("/v1/chat/completions", Some("application/json; charset")),
+        ("/v1/messages", None),
+    ] {
+        let mut request = Request::post(path)
+            .header(header::AUTHORIZATION, format!("Bearer {}", w.token))
+            .header("anthropic-version", "2023-06-01");
+        if let Some(content_type) = content_type {
+            request = request.header(header::CONTENT_TYPE, content_type);
+        }
+        let response = w
+            .router
+            .clone()
+            .oneshot(request.body(Body::from(body.clone())).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "{path} {content_type:?}"
+        );
+    }
+}

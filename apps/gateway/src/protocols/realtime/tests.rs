@@ -517,3 +517,25 @@ mod contract;
 
 #[cfg(feature = "integration-tests")]
 pub(crate) use contract::inference_openapi_handshake_fixtures;
+
+/// A client frame that would parse into more structure than any JSON
+/// request body may (`inference::json_weight`, #872) is refused before it is
+/// parsed, naming no part of it; the same bytes of text are accepted.
+#[test]
+fn a_frame_that_parses_too_large_is_refused_before_it_is_parsed() {
+    let objects = vec![r#"{"a":0}"#; 20_000].join(",");
+    let frame = format!(r#"{{"type":"session.update","session":{{"x":[{objects}]}}}}"#);
+    assert!(!crate::inference::json_weight::within_budget(
+        frame.as_bytes()
+    ));
+    let before = crate::metrics::METRICS.json_structure_refusal_count("realtime");
+    let refused = validate(&frame, 100).unwrap_err();
+    assert_eq!(refused.message, "The event is too large");
+    assert_eq!(
+        crate::metrics::METRICS.json_structure_refusal_count("realtime"),
+        before + 1
+    );
+    let audio = "A".repeat(frame.len() / 4 * 4);
+    let text = json!({"type":"input_audio_buffer.append","audio":audio}).to_string();
+    assert!(validate(&text, 100).is_ok());
+}

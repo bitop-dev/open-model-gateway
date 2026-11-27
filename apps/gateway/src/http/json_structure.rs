@@ -3,17 +3,17 @@
 //! `inference::json_weight::BUDGET` is refused with 413, its bytes never
 //! parsed or echoed.
 //!
-//! The body is read whole here, under the route's own byte limit (the
-//! layers outside this one bound it), as the handler's JSON extractor would
-//! read it; the handler then parses these same bytes, uncopied. A body that
-//! is not JSON by its `Content-Type`, or of a route that ignores its body,
-//! passes through unread: the handler refuses it, reads it as the multipart
-//! form it is, or never reads it. The image input
-//! routes take the same measure inside `image_input_body`, in the same pass
-//! as their image scan.
+//! The body is read whole here, never past the route's own byte limit
+//! (this layer is given it and reads through it, whatever stands outside),
+//! as the handler's JSON extractor would read it; the handler then parses
+//! these same bytes, uncopied. A multipart form, or the body of a route
+//! that ignores its body, passes through unread: the handler reads it as the
+//! form it is, or never reads it. Every other body is measured, whatever its
+//! `Content-Type`. The image input routes take the same measure inside
+//! `image_input_body`, in the same pass as their image scan.
 use axum::{
     body::{Body, Bytes},
-    extract::Request,
+    extract::{Request, State},
     http::{StatusCode, request::Parts},
     middleware::Next,
     response::Response,
@@ -54,27 +54,36 @@ pub(super) fn refusal(path: &str, structure: usize) -> Option<Response> {
     })
 }
 
-/// The middleware of the inference routes outside the image input routes.
-pub(super) async fn bound(request: Request, next: Next) -> Response {
-    if !super::json_content_type(request.headers()) || family(request.uri().path()).is_none() {
+/// The middleware of the inference routes outside the image input routes,
+/// given the route's byte limit.
+pub(super) async fn bound(State(limit): State<usize>, request: Request, next: Next) -> Response {
+    if multipart(request.headers()) || family(request.uri().path()).is_none() {
         return next.run(request).await;
     }
     let (parts, body) = request.into_parts();
-    match measured(parts, body).await {
-        Ok(request) => next.run(request).await,
-        Err(response) => response,
+    match measured(parts, body, limit).await {
+        Measured::Run(request) => next.run(request).await,
+        Measured::Refused(response) => response,
     }
 }
 
-/// `body` read whole and measured: the request to run with it, or the
-/// response that refuses it.
-pub(super) async fn measured(parts: Parts, body: Body) -> Result<Request, Response> {
+/// What measuring a body decided.
+pub(super) enum Measured {
+    /// The request to run, with the body read whole.
+    Run(Request),
+    /// The response that refuses it.
+    Refused(Response),
+}
+
+/// `body` read whole, at most `limit` bytes of it, and measured.
+pub(super) async fn measured(parts: Parts, body: Body, limit: usize) -> Measured {
+    let body = http_body_util::Limited::new(body, limit);
     let bytes = match http_body_util::BodyExt::collect(body).await {
         Ok(collected) => collected.to_bytes(),
         // Past the route's byte limit: the 413 the handler's extractor
         // would answer.
-        Err(error) if over_limit(&error) => {
-            return Err(if super::anthropic_path(parts.uri.path()) {
+        Err(error) if over_limit(&*error) => {
+            return Measured::Refused(if super::anthropic_path(parts.uri.path()) {
                 crate::protocols::messages::http_error(StatusCode::PAYLOAD_TOO_LARGE)
             } else {
                 crate::protocols::payload_too_large()
@@ -87,18 +96,33 @@ pub(super) async fn measured(parts: Parts, body: Body) -> Result<Request, Respon
                 Body::from_stream(futures_util::stream::once(
                     async move { Err::<Bytes, _>(error) },
                 ));
-            return Ok(Request::from_parts(parts, failed));
+            return Measured::Run(Request::from_parts(parts, failed));
         }
     };
     if let Some(response) = refusal(parts.uri.path(), json_weight::estimate(&bytes)) {
-        return Err(response);
+        return Measured::Refused(response);
     }
-    Ok(Request::from_parts(parts, Body::from(bytes)))
+    Measured::Run(Request::from_parts(parts, Body::from(bytes)))
+}
+
+/// Whether the body is a multipart form (file uploads, transcriptions and
+/// video references), which no handler parses as one JSON document. Every
+/// other body is measured, whatever its `Content-Type` says, so a handler
+/// that reads a loosely typed body as JSON never parses one unmeasured.
+fn multipart(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.trim_start()
+                .get(..10)
+                .is_some_and(|p| p.eq_ignore_ascii_case("multipart/"))
+        })
 }
 
 /// Whether a body read failed because it passed its byte limit.
-fn over_limit(error: &axum::Error) -> bool {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+fn over_limit(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(error);
     while let Some(error) = source {
         if error.is::<http_body_util::LengthLimitError>() {
             return true;
@@ -106,4 +130,35 @@ fn over_limit(error: &axum::Error) -> bool {
         source = error.source();
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    /// The request wire types deserialize directly: none of the serde shapes
+    /// that first buffer a value into a generic tree (an untagged or
+    /// internally tagged enum, a flattened field), whose cost per value the
+    /// structure estimate does not cover (#872).
+    #[test]
+    fn request_types_use_no_buffering_serde_shape() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![root.join("protocols"), root.join("jobs")];
+        let mut found = Vec::new();
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if name.ends_with(".rs") && !name.contains("test") {
+                    let source = std::fs::read_to_string(&path).unwrap().replace(' ', "");
+                    for shape in ["serde(untagged", "serde(flatten", "serde(tag="] {
+                        if source.contains(shape) {
+                            found.push(format!("{}: {shape}", path.display()));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(found.is_empty(), "{found:#?}");
+    }
 }

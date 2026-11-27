@@ -321,6 +321,7 @@ partitions.rs :: run_job :: metrics call :: crate :: metrics :: METRICS . set_pa
 protocols/chat_completions.rs :: handle :: metrics call :: crate :: metrics :: METRICS . image_input_refused ("too_large")
 protocols/messages.rs :: beyond_image_sources :: metrics call :: crate :: metrics :: METRICS . image_input_refused ("too_large")
 protocols/messages.rs :: beyond_images :: metrics call :: crate :: metrics :: METRICS . image_input_refused ("too_large")
+protocols/realtime/events.rs :: validate_measured :: metrics call :: crate :: metrics :: METRICS . json_structure_refused ("realtime")
 protocols/responses.rs :: handle :: metrics call :: crate :: metrics :: METRICS . image_input_refused ("too_large")
 rollups.rs :: run_once :: metrics call :: crate :: metrics :: METRICS . observe_rollup_hours ("changed" , report . changed_hours)
 rollups.rs :: run_once :: metrics call :: crate :: metrics :: METRICS . observe_rollup_hours ("new" , report . new_hours)

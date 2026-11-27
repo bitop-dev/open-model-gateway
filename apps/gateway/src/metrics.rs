@@ -255,8 +255,7 @@ pub struct Metrics {
     key_issuance_refused: Family<L2, Counter>,
     egress_denied: Family<L1, Counter>,
     guardrails: GuardrailMetrics,
-    image_input: ImageInputFamilies,
-    json_structure_refusals: Family<L1, Counter>,
+    bodies: BodyFamilies,
     upstream_connection_lost: Family<L1, Counter>,
     upstream_connections_opened: Family<L1, Counter>,
     job_lease_renewals: Family<L1, Counter>,
@@ -293,12 +292,14 @@ pub struct Metrics {
     reservations_refreshed: Mutex<Option<Instant>>,
 }
 
-/// The image input buffer's gauges and its refusals by reason.
+/// Request bodies: the image input buffer's gauges and its refusals by
+/// reason, and the JSON bodies refused for their structure by route family.
 #[derive(Default)]
-struct ImageInputFamilies {
+struct BodyFamilies {
     in_use: Gauge,
     size: Gauge,
     refusals: Family<L1, Counter>,
+    structure_refusals: Family<L1, Counter>,
 }
 
 pub static METRICS: LazyLock<Metrics> = LazyLock::new(Metrics::new);

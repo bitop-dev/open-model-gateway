@@ -17,7 +17,8 @@
 //! and a generation's alike): a key that declares large bodies and sends
 //! them slowly cannot turn every other key's large image requests away. A
 //! key at its share is answered as for a spent buffer (503, `Retry-After`),
-//! while other keys are still admitted.
+//! while other keys are still admitted. The share is per key: each key of a
+//! workspace has its own.
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
