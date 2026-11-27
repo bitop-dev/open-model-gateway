@@ -574,6 +574,7 @@ impl ExecutionGuard {
         started: Instant,
         permit: SharedPermit,
         log_trace_id: Option<LogTraceId>,
+        health_write_bound: Duration,
     ) -> Self {
         Self {
             repository,
@@ -585,7 +586,7 @@ impl ExecutionGuard {
             telemetry: AttemptTelemetry::default(),
             finished: false,
             health_observation: true,
-            health_write_bound: HEALTH_WRITE_BOUND,
+            health_write_bound,
             probe: None,
             probe_closing: None,
             _permit: permit,

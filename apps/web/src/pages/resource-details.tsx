@@ -1,6 +1,7 @@
 import { placeHold } from "./legal-holds";
 import { useEffect, type ReactNode } from "react";
-import { BellRing, Bot, Boxes, Gauge, Inbox, LayoutDashboard, Library, ScrollText, Settings2, ShieldCheck, UsersRound, UserPlus } from "lucide-react";
+import { BellRing, Bot, Boxes, Gauge, Inbox, LayoutDashboard, Library, ScrollText, Settings2, Shield, ShieldCheck, UsersRound, UserPlus } from "lucide-react";
+import { WorkspaceGuardrailsAdmin, WorkspaceGuardrailsTab } from "./guardrails";
 import { api, wsPath, platformWorkspacePath, type Session, type Workspace, type CostCenter, type CatalogAvailability, type Grant, type ObjectVisibility } from "../lib/api";
 import { ResourcePage } from "../components/resource-page";
 import { DateTime, ErrorNotice, Panel, Stack, Alert, StatCard, useApi, useChoices, Button, useAction } from "../components/ui";
@@ -39,8 +40,8 @@ import s from "./shared.module.css";
  * Members, Limits and Audit log.
  */
 export function workspaceSettingsTabs(session: Session, workspace: Workspace): string[] {
-  if (workspace.kind === "personal") return ["limits", "access", "alerts", "audit"];
-  return ["overview", "members", ...(permissions(session, workspace).manageServiceAccounts ? ["service-accounts"] : []), ...(permissions(session, workspace).manageTeam ? ["access-requests"] : []), "limits", "access", ...(permissions(session, workspace).managePolicy ? ["alerts"] : []), "audit"];
+  if (workspace.kind === "personal") return ["limits", "access", "guardrails", "alerts", "audit"];
+  return ["overview", "members", ...(permissions(session, workspace).manageServiceAccounts ? ["service-accounts"] : []), ...(permissions(session, workspace).manageTeam ? ["access-requests"] : []), "limits", "access", "guardrails", ...(permissions(session, workspace).managePolicy ? ["alerts"] : []), "audit"];
 }
 export function WorkspaceSettings({ session, workspace, tab, onTabChange }: Scope & { tab?: string; onTabChange: (tab: string) => void }) {
   const personal = workspace.kind === "personal", editLimits = !personal && permissions(session, workspace).managePolicy;
@@ -52,6 +53,7 @@ export function WorkspaceSettings({ session, workspace, tab, onTabChange }: Scop
     "access-requests": { label: "Access requests", icon: <Inbox aria-hidden />, content: <WorkspaceAccessRequestQueue session={session} workspace={workspace} /> },
     limits: { label: "Limits", icon: <Gauge aria-hidden />, content: editLimits ? <Governance session={session} workspace={workspace} /> : <EffectiveLimits workspace={workspace} /> },
     access: { label: "Access", icon: <ShieldCheck aria-hidden />, content: <EffectiveAccess workspace={workspace} title="Access" canManageModels={permissions(session, workspace).manageGrants} /> },
+    guardrails: { label: "Guardrails", icon: <Shield aria-hidden />, content: <WorkspaceGuardrailsTab workspace={workspace} /> },
     alerts: { label: "Alerts", icon: <BellRing aria-hidden />, content: <WorkspaceAlerts session={session} workspace={workspace} /> },
     audit: { label: "Audit log", icon: <ScrollText aria-hidden />, content: <AuditHistory session={session} workspace={workspace} /> },
   };
@@ -128,6 +130,7 @@ export function WorkspaceDetail({ session, id, kind, tab, onTabChange }: { sessi
       { value: "model-access", label: "Models", icon: <Boxes aria-hidden />, count: modelsVisible ? models.data?.length : undefined, content: <WorkspaceModelAccess session={session} workspace={workspace} /> },
       { value: "limits", label: "Limits", icon: <Gauge aria-hidden />, content: <ScopeLimits mode="replacement" path={`${platformWorkspacePath(id)}/policy`} writable={writable} kind={workspace.kind} /> },
       { value: "access", label: "Access", icon: <ShieldCheck aria-hidden />, content: <EffectiveAccess workspace={workspace} title="Access" /> },
+      { value: "guardrails", label: "Guardrails", icon: <Shield aria-hidden />, content: <WorkspaceGuardrailsAdmin id={id} writable={writable} /> },
       { value: "settings", label: "General", icon: <Settings2 aria-hidden />, content: <Stack gap={6}><Panel title="Administrative settings"><SettingsForm fields={[{ ...nameField, value: workspace.name }, { name: "cost_center_id", label: "Cost center", type: "select", value: workspace.cost_center_id ?? "", options: centers.data?.filter(c => !c.archived_at).map(c => ({ value: c.id, label: `${c.name} · ${c.code}` })) ?? [], help: "Applies to new requests only. Empty: Unallocated." }]} writable={writable && centers.isSuccess} onSave={(v, signal) => api(platformWorkspacePath(id), { method: "PATCH", body: { name: v.name, cost_center_id: v.cost_center_id || null }, signal })} />{centers.isError && <ErrorNotice error={centers.error} />}</Panel>
       <Panel title="Discovery"><DescriptionList items={[{ label: "Discoverable", value: <Badge tone={discoverable ? "success" : "neutral"}>{discoverable ? "Yes" : "No"}</Badge> }]} />
         <p className={s.note}>Active, entitled users can find a discoverable workspace and ask to join it as a member. Defaults off.</p>

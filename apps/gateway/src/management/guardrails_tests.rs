@@ -22,6 +22,47 @@ fn moderation() -> Value {
 fn reason(v: &Value) -> &str {
     v["error"]["reason"].as_str().unwrap_or("")
 }
+/// A PUT built from the layer as `u` reads it now: `expected` is filled in
+/// (the layer's id and revision, or null) unless the body names one.
+async fn put(s: &Store, u: &BrowserPrincipal, path: &str, mut body: Value) -> (StatusCode, Value) {
+    if body.is_object() && body.get("expected").is_none() {
+        body["expected"] = read_expected(s, u, path).await;
+    }
+    call(s, u, "PUT", path, body).await
+}
+/// A reset naming the override `u` reads now (none: no query).
+async fn reset_override(s: &Store, u: &BrowserPrincipal, ws: Uuid) -> (StatusCode, Value) {
+    let path = platform_ws(ws);
+    let query = match read_expected(s, u, &path).await {
+        Value::Null => String::new(),
+        e => format!(
+            "?rule_set_id={}&revision={}",
+            e["rule_set_id"].as_str().unwrap(),
+            e["revision"]
+        ),
+    };
+    call(s, u, "DELETE", &format!("{path}{query}"), Value::Null).await
+}
+/// The `expected` of the layer at `path` as `u` reads it (null when there is
+/// none, or `u` may not read it).
+async fn read_expected(s: &Store, u: &BrowserPrincipal, path: &str) -> Value {
+    let (status, v) = call(s, u, "GET", path, Value::Null).await;
+    if !status.is_success() {
+        return Value::Null;
+    }
+    let set = if path.contains("/workspace-types/") {
+        &v["rule_set"]
+    } else if path.contains("/platform/workspaces/") {
+        &v["override"]
+    } else {
+        &v["local"]
+    };
+    if set.is_null() {
+        Value::Null
+    } else {
+        json!({"rule_set_id": set["id"], "revision": set["revision"]})
+    }
+}
 async fn version(pool: &PgPool) -> i64 {
     sqlx::query_scalar("SELECT version FROM config_versions WHERE topic='guardrails'")
         .fetch_one(pool)
@@ -33,10 +74,9 @@ async fn version(pool: &PgPool) -> i64 {
 async fn platform_layers_are_written_by_admins_and_read_by_auditors(pool: PgPool) {
     let f = fixture(&pool).await;
     let before = version(&pool).await;
-    let (status, body) = call(
+    let (status, body) = put(
         &f.s,
         &f.admin,
-        "PUT",
         TYPE_TEAM,
         json!({"local_only":false,"rules":[secrets("block"), custom(r"PROJECT-\d{4}")]}),
     )
@@ -64,10 +104,9 @@ async fn platform_layers_are_written_by_admins_and_read_by_auditors(pool: PgPool
         let (status, _) = call(&f.s, u, method, TYPE_TEAM, json!({"rules":[]})).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{method} by {}", u.email);
     }
-    let (status, _) = call(
+    let (status, _) = put(
         &f.s,
         &f.admin,
-        "PUT",
         "/api/v1/platform/workspace-types/galaxy/guardrails",
         json!({"local_only":false,"rules":[]}),
     )
@@ -77,10 +116,9 @@ async fn platform_layers_are_written_by_admins_and_read_by_auditors(pool: PgPool
     let id = read["rule_set"]["rules"][0]["id"].clone();
     let mut kept = secrets("monitor");
     kept["id"] = id.clone();
-    let (status, body) = call(
+    let (status, body) = put(
         &f.s,
         &f.admin,
-        "PUT",
         TYPE_TEAM,
         json!({"local_only":false,"rules":[kept]}),
     )
@@ -121,10 +159,9 @@ async fn platform_layers_are_written_by_admins_and_read_by_auditors(pool: PgPool
 #[dbtest::test]
 async fn the_local_layer_is_written_by_owners_and_admins_only(pool: PgPool) {
     let f = fixture(&pool).await;
-    let (status, body) = call(
+    let (status, body) = put(
         &f.s,
         &f.owner,
-        "PUT",
         &local(f.team),
         json!({"rules":[custom("internal-host-[0-9]+")]}),
     )
@@ -136,7 +173,7 @@ async fn the_local_layer_is_written_by_owners_and_admins_only(pool: PgPool) {
         "the writer reads its patterns"
     );
     assert_eq!(body["enforced"], true, "input rules are enforced");
-    let (status, _) = call(&f.s, &f.member, "PUT", &local(f.team), json!({"rules":[]})).await;
+    let (status, _) = put(&f.s, &f.member, &local(f.team), json!({"rules":[]})).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     let (status, read) = call(&f.s, &f.member, "GET", &local(f.team), Value::Null).await;
     assert_eq!(status, StatusCode::OK);
@@ -169,17 +206,16 @@ async fn the_local_layer_is_written_by_owners_and_admins_only(pool: PgPool) {
     let (status, staff) = call(&f.s, &f.auditor, "GET", &local(f.team), Value::Null).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(staff["can_edit"], false);
-    let (status, _) = call(&f.s, &f.admin, "PUT", &local(f.team), json!({"rules":[]})).await;
+    let (status, _) = put(&f.s, &f.admin, &local(f.team), json!({"rules":[]})).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 #[dbtest::test]
 async fn a_personal_owner_tightens_privately(pool: PgPool) {
     let f = fixture(&pool).await;
-    let (status, body) = call(
+    let (status, body) = put(
         &f.s,
         &f.owner,
-        "PUT",
         &local(f.personal),
         json!({"rules":[custom("my-secret-code")]}),
     )
@@ -210,19 +246,17 @@ async fn a_personal_owner_tightens_privately(pool: PgPool) {
 #[dbtest::test]
 async fn a_local_layer_cannot_loosen_a_platform_rule(pool: PgPool) {
     let f = fixture(&pool).await;
-    let (_, platform) = call(
+    let (_, platform) = put(
         &f.s,
         &f.admin,
-        "PUT",
         TYPE_TEAM,
         json!({"local_only":false,"rules":[secrets("monitor")]}),
     )
     .await;
     let target = platform["rule_set"]["rules"][0]["id"].clone();
-    let (status, body) = call(
+    let (status, body) = put(
         &f.s,
         &f.owner,
-        "PUT",
         &local(f.team),
         json!({"rules":[{"tightens":target,"input":{"action":"off"}}]}),
     )
@@ -232,22 +266,14 @@ async fn a_local_layer_cannot_loosen_a_platform_rule(pool: PgPool) {
     assert_eq!(body["error"]["rule"], target);
     let mut replaced = secrets("off");
     replaced["id"] = target.clone();
-    let (status, body) = call(
-        &f.s,
-        &f.owner,
-        "PUT",
-        &local(f.team),
-        json!({"rules":[replaced]}),
-    )
-    .await;
+    let (status, body) = put(&f.s, &f.owner, &local(f.team), json!({"rules":[replaced]})).await;
     assert_eq!(
         (status, reason(&body)),
         (StatusCode::FORBIDDEN, "guardrail_loosen_not_allowed")
     );
-    let (status, body) = call(
+    let (status, body) = put(
         &f.s,
         &f.owner,
-        "PUT",
         &local(f.team),
         json!({"rules":[{"tightens":target,"input":{"action":"block"}}]}),
     )
@@ -264,10 +290,9 @@ async fn a_local_layer_cannot_loosen_a_platform_rule(pool: PgPool) {
         json!([body["local"]["rules"][0]["id"]])
     );
     // The platform rule is removed: the entry stays, inactive.
-    call(
+    put(
         &f.s,
         &f.admin,
-        "PUT",
         TYPE_TEAM,
         json!({"local_only":false,"rules":[]}),
     )
@@ -283,10 +308,9 @@ async fn a_local_layer_cannot_loosen_a_platform_rule(pool: PgPool) {
 #[dbtest::test]
 async fn later_phase_rules_and_egress_are_refused_on_write(pool: PgPool) {
     let f = fixture(&pool).await;
-    let (status, body) = call(
+    let (status, body) = put(
         &f.s,
         &f.owner,
-        "PUT",
         &local(f.team),
         json!({"rules":[moderation()]}),
     )
@@ -297,10 +321,9 @@ async fn later_phase_rules_and_egress_are_refused_on_write(pool: PgPool) {
         "{body}"
     );
     let mut redact = secrets("redact");
-    let (status, body) = call(
+    let (status, body) = put(
         &f.s,
         &f.admin,
-        "PUT",
         TYPE_TEAM,
         json!({"local_only":false,"rules":[redact.clone()]}),
     )
@@ -311,10 +334,9 @@ async fn later_phase_rules_and_egress_are_refused_on_write(pool: PgPool) {
     );
     redact["input"]["action"] = json!("block");
     redact["output"] = json!({"mode":"monitor"});
-    let (status, body) = call(
+    let (status, body) = put(
         &f.s,
         &f.admin,
-        "PUT",
         TYPE_TEAM,
         json!({"local_only":false,"rules":[redact]}),
     )
@@ -323,10 +345,9 @@ async fn later_phase_rules_and_egress_are_refused_on_write(pool: PgPool) {
         (status, reason(&body)),
         (StatusCode::BAD_REQUEST, "guardrail_detector_unavailable")
     );
-    let (status, body) = call(
+    let (status, body) = put(
         &f.s,
         &f.admin,
-        "PUT",
         &platform_ws(f.team),
         json!({"local_only":true,"rules":[moderation()]}),
     )
@@ -335,19 +356,17 @@ async fn later_phase_rules_and_egress_are_refused_on_write(pool: PgPool) {
         (status, reason(&body)),
         (StatusCode::FORBIDDEN, "guardrail_egress_not_allowed")
     );
-    let (status, _) = call(
+    let (status, _) = put(
         &f.s,
         &f.admin,
-        "PUT",
         &platform_ws(f.team),
         json!({"local_only":true,"rules":[]}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let (status, body) = call(
+    let (status, body) = put(
         &f.s,
         &f.owner,
-        "PUT",
         &local(f.team),
         json!({"rules":[moderation()]}),
     )
@@ -357,10 +376,9 @@ async fn later_phase_rules_and_egress_are_refused_on_write(pool: PgPool) {
         (StatusCode::FORBIDDEN, "guardrail_egress_not_allowed"),
         "{body}"
     );
-    let (status, body) = call(
+    let (status, body) = put(
         &f.s,
         &f.owner,
-        "PUT",
         &local(f.team),
         json!({"rules":[custom("(unclosed")]}),
     )
@@ -369,10 +387,9 @@ async fn later_phase_rules_and_egress_are_refused_on_write(pool: PgPool) {
         (status, reason(&body)),
         (StatusCode::BAD_REQUEST, "guardrail_pattern_invalid")
     );
-    let (status, body) = call(
+    let (status, body) = put(
         &f.s,
         &f.owner,
-        "PUT",
         &local(f.team),
         json!({"local_only":true,"rules":[]}),
     )
@@ -393,10 +410,9 @@ async fn later_phase_rules_and_egress_are_refused_on_write(pool: PgPool) {
 #[dbtest::test]
 async fn local_only_makes_an_earlier_egress_rule_inactive_when_composing(pool: PgPool) {
     let f = fixture(&pool).await;
-    call(
+    put(
         &f.s,
         &f.owner,
-        "PUT",
         &local(f.team),
         json!({"rules":[secrets("block")]}),
     )
@@ -434,10 +450,9 @@ async fn local_only_makes_an_earlier_egress_rule_inactive_when_composing(pool: P
         (later["active"].clone(), later["inactive_reason"].clone()),
         (json!(false), json!("not_runnable"))
     );
-    let (status, _) = call(
+    let (status, _) = put(
         &f.s,
         &f.admin,
-        "PUT",
         &platform_ws(f.team),
         json!({"local_only":true,"rules":[]}),
     )
@@ -464,18 +479,16 @@ async fn local_only_makes_an_earlier_egress_rule_inactive_when_composing(pool: P
 #[dbtest::test]
 async fn an_override_replaces_the_type_default_until_reset(pool: PgPool) {
     let f = fixture(&pool).await;
-    call(
+    put(
         &f.s,
         &f.admin,
-        "PUT",
         TYPE_TEAM,
         json!({"local_only":false,"rules":[secrets("monitor")]}),
     )
     .await;
-    let (status, body) = call(
+    let (status, body) = put(
         &f.s,
         &f.admin,
-        "PUT",
         &platform_ws(f.team),
         json!({"local_only":false,"rules":[secrets("block"), custom("acme-[a-z]+")]}),
     )
@@ -484,7 +497,7 @@ async fn an_override_replaces_the_type_default_until_reset(pool: PgPool) {
     assert_eq!(body["platform"]["source"], "workspace_override");
     assert_eq!(body["effective"].as_array().unwrap().len(), 2);
     assert_eq!(body["effective"][0]["input"]["action"], "block");
-    let (status, body) = call(&f.s, &f.admin, "DELETE", &platform_ws(f.team), Value::Null).await;
+    let (status, body) = reset_override(&f.s, &f.admin, f.team).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["platform"]["source"], "type_default");
     assert_eq!(body["override"], Value::Null);
@@ -528,16 +541,15 @@ async fn the_database_refuses_writes_the_routes_would_refuse(pool: PgPool) {
         "local_only is a platform field: {err}"
     );
     // A tightening entry names a rule of its own workspace's platform layer.
-    call(
+    put(
         &f.s,
         &f.admin,
-        "PUT",
         &platform_ws(f.project),
         json!({"local_only":false,"rules":[secrets("monitor")]}),
     )
     .await;
     let other: Uuid = sqlx::query_scalar("SELECT r.id FROM guardrail_rules r JOIN guardrail_rule_sets s ON s.id=r.rule_set_id WHERE s.workspace_id=$1").bind(f.project).fetch_one(&pool).await.unwrap();
-    call(&f.s, &f.owner, "PUT", &local(f.team), json!({"rules":[]})).await;
+    put(&f.s, &f.owner, &local(f.team), json!({"rules":[]})).await;
     let set: Uuid = sqlx::query_scalar(
         "SELECT id FROM guardrail_rule_sets WHERE layer='workspace_local' AND workspace_id=$1",
     )
@@ -573,10 +585,9 @@ const FULL_RULE: &str = "INSERT INTO guardrail_rules(id,rule_set_id,position,nam
 #[dbtest::test]
 async fn rules_change_only_with_their_sets_revision(pool: PgPool) {
     let f = fixture(&pool).await;
-    let (status, _) = call(
+    let (status, _) = put(
         &f.s,
         &f.admin,
-        "PUT",
         &platform_ws(f.project),
         json!({"local_only":false,"rules":[secrets("monitor")]}),
     )
@@ -675,25 +686,216 @@ async fn rules_change_only_with_their_sets_revision(pool: PgPool) {
     assert!(err.to_string().contains("at most 50"), "{err}");
     drop(tx);
     // The route removes an override in one transaction with its revision.
-    let (status, reset) = call(
-        &f.s,
-        &f.admin,
-        "DELETE",
-        &platform_ws(f.project),
-        Value::Null,
-    )
-    .await;
+    let (status, reset) = reset_override(&f.s, &f.admin, f.project).await;
     assert_eq!(status, StatusCode::OK, "{reset}");
     assert_eq!(reset["platform"]["source"], "type_default");
     // A pattern PostgreSQL cannot store is refused as a pattern, not a fault.
-    let (status, body) = call(
+    let (status, body) = put(
         &f.s,
         &f.owner,
-        "PUT",
         &local(f.team),
         json!({"rules":[custom("a\u{0}b")]}),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"]["reason"], "guardrail_pattern_invalid");
+}
+
+/// A layer write names the layer it was built from, by id and revision, and
+/// is refused (409) when the layer stored now is another one: a page or
+/// script that read an older layer never replaces a newer one. A missing
+/// `expected` is refused (400) only after authorization.
+#[dbtest::test]
+async fn a_write_built_from_an_older_layer_is_refused(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let at = |id: &Value, revision: i64| json!({"rule_set_id": id, "revision": revision});
+    let body = |expected: Value| json!({"local_only":false,"expected":expected,"rules":[secrets("monitor")]});
+    let write = |path: String, expected: Value| {
+        let s = f.s.clone();
+        let u = f.admin.clone();
+        async move { call(&s, &u, "PUT", &path, body(expected)).await }
+    };
+
+    // No `expected` at all: refused, but only once the caller may write.
+    let (status, v) = call(
+        &f.s,
+        &f.admin,
+        "PUT",
+        TYPE_TEAM,
+        json!({"local_only":false,"rules":[]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(reason(&v), "guardrail_expected_required");
+    let (status, _) = call(
+        &f.s,
+        &f.auditor,
+        "PUT",
+        TYPE_TEAM,
+        json!({"local_only":false,"rules":[]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // The type default: created from no layer, then only from its current revision.
+    let (status, v) = write(TYPE_TEAM.into(), Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let id = v["rule_set"]["id"].clone();
+    assert_eq!(v["rule_set"]["revision"], 1);
+    // A revision is at least 1: zero is a malformed body, never a mismatch.
+    let (status, v) = write(TYPE_TEAM.into(), at(&id, 0)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+    for stale in [Value::Null, at(&json!(Uuid::new_v4()), 1)] {
+        let (status, v) = write(TYPE_TEAM.into(), stale.clone()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{stale}: {v}");
+        assert_eq!(reason(&v), "guardrail_layer_changed");
+    }
+    let (status, v) = write(TYPE_TEAM.into(), at(&id, 1)).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["rule_set"]["revision"], 2);
+    let (status, _) = write(TYPE_TEAM.into(), at(&id, 1)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "a revision already replaced");
+
+    // An override removed and created again starts over at revision 1 under a
+    // new id: the old id with the same revision is refused.
+    let path = platform_ws(f.team);
+    let (status, v) = write(path.clone(), Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let first = v["override"]["id"].clone();
+    let reset = |q: String| {
+        let s = f.s.clone();
+        let u = f.admin.clone();
+        let path = format!("{}{q}", platform_ws(f.team));
+        async move { call(&s, &u, "DELETE", &path, Value::Null).await }
+    };
+    let (status, v) = reset(String::new()).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a reset names the override it removes: {v}"
+    );
+    assert_eq!(reason(&v), "guardrail_layer_changed");
+    let (status, v) = reset(format!("?rule_set_id={}", first.as_str().unwrap())).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "id without revision: {v}");
+    let (status, _) = call(
+        &f.s,
+        &f.admin,
+        "DELETE",
+        &format!("{}?revision=0", platform_ws(Uuid::new_v4())),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the workspace is checked first"
+    );
+    let (status, v) = reset(format!(
+        "?rule_set_id={}&revision=1",
+        first.as_str().unwrap()
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert!(v["override"].is_null());
+    let (status, _) = reset(format!(
+        "?rule_set_id={}&revision=1",
+        first.as_str().unwrap()
+    ))
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "no override left to remove");
+    let (status, v) = write(path.clone(), Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let second = v["override"]["id"].clone();
+    assert_ne!(first, second);
+    assert_eq!(v["override"]["revision"], 1);
+    let (status, _) = write(path.clone(), at(&first, 1)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "the removed override's id");
+    let (status, v) = write(path.clone(), at(&second, 1)).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+
+    // The local layer, written by a workspace admin.
+    let local_body =
+        |expected: Value| json!({"expected":expected,"rules":[custom(r"TICKET-\d{4}")]});
+    let (status, v) = call(
+        &f.s,
+        &f.owner,
+        "PUT",
+        &local(f.team),
+        local_body(Value::Null),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let lid = v["local"]["id"].clone();
+    let (status, v) = call(
+        &f.s,
+        &f.owner,
+        "PUT",
+        &local(f.team),
+        local_body(Value::Null),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{v}");
+    let (status, v) = call(
+        &f.s,
+        &f.owner,
+        "PUT",
+        &local(f.team),
+        local_body(at(&lid, 1)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["local"]["revision"], 2);
+}
+
+/// Two writers built from the same revision: one write lands, the other is
+/// refused, whatever the order the database serves them in.
+#[dbtest::test]
+async fn of_two_writes_built_from_one_revision_one_lands(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let (status, v) = call(
+        &f.s,
+        &f.admin,
+        "PUT",
+        TYPE_TEAM,
+        json!({"local_only":false,"expected":null,"rules":[]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let id = v["rule_set"]["id"].clone();
+    for revision in 1..=5_i64 {
+        let expected = json!({"rule_set_id": id, "revision": revision});
+        let a = call(
+            &f.s,
+            &f.admin,
+            "PUT",
+            TYPE_TEAM,
+            json!({"local_only":false,"expected":expected,"rules":[secrets("monitor")]}),
+        );
+        let b = call(
+            &f.s,
+            &f.admin,
+            "PUT",
+            TYPE_TEAM,
+            json!({"local_only":false,"expected":expected,"rules":[secrets("block")]}),
+        );
+        let ((sa, va), (sb, vb)) = tokio::join!(a, b);
+        let mut statuses = [sa, sb];
+        statuses.sort();
+        assert_eq!(
+            statuses,
+            [StatusCode::OK, StatusCode::CONFLICT],
+            "{va} {vb}"
+        );
+        let current: i64 = sqlx::query_scalar(
+            "SELECT revision::bigint FROM guardrail_rule_sets WHERE layer='type_default' AND kind='team'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            current,
+            revision + 1,
+            "exactly one write moved the revision"
+        );
+    }
 }

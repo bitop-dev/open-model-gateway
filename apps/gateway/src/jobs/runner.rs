@@ -64,6 +64,8 @@ use crate::{
 mod dispatch;
 mod lanes;
 mod line;
+#[cfg(all(test, feature = "integration-tests"))]
+pub(crate) use line::tests_stop;
 mod renewal;
 mod repository;
 mod segments;
