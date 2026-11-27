@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { BASE_URL } from "./stack.mjs";
 import { api, expectAccessible, expectNoCspViolations, expectNoHorizontalScroll, readFixture, signIn } from "./helpers";
 
@@ -11,6 +11,12 @@ import { api, expectAccessible, expectNoCspViolations, expectNoHorizontalScroll,
  * and the matching text are synthetic; matched text is never shown anywhere.
  */
 test.afterEach(expectNoCspViolations);
+/** A layer write names the layer it was built from (#841): read it as `page`'s user sees it now. */
+async function built(page: Page, path: string, key: "override" | "local" | "rule_set") {
+  const set = (await (await api(page, "GET", path)).json())[key];
+  return set ? { rule_set_id: set.id, revision: set.revision } : null;
+}
+const resetQuery = async (page: Page, path: string) => { const e = await built(page, path, "override"); return e ? `?rule_set_id=${e.rule_set_id}&revision=${e.revision}` : ""; };
 test.use({ trace: "off", screenshot: "off", video: "off" });
 
 test("a workspace rule blocks a request and the admin pages show the layers", async ({ browser }) => {
@@ -19,7 +25,7 @@ test("a workspace rule blocks a request and the admin pages show the layers", as
   const alex = await signIn(browser, "alex"), blair = await signIn(browser, "blair"), operator = await signIn(browser, "operator"), auditor = await signIn(browser, "auditor");
   try {
     // A platform override with a monitoring secrets rule, for the workspace to tighten.
-    expect((await api(operator.page, "PUT", platform, { local_only: false, rules: [{ name: "Secrets", protection: "secrets", detector: { kind: "pattern", categories: ["secret"] }, input: { action: "monitor" }, workloads: ["generation", "embeddings"] }] })).status()).toBe(200);
+    expect((await api(operator.page, "PUT", platform, { local_only: false, expected: await built(operator.page, platform, "override"), rules: [{ name: "Secrets", protection: "secrets", detector: { kind: "pattern", categories: ["secret"] }, input: { action: "monitor" }, workloads: ["generation", "embeddings"] }] })).status()).toBe(200);
     // A Team admin adds a blocking custom-pattern rule.
     await alex.page.goto(`/workspaces/${ws}/settings?tab=guardrails`);
     await expect(alex.page.getByText("What is checked")).toBeVisible();
@@ -146,7 +152,7 @@ test("a workspace rule blocks a request and the admin pages show the layers", as
     // Off rule to Monitor, a Platform Admin then raises the rule itself to
     // Block. The tightening is marked as weaker, and the next local save
     // leaves it out instead of being refused.
-    expect((await api(operator.page, "PUT", platform, { local_only: false, rules: [{ name: "Secrets", protection: "secrets", detector: { kind: "pattern", categories: ["secret"] }, input: { action: "off" } }] })).status()).toBe(200);
+    expect((await api(operator.page, "PUT", platform, { local_only: false, expected: await built(operator.page, platform, "override"), rules: [{ name: "Secrets", protection: "secrets", detector: { kind: "pattern", categories: ["secret"] }, input: { action: "off" } }] })).status()).toBe(200);
     const secretsRule = (await (await api(operator.page, "GET", platform)).json()).override.rules[0];
     await alex.page.reload();
     await alex.page.getByRole("button", { name: "Tighten Secrets" }).click();
@@ -154,7 +160,7 @@ test("a workspace rule blocks a request and the admin pages show the layers", as
     await tightenOff.getByRole("combobox", { name: "On input" }).selectOption("monitor");
     await tightenOff.getByRole("button", { name: "Tighten" }).click();
     await expect(effective.getByText("Tightened by this workspace")).toBeVisible();
-    expect((await api(operator.page, "PUT", platform, { local_only: false, rules: [{ id: secretsRule.id, name: "Secrets", protection: "secrets", detector: { kind: "pattern", categories: ["secret"] }, input: { action: "block" } }] })).status()).toBe(200);
+    expect((await api(operator.page, "PUT", platform, { local_only: false, expected: await built(operator.page, platform, "override"), rules: [{ id: secretsRule.id, name: "Secrets", protection: "secrets", detector: { kind: "pattern", categories: ["secret"] }, input: { action: "block" } }] })).status()).toBe(200);
     await alex.page.reload();
     await expect(alex.page.getByText(/“Secrets” is now stricter than this: it no longer applies/)).toBeVisible();
     await alex.page.getByRole("button", { name: "Add rule" }).click();
@@ -176,8 +182,8 @@ test("a workspace rule blocks a request and the admin pages show the layers", as
     expect((await api(auditor.page, "PUT", "/platform/workspace-types/team/guardrails", { local_only: false, rules: [] })).status()).toBe(403);
     await expectAccessible(auditor.page, "admin guardrails settings");
   } finally {
-    await api(operator.page, "DELETE", platform);
-    expect((await api(alex.page, "PUT", local, { rules: [] })).status()).toBe(200);
+    await api(operator.page, "DELETE", `${platform}${await resetQuery(operator.page, platform)}`);
+    expect((await api(alex.page, "PUT", local, { expected: await built(alex.page, local, "local"), rules: [] })).status()).toBe(200);
     for (const session of [alex, blair, operator, auditor]) await session.context.close();
   }
 });

@@ -896,21 +896,21 @@ async fn every_json_management_write_rejects_unknown_fields_after_valid_control(
         "PUT",
         "/api/v1/platform/workspace-types/team/guardrails",
         &f.admin,
-        json!({"local_only":false,"rules":[]})
+        json!({"local_only":false,"expected":null,"rules":[]})
     );
     case!(
         "guardrails::put_platform_workspace_guardrails",
         "PUT",
         format!("/api/v1/platform/workspaces/{}/guardrails", f.team),
         &f.admin,
-        json!({"local_only":false,"rules":[]})
+        json!({"local_only":false,"expected":null,"rules":[]})
     );
     case!(
         "guardrails::put_workspace_guardrails",
         "PUT",
         format!("/api/v1/workspaces/{}/guardrails", f.team),
         &f.owner,
-        json!({"rules":[]})
+        json!({"expected":null,"rules":[]})
     );
     let reviewer = user(&pool, "matrix-template-reviewer", "admin").await;
     let tid = id(&template);

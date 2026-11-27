@@ -33,6 +33,49 @@ pub(super) const PATTERN_INVALID: &str =
     "A custom pattern does not compile within the guardrail pattern limits";
 pub(super) const LOOSEN_NOT_ALLOWED: &str =
     "A workspace may tighten a platform guardrail rule, never weaken, replace or remove it";
+pub(super) const LAYER_CHANGED: &str =
+    "This guardrail layer changed since it was read; read it again and retry";
+
+/// A write must name the layer it was built from (`expected`: its id and
+/// revision, or none). It is compared with the layer read in the write
+/// transaction, which holds the installation row every guardrail write
+/// takes first, so no other write can land between the check and the write.
+fn unchanged(built_from: Option<bool>) -> std::result::Result<(), ApiError> {
+    match built_from {
+        Some(true) => Ok(()),
+        Some(false) => Err(ApiError(StatusCode::CONFLICT, LAYER_CHANGED)),
+        None => Err(ApiError(StatusCode::BAD_REQUEST, EXPECTED_REQUIRED)),
+    }
+}
+pub(super) const EXPECTED_REQUIRED: &str = "Name the layer this write was built from: expected is its rule_set_id and revision, or null when there was none";
+
+/// The reset's precondition: `rule_set_id` and `revision` of the override it
+/// removes, both or neither (neither: no override).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ResetQuery {
+    rule_set_id: Option<Uuid>,
+    revision: Option<i64>,
+}
+impl ResetQuery {
+    fn expected(&self) -> std::result::Result<Option<policy::Expected>, ApiError> {
+        match (self.rule_set_id, self.revision) {
+            (_, Some(revision)) if revision < 1 => Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                "A revision is at least 1",
+            )),
+            (Some(rule_set_id), Some(revision)) => Ok(Some(policy::Expected {
+                rule_set_id,
+                revision,
+            })),
+            (None, None) => Ok(None),
+            _ => Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                "Name both rule_set_id and revision of the override, or neither when there is none",
+            )),
+        }
+    }
+}
 
 /// A management error, or the one refusal that names a rule.
 pub(super) enum GuardrailError {
@@ -372,6 +415,7 @@ async fn put_type_guardrails(
     let mut tx = platform_tx(&s, &u, true).await?;
     let scope = Scope::Type(&k);
     let current = load(&mut tx, scope).await?;
+    unchanged(body.built_from(current.as_ref()))?;
     let (local_only, rules) = validated(
         &mut tx,
         body,
@@ -471,6 +515,7 @@ async fn put_platform_workspace_guardrails(
     platform(&mut tx, ws).await?;
     let scope = Scope::Override(ws);
     let current = load(&mut tx, scope).await?;
+    unchanged(body.built_from(current.as_ref()))?;
     let (local_only, rules) = validated(
         &mut tx,
         body,
@@ -508,10 +553,14 @@ async fn reset_platform_workspace_guardrails(
     State(s): State<Store>,
     Extension(u): Extension<ManagementPrincipal>,
     Path(ws): Path<Uuid>,
+    Query(q): Query<ResetQuery>,
 ) -> Result<Json<Value>> {
     let mut tx = platform_tx(&s, &u, true).await?;
     platform(&mut tx, ws).await?;
-    if let Some(set) = load(&mut tx, Scope::Override(ws)).await? {
+    let expected = q.expected()?;
+    let current = load(&mut tx, Scope::Override(ws)).await?;
+    unchanged(Some(policy::Expected::matches(expected, current.as_ref())))?;
+    if let Some(set) = current {
         // The removal is made by the Platform Admin who moves the revision:
         // the database removes an override's rules and the override only in
         // that transaction (0092).
@@ -585,6 +634,7 @@ async fn put_workspace_guardrails(
     let p = platform(&mut tx, ws).await?;
     let scope = Scope::Local(ws);
     let current = load(&mut tx, scope).await?;
+    unchanged(body.built_from(current.as_ref()))?;
     let (_, rules) = validated(
         &mut tx,
         body,

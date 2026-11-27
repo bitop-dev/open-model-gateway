@@ -18,7 +18,7 @@ import {
 } from "../lib/guardrails";
 import { kindLabels } from "../lib/people";
 import { ResourcePage } from "../components/resource-page";
-import { EffectiveRules, LayerEditor, guardrailWrite, putPlatformLayer, tightenRule, unchanged } from "../components/guardrails";
+import { EffectiveRules, LayerEditor, expectedOf, guardrailWrite, putPlatformLayer, refetchOnConflict, tightenRule } from "../components/guardrails";
 import { Alert, Button, ErrorNotice, Stack, useAction, useApi } from "../components/ui";
 import { Badge } from "../components/ui/badge/badge";
 import { Card } from "../components/ui/card/card";
@@ -45,15 +45,14 @@ function TypeDefaultTab({ kind, writable }: { kind: WorkspaceKind; writable: boo
   if (q.isPending) return <p role="status">Loading guardrails…</p>;
   if (q.isError) return <ErrorNotice error={q.error} retry={() => void q.refetch()} />;
   const set = q.data.rule_set, localOnly = !!set?.local_only, every = `every ${kindLabels[kind].toLowerCase()} workspace without a platform override`;
-  // Each write reads the layer again and refuses if it changed since the page
-  // loaded it, so a stale page never undoes another admin's change.
-  const fresh = async (signal: AbortSignal) => { const now = (await api<TypeDefault>(path, { signal })).rule_set; unchanged(now, set); return now; };
+  // Each write names the layer as the page loaded it; the server refuses it if that layer changed since.
+  const fresh = refetchOnConflict(() => q.refetch());
   return <Stack gap={6}>
     <Alert tone="info" title="What is checked">{inspectedSentence(q.data.inspected_workloads)}</Alert>
     <LayerEditor title={`${kindLabels[kind]} default`} description={`Applies to ${every}.`} set={set} writable={writable}
       reach={{ change: `This applies to ${every}.`, remove: `It stops applying to ${every}, and their tightenings of it stop applying.` }}
-      save={async (rules, signal) => putPlatformLayer(path, !!(await fresh(signal))?.local_only, rules, signal)} localOnly={localOnly}
-      onLocalOnly={async (value, signal) => putPlatformLayer(path, value, ((await fresh(signal))?.rules ?? []).map(toInput), signal)} empty="No default rules." />
+      save={(rules, signal) => fresh(putPlatformLayer(path, set, localOnly, rules, signal))} localOnly={localOnly}
+      onLocalOnly={(value, signal) => fresh(putPlatformLayer(path, set, value, (set?.rules ?? []).map(toInput), signal))} empty="No default rules." />
   </Stack>;
 }
 
@@ -106,15 +105,14 @@ export function WorkspaceGuardrailsTab({ workspace }: { workspace: Workspace }) 
   if (q.isPending) return <p role="status">Loading guardrails…</p>;
   if (q.isError) return <ErrorNotice error={q.error} retry={() => void q.refetch()} />;
   const g = q.data, marks = tighteningMarks(g), names = Object.fromEntries([...platformRules(g)].map(([id, r]) => [id, r.name]));
-  // Each save reads the workspace again: it refuses if this layer changed
-  // since the page loaded it (a stale page never undoes another admin's
-  // change), and checks the tightenings against the live platform layer, so
-  // a page loaded before that layer changed never drops one that applies
-  // again nor sends one the server refuses.
+  // Each save names this layer as the page loaded it (the server refuses it
+  // if the layer changed since, so a stale page never undoes another admin's
+  // change). It reads the live platform layer first and checks the
+  // tightenings against it, so a page loaded before that layer changed never
+  // drops one that applies again nor sends one the server refuses.
   const save = async (rules: Record<string, unknown>[], signal: AbortSignal) => {
     const now = await api<WorkspaceGuardrails>(path, { signal });
-    unchanged(now.local, g.local);
-    return api(path, { method: "PUT", body: { rules: liveEntries(rules, now) }, signal });
+    return refetchOnConflict(() => q.refetch())(api(path, { method: "PUT", body: { expected: expectedOf(g.local), rules: liveEntries(rules, now) }, signal }));
   };
   return <Stack gap={6}>
     <Alert tone="info" title="What is checked">{inspectedSentence(g.inspected_workloads)}{g.egress.local_only ? " Text never leaves the gateway to be checked." : ""}</Alert>
@@ -124,6 +122,9 @@ export function WorkspaceGuardrailsTab({ workspace }: { workspace: Workspace }) 
     {(g.can_edit || (g.local?.rules.length ?? 0) > 0) && <LayerEditor title="This workspace's rules" description={g.can_edit ? "Add rules or make the platform's stricter. They can't turn a platform rule off." : "Set by this workspace's admins."} set={g.local} writable={g.can_edit} save={save} marks={marks} names={names} empty="No rules of this workspace's own." />}
   </Stack>;
 }
+
+/** The reset's query: the override it removes, as the page loaded it. */
+const resetQuery = (set: RuleSet | null) => set ? `?${new URLSearchParams({ rule_set_id: set.id, revision: String(set.revision) })}` : "";
 
 /** Admin › Team/Project › Guardrails: the override, the type default it replaces and this month's totals. */
 export function WorkspaceGuardrailsAdmin({ id, writable }: { id: string; writable: boolean }) {
@@ -139,19 +140,20 @@ export function WorkspaceGuardrailsAdmin({ id, writable }: { id: string; writabl
     if (n === 0 || ids.size === 0) return "";
     return ` ${n === null ? `Any tightening this workspace made of the ${rules} stops applying` : `This workspace's ${n === 1 ? "tightening" : `${n} tightenings`} of the ${rules} stop${n === 1 ? "s" : ""} applying`}; it can tighten the rules that replace them.`;
   };
-  // Each write reads the workspace again and refuses if the override changed
-  // since the page loaded it; a new override starts from the default as it is now.
-  const fresh = async (signal: AbortSignal) => { const now = await api<PlatformWorkspaceGuardrails>(path, { signal }); unchanged(now.override, override); return now; };
+  // Each write names the override as the page loaded it (none, to create
+  // one); the server refuses it if that changed since. A new override starts
+  // from the default as it is now, read just before.
+  const fresh = refetchOnConflict(() => q.refetch());
   const create = () => ask({ title: "Override the default for this workspace?", description: `Starts from a copy of the ${kindLabels[g.kind].toLowerCase()} default's rules. While it exists, the default no longer applies here.${dropped(g.type_default, "default's rules")}`, submitLabel: "Create override", successNotice: "Override created.",
-    run: (_, signal) => guardrailWrite(async () => { const now = await fresh(signal); return putPlatformLayer(path, !!now.type_default?.local_only, (now.type_default?.rules ?? []).map(r => { const { id: _id, ...rest } = toInput(r); return rest; }), signal); }) });
-  const reset = () => ask({ title: "Reset to the default?", description: `Removes this workspace's override; the ${kindLabels[g.kind].toLowerCase()} default applies again.${dropped(override, "override's rules")}`, danger: true, submitLabel: "Reset", successNotice: "Default restored.", run: async (_, signal) => { await fresh(signal); return api(path, { method: "DELETE", signal }); } });
+    run: (_, signal) => guardrailWrite(async () => { const now = await api<PlatformWorkspaceGuardrails>(path, { signal }); return fresh(putPlatformLayer(path, override, !!now.type_default?.local_only, (now.type_default?.rules ?? []).map(r => { const { id: _id, ...rest } = toInput(r); return rest; }), signal)); }) });
+  const reset = () => ask({ title: "Reset to the default?", description: `Removes this workspace's override; the ${kindLabels[g.kind].toLowerCase()} default applies again.${dropped(override, "override's rules")}`, danger: true, submitLabel: "Reset", successNotice: "Default restored.", run: (_, signal) => guardrailWrite(() => fresh(api(`${path}${resetQuery(override)}`, { method: "DELETE", signal }))) });
   return <Stack gap={6}>
     <Alert tone="info" title="What is checked">{inspectedSentence(g.inspected_workloads)}</Alert>
     {override
       ? <LayerEditor title="Platform override" description={`Replaces the ${kindLabels[g.kind].toLowerCase()} default for this workspace.`} set={override} writable={writable}
           reach={{ change: "This applies to this workspace only.", remove: "This workspace's tightenings of it stop applying." }}
-          save={async (rules, signal) => putPlatformLayer(path, !!(await fresh(signal)).override?.local_only, rules, signal)} localOnly={localOnly}
-          onLocalOnly={async (value, signal) => putPlatformLayer(path, value, ((await fresh(signal)).override?.rules ?? []).map(toInput), signal)} />
+          save={(rules, signal) => fresh(putPlatformLayer(path, override, localOnly, rules, signal))} localOnly={localOnly}
+          onLocalOnly={(value, signal) => fresh(putPlatformLayer(path, override, value, override.rules.map(toInput), signal))} />
       : <LayerEditor title={`${kindLabels[g.kind]} default`} description="Applies here: this workspace has no override. Edit it under Settings › Guardrails." set={g.type_default} writable={false} save={() => Promise.resolve()} empty="No default rules." />}
     {writable && <div><Button size="sm" variant={override ? "ghost" : "secondary"} onClick={override ? reset : create}>{override ? "Reset to default" : "Override the default"}</Button></div>}
     {g.local_visible && g.local && <LayerEditor title="This workspace's rules" description="Set by its owners and admins." set={g.local} writable={false} save={() => Promise.resolve()} empty="None." />}

@@ -62,6 +62,8 @@ pub(super) const REASONS: &[(&str, &str)] = &[
         guardrails::LOOSEN_NOT_ALLOWED,
         "guardrail_loosen_not_allowed",
     ),
+    (guardrails::LAYER_CHANGED, "guardrail_layer_changed"),
+    (guardrails::EXPECTED_REQUIRED, "guardrail_expected_required"),
     (drain::REASON_INVALID, "drain_reason_invalid"),
     (drain::UNTIL_INVALID, "drain_until_invalid"),
     (INSTALLATION_LIMITS_REMOVED, "installation_limits_removed"),
