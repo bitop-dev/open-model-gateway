@@ -43,8 +43,12 @@ pub const COPY_FACTOR: usize = 4;
 /// The largest number of copies of any byte of a large body: the text it
 /// may carry beside its images (at most [`TEXT_BODY_BYTES`]) is copied by
 /// the parse, each attempt, the upstream value, its serialization and the
-/// spliced body. The buffer's worst case counts every byte at this.
-pub const WORST_COPIES: usize = 5;
+/// spliced body; and a body refused by its parse can hold, beside itself,
+/// the parser's scratch copy of an escaped image literal (up to twice it)
+/// and an error message that shows it (up to twice it, as the message
+/// grows), about five and a half times that literal (#872). The buffer's
+/// worst case counts every byte at this.
+pub const WORST_COPIES: usize = 6;
 /// `Retry-After` of a request refused because the budget is spent.
 pub const BUSY_RETRY_SECONDS: u32 = 1;
 

@@ -90,9 +90,13 @@ fn scan(body: &[u8], data_values: bool) -> Scan {
             if literal.len() > held {
                 longest[shortest] = literal.len();
             }
-            // Image data, whatever is set aside: its copies, the parser's
-            // scratch copy of an escaped one included, are the image input
-            // buffer's (`inference::image_buffer`), not structure.
+            // Image data: its copies are the image input buffer's
+            // (`inference::image_buffer`), not structure. That includes the
+            // parser's scratch copy of an escaped one, whether or not it is
+            // among the literals set aside: the scratch is one buffer, reused,
+            // at most twice the longest literal it decodes, and an image
+            // literal not set aside is no longer than the shortest one that
+            // is.
             return true;
         }
         false

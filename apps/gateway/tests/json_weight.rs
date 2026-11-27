@@ -205,6 +205,23 @@ fn the_estimate_covers_hostile_shapes() {
         ),
         format!(r#"["{}","{long}\n"]"#, r"\n".repeat(1 << 18)),
     ]);
+    // Strings an error message shows escaped for display: a string where
+    // `max_tokens` takes a number, and an unknown field's own name.
+    let del = "\u{7f}".repeat(1 << 20);
+    let c1 = "\u{85}".repeat(1 << 19);
+    let shown = |text: &str| format!(r#"{{"max_tokens":"{text}"}}"#);
+    bodies.extend([
+        shown(&del),
+        shown(&c1),
+        format!(r#"{{"{del}":0}}"#),
+        format!(r#"{{"model":"m","{c1}":0}}"#),
+        shown(&r"\b".repeat(1 << 19)),
+        shown(&r"\u0001".repeat(1 << 18)),
+        shown(&r"\ud83d\ude00".repeat(1 << 16)),
+        shown(&"\u{200b}".repeat(1 << 18)),
+        shown(&"字".repeat(1 << 19)),
+        shown(&"x".repeat(1 << 20)),
+    ]);
     // Long numbers (with `float_roundtrip`, which dev-dependencies enable,
     // their digits go through the same scratch buffer).
     bodies.extend([
@@ -233,56 +250,31 @@ fn the_estimate_covers_hostile_shapes() {
 #[allow(dead_code)]
 struct Request {
     model: Option<String>,
+    max_tokens: Option<u32>,
     input: Option<Value>,
     tool_choice: Option<Value>,
 }
 
-/// The raw length of the longest string literal of `body` (by the same
-/// boundaries every JSON parser reads).
-fn longest_string(body: &[u8]) -> usize {
-    let (mut i, mut longest) = (0, 0);
-    while i < body.len() {
-        if body[i] == b'"' {
-            let start = i + 1;
-            let mut j = start;
-            while j < body.len() && body[j] != b'"' {
-                j += if body[j] == b'\\' { 2 } else { 1 };
-            }
-            longest = longest.max(j.min(body.len()) - start);
-            i = j + 1;
-        } else {
-            i += 1;
-        }
-    }
-    longest
-}
-
 /// [`holds`] for a parse into [`Request`] with `serde_json::from_slice`, as
-/// the gateway's JSON extractor parses (`http::json_body`). A parse that
-/// fails builds its error message too, which can hold one decoded string
-/// (an unknown field's name, or an invalid value), escaped for display (at
-/// most three bytes per byte) in a message that grows by doubling: at most
-/// eight times the longest string, for a moment. The estimate leaves it out
-/// (it is bounded by the body and never sent), so this check allows it.
+/// the gateway's JSON extractor parses (`http::json_body`), its error
+/// message included: a refused body's message can hold one of its strings,
+/// shown for display.
 fn holds_typed(body: &[u8]) -> Result<(), String> {
     LIVE.set(0);
     PEAK.set(0);
     ON.set(true);
     let parsed = serde_json::from_slice::<Request>(body);
     ON.set(false);
-    let echo = if parsed.is_err() {
-        8 * longest_string(body) + 1024
-    } else {
-        0
-    };
     drop(parsed);
     let peak = usize::try_from(PEAK.get()).unwrap();
-    let estimate = body.len() + estimate(body) + echo;
+    let estimate = body.len() + estimate(body);
     if estimate >= peak {
         Ok(())
     } else {
         Err(format!(
-            "typed: estimate {estimate} below the parse's peak {peak}"
+            "typed: estimate {estimate} below the parse's peak {peak} for a body of {} bytes: {}",
+            body.len(),
+            String::from_utf8_lossy(&body[..body.len().min(80)])
         ))
     }
 }

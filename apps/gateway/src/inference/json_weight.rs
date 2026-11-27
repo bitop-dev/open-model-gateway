@@ -11,11 +11,7 @@
 //! gateway's parse of the body allocates (`serde_json::from_slice`, into a
 //! `Value` or a request type, as `http::json_body` parses; proved by the
 //! property test `tests/json_weight.rs`, which measures the parse's
-//! allocations). One thing is left out: the error message of a body that is
-//! refused can hold one of its strings, decoded and escaped for display, for
-//! a moment (at most about eight times that string, never sent); it is
-//! bounded by the body, and charging it for every string would refuse a
-//! legitimate long text. A body
+//! allocations), the error message of a body it refuses included. A body
 //! whose structure estimate exceeds [`BUDGET`] is refused before it is
 //! parsed.
 //!
@@ -29,7 +25,10 @@
 //! twice the longest string literal with an escape or number: `serde_json`
 //! decodes such a string (and, with its `float_roundtrip` feature, which a
 //! build may enable, such a number) into a scratch buffer, which it reuses
-//! and which grows to up to twice the longest it held.
+//! and which grows to up to twice the longest it held; plus three times the
+//! longest string as an error message would show it (a refused body's
+//! message holds one of its strings, escaped for display, and grows by
+//! doubling), which for printable text is its own length.
 //!
 //! The walk agrees with any JSON parser on where strings begin and end: from
 //! the first byte, outside a string a `"` opens one; inside, a `\` escapes
@@ -63,6 +62,9 @@ pub(crate) const OBJECT: usize = 640;
 pub(crate) const ARRAY: usize = 128;
 /// The scratch buffer's smallest allocation, once a string has an escape.
 const SCRATCH_MIN: usize = 64;
+/// An error message's text besides the one string it may hold (what it
+/// expected: a type, or the names of a type's fields).
+const MESSAGE_MIN: usize = 4096;
 
 /// A string literal the walk passed, for a caller that reads them (the image
 /// scan): `start..end` is its content between the quotes, and `key` is true
@@ -82,18 +84,31 @@ pub(crate) fn walk(body: &[u8], mut on_string: impl FnMut(&Literal) -> bool) -> 
     let mut tokens = 0usize;
     let mut containers = 0usize;
     let mut longest_scratch = 0usize;
+    let mut longest_shown = 0usize;
     let mut i = 0;
     while i < body.len() {
         match body[i] {
             b' ' | b'\t' | b'\n' | b'\r' | b',' | b':' | b']' | b'}' => i += 1,
             b'"' => {
                 let start = i + 1;
-                let (end, escaped) = string_end(body, start);
+                let StringEnd {
+                    end,
+                    escaped,
+                    plain,
+                } = string_end(body, start);
                 let after = (end + 1).min(body.len());
                 let key = next_byte(body, after).is_some_and(|at| body[at] == b':');
                 let image = on_string(&Literal { start, end, key });
-                if escaped && !image {
-                    longest_scratch = longest_scratch.max(end - start);
+                if !image {
+                    if escaped {
+                        longest_scratch = longest_scratch.max(end - start);
+                    }
+                    let shown = if plain {
+                        end - start
+                    } else {
+                        shown_len(&body[start..end])
+                    };
+                    longest_shown = longest_shown.max(shown);
                 }
                 tokens += 1;
                 i = after;
@@ -142,6 +157,85 @@ pub(crate) fn walk(body: &[u8], mut on_string: impl FnMut(&Literal) -> bool) -> 
         .saturating_add(containers)
         .saturating_add(longest_scratch.saturating_mul(2))
         .saturating_add(if longest_scratch > 0 { SCRATCH_MIN } else { 0 })
+        // A refused body's error message, which holds one of its strings
+        // shown for display, in a message that grows by doubling (each step
+        // holds the old and the new buffer: up to three times its length).
+        .saturating_add(longest_shown.saturating_mul(3))
+        .saturating_add(MESSAGE_MIN)
+}
+
+/// The most bytes a string literal's decoded text takes when an error
+/// message shows it (`{:?}`, which escapes every character `escape_debug`
+/// escapes; `{}` shows no more), for a literal that is not plain printable
+/// ASCII (which shows as it is, [`StringEnd::plain`]): decoded and measured
+/// character by character. A literal that is not valid JSON text is
+/// measured as raw bytes, each shown at most as `\u{ff}`.
+fn shown_len(literal: &[u8]) -> usize {
+    let mut shown = 0usize;
+    let mut i = 0;
+    while i < literal.len() {
+        let (c, width) = match literal[i] {
+            b'\\' => match literal.get(i + 1) {
+                Some(b'u') => match escaped_char(literal, i) {
+                    Some(decoded) => decoded,
+                    None => return literal.len().saturating_mul(6),
+                },
+                Some(&e) => (
+                    match e {
+                        b'b' => '\u{8}',
+                        b'f' => '\u{c}',
+                        b'n' => '\n',
+                        b'r' => '\r',
+                        b't' => '\t',
+                        other => char::from(other),
+                    },
+                    2,
+                ),
+                None => return literal.len().saturating_mul(6),
+            },
+            _ => {
+                let rest = &literal[i..];
+                let width = utf8_width(rest[0]).min(rest.len());
+                match std::str::from_utf8(&rest[..width])
+                    .ok()
+                    .and_then(|s| s.chars().next())
+                {
+                    Some(c) => (c, width),
+                    None => return literal.len().saturating_mul(6),
+                }
+            }
+        };
+        shown += c.escape_debug().map(char::len_utf8).sum::<usize>();
+        i += width;
+    }
+    shown
+}
+
+/// The character a `\u` escape at `at` decodes to (a surrogate pair taken
+/// together), and the escape's width.
+fn escaped_char(literal: &[u8], at: usize) -> Option<(char, usize)> {
+    let hex = |from: usize| -> Option<u32> {
+        let digits = literal.get(from..from + 4)?;
+        u32::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()
+    };
+    let high = hex(at + 2)?;
+    if (0xd800..0xdc00).contains(&high) && literal.get(at + 6..at + 8) == Some(b"\\u") {
+        let low = hex(at + 8)?;
+        let code = 0x10000 + ((high - 0xd800) << 10) + (low.checked_sub(0xdc00)?);
+        return Some((char::from_u32(code)?, 12));
+    }
+    // A lone surrogate decodes to U+FFFD at most (`serde_json` refuses it).
+    Some((char::from_u32(high).unwrap_or('\u{fffd}'), 6))
+}
+
+/// The byte length of the UTF-8 character that `lead` starts.
+fn utf8_width(lead: u8) -> usize {
+    match lead {
+        0xf0..=0xf7 => 4,
+        0xe0..=0xef => 3,
+        0xc0..=0xdf => 2,
+        _ => 1,
+    }
 }
 
 /// The structure estimate of `body` ([`walk`] without a reader).
@@ -159,12 +253,21 @@ pub fn within_budget(body: &[u8]) -> bool {
 /// [`BUDGET`] at planning is within it with its plan when it runs.
 pub const PLAN_ALLOWANCE: usize = 4 * 1024;
 
-/// The index of the `"` that closes the string whose content starts at
-/// `start`, or the body's end when it is unterminated, and whether the
-/// string holds an escape.
-pub(crate) fn string_end(body: &[u8], start: usize) -> (usize, bool) {
+/// The end of a string literal: the index of the `"` that closes it (the
+/// body's end when it is unterminated), whether it holds an escape, and
+/// whether every byte of it is printable ASCII (`0x20..0x7f`) with no
+/// escape, which an error message shows as it is.
+pub(crate) struct StringEnd {
+    pub end: usize,
+    pub escaped: bool,
+    pub plain: bool,
+}
+
+/// [`StringEnd`] of the string whose content starts at `start`.
+pub(crate) fn string_end(body: &[u8], start: usize) -> StringEnd {
     let mut i = start;
     let mut escaped = false;
+    let mut special = false;
     loop {
         // Eight bytes at a time while none of them is a quote or a
         // backslash: string content, which only those two bytes can end.
@@ -173,18 +276,45 @@ pub(crate) fn string_end(body: &[u8], start: usize) -> (usize, bool) {
             if has_byte(word, b'"') || has_byte(word, b'\\') {
                 break;
             }
+            special |= !printable_ascii(word);
             i += 8;
         }
         match body.get(i) {
-            None => return (body.len(), escaped),
+            None => {
+                return StringEnd {
+                    end: body.len(),
+                    escaped,
+                    plain: !escaped && !special,
+                };
+            }
             Some(b'\\') => {
                 escaped = true;
                 i += 2;
             }
-            Some(b'"') => return (i, escaped),
-            Some(_) => i += 1,
+            Some(b'"') => {
+                return StringEnd {
+                    end: i,
+                    escaped,
+                    plain: !escaped && !special,
+                };
+            }
+            Some(&b) => {
+                special |= !(0x20..0x7f).contains(&b);
+                i += 1;
+            }
         }
     }
+}
+
+/// Whether every byte of `word` is printable ASCII (`0x20..0x7f`): none has
+/// its high bit, none is below `0x20` (the classic less-than test, exact for
+/// bytes without the high bit) and none is DEL.
+const fn printable_ascii(word: u64) -> bool {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGHS: u64 = 0x8080_8080_8080_8080;
+    word & HIGHS == 0
+        && word.wrapping_sub(ONES * 0x20) & !word & HIGHS == 0
+        && !has_byte(word, 0x7f)
 }
 
 /// Whether any byte of `word` is `byte`: exact (the classic zero-byte test

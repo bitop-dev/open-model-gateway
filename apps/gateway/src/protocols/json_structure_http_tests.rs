@@ -132,6 +132,10 @@ async fn legitimate_large_requests_are_served(pool: PgPool) {
             json!({"model":"company/smart","max_tokens":16,"messages":[{"role":"user","content":text}]}),
         ),
         (
+            "/v1/messages",
+            json!({"model":"company/smart","max_tokens":16,"messages":[{"role":"user","content":"字".repeat((TEXT_BODY_BYTES - 1024) / 3)}]}),
+        ),
+        (
             "/v1/chat/completions",
             json!({"model":"company/smart","max_tokens":16,"messages":[{"role":"user","content":"hi"}],"tools":chat_tools}),
         ),
@@ -269,20 +273,36 @@ async fn an_undeclared_body_past_its_route_cap_is_read_only_to_the_cap(pool: PgP
     }
 }
 
-/// A body is measured whatever its `Content-Type` claims: a JSON type the
-/// `mime` parser cannot read, or none at all, still reaches a handler that
-/// may read the bytes as JSON (`/v1/videos` compares only the media type
-/// before the first `;`), so it is measured like any other.
+/// A body is measured whatever its `Content-Type` claims on a route whose
+/// handler may read the bytes as JSON anyway (`/v1/videos` compares only
+/// the media type before the first `;`). The image input routes take only a
+/// JSON type and refuse any other unread (400), never parsing it.
 #[dbtest::test]
 async fn a_body_is_measured_whatever_its_content_type(pool: PgPool) {
     let w = world(pool, ImageInputLimits::default(), true).await;
     let body = hostile(r#"{"a":0}"#, TEXT_BODY_BYTES);
-    for (path, content_type) in [
-        ("/v1/videos", Some("application/json; charset")),
-        ("/v1/videos", Some("application/json;=x")),
-        ("/v1/rerank", Some("text/plain")),
-        ("/v1/chat/completions", Some("application/json; charset")),
-        ("/v1/messages", None),
+    for (path, content_type, status) in [
+        (
+            "/v1/videos",
+            Some("application/json; charset"),
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+        (
+            "/v1/videos",
+            Some("application/json;=x"),
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+        (
+            "/v1/rerank",
+            Some("text/plain"),
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+        (
+            "/v1/chat/completions",
+            Some("application/json; charset"),
+            StatusCode::BAD_REQUEST,
+        ),
+        ("/v1/messages", None, StatusCode::BAD_REQUEST),
     ] {
         let mut request = Request::post(path)
             .header(header::AUTHORIZATION, format!("Bearer {}", w.token))
@@ -296,11 +316,7 @@ async fn a_body_is_measured_whatever_its_content_type(pool: PgPool) {
             .oneshot(request.body(Body::from(body.clone())).unwrap())
             .await
             .unwrap();
-        assert_eq!(
-            response.status(),
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "{path} {content_type:?}"
-        );
+        assert_eq!(response.status(), status, "{path} {content_type:?}");
     }
 }
 

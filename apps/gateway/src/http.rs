@@ -202,8 +202,13 @@ async fn image_input_body(
     };
     match buffer.admit(length, key) {
         Admission::Text => {
-            // Measured whatever its `Content-Type`: these routes parse only
-            // JSON, and their extractor refuses any other type unread.
+            // These routes parse only JSON, and their extractor
+            // (`http::json_body`) refuses any other type unread: such a body
+            // goes to it unmeasured.
+            if !json_content_type(&parts.headers) {
+                return next.run(Request::from_parts(parts, body)).await;
+            }
+            let body = axum::body::Body::new(http_body_util::Limited::new(body, TEXT_BODY_BYTES));
             match json_structure::measured(parts, body, TEXT_BODY_BYTES).await {
                 json_structure::Measured::Run(request) => next.run(request).await,
                 json_structure::Measured::Refused(response) => response,

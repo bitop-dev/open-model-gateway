@@ -41,13 +41,43 @@ impl JsonBodyRejection {
         }
     }
     /// `serde_json`'s message for a body that is not a `T`; a fixed text
-    /// otherwise. Never returned to a client as such: it can hold body text.
+    /// otherwise. It can hold body text, so it must never reach a client:
+    /// a handler may only take an identifier it validates from it (the
+    /// Messages handler's unknown field name).
     pub fn body_text(&self) -> String {
         match self {
-            Self::Data(error) => error.to_string(),
+            Self::Data(error) => {
+                // At most `BODY_TEXT` bytes: enough for any identifier a
+                // handler takes from it, and never a second copy of a long
+                // message (which can hold a whole string of the body).
+                let mut text = Bounded(String::new());
+                let _ = std::fmt::Write::write_fmt(&mut text, format_args!("{error}"));
+                text.0
+            }
             Self::ContentType => "Expected request with `Content-Type: application/json`".into(),
             Self::Body(_) => "Failed to read the request body".into(),
         }
+    }
+}
+
+/// The longest [`JsonBodyRejection::body_text`].
+const BODY_TEXT: usize = 256;
+
+/// A string that takes at most [`BODY_TEXT`] bytes, then refuses more.
+struct Bounded(String);
+impl std::fmt::Write for Bounded {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let room = BODY_TEXT - self.0.len();
+        if s.len() <= room {
+            self.0.push_str(s);
+            return Ok(());
+        }
+        let mut end = room;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.0.push_str(&s[..end]);
+        Err(std::fmt::Error)
     }
 }
 
