@@ -355,7 +355,7 @@ fn tool_specs(
 ) -> Result<(BTreeSet<String>, Vec<aws::Tool>)> {
     let mut names = BTreeSet::new();
     let mut tools = Vec::new();
-    for tool in &request.tools {
+    for tool in request.tools.iter() {
         if !identifier(&tool.name)
             || !names.insert(tool.name.clone())
             || !tool.parameters.is_object()

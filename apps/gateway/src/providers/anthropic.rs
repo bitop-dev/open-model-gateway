@@ -343,7 +343,22 @@ fn set_native_overrides(value: &mut Value, request: &ChatRequest) {
             value["system"] = system.clone();
         }
         if !options.native_tools.is_empty() {
-            value["tools"] = json!(options.native_tools);
+            // Each definition with its schema back from the canonical tool
+            // at its index (`MessagesOptions::native_tools`).
+            value["tools"] = Value::Array(
+                options
+                    .native_tools
+                    .iter()
+                    .zip(request.tools.iter())
+                    .map(|(native, tool)| {
+                        let mut definition = native.clone();
+                        if let Some(schema) = definition.get_mut("input_schema") {
+                            *schema = tool.parameters.clone();
+                        }
+                        definition
+                    })
+                    .collect(),
+            );
         }
         if let Some(thinking) = &options.thinking {
             value["thinking"] = thinking.clone();
@@ -395,7 +410,20 @@ fn encode_within(
         value["system"] = system.into();
     }
     set_sampling(&mut value, request);
-    set_tools(&mut value, request);
+    // A native request's tools are its validated envelope
+    // (`set_native_overrides`): the translated copy would only be replaced.
+    let native_tools = request
+        .messages_options
+        .as_ref()
+        .map_or(0, |o| o.native_tools.len());
+    // The native definitions take their schemas from the canonical tools,
+    // one for one: a request where the two differ is not encoded.
+    if native_tools > 0 && native_tools != request.tools.len() {
+        return Err(InferenceError::InvalidRequest);
+    }
+    if native_tools == 0 {
+        set_tools(&mut value, request);
+    }
     set_native_overrides(&mut value, request);
     set_tool_choice(&mut value, request);
     if request.has_images() {

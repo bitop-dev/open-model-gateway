@@ -15,7 +15,7 @@ fn request(messages: Vec<Message>, tools: Vec<FunctionTool>) -> ChatRequest {
         messages_options: None,
         model: "m".into(),
         messages,
-        tools,
+        tools: std::sync::Arc::new(tools),
         tool_choice: None,
         temperature: None,
         max_output_tokens: None,

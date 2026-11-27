@@ -153,7 +153,7 @@ pub async fn count_tokens(
         return refused;
     }
     if let Some(options) = &mut request.messages_options {
-        options.beta_headers = betas;
+        std::sync::Arc::make_mut(options).beta_headers = betas;
     }
     match engine.count_tokens(principal, request, request_id.0).await {
         Ok(count) => {
@@ -214,7 +214,7 @@ pub async fn handle(
         return refused;
     }
     if let Some(options) = &mut request.messages_options {
-        options.beta_headers = betas;
+        std::sync::Arc::make_mut(options).beta_headers = betas;
     }
     let model = request.model.clone();
     let show_thinking = crate::providers::messages::shows_thinking(&request);

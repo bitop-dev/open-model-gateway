@@ -222,7 +222,7 @@ fn build(spec: &Spec) -> ChatRequest {
     };
     ChatRequest {
         messages_options: spec.options.as_ref().map(|(top_p, stop)| {
-            Box::new(MessagesOptions {
+            std::sync::Arc::new(MessagesOptions {
                 top_p: *top_p,
                 stop_sequences: stop.clone(),
                 ..MessagesOptions::default()
@@ -230,7 +230,7 @@ fn build(spec: &Spec) -> ChatRequest {
         }),
         model: "public-model".into(),
         messages,
-        tools,
+        tools: std::sync::Arc::new(tools),
         tool_choice,
         temperature: spec.temperature,
         max_output_tokens: spec.max_tokens,
@@ -394,7 +394,7 @@ fn check_carried(request: &ChatRequest, input: &Input) -> std::result::Result<()
         }
         Some(config) => {
             prop_assert_eq!(config.tools.len(), request.tools.len());
-            for (got, want) in config.tools.iter().zip(&request.tools) {
+            for (got, want) in config.tools.iter().zip(request.tools.iter()) {
                 let aws::Tool::ToolSpec(spec) = got else {
                     panic!("a tool kind the request never had")
                 };
@@ -588,7 +588,7 @@ fn a_call(id: &str) -> ToolCall {
 }
 
 fn options(r: &mut ChatRequest) -> &mut MessagesOptions {
-    r.messages_options.get_or_insert_with(Default::default)
+    std::sync::Arc::make_mut(r.messages_options.get_or_insert_with(Default::default))
 }
 
 /// Break exactly one rule of a valid request, returning the refusal it must get.
@@ -605,7 +605,7 @@ fn inject(r: &mut ChatRequest, fault: &Fault) -> InferenceError {
             InvalidRequest
         }
         Fault::TooManyTools => {
-            r.tools = (0..129).map(|i| a_tool(&format!("t{i}"))).collect();
+            r.tools = std::sync::Arc::new((0..129).map(|i| a_tool(&format!("t{i}"))).collect());
             r.tool_choice = None;
             InvalidRequest
         }
@@ -618,36 +618,42 @@ fn inject(r: &mut ChatRequest, fault: &Fault) -> InferenceError {
             InvalidRequest
         }
         Fault::BadToolName(n) => {
-            r.tools.push(a_tool(n));
+            std::sync::Arc::make_mut(&mut r.tools).push(a_tool(n));
             InvalidRequest
         }
         Fault::DuplicateToolName => {
             if r.tools.is_empty() {
-                r.tools.push(a_tool("t0"));
+                std::sync::Arc::make_mut(&mut r.tools).push(a_tool("t0"));
             }
             let again = r.tools[0].clone();
-            r.tools.push(again);
+            std::sync::Arc::make_mut(&mut r.tools).push(again);
             InvalidRequest
         }
         Fault::ParametersNotAnObject(v) => {
-            r.tools.push(a_tool("t_bad"));
-            r.tools.last_mut().unwrap().parameters = v.clone();
+            std::sync::Arc::make_mut(&mut r.tools).push(a_tool("t_bad"));
+            std::sync::Arc::make_mut(&mut r.tools)
+                .last_mut()
+                .unwrap()
+                .parameters = v.clone();
             InvalidRequest
         }
         Fault::SchemaTypeNotObject(t) => {
-            r.tools.push(a_tool("t_bad"));
-            r.tools.last_mut().unwrap().parameters = json!({ "type": t });
+            std::sync::Arc::make_mut(&mut r.tools).push(a_tool("t_bad"));
+            std::sync::Arc::make_mut(&mut r.tools)
+                .last_mut()
+                .unwrap()
+                .parameters = json!({ "type": t });
             InvalidRequest
         }
         Fault::ChoiceNoneWithTools => {
             if r.tools.is_empty() {
-                r.tools.push(a_tool("t0"));
+                std::sync::Arc::make_mut(&mut r.tools).push(a_tool("t0"));
             }
             r.tool_choice = Some(ToolChoice::None);
             Unsupported
         }
         Fault::ChoiceWithoutTools(k) => {
-            r.tools.clear();
+            std::sync::Arc::make_mut(&mut r.tools).clear();
             r.tool_choice = Some(match k {
                 0 => ToolChoice::Auto,
                 1 => ToolChoice::Required,
@@ -658,7 +664,7 @@ fn inject(r: &mut ChatRequest, fault: &Fault) -> InferenceError {
         }
         Fault::ChoiceUnknownFunction => {
             if r.tools.is_empty() {
-                r.tools.push(a_tool("t0"));
+                std::sync::Arc::make_mut(&mut r.tools).push(a_tool("t0"));
             }
             r.tool_choice = Some(ToolChoice::Function("zz_not_a_tool".into()));
             InvalidRequest
@@ -886,10 +892,14 @@ fn edit_request(r: &mut ChatRequest, e: &Edit) {
             }
         }
         Edit::DropTool(i) if !r.tools.is_empty() => {
-            r.tools.remove(i % t);
+            std::sync::Arc::make_mut(&mut r.tools).remove(i % t);
         }
-        Edit::ToolParams(i, v) if !r.tools.is_empty() => r.tools[i % t].parameters = v.clone(),
-        Edit::ToolStrict(i, s) if !r.tools.is_empty() => r.tools[i % t].strict = *s,
+        Edit::ToolParams(i, v) if !r.tools.is_empty() => {
+            std::sync::Arc::make_mut(&mut r.tools)[i % t].parameters = v.clone()
+        }
+        Edit::ToolStrict(i, s) if !r.tools.is_empty() => {
+            std::sync::Arc::make_mut(&mut r.tools)[i % t].strict = *s
+        }
         Edit::Choice(k, i) => {
             r.tool_choice = match k {
                 0 => None,
@@ -1060,7 +1070,7 @@ proptest! {
     fn identifiers_follow_the_rule_in_all_three_places(name in ident(), id in ident(), call_name in ident()) {
         // A tool definition's name.
         let mut r = build(&spec_min());
-        r.tools.push(a_tool(&name));
+        std::sync::Arc::make_mut(&mut r.tools).push(a_tool(&name));
         prop_assert_eq!(encode(&r).is_ok(), rule(&name), "tool name {:?}", name);
         // A call's id and name, with its result.
         let mut r = build(&spec_min());
@@ -1119,11 +1129,11 @@ fn thinking_history_is_refused_with_or_without_text() {
 #[test]
 fn the_limits_are_inclusive_and_never_truncate() {
     let mut r = build(&spec_min());
-    r.tools = (0..MAX_TOOLS).map(|i| a_tool(&format!("t{i}"))).collect();
+    r.tools = std::sync::Arc::new((0..MAX_TOOLS).map(|i| a_tool(&format!("t{i}"))).collect());
     let input = encode(&r).expect("exactly MAX_TOOLS tools");
     check_carried(&r, &input).unwrap();
     assert_eq!(input.tools.unwrap().tools.len(), MAX_TOOLS);
-    r.tools.push(a_tool("one_too_many"));
+    std::sync::Arc::make_mut(&mut r.tools).push(a_tool("one_too_many"));
     assert_eq!(encode(&r).err(), Some(InferenceError::InvalidRequest));
 
     let mut r = build(&spec_min());

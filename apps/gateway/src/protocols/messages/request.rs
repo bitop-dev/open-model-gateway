@@ -414,12 +414,12 @@ fn image_data_bytes(messages: &[WireMessage]) -> usize {
         .sum()
 }
 fn system_messages(
-    system: Option<Value>,
+    system: Option<&Value>,
     options: &mut MessagesOptions,
     messages: &mut Vec<Message>,
 ) -> Result<()> {
     if let Some(system) = system {
-        for text in text_blocks(&system, options)? {
+        for text in text_blocks(system, options)? {
             messages.push(message(Role::System, text));
         }
     }
@@ -598,7 +598,12 @@ fn tool_content(value: &Value, options: &mut MessagesOptions) -> Result<Option<C
     }
     Ok(content)
 }
-fn function_tool(t: &Value, options: &mut MessagesOptions) -> Result<FunctionTool> {
+/// The canonical tool of a validated tool definition. Its `input_schema`
+/// moves into the canonical tool (`parameters`), leaving `null` in the
+/// definition when it was present, so the definition, kept as the native
+/// envelope, holds no second copy of the schema; the native encoder puts it
+/// back from the canonical tool (#872).
+fn function_tool(t: &mut Value, options: &mut MessagesOptions) -> Result<FunctionTool> {
     if t.get("type").is_some_and(|v| v != "custom") {
         return Err(invalid("tools.type"));
     }
@@ -624,7 +629,10 @@ fn function_tool(t: &Value, options: &mut MessagesOptions) -> Result<FunctionToo
     Ok(FunctionTool {
         name: string(&t["name"])?,
         description: t.get("description").map(string).transpose()?,
-        parameters: t["input_schema"].clone(),
+        parameters: t
+            .get_mut("input_schema")
+            .map(std::mem::take)
+            .unwrap_or(Value::Null),
         strict: t
             .get("strict")
             .map(|v| v.as_bool().ok_or_else(|| invalid("strict")))
@@ -693,7 +701,6 @@ impl Request {
             top_p,
             top_k,
             stop_sequences: self.stop_sequences,
-            system: self.system.clone(),
             thinking: self.thinking,
             output_config: self.output_config,
             context_management: self.context_management,
@@ -701,11 +708,12 @@ impl Request {
             // These envelopes are used only after every nested field below has
             // passed the explicit grammar. Never retain top-level caller JSON.
             native_messages: native_messages(&self.messages),
-            native_tools: self.tools.clone(),
             ..Default::default()
         };
         let mut messages = vec![];
-        system_messages(self.system, &mut options, &mut messages)?;
+        system_messages(self.system.as_ref(), &mut options, &mut messages)?;
+        // Kept as the native envelope: moved, not copied (#872).
+        options.system = self.system;
         for wire in self.messages {
             wire_message(wire, &mut options, &mut messages)?;
         }
@@ -721,21 +729,24 @@ impl Request {
                 tool_result_is_error: false,
             });
         }
-        let tools = self
-            .tools
-            .iter()
+        let mut native_tools = self.tools;
+        let tools = native_tools
+            .iter_mut()
             .map(|t| function_tool(t, &mut options))
             .collect::<Result<Vec<_>>>()?;
+        // The validated tool definitions become the native envelope, their
+        // schemas held once, by the canonical tools (#872).
+        options.native_tools = native_tools;
         let tool_choice = self.tool_choice.as_ref().map(tool_choice).transpose()?;
         validate(ChatRequest {
             model: self.model,
             messages,
-            tools,
+            tools: std::sync::Arc::new(tools),
             tool_choice,
             max_output_tokens: Some(self.max_tokens),
             temperature,
             stream: self.stream,
-            messages_options: Some(Box::new(options)),
+            messages_options: Some(std::sync::Arc::new(options)),
         })
     }
 }

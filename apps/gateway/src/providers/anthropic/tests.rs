@@ -35,7 +35,7 @@ pub(super) fn request(stream: bool) -> ChatRequest {
             tool_call_id: None,
             tool_result_is_error: false,
         }],
-        tools: vec![],
+        tools: std::sync::Arc::new(vec![]),
         tool_choice: None,
         temperature: None,
         max_output_tokens: Some(50),
@@ -63,7 +63,7 @@ async fn messages_frontend_safe_errors_through_mock_upstream() {
     ] {
         let mock = Mock::new(status, Some(body.to_string().into_bytes())).await;
         let mut r = request(false);
-        r.messages_options = Some(Box::default());
+        r.messages_options = Some(std::sync::Arc::default());
         let result = mock.adapter.execute(&target(), r).await;
         assert!(matches!(result, Err(e) if e == expected));
         assert!(!expected.message().contains("SECRET"));
@@ -165,7 +165,7 @@ fn a_started_message_cannot_finish_after_a_rejected_terminal() {
 #[test]
 fn messages_sampling_is_forwarded_and_client_labels_are_not() {
     let mut r = request(false);
-    r.messages_options = Some(Box::new(MessagesOptions {
+    r.messages_options = Some(std::sync::Arc::new(MessagesOptions {
         top_p: Some(0.7),
         top_k: Some(20),
         stop_sequences: Some(vec!["STOP".into()]),
@@ -332,7 +332,7 @@ async fn no_argument_tool_defaults_preserve_messages_wire() {
     for request in super::super::contract::no_argument_tool_requests() {
         for strict in [None, Some(false), Some(true)] {
             let mut r = request.clone();
-            r.tools[0].strict = strict;
+            std::sync::Arc::make_mut(&mut r.tools)[0].strict = strict;
             // A Chat strict tool has no encoding here and is refused. A
             // Messages request sends its validated wire tools, so a setting on
             // the shared tool cannot add or remove `strict` (none was sent).

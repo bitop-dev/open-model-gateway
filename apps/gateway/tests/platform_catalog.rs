@@ -206,7 +206,7 @@ async fn shared_global_deployment_requires_each_workspace_grant_and_uses_pinned_
         messages_options: None,
         model: "company/smart".into(),
         messages: vec![],
-        tools: vec![],
+        tools: Default::default(),
         tool_choice: None,
         temperature: None,
         max_output_tokens: Some(10),

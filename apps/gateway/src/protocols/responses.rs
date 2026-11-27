@@ -108,7 +108,7 @@ pub(super) fn validate(request: ChatRequest) -> Result<ChatRequest> {
         return Err(InferenceError::InvalidRequest);
     }
     let mut names = std::collections::BTreeSet::new();
-    for tool in &request.tools {
+    for tool in request.tools.iter() {
         if !name(&tool.name) || !tool.parameters.is_object() || !names.insert(&tool.name) {
             return Err(InferenceError::InvalidRequest);
         }
@@ -362,7 +362,7 @@ impl Request {
             messages_options: None,
             model: self.model,
             messages,
-            tools,
+            tools: std::sync::Arc::new(tools),
             tool_choice,
             temperature: self.temperature,
             max_output_tokens: self.max_output_tokens,

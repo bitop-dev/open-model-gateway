@@ -15,7 +15,7 @@ async fn run(steps: Vec<Step>, messages: bool) -> (Vec<ChatEvent>, Result<()>) {
     let mut req = request();
     req.stream = true;
     if messages {
-        req.messages_options = Some(Box::default());
+        req.messages_options = Some(std::sync::Arc::default());
     }
     let output = BedrockAdapter::for_test(&base)
         .execute(&target(), req)
