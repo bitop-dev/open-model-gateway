@@ -407,7 +407,7 @@ async fn a_retried_spent_try_records_nothing_and_the_line_runs(pool: PgPool) {
     crate::guardrails::enforce::SPEND_BUDGET
         .lock()
         .unwrap()
-        .insert(rule, 1);
+        .insert(rule, [true].into());
     let file = w
         .upload(
             &f.principal,
@@ -436,7 +436,7 @@ async fn a_retried_spent_try_records_nothing_and_the_line_runs(pool: PgPool) {
         "the spent try wrote nothing; the try that ran found nothing"
     );
     assert_eq!(
-        crate::guardrails::enforce::SPEND_BUDGET.lock().unwrap()[&rule],
+        crate::guardrails::enforce::SPEND_BUDGET.lock().unwrap()[&rule].len(),
         0,
         "the first try was spent"
     );
@@ -452,7 +452,7 @@ async fn a_line_spent_on_every_try_records_its_last_try_only(pool: PgPool) {
     crate::guardrails::enforce::SPEND_BUDGET
         .lock()
         .unwrap()
-        .insert(rule, 10);
+        .insert(rule, [true; 10].into());
     let file = w
         .upload(
             &f.principal,
@@ -481,7 +481,7 @@ async fn a_line_spent_on_every_try_records_its_last_try_only(pool: PgPool) {
         .unwrap();
     assert_eq!(rows, [("detector_failed".into(), true)], "one try recorded");
     assert_eq!(
-        crate::guardrails::enforce::SPEND_BUDGET.lock().unwrap()[&rule],
+        crate::guardrails::enforce::SPEND_BUDGET.lock().unwrap()[&rule].len(),
         7,
         "three tries in all"
     );
@@ -548,4 +548,154 @@ async fn a_line_without_a_slot_spends_its_ordinary_retries_after_its_free_tries(
         ("succeeded".into(), 2),
         "its free tries, then one ordinary retry"
     );
+}
+
+/// A line's last spent-budget try is recorded, so it ends the line with its
+/// guardrail error even when the batch stops at that moment: Logs and the
+/// line's result agree.
+#[dbtest::test]
+async fn a_recorded_try_ends_the_line_with_its_error_even_when_the_batch_stops(pool: PgPool) {
+    let w = world_with(pool, false, false, 1, None).await;
+    let f = &w.f;
+    let rule = custom_rule(f).await;
+    crate::guardrails::enforce::SPEND_BUDGET
+        .lock()
+        .unwrap()
+        .insert(rule, [true; 10].into());
+    let file = w
+        .upload(
+            &f.principal,
+            &[chat_line("clean", "company/smart", "hello")],
+        )
+        .await;
+    let job = w
+        .create(f.principal, &file, BatchEndpoint::ChatCompletions, None)
+        .await
+        .unwrap();
+    // The batch is cancelled at the third try, the recorded one.
+    crate::jobs::runner::tests_stop::cancel_at(job.id, 3);
+    let _ = Runner::new(w.jobs.clone()).run_next().await;
+    let line: (String, Option<String>) =
+        sqlx::query_as("SELECT state,error_code FROM batch_lines WHERE job_id=$1")
+            .bind(job.id)
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        line,
+        ("failed".into(), Some("guardrail_unavailable".into()))
+    );
+    let rows: Vec<(String, bool)> = sqlx::query_as("SELECT action,refused FROM guardrail_events")
+        .fetch_all(&f.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, [("detector_failed".into(), true)]);
+    // The line is counted failed exactly once.
+    assert_eq!(w.reload(&job).await.request_failed, Some(1));
+}
+
+/// A line whose first attempt ran and failed, and whose retry then waits to
+/// be inspected when the batch stops, is reported with that attempt's error
+/// and execution, never as not run.
+#[dbtest::test]
+async fn a_stopped_retry_of_a_line_that_ran_is_reported_with_its_attempt(pool: PgPool) {
+    let w = world_with(pool, false, false, 1, None).await;
+    let f = &w.f;
+    let rule = custom_rule(f).await;
+    // The first attempt is inspected; its retry's budget is spent.
+    crate::guardrails::enforce::SPEND_BUDGET
+        .lock()
+        .unwrap()
+        .insert(rule, [false, true, true].into());
+    let file = w
+        .upload(&f.principal, &[chat_line("a", "company/smart", "fail")])
+        .await;
+    let job = w
+        .create(
+            f.principal,
+            &file,
+            BatchEndpoint::ChatCompletions,
+            Some(json!({"omg_retries":"1"})),
+        )
+        .await
+        .unwrap();
+    crate::jobs::runner::tests_stop::cancel_at(job.id, 1);
+    let _ = Runner::new(w.jobs.clone()).run_next().await;
+    assert_eq!(w.openai.executed(), ["fail"], "the first attempt ran");
+    let line: (String, Option<String>, i16) =
+        sqlx::query_as("SELECT state,error_code,attempts FROM batch_lines WHERE job_id=$1")
+            .bind(job.id)
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        line,
+        ("failed".into(), Some("upstream_unavailable".into()), 2)
+    );
+    let first: Uuid = sqlx::query_scalar(
+        "SELECT e.id FROM inference_executions e JOIN async_jobs j ON e.batch_job_id=j.id WHERE j.id=$1",
+    )
+    .bind(job.id)
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    let recorded: Uuid = sqlx::query_scalar("SELECT execution_id FROM batch_lines WHERE job_id=$1")
+        .bind(job.id)
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(recorded, first, "the line names the attempt that failed");
+    let job = w.reload(&job).await;
+    let errors = w.read(f.principal.workspace_id, job.error_file_id).await;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    let text = errors[0].to_string();
+    assert!(!text.contains("batch_cancelled"), "{text}");
+    assert!(
+        text.contains(&first.simple().to_string()) || text.contains(&first.to_string()),
+        "{text}"
+    );
+    // The line is counted failed exactly once.
+    assert_eq!(w.reload(&job).await.request_failed, Some(1));
+}
+
+/// A line none of whose attempts reached a provider (no scan slot through its
+/// free tries, then again on its ordinary retry) is reported as not run when
+/// its batch stops while the retry waits: nothing was sent.
+#[dbtest::test]
+async fn a_stopped_retry_of_a_line_that_never_reached_a_provider_is_not_run(pool: PgPool) {
+    let w = world_with(pool, false, false, 1, None).await;
+    let f = &w.f;
+    custom_rule(f).await;
+    let file = w
+        .upload(&f.principal, &[chat_line("a", "company/smart", "hello")])
+        .await;
+    let job = w
+        .create(
+            f.principal,
+            &file,
+            BatchEndpoint::ChatCompletions,
+            Some(json!({"omg_retries":"1"})),
+        )
+        .await
+        .unwrap();
+    let slots = &crate::guardrails::limits::SHARED_SCANS;
+    let mut held = Vec::new();
+    for _ in 0..crate::guardrails::limits::SHARE {
+        held.push(slots.acquire(f.principal.workspace_id).await.unwrap());
+    }
+    // Two free tries and the refusal that ends them, then the retry's first
+    // try: the batch is cancelled there.
+    crate::jobs::runner::tests_stop::cancel_at(job.id, 4);
+    let _ = Runner::new(w.jobs.clone()).run_next().await;
+    drop(held);
+    assert!(w.openai.executed().is_empty(), "nothing was sent");
+    let line: (String, Option<String>, i16) =
+        sqlx::query_as("SELECT state,error_code,attempts FROM batch_lines WHERE job_id=$1")
+            .bind(job.id)
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(line, ("failed".into(), Some("batch_cancelled".into()), 2));
+    // The line is counted failed exactly once.
+    assert_eq!(w.reload(&job).await.request_failed, Some(1));
 }

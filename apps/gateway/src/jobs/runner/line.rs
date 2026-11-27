@@ -4,6 +4,12 @@ use super::*;
 use crate::jobs::{fence::UndispatchedRetry, schedule::claims::RetryClaim};
 use gateway_datetime_compat::UtcInstant;
 
+mod workers;
+use workers::Stopped;
+pub(super) use workers::Workers;
+#[cfg(all(test, feature = "integration-tests"))]
+pub(crate) use workers::tests_stop;
+
 /// Why a batch stopped dispatching.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Stop {
@@ -268,7 +274,7 @@ impl LineRun {
                 Err(e) if self.rescan_later(e, &mut pin, &mut workers).await => {
                     if let Some(stop) = workers.stopped.take() {
                         return self
-                            .not_run(n, execution, &line.custom_id, stop, &records)
+                            .not_run(n, (execution, attempt), &line.custom_id, stop, &records)
                             .await;
                     }
                 }
@@ -296,6 +302,9 @@ impl LineRun {
                         {
                             Retry::Started(next) => {
                                 attempt += 1;
+                                if self.admitted(execution).await {
+                                    workers.ran = Some((execution, e));
+                                }
                                 execution = next;
                                 // The dispatch's probe slot was the first
                                 // attempt's; a retry claims its own.
@@ -322,6 +331,21 @@ impl LineRun {
         }
     }
 
+    /// Whether an attempt was admitted: it has its execution (its reservation,
+    /// and its row in Logs), so it may have reached a provider. An attempt
+    /// stopped before admission (a guardrail refusal, no route or capacity, a
+    /// deadline before admission) has none, and neither has one whose row
+    /// can't be read now: such a line is reported as not run.
+    async fn admitted(&self, execution: Uuid) -> bool {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM inference_executions WHERE id=$1)",
+        )
+        .bind(execution)
+        .fetch_one(&self.store.pool)
+        .await
+        .unwrap_or(false)
+    }
+
     /// The probe slot dispatch claimed for this line, freed if the line ends
     /// before its attempt reaches the engine (an unparseable line, or the task
     /// aborted); from the attempt on, the engine and `unpin` end it.
@@ -342,23 +366,53 @@ impl LineRun {
         })
     }
 
-    /// A line its batch stopped while it waited to be inspected again: it
-    /// never ran (nothing was admitted or sent), so it is reported like the
-    /// lines the stop left unrun, never as a guardrail refusal.
+    /// A line its batch stopped while its current attempt (`execution`,
+    /// number `attempt`) waited to be inspected again, never as a guardrail
+    /// refusal: one no attempt of which was admitted is reported like the
+    /// lines the stop left unrun; one with an earlier admitted attempt is
+    /// reported with that attempt's execution and error, as a retry the stop
+    /// kept from starting is (`count_retry_failure`).
     async fn not_run(
         &self,
         n: i32,
-        execution: Uuid,
+        (execution, attempt): (Uuid, i16),
         custom_id: &str,
-        stop: NotRun,
+        stopped: Stopped,
         records: &mpsc::Sender<Record>,
     ) {
-        if self
-            .finished_error(n, execution, None, Some(stop.code()))
-            .await
-        {
-            let value = lines::not_run_line(custom_id, stop);
-            self.emit_error(records, n, execution, value).await;
+        match stopped {
+            Stopped::NeverRan(stop) => {
+                if self
+                    .finished_error(n, execution, None, Some(stop.code()))
+                    .await
+                {
+                    let value = lines::not_run_line(custom_id, stop);
+                    self.emit_error(records, n, execution, value).await;
+                }
+            }
+            Stopped::AfterAttempt(ran, error) => {
+                let retry = UndispatchedRetry {
+                    execution,
+                    attempt,
+                    status: crate::protocols::batch_line_error(false, error).0,
+                    code: error.code(),
+                };
+                let counted = self
+                    .state
+                    .fence
+                    .count_retry_failure(&self.store, n, ran, Some(retry))
+                    .await;
+                if self.confirmed(n, ran, counted) {
+                    crate::metrics::METRICS.observe_batch_lines(
+                        "gateway",
+                        &self.job.provider,
+                        0,
+                        1,
+                    );
+                    let value = lines::failure_line(custom_id, Some(ran), self.endpoint, error);
+                    self.emit_error(records, n, ran, value).await;
+                }
+            }
         }
     }
 
@@ -388,8 +442,10 @@ impl LineRun {
     /// an attempt: up to `GUARDRAIL_TRIES` times for the first cause and
     /// `SPENT_TRIES` for the second, each counted on its own. `true` once the
     /// wait is over: the line holds its workers again, or its batch stopped
-    /// meanwhile (`workers.stopped`, and the line is reported as not run);
-    /// `false` when the line is not tried again.
+    /// meanwhile (`workers.stopped`: the line ends as `Stopped` says, never
+    /// as a guardrail refusal); `false` when the line is not tried again,
+    /// including the last try a spent budget gets, which was recorded and
+    /// ends the line with its guardrail error.
     async fn rescan_later(
         &self,
         e: InferenceError,
@@ -401,9 +457,19 @@ impl LineRun {
             Some(Rescan::Spent) => (&mut workers.spent, SPENT_TRIES),
             None => return false,
         };
-        // A batch that stopped meanwhile reports the line as not run.
+        #[cfg(all(test, feature = "integration-tests"))]
+        if tests_stop::now(self.job.id) {
+            self.state.cancel.store(true, Ordering::SeqCst);
+        }
+        // A recorded try (the last one a spent budget gets) ends the line
+        // with its guardrail error, whatever happens to the batch: Logs and
+        // the line's result agree.
+        if *tries >= limit && rescan_cause(e) == Some(Rescan::Spent) {
+            return false;
+        }
+        // A batch that stopped meanwhile ends the line (see `Stopped`).
         if let Some(stop) = self.state.stop_reason(&self.job) {
-            workers.stopped = Some(NotRun::from(stop));
+            workers.stopped = Some(workers.stopped_by(stop));
             return true;
         }
         if *tries >= limit {
@@ -422,15 +488,21 @@ impl LineRun {
         .await;
         // A batch stopped during the wait, or while the line waited for its
         // worker, runs nothing more (cancelled, expired, its budget spent,
-        // lost): the line is reported as not run.
-        workers.stopped = self.state.stop_reason(&self.job).map(NotRun::from);
+        // lost): the line ends as `Stopped` says.
+        workers.stopped = self
+            .state
+            .stop_reason(&self.job)
+            .map(|s| workers.stopped_by(s));
         if workers.stopped.is_none() {
             // The pools are never closed; were one, the line would fail with
             // its guardrail error, as before the wait.
             if !workers.reacquire().await {
                 return false;
             }
-            workers.stopped = self.state.stop_reason(&self.job).map(NotRun::from);
+            workers.stopped = self
+                .state
+                .stop_reason(&self.job)
+                .map(|s| workers.stopped_by(s));
         }
         if workers.stopped.is_some() {
             return true;
@@ -686,8 +758,9 @@ enum Rescan {
     /// loaded): the refusal says nothing about the line, and wrote no row.
     Busy,
     /// The custom-pattern budget ran out: a wall-clock budget, which a busy
-    /// replica can exhaust too, so a line gets two more tries (each writes
-    /// its decisions again).
+    /// replica can exhaust too, so a line gets two more tries. A try that
+    /// will be tried again records nothing; only the try that answers (the
+    /// one that ran, or the last) writes its decisions.
     Spent,
 }
 fn rescan_cause(e: InferenceError) -> Option<Rescan> {
@@ -700,50 +773,6 @@ fn rescan_cause(e: InferenceError) -> Option<Rescan> {
             ..
         }) => Some(if scanned { Rescan::Spent } else { Rescan::Busy }),
         _ => None,
-    }
-}
-
-/// A line's per-batch and process worker permits (the process permit given
-/// back while the line waits to be inspected again), and how often it waited
-/// for each cause.
-pub(super) struct Workers {
-    /// Set when the line's batch stopped while it waited.
-    stopped: Option<NotRun>,
-    busy: u32,
-    spent: u32,
-    _batch: tokio::sync::OwnedSemaphorePermit,
-    process: Option<tokio::sync::OwnedSemaphorePermit>,
-    pool: Arc<tokio::sync::Semaphore>,
-}
-impl Workers {
-    pub(super) fn new(
-        (batch, process): (
-            tokio::sync::OwnedSemaphorePermit,
-            tokio::sync::OwnedSemaphorePermit,
-        ),
-    ) -> Self {
-        Self {
-            stopped: None,
-            busy: 0,
-            spent: 0,
-            _batch: batch,
-            pool: Arc::clone(process.semaphore()),
-            process: Some(process),
-        }
-    }
-    /// Whether a spent budget would be tried again.
-    fn spent_left(&self) -> bool {
-        self.spent < SPENT_TRIES
-    }
-    /// The process permit again; `false` if the pool closed.
-    async fn reacquire(&mut self) -> bool {
-        match Arc::clone(&self.pool).acquire_owned().await {
-            Ok(permit) => {
-                self.process = Some(permit);
-                true
-            }
-            Err(_) => false,
-        }
     }
 }
 

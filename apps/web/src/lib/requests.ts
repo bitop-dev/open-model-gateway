@@ -49,12 +49,12 @@ export function sessionTarget(scope: LogsScope, session: string, workspace: stri
   return scope.kind === "platform" ? { page: "platform-log-session", workspace_id: workspace, session_id: session, ...period } : { page: "session-detail", ws: scope.workspace.id, session_id: session, ...period };
 }
 
-export type RequestStatus = "succeeded" | "failed" | "cancelled" | "indeterminate" | "in_progress";
+export type RequestStatus = "succeeded" | "failed" | "cancelled" | "indeterminate" | "in_progress" | "blocked";
 export const requestStatuses: { value: RequestStatus; label: string }[] = [
-  { value: "succeeded", label: "Succeeded" }, { value: "failed", label: "Failed" }, { value: "cancelled", label: "Cancelled" }, { value: "indeterminate", label: "Unknown result" }, { value: "in_progress", label: "In progress" },
+  { value: "succeeded", label: "Succeeded" }, { value: "failed", label: "Failed" }, { value: "cancelled", label: "Cancelled" }, { value: "indeterminate", label: "Unknown result" }, { value: "in_progress", label: "In progress" }, { value: "blocked", label: "Refused by guardrails" },
 ];
 export const requestStatusLabel = (status: string) => requestStatuses.find(s => s.value === status)?.label ?? status;
-export const requestStatusTone = (status: string) => status === "succeeded" ? "success" : status === "failed" ? "danger" : status === "cancelled" ? "neutral" : status === "in_progress" ? "info" : "warning";
+export const requestStatusTone = (status: string) => status === "succeeded" ? "success" : status === "failed" || status === "blocked" ? "danger" : status === "cancelled" ? "neutral" : status === "in_progress" ? "info" : "warning";
 export type FinishReason = "stop" | "length" | "tool_calls" | "content_filter" | "error" | "cancelled" | "unknown";
 export const finishReasons: { value: FinishReason; label: string }[] = [
   { value: "stop", label: "Stop" }, { value: "length", label: "Length limit" }, { value: "tool_calls", label: "Tool calls" }, { value: "content_filter", label: "Content filter" },
@@ -90,6 +90,8 @@ export type RequestRow = {
   trace_id?: string | null;
   /** Async video/batch job of this request (gateway id, gateway state, provider status). */
   job?: JobSummary | null;
+  /** Its guardrail decisions in short (#840): null when no rule decided anything. */
+  guardrail?: { refused: boolean; actions: string[]; categories: string[] } | null;
 } & LogTelemetry;
 export type JobSummary = { id: string; kind: "video" | "batch"; state: JobState; upstream_status: string | null };
 export type JobState = "queued" | "in_progress" | "completed" | "failed" | "cancelled" | "expired";
@@ -163,14 +165,25 @@ export function modalityText(text: string | null, audio: string | null, cached?:
   const total = /^\d+$/.test(cached ?? "") ? BigInt(cached!) : 0n;
   return `${countText(text)} text · ${countText(audio)} audio${total > 0n ? ` (${countText(cached!)} cached)` : ""}`;
 }
-export type RequestDetail = Omit<RequestRow, "attempts" | "job"> & { workspace_id: string; attempt_count: number; attempts: RequestAttempt[]; prev_id: string | null; next_id: string | null; job?: JobDetail | null };
+export type RequestDetail = Omit<RequestRow, "attempts" | "job"> & { workspace_id: string; attempt_count: number; attempts: RequestAttempt[]; prev_id: string | null; next_id: string | null; job?: JobDetail | null; guardrail_decisions?: GuardrailDecision[] };
+/** One guardrail decision of a request: ids, codes and a count of distinct matched values, never text. */
+export type GuardrailDecision = { rule_set_id: string; rule_id: string; revision: number; layer: string; stage: string; detector: string; category: string; action: string; count: number; refused: boolean; created_at: string };
+/** Filters the Generations and Sessions tabs take: they have no refused request (it has no attempt), so not the guardrail filters. */
+export function attemptFilters(filters: RequestFilters): RequestFilters {
+  const status = filters.status?.split(",").filter(s => s !== "blocked").join(",") || undefined;
+  return { ...filters, guardrail: undefined, status };
+}
+export const guardrailFilterOptions: { value: NonNullable<DashboardSearch["guardrail"]>; label: string }[] = [
+  { value: "any", label: "Any decision" }, { value: "refused", label: "Refused" }, { value: "monitored", label: "Monitored" }, { value: "blocked", label: "Blocked" }, { value: "detector_failed", label: "Could not check" }, { value: "skipped", label: "Not readable" },
+];
+export const guardrailActionLabels: Record<string, string> = { monitored: "Monitored", redacted: "Redacted", blocked: "Blocked", stopped: "Stopped", detector_failed: "Could not check", skipped: "Not readable" };
 export type RequestPage = { data: RequestRow[]; next_cursor: string | null };
 
 /** The URL filters shared by the Logs tabs and the request page (not the cursor, tab or table view). */
-export type RequestFilters = Pick<DashboardSearch, "model" | "key_id" | "status" | "q" | "range" | "start_date" | "end_date" | "finish_reason" | "streamed" | "session_id" | "workspace_id" | "workload">;
+export type RequestFilters = Pick<DashboardSearch, "model" | "key_id" | "status" | "q" | "range" | "start_date" | "end_date" | "finish_reason" | "streamed" | "session_id" | "workspace_id" | "workload" | "guardrail">;
 export function requestFilters(search: DashboardSearch): RequestFilters {
   const picked = new Set((search.finish_reason ?? "").split(",")), reasons = finishReasons.filter(f => picked.has(f.value)).map(f => f.value);
-  const extra = { finish_reason: reasons.length ? reasons.join(",") : undefined, streamed: search.streamed, session_id: search.session_id, workspace_id: search.workspace_id, workload: search.workload };
+  const extra = { finish_reason: reasons.length ? reasons.join(",") : undefined, streamed: search.streamed, session_id: search.session_id, workspace_id: search.workspace_id, workload: search.workload, guardrail: search.guardrail };
   return Object.fromEntries(Object.entries({ ...baseFilters(search), ...extra }).filter(([, v]) => v !== undefined)) as RequestFilters;
 }
 function baseFilters(search: DashboardSearch): RequestFilters {
@@ -181,7 +194,7 @@ function baseFilters(search: DashboardSearch): RequestFilters {
   const custom = (search.range === "custom" || !search.range) && !!search.start_date && !!search.end_date;
   return { model: search.model, key_id: search.key_id, status, q: search.q, range: custom ? "custom" : search.range === "custom" ? undefined : search.range, start_date: custom ? search.start_date : undefined, end_date: custom ? search.end_date : undefined };
 }
-export const activeFilterCount = (f: RequestFilters) => [f.model, f.key_id, f.status, f.q, f.finish_reason, f.streamed, f.session_id, f.workspace_id, f.workload, f.range && f.range !== "30d" ? f.range : undefined].filter(Boolean).length;
+export const activeFilterCount = (f: RequestFilters) => [f.model, f.key_id, f.status, f.q, f.finish_reason, f.streamed, f.session_id, f.workspace_id, f.workload, f.guardrail, f.range && f.range !== "30d" ? f.range : undefined].filter(Boolean).length;
 /** Client session ids: 1–128 characters, no control characters or surrounding spaces (the server's rule). */
 export const validSessionId = (id: string) => id.length >= 1 && [...id].length <= 128 && id.trim() === id && !/[\u0000-\u001f\u007f-\u009f]/.test(id);
 /** A request ID search: 4 to 36 hex digits or hyphens (the server's rule). */
@@ -225,6 +238,7 @@ export function requestQuery(filters: RequestFilters, now = Date.now()): { query
   if (filters.finish_reason) query.set("finish_reason", filters.finish_reason);
   if (filters.streamed) query.set("streamed", filters.streamed);
   if (filters.workload) query.set("workload", filters.workload);
+  if (filters.guardrail) query.set("guardrail", filters.guardrail);
   if (filters.session_id) { if (!validSessionId(filters.session_id)) return { query, error: "A session ID has 1 to 128 characters without leading or trailing spaces." }; query.set("session_id", filters.session_id); }
   if (filters.workspace_id) query.set("workspace_id", filters.workspace_id);
   if (filters.q?.trim()) { if (!requestIdQuery(filters.q)) return { query, error: "Search by at least 4 characters of a request ID (0–9, a–f)." }; query.set("q", filters.q.trim().toLowerCase()); }

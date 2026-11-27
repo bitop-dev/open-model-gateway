@@ -20,7 +20,7 @@ import { FileQuestion } from "lucide-react";
 import { ApiError, platformPath, wsPath, type Session } from "../lib/api";
 import { formatUsd } from "../lib/governance";
 import { Money } from "../components/templates/money";
-import { costText, countText, dataPolicyOf, finishReasonLabel, jobStateTone, jobText, type JobDetail, latencyText, logPaths, logsSearch, requestFilters, requestQuery, requestStatusLabel, requestStatusTone, requestTarget, servedModel, sessionTarget, timelineStatus, tokensText, tpsText, unresolvedText, workloadText, modalityText, realtimeResponseState, realtimeStatusLabel, type LogsScope, type RealtimeResponse, type RequestAttempt, type RequestDetail, type RequestPage } from "../lib/requests";
+import { costText, countText, guardrailActionLabels, type GuardrailDecision, dataPolicyOf, finishReasonLabel, jobStateTone, jobText, type JobDetail, latencyText, logPaths, logsSearch, requestFilters, requestQuery, requestStatusLabel, requestStatusTone, requestTarget, servedModel, sessionTarget, timelineStatus, tokensText, tpsText, unresolvedText, workloadText, modalityText, realtimeResponseState, realtimeStatusLabel, type LogsScope, type RealtimeResponse, type RequestAttempt, type RequestDetail, type RequestPage } from "../lib/requests";
 import type { DashboardSearch } from "../lib/permissions";
 import { Button, ErrorNotice, Stack, useAction, useApi } from "../components/ui";
 import { canResolveRealtime, canSettleRealtimeSession, realtimeResolveAction, realtimeSessionAction } from "../lib/realtime-resolution";
@@ -37,6 +37,7 @@ import { StatTile, StatTileGrid } from "../components/templates/stat-tile";
 import { Timeline, type TimelineItem } from "../components/templates/timeline";
 import { StatusBadge } from "../components/ui/badge/badge";
 import { Card } from "../components/ui/card/card";
+import { Table, Td, Tr } from "../components/ui/table/table";
 import { DescriptionList } from "../components/ui/description-list/description-list";
 import { PageHeader } from "../components/templates/page-header";
 import { Time } from "../components/ui/time/time";
@@ -126,6 +127,19 @@ function RequestRoute({ session, scope, id }: { session: Session; scope: LogsSco
   return <RequestNotFound scope={scope} back={back} />;
 }
 
+/** The request's guardrail decisions (#840): rule, outcome and a count of distinct matched values. No text is kept. */
+export function GuardrailDecisions({ decisions }: { decisions: GuardrailDecision[] }) {
+  const categories: Record<string, string> = { secret: "Secrets", custom: "Custom patterns", personal_data: "Personal data", moderation: "Moderation", prompt_injection: "Prompt injection" };
+  const layers: Record<string, string> = { type_default: "Workspace-type default", workspace_override: "Platform override", workspace_local: "Workspace's own rule" };
+  return <Card title="Guardrail decisions" titleAs="h2" description="What each rule decided on the input. Findings count distinct matched values; the matched text is never kept or shown." flush>
+    <Table caption="Guardrail decisions" stack columns={["Outcome", "Looked for", "Rule", { label: "Findings", numeric: true }]}>{decisions.map((d, i) => <Tr key={`${d.rule_id}:${d.category}:${i}`}>
+      <Td><StatusBadge size="sm" tone={d.action === "blocked" || d.refused ? "danger" : d.action === "monitored" ? "info" : "warning"}>{guardrailActionLabels[d.action] ?? d.action}</StatusBadge>{d.refused && <span className={s.secondary}>Refused the request</span>}</Td>
+      <Td>{categories[d.category] ?? d.category}</Td>
+      <Td><span className={s.primary}>{layers[d.layer] ?? d.layer}</span><span className={s.secondary}>Revision {d.revision} · <code title={d.rule_id}>{shortId(d.rule_id)}</code></span></Td>
+      <Td>{d.action === "monitored" || d.action === "blocked" ? d.count : "—"}</Td>
+    </Tr>)}</Table>
+  </Card>;
+}
 /** An async video or batch job: one attempt whose hold stays until the provider reports a terminal state. */
 export function JobCard({ job }: { job: JobDetail }) {
   const when = (v: string | null | undefined, missing: string) => v ? <DetailTime value={v} fallback={v} /> : <span className={s.secondary}>{missing}</span>;
@@ -190,8 +204,9 @@ function RequestDetail({ session, scope, id }: { session: Session; scope: LogsSc
         ...(r!.cost_center ? [{ label: "Cost center", value: `${r!.cost_center.name} · ${r!.cost_center.code}` }] : []),
       ]} /></Card>
       <Card title="Attempts" titleAs="h2" description="In order. A fallback runs only if an earlier attempt failed before any output.">
-        <Timeline label="Upstream attempts" items={r!.attempts.map(a => attemptItem(a, r!.attempts, r!.workload_kind))} showDurationBars showTotal empty="No attempts are visible for this request." />
+        <Timeline label="Upstream attempts" items={r!.attempts.map(a => attemptItem(a, r!.attempts, r!.workload_kind))} showDurationBars showTotal empty={r!.status === "blocked" ? "Refused by guardrails before any attempt: nothing was sent or charged." : "No attempts are visible for this request."} />
       </Card>
+      {!!r!.guardrail_decisions?.length && <GuardrailDecisions decisions={r!.guardrail_decisions} />}
       {r!.job && <JobCard job={r!.job} />}
       {served?.realtime_responses && <Card title="Realtime responses" titleAs="h2" description="One realtime session is one attempt. Each response reserved a bounded budget window and was valued from its own usage; responses without usage keep their window on hold." actions={canSettleRealtimeSession(session, served) && <Button size="sm" variant="secondary" onClick={e => ask({ ...realtimeSessionAction(r!.workspace_id, served.execution_id), returnFocus: e.currentTarget })}>Settle session</Button>}>
         <Timeline label="Realtime responses" items={served.realtime_responses.map(x => realtimeResponseItem(x, cachedSum, canResolveRealtime(session, served, x) ? (resp, opener) => ask({ ...realtimeResolveAction(r!.workspace_id, served.execution_id, resp), returnFocus: opener }) : undefined))} showDurationBars empty="No responses were created in this session." />
