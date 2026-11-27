@@ -62,7 +62,15 @@ pub(super) async fn detail(
     // Visibility of the root itself ignores list filters.
     let sql = format!(
         "{} SELECT {ROW},started_at,workspace_id FROM roots",
-        logs::roots(&scope, "e.root_request_id=$4")
+        logs::roots_with_refused(
+            &scope,
+            "e.root_request_id=$4",
+            // A root id is a UUIDv7 drawn when the request arrived (a
+            // gateway-run batch line's when the line was read): its
+            // decisions lie after that, within the longest completion window
+            // (168 h; at most two monthly partitions).
+            "e.root_request_id=$4 AND (uuid_extract_timestamp($4) IS NULL OR (e.created_at>=uuid_extract_timestamp($4)-interval '10 minutes' AND e.created_at<uuid_extract_timestamp($4)+interval '8 days'))",
+        )
     );
     let (mut summary, started, ws): (Value, UtcInstant, Uuid) = sqlx::query_as(&sql)
         .bind(scope.workspace)
@@ -83,9 +91,10 @@ pub(super) async fn detail(
         .collect();
     // Neighbours within the current list filters.
     let all = format!(
-        "{} SELECT root_request_id FROM roots WHERE {FILTERED}{}",
-        logs::listed_roots(&scope, false),
-        f.workload_sql("workload_kind")
+        "{} SELECT root_request_id FROM roots WHERE {FILTERED}{}{}",
+        logs::listed_roots_with_refused(&scope),
+        f.workload_sql("workload_kind"),
+        f.guardrail_sql()
     );
     // Async job of this request (one attempt: the request id is the
     // execution id). Metadata only; visibility is the root's.
@@ -93,6 +102,14 @@ pub(super) async fn detail(
         .bind(root)
         .bind(ws)
         .fetch_optional(&mut *tx)
+        .await?;
+    // Guardrail decisions on this request (#840): ids, codes and counts
+    // only; visibility is the root's.
+    let (decisions,): (Value,) = sqlx::query_as("SELECT coalesce(jsonb_agg(jsonb_build_object('rule_set_id',g.rule_set_id,'rule_id',g.rule_id,'revision',g.revision,'layer',g.layer,'stage',g.stage,'detector',g.detector_kind,'category',g.category,'action',g.action,'count',g.count,'refused',g.refused,'created_at',g.created_at) ORDER BY g.created_at,g.id),'[]'::jsonb) FROM guardrail_events g WHERE g.root_request_id=$1 AND g.workspace_id=$2 AND g.created_at>=$3-interval '10 minutes' AND g.created_at<$3+interval '10 minutes'")
+        .bind(root)
+        .bind(ws)
+        .bind(started)
+        .fetch_one(&mut *tx)
         .await?;
     let prev: Option<(Uuid,)> = bind_filters(
         sqlx::query_as(&format!("{all} AND (started_at,root_request_id)>($13,$14) ORDER BY started_at,root_request_id LIMIT 1")),
@@ -119,6 +136,7 @@ pub(super) async fn detail(
         o.insert("attempt_count".into(), o["attempts"].clone());
         o.insert("attempts".into(), Value::Array(attempts));
         o.insert("job".into(), job.map_or(Value::Null, |j| j.0));
+        o.insert("guardrail_decisions".into(), decisions);
         o.insert("prev_id".into(), json!(prev.map(|p| p.0)));
         o.insert("next_id".into(), json!(next.map(|n| n.0)));
     }

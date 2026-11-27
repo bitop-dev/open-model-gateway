@@ -135,7 +135,7 @@ async fn the_local_layer_is_written_by_owners_and_admins_only(pool: PgPool) {
         json!(["internal-host-[0-9]+"]),
         "the writer reads its patterns"
     );
-    assert_eq!(body["enforced"], false, "nothing is inspected yet");
+    assert_eq!(body["enforced"], true, "input rules are enforced");
     let (status, _) = call(&f.s, &f.member, "PUT", &local(f.team), json!({"rules":[]})).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     let (status, read) = call(&f.s, &f.member, "GET", &local(f.team), Value::Null).await;
@@ -422,12 +422,17 @@ async fn local_only_makes_an_earlier_egress_rule_inactive_when_composing(pool: P
         .bind(egress).bind(set).execute(&mut *tx).await.unwrap();
     tx.commit().await.unwrap();
     let (_, open) = call(&f.s, &f.owner, "GET", &local(f.team), Value::Null).await;
-    assert!(
-        open["effective"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|r| r["active"] == true)
+    // Allowed without `local_only`, but this release cannot run it: never
+    // shown active, with the reason named.
+    let later = open["effective"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == json!(egress))
+        .unwrap();
+    assert_eq!(
+        (later["active"].clone(), later["inactive_reason"].clone()),
+        (json!(false), json!("not_runnable"))
     );
     let (status, _) = call(
         &f.s,

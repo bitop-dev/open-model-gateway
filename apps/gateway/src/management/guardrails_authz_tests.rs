@@ -5,9 +5,9 @@
 //! again in their own transaction, because that first check can be stale.
 use super::*;
 
-/// The largest patterns that still compile, enough to fill a layer.
+/// A full layer of patterns that compile within the limits.
 fn expensive() -> Value {
-    let patterns: Vec<String> = (0..50).map(|i| format!(r"(?i)\p{{L}}{{24}}{i}")).collect();
+    let patterns: Vec<String> = (0..50).map(|i| format!(r"(?i)[a-z]{{40}}{i}")).collect();
     json!({"local_only":false,"rules":[{"name":"Costly","protection":"custom","detector":{"kind":"pattern","categories":["custom"],"patterns":patterns},"input":{"action":"block"}}]})
 }
 

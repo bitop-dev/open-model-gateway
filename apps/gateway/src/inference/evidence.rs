@@ -39,6 +39,34 @@ pub(crate) fn preserve<T>(
     result
 }
 
+/// Whether a usage report is well-formed evidence: valid meters, a
+/// non-negative provider cost and token counts the ledger can hold.
+pub(crate) fn valid_usage(usage: Usage) -> bool {
+    usage.meters.is_none_or(|m| m.validate().is_ok())
+        && usage.provider_cost_microusd.is_none_or(|n| n >= 0)
+        && valid_token_usage(usage)
+}
+/// Whether a usage report's token counts fit the ledger's integers (and its
+/// billing breakdown is consistent with them).
+fn valid_token_usage(usage: Usage) -> bool {
+    [usage.input_tokens, usage.output_tokens]
+        .into_iter()
+        .flatten()
+        .all(|n| n <= i64::MAX as u64)
+        && u128::from(usage.input_tokens.unwrap_or(0))
+            + u128::from(usage.output_tokens.unwrap_or(0))
+            <= i64::MAX as u128
+        && usage.billing.is_none_or(|billing| {
+            billing.input_lower_bound().is_ok_and(|n| {
+                u128::from(n) + u128::from(usage.output_tokens.unwrap_or(0)) <= i64::MAX as u128
+            }) && billing.validate().is_ok()
+                && match (billing.total_input_tokens, usage.input_tokens) {
+                    (Some(total), Some(raw)) => total >= raw,
+                    _ => true,
+                }
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

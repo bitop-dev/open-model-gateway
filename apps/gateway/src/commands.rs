@@ -316,7 +316,7 @@ pub(crate) async fn archive(store: &Store, pool: &PgPool, action: ArchiveCommand
             store.preflight_enterprise().await?;
             let request = open_model_gateway::archive::Request {
                 group: open_model_gateway::archive::Group::parse(&group)
-                    .context("group must be history, audit or storage")?,
+                    .context("group must be history, audit, storage or guardrails")?,
                 month: open_model_gateway::archive::Month::parse(&month)
                     .context("month must be YYYY-MM or legacy")?,
                 to,

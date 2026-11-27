@@ -141,6 +141,46 @@ impl Metrics {
         self.audit_export_oldest.set(oldest_seconds);
     }
 
+    /// One guardrail decision. Every value comes from a fixed set.
+    pub(crate) fn guardrail_decision(
+        &self,
+        stage: &'static str,
+        detector: &'static str,
+        family: &'static str,
+        action: &'static str,
+    ) {
+        self.guardrails
+            .decisions
+            .get_or_create(&[
+                ("stage", stage.to_owned()),
+                ("detector", detector.to_owned()),
+                ("family", family.to_owned()),
+                ("action", action.to_owned()),
+            ])
+            .inc();
+    }
+
+    /// A request the guardrail step refused without a scan (`rate_limited`
+    /// or `no_slot`).
+    pub(crate) fn guardrail_unscanned(&self, reason: &'static str) {
+        self.guardrails
+            .unscanned
+            .get_or_create(&[("reason", reason.to_owned())])
+            .inc();
+    }
+
+    /// How long a request's guardrail detectors of one kind took.
+    pub(crate) fn guardrail_detector_seconds(
+        &self,
+        detector: &'static str,
+        elapsed: std::time::Duration,
+    ) {
+        self.guardrails
+            .detector
+            .get_or_create(&[("detector", detector.to_owned())])
+            .observe(elapsed.as_secs_f64());
+    }
+
     /// The image input buffer's in-use gauge and its configured size
     /// (`inference::image_buffer::ImageBuffer`).
     pub(crate) fn image_input_buffer(&self) -> (Gauge, Gauge) {

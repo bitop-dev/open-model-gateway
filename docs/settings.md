@@ -49,6 +49,7 @@ Retention compacts settled request metadata older than the window (error code, l
 | Request records: model, tokens, cost, times, workspace, key | As long as the database keeps the month | `archive partition` (operator), whole months past `GATEWAY_HISTORY_RETENTION_MONTHS` | Archive refuses a month with held records |
 | Request details: error code, latency, client session id and app | Until request log retention (if set) | Compaction, hourly | Kept |
 | Prices, reservations, monetary ledger | Never removed by the gateway | Only with their history month (`archive partition`) | As above |
+| Guardrail decisions (`guardrail_events`: rule, category, action, count; never text) | As long as the database keeps the month | `archive partition guardrails` (operator), whole months past `GATEWAY_HISTORY_RETENTION_MONTHS` | Archive refuses a month with held records |
 | Audit log | Until an operator archives its month (the gateway itself never removes it) | `archive partition` of audit months (operator only); off-host copy through [audit export](operations.md#audit-export) | Archive refuses a month with held events |
 | Stored files | Per purpose (table below) | The file sweeper; users and workspace admins can delete | Expiry waits; deliberate deletes don't |
 | A departed person's identity | 30 days after access ends | Cleanup (or **Remove personal data now**) | Kept |

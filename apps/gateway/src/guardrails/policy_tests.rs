@@ -409,7 +409,10 @@ fn local_only_makes_an_egress_rule_inactive_when_composing() {
         ],
     );
     let open = compose(Some(&platform_with("monitor", false)), Some(&local));
-    assert!(open.iter().all(EffectiveRule::active));
+    // Without `local_only` the egress rule is allowed, but this release
+    // cannot run it: it is never shown active (and fails under its on_error).
+    assert_eq!(open[1].inactive_reason, Some(InactiveReason::NotRunnable));
+    assert!(open[0].active() && open[2].active());
     let closed = compose(Some(&platform_with("monitor", true)), Some(&local));
     assert_eq!(closed.len(), 3, "never dropped");
     assert_eq!(

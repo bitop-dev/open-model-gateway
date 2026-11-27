@@ -110,7 +110,7 @@ async fn months_are_created_ahead_and_rows_route_at_the_boundary(pool: PgPool) {
     // The migration covered the next three months already.
     let now = coverage(&pool, None).await.unwrap();
     assert!(now.iter().all(|c| c.months_ahead >= 3), "{now:?}");
-    assert_eq!(now.len(), 5);
+    assert_eq!(now.len(), 6);
     // One second before the month after the legacy partition: three ahead.
     let at = month(2) - TimeDelta::seconds(1);
     let report = ensure_at(&pool, 4, at).await.unwrap();
@@ -123,7 +123,8 @@ async fn months_are_created_ahead_and_rows_route_at_the_boundary(pool: PgPool) {
             .collect::<Vec<_>>(),
         vec![name(month(3)), name(month(4)), name(month(5))]
     );
-    assert_eq!(report.created.len(), 15, "{report:?}");
+    // Three months for each of the six partitioned parents.
+    assert_eq!(report.created.len(), 18, "{report:?}");
     assert!(report.short.is_empty());
     // Ensuring again creates nothing (idempotent).
     assert!(ensure_at(&pool, 4, at).await.unwrap().created.is_empty());

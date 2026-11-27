@@ -47,6 +47,18 @@ struct TelemetryRepository {
 }
 #[async_trait]
 impl InferenceRepository for TelemetryRepository {
+    async fn guardrails(
+        &self,
+        _: Uuid,
+    ) -> Result<std::sync::Arc<crate::guardrails::enforce::Policy>, InferenceError> {
+        Ok(std::sync::Arc::default())
+    }
+    async fn record_guardrails(
+        &self,
+        _: &crate::inference::guardrails::GuardrailRecord<'_>,
+    ) -> Result<(), InferenceError> {
+        Ok(())
+    }
     async fn deployments(&self, _: &Principal, _: &str) -> Result<Vec<Deployment>, InferenceError> {
         Ok(self.deployments.lock().unwrap().clone())
     }

@@ -734,13 +734,7 @@ async fn assemble_results(
             .into_iter()
             .map(|(n, s, _)| (n, s))
             .collect();
-        let unrun = match stop {
-            Some(Stop::Cancelled) => NotRun::Cancelled,
-            Some(Stop::Expired) => NotRun::Expired,
-            Some(Stop::Budget) => NotRun::BudgetExceeded,
-            Some(Stop::HoldUnavailable) => NotRun::HoldUnavailable,
-            Some(Stop::Lost) | None => NotRun::Failed,
-        };
+        let unrun = stop.map_or(NotRun::Failed, NotRun::from);
         let mut reader = LineReader::stored(files, work, job.workspace_id, WORK_LINE_BYTES)
             .await
             .map_err(|_| InferenceError::Storage)?;

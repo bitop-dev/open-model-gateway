@@ -7,6 +7,8 @@ pub mod dispatch;
 mod embeddings;
 pub mod error;
 pub(crate) mod evidence;
+use evidence::valid_usage;
+pub mod guardrails;
 mod hand_off;
 pub mod image_buffer;
 pub mod images;
@@ -110,6 +112,10 @@ pub struct Engine {
     recorder: Option<telemetry::Recorder>,
     /// Token-count windows, concurrency and clock of this process (`count`).
     counts: Arc<count::Counts>,
+    /// Whether the guardrail step applies its per-key bound (not to
+    /// gateway-run batch lines: their batch was accepted with a bounded line
+    /// count, and a clean line never fails because others were refused).
+    per_key_bound: bool,
 }
 
 impl Engine {
@@ -177,6 +183,7 @@ impl Engine {
             realtime: realtime::RealtimeLimits::default(),
             recorder: None,
             counts: Arc::new(count::Counts::new(limits.count_concurrency)),
+            per_key_bound: true,
         })
     }
 
@@ -216,6 +223,7 @@ impl Engine {
             // same as every other non-interactive admission path.
             recorder: None,
             counts: self.counts.clone(),
+            per_key_bound: false,
         }
     }
 
@@ -274,6 +282,12 @@ impl Engine {
                 .refuse(&principal, &request, &refused, request_id, deadline)
                 .await;
         }
+        // Guardrails, once per root request, before the route plan and any
+        // admission: a refused input reserves nothing and reaches no provider.
+        let checked = self.guard_chat(&principal, &request, request_id, protocol, deadline);
+        let unadmitted = checked
+            .await
+            .inspect_err(|&e| telemetry.finish(telemetry::Outcome::Error, Some(e)))?;
         let plan = timeout_at(
             deadline,
             self.repository
@@ -287,6 +301,7 @@ impl Engine {
         record_routing_span(&mut telemetry, routing_start, protocol);
         let streamed = request.stream;
         let scope = RequestScope {
+            unadmitted: &unadmitted,
             principal,
             request: &request,
             request_id,
@@ -358,30 +373,6 @@ fn upstream_snapshot(model: &str) -> Option<String> {
     (1..=512)
         .contains(&model.chars().count())
         .then(|| model.to_owned())
-}
-
-fn valid_usage(usage: Usage) -> bool {
-    usage.meters.is_none_or(|m| m.validate().is_ok())
-        && usage.provider_cost_microusd.is_none_or(|n| n >= 0)
-        && valid_token_usage(usage)
-}
-fn valid_token_usage(usage: Usage) -> bool {
-    [usage.input_tokens, usage.output_tokens]
-        .into_iter()
-        .flatten()
-        .all(|n| n <= i64::MAX as u64)
-        && u128::from(usage.input_tokens.unwrap_or(0))
-            + u128::from(usage.output_tokens.unwrap_or(0))
-            <= i64::MAX as u128
-        && usage.billing.is_none_or(|billing| {
-            billing.input_lower_bound().is_ok_and(|n| {
-                u128::from(n) + u128::from(usage.output_tokens.unwrap_or(0)) <= i64::MAX as u128
-            }) && billing.validate().is_ok()
-                && match (billing.total_input_tokens, usage.input_tokens) {
-                    (Some(total), Some(raw)) => total >= raw,
-                    _ => true,
-                }
-        })
 }
 
 /// Settles one attempt's durable write (wrapping its real phase boundaries
@@ -721,6 +712,10 @@ pub(crate) mod admission_validation_tests;
 mod count_db_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod drain_e2e_tests;
+#[cfg(all(test, feature = "integration-tests"))]
+mod guardrail_db_tests;
+#[cfg(all(test, feature = "integration-tests"))]
+mod guardrail_limits_db_tests;
 mod route_use;
 use route_use::after;
 pub(crate) use route_use::{Passed, RouteUse, exhausted, route_use};

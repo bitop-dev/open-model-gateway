@@ -30,6 +30,9 @@ pub(super) struct LogQuery {
     /// Workload of the request: a workload kind, or `jobs` (async video and
     /// batch jobs).
     pub(super) workload: Option<String>,
+    /// Requests with guardrail decisions (#840): `any`, `refused`, or one
+    /// action. The request list, its neighbours and metrics only.
+    pub(super) guardrail: Option<String>,
     pub(super) cursor: Option<String>,
     pub(super) limit: Option<i64>,
 }
@@ -45,6 +48,8 @@ pub(super) struct Filters {
     session: Option<String>,
     /// Validated workload kinds (a closed set, never client text).
     workloads: Option<Vec<&'static str>>,
+    /// The guardrail filter's condition (constants only, never client text).
+    guardrail: Option<&'static str>,
 }
 impl Filters {
     /// ` AND {column} IN(...)` for the workload filter (constants only).
@@ -61,6 +66,39 @@ impl Filters {
             ),
         }
     }
+}
+impl Filters {
+    /// ` AND EXISTS(...)` over a root's guardrail decisions (constants only).
+    pub(super) fn guardrail_sql(&self) -> String {
+        self.guardrail.map_or_else(String::new, |c| {
+            format!(" AND EXISTS(SELECT 1 FROM guardrail_events g WHERE g.root_request_id=roots.root_request_id AND g.workspace_id=roots.workspace_id AND g.created_at>=roots.started_at-interval '10 minutes' AND g.created_at<roots.started_at+interval '10 minutes'{c})")
+        })
+    }
+}
+fn guardrail(s: &str) -> Result<&'static str, ApiError> {
+    Ok(match s {
+        "any" => "",
+        "refused" => " AND g.refused",
+        "monitored" => " AND g.action='monitored'",
+        "blocked" => " AND g.action='blocked'",
+        "detector_failed" => " AND g.action='detector_failed'",
+        "skipped" => " AND g.action='skipped'",
+        _ => return Err(invalid()),
+    })
+}
+/// Request status values in Logs: the attempt statuses, and `blocked` (a
+/// guardrail refused the request before any attempt).
+fn statuses(s: &str) -> Result<Vec<String>, ApiError> {
+    let mut out: Vec<String> = Vec::new();
+    for v in s.split(',') {
+        if !super::usage::STATUSES.contains(&v) && v != "blocked" {
+            return Err(invalid());
+        }
+        if !out.iter().any(|o| o == v) {
+            out.push(v.to_owned());
+        }
+    }
+    Ok(out)
 }
 fn workloads(s: &str) -> Result<Vec<&'static str>, ApiError> {
     use crate::inference::types::{ApiProtocol, WorkloadKind};
@@ -116,11 +154,7 @@ impl LogQuery {
         }) {
             return Err(invalid());
         }
-        let status = self
-            .status
-            .as_deref()
-            .map(super::usage::statuses)
-            .transpose()?;
+        let status = self.status.as_deref().map(statuses).transpose()?;
         let finish = self
             .finish_reason
             .as_deref()
@@ -156,6 +190,7 @@ impl LogQuery {
             streamed: self.streamed,
             session: self.session_id.clone(),
             workloads: self.workload.as_deref().map(workloads).transpose()?,
+            guardrail: self.guardrail.as_deref().map(guardrail).transpose()?,
         })
     }
     pub(super) fn limit(&self) -> Result<i64, ApiError> {
@@ -164,6 +199,19 @@ impl LogQuery {
             return Err(invalid());
         }
         Ok(limit)
+    }
+    /// Generations and sessions list attempts, which a refused request never
+    /// had: the guardrail filter and the `blocked` status are refused there.
+    pub(super) fn executions_only(&self) -> Result<(), ApiError> {
+        if self.guardrail.is_some()
+            || self
+                .status
+                .as_deref()
+                .is_some_and(|s| s.split(',').any(|v| v == "blocked"))
+        {
+            return Err(invalid());
+        }
+        Ok(())
     }
     /// Detail and metrics endpoints take filters only (no paging).
     pub(super) fn no_paging(&self) -> Result<(), ApiError> {
@@ -253,9 +301,14 @@ const TPS: &str = "CASE WHEN e.workload_kind='generation' AND e.state='succeeded
 /// Root requests visible in `scope`: `att` (attempts) then `roots` (one row
 /// per root). `{FILTER}` restricts attempts before aggregation.
 const ROOTS: &str = "WITH att AS (SELECT e.*,k.name key_name,w.name workspace_name,w.kind workspace_kind,r.state accounting_state,r.actual_microusd,r.held_microusd,(e.billing_usage->>'cache_read_input_tokens')::bigint cached_tokens,{TPS} decode_ms FROM inference_executions e JOIN api_keys k ON k.id=e.api_key_id AND k.workspace_id=e.workspace_id JOIN workspaces w ON w.id=e.workspace_id LEFT JOIN governance_reservations r ON r.execution_id=e.id WHERE {VISIBLE} AND {FILTER}),
-roots AS (SELECT root_request_id,(array_agg(workspace_id ORDER BY attempt_number))[1] workspace_id,(array_agg(workspace_name ORDER BY attempt_number))[1] workspace_name,(array_agg(workspace_kind ORDER BY attempt_number))[1] workspace_kind,min(started_at) started_at,CASE WHEN bool_and(completed_at IS NOT NULL) THEN max(completed_at) END completed_at,CASE WHEN bool_and(completed_at IS NOT NULL) THEN floor(extract(epoch FROM max(completed_at)-min(started_at))*1000)::bigint END latency_ms,(array_agg(public_model ORDER BY attempt_number))[1] model,(array_agg(api_key_id ORDER BY attempt_number))[1] key_id,(array_agg(key_name ORDER BY attempt_number))[1] key_name,CASE (array_agg(state ORDER BY attempt_number DESC))[1] WHEN 'started' THEN 'in_progress' ELSE (array_agg(state ORDER BY attempt_number DESC))[1] END status,count(*) attempts,CASE WHEN count(*) FILTER(WHERE input_tokens IS NULL)=0 THEN sum(input_tokens) END input_tokens,CASE WHEN count(*) FILTER(WHERE output_tokens IS NULL)=0 THEN sum(output_tokens) END output_tokens,CASE WHEN count(*) FILTER(WHERE cached_tokens IS NULL)=0 THEN sum(cached_tokens) END cached_tokens,CASE WHEN count(*) FILTER(WHERE reasoning_tokens IS NULL)=0 THEN sum(reasoning_tokens) END reasoning_tokens,CASE WHEN count(*) FILTER(WHERE actual_microusd IS NULL)=0 THEN sum(actual_microusd) END cost_microusd,coalesce(sum(actual_microusd),0) known_cost_microusd,coalesce(sum(held_microusd) FILTER(WHERE actual_microusd IS NULL AND accounting_state IN('pending','unknown')),0) held_microusd,(array_agg(cost_center_id ORDER BY attempt_number))[1] cost_center_id,(array_agg(cost_center_name ORDER BY attempt_number))[1] cost_center_name,(array_agg(cost_center_code ORDER BY attempt_number))[1] cost_center_code,(array_agg(workload_kind ORDER BY attempt_number))[1] workload_kind,bool_or(streamed) streamed,(array_agg(finish_reason ORDER BY attempt_number DESC))[1] finish_reason,(array_agg(time_to_first_token_ms ORDER BY attempt_number DESC))[1] ttft_ms,(array_agg(generation_ms ORDER BY attempt_number DESC))[1] generation_ms,(array_agg(decode_ms ORDER BY attempt_number DESC))[1] decode_ms,(array_agg(output_tokens ORDER BY attempt_number DESC))[1] final_output_tokens,(array_agg(upstream_model ORDER BY attempt_number DESC))[1] upstream_model,(array_agg(reported_upstream_model ORDER BY attempt_number DESC))[1] reported_upstream_model,(array_agg(provider ORDER BY attempt_number DESC))[1] provider,(array_agg(client_session_id ORDER BY attempt_number))[1] session_id,(array_agg(client_app ORDER BY attempt_number))[1] app,array_agg(id) execution_ids FROM att GROUP BY root_request_id)";
+roots AS (SELECT root_request_id,(array_agg(workspace_id ORDER BY attempt_number))[1] workspace_id,(array_agg(workspace_name ORDER BY attempt_number))[1] workspace_name,(array_agg(workspace_kind ORDER BY attempt_number))[1] workspace_kind,min(started_at) started_at,CASE WHEN bool_and(completed_at IS NOT NULL) THEN max(completed_at) END completed_at,CASE WHEN bool_and(completed_at IS NOT NULL) THEN floor(extract(epoch FROM max(completed_at)-min(started_at))*1000)::bigint END latency_ms,(array_agg(public_model ORDER BY attempt_number))[1] model,(array_agg(api_key_id ORDER BY attempt_number))[1] key_id,(array_agg(key_name ORDER BY attempt_number))[1] key_name,CASE (array_agg(state ORDER BY attempt_number DESC))[1] WHEN 'started' THEN 'in_progress' ELSE (array_agg(state ORDER BY attempt_number DESC))[1] END status,count(*) attempts,CASE WHEN count(*) FILTER(WHERE input_tokens IS NULL)=0 THEN sum(input_tokens) END input_tokens,CASE WHEN count(*) FILTER(WHERE output_tokens IS NULL)=0 THEN sum(output_tokens) END output_tokens,CASE WHEN count(*) FILTER(WHERE cached_tokens IS NULL)=0 THEN sum(cached_tokens) END cached_tokens,CASE WHEN count(*) FILTER(WHERE reasoning_tokens IS NULL)=0 THEN sum(reasoning_tokens) END reasoning_tokens,CASE WHEN count(*) FILTER(WHERE actual_microusd IS NULL)=0 THEN sum(actual_microusd) END cost_microusd,coalesce(sum(actual_microusd),0) known_cost_microusd,coalesce(sum(held_microusd) FILTER(WHERE actual_microusd IS NULL AND accounting_state IN('pending','unknown')),0) held_microusd,(array_agg(cost_center_id ORDER BY attempt_number))[1] cost_center_id,(array_agg(cost_center_name ORDER BY attempt_number))[1] cost_center_name,(array_agg(cost_center_code ORDER BY attempt_number))[1] cost_center_code,(array_agg(workload_kind ORDER BY attempt_number))[1] workload_kind,bool_or(streamed) streamed,(array_agg(finish_reason ORDER BY attempt_number DESC))[1] finish_reason,(array_agg(time_to_first_token_ms ORDER BY attempt_number DESC))[1] ttft_ms,(array_agg(generation_ms ORDER BY attempt_number DESC))[1] generation_ms,(array_agg(decode_ms ORDER BY attempt_number DESC))[1] decode_ms,(array_agg(output_tokens ORDER BY attempt_number DESC))[1] final_output_tokens,(array_agg(upstream_model ORDER BY attempt_number DESC))[1] upstream_model,(array_agg(reported_upstream_model ORDER BY attempt_number DESC))[1] reported_upstream_model,(array_agg(provider ORDER BY attempt_number DESC))[1] provider,(array_agg(client_session_id ORDER BY attempt_number))[1] session_id,(array_agg(client_app ORDER BY attempt_number))[1] app,array_agg(id) execution_ids FROM att GROUP BY root_request_id{REFUSED})";
+/// Requests a guardrail refused (#840): no execution row exists (nothing was
+/// reserved or sent), so their roots come from the refusing decision in
+/// `guardrail_events`, under the same visibility, as status `blocked` with
+/// known zero tokens and cost. `{RFILTER}` restricts the decisions.
+const REFUSED: &str = " UNION ALL SELECT e.root_request_id,e.workspace_id,w.name,w.kind,min(e.created_at),min(e.created_at),NULL::bigint,(array_agg(e.model))[1],e.api_key_id,k.name,'blocked',0::bigint,0::numeric,0::numeric,0::numeric,0::numeric,0::numeric,0::numeric,0::numeric,NULL::uuid,NULL::text,NULL::text,(array_agg(CASE WHEN e.operation IN('chat_completions','responses','messages','count_tokens') THEN 'generation' ELSE e.operation END))[1],bool_or(e.streamed),NULL::text,NULL::bigint,NULL::bigint,NULL::bigint,NULL::bigint,NULL::text,NULL::text,NULL::text,NULL::text,NULL::text,'{}'::uuid[] FROM guardrail_events e JOIN api_keys k ON k.id=e.api_key_id AND k.workspace_id=e.workspace_id JOIN workspaces w ON w.id=e.workspace_id WHERE {VISIBLE} AND e.refused AND {RFILTER} AND NOT EXISTS(SELECT 1 FROM inference_executions x WHERE x.root_request_id=e.root_request_id AND x.started_at>=e.created_at-interval '10 minutes' AND x.started_at<e.created_at+interval '10 minutes') GROUP BY e.root_request_id,e.workspace_id,w.name,w.kind,e.api_key_id,k.name";
 /// One root row (requests list, detail summary).
-pub(super) const ROW: &str = "jsonb_build_object('root_request_id',root_request_id,'workspace',jsonb_build_object('id',workspace_id,'name',workspace_name,'kind',workspace_kind),'started_at',started_at,'completed_at',completed_at,'model',model,'upstream_model',upstream_model,'reported_upstream_model',reported_upstream_model,'provider',provider,'key',jsonb_build_object('id',key_id,'name',key_name),'status',status,'finish_reason',finish_reason,'attempts',attempts,'input_tokens',input_tokens::text,'output_tokens',output_tokens::text,'cached_input_tokens',cached_tokens::text,'reasoning_tokens',reasoning_tokens::text,'cost_microusd',cost_microusd::text,'held_microusd',held_microusd::text,'latency_ms',latency_ms,'time_to_first_token_ms',ttft_ms,'generation_ms',generation_ms,'tokens_per_second',CASE WHEN decode_ms>0 THEN round(final_output_tokens*1000.0/decode_ms,2)::text END,'cost_center',CASE WHEN cost_center_id IS NULL THEN NULL ELSE jsonb_build_object('id',cost_center_id,'name',cost_center_name,'code',cost_center_code) END,'workload_kind',workload_kind,'streamed',streamed,'session_id',session_id,'app',app,'job',(SELECT jsonb_build_object('id',j.kind||'_'||replace(j.id::text,'-',''),'kind',j.kind,'state',j.state,'upstream_status',j.upstream_status) FROM async_jobs j WHERE j.execution_id=roots.root_request_id))";
+pub(super) const ROW: &str = "jsonb_build_object('root_request_id',root_request_id,'workspace',jsonb_build_object('id',workspace_id,'name',workspace_name,'kind',workspace_kind),'started_at',started_at,'completed_at',completed_at,'model',model,'upstream_model',upstream_model,'reported_upstream_model',reported_upstream_model,'provider',provider,'key',jsonb_build_object('id',key_id,'name',key_name),'status',status,'finish_reason',finish_reason,'attempts',attempts,'input_tokens',input_tokens::text,'output_tokens',output_tokens::text,'cached_input_tokens',cached_tokens::text,'reasoning_tokens',reasoning_tokens::text,'cost_microusd',cost_microusd::text,'held_microusd',held_microusd::text,'latency_ms',latency_ms,'time_to_first_token_ms',ttft_ms,'generation_ms',generation_ms,'tokens_per_second',CASE WHEN decode_ms>0 THEN round(final_output_tokens*1000.0/decode_ms,2)::text END,'cost_center',CASE WHEN cost_center_id IS NULL THEN NULL ELSE jsonb_build_object('id',cost_center_id,'name',cost_center_name,'code',cost_center_code) END,'workload_kind',workload_kind,'streamed',streamed,'session_id',session_id,'app',app,'job',(SELECT jsonb_build_object('id',j.kind||'_'||replace(j.id::text,'-',''),'kind',j.kind,'state',j.state,'upstream_status',j.upstream_status) FROM async_jobs j WHERE j.execution_id=roots.root_request_id),'guardrail',(SELECT CASE WHEN count(*)>0 THEN jsonb_build_object('refused',bool_or(g.refused),'actions',jsonb_agg(DISTINCT g.action),'categories',jsonb_agg(DISTINCT g.category)) END FROM guardrail_events g WHERE g.root_request_id=roots.root_request_id AND g.workspace_id=roots.workspace_id AND g.created_at>=roots.started_at-interval '10 minutes' AND g.created_at<roots.started_at+interval '10 minutes'))";
 /// Filters on roots: $4 start, $5 end, $6 model, $7 key, $8 statuses,
 /// $9 id prefix, $10 finish reasons (final attempt), $11 streamed, $12 session.
 pub(super) const FILTERED: &str = "started_at>=$4 AND started_at<$5 AND ($6::text IS NULL OR model=$6) AND ($7::uuid IS NULL OR key_id=$7) AND ($8::text[] IS NULL OR status=ANY($8)) AND ($9::text IS NULL OR root_request_id::text LIKE $9||'%' OR EXISTS(SELECT 1 FROM unnest(execution_ids) x WHERE x::text LIKE $9||'%')) AND ($10::text[] IS NULL OR finish_reason=ANY($10)) AND ($11::boolean IS NULL OR streamed=$11) AND ($12::text IS NULL OR session_id=$12)";
@@ -263,7 +316,10 @@ pub(super) const FILTERED: &str = "started_at>=$4 AND started_at<$5 AND ($6::tex
 /// Root requests whose first attempt started in the period, with the
 /// root-invariant filters (model, key, streamed, session) pushed down.
 pub(super) fn listed_roots(scope: &LogScope, sessions_only: bool) -> String {
-    let filter = format!(
+    roots(scope, &listed_filter(scope, sessions_only))
+}
+fn listed_filter(scope: &LogScope, sessions_only: bool) -> String {
+    format!(
         "e.root_request_id IN(SELECT x.root_request_id FROM inference_executions x WHERE {} AND x.attempt_number=1 AND x.started_at>=$4 AND x.started_at<$5 AND ($6::text IS NULL OR x.public_model=$6) AND ($7::uuid IS NULL OR x.api_key_id=$7) AND ($11::boolean IS NULL OR x.streamed=$11) AND ($12::text IS NULL OR x.client_session_id=$12){})",
         scope.preselect_workspace(),
         if sessions_only {
@@ -271,14 +327,33 @@ pub(super) fn listed_roots(scope: &LogScope, sessions_only: bool) -> String {
         } else {
             ""
         }
-    );
-    roots(scope, &filter)
+    )
 }
 pub(super) fn roots(scope: &LogScope, filter: &str) -> String {
     ROOTS
+        .replace("{REFUSED}", "")
         .replace("{TPS}", TPS)
         .replace("{VISIBLE}", scope.visible())
         .replace("{FILTER}", filter)
+}
+/// As [`roots`], plus the requests a guardrail refused whose decisions match
+/// `refused_filter` (over `e`, the decisions).
+pub(super) fn roots_with_refused(scope: &LogScope, filter: &str, refused_filter: &str) -> String {
+    ROOTS
+        .replace("{REFUSED}", &REFUSED.replace("{RFILTER}", refused_filter))
+        .replace("{TPS}", TPS)
+        .replace("{VISIBLE}", scope.visible())
+        .replace("{FILTER}", filter)
+}
+/// The request list's roots: [`listed_roots`] and the refused requests in the
+/// period with the root-invariant filters (a refused request has no
+/// session and no streamed flag, so those two filters exclude it).
+pub(super) fn listed_roots_with_refused(scope: &LogScope) -> String {
+    roots_with_refused(
+        scope,
+        &listed_filter(scope, false),
+        "e.created_at>=$4 AND e.created_at<$5 AND ($6::text IS NULL OR e.model=$6) AND ($7::uuid IS NULL OR e.api_key_id=$7) AND $11::boolean IS NULL AND $12::text IS NULL",
+    )
 }
 pub(super) type PgQueryAs<'q, O> =
     sqlx::query::QueryAs<'q, Postgres, O, sqlx::postgres::PgArguments>;
@@ -369,9 +444,10 @@ pub(super) async fn list_requests(
     let cursor = p.cursor.as_deref().map(cursor_parts).transpose()?;
     // Roots are selected by their first attempt's start inside the range.
     let sql = format!(
-        "{} SELECT {ROW},started_at,root_request_id FROM roots WHERE {FILTERED}{} AND ($13::timestamptz IS NULL OR (started_at,root_request_id)<($13,$14)) ORDER BY started_at DESC,root_request_id DESC LIMIT $15",
-        listed_roots(&scope, false),
-        f.workload_sql("workload_kind")
+        "{} SELECT {ROW},started_at,root_request_id FROM roots WHERE {FILTERED}{}{} AND ($13::timestamptz IS NULL OR (started_at,root_request_id)<($13,$14)) ORDER BY started_at DESC,root_request_id DESC LIMIT $15",
+        listed_roots_with_refused(&scope),
+        f.workload_sql("workload_kind"),
+        f.guardrail_sql()
     );
     let rows: Vec<(Value, UtcInstant, Uuid)> = bind_filters(sqlx::query_as(&sql), &scope, &f)
         .bind(cursor.map(|c| c.0))
@@ -396,6 +472,7 @@ pub(super) async fn list_generations(
     scope: LogScope,
     p: &LogQuery,
 ) -> ApiResult {
+    p.executions_only()?;
     let f = p.filters()?;
     let limit = p.limit()?;
     let cursor = p.cursor.as_deref().map(cursor_parts).transpose()?;
@@ -458,6 +535,7 @@ pub(super) async fn list_sessions(
     scope: LogScope,
     p: &LogQuery,
 ) -> ApiResult {
+    p.executions_only()?;
     let f = p.filters()?;
     let limit = p.limit()?;
     let cursor = p.cursor.as_deref().map(session_cursor).transpose()?;
@@ -498,6 +576,7 @@ pub(super) async fn session_detail(
             missing()
         });
     }
+    p.executions_only()?;
     let mut f = p.filters()?;
     f.session = Some(session.to_owned());
     scope.workspace = Some(ws);
@@ -519,9 +598,10 @@ pub(super) async fn metrics(
     p.no_paging()?;
     let f = p.filters()?;
     let sql = format!(
-        "{}, f AS (SELECT * FROM roots WHERE {FILTERED}{}) SELECT jsonb_build_object('requests',count(*)::text,'completed',count(*) FILTER(WHERE status<>'in_progress')::text,'failed',count(*) FILTER(WHERE status='failed')::text,'error_rate',CASE WHEN count(*) FILTER(WHERE status<>'in_progress')>0 THEN round(count(*) FILTER(WHERE status='failed')::numeric/count(*) FILTER(WHERE status<>'in_progress'),4)::text END,'latency_p50_ms',percentile_disc(0.5) WITHIN GROUP (ORDER BY latency_ms),'latency_p95_ms',percentile_disc(0.95) WITHIN GROUP (ORDER BY latency_ms),'avg_time_to_first_token_ms',round(avg(ttft_ms))::bigint,'ttft_requests',count(ttft_ms)::text,'tokens_per_second',CASE WHEN coalesce(sum(decode_ms) FILTER(WHERE decode_ms>0),0)>0 THEN round(sum(final_output_tokens) FILTER(WHERE decode_ms>0)*1000.0/sum(decode_ms) FILTER(WHERE decode_ms>0),2)::text END,'input_tokens',coalesce(sum(input_tokens),0)::text,'output_tokens',coalesce(sum(output_tokens),0)::text,'unknown_token_requests',count(*) FILTER(WHERE input_tokens IS NULL OR output_tokens IS NULL)::text,'known_cost_microusd',coalesce(sum(known_cost_microusd),0)::text,'held_microusd',coalesce(sum(held_microusd),0)::text,'unresolved_requests',count(*) FILTER(WHERE cost_microusd IS NULL)::text) FROM f",
+        "{}, f AS (SELECT * FROM roots WHERE {FILTERED}{}{}) SELECT jsonb_build_object('requests',count(*)::text,'completed',count(*) FILTER(WHERE status<>'in_progress')::text,'failed',count(*) FILTER(WHERE status='failed')::text,'error_rate',CASE WHEN count(*) FILTER(WHERE status<>'in_progress')>0 THEN round(count(*) FILTER(WHERE status='failed')::numeric/count(*) FILTER(WHERE status<>'in_progress'),4)::text END,'latency_p50_ms',percentile_disc(0.5) WITHIN GROUP (ORDER BY latency_ms),'latency_p95_ms',percentile_disc(0.95) WITHIN GROUP (ORDER BY latency_ms),'avg_time_to_first_token_ms',round(avg(ttft_ms))::bigint,'ttft_requests',count(ttft_ms)::text,'tokens_per_second',CASE WHEN coalesce(sum(decode_ms) FILTER(WHERE decode_ms>0),0)>0 THEN round(sum(final_output_tokens) FILTER(WHERE decode_ms>0)*1000.0/sum(decode_ms) FILTER(WHERE decode_ms>0),2)::text END,'input_tokens',coalesce(sum(input_tokens),0)::text,'output_tokens',coalesce(sum(output_tokens),0)::text,'unknown_token_requests',count(*) FILTER(WHERE input_tokens IS NULL OR output_tokens IS NULL)::text,'known_cost_microusd',coalesce(sum(known_cost_microusd),0)::text,'held_microusd',coalesce(sum(held_microusd),0)::text,'unresolved_requests',count(*) FILTER(WHERE cost_microusd IS NULL)::text) FROM f",
         listed_roots(&scope, false),
-        f.workload_sql("workload_kind")
+        f.workload_sql("workload_kind"),
+        f.guardrail_sql()
     );
     let (v,): (Value,) = bind_filters(sqlx::query_as(&sql), &scope, &f)
         .fetch_one(&mut *tx)

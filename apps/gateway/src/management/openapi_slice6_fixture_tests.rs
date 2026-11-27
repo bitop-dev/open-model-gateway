@@ -1476,6 +1476,48 @@ async fn slice6_fixtures(pool: PgPool, shard: usize) -> (PositiveFixtures, Vec<S
     .await;
     sqlx::query("UPDATE async_jobs SET state='failed',upstream_status='failed',cancel_requested_at=now(),completed_at=now(),settled_at=now(),deleted_at=now(),error_code='upstream_failed' WHERE id=$1").bind(jp4).execute(&pool).await.unwrap();
 
+    // Guardrail decisions (#840): monitored ones on request A and on the
+    // personal request, and in each workspace a request a guardrail refused
+    // (no attempt). The other requests have none.
+    let (refused_root, refused_private) = (Uuid::now_v7(), Uuid::now_v7());
+    for (root, ws, key, action, refused) in [
+        (a, f.team, log_key, "monitored", false),
+        (refused_root, f.team, log_key, "blocked", true),
+        (private_root, f.personal, private_key, "monitored", false),
+        (refused_private, f.personal, private_key, "blocked", true),
+    ] {
+        sqlx::query("INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused) VALUES(gen_random_uuid(),$1,$2,$3,'chat_completions','contract-log','input',gen_random_uuid(),gen_random_uuid(),2,'type_default','pattern','secret',$4,1,$5)")
+            .bind(root)
+            .bind(ws)
+            .bind(key)
+            .bind(action)
+            .bind(refused)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    w.json(
+        &owner,
+        "GET",
+        &format!("{ws}/requests/{refused_root}"),
+        None,
+    )
+    .await;
+    w.json(
+        &auditor,
+        "GET",
+        &format!("/api/v1/platform/logs/requests/{refused_root}"),
+        None,
+    )
+    .await;
+    w.json(
+        &owner,
+        "GET",
+        &format!("{personal}/requests/{refused_private}"),
+        None,
+    )
+    .await;
+
     // Audit rows the system itself writes (no person acts): the producers'
     // own statements (lifecycle.rs, bootstrap.rs).
     sqlx::query("INSERT INTO audit_events(id,actor_user_id,action,resource_type,resource_id) VALUES($1,NULL,'user.cleaned','user',$2)").bind(Uuid::new_v4()).bind(f.outsider.user_id).execute(&pool).await.unwrap();
@@ -2233,6 +2275,7 @@ async fn slice6_fixtures(pool: PgPool, shard: usize) -> (PositiveFixtures, Vec<S
         }
     }
     let workspace_logs: Vec<(&str, &str)> = logs.to_vec();
+
     query_ops(
         &mut w,
         &auditor,
@@ -2246,7 +2289,7 @@ async fn slice6_fixtures(pool: PgPool, shard: usize) -> (PositiveFixtures, Vec<S
         &auditor,
         "/api/v1/platform/logs/requests",
         "/api/v1/platform/logs/requests",
-        &platform_logs,
+        &with_guardrail(&platform_logs),
     )
     .await;
     query_ops(
@@ -2262,7 +2305,7 @@ async fn slice6_fixtures(pool: PgPool, shard: usize) -> (PositiveFixtures, Vec<S
         &auditor,
         "/api/v1/platform/logs/metrics",
         "/api/v1/platform/logs/metrics",
-        &platform_filters,
+        &with_guardrail(&platform_filters),
     )
     .await;
     query_ops(
@@ -2270,7 +2313,7 @@ async fn slice6_fixtures(pool: PgPool, shard: usize) -> (PositiveFixtures, Vec<S
         &auditor,
         "/api/v1/platform/logs/requests/{root}",
         &format!("/api/v1/platform/logs/requests/{a}"),
-        &platform_filters,
+        &with_guardrail(&platform_filters),
     )
     .await;
     query_ops(
@@ -2294,7 +2337,7 @@ async fn slice6_fixtures(pool: PgPool, shard: usize) -> (PositiveFixtures, Vec<S
         &owner,
         "/api/v1/workspaces/{ws}/requests",
         &format!("{ws}/requests"),
-        &workspace_logs,
+        &with_guardrail(&workspace_logs),
     )
     .await;
     query_ops(
@@ -2302,7 +2345,7 @@ async fn slice6_fixtures(pool: PgPool, shard: usize) -> (PositiveFixtures, Vec<S
         &owner,
         "/api/v1/workspaces/{ws}/logs/metrics",
         &format!("{ws}/logs/metrics"),
-        &no_page,
+        &with_guardrail(&no_page),
     )
     .await;
     query_ops(
@@ -2310,7 +2353,7 @@ async fn slice6_fixtures(pool: PgPool, shard: usize) -> (PositiveFixtures, Vec<S
         &owner,
         "/api/v1/workspaces/{ws}/requests/{root}",
         &format!("{ws}/requests/{a}"),
-        &no_page,
+        &with_guardrail(&no_page),
     )
     .await;
     let first_file = fileid.clone();
@@ -3267,4 +3310,11 @@ async fn slice6_fixtures(pool: PgPool, shard: usize) -> (PositiveFixtures, Vec<S
     .await;
     w.status(&owner,"PUT",&format!("{keypath}/policy"),Some(json!({"requests_per_minute":null,"tokens_per_minute":null,"concurrent_requests":null,"budgets":[{"period":"month","amount_microusd":"1","unknown":true}]})),StatusCode::UNPROCESSABLE_ENTITY).await;
     (w.observed, w.failed)
+}
+
+/// Root-request reads also filter by guardrail decisions (#840).
+fn with_guardrail<'a>(q: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+    let mut q = q.to_vec();
+    q.push(("guardrail", "any"));
+    q
 }

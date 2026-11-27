@@ -19,6 +19,10 @@ use serde_json::{Map, Value, json};
 use syn::visit::Visit;
 
 use crate::{
+    guardrails::{
+        enforce::{Refusal, RefusalKind},
+        policy::{Category, DetectorKind},
+    },
     inference::error::{FieldName, InferenceError, LimitScope},
     protocols::batch_line_error,
 };
@@ -50,6 +54,25 @@ pub(super) fn all() -> Vec<InferenceError> {
         InferenceError::InvalidUpstream,
         InferenceError::Storage,
     ];
+    all.extend([
+        InferenceError::GuardrailUnavailable,
+        InferenceError::GuardrailThrottled(1),
+    ]);
+    for kind in [
+        RefusalKind::InputBlocked,
+        RefusalKind::Unavailable,
+        RefusalKind::DetectorFailed,
+        RefusalKind::NotSupported,
+    ] {
+        all.push(InferenceError::Guardrail(Refusal {
+            kind,
+            rule_set_id: uuid::Uuid::nil(),
+            rule_id: uuid::Uuid::nil(),
+            category: Category::Secret,
+            detector: DetectorKind::Pattern,
+            scanned: true,
+        }));
+    }
     for scope in [LimitScope::Workspace, LimitScope::ApiKey] {
         all.extend([
             InferenceError::BudgetExceeded(scope),
@@ -84,7 +107,10 @@ pub(super) const fn guard(error: InferenceError) -> usize {
         InferenceError::InvalidUpstream => 19,
         InferenceError::Storage => 20,
         InferenceError::ScopeBusy => 21,
-        InferenceError::RouteDrained(_) => 22,
+        InferenceError::Guardrail(_) => 22,
+        InferenceError::GuardrailUnavailable => 23,
+        InferenceError::GuardrailThrottled(_) => 24,
+        InferenceError::RouteDrained(_) => 25,
     }
 }
 const _: fn(InferenceError) -> usize = guard;
@@ -280,7 +306,8 @@ pub(super) fn components() -> Result<Value> {
                 json!({"$ref":"#/components/schemas/OpenAiErrorCode"}),
                 json!({"type":"null"}),
             );
-            schema["description"] = json!("OpenAI-shaped inference error. Never the management ErrorEnvelope: error.code is a gateway machine code, not the HTTP status, and there is no error.reason.");
+            schema["description"] = json!("OpenAI-shaped inference error. Never the management ErrorEnvelope: error.code is a gateway machine code, not the HTTP status, and there is no error.reason. A guardrail refusal (guardrail_* codes) adds error.guardrail.");
+            schema["properties"]["error"]["properties"]["guardrail"] = json!({"$ref":"#/components/schemas/GuardrailRefusal"});
             schema
         },
     );
@@ -311,7 +338,13 @@ pub(super) fn components() -> Result<Value> {
     schemas.insert("AnthropicErrorEnvelope".into(), json!({"type":"object","required":["type","error"],"additionalProperties":false,
         "description":"Anthropic-shaped /v1/messages error (protocols/messages.rs). It carries NO gateway machine code: unsupported_capability, budget_exceeded and the rest cannot be told apart except by their message.",
         "properties":{"type":{"const":"error"},"error":{"type":"object","required":["type","message"],"additionalProperties":false,
-            "properties":{"type":{"$ref":"#/components/schemas/AnthropicErrorType"},"message":{"type":"string"}}}}}));
+            "properties":{"type":{"$ref":"#/components/schemas/AnthropicErrorType"},"message":{"type":"string"},"guardrail":{"$ref":"#/components/schemas/GuardrailRefusal"}}}}}));
+    schemas.insert("GuardrailRefusal".into(), json!({"type":"object","additionalProperties":false,
+        "required":["policy_id","rule_id","stage","category","detector"],
+        "description":"The guardrail rule a request was refused by (#840): the rule set (policy) and rule ids, the stage, the category family and the detector; never matched text. Present exactly on guardrail refusals (on the Anthropic shape, the only way to tell them apart).",
+        "properties":{"policy_id":{"type":"string","format":"uuid"},"rule_id":{"type":"string","format":"uuid"},"stage":{"const":"input"},
+            "category":{"enum":["secret","personal_data","moderation","prompt_injection","custom"]},
+            "detector":{"enum":["pattern","systemone","llm_judge","external"]}}}));
 
     let headers = json!({
         "RequestId":{"description":"The gateway's request ID (UUIDv7), also the attempt ID of a root request.","required":true,"schema":{"type":"string","format":"uuid"}},

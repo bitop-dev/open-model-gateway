@@ -1,18 +1,97 @@
-//! Custom patterns: compiled with fixed limits, so an administrator's pattern
-//! cannot exhaust memory or time. A pattern is compiled at save; whatever later
-//! compiles stored patterns uses `compile` too, so it holds the same limits. The `regex` crate matches in time linear in the input (no
-//! backtracking), and these limits bound what a compiled pattern may hold.
+//! Custom patterns: compiled with fixed limits, so a pattern cannot exhaust
+//! memory or time. A pattern is compiled at save; whatever later compiles
+//! stored patterns uses `compile` too, so it holds the same limits. The
+//! `regex` crate matches in time linear in the input (no backtracking); these
+//! limits bound what a compiled pattern may hold, and so the work per byte.
 use regex::{Regex, RegexBuilder};
 
-/// The compiled program of one pattern (the crate's default is 10 MiB).
-pub const COMPILED_LIMIT: usize = 1 << 20;
-/// The lazy DFA cache of one pattern (the crate's default is 2 MiB).
-pub const DFA_LIMIT: usize = 1 << 20;
+/// Who wrote a pattern, which sets its program limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Limit {
+    /// A platform layer (Platform Admins): up to 1 MiB, so Unicode classes
+    /// (`\w`, `\d`, `\b`) fit.
+    Platform,
+    /// A local layer, which any user writes for a personal workspace: up to
+    /// 64 KiB, which also bounds the work per scanned byte when a pattern
+    /// defeats the lazy DFA (ASCII classes such as `[0-9]` or `(?-u:\w)` stay
+    /// small).
+    Local,
+}
+impl Limit {
+    /// The compiled program of one pattern (the crate's default is 10 MiB).
+    pub fn program(self) -> usize {
+        match self {
+            Self::Platform => 1 << 20,
+            Self::Local => 64 << 10,
+        }
+    }
+    /// The lazy DFA cache of one pattern, per scan using it at once (the
+    /// crate's default is 2 MiB). Smaller for local layers: any user writes
+    /// one, a cached local policy keeps up to 50 patterns, and the request's
+    /// budget already bounds the slower path a full cache falls back to.
+    pub fn dfa(self) -> usize {
+        match self {
+            Self::Platform => 1 << 20,
+            Self::Local => 128 << 10,
+        }
+    }
+    pub fn of(layer: super::policy::Layer) -> Self {
+        if layer == super::policy::Layer::WorkspaceLocal {
+            Self::Local
+        } else {
+            Self::Platform
+        }
+    }
+}
 /// How deeply a pattern may nest (the crate's default is 250).
 pub const NEST_LIMIT: u32 = 64;
 
-/// Compile one custom pattern within the limits.
+/// Pattern compiles per replica (at save, and when the engine compiles a
+/// workspace's policy), in separate slots for the platform layers (Platform
+/// Admins) and the local layers (every User owns one, on their personal
+/// workspace), so local writers never queue ahead of the platform.
+pub static PLATFORM_COMPILES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+pub static LOCAL_COMPILES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+/// Run `work` on the blocking pool while holding one of `slots`. The slot
+/// moves into the blocking task, so it is held until the work ends even when
+/// the caller is dropped (a client that disconnects never frees a slot while
+/// its compile still runs). `None` if the work could not run.
+pub async fn in_slot<T: Send + 'static>(
+    slots: &'static tokio::sync::Semaphore,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    in_slot_within(slots, None, work).await
+}
+
+/// As [`in_slot`], waiting at most `wait` for the slot (`None`: as long as
+/// it takes); the work itself always runs to its end.
+pub async fn in_slot_within<T: Send + 'static>(
+    slots: &'static tokio::sync::Semaphore,
+    wait: Option<std::time::Duration>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let slot = match wait {
+        Some(wait) => tokio::time::timeout(wait, slots.acquire()).await.ok()?,
+        None => slots.acquire().await,
+    }
+    .ok()?;
+    tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        work()
+    })
+    .await
+    .ok()
+}
+
+/// Compile one custom pattern within the limits of a local layer.
 pub fn compile(pattern: &str) -> Option<Regex> {
+    compile_within(pattern, Limit::Local)
+}
+
+/// Compile one custom pattern within `limit`. The byte limit is checked
+/// before anything parses the pattern, so parsing is bounded too.
+pub fn compile_within(pattern: &str, limit: Limit) -> Option<Regex> {
     // PostgreSQL text cannot hold NUL, so such a pattern is never storable.
     if pattern.is_empty()
         || pattern.len() > super::policy::MAX_PATTERN_BYTES
@@ -20,17 +99,33 @@ pub fn compile(pattern: &str) -> Option<Regex> {
     {
         return None;
     }
-    RegexBuilder::new(pattern)
-        .size_limit(COMPILED_LIMIT)
-        .dfa_size_limit(DFA_LIMIT)
+    let regex = RegexBuilder::new(pattern)
+        .size_limit(limit.program())
+        .dfa_size_limit(limit.dfa())
         .nest_limit(NEST_LIMIT)
         .build()
-        .ok()
+        .ok()?;
+    // A pattern that can match the empty string matches at every position:
+    // it finds nothing and costs a scan of every byte, so it is refused.
+    let empty = regex_syntax::ParserBuilder::new()
+        .nest_limit(NEST_LIMIT)
+        .build()
+        .parse(pattern)
+        .ok()?
+        .properties()
+        .minimum_len()
+        == Some(0);
+    (!empty).then_some(regex)
 }
 
-/// Whether a pattern compiles within the limits (the save-time check).
+/// Whether a pattern compiles within a local layer's limits.
 pub fn valid(pattern: &str) -> bool {
     compile(pattern).is_some()
+}
+
+/// Whether a pattern compiles within `limit` (the save-time check).
+pub fn valid_within(pattern: &str, limit: Limit) -> bool {
+    compile_within(pattern, limit).is_some()
 }
 
 #[cfg(test)]
@@ -77,6 +172,11 @@ mod tests {
         assert!(!valid("(unclosed"));
         assert!(!valid(&"a".repeat(513)));
         assert!(!valid("a\0b"), "NUL is not storable");
+        // Refused by length before anything parses it.
+        assert!(!valid(&"\\w".repeat(100_000)));
+        for empty in ["x?", "(?:)", "\\b", "a*", "(?m)^", "a|"] {
+            assert!(!valid(empty), "{empty} can match the empty string");
+        }
         // Small to write, enormous to compile: the size limit refuses it.
         assert!(!valid(r"\w{1000}\w{1000}"));
         assert!(
