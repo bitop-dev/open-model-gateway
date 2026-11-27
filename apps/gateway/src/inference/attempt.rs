@@ -105,10 +105,12 @@ impl Engine {
             )
             .await
         {
-            Ok(admission) => {
-                scope.unadmitted.admitted();
-                admission
-            }
+            Ok(admission) => admission,
+            // Refused as drained since the plan was read: nothing was
+            // admitted or sent, and the request goes on to its next route
+            // with the same telemetry. A probe slot it held is freed as
+            // `probe` drops.
+            Err(InferenceError::RouteDrained(ends)) => return AttemptEnd::Skipped(telemetry, ends),
             Err(error) => {
                 // The timeout and the admission's
                 // own error (e.g. a team-workspace rate or budget
@@ -118,15 +120,12 @@ impl Engine {
                 // function, telemetry must be finished explicitly here
                 // rather than left for Drop to mislabel `cancelled`.
                 // A probe slot it held is freed as `probe` drops.
-                if let InferenceError::RouteDrained(seconds) = error {
-                    // Nothing was admitted or sent: the request goes on to
-                    // its next route with the same telemetry.
-                    return AttemptEnd::Skipped(telemetry, seconds);
-                }
                 telemetry.finish(telemetry::Outcome::Error, Some(error));
                 return AttemptEnd::Return(Err(error));
             }
         };
+        // Only an admitted attempt gets here (every refusal returned above).
+        scope.unadmitted.admitted();
         // Logging-only correlation (#98): known only once a
         // shared-workspace admission has already committed for this
         // request; never for personal workspaces.
