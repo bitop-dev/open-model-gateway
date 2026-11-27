@@ -1,5 +1,6 @@
 import { ReportRunPage } from "./scheduled-reports";
 import { LegalHolds } from "./legal-holds";
+import { AdminGuardrails } from "./guardrails";
 import { AuditExportSettingsPage } from "./settings/audit-export";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -124,6 +125,7 @@ export function DashboardContent({ session, search, workspace, navigate, workspa
     case "oidc": return <OidcMappings session={session} />;
     case "platform-audit": return <AuditHistory />;
     case "legal-holds": return <LegalHolds session={session} />;
+    case "guardrails": return <AdminGuardrails session={session} tab={search.tab} onTabChange={changeTab} />;
     case "key-safety": return <KeySafetyPage session={session} />;
     case "admin-tokens": return <AdminTokensPage session={session} />;
     case "platform-model-compare": return <ModelComparePage scope={{ kind: "platform" }} ids={parseCompareIds(search.ids)} />;

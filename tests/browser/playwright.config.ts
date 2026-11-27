@@ -45,6 +45,7 @@ export default defineConfig({
     { name: "workspace-templates", testMatch: /workspace-templates\.spec\.ts/, dependencies: ["journey"] },
     { name: "access-reviews", testMatch: /access-reviews\.spec\.ts/, dependencies: ["journey"] },
     { name: "access-review-schedules", testMatch: /access-review-schedules\.spec\.ts/, dependencies: ["journey"] },
+    { name: "guardrails", testMatch: /guardrails\.spec\.ts/, dependencies: ["journey"] },
     { name: "accessibility", testMatch: /accessibility\.spec\.ts/, dependencies: ["journey"] },
   ],
 });

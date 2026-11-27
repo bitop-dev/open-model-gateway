@@ -18,7 +18,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { ListTree, MessagesSquare, RefreshCw } from "lucide-react";
 import { platformPath, wsPath, type Grant, type Model, type Workspace } from "../lib/api";
 import type { DashboardSearch, RangePreset } from "../lib/permissions";
-import { activeFilterCount, compactDateTime, countText, finishReasonLabel, finishReasonTone, finishReasons, jobStateTone, jobText, latencyText, logPaths, logTab, logsSearch, rangeLabels, rateText, requestFilters, requestQuery, requestStatuses, requestStatusLabel, requestStatusTone, requestTarget, servedModel, servedModelText, sessionTarget, tokensText, tpsText, ttftText, utcDate, validSessionId, workloadText, type GenerationPage, type GenerationRow, type LogMetrics, type LogTab, type LogsScope, type RequestFilters, type RequestPage, type RequestRow, type SessionPage, type SessionRow } from "../lib/requests";
+import { activeFilterCount, attemptFilters, guardrailActionLabels, guardrailFilterOptions, compactDateTime, countText, finishReasonLabel, finishReasonTone, finishReasons, jobStateTone, jobText, latencyText, logPaths, logTab, logsSearch, rangeLabels, rateText, requestFilters, requestQuery, requestStatuses, requestStatusLabel, requestStatusTone, requestTarget, servedModel, servedModelText, sessionTarget, tokensText, tpsText, ttftText, utcDate, validSessionId, workloadText, type GenerationPage, type GenerationRow, type LogMetrics, type LogTab, type LogsScope, type RequestFilters, type RequestPage, type RequestRow, type SessionPage, type SessionRow } from "../lib/requests";
 import { formatMicroUsd, formatUsd } from "../lib/governance";
 import { Money } from "../components/templates/money";
 import { NARROW_QUERY, useMediaQuery } from "../lib/bitop-utils";
@@ -94,7 +94,7 @@ const requestColumns = (scope: LogsScope, filters: RequestFilters, view: View): 
   { id: "speed", header: "Speed", label: "Speed (tokens per second)", numeric: true, cell: r => r.tokens_per_second ? tpsText(r.tokens_per_second) : <span className={s.secondary}>—</span> },
   { id: "finish", header: "Finish", label: "Finish reason", cell: r => <FinishBadge reason={r.finish_reason} /> },
   // Fallbacks show under the status (the Attempts column is optional), so the default row fits at 1440.
-  { id: "status", header: "Status", cell: r => <span className={rq.costCell} style={{ alignItems: "flex-start" }}><StatusBadge tone={requestStatusTone(r.status)} size="sm">{requestStatusLabel(r.status)}</StatusBadge>{r.attempts > 1 && <span className={s.secondary} title={`${r.attempts} attempts`}>{r.attempts - 1} fallback{r.attempts > 2 ? "s" : ""}</span>}</span> },
+  { id: "status", header: "Status", cell: r => <span className={rq.costCell} style={{ alignItems: "flex-start" }}><StatusBadge tone={requestStatusTone(r.status)} size="sm">{requestStatusLabel(r.status)}</StatusBadge>{r.attempts > 1 && <span className={s.secondary} title={`${r.attempts} attempts`}>{r.attempts - 1} fallback{r.attempts > 2 ? "s" : ""}</span>}{r.guardrail && r.status !== "blocked" && <span className={s.secondary}>Guardrails: {r.guardrail.actions.map(a => guardrailActionLabels[a] ?? a).join(", ")}</span>}</span> },
   { id: "attempts", header: "Attempts", numeric: true, defaultHidden: true, cell: r => r.attempts > 1 ? `${r.attempts} (${r.attempts - 1} fallback${r.attempts > 2 ? "s" : ""})` : countText(r.attempts) },
   { id: "cached", header: "Cached", label: "Cached input tokens", numeric: true, defaultHidden: true, cell: r => optionalCount(r.cached_input_tokens) },
   { id: "reasoning", header: "Reasoning", label: "Reasoning tokens", numeric: true, defaultHidden: true, cell: r => optionalCount(r.reasoning_tokens) },
@@ -295,7 +295,8 @@ export function LogsPage({ scope }: { scope: LogsScope }) {
   const search: DashboardSearch = nav?.search ?? (scope.kind === "platform" ? { page: "platform-logs" } : { page: "requests", ws: scope.workspace.id });
   const go = (patch: Partial<DashboardSearch>) => nav?.navigate({ ...search, ...patch });
   const tab = logTab(search.tab), platform = scope.kind === "platform";
-  const filters = requestFilters(platform ? search : { ...search, workspace_id: undefined });
+  // Generations and Sessions have no refused request (it has no attempt): they never take the guardrail filters.
+  const all = requestFilters(platform ? search : { ...search, workspace_id: undefined }), filters = tab === "requests" ? all : attemptFilters(all);
   const { query, error: filterError } = requestQuery(filters);
   // Filter options: the workspace's own models (a short list); on Admin, every model searched on the server (R06, #68).
   // The keys the caller can see (workspace only) and, on Admin, teams and projects are searched on the server
@@ -322,16 +323,17 @@ export function LogsPage({ scope }: { scope: LogsScope }) {
     platform ? { id: "model", label: "Model", type: "search", placeholder: "Any model", options: modelOptions, onSearch: platformModels.onSearch } : { id: "model", label: "Model", type: "select", placeholder: "Any model", options: modelOptions },
     ...(platform ? [{ id: "workspace_id", label: "Workspace", type: "search", placeholder: "Any team or project", options: workspaceOptions, onSearch: workspaces.onSearch } satisfies ToolbarFacet] : [{ id: "key_id", label: "Key", type: "search", placeholder: "Any key", options: keyOptions, onSearch: keys.onSearch } satisfies ToolbarFacet]),
     // A compact multi-select (five statuses as a segmented control took a row of its own).
-    { id: "status", label: "Status", type: "select", multiple: true, placeholder: "Any status", options: requestStatuses },
+    { id: "status", label: "Status", type: "select", multiple: true, placeholder: "Any status", options: tab === "requests" ? requestStatuses : requestStatuses.filter(o => o.value !== "blocked") },
+    ...(tab === "requests" ? [{ id: "guardrail", label: "Guardrails", type: "select", placeholder: "Any", options: guardrailFilterOptions } satisfies ToolbarFacet] : []),
     { id: "finish_reason", label: "Finish reason", type: "select", multiple: true, placeholder: "Any", options: finishReasons },
     { id: "streamed", label: "Streamed", type: "toggle", allLabel: "Any", options: [{ value: "true", label: "Streamed" }, { value: "false", label: "Not streamed" }] },
     { id: "workload", label: "Jobs", type: "toggle", allLabel: "All requests", options: [{ value: "jobs", label: "Video and batch jobs" }] },
   ];
   const list = (v?: string) => v ? v.split(",") : [];
-  const facetValues: FilterValues = { model: list(filters.model), key_id: list(filters.key_id), workspace_id: list(filters.workspace_id), status: list(filters.status), finish_reason: list(filters.finish_reason), streamed: list(filters.streamed), workload: list(filters.workload) };
+  const facetValues: FilterValues = { model: list(filters.model), key_id: list(filters.key_id), workspace_id: list(filters.workspace_id), status: list(filters.status), finish_reason: list(filters.finish_reason), streamed: list(filters.streamed), workload: list(filters.workload), guardrail: list(filters.guardrail) };
   const onFacets = (next: FilterValues) => {
     const one = (v: unknown) => Array.isArray(v) && typeof v[0] === "string" ? v[0] : undefined, several = (v: unknown) => Array.isArray(v) && v.length ? (v as string[]).join(",") : undefined;
-    go({ model: one(next.model), key_id: platform ? undefined : one(next.key_id), workspace_id: platform ? one(next.workspace_id) : undefined, status: several(next.status), finish_reason: several(next.finish_reason), streamed: one(next.streamed) as DashboardSearch["streamed"], workload: one(next.workload) === "jobs" ? "jobs" : undefined, cursor: undefined });
+    go({ model: one(next.model), key_id: platform ? undefined : one(next.key_id), workspace_id: platform ? one(next.workspace_id) : undefined, status: several(next.status), finish_reason: several(next.finish_reason), streamed: one(next.streamed) as DashboardSearch["streamed"], guardrail: tab === "requests" ? one(next.guardrail) as DashboardSearch["guardrail"] : search.guardrail, workload: one(next.workload) === "jobs" ? "jobs" : undefined, cursor: undefined });
   };
   const chips: ToolbarChip[] = filters.session_id ? [{ key: "session", label: "Session", text: filters.session_id, onRemove: () => go({ session_id: undefined, cursor: undefined }) }] : [];
   const periodActive = filters.range && filters.range !== "30d" ? 1 : 0;
@@ -358,7 +360,7 @@ export function LogsPage({ scope }: { scope: LogsScope }) {
         <FilterToolbar search={{ label: "Search by request ID (at least 4 characters)", placeholder: "Request ID", value: search.q ?? "", onChange: next => go({ q: next || undefined, cursor: undefined }) }}
           start={<PeriodControl filters={filters} onChange={patch => go({ ...patch, cursor: undefined })} />} extraActive={periodActive} extraChips={chips}
           moreStart={<SessionField value={filters.session_id} onChange={session_id => go({ session_id, cursor: undefined })} />} moreStartActive={filters.session_id ? 1 : 0}
-          facets={facets} values={facetValues} onChange={onFacets} more={["key_id", "workspace_id", "finish_reason", "streamed"]}
+          facets={facets} values={facetValues} onChange={onFacets} more={["key_id", "workspace_id", "finish_reason", "streamed", "guardrail"]}
           end={tools && <><IconButton icon={<RefreshCw aria-hidden />} label="Refresh" loading={refreshing} disabled={!!filterError} onClick={() => void refresh()} /><ColumnChooser columns={tools.columns} hidden={tools.view.hidden} onHiddenChange={hidden => go(logViewSearch({ ...tools.view, hidden }, tab, narrow, platform))} defaultHidden={defaults} /><DensityToggle value={tools.view.density} onChange={density => go(logViewSearch({ ...tools.view, density }, tab, narrow))} /></>} />
         {filterError && <InfoBanner tone="warning" title="Filters not applied">{filterError}</InfoBanner>}
         {tab === "requests" ? <RequestsTable {...props} /> : tab === "generations" ? <GenerationsTable {...props} /> : <SessionsTable {...props} />}

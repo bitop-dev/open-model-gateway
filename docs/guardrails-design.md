@@ -1,6 +1,6 @@
 # Guardrails design (issue #36)
 
-**Status:** phase 1 (#840) in progress. Implemented: the policy model of §5 (migration 0092) and input enforcement: the pattern detector, the engine step for generation and embeddings, the client errors of §6, `guardrail_events` (migration 0095), the two metrics and Logs. Response text is not inspected. The dashboard pages follow. Phases 2–7 are #841–#846. **Date:** 2026-10-13; implementation notes 2026-11-25 ([§14](#14-implementation-notes-phase-1)).
+**Status:** phase 1 (#840) complete: the policy model of §5 (migration 0092), input enforcement (the pattern detector, the engine step for generation and embeddings, the client errors of §6, `guardrail_events` in migration 0095, the metrics and Logs) and the dashboard pages of §5 ("Dashboard"; [dashboard](dashboard.md#guardrails-840)). Response text is not inspected. Phases 2–7 are #841–#846. **Date:** 2026-10-13; implementation notes 2026-11-25 ([§14](#14-implementation-notes-phase-1)).
 
 *User decision* marks the user's decisions of 2026-10-13. **Recommendation** marks proposals that still need review. Today the gateway never inspects prompt or response text.
 
@@ -251,6 +251,7 @@ Changes are audited as `guardrail_policy.updated`, with layer, rule IDs, actions
 - **Workspace › Guardrails:** effective rules with provenance, each with one sentence on what is inspected and where it goes ("New user messages are sent to `company/jev` (OpenRouter) for moderation."), plus "Streaming responses are held until checked" when block-before-sending is on.
 - **Admin › Guardrails:** type defaults and overrides.
 - **Logs:** a `guardrail=monitored|redacted|blocked` badge and filter; request detail lists findings and linked detector requests with cost.
+- **Phase 1** ships the Workspace and Admin pages above (pattern rules only; no streaming hold, no detector requests or costs yet) and the Logs badge, filter and decisions; a personal workspace's platform override is set through the API.
 - **Usage & costs:** a `purpose: client|guardrail` breakdown.
 
 ## 6. Client-visible behavior

@@ -34,6 +34,15 @@ Admin › **Access reviews** (`/admin/access-reviews`) lists one-off reviews wit
 
 Keys in a review's page under Admin are shown as Key safety's platform scope shows them: a member's key or a service account key with the start of its id, its workspace, expiry and last use, never the key's name or its holder. Keys are never assigned a reviewer: the workspace's owners and admins review them (the Reviewer column says **Owners and admins**), never their own. For a key, **No reviewer** means the workspace has no owner or admin at all; a key held by the workspace's only owner or admin is not marked, stays undecided, and is settled by closing the review.
 
+## Guardrails (#840)
+
+Guardrail rules check request text before it reaches a provider ([guardrails design](guardrails-design.md), [management API](management-api.md#guardrail-policies-840)). Every page says what this release checks: the input of generation and embeddings requests (also token counts and gateway-run batch lines), never response text.
+
+- **Workspace › Settings › Guardrails** (`/workspaces/{ws}/settings?tab=guardrails`): the rules in effect, each with who set it (workspace-type default, platform override or this workspace), its action on input, whether it is active (or why not) and one sentence on what it inspects and where the text goes (in this release, nowhere: patterns are checked inside the gateway). Members see a custom rule's pattern count, never its patterns. A Team or Project's owners and admins, and a personal workspace's owner, also edit **This workspace's rules**: add a secrets or custom-pattern rule (monitor or block), edit or remove one, or **Tighten** a platform rule (a stricter action only; never weaker).
+- **Admin › Settings › Guardrails** (`/admin/settings/guardrails`): the default of each workspace kind (Team, Project, Personal), edited by Platform Admins and read by Auditors, with whether text must stay inside the gateway; and **What runs**: each detector, where it sends text and whether this release provides it.
+- **Admin › Team/Project › Guardrails**: the platform override that replaces the type default for that workspace (**Override the default** starts it from the default's rules; **Reset to default** removes it), the workspace's own rules read-only, and this month's decision counts per outcome and category (counts the gateway recorded; no text). A personal workspace's override is set through the API (`PUT /platform/workspaces/{ws}/guardrails`); its own rules stay its owner's.
+- **Logs**: a request refused by guardrails has status **Refused by guardrails** (it has no attempt: nothing was sent or charged); other requests show their guardrail outcomes under the status. The Requests tab filters by **Guardrails** (any decision, refused, monitored, blocked, could not check, not readable) and by the refused status; Generations and Sessions have no refused request and drop those filters. A request's page lists its **Guardrail decisions**: outcome, category, the deciding layer and rule, and a count of distinct matched values. Matched text is never kept or shown.
+
 ## Canonical links
 
 Identifiers are UUIDs, not organization paths or public model aliases:
@@ -43,7 +52,7 @@ Identifiers are UUIDs, not organization paths or public model aliases:
 | Admin overview | `/admin` |
 | Shared directories/details | `/admin/teams[/{uuid}]`, `/admin/projects[/{uuid}]` |
 | Users/model/connection/catalog lists/details | `/admin/users`, `/admin/models`, `/admin/connections`, `/admin/catalogs`, optionally `/{uuid}`; routes are `/admin/routes/{uuid}` |
-| Settings ([settings](settings.md)) | `/admin/settings/general`, `/admin/settings/limits` (defaults & limits), `/admin/settings/privacy`, `/admin/settings/email`, `/admin/settings/sign-in` |
+| Settings ([settings](settings.md)) | `/admin/settings/general`, `/admin/settings/limits` (defaults & limits), `/admin/settings/privacy`, `/admin/settings/email`, `/admin/settings/sign-in`, `/admin/settings/guardrails` |
 | Platform controls | `/admin/cost-centers`, `/admin/costs`, `/admin/sso-groups`, `/admin/audit`, `/admin/pricing` |
 | Old URLs (rewritten in place) | `/admin/providers[/{uuid}]`, `/admin/policies`, `/admin/limits`, `/admin/settings`, `/admin/oidc`, `/admin/deployments/{uuid}` → the new paths; `/admin/deployments` and `/admin/routing` → `/admin/models` |
 | Workspace overview | `/workspaces/{uuid}` |
