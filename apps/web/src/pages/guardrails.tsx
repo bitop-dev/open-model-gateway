@@ -66,17 +66,23 @@ function DetectorsCard() {
   </Card>;
 }
 
+const staleTightenings = (g: WorkspaceGuardrails) => new Set(g.effective.filter(e => e.inactive_reason === "tightened_rule_missing").map(e => e.id));
+
 /** Workspace › Settings › Guardrails. */
 export function WorkspaceGuardrailsTab({ workspace }: { workspace: Workspace }) {
   const path = guardrailsPath(workspace.id), q = useApi<WorkspaceGuardrails>(path), ask = useAction();
   if (q.isPending) return <p role="status">Loading guardrails…</p>;
   if (q.isError) return <ErrorNotice error={q.error} retry={() => void q.refetch()} />;
-  const g = q.data;
+  const g = q.data, stale = staleTightenings(g);
   // A tightening whose platform rule is gone (an override was created or
   // removed) no longer applies, and the server refuses a layer that names it:
-  // every save leaves such entries out.
-  const stale = new Set(g.effective.filter(e => e.inactive_reason === "tightened_rule_missing").map(e => e.id));
-  const save = (rules: Record<string, unknown>[], signal: AbortSignal) => api(path, { method: "PUT", body: { rules: rules.filter(r => !stale.has(String(r.id))) }, signal });
+  // a save leaves such entries out. Which ones are gone is read again just
+  // before the save, so a page loaded before the platform layer changed never
+  // drops a tightening that applies again.
+  const save = async (rules: Record<string, unknown>[], signal: AbortSignal) => {
+    const gone = staleTightenings(await api<WorkspaceGuardrails>(path, { signal }));
+    return api(path, { method: "PUT", body: { rules: rules.filter(r => !gone.has(String(r.id))) }, signal });
+  };
   return <Stack gap={6}>
     <Alert tone="info" title="What is checked">{inspectedSentence(g.inspected_workloads)}{g.egress.local_only ? " Text never leaves the gateway to be checked." : ""}</Alert>
     <Card title="Rules in effect" titleAs="h2" description={g.platform.source === "workspace_override" ? "Set by a Platform Admin for this workspace, with this workspace's own rules." : `The ${kindLabels[g.kind].toLowerCase()} default, with this workspace's own rules.`} flush={g.effective.length > 0}>

@@ -145,6 +145,20 @@ describe("Workspace › Settings › Guardrails", () => {
     await user.click(screen.getByRole("button", { name: "Remove" }));
     await waitFor(() => expect(writes(fetch)).toEqual([["PUT", guardrailsPath(team.id), { rules: [] }]]));
   });
+  it("keeps a tightening that applies again since the page loaded", async () => {
+    const old = { id: "t-old", tightens: "r-secrets", input: { action: "block" as const } };
+    const dangling: EffectiveEntry = { id: "t-old", tightens: "r-secrets", rule_set_id: "set-l", revision: 2, source: "workspace_local", active: false, inactive_reason: "tightened_rule_missing", tightened_by: [] };
+    let loads = 0;
+    // Loaded under an override (the tightening is stale); the override is then reset, so it applies again.
+    const fetch = serve({ [guardrailsPath(team.id)]: init => init?.method === "PUT" ? view() : loads++ === 0
+      ? view({ local: { ...localSet, rules: [codes, old] }, effective: [effective(codes, "workspace_local", "set-l"), dangling] })
+      : view({ local: { ...localSet, rules: [codes, old] }, effective: [{ ...effective(secrets, "type_default", "set-p"), input: { action: "block" }, tightened_by: ["t-old"] }, effective(codes, "workspace_local", "set-l")] }) });
+    const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
+    expect(await screen.findByText("Tightens a removed platform rule")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Remove Code names" }));
+    await user.click(screen.getByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(writes(fetch)).toEqual([["PUT", guardrailsPath(team.id), { rules: [old] }]]));
+  });
   it("offers refusing on a failed check with Block only, and never sends less than is in effect", async () => {
     const fetch = serve({ [guardrailsPath(team.id)]: () => view() });
     const user = mount(<WorkspaceGuardrailsTab workspace={team} />);

@@ -51,8 +51,8 @@ export function EffectiveRules({ entries, caption, tighten }: { entries: Effecti
 /** A platform rule in effect that a local entry can still make stricter: a stricter action, or refusing when its check can't run. */
 const canTighten = (e: EffectiveEntry) => e.source !== "workspace_local" && e.active && (e.input?.action !== "block" || e.on_error !== "fail_closed");
 
-/** The server's `on_error` for a rule that names none. */
-const defaultOnError = (action: InputAction) => action === "block" ? "fail_closed" : "fail_open";
+/** The server's `on_error` for a rule that names none: block and redact rules, and output stop or hold, fail closed. */
+const defaultOnError = (rule: StoredRule) => rule.input.action === "block" || rule.input.action === "redact" || !["off", "monitor"].includes(rule.output?.mode ?? "off") ? "fail_closed" : "fail_open";
 
 const ruleFields = (rule?: StoredRule, actions: InputAction[] = ["monitor", "block"]): Field[] => [
   { name: "name", label: "Name", required: true, maxLength: 100, value: rule?.name ?? "" },
@@ -60,7 +60,7 @@ const ruleFields = (rule?: StoredRule, actions: InputAction[] = ["monitor", "blo
   { name: "patterns", label: "Patterns", type: "textarea", value: rule?.detector.patterns?.join("\n") ?? "", visibleWhen: v => v.protection === "custom", requiredWhen: v => v.protection === "custom", help: "Regular expressions, one per line: at most 50 per layer, 512 bytes each. Use ASCII classes like [0-9].", validate: (v, all) => all.protection !== "custom" ? undefined : v.split("\n").filter(p => p.trim()).length > 50 ? "Use at most 50 patterns." : undefined },
   { name: "action", label: "On input", type: "select", required: true, value: rule?.input.action ?? "monitor", options: actions.map(a => ({ value: a, label: `${actionLabels[a]}: ${actionHelp[a]}` })) },
   // A stored value that is its action's default shows as the default, so changing the action changes it too.
-  { name: "on_error", label: "If the check can't run", type: "select", value: rule?.on_error && rule.on_error !== defaultOnError(rule.input.action) ? rule.on_error : "", help: "When the gateway can't check a request (it's busy, or a pattern takes too long).", options: [{ value: "", label: "Default: refused for Block, goes on for Monitor" }, { value: "fail_closed", label: "Refuse the request" }, { value: "fail_open", label: "Let the request go on and record it" }] },
+  { name: "on_error", label: "If the check can't run", type: "select", value: rule?.on_error && rule.on_error !== defaultOnError(rule) ? rule.on_error : "", help: "When the gateway can't check a request (it's busy, or a pattern takes too long).", options: [{ value: "", label: "Default: refused for Block, goes on for Monitor" }, { value: "fail_closed", label: "Refuse the request" }, { value: "fail_open", label: "Let the request go on and record it" }] },
   { name: "workloads", label: "Requests", type: "checkboxes", required: true, value: JSON.stringify(rule?.workloads ?? ["generation", "embeddings"]), options: [{ value: "generation", label: "Generation (chat, responses, messages)" }, { value: "embeddings", label: "Embeddings" }] },
 ];
 
