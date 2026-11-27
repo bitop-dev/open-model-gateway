@@ -186,16 +186,25 @@ async fn one_key_holds_at_most_half_the_image_buffer(pool: PgPool) {
     let first = w.token.clone();
     let second = issue_key(&mut w.f).await;
     let count = |reason: &str| METRICS.image_input_refusal_count(reason);
-    let body = serde_json::to_vec(&chat_body(&png_url(2 * MIB + MIB / 4, "k"), false)).unwrap();
-    // A large body that has sent half of itself and waits: its share (3 MiB)
-    // stays taken while it is held.
+    let in_use = || METRICS.image_input_buffer().0.get();
+    // A large body that takes exactly 3 MiB of the buffer: two of them are
+    // the key's whole share (6 of 12 MiB).
+    let body = serde_json::to_vec(&chat_body(&png_url(2 * MIB + 128 * 1024, "k"), false)).unwrap();
+    assert!(body.len() > 2 * MIB && body.len() <= 3 * MIB, "{}", body.len());
+    // A large body that sends half of itself and waits. The server reads a
+    // body only once it holds its share, so the first read is the signal
+    // that the share is taken.
     let held = |path: &'static str, token: String| {
         let head = Bytes::copy_from_slice(&body[..body.len() / 2]);
+        let (read, admitted) = tokio::sync::oneshot::channel::<()>();
         let stalled = Body::from_stream(
-            futures_util::stream::once(async move { Ok::<_, std::convert::Infallible>(head) })
-                .chain(futures_util::stream::pending()),
+            futures_util::stream::once(async move {
+                let _ = read.send(());
+                Ok::<_, std::convert::Infallible>(head)
+            })
+            .chain(futures_util::stream::pending()),
         );
-        tokio::spawn(
+        let task = tokio::spawn(
             w.router.clone().oneshot(
                 Request::post(path)
                     .header(header::CONTENT_TYPE, "application/json")
@@ -205,11 +214,15 @@ async fn one_key_holds_at_most_half_the_image_buffer(pool: PgPool) {
                     .body(stalled)
                     .unwrap(),
             ),
-        )
+        );
+        (task, admitted)
     };
-    let generation = held("/v1/chat/completions", first.clone());
-    let counting = held("/v1/messages/count_tokens", first.clone());
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let before = in_use();
+    let (generation, generation_admitted) = held("/v1/chat/completions", first.clone());
+    generation_admitted.await.expect("the generation is admitted");
+    let (counting, counting_admitted) = held("/v1/messages/count_tokens", first.clone());
+    counting_admitted.await.expect("the count is admitted beside it");
+    assert_eq!(in_use() - before, 6 * MIB as i64, "both hold their share");
     // The first key holds 6 of 12 MiB: its share.
     let shares = count("key_share");
     let (status, retry, value, pulled) =
@@ -222,25 +235,21 @@ async fn one_key_holds_at_most_half_the_image_buffer(pool: PgPool) {
     assert_eq!(value["error"]["code"], "image_input_busy");
     assert_eq!(count("key_share"), shares + 1);
     // Another key's large body is admitted and served meanwhile.
-    let (status, _, value, _) = send(
-        &w,
-        "/v1/chat/completions",
-        Some(&second),
-        body.clone(),
-        true,
-    )
-    .await;
+    let (status, _, value, _) =
+        send(&w, "/v1/chat/completions", Some(&second), body.clone(), true).await;
     assert_eq!(status, StatusCode::OK, "{value}");
-    // The client goes away: its share comes back, and the first key may
-    // send again.
+    // The client goes away: once its request is dropped (the join below
+    // returns after the task's future is dropped), its share is back, and
+    // the first key may send again.
     generation.abort();
-    let _ = generation.await;
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(generation.await.unwrap_err().is_cancelled());
+    assert_eq!(in_use() - before, 3 * MIB as i64, "the dropped body's share is back");
     let (status, _, value, _) =
         send(&w, "/v1/chat/completions", Some(&first), body.clone(), true).await;
     assert_eq!(status, StatusCode::OK, "{value}");
     counting.abort();
-    let _ = counting.await;
+    assert!(counting.await.unwrap_err().is_cancelled());
+    assert_eq!(in_use(), before, "every share is back");
 }
 
 /// A body without a declared length is read only up to its route's cap:
