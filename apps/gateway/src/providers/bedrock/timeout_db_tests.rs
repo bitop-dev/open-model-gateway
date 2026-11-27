@@ -86,7 +86,7 @@ impl World {
             .engine
             .execute(self.f.principal, req, id)
             .await
-            .unwrap()
+            .expect("admission and the first frame finish before the engine deadline")
         else {
             panic!("expected stream")
         };
@@ -235,10 +235,18 @@ async fn active_http_read_stall_records_failure_and_retains_hold(pool: PgPool) {
         .await;
 }
 
-// An unpolled reader must not keep transport alive after either a shorter or
-// longer engine deadline. Upon resuming, timeout is health-neutral, with no usage.
-async fn deadline(pool: PgPool, duration: Duration) {
-    let mut w = world(pool, Script::Gated, duration).await;
+/// The engine deadline of the two tests below. It also bounds admission and
+/// the first frame, which take hundreds of milliseconds on a loaded host, so
+/// it leaves room for them; what the two tests vary is the transport's caps.
+const UNPOLLED_DEADLINE: Duration = Duration::from_secs(3);
+
+// An unpolled reader must not keep transport alive after the engine deadline,
+// whether the transport's own caps are longer than the deadline (only the
+// watchdog can end the stream) or shorter (the old fixed body lifetime, which
+// must not end a stream first). Upon resuming, timeout is health-neutral, with
+// no usage.
+async fn deadline(pool: PgPool, timeouts: transport::Timeouts) {
+    let mut w = world_with_timeouts(pool, Script::Gated, UNPOLLED_DEADLINE, timeouts).await;
     let id = Uuid::now_v7();
     let mut output = w.stream(id).await;
     first(&mut output).await;
@@ -252,11 +260,21 @@ async fn deadline(pool: PgPool, duration: Duration) {
 }
 #[dbtest::test]
 async fn engine_deadline_shorter_than_old_cap_is_neutral(pool: PgPool) {
-    deadline(pool, Duration::from_millis(350)).await;
+    let cap = UNPOLLED_DEADLINE * 3;
+    deadline(
+        pool,
+        transport::Timeouts {
+            read: cap,
+            total: cap,
+        },
+    )
+    .await;
 }
 #[dbtest::test]
 async fn engine_deadline_longer_than_old_cap_is_neutral(pool: PgPool) {
-    deadline(pool, Duration::from_millis(900)).await;
+    // The read and total caps (200 and 450 ms) end well before the deadline.
+    assert!(TOTAL < UNPOLLED_DEADLINE);
+    deadline(pool, timeouts()).await;
 }
 
 #[dbtest::test]
