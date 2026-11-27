@@ -132,6 +132,12 @@ pub(crate) const SEMANTIC_REFINEMENTS: &[(&str, &str, &str, &[&str])] = &[
         &["/upstream_model"],
     ),
     (
+        "PATCH",
+        "/api/v1/platform/deployments/{id}",
+        "video options are 1 to 32 distinct lengths of 1 to 3600 seconds and optionally 1 to 32 distinct WIDTHxHEIGHT sizes",
+        &["/video"],
+    ),
+    (
         "POST",
         "/api/v1/platform/model-setup",
         "the nested model and route carry the same value rules as their own operations",
@@ -451,7 +457,20 @@ pub(super) fn refined_pointers_exist(
             .iter()
             .position(|name| *name == field)
             .with_context(|| format!("refined pointer {pointer} is not a DTO field"))?;
-        if let Some(items) = positional {
+        // A field past the positional form's documented length is
+        // object-only by that schema (serde refuses it positionally), so it
+        // has no item to check; any other must have one.
+        let positional_len = arms
+            .iter()
+            .find_map(|arm| {
+                arm["prefixItems"]
+                    .is_array()
+                    .then(|| arm["maxItems"].as_u64())
+            })
+            .flatten();
+        if let Some(items) = positional
+            && positional_len.is_none_or(|max| index < max as usize)
+        {
             ensure!(
                 items.len() > index,
                 "refined pointer {pointer} has no positional item in the request schema"
@@ -922,6 +941,17 @@ fn management_openapi_refined_pointers_must_exist_in_the_request_schema() {
         refined_pointers_exist(&short, &["a", "b"], &["/b"]).unwrap_err()
     );
     assert!(text.contains("/b") && text.contains("positional"), "{text}");
+    // A field the positional form documents it does not carry (`maxItems`
+    // below its index) is object-only: nothing positional to check. A
+    // `maxItems` that does reach it still needs the item.
+    let object_only = json!({"oneOf":[
+        {"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}}},
+        {"type":"array","prefixItems":[{"type":"string"}],"maxItems":1}]});
+    refined_pointers_exist(&object_only, &["a", "b"], &["/b"]).unwrap();
+    let reaching = json!({"oneOf":[
+        {"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}}},
+        {"type":"array","prefixItems":[{"type":"string"}],"maxItems":2}]});
+    assert!(refined_pointers_exist(&reaching, &["a", "b"], &["/b"]).is_err());
 }
 
 #[derive(serde::Deserialize)]
