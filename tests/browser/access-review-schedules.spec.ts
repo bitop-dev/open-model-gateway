@@ -9,6 +9,16 @@ import { api, expectAccessible, expectNoCspViolations, expectNoHorizontalScroll,
  */
 test.afterEach(expectNoCspViolations);
 
+/*
+ * While a dialog is open the page behind it is inert, so a role query finds none of its rows: a
+ * row assertion made then passes without the change having happened. Each dialog step therefore
+ * waits for its own request's response (bounded by the test's timeout, not the shorter expect
+ * timeout: a management write can wait behind the installation lock), then for the dialog to
+ * close, and only then reads the table.
+ */
+const answered = (page: import("@playwright/test").Page, method: string, id: string) =>
+  page.waitForResponse(r => r.request().method() === method && new URL(r.url()).pathname === `/api/v1/platform/access-review-schedules/${id}`, { timeout: 0 });
+
 test("a schedule is created, paused, resumed, read by the auditor and deleted", async ({ browser }) => {
   const name = `Browser schedule ${Date.now().toString(36)}`;
   const operator = await signIn(browser, "operator");
@@ -45,11 +55,18 @@ test("a schedule is created, paused, resumed, read by the auditor and deleted", 
 
     await row.getByRole("button", { name: `Actions for ${name}` }).click();
     await page.getByRole("menuitem", { name: "Pause…" }).click();
+    const paused = answered(page, "PATCH", id);
     await page.getByRole("dialog").getByRole("button", { name: "Pause" }).click();
+    expect((await paused).status()).toBe(200);
+    await expect(page.getByRole("dialog")).toBeHidden();
     await expect(row.getByText("Paused", { exact: true })).toBeVisible();
     await row.getByRole("button", { name: `Actions for ${name}` }).click();
     await page.getByRole("menuitem", { name: "Resume…" }).click();
+    const resumed = answered(page, "PATCH", id);
     await page.getByRole("dialog").getByRole("button", { name: "Resume" }).click();
+    expect((await resumed).status()).toBe(200);
+    await expect(page.getByRole("dialog")).toBeHidden();
+    await expect(row).toHaveCount(1);
     await expect(row.getByText("Paused", { exact: true })).toHaveCount(0);
 
     const auditor = await signIn(browser, "auditor");
@@ -64,13 +81,18 @@ test("a schedule is created, paused, resumed, read by the auditor and deleted", 
     await page.getByRole("menuitem", { name: "Delete…" }).click();
     const confirm = page.getByRole("dialog");
     await expect(confirm).toContainText("Reviews it already started stay as they are.");
+    const deleted = answered(page, "DELETE", id);
     await confirm.getByRole("button", { name: "Delete schedule" }).click();
+    expect((await deleted).status()).toBe(200);
+    await expect(confirm).toBeHidden();
     await expect(row).toHaveCount(0);
     expect((await api(page, "GET", `/platform/access-review-schedules/${id}`)).status()).toBe(404);
     id = undefined;
   } finally {
+    // Only removes what a failed step left behind, and never replaces that step's error: a
+    // schedule the dialog already deleted answers 404, and that is the outcome wanted here.
     try {
-      if (id) expect((await api(page, "DELETE", `/platform/access-review-schedules/${id}`)).status()).toBe(200);
+      if (id) expect([200, 404]).toContain((await api(page, "DELETE", `/platform/access-review-schedules/${id}`)).status());
     } finally { await operator.context.close(); }
   }
 });
