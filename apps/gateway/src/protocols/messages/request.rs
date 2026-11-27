@@ -478,8 +478,8 @@ fn content_block(
             cache(block, options)?;
             push_text(&mut turn.content, string(&block["text"])?);
         }
-        // In any turn, as native Anthropic always took them; a translated
-        // route refuses an image outside a user turn or tool result
+        // In any turn: native Anthropic takes an image in every turn, and a
+        // translated route refuses one outside a user turn or tool result
         // (`providers::messages::validate`).
         Some("image") => push_image(&mut turn.content, image(block, options)?),
         Some("thinking") if role == Role::Assistant => {
@@ -709,10 +709,10 @@ impl Request {
         for wire in self.messages {
             wire_message(wire, &mut options, &mut messages)?;
         }
-        // Native image/thinking-only turns have no text representation, but
-        // still need a canonical envelope for capability/admission validation.
-        if messages.is_empty() && (options.image_count > 0 || !options.history_thinking.is_empty())
-        {
+        // Thinking-only turns have no text representation, but still need a
+        // canonical envelope for capability/admission validation. (An image
+        // is a part of its turn's canonical message.)
+        if messages.is_empty() && !options.history_thinking.is_empty() {
             messages.push(Message {
                 role: Role::User,
                 content: None,
@@ -764,14 +764,14 @@ pub struct CountRequest {
     output_config: Option<Value>,
 }
 impl CountRequest {
-    /// The canonical request a count is validated, routed and counted as.
-    /// A count has no output bound: the grammar runs with the largest
-    /// maximum (so `thinking.budget_tokens` needs only its own lower bound),
-    /// and the result has none, so no adapter sends one.
     /// See [`image_data_bytes`].
     pub(super) fn image_data_bytes(&self) -> usize {
         image_data_bytes(&self.messages)
     }
+    /// The canonical request a count is validated, routed and counted as.
+    /// A count has no output bound: the grammar runs with the largest
+    /// maximum (so `thinking.budget_tokens` needs only its own lower bound),
+    /// and the result has none, so no adapter sends one.
     pub(super) fn normalize(self) -> Result<ChatRequest> {
         let mut request = Request {
             model: self.model,

@@ -332,7 +332,11 @@ impl ScanState {
         let mut rejection = None;
         let coarse_ok = resolved.legacy
             || match &request {
-                BatchRequest::Chat(r) => resolved.adapter.supports_chat_request(r),
+                BatchRequest::Chat(r) => {
+                    resolved
+                        .adapter
+                        .route_takes(&resolved.deployment, endpoint.protocol(), r)
+                }
                 BatchRequest::Embeddings(r) => resolved
                     .adapter
                     .supports_embedding_target(&resolved.deployment, r),

@@ -169,8 +169,8 @@ pub struct MessagesOptions {
     pub cache_controls: Vec<serde_json::Value>,
     pub thinking: Option<serde_json::Value>,
     pub history_thinking: Vec<serde_json::Value>,
-    /// Images the request carries (native and canonical alike), so the
-    /// parser can bound their count before validating the next.
+    /// The canonical images parsed so far, so the parser can bound their
+    /// count before validating the next.
     pub image_count: usize,
     pub output_config: Option<serde_json::Value>,
     pub context_management: Option<serde_json::Value>,

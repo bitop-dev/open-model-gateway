@@ -1071,3 +1071,39 @@ fn image_blocks_become_canonical_images_and_the_native_envelope_holds_placeholde
         assert!(request(json!({"messages":messages})).is_err(), "{messages}");
     }
 }
+
+/// The native envelope's placeholders follow the order of the canonical
+/// images the body is spliced from, wherever the parser moves an image (a
+/// tool result's content becomes its own message): the spliced envelope is
+/// the wire's messages, each image back in its own place.
+#[test]
+fn the_spliced_native_envelope_is_the_wire_with_every_image_in_its_place() {
+    let png = |k: u8| {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .encode([0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', k, k, k])
+    };
+    let image = |k: u8| json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":png(k)}});
+    let text = |t: &str| json!({"type":"text","text":t});
+    let messages = json!([
+        {"role":"user","content":[text("start"), image(0)]},
+        {"role":"assistant","content":[text("drawn"), image(1),
+            {"type":"tool_use","id":"a","name":"shoot","input":{}},
+            {"type":"tool_use","id":"b","name":"shoot","input":{}}]},
+        {"role":"user","content":[
+            text("look"),
+            image(2),
+            {"type":"tool_result","tool_use_id":"a","content":[image(3)]},
+            image(4),
+            {"type":"tool_result","tool_use_id":"b","content":[text("second"), image(5)]},
+            text("and"),
+            image(6)]},
+        {"role":"assistant","content":[text("seen")]},
+        {"role":"user","content":[image(7), text("last")]}
+    ]);
+    let r = request(json!({ "messages": messages })).unwrap();
+    assert_eq!(crate::providers::image_body::images(&r).count(), 8);
+    let native = Value::Array(r.messages_options.as_ref().unwrap().native_messages.clone());
+    let spliced = crate::providers::image_body::json_body_base64(&native, &r).unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&spliced).unwrap(), messages);
+}

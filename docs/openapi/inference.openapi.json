@@ -10927,7 +10927,7 @@
             "code": null,
             "envelope": "AnthropicErrorEnvelope",
             "status": 400,
-            "trigger": "top_k on translated routes; a tool result's image on OpenAI-style and local routes (tool_result.content.image); thinking history without a representable translated conversation"
+            "trigger": "top_k on translated routes; an assistant turn's image on translated routes (messages.content.image); a tool result's image on OpenAI-style and local routes (tool_result.content.image); thinking history without a representable translated conversation"
           },
           {
             "code": null,
@@ -11352,7 +11352,7 @@
             "code": null,
             "envelope": "AnthropicErrorEnvelope",
             "status": 400,
-            "trigger": "a field the selected route refuses for generation (for example images on translated routes, structured output on local routes), hosted/server tools, remote image sources or denied beta prefixes"
+            "trigger": "a field the selected route refuses for generation (for example an assistant turn's image on translated routes, a tool result's image on OpenAI-style and local routes, structured output on local routes), an image on a route that would estimate (image: the estimate counts text only), hosted/server tools, remote image sources or denied beta prefixes"
           },
           {
             "code": null,

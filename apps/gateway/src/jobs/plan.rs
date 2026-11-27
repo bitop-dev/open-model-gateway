@@ -331,7 +331,7 @@ impl Jobs {
                 continue;
             }
             let verdict = match request {
-                BatchRequest::Chat(r) if adapter.supports_chat_request(r) => {
+                BatchRequest::Chat(r) if adapter.route_takes(deployment, protocol, r) => {
                     *verdicts.entry(deployment.provider.clone()).or_insert_with(|| {
                         match adapter.validate_chat_request(r) {
                             verdict @ (Ok(()) | Err(InferenceError::InvalidRequest | InferenceError::InvalidField(_) | InferenceError::Unsupported)) => verdict,

@@ -137,11 +137,31 @@ pub trait ProviderAdapter: Send + Sync {
         false
     }
     /// A Messages request reaches this provider as its own validated
-    /// envelope (native Messages). Its image blocks have always gone there
-    /// without the deployment's `image_input` opt-in, which governs the
-    /// images an adapter translates into its own wire.
+    /// envelope (native Messages). Its image blocks go there without the
+    /// deployment's `image_input` opt-in, which governs only the images an
+    /// adapter translates into its own wire (`ProviderAdapter::route_takes`).
     fn forwards_native_messages(&self) -> bool {
         false
+    }
+    /// Whether `deployment`'s coarse capability takes `request` on
+    /// `protocol`: the adapter takes the request, and a request with an
+    /// image goes only to a route whose operator allows image input (0094),
+    /// unless it is a Messages request to an adapter that forwards its native
+    /// envelope. The engine's route filter and every batch planning check
+    /// call this one method, so a batch line is never planned or priced on a
+    /// route the engine would skip at run time. Adapters do not override it:
+    /// their own refusals belong in `supports_chat_request` and
+    /// `validate_chat_request`.
+    fn route_takes(
+        &self,
+        deployment: &Deployment,
+        protocol: ApiProtocol,
+        request: &ChatRequest,
+    ) -> bool {
+        self.supports_chat_request(request)
+            && (deployment.image_input
+                || (protocol == ApiProtocol::Messages && self.forwards_native_messages())
+                || !request.has_images())
     }
     // Non-generation workloads (see `inference::workload`). Each is gated by
     // `supports_protocol` and defaults to an explicit `Unsupported`. Dropping

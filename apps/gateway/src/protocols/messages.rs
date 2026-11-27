@@ -434,7 +434,6 @@ fn render_messages(
         }
     }
 }
-/// Outer transport rejections must not become plain text/OpenAI errors.
 /// A large image body's refusal from `http::image_input_body` (413, 408,
 /// 503 with `Retry-After`, 400) in Anthropic's error shape: the same status
 /// and headers, Anthropic's error type for it.
@@ -492,6 +491,7 @@ fn beyond_images(
     crate::metrics::METRICS.image_input_refused("too_large");
     Some(http_error(StatusCode::PAYLOAD_TOO_LARGE))
 }
+/// Outer transport rejections must not become plain text/OpenAI errors.
 pub(crate) fn http_error(status: StatusCode) -> Response {
     let (kind, message) = if status == StatusCode::PAYLOAD_TOO_LARGE {
         ("request_too_large", "Request body too large")

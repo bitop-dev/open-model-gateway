@@ -221,11 +221,8 @@ impl Engine {
         let mut refused = Vec::new();
         let mut verdicts: std::collections::HashMap<String, Result<(), InferenceError>> =
             std::collections::HashMap::new();
-        // An image goes only to a route whose operator allows image input
-        // (0094), before the route plan, so failover never lands it elsewhere.
-        // A Messages request to an adapter that forwards its native envelope
-        // needs no opt-in, as native Messages images never have.
-        let images = request.has_images();
+        // The image gate (`ProviderAdapter::route_takes`) applies before the route
+        // plan, so failover never lands an image on a route without it.
         for deployment in deployments {
             if !deployment
                 .supported_protocols
@@ -237,11 +234,9 @@ impl Engine {
             let Some(adapter) = self.registry.get(&deployment.provider) else {
                 continue;
             };
-            let native = protocol == ApiProtocol::Messages && adapter.forwards_native_messages();
-            if images && !deployment.image_input && !native {
-                continue;
-            }
-            if !(adapter.supports_protocol(protocol) && adapter.supports_chat_request(request)) {
+            if !(adapter.supports_protocol(protocol)
+                && adapter.route_takes(&deployment, protocol, request))
+            {
                 continue;
             }
             let verdict = *verdicts
