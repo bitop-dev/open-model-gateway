@@ -890,7 +890,10 @@
           ],
           "minItems": 0,
           "maxItems": 2,
-          "items": false
+          "items": false,
+          "x-omg-object-only": [
+            "video"
+          ]
         }
       ],
       "description": "Closed serde object, or the existing positional struct array `[enabled, image_input]` (the video options are set only in the object form). Handler semantic validation is additional: at least one of `enabled`, `image_input` and `video` must be set; `enabled` changes the route's enablement (with its revision and history), `image_input` its image-input opt-in (#24), `video` its video options (#52)."
