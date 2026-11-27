@@ -42,6 +42,11 @@ export async function guardrailWrite<T>(write: () => Promise<T>, names: Record<s
  * one, so a page loaded before another admin's change never undoes it.
  */
 export const expectedOf = (set: RuleSet | null | undefined) => set ? { rule_set_id: set.id, revision: set.revision } : null;
+/** A write that refetches its page's layer when the server finds it changed, so the next try is built from what is stored. */
+export const refetchOnConflict = (refetch: () => unknown) => <T,>(write: Promise<T>): Promise<T> => write.catch((error: unknown) => {
+  if (error instanceof ApiError && error.reason === "guardrail_layer_changed") void refetch();
+  throw error;
+});
 
 const actionTone = (a?: InputAction) => a === "block" ? "danger" as const : a === "monitor" ? "info" as const : "neutral" as const;
 export function ActionBadge({ action }: { action?: InputAction }) { return <Badge size="sm" tone={actionTone(action)}>{actionLabels[action ?? "off"]}</Badge>; }

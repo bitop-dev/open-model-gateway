@@ -83169,7 +83169,7 @@
     },
     "/api/v1/platform/workspaces/{ws}/guardrails": {
       "delete": {
-        "description": "#840: remove the override, restoring the type default (audited with reset true). The request names the override it removes by rule_set_id and revision (both, or neither when there is none); another override stored now, or one when neither is given, is 409 guardrail_layer_changed.",
+        "description": "#840: remove the override, restoring the type default (audited with reset true). The request names the override it removes by rule_set_id and revision (both, or neither when there is none); another override stored now, one stored when neither is given, or none stored when one is named, is 409 guardrail_layer_changed.",
         "operationId": "delete_api_v1_platform_workspaces_by_ws_guardrails",
         "parameters": [
           {

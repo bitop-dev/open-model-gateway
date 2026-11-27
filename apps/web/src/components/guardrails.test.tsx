@@ -226,8 +226,11 @@ describe("Workspace › Settings › Guardrails", () => {
     const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
     await user.click(await screen.findByRole("button", { name: "Remove Code names" }));
     await user.click(screen.getByRole("button", { name: "Remove" }));
-    expect(await screen.findByText("This changed since you opened it. Reload and try again.")).toBeTruthy();
+    expect(await screen.findByText("This changed since you opened it. The page now shows the current rules: check them and try again.")).toBeTruthy();
     expect(writes(fetch)).toEqual([["PUT", guardrailsPath(team.id), { expected: { rule_set_id: "set-l", revision: 2 }, rules: [] }]]);
+    // The page reads the layer again, so the next try is built from what is stored.
+    const reads = () => fetch.mock.calls.filter(([path, init]) => path === guardrailsPath(team.id) && ((init as RequestInit | undefined)?.method ?? "GET") === "GET").length;
+    await waitFor(() => expect(reads()).toBeGreaterThanOrEqual(3));
   });
   it("shows an active rule that is off as Off, never Active", () => {
     const off: StoredRule = { ...secrets, input: { action: "off", redact_scope: "user_text" } };
@@ -303,7 +306,7 @@ describe("Admin › Guardrails: reach and fresh reads", () => {
     const user = mount(<WorkspaceGuardrailsAdmin id={team.id} writable />);
     await user.click(await screen.findByRole("button", { name: "Reset to default" }));
     await user.click(screen.getByRole("button", { name: "Reset" }));
-    expect(await screen.findByText("This changed since you opened it. Reload and try again.")).toBeTruthy();
+    expect(await screen.findByText("This changed since you opened it. The page now shows the current rules: check them and try again.")).toBeTruthy();
     expect(writes(fetch)).toEqual([["DELETE", `${platformGuardrailsPath(team.id)}?rule_set_id=set-o&revision=1`, null]]);
   });
   it("creates an override from the default as it is when the override is created", async () => {
@@ -316,6 +319,37 @@ describe("Admin › Guardrails: reach and fresh reads", () => {
     await waitFor(() => expect(writes(fetch)).toHaveLength(1));
     const strip = (r: StoredRule) => { const { id: _id, ...rest } = toInput(r); return rest; };
     expect(writes(fetch)[0]![2]).toEqual({ local_only: true, expected: null, rules: [strip(secrets), strip(later)] });
+  });
+});
+
+describe("Admin › Guardrails: every platform write names the layer as loaded", () => {
+  it("edits the type default and its local_only from the layer the page loaded", async () => {
+    const data: TypeDefault = { kind: "team", rule_set: platformSet, inspected_workloads: ["generation", "embeddings"] };
+    const fetch = serve({ [typeDefaultPath("team")]: () => data });
+    const user = mount(<AdminGuardrails session={admin} tab="team" onTabChange={() => {}} />);
+    await user.click(await screen.findByRole("button", { name: "Remove Secrets" }));
+    await user.click(screen.getByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(writes(fetch)).toHaveLength(1));
+    expect(writes(fetch)[0]).toEqual(["PUT", typeDefaultPath("team"), { local_only: false, expected: { rule_set_id: "set-p", revision: 3 }, rules: [] }]);
+    await user.click(await screen.findByRole("button", { name: /^Text stays inside/ }));
+    await user.click(screen.getByRole("switch"));
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(writes(fetch)).toHaveLength(2));
+    expect(writes(fetch)[1]).toEqual(["PUT", typeDefaultPath("team"), { local_only: true, expected: { rule_set_id: "set-p", revision: 3 }, rules: [toInput(secrets)] }]);
+  });
+  it("edits an override and its local_only from the override the page loaded", async () => {
+    const override = { ...platformSet, id: "set-o", layer: "workspace_override" as const, revision: 5 };
+    const fetch = serve({ [platformGuardrailsPath(team.id)]: () => platformView({ override, platform: { source: "workspace_override", rule_set: override } }) });
+    const user = mount(<WorkspaceGuardrailsAdmin id={team.id} writable />);
+    await user.click(await screen.findByRole("button", { name: "Remove Secrets" }));
+    await user.click(screen.getByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(writes(fetch)).toHaveLength(1));
+    expect(writes(fetch)[0]).toEqual(["PUT", platformGuardrailsPath(team.id), { local_only: false, expected: { rule_set_id: "set-o", revision: 5 }, rules: [] }]);
+    await user.click(await screen.findByRole("button", { name: /^Text stays inside/ }));
+    await user.click(screen.getByRole("switch"));
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(writes(fetch)).toHaveLength(2));
+    expect(writes(fetch)[1]).toEqual(["PUT", platformGuardrailsPath(team.id), { local_only: true, expected: { rule_set_id: "set-o", revision: 5 }, rules: [toInput(secrets)] }]);
   });
 });
 

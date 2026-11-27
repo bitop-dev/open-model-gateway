@@ -168,5 +168,5 @@ export const refusalMessages: Record<string, string> = {
   guardrail_egress_not_allowed: "This workspace's platform rules keep text inside the gateway, so this rule isn't allowed.",
   guardrail_detector_unavailable: "That option isn't available in this release.",
   guardrail_pattern_invalid: "A pattern doesn't compile within the limits. Check it and try again.",
-  guardrail_layer_changed: "This changed since you opened it. Reload and try again.",
+  guardrail_layer_changed: "This changed since you opened it. The page now shows the current rules: check them and try again.",
 };

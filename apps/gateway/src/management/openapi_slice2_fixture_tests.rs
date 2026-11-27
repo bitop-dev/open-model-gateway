@@ -4072,14 +4072,6 @@ async fn access_review_fixtures(c: &Client, admin: &Browser, f: &Fixture, pool: 
     }
 }
 
-/// #840: guardrail policy layers. Body vectors for the three PUTs first (each
-/// replaces its layer), then the states every response branch is seen in: type
-/// defaults and overrides with custom patterns, a local layer that tightens a
-/// platform rule and adds a pattern, tightening entries left inactive by an
-/// override and by a removed rule, the member view (pattern count only), an
-/// Auditor who also administers a Team (platform pattern text), personal
-/// workspaces with no rules and as platform staff see them (local hidden), an
-/// override reset, and the detectors.
 /// The `expected` of the guardrail layer at `path` (a PUT or reset target),
 /// from the database: its id and revision, or null when there is none.
 async fn guardrail_expected(pool: &PgPool, path: &str) -> Value {
@@ -4149,6 +4141,14 @@ async fn reset_query(pool: &PgPool, path: &str) -> String {
     }
 }
 
+/// #840: guardrail policy layers. Body vectors for the three PUTs first (each
+/// replaces its layer), then the states every response branch is seen in: type
+/// defaults and overrides with custom patterns, a local layer that tightens a
+/// platform rule and adds a pattern, tightening entries left inactive by an
+/// override and by a removed rule, the member view (pattern count only), an
+/// Auditor who also administers a Team (platform pattern text), personal
+/// workspaces with no rules and as platform staff see them (local hidden), an
+/// override reset, and the detectors.
 async fn guardrail_fixtures(
     c: &Client,
     admin: &Browser,

@@ -742,7 +742,10 @@ async fn a_write_built_from_an_older_layer_is_refused(pool: PgPool) {
     assert_eq!(status, StatusCode::OK, "{v}");
     let id = v["rule_set"]["id"].clone();
     assert_eq!(v["rule_set"]["revision"], 1);
-    for stale in [Value::Null, at(&id, 0), at(&json!(Uuid::new_v4()), 1)] {
+    // A revision is at least 1: zero is a malformed body, never a mismatch.
+    let (status, v) = write(TYPE_TEAM.into(), at(&id, 0)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+    for stale in [Value::Null, at(&json!(Uuid::new_v4()), 1)] {
         let (status, v) = write(TYPE_TEAM.into(), stale.clone()).await;
         assert_eq!(status, StatusCode::CONFLICT, "{stale}: {v}");
         assert_eq!(reason(&v), "guardrail_layer_changed");
@@ -774,6 +777,19 @@ async fn a_write_built_from_an_older_layer_is_refused(pool: PgPool) {
     assert_eq!(reason(&v), "guardrail_layer_changed");
     let (status, v) = reset(format!("?rule_set_id={}", first.as_str().unwrap())).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "id without revision: {v}");
+    let (status, _) = call(
+        &f.s,
+        &f.admin,
+        "DELETE",
+        &format!("{}?revision=0", platform_ws(Uuid::new_v4())),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the workspace is checked first"
+    );
     let (status, v) = reset(format!(
         "?rule_set_id={}&revision=1",
         first.as_str().unwrap()

@@ -555,9 +555,9 @@ async fn reset_platform_workspace_guardrails(
     Path(ws): Path<Uuid>,
     Query(q): Query<ResetQuery>,
 ) -> Result<Json<Value>> {
-    let expected = q.expected()?;
     let mut tx = platform_tx(&s, &u, true).await?;
     platform(&mut tx, ws).await?;
+    let expected = q.expected()?;
     let current = load(&mut tx, Scope::Override(ws)).await?;
     unchanged(Some(policy::Expected::matches(expected, current.as_ref())))?;
     if let Some(set) = current {
