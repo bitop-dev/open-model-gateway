@@ -222,22 +222,22 @@ impl Engine {
         let mut refused = Vec::new();
         let mut verdicts: std::collections::HashMap<String, Result<(), InferenceError>> =
             std::collections::HashMap::new();
-        // An image goes only to a route whose operator allows image input
-        // (0094), before the route plan, so failover never lands it elsewhere.
-        let images = request.has_images();
+        // The image gate (`ProviderAdapter::route_takes`) applies before the route
+        // plan, so failover never lands an image on a route without it.
         for deployment in deployments {
             if !deployment
                 .supported_protocols
                 .iter()
                 .any(|p| p == protocol.as_str())
-                || (images && !deployment.image_input)
             {
                 continue;
             }
             let Some(adapter) = self.registry.get(&deployment.provider) else {
                 continue;
             };
-            if !(adapter.supports_protocol(protocol) && adapter.supports_chat_request(request)) {
+            if !(adapter.supports_protocol(protocol)
+                && adapter.route_takes(&deployment, protocol, request))
+            {
                 continue;
             }
             let verdict = *verdicts

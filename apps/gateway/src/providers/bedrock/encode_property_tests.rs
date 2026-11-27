@@ -493,7 +493,6 @@ enum Fault {
     DuplicateCallId,
     BadCallId(String),
     BadCallArguments(String),
-    OptionImages,
     OptionTopK,
     OptionOutputFormat,
     OptionBadBeta(String),
@@ -533,7 +532,6 @@ fn fault() -> impl Strategy<Value = Fault> {
         Fault::LastIsAssistant,
         Fault::Oversize,
         Fault::DuplicateCallId,
-        Fault::OptionImages,
         Fault::OptionTopK,
         Fault::OptionOutputFormat,
     ]);
@@ -760,10 +758,6 @@ fn inject(r: &mut ChatRequest, fault: &Fault) -> InferenceError {
             a.tool_calls = vec![call];
             r.messages.push(a);
             InvalidRequest
-        }
-        Fault::OptionImages => {
-            options(r).images = vec![json!({"type": "image"})];
-            InvalidField("image")
         }
         Fault::OptionTopK => {
             options(r).top_k = Some(5);

@@ -546,9 +546,6 @@ pub fn chat_inspection(request: &ChatRequest) -> Inspection<'_> {
         for stop in options.stop_sequences.iter().flatten() {
             input.push(stop, Part::System);
         }
-        if !options.images.is_empty() {
-            input.uninspectable = true;
-        }
     }
     input
 }

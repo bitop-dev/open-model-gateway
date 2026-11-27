@@ -577,7 +577,7 @@
       "scope": null,
       "operation": {
         "summary": "Generate with messages",
-        "description": "Real gateway text/function generation frontend. Admission checks live key, workspace, model and provider capabilities. Default root body cap is fixed 2097152 bytes: declared Content-Length above it is rejected before decoding; Messages uses Anthropic errors, other routes plain text. Unknown fields are 400 invalid_request_error. Usage counters are emitted only when known; Messages message_start input_tokens:0 is a compatibility placeholder, never accounting. Native-only fields and translated-route refusals are described below.",
+        "description": "Real gateway text/function generation frontend. Admission checks live key, workspace, model and provider capabilities. The body cap is 2097152 bytes. A body with inline images may exceed it only when it declares its Content-Length, is at most GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT (default 20971520 bytes), fits this replica's image input buffer (GATEWAY_IMAGE_INPUT_BUFFER_BYTES), keeps arriving (no pause of more than 10 s, at least 128 KiB/s on average from its start after a 128 KiB allowance, at most 180 s in all) and has at most 2097152 bytes outside its images' base64. Authentication and the length checks run before any body byte is read. Every refusal is an Anthropic-shaped JSON error: 413 request_too_large, 408 invalid_request_error, 503 overloaded_error with Retry-After. Unknown fields are 400 invalid_request_error. Usage counters are emitted only when known; Messages message_start input_tokens:0 is a compatibility placeholder, never accounting. Native-only fields and translated-route refusals are described below.",
         "responses": {
           "200": {
             "description": "JSON completion or ordered SSE. Errors after opening a stream are terminal error frames, never fabricated successful termination.",
@@ -725,8 +725,50 @@
               }
             }
           },
+          "405": {
+            "description": "Method not allowed",
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "cache-control": {
+                "$ref": "#/components/headers/NoStore"
+              },
+              "allow": {
+                "required": true,
+                "schema": {
+                  "const": "POST"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnthropicErrorEnvelope"
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "A body over 2 MiB stopped arriving: a pause of more than 10 s, under 128 KiB/s on average from its start (after a 128 KiB allowance; a pause counts against it), or more than 180 s in all (invalid_request_error). Its share of the image input buffer is back; nothing was admitted or sent.",
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "cache-control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnthropicErrorEnvelope"
+                }
+              }
+            }
+          },
           "413": {
-            "description": "Anthropic-shaped error without gateway machine code; status 413",
+            "description": "The body is too large (request_too_large), always as JSON: a declared Content-Length over GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT or over this replica's whole image input buffer (refused before any body byte is read), a body without a declared length that streams past 2 MiB, or a large body with more than 2 MiB outside its images' base64 (text, tool input or any other field cannot ride an image past the text limit).",
             "headers": {
               "x-request-id": {
                 "$ref": "#/components/headers/RequestId"
@@ -804,7 +846,7 @@
             }
           },
           "503": {
-            "description": "Anthropic-shaped error without gateway machine code; status 503",
+            "description": "Anthropic-shaped error without gateway machine code; status 503: storage or configuration unavailable, an unbounded price, every route cooling down (Retry-After); or, for a declared body over 2 MiB, this replica's image input buffer is full (overloaded_error, Retry-After: 1): nothing was read, admitted or sent.",
             "headers": {
               "x-request-id": {
                 "$ref": "#/components/headers/RequestId"
@@ -853,30 +895,6 @@
               },
               "cache-control": {
                 "$ref": "#/components/headers/NoStore"
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AnthropicErrorEnvelope"
-                }
-              }
-            }
-          },
-          "405": {
-            "description": "Method not allowed",
-            "headers": {
-              "x-request-id": {
-                "$ref": "#/components/headers/RequestId"
-              },
-              "cache-control": {
-                "$ref": "#/components/headers/NoStore"
-              },
-              "allow": {
-                "required": true,
-                "schema": {
-                  "const": "POST"
-                }
               }
             },
             "content": {
@@ -955,7 +973,7 @@
             "status": 400,
             "envelope": "AnthropicErrorEnvelope",
             "code": null,
-            "trigger": "image or top_k on translated routes; image/thinking history without a representable translated conversation"
+            "trigger": "top_k on translated routes; an assistant turn's image on translated routes (messages.content.image); a tool result's image on OpenAI-style and local routes (tool_result.content.image); thinking history without a representable translated conversation"
           },
           {
             "status": 501,
@@ -968,6 +986,24 @@
             "envelope": "AnthropicErrorEnvelope",
             "code": null,
             "trigger": "content_filter finish cannot be represented as a Messages terminal; streaming emits a final error without message_stop"
+          },
+          {
+            "status": 408,
+            "envelope": "AnthropicErrorEnvelope",
+            "code": null,
+            "trigger": "a body over 2 MiB paused more than 10 s, arrived under 128 KiB/s on average (after a 128 KiB allowance), or took more than 180 s"
+          },
+          {
+            "status": 413,
+            "envelope": "AnthropicErrorEnvelope",
+            "code": null,
+            "trigger": "declared length over the image input cap or the replica's buffer, an undeclared body past 2 MiB, or more than 2 MiB outside image data"
+          },
+          {
+            "status": 503,
+            "envelope": "AnthropicErrorEnvelope",
+            "code": null,
+            "trigger": "the replica's image input buffer is full for a declared body over 2 MiB; Retry-After: 1"
           }
         ],
         "x-omg-request-constraints": "generation-normalization",
@@ -975,7 +1011,7 @@
           "body_bytes": {
             "default": 2097152,
             "env": null,
-            "source": "Fixed root RequestBodyLimitLayer in apps/gateway/src/http.rs"
+            "source": "Text limit of the image input routes (inference/image_buffer.rs TEXT_BODY_BYTES): an undeclared body, and everything outside image data"
           },
           "output_buffer_bytes": {
             "default": 16777216,
@@ -986,7 +1022,32 @@
             "maximum": 20,
             "decoded_bytes_per_image": 5242880,
             "encoded_bytes_per_image": 6990508,
-            "scope": "All message and tool-result images combined; the aggregate HTTP body cap applies first."
+            "scope": "All message and tool-result images combined (protocols/image_input.rs MAX_IMAGES, MAX_DECODED_BYTES, the validator Chat and Responses images use)."
+          },
+          "image_input_body_bytes": {
+            "default": 20971520,
+            "env": "GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT",
+            "source": "inference/image_buffer.rs ImageInputLimits::body_bytes (2 MiB to MAX_BODY_BYTES, 141907772 bytes); a declared Content-Length only"
+          },
+          "image_input_buffer_bytes": {
+            "default": 50331648,
+            "env": "GATEWAY_IMAGE_INPUT_BUFFER_BYTES",
+            "source": "inference/image_buffer.rs DEFAULT_BUFFER_BYTES: in-flight large bodies per replica, each taking its declared length in whole MiB until its response ends"
+          },
+          "image_input_body_idle_seconds": {
+            "default": 10,
+            "env": null,
+            "source": "inference/image_buffer.rs BODY_IDLE"
+          },
+          "image_input_body_total_seconds": {
+            "default": 180,
+            "env": null,
+            "source": "inference/image_buffer.rs BODY_TOTAL"
+          },
+          "image_input_body_min_rate_bytes_per_second": {
+            "default": 131072,
+            "env": null,
+            "source": "inference/image_buffer.rs BODY_MIN_RATE: the slowest average from the start, after BODY_RATE_ALLOWANCE"
           }
         }
       }
@@ -997,7 +1058,7 @@
       "scope": null,
       "operation": {
         "summary": "Count message tokens",
-        "description": "Counts the input tokens of a Messages request (#72). Authorized like POST /v1/messages: the workspace and key come from the validated inference key, and the model must be one the key may use now and must serve the messages protocol. Anthropic routes ask Anthropic's counting endpoint with the connection's own credential; every other route returns the gateway estimate. The route is the first one routing would choose; a count never fails over and is not an attempt. Each gateway process bounds counts by key per minute, by provider connection credential per minute (provider-backed counts only) and by its own concurrency pool, separate from generation, of which one key may hold at most 2 counts at once (429 beyond any of them; a count refused for concurrency does not spend the key's minute). A count consults no budget or rate limit and does not consume the key's request-rate allowance. Default root body cap is fixed 2097152 bytes. Unknown fields are 400 invalid_request_error.",
+        "description": "Counts the input tokens of a Messages request (#72). Authorized like POST /v1/messages: the workspace and key come from the validated inference key, and the model must be one the key may use now and must serve the messages protocol. Anthropic routes ask Anthropic's counting endpoint with the connection's own credential; every other route returns the gateway estimate. The route is the first one routing would choose; a count never fails over and is not an attempt. Each gateway process bounds counts by key per minute, by provider connection credential per minute (provider-backed counts only) and by its own concurrency pool, separate from generation, of which one key may hold at most 2 counts at once (429 beyond any of them; a count refused for concurrency does not spend the key's minute). A count consults no budget or rate limit and does not consume the key's request-rate allowance. The body cap is 2097152 bytes. A body with inline images may exceed it only when it declares its Content-Length, is at most GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT (default 20971520 bytes), fits this replica's image input buffer (GATEWAY_IMAGE_INPUT_BUFFER_BYTES), keeps arriving (no pause of more than 10 s, at least 128 KiB/s on average from its start after a 128 KiB allowance, at most 180 s in all) and has at most 2097152 bytes outside its images' base64. Authentication and the length checks run before any body byte is read. Every refusal is an Anthropic-shaped JSON error: 413 request_too_large, 408 invalid_request_error, 503 overloaded_error with Retry-After. A count of a request with an image is the provider's (Anthropic routes); a route that would estimate refuses it with 400, because the estimate counts text only. Unknown fields are 400 invalid_request_error.",
         "requestBody": {
           "required": true,
           "content": {
@@ -1140,8 +1201,50 @@
               }
             }
           },
+          "405": {
+            "description": "Method not allowed",
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "cache-control": {
+                "$ref": "#/components/headers/NoStore"
+              },
+              "allow": {
+                "required": true,
+                "schema": {
+                  "const": "POST"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnthropicErrorEnvelope"
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "A body over 2 MiB stopped arriving: a pause of more than 10 s, under 128 KiB/s on average from its start (after a 128 KiB allowance; a pause counts against it), or more than 180 s in all (invalid_request_error). Its share of the image input buffer is back; nothing was admitted or sent.",
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "cache-control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnthropicErrorEnvelope"
+                }
+              }
+            }
+          },
           "413": {
-            "description": "Anthropic-shaped error without gateway machine code; status 413",
+            "description": "The body is too large (request_too_large), always as JSON: a declared Content-Length over GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT or over this replica's whole image input buffer (refused before any body byte is read), a body without a declared length that streams past 2 MiB, or a large body with more than 2 MiB outside its images' base64 (text, tool input or any other field cannot ride an image past the text limit).",
             "headers": {
               "x-request-id": {
                 "$ref": "#/components/headers/RequestId"
@@ -1219,7 +1322,7 @@
             }
           },
           "503": {
-            "description": "Anthropic-shaped error without gateway machine code; status 503",
+            "description": "Anthropic-shaped error without gateway machine code; status 503: storage or configuration unavailable, an unbounded price, every route cooling down (Retry-After); or, for a declared body over 2 MiB, this replica's image input buffer is full (overloaded_error, Retry-After: 1): nothing was read, admitted or sent.",
             "headers": {
               "x-request-id": {
                 "$ref": "#/components/headers/RequestId"
@@ -1259,30 +1362,6 @@
                 }
               }
             }
-          },
-          "405": {
-            "description": "Method not allowed",
-            "headers": {
-              "x-request-id": {
-                "$ref": "#/components/headers/RequestId"
-              },
-              "cache-control": {
-                "$ref": "#/components/headers/NoStore"
-              },
-              "allow": {
-                "required": true,
-                "schema": {
-                  "const": "POST"
-                }
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AnthropicErrorEnvelope"
-                }
-              }
-            }
           }
         },
         "x-omg-refusals": [
@@ -1296,7 +1375,7 @@
             "status": 400,
             "envelope": "AnthropicErrorEnvelope",
             "code": null,
-            "trigger": "a field the selected route refuses for generation (for example images on translated routes, structured output on local routes), hosted/server tools, remote image sources or denied beta prefixes"
+            "trigger": "a field the selected route refuses for generation (for example an assistant turn's image on translated routes, a tool result's image on OpenAI-style and local routes, structured output on local routes), an image on a route that would estimate (image: the estimate counts text only), hosted/server tools, remote image sources or denied beta prefixes"
           },
           {
             "status": 404,
@@ -1315,6 +1394,24 @@
             "envelope": "AnthropicErrorEnvelope",
             "code": null,
             "trigger": "the model is available to the key but no enabled deployment serves the messages protocol, or none supports the requested capability"
+          },
+          {
+            "status": 408,
+            "envelope": "AnthropicErrorEnvelope",
+            "code": null,
+            "trigger": "a body over 2 MiB paused more than 10 s, arrived under 128 KiB/s on average (after a 128 KiB allowance), or took more than 180 s"
+          },
+          {
+            "status": 413,
+            "envelope": "AnthropicErrorEnvelope",
+            "code": null,
+            "trigger": "declared length over the image input cap or the replica's buffer, an undeclared body past 2 MiB, or more than 2 MiB outside image data"
+          },
+          {
+            "status": 503,
+            "envelope": "AnthropicErrorEnvelope",
+            "code": null,
+            "trigger": "the replica's image input buffer is full for a declared body over 2 MiB; Retry-After: 1"
           }
         ],
         "x-omg-request-constraints": "generation-normalization",
@@ -1322,7 +1419,7 @@
           "body_bytes": {
             "default": 2097152,
             "env": null,
-            "source": "Fixed root RequestBodyLimitLayer in apps/gateway/src/http.rs"
+            "source": "Text limit of the image input routes (inference/image_buffer.rs TEXT_BODY_BYTES): an undeclared body, and everything outside image data"
           },
           "counts_per_key_per_minute": {
             "default": 60,
@@ -1343,6 +1440,31 @@
             "default": 2,
             "env": null,
             "source": "Fixed COUNTS_IN_FLIGHT_PER_KEY in inference/count.rs: counts one key may have running at once, per gateway process"
+          },
+          "image_input_body_bytes": {
+            "default": 20971520,
+            "env": "GATEWAY_MAX_BODY_BYTES_IMAGE_INPUT",
+            "source": "inference/image_buffer.rs ImageInputLimits::body_bytes (2 MiB to MAX_BODY_BYTES, 141907772 bytes); a declared Content-Length only"
+          },
+          "image_input_buffer_bytes": {
+            "default": 50331648,
+            "env": "GATEWAY_IMAGE_INPUT_BUFFER_BYTES",
+            "source": "inference/image_buffer.rs DEFAULT_BUFFER_BYTES: in-flight large bodies per replica, each taking its declared length in whole MiB until its response ends"
+          },
+          "image_input_body_idle_seconds": {
+            "default": 10,
+            "env": null,
+            "source": "inference/image_buffer.rs BODY_IDLE"
+          },
+          "image_input_body_total_seconds": {
+            "default": 180,
+            "env": null,
+            "source": "inference/image_buffer.rs BODY_TOTAL"
+          },
+          "image_input_body_min_rate_bytes_per_second": {
+            "default": 131072,
+            "env": null,
+            "source": "inference/image_buffer.rs BODY_MIN_RATE: the slowest average from the start, after BODY_RATE_ALLOWANCE"
           }
         }
       }

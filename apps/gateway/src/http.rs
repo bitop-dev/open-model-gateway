@@ -119,8 +119,6 @@ fn build_router(
 fn inference_routes(store: &Store) -> Router<Store> {
     Router::new()
         .route("/v1/models", get(models))
-        .route("/v1/messages", post(messages::handle))
-        .route("/v1/messages/count_tokens", post(messages::count_tokens))
         .route("/v1/embeddings", post(embeddings::handle))
         // Explicitly unsupported realtime companions (never minted upstream).
         .route(
@@ -135,7 +133,8 @@ fn inference_routes(store: &Store) -> Router<Store> {
         ))
 }
 
-/// Chat Completions and Responses, whose inline images may take a body past
+/// Chat Completions, Responses and Messages (generation and counting), whose
+/// inline images may take a body past
 /// the shared 2 MiB limit within the replica's image input budget
 /// (`inference::image_buffer`). Authentication, then the client labels, run
 /// before the budget is consulted and before any body byte is read.
@@ -148,6 +147,8 @@ fn image_input_routes(store: &Store, engine: &Engine) -> Router<Store> {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions::handle))
         .route("/v1/responses", post(responses::handle))
+        .route("/v1/messages", post(messages::handle))
+        .route("/v1/messages/count_tokens", post(messages::count_tokens))
         .layer(DefaultBodyLimit::max(limits.body_bytes))
         .route_layer(middleware::from_fn_with_state(buffer, image_input_body))
         .route_layer(middleware::from_fn(client_labels))
@@ -170,6 +171,15 @@ async fn image_input_body(
 ) -> Response {
     use crate::inference::image_buffer::{Admission, LargeBody, TEXT_BODY_BYTES};
     use crate::metrics::METRICS;
+    // The Messages routes answer in Anthropic's error shape.
+    let anthropic = anthropic_path(request.uri().path());
+    let shaped = |response: Response| {
+        if anthropic {
+            crate::protocols::messages::large_body_refusal(response)
+        } else {
+            response
+        }
+    };
     let length = request
         .headers()
         .get(header::CONTENT_LENGTH)
@@ -183,16 +193,16 @@ async fn image_input_body(
         }
         Admission::TooLarge => {
             METRICS.image_input_refused("too_large");
-            crate::protocols::image_input_too_large()
+            shaped(crate::protocols::image_input_too_large())
         }
         Admission::Busy => {
             METRICS.image_input_refused("busy");
-            crate::protocols::image_input_busy()
+            shaped(crate::protocols::image_input_busy())
         }
         // Refused as the handler's JSON extractor would refuse it, before a
         // body that could never be parsed is read and holds its share.
         Admission::Large(_) if !json_content_type(&parts.headers) => {
-            crate::protocols::invalid_request()
+            shaped(crate::protocols::invalid_request())
         }
         Admission::Large(permit) => {
             parts.extensions.insert(LargeBody(permit.length));
@@ -220,12 +230,17 @@ async fn image_input_body(
                         StatusCode::PAYLOAD_TOO_LARGE => METRICS.image_input_refused("too_large"),
                         _ => {}
                     }
-                    return response;
+                    return shaped(response);
                 }
             };
-            if image_body_scan::outside_images(&bytes) > TEXT_BODY_BYTES {
+            let outside = if anthropic {
+                image_body_scan::outside_messages_images(&bytes)
+            } else {
+                image_body_scan::outside_images(&bytes)
+            };
+            if outside > TEXT_BODY_BYTES {
                 METRICS.image_input_refused("too_large");
-                return crate::protocols::payload_too_large();
+                return shaped(crate::protocols::payload_too_large());
             }
             let body = axum::body::Body::from(bytes);
             next.run(Request::from_parts(parts, body))
@@ -702,7 +717,10 @@ mod tests {
     #[tokio::test]
     async fn messages_outer_rejections_keep_anthropic_shapes_with_beta_query() {
         // main authenticates before method dispatch. A credential-free GET
-        // must retain its 401, including when a query is present.
+        // must retain its 401, including when a query is present. A body over
+        // 2 MiB is judged after authentication, as on every image input
+        // route (no length check before the key), so without one it is 401;
+        // with a key, a body past the image input cap is Anthropic's 413.
         for (uri, method, bytes, status, kind) in [
             ("/v1/messages", "GET", 0, 401, "authentication_error"),
             (
@@ -716,8 +734,8 @@ mod tests {
                 "/v1/messages?beta=true",
                 "POST",
                 2 * 1024 * 1024 + 1,
-                413,
-                "request_too_large",
+                401,
+                "authentication_error",
             ),
         ] {
             let response = app()

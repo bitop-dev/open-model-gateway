@@ -124,6 +124,7 @@ pub async fn count_tokens(
     Extension(principal): Extension<Principal>,
     Extension(request_id): Extension<RequestId>,
     headers: HeaderMap,
+    large: Option<Extension<crate::inference::image_buffer::LargeBody>>,
     input: std::result::Result<Json<CountRequest>, JsonRejection>,
 ) -> Response {
     let (betas, _version) = match protocol_headers(&headers) {
@@ -134,10 +135,18 @@ pub async fn count_tokens(
         Ok(v) => v,
         Err(response) => return *response,
     };
+    // A large body's bytes beyond its image sources are refused before the
+    // request is normalized (its copies), then checked exactly after it.
+    if let Some(refused) = beyond_image_sources(large.as_ref(), wire.image_data_bytes()) {
+        return refused;
+    }
     let mut request = match wire.normalize() {
         Ok(v) => v,
         Err(e) => return error_response(e),
     };
+    if let Some(refused) = beyond_images(large, &request) {
+        return refused;
+    }
     if let Some(options) = &mut request.messages_options {
         options.beta_headers = betas;
     }
@@ -158,6 +167,7 @@ pub async fn handle(
     Extension(principal): Extension<Principal>,
     Extension(request_id): Extension<RequestId>,
     headers: HeaderMap,
+    large: Option<Extension<crate::inference::image_buffer::LargeBody>>,
     input: std::result::Result<Json<Request>, JsonRejection>,
 ) -> Response {
     let (betas, version) = match protocol_headers(&headers) {
@@ -182,10 +192,18 @@ pub async fn handle(
     }
     let labels = crate::inference::client::current()
         .with_body_session([wire.metadata.as_ref().and_then(|m| m.user_id.as_deref())]);
+    // A large body's bytes beyond its image sources are refused before the
+    // request is normalized (its copies), then checked exactly after it.
+    if let Some(refused) = beyond_image_sources(large.as_ref(), wire.image_data_bytes()) {
+        return refused;
+    }
     let mut request = match wire.normalize() {
         Ok(v) => v,
         Err(e) => return error_response(e),
     };
+    if let Some(refused) = beyond_images(large, &request) {
+        return refused;
+    }
     if let Some(options) = &mut request.messages_options {
         options.beta_headers = betas;
     }
@@ -415,6 +433,63 @@ fn render_messages(
                 .into_response()
         }
     }
+}
+/// A large image body's refusal from `http::image_input_body` (413, 408,
+/// 503 with `Retry-After`, 400) in Anthropic's error shape: the same status
+/// and headers, Anthropic's error type for it.
+pub(crate) fn large_body_refusal(response: Response) -> Response {
+    let status = response.status();
+    let (kind, message) = match status {
+        StatusCode::PAYLOAD_TOO_LARGE => ("request_too_large", "Request body too large"),
+        StatusCode::SERVICE_UNAVAILABLE => (
+            "overloaded_error",
+            "The gateway is buffering as many large image requests as it can; nothing was read or sent. Retry after the indicated delay",
+        ),
+        StatusCode::REQUEST_TIMEOUT => (
+            "invalid_request_error",
+            "The request body did not arrive in time",
+        ),
+        _ => ("invalid_request_error", "Invalid request"),
+    };
+    let mut shaped = (
+        status,
+        Json(json!({"type":"error","error":{"type":kind,"message":message}})),
+    )
+        .into_response();
+    if let Some(retry) = response.headers().get(axum::http::header::RETRY_AFTER) {
+        shaped
+            .headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, retry.clone());
+    }
+    shaped
+}
+/// A large body whose bytes outside its image sources' base64 already
+/// exceed the text limit, refused before it is normalized.
+fn beyond_image_sources(
+    large: Option<&Extension<crate::inference::image_buffer::LargeBody>>,
+    sources: usize,
+) -> Option<Response> {
+    let Extension(large) = large?;
+    if large.0.saturating_sub(sources) <= crate::inference::image_buffer::TEXT_BODY_BYTES {
+        return None;
+    }
+    crate::metrics::METRICS.image_input_refused("too_large");
+    Some(http_error(StatusCode::PAYLOAD_TOO_LARGE))
+}
+/// A large body may hold at most the text limit outside its validated
+/// images (`LargeBody::allows`): a long base64 string anywhere else (a text
+/// block, a tool input, a non-image `data` field) is refused, never admitted
+/// as large text.
+fn beyond_images(
+    large: Option<Extension<crate::inference::image_buffer::LargeBody>>,
+    request: &crate::inference::types::ChatRequest,
+) -> Option<Response> {
+    let Extension(large) = large?;
+    if large.allows(request) {
+        return None;
+    }
+    crate::metrics::METRICS.image_input_refused("too_large");
+    Some(http_error(StatusCode::PAYLOAD_TOO_LARGE))
 }
 /// Outer transport rejections must not become plain text/OpenAI errors.
 pub(crate) fn http_error(status: StatusCode) -> Response {

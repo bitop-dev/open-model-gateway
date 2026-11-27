@@ -328,9 +328,10 @@ pub(super) fn encode_native_line(
     request: &BatchRequest,
 ) -> Result<Vec<u8>> {
     let body = match (request, endpoint.is_generation()) {
-        // Batch lines refuse images when parsed; a line is serialized without
-        // `image_body`'s splice, so an image here could only leave a
-        // placeholder in the file. Refused, never written.
+        // Chat and Responses batch lines refuse images when parsed, and a
+        // Messages line with images is not encoded for this native batch; a
+        // line is serialized without `image_body`'s splice, so an image here
+        // could only leave a placeholder in the file. Refused, never written.
         (BatchRequest::Chat(r), true) if r.has_images() => {
             return Err(InferenceError::InvalidField("image"));
         }

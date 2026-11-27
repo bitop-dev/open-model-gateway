@@ -6,10 +6,12 @@
 //! ordinary strings) must fit the text limit, or parsing it could build a
 //! tree many times its size. [`outside_images`] walks the JSON string
 //! literals with no allocation and sets aside the raw length of at most
-//! [`MAX_IMAGES`] of the longest literals that are whole image URLs as
-//! `image_input::Images::take` accepts them (a PNG, JPEG, WebP or GIF
-//! `data:` prefix, then only base64 characters, at most its length bound);
-//! whatever is left is what parsing may turn into structure. Capping the
+//! [`MAX_IMAGES`] of the longest literals that are an image's data: a whole
+//! image URL as `image_input::Images::take` accepts it (a PNG, JPEG, WebP or
+//! GIF `data:` prefix, then only base64 characters, at most its length
+//! bound), or a Messages image source's `data` (the value of a `data` key
+//! that is only padded base64, within the same bound); whatever is left is
+//! what parsing may turn into structure. Capping the
 //! set-aside at the image limit means many small image strings cannot lift
 //! the bound, and holding it to the image grammar means what is set aside is
 //! printable ASCII: a parser that echoes one in an error (an image URL in a
@@ -29,21 +31,52 @@ use crate::{
 };
 
 /// The body's length less the raw lengths of at most [`MAX_IMAGES`] of its
-/// longest string literals that are image URLs.
+/// longest string literals that are image URLs (Chat Completions, Responses).
 pub(super) fn outside_images(body: &[u8]) -> usize {
+    scan(body, false)
+}
+
+/// [`outside_images`] for a Messages body, whose image data is also the
+/// padded base64 value of a `data` key (an image source's).
+pub(super) fn outside_messages_images(body: &[u8]) -> usize {
+    scan(body, true)
+}
+
+fn scan(body: &[u8], data_values: bool) -> usize {
     let mut longest = [0usize; MAX_IMAGES];
     let mut at = 0;
+    // Where the string value of the last `data` key opens, if it is one.
+    let mut data_value = None;
     while let Some(open) = body[at..].iter().position(|&b| b == b'"') {
         let start = at + open + 1;
         let end = string_end(body, start);
         let literal = &body[start..end];
         // An image is always a value; a key is structure, which parsers copy
         // more often than a value (the error path keeps each key on it).
-        let key = body[(end + 1).min(body.len())..]
+        let after = (end + 1).min(body.len());
+        let colon = body[after..]
             .iter()
-            .find(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
-            == Some(&b':');
-        if !key && is_image_url(literal) {
+            .position(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+            .map(|i| after + i)
+            .filter(|&i| body[i] == b':');
+        if let Some(colon) = colon {
+            // A key: remember where its value opens when that value is a
+            // string, so only that literal is read as the key's value.
+            data_value = (data_values && literal == b"data")
+                .then(|| {
+                    body[colon + 1..]
+                        .iter()
+                        .position(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+                        .map(|i| colon + 1 + i)
+                        .filter(|&i| body[i] == b'"')
+                        .map(|i| i + 1)
+                })
+                .flatten();
+            at = after;
+            continue;
+        }
+        let source_data = data_value.take() == Some(start) && is_base64(literal);
+        if source_data || is_image_url(literal) {
             // Keep the longest: replace the shortest held so far.
             let (shortest, held) = longest
                 .iter_mut()
@@ -133,19 +166,31 @@ fn is_image_url(literal: &[u8]) -> bool {
     {
         return false;
     }
+    base64_length(chars).is_some()
+}
+
+/// Whether a raw literal decodes to padded base64 alone, one to
+/// [`MAX_BASE64_BYTES`] characters (a Messages image source's `data`).
+fn is_base64(literal: &[u8]) -> bool {
+    base64_length(decoded(literal)).is_some_and(|n| n % 4 == 0)
+}
+
+/// The count of decoded characters when all are base64, at most
+/// [`MAX_BASE64_BYTES`] and at least one.
+fn base64_length(chars: impl Iterator<Item = Option<u8>>) -> Option<usize> {
     let mut data = 0usize;
     for c in chars {
         match c {
             Some(b) if b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=') => {
                 data += 1;
                 if data > MAX_BASE64_BYTES {
-                    return false;
+                    return None;
                 }
             }
-            _ => return false,
+            _ => return None,
         }
     }
-    data > 0
+    (data > 0).then_some(data)
 }
 
 /// Four hex digits, exactly as JSON writes them (no sign).
@@ -292,5 +337,39 @@ mod tests {
         assert_eq!(outside_images(&body), TEXT_BODY_BYTES);
         body.push(b' ');
         assert_eq!(outside_images(&body), TEXT_BODY_BYTES + 1);
+    }
+
+    #[test]
+    fn a_data_value_is_image_data_only_in_a_messages_body() {
+        let base64 = "A".repeat(4096);
+        // A Messages source: its `data` is set aside, whatever whitespace
+        // stands around the colon.
+        for body in [
+            format!(r#"{{"source":{{"type":"base64","data":"{base64}"}}}}"#),
+            format!("{{\"data\" :\n \"{base64}\"}}"),
+        ] {
+            assert_eq!(
+                outside_messages_images(body.as_bytes()),
+                body.len() - base64.len(),
+                "{body}"
+            );
+            // On Chat and Responses a `data` key is no image (a tool
+            // schema's, an audio part's): it counts in full.
+            assert_eq!(outside_images(body.as_bytes()), body.len(), "{body}");
+        }
+        // Only the key's own string value: not a nested one, not a value
+        // spelled "data", not base64 that is unpadded or not base64.
+        for body in [
+            format!(r#"{{"data":{{"x":"{base64}"}}}}"#),
+            format!(r#"{{"k":"data","v":"{base64}"}}"#),
+            format!(r#"{{"data":"{}"}}"#, "A".repeat(4097)),
+            format!(r#"{{"data":"{base64}!"}}"#),
+        ] {
+            assert_eq!(
+                outside_messages_images(body.as_bytes()),
+                body.len(),
+                "{body}"
+            );
+        }
     }
 }

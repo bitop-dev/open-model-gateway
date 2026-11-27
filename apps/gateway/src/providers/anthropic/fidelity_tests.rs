@@ -145,10 +145,14 @@ fn image_types_count_and_data_limits_are_enforced_before_dispatch() {
         let block = json!({"type":"image","source":{"type":"base64","media_type":media,"data":base64::engine::general_purpose::STANDARD.encode(bytes)}});
         let body = |blocks| json!({"model":"m","max_tokens":32,"messages":[{"role":"user","content":blocks}]});
         let r = native(body(vec![block.clone()]));
-        assert_eq!(
-            encode("private", &r).unwrap()["messages"][0]["content"][0],
-            block
-        );
+        // The native envelope holds a placeholder; the body sent holds the
+        // image's base64, spliced in from the canonical image.
+        let sent: Value = serde_json::from_slice(
+            &super::super::image_body::json_body_base64(&encode("private", &r).unwrap(), &r)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sent["messages"][0]["content"][0], block);
         assert!(crate::protocols::messages::batch_request(body(vec![block; 21])).is_err());
     }
 }

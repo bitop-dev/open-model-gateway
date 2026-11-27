@@ -93,8 +93,26 @@ pub(crate) fn validate(request: &ChatRequest, class: ProviderClass) -> Result<()
         return Ok(());
     };
     let refuse = |field| Err(InferenceError::InvalidField(field));
-    if class != ProviderClass::Anthropic && !options.images.is_empty() {
-        return refuse("image");
+    let images_in = |role: crate::inference::types::Role| {
+        request.messages.iter().any(|m| {
+            m.role == role
+                && m.content
+                    .as_ref()
+                    .is_some_and(|c| c.images().next().is_some())
+        })
+    };
+    // An assistant turn's image goes only to Anthropic, in its own
+    // envelope; no translated wire carries one.
+    if class != ProviderClass::Anthropic && images_in(crate::inference::types::Role::Assistant) {
+        return refuse("messages.content.image");
+    }
+    // A tool result's images: Anthropic and Bedrock carry them in the tool
+    // result; an OpenAI-style or local tool message is text only, so they
+    // are refused rather than dropped.
+    if matches!(class, ProviderClass::OpenAi | ProviderClass::Local)
+        && images_in(crate::inference::types::Role::Tool)
+    {
+        return refuse("tool_result.content.image");
     }
     // Anthropic forwards structured output and strict tools; OpenAI-style and
     // Bedrock adapters map them to their own JSON-schema controls. Local

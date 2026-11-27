@@ -372,7 +372,8 @@ fn oversized(path: &str, key: &str, streamed: bool) -> Request<Body> {
         .method("POST")
         .uri(path)
         .header("authorization", format!("Bearer {key}"))
-        .header("content-type", "application/json");
+        .header("content-type", "application/json")
+        .header("anthropic-version", "2023-06-01");
     if streamed {
         let chunks: Vec<Result<Bytes, std::io::Error>> =
             (0..3).map(|_| Ok(chunk.clone())).collect();
@@ -390,6 +391,7 @@ fn declared(path: &str, key: &str, size: usize) -> Request<Body> {
         .uri(path)
         .header("authorization", format!("Bearer {key}"))
         .header("content-type", "application/json")
+        .header("anthropic-version", "2023-06-01")
         .header("content-length", size)
         .body(Body::from(vec![b'x'; size]))
         .unwrap()
@@ -732,11 +734,7 @@ impl ProviderAdapter for GenerationAdapter {
         _target: &Deployment,
         request: &ChatRequest,
     ) -> Result<Option<u64>, InferenceError> {
-        let native = request
-            .messages_options
-            .as_ref()
-            .is_some_and(|o| !o.images.is_empty());
-        Ok((native || request.has_images()).then_some(1))
+        Ok(request.has_images().then_some(1))
     }
     async fn execute(
         &self,
@@ -1387,7 +1385,12 @@ fn png_data_url(decoded: usize) -> String {
 }
 /// A user message with an image and `text`, then the adapter's mode text.
 fn generation_image_body(path: &str, url: &str, text: &str) -> Value {
-    if path == "/v1/chat/completions" {
+    if path == "/v1/messages" {
+        let (head, data) = url.split_once(',').unwrap();
+        let media = head.trim_start_matches("data:").trim_end_matches(";base64");
+        json!({"model":"company/smart","max_tokens":32,"messages":[
+            {"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":media,"data":data}},{"type":"text","text":text}]}]})
+    } else if path == "/v1/chat/completions" {
         json!({"model":"company/smart","messages":[
             {"role":"user","content":[{"type":"image_url","image_url":{"url":url}},{"type":"text","text":text}]},
             {"role":"user","content":"text"}]})
@@ -1404,6 +1407,7 @@ fn with_length(path: &str, key: &str, body: Body, length: usize) -> Request<Body
         .uri(path)
         .header("authorization", format!("Bearer {key}"))
         .header("content-type", "application/json")
+        .header("anthropic-version", "2023-06-01")
         .header("content-length", length)
         .body(body)
         .unwrap()
@@ -1431,10 +1435,31 @@ async fn inference_openapi_generation_image_input_transport(pool: PgPool) {
     .await;
     let key = keys.personal_key.token;
     let large_url = png_data_url(2 * MIB + MIB / 4);
+    // The OpenAI-shaped code, or for Messages the Anthropic error type that
+    // stands for it (Anthropic's shape carries no gateway code).
     let code = |captured: &crate::management::openapi::responses::Captured| {
-        serde_json::from_slice::<Value>(&captured.bytes).unwrap()["error"]["code"].clone()
+        let error = serde_json::from_slice::<Value>(&captured.bytes).unwrap()["error"].clone();
+        if captured.template.as_deref() != Some("/v1/messages") {
+            return error["code"].clone();
+        }
+        let openai = match error["type"].as_str() {
+            Some("request_too_large") => "payload_too_large",
+            Some("overloaded_error") => "image_input_busy",
+            Some("invalid_request_error") if captured.status == StatusCode::REQUEST_TIMEOUT => {
+                "request_timeout"
+            }
+            Some("invalid_request_error") if captured.status == StatusCode::NOT_IMPLEMENTED => {
+                "unsupported_capability"
+            }
+            other => return json!(other),
+        };
+        json!(openai)
     };
-    for path in super::generation::IMAGE_INPUT_PATHS {
+    // Generation and its count share the routes; the journey is generation.
+    for path in super::generation::IMAGE_INPUT_PATHS
+        .iter()
+        .filter(|p| **p != "/v1/messages/count_tokens")
+    {
         let path: &str = path;
         let send = async |request: Request<Body>| {
             capture("POST", path, app.clone().oneshot(request).await.unwrap()).await
@@ -1548,7 +1573,7 @@ async fn inference_openapi_generation_image_input_transport(pool: PgPool) {
             .fetch_one(&pool)
             .await
             .unwrap(),
-        4,
+        6,
         "only the admitted large image bodies execute"
     );
 }

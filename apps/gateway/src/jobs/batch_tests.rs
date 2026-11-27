@@ -35,6 +35,11 @@ struct Script {
     /// adapter that does not forward them (`forwards_cache_controls` is
     /// false whatever its id).
     drops_cache_controls: bool,
+    /// The fake declares image input (`Capabilities::image_input`).
+    image_input: bool,
+    /// When true, the `anthropic` fake translates Messages requests instead
+    /// of forwarding their native envelope (`forwards_native_messages`).
+    translates_messages: bool,
     /// #238 multi-route tests: when true, `validate_chat_request` never
     /// refuses - this provider accepts a body another provider's `Fake`
     /// (left at the default, `false`) would refuse, so a model with routes
@@ -222,11 +227,12 @@ impl ProviderAdapter for Fake {
         self.id
     }
     fn capabilities(&self) -> Capabilities {
+        let script = self.script.lock().unwrap();
         Capabilities {
-            image_input: false,
+            image_input: script.image_input,
             text_chat: true,
             streaming: false,
-            tools: self.script.lock().unwrap().accept_tools,
+            tools: script.accept_tools,
         }
     }
     fn supports_protocol(&self, p: ApiProtocol) -> bool {
@@ -386,6 +392,10 @@ impl ProviderAdapter for Fake {
     /// adapter does, unless the script makes it drop the hints.
     fn forwards_cache_controls(&self) -> bool {
         self.id == "anthropic" && !self.script.lock().unwrap().drops_cache_controls
+    }
+    /// As the real Anthropic adapter, unless the script makes it translate.
+    fn forwards_native_messages(&self) -> bool {
+        self.id == "anthropic" && !self.script.lock().unwrap().translates_messages
     }
     fn encode_native_line(
         &self,
@@ -3461,6 +3471,7 @@ mod envelope;
 mod fence;
 mod guardrails;
 mod http_support;
+mod images;
 mod poller;
 mod poller_concurrency;
 mod poller_http;
