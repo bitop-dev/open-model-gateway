@@ -244,7 +244,7 @@ impl Engine {
     /// [`HEALTH_WRITE_BOUND`]: the request (a stream: its end) then finishes
     /// only after the observation committed, so the test reads the event
     /// itself rather than racing the advisory bound on a loaded host.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "integration-tests"))]
     pub(crate) fn with_health_write_bound(mut self, bound: Duration) -> Self {
         self.health_write_bound = bound;
         self
