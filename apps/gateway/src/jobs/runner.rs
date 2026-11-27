@@ -64,6 +64,8 @@ use crate::{
 mod dispatch;
 mod lanes;
 mod line;
+#[cfg(test)]
+pub(crate) use line::tests_stop;
 mod renewal;
 mod repository;
 mod segments;

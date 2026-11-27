@@ -296,6 +296,7 @@ impl LineRun {
                         {
                             Retry::Started(next) => {
                                 attempt += 1;
+                                workers.ran = Some((execution, e));
                                 execution = next;
                                 // The dispatch's probe slot was the first
                                 // attempt's; a retry claims its own.
@@ -342,22 +343,28 @@ impl LineRun {
         })
     }
 
-    /// A line its batch stopped while it waited to be inspected again: it
-    /// never ran (nothing was admitted or sent), so it is reported like the
-    /// lines the stop left unrun, never as a guardrail refusal.
+    /// A line its batch stopped while it waited to be inspected again,
+    /// never as a guardrail refusal: one that never ran is reported like the
+    /// lines the stop left unrun; one whose earlier attempt ran is reported
+    /// with that attempt's error, like a line whose retry the stop kept from
+    /// starting.
     async fn not_run(
         &self,
         n: i32,
         execution: Uuid,
         custom_id: &str,
-        stop: NotRun,
+        stopped: Stopped,
         records: &mpsc::Sender<Record>,
     ) {
-        if self
-            .finished_error(n, execution, None, Some(stop.code()))
-            .await
-        {
-            let value = lines::not_run_line(custom_id, stop);
+        let (status, code, value) = match stopped {
+            Stopped::NeverRan(stop) => (None, stop.code(), lines::not_run_line(custom_id, stop)),
+            Stopped::AfterAttempt(ran, error) => (
+                Some(crate::protocols::batch_line_error(false, error).0),
+                error.code(),
+                lines::failure_line(custom_id, Some(ran), self.endpoint, error),
+            ),
+        };
+        if self.finished_error(n, execution, status, Some(code)).await {
             self.emit_error(records, n, execution, value).await;
         }
     }
@@ -401,9 +408,19 @@ impl LineRun {
             Some(Rescan::Spent) => (&mut workers.spent, SPENT_TRIES),
             None => return false,
         };
-        // A batch that stopped meanwhile reports the line as not run.
+        #[cfg(test)]
+        if tests_stop::now(self.job.id) {
+            self.state.cancel.store(true, Ordering::SeqCst);
+        }
+        // A recorded try (the last one a spent budget gets) ends the line
+        // with its guardrail error, whatever happens to the batch: Logs and
+        // the line's result agree.
+        if *tries >= limit && rescan_cause(e) == Some(Rescan::Spent) {
+            return false;
+        }
+        // A batch that stopped meanwhile ends the line (see `Stopped`).
         if let Some(stop) = self.state.stop_reason(&self.job) {
-            workers.stopped = Some(NotRun::from(stop));
+            workers.stopped = Some(workers.stopped_by(stop));
             return true;
         }
         if *tries >= limit {
@@ -423,14 +440,20 @@ impl LineRun {
         // A batch stopped during the wait, or while the line waited for its
         // worker, runs nothing more (cancelled, expired, its budget spent,
         // lost): the line is reported as not run.
-        workers.stopped = self.state.stop_reason(&self.job).map(NotRun::from);
+        workers.stopped = self
+            .state
+            .stop_reason(&self.job)
+            .map(|s| workers.stopped_by(s));
         if workers.stopped.is_none() {
             // The pools are never closed; were one, the line would fail with
             // its guardrail error, as before the wait.
             if !workers.reacquire().await {
                 return false;
             }
-            workers.stopped = self.state.stop_reason(&self.job).map(NotRun::from);
+            workers.stopped = self
+                .state
+                .stop_reason(&self.job)
+                .map(|s| workers.stopped_by(s));
         }
         if workers.stopped.is_some() {
             return true;
@@ -694,12 +717,24 @@ fn rescan_cause(e: InferenceError) -> Option<Rescan> {
     }
 }
 
+/// How a line its batch stopped while it waited to be inspected again ends.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Stopped {
+    /// No attempt of it ran: reported like the lines the stop left unrun.
+    NeverRan(NotRun),
+    /// An earlier attempt ran (and failed with this error): reported with it.
+    AfterAttempt(Uuid, InferenceError),
+}
+
 /// A line's per-batch and process worker permits (the process permit given
 /// back while the line waits to be inspected again), and how often it waited
 /// for each cause.
 pub(super) struct Workers {
     /// Set when the line's batch stopped while it waited.
-    stopped: Option<NotRun>,
+    stopped: Option<Stopped>,
+    /// The line's latest attempt that ran, and how it failed (its retry is
+    /// the current attempt).
+    ran: Option<(Uuid, InferenceError)>,
     busy: u32,
     spent: u32,
     _batch: tokio::sync::OwnedSemaphorePermit,
@@ -715,11 +750,19 @@ impl Workers {
     ) -> Self {
         Self {
             stopped: None,
+            ran: None,
             busy: 0,
             spent: 0,
             _batch: batch,
             pool: Arc::clone(process.semaphore()),
             process: Some(process),
+        }
+    }
+    /// How a line its batch stopped (`stop`) while it waited is reported.
+    fn stopped_by(&self, stop: Stop) -> Stopped {
+        match self.ran {
+            Some((ran, error)) => Stopped::AfterAttempt(ran, error),
+            None => Stopped::NeverRan(NotRun::from(stop)),
         }
     }
     /// Whether a spent budget would be tried again.
@@ -734,6 +777,34 @@ impl Workers {
                 true
             }
             Err(_) => false,
+        }
+    }
+}
+
+/// Tests: cancel a batch at a line's Nth guardrail wait (a cancel reaches a
+/// running batch only through its lease renewal, too late for a test).
+#[cfg(test)]
+pub(crate) mod tests_stop {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    use uuid::Uuid;
+    static AT: LazyLock<Mutex<HashMap<Uuid, u32>>> = LazyLock::new(Default::default);
+    /// Cancel batch `job` at its `nth` wait (1-based).
+    pub(crate) fn cancel_at(job: Uuid, nth: u32) {
+        AT.lock().unwrap().insert(job, nth);
+    }
+    pub(super) fn now(job: Uuid) -> bool {
+        let mut at = AT.lock().unwrap();
+        match at.get_mut(&job) {
+            Some(n) if *n > 1 => {
+                *n -= 1;
+                false
+            }
+            Some(_) => {
+                at.remove(&job);
+                true
+            }
+            None => false,
         }
     }
 }

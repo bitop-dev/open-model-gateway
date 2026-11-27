@@ -140,11 +140,12 @@ impl Policy {
     }
 }
 
-/// Tests: rules whose next decisions have their custom-pattern budget spent
-/// at once, and how many (the real-path tests run with a long budget).
+/// Tests: for listed rules, whether each of their next decisions has its
+/// custom-pattern budget spent at once (the real-path tests run with a long
+/// budget).
 #[cfg(test)]
 pub static SPEND_BUDGET: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<Uuid, u32>>,
+    std::sync::Mutex<std::collections::HashMap<Uuid, std::collections::VecDeque<bool>>>,
 > = std::sync::LazyLock::new(Default::default);
 
 /// The time a request's custom patterns may take in all (tests run with a
@@ -318,16 +319,15 @@ impl Policy {
         self.decide_with(workload, input, &Budget::time(CUSTOM_BUDGET))
     }
     /// Tests: whether this decision's budget is spent at once
-    /// ([`SPEND_BUDGET`], counted down per decision of a listed rule).
+    /// ([`SPEND_BUDGET`]: the next answer of a listed rule's sequence).
     #[cfg(test)]
     fn spend_budget_now(&self) -> bool {
         let mut spend = SPEND_BUDGET.lock().unwrap();
-        self.rules.iter().any(|r| match spend.get_mut(&r.id) {
-            Some(n) if *n > 0 => {
-                *n -= 1;
-                true
-            }
-            _ => false,
+        self.rules.iter().any(|r| {
+            spend
+                .get_mut(&r.id)
+                .and_then(std::collections::VecDeque::pop_front)
+                .unwrap_or(false)
         })
     }
     /// As [`Policy::decide`], within `budget`.
