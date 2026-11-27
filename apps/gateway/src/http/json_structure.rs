@@ -60,7 +60,13 @@ pub(crate) fn inner_refusal(
     body: Option<axum::Extension<BodyWeight>>,
     request: &crate::inference::types::ChatRequest,
 ) -> Option<Response> {
-    let body = body.map_or(0, |axum::Extension(BodyWeight(weight))| weight);
+    // Every generation handler sits behind a measure that records it: a
+    // request without one reached the handler unmeasured, a wiring fault,
+    // and is refused rather than checked on its documents alone.
+    let body = body.map_or(
+        json_weight::BUDGET.saturating_add(1),
+        |axum::Extension(BodyWeight(weight))| weight,
+    );
     refusal(
         path,
         body.saturating_add(json_weight::inner_documents(request)),
@@ -227,28 +233,24 @@ mod tests {
     }
 
     /// A tool call's `arguments` from a request is parsed only through
-    /// `json_weight::parse_document`, which refuses one over the budget. The
-    /// parses listed here read a provider's output (a response or a stream),
-    /// never a request.
+    /// `json_weight::parse_document`, which refuses one over the budget. Every
+    /// `from_str`, `from_slice`, `from_reader` (a `Deserializer::from_str`
+    /// included) and `.parse::<T>()` call is read whole, however it is spread
+    /// over lines; one that names `arguments` must be one of those listed,
+    /// each exactly once, which read a provider's output (a response or a
+    /// stream), never a request. (A parse through a renamed binding is the
+    /// reviewer's to catch.)
     #[test]
     fn request_arguments_are_parsed_only_when_measured() {
         const UPSTREAM: [(&str, &str); 3] = [
-            (
-                "providers/anthropic.rs",
-                "serde_json::from_str::<Value>(&self.arguments)",
-            ),
-            (
-                "providers/bedrock/stream.rs",
-                "serde_json::from_str(&block.arguments)",
-            ),
-            (
-                "protocols/messages.rs",
-                "serde_json::from_str(&call.arguments)",
-            ),
+            ("providers/anthropic.rs", "&self.arguments"),
+            ("providers/bedrock/stream.rs", "&block.arguments"),
+            ("protocols/messages.rs", "&call.arguments"),
         ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut stack = vec![root.clone()];
         let mut found = Vec::new();
+        let mut seen = [0usize; UPSTREAM.len()];
         while let Some(dir) = stack.pop() {
             for entry in std::fs::read_dir(&dir).unwrap() {
                 let path = entry.unwrap().path();
@@ -257,11 +259,11 @@ mod tests {
                     stack.push(path);
                     continue;
                 }
-                if !name.ends_with(".rs") || name.contains("test") {
-                    continue;
-                }
-                // This file holds the list above.
-                if path.ends_with("http/json_structure.rs") {
+                // Test code, and this file (which holds the list above).
+                if !name.ends_with(".rs")
+                    || name.contains("test")
+                    || path.ends_with("http/json_structure.rs")
+                {
                     continue;
                 }
                 let relative = path
@@ -269,20 +271,58 @@ mod tests {
                     .unwrap()
                     .to_string_lossy()
                     .replace('\\', "/");
-                for line in std::fs::read_to_string(&path).unwrap().lines() {
-                    let parses = line.contains("from_str") || line.contains("from_slice");
-                    if parses
-                        && line.contains("arguments")
-                        && !UPSTREAM
+                let compact: String = std::fs::read_to_string(&path)
+                    .unwrap()
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect();
+                for call in ["from_str", "from_slice", "from_reader", ".parse::<"] {
+                    for (at, _) in compact.match_indices(call) {
+                        let rest = &compact[at + call.len()..];
+                        // The call's arguments: past any turbofish, to the
+                        // parenthesis that closes them.
+                        let Some(open) = rest.find('(') else { continue };
+                        let mut depth = 0usize;
+                        let end = rest[open..]
+                            .char_indices()
+                            .find(|&(_, c)| {
+                                match c {
+                                    '(' => depth += 1,
+                                    ')' => depth -= 1,
+                                    _ => {}
+                                }
+                                depth == 0
+                            })
+                            .map_or(rest.len(), |(i, _)| open + i);
+                        let argument = &rest[open..end];
+                        // `.parse::<T>()` names its subject before the call.
+                        let subject = if call == ".parse::<" {
+                            let mut start = at.saturating_sub(40);
+                            while !compact.is_char_boundary(start) {
+                                start += 1;
+                            }
+                            &compact[start..at]
+                        } else {
+                            argument
+                        };
+                        if !subject.contains("arguments") {
+                            continue;
+                        }
+                        match UPSTREAM
                             .iter()
-                            .any(|(file, call)| relative == *file && line.contains(call))
-                    {
-                        found.push(format!("{relative}: {}", line.trim()));
+                            .position(|(file, arg)| relative == *file && subject.contains(arg))
+                        {
+                            Some(listed) => seen[listed] += 1,
+                            None => found.push(format!("{relative}: {call}{argument})")),
+                        }
                     }
                 }
             }
         }
         assert!(found.is_empty(), "{found:#?}");
+        // Each listed parse exactly once: another call of the same text in
+        // that file is a new parse, not the reviewed one.
+        assert_eq!(seen, [1; UPSTREAM.len()], "{UPSTREAM:?}");
     }
 
     /// The request wire types deserialize directly: none of the serde shapes

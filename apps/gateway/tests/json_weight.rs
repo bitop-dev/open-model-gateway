@@ -396,6 +396,26 @@ fn the_estimate_covers_each_routes_request_type() {
     .unwrap();
 }
 
+/// Every key and string of `value`, copied out (a guardrail's segments).
+fn segments(value: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![value];
+    while let Some(v) = stack.pop() {
+        match v {
+            Value::String(s) => out.push(s.clone()),
+            Value::Array(items) => stack.extend(items),
+            Value::Object(map) => {
+                for (k, item) in map {
+                    out.push(k.clone());
+                    stack.push(item);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// A JSON document held in a string (a tool call's `arguments`), parsed by
 /// `json_weight::parse_document` while the body it came from is held, as an
 /// adapter or a guardrail does: within the body's bound plus the
@@ -424,6 +444,49 @@ fn the_estimate_covers_a_document_held_in_a_string() {
             body.len() + estimate(body.as_bytes()) + inner.len() + estimate(inner.as_bytes());
         assert!(bound >= peak, "bound {bound} below the parse's peak {peak}");
     }
+    // Several documents held together, as an adapter keeps every call of a
+    // request: within the body's bound plus what `inner_documents` charges
+    // (each document's length and structure, and the largest strings part,
+    // which lasts only while that one is parsed).
+    let documents = [
+        json!({"k": vec![json!({"a": 0}); 4_000]}).to_string(),
+        json!({"path": "f", "content": "line\n".repeat(40_000)}).to_string(),
+        json!({"k": vec![json!(0); 60_000]}).to_string(),
+    ];
+    let body = json!({"calls": documents}).to_string();
+    LIVE.set(0);
+    PEAK.set(0);
+    ON.set(true);
+    let value = serde_json::from_slice::<Value>(body.as_bytes()).unwrap();
+    // Each held three ways, as the sinks hold one: the parsed value, a full
+    // second form beside it (an adapter's, e.g. Bedrock's `Document`), and
+    // a guardrail's segments of its keys and strings.
+    let parsed: Vec<_> = value["calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            let document = parse_document(d.as_str().unwrap()).unwrap();
+            let copy = document.clone();
+            let segments = segments(&document);
+            (document, copy, segments)
+        })
+        .collect();
+    ON.set(false);
+    drop((value, parsed));
+    let peak = usize::try_from(PEAK.get()).unwrap();
+    let (kept, transient) = documents.iter().fold((0, 0), |(kept, transient), d| {
+        let w = weight(d.as_bytes());
+        (
+            kept + d.len() + w.structure,
+            usize::max(transient, w.strings),
+        )
+    });
+    let bound = body.len() + estimate(body.as_bytes()) + kept + transient;
+    assert!(
+        bound >= peak,
+        "several documents: bound {bound} below the parse's peak {peak}"
+    );
     // Over the budget, the document is never parsed.
     let over = json!({"k": vec![json!({"a": 0}); 20_000]}).to_string();
     LIVE.set(0);

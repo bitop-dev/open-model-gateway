@@ -324,10 +324,11 @@ pub fn parse_document(text: &str) -> Option<serde_json::Value> {
 /// What the JSON documents held in a request's strings may parse into,
 /// their own decoded bytes included: every tool call's `arguments`, which
 /// an adapter or a guardrail parses ([`parse_document`]) and keeps beside
-/// the request. Each document's bytes and structure stay; its strings part
-/// (the scratch buffer, a refused parse's message) lasts only while it is
-/// parsed, one at a time, so only the largest counts. Added to the body's
-/// estimate and compared with [`BUDGET`] before admission.
+/// the request. Each document's bytes stay, and its structure up to
+/// [`DOCUMENT_COPIES`] times; its strings part (the scratch buffer, a
+/// refused parse's message) lasts only while it is parsed, one at a time, so
+/// only the largest counts. Added to the body's estimate and compared with
+/// [`BUDGET`] before admission.
 pub fn inner_documents(request: &crate::inference::types::ChatRequest) -> usize {
     let (kept, transient) = request
         .messages
@@ -336,12 +337,19 @@ pub fn inner_documents(request: &crate::inference::types::ChatRequest) -> usize 
         .map(|call| (call.arguments.len(), weight(call.arguments.as_bytes())))
         .fold((0usize, 0usize), |(kept, transient), (len, w)| {
             (
-                kept.saturating_add(len).saturating_add(w.structure),
+                kept.saturating_add(len)
+                    .saturating_add(w.structure.saturating_mul(DOCUMENT_COPIES)),
                 transient.max(w.strings),
             )
         });
     kept.saturating_add(transient)
 }
+
+/// How many structures a parsed document may be held as at once: the parsed
+/// value, an adapter's own form of it built beside it (Bedrock's `Document`,
+/// measured at about the size of the value, with its vectors' doubling),
+/// and a guardrail's segments of its keys and strings (#872).
+pub const DOCUMENT_COPIES: usize = 3;
 
 /// What the gateway's own plan adds to a batch work line: one object of a
 /// few fields (`jobs::lines::LinePlan`), well within this, so a line within

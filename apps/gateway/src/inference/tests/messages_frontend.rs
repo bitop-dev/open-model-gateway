@@ -70,7 +70,11 @@ fn frontend_adapter(adapter: Arc<dyn ProviderAdapter>) -> (Router, Arc<MemoryRep
             .route("/v1/messages", post(crate::protocols::messages::handle))
             .layer(Extension(engine))
             .layer(Extension(principal()))
-            .layer(Extension(crate::http::RequestId(Uuid::new_v4()))),
+            .layer(Extension(crate::http::RequestId(Uuid::new_v4())))
+            // The handler alone, without the gateway's body measure, which
+            // would record this weight (`http::json_structure`); these
+            // bodies are small.
+            .layer(Extension(crate::http::BodyWeight(0))),
         repository,
     )
 }
