@@ -4080,6 +4080,75 @@ async fn access_review_fixtures(c: &Client, admin: &Browser, f: &Fixture, pool: 
 /// Auditor who also administers a Team (platform pattern text), personal
 /// workspaces with no rules and as platform staff see them (local hidden), an
 /// override reset, and the detectors.
+/// The `expected` of the guardrail layer at `path` (a PUT or reset target),
+/// from the database: its id and revision, or null when there is none.
+async fn guardrail_expected(pool: &PgPool, path: &str) -> Value {
+    let path = path.split('?').next().unwrap();
+    let parts: Vec<&str> = path.split('/').collect();
+    let (layer, kind, ws): (&str, Option<String>, Option<Uuid>) = match parts.as_slice() {
+        [
+            "",
+            "api",
+            "v1",
+            "platform",
+            "workspace-types",
+            k,
+            "guardrails",
+        ] => ("type_default", Some((*k).to_owned()), None),
+        ["", "api", "v1", "platform", "workspaces", w, "guardrails"] => {
+            ("workspace_override", None, w.parse().ok())
+        }
+        ["", "api", "v1", "workspaces", w, "guardrails"] => {
+            ("workspace_local", None, w.parse().ok())
+        }
+        _ => panic!("not a guardrail layer path"),
+    };
+    let row: Option<(Uuid, i64)> = sqlx::query_as("SELECT id,revision::bigint FROM guardrail_rule_sets WHERE layer=$1 AND kind IS NOT DISTINCT FROM $2 AND workspace_id IS NOT DISTINCT FROM $3")
+        .bind(layer)
+        .bind(kind)
+        .bind(ws)
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+    row.map_or(
+        Value::Null,
+        |(id, revision)| json!({"rule_set_id": id, "revision": revision}),
+    )
+}
+/// `body` with `expected` naming the layer at `path` as stored now, when the
+/// body's own is well formed (null, or an id and a positive revision) or
+/// absent from a fixture body; a malformed one is left for the schema check.
+async fn with_expected(pool: &PgPool, path: &str, mut body: Value) -> Value {
+    let well_formed = match body.get("expected") {
+        None | Some(Value::Null) => true,
+        Some(Value::Object(e)) => {
+            e.len() == 2
+                && e.get("rule_set_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|v| v.parse::<Uuid>().is_ok())
+                && e.get("revision")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|r| r >= 1)
+        }
+        Some(_) => false,
+    };
+    if body.is_object() && well_formed {
+        body["expected"] = guardrail_expected(pool, path).await;
+    }
+    body
+}
+/// The reset's query naming the override at `path` as stored now.
+async fn reset_query(pool: &PgPool, path: &str) -> String {
+    match guardrail_expected(pool, path).await {
+        Value::Null => String::new(),
+        e => format!(
+            "?rule_set_id={}&revision={}",
+            e["rule_set_id"].as_str().unwrap(),
+            e["revision"]
+        ),
+    }
+}
+
 async fn guardrail_fixtures(
     c: &Client,
     admin: &Browser,
@@ -4179,6 +4248,14 @@ async fn guardrail_fixtures(
         let refused = crate::management::openapi_semantic::check_request("PUT", path, &body)
             .is_ok()
             && described(&body, platform);
+        // A well-formed `expected` names the layer as stored now (each vector
+        // replaces the layer); an omitted or malformed one is sent as the
+        // vector made it.
+        let body = if body.get("expected").is_some() {
+            with_expected(pool, path, body).await
+        } else {
+            body
+        };
         let captured = c.raw(who, "PUT", path, Some(body), &[]).await;
         if refused && matches!(captured.status.as_u16(), 400 | 403) {
             Probe::decided(captured, true)
@@ -4194,7 +4271,7 @@ async fn guardrail_fixtures(
         let mut o = c.observed.lock().await;
         c.guarded(
             "PUT /platform/workspace-types/{kind}/guardrails",
-            body_vectors_seeded(&mut o, "PUT", "/api/v1/platform/workspace-types/{kind}/guardrails", json!({"local_only":false,"rules":[secrets("monitor"), custom("PROJECT-[0-9]{4}")]}), &[("/rules/0/id", json!(seeded))], async |body| probe(admin, TEAM_TYPE, body, &none).await),
+            body_vectors_seeded(&mut o, "PUT", "/api/v1/platform/workspace-types/{kind}/guardrails", json!({"local_only":false,"expected":{"rule_set_id":"00000000-0000-4000-8000-000000000000","revision":1},"rules":[secrets("monitor"), custom("PROJECT-[0-9]{4}")]}), &[("/rules/0/id", json!(seeded))], async |body| probe(admin, TEAM_TYPE, body, &none).await),
         )
         .await;
         c.guarded(
@@ -4203,7 +4280,7 @@ async fn guardrail_fixtures(
                 &mut o,
                 "PUT",
                 "/api/v1/platform/workspaces/{ws}/guardrails",
-                json!({"local_only":true,"rules":[secrets("block"), custom("acme-[a-z]+")]}),
+                json!({"local_only":true,"expected":{"rule_set_id":"00000000-0000-4000-8000-000000000000","revision":1},"rules":[secrets("block"), custom("acme-[a-z]+")]}),
                 &[("/rules/0/id", json!(seeded))],
                 async |body| probe(admin, &platform_project, body, &none).await,
             ),
@@ -4218,7 +4295,7 @@ async fn guardrail_fixtures(
             admin,
             "PUT",
             TEAM_TYPE,
-            Some(json!({"local_only":false,"rules":[{"name":"Secrets","protection":"secrets","detector":{"kind":"pattern","categories":["secret"]},"input":{"action":"off"},"on_error":"fail_open"}, custom("PROJECT-[0-9]{4}")]})),
+            Some(with_expected(pool, TEAM_TYPE, json!({"local_only":false,"rules":[{"name":"Secrets","protection":"secrets","detector":{"kind":"pattern","categories":["secret"]},"input":{"action":"off"},"on_error":"fail_open"}, custom("PROJECT-[0-9]{4}")]})).await),
         )
         .await;
     let rules = platform_rules(&team_type["rule_set"]);
@@ -4228,7 +4305,88 @@ async fn guardrail_fixtures(
         let mut o = c.observed.lock().await;
         c.guarded(
             "PUT /workspaces/{ws}/guardrails",
-            body_vectors_seeded(&mut o, "PUT", "/api/v1/workspaces/{ws}/guardrails", json!({"rules":[{"tightens":target,"input":{"action":"block"},"output":{"mode":"off"},"on_error":"fail_closed","threshold":null}, custom("internal-[0-9]+")]}), &[("/rules/0/id", json!(seeded)), ("/rules/1/id", json!(seeded))], async |body| probe(owner, &local_team, body, &rules).await),
+            body_vectors_seeded(&mut o, "PUT", "/api/v1/workspaces/{ws}/guardrails", json!({"expected":{"rule_set_id":"00000000-0000-4000-8000-000000000000","revision":1},"rules":[{"tightens":target,"input":{"action":"block"},"output":{"mode":"off"},"on_error":"fail_closed","threshold":null}, custom("internal-[0-9]+")]}), &[("/rules/0/id", json!(seeded)), ("/rules/1/id", json!(seeded))], async |body| probe(owner, &local_team, body, &rules).await),
+        )
+        .await;
+    }
+    // The reset's query: each vector removes a freshly written override.
+    // Its two parameters go together and must name the override stored now,
+    // which the schema cannot state: a well-formed query refused for that
+    // (400 for one of the two, 409 for another override) is a described
+    // refusal.
+    let resettable = format!(
+        "/api/v1/platform/workspaces/{}/guardrails",
+        workspace(pool, "Guardrail reset vectors", "team", f.owner.user_id).await
+    );
+    {
+        let mut o = c.observed.lock().await;
+        c.guarded(
+            "DELETE /platform/workspaces/{ws}/guardrails",
+            query_vectors(
+                &mut o,
+                "DELETE",
+                "/api/v1/platform/workspaces/{ws}/guardrails",
+                &[],
+                async || {
+                    let body = with_expected(
+                        pool,
+                        &resettable,
+                        json!({"local_only":false,"rules":[secrets("monitor")]}),
+                    )
+                    .await;
+                    c.setup(admin, "PUT", &resettable, Some(body)).await;
+                    let e = guardrail_expected(pool, &resettable).await;
+                    (
+                        (),
+                        vec![
+                            (
+                                "rule_set_id".to_owned(),
+                                e["rule_set_id"].as_str().unwrap().to_owned(),
+                            ),
+                            ("revision".to_owned(), e["revision"].to_string()),
+                        ],
+                    )
+                },
+                async |_: &(), q| {
+                    let decode = |v: &str| {
+                        percent_encoding::percent_decode_str(&v.replace('+', " "))
+                            .decode_utf8_lossy()
+                            .into_owned()
+                    };
+                    let pairs: Vec<(String, String)> = q
+                        .split('&')
+                        .filter(|p| !p.is_empty())
+                        .map(|p| {
+                            let (k, v) = p.split_once('=').unwrap_or((p, ""));
+                            (decode(k), decode(v))
+                        })
+                        .collect();
+                    let id = pairs
+                        .iter()
+                        .filter(|(k, _)| k == "rule_set_id")
+                        .map(|(_, v)| v.parse::<Uuid>().is_ok())
+                        .collect::<Vec<_>>();
+                    let revision = pairs
+                        .iter()
+                        .filter(|(k, _)| k == "revision")
+                        .map(|(_, v)| v.parse::<i64>().is_ok_and(|r| r >= 1))
+                        .collect::<Vec<_>>();
+                    let well_formed = id.len() <= 1
+                        && revision.len() <= 1
+                        && id.iter().chain(&revision).all(|ok| *ok)
+                        && pairs
+                            .iter()
+                            .all(|(k, _)| k == "rule_set_id" || k == "revision");
+                    let captured = c
+                        .raw(admin, "DELETE", &self::target(&resettable, &q), None, &[])
+                        .await;
+                    if well_formed && matches!(captured.status.as_u16(), 400 | 409) {
+                        Probe::decided(captured, true)
+                    } else {
+                        Probe::from(captured)
+                    }
+                },
+            ),
         )
         .await;
     }
@@ -4238,12 +4396,12 @@ async fn guardrail_fixtures(
         rule
     };
     // Type defaults with custom patterns (the personal one stays unwritten).
-    c.ok(admin, "PUT", TEAM_TYPE, Some(json!({"local_only":false,"rules":[keep(&target, secrets("monitor")), keep(&custom_rule, custom("PROJECT-[0-9]{4}"))]}))).await;
+    c.ok(admin, "PUT", TEAM_TYPE, Some(with_expected(pool, TEAM_TYPE, json!({"local_only":false,"rules":[keep(&target, secrets("monitor")), keep(&custom_rule, custom("PROJECT-[0-9]{4}"))]})).await)).await;
     c.ok(
         admin,
         "PUT",
         PROJECT_TYPE,
-        Some(json!({"local_only":false,"rules":[secrets("monitor"), custom("PROJECT-[0-9]{4}")]})),
+        Some(with_expected(pool, PROJECT_TYPE, json!({"local_only":false,"rules":[secrets("monitor"), custom("PROJECT-[0-9]{4}")]})).await),
     )
     .await;
     c.ok(auditor, "GET", TEAM_TYPE, None).await;
@@ -4255,7 +4413,7 @@ async fn guardrail_fixtures(
     )
     .await;
     // The Team's local layer tightens both type-default rules and adds a pattern.
-    c.ok(owner, "PUT", &local_team, Some(json!({"rules":[{"tightens":target,"input":{"action":"block"}}, {"tightens":custom_rule,"on_error":"fail_closed"}, custom("internal-[0-9]+")]}))).await;
+    c.ok(owner, "PUT", &local_team, Some(with_expected(pool, &local_team, json!({"rules":[{"tightens":target,"input":{"action":"block"}}, {"tightens":custom_rule,"on_error":"fail_closed"}, custom("internal-[0-9]+")]})).await)).await;
     c.ok(regular, "GET", &local_team, None).await;
     // A personal workspace with no rules in any layer.
     c.ok(owner, "GET", &local_personal, None).await;
@@ -4266,12 +4424,19 @@ async fn guardrail_fixtures(
             admin,
             "PUT",
             &platform_project,
-            Some(json!({"local_only":false,"rules":[secrets("monitor"), custom("acme-[a-z]+")]})),
+            Some(
+                with_expected(
+                    pool,
+                    &platform_project,
+                    json!({"local_only":false,"rules":[secrets("monitor"), custom("acme-[a-z]+")]}),
+                )
+                .await,
+            ),
         )
         .await;
     let overridden = first["override"]["rules"][0]["id"].clone();
-    c.ok(owner, "PUT", &local_project, Some(json!({"rules":[{"tightens":overridden,"input":{"action":"block"}}, custom("internal-[0-9]+")]}))).await;
-    c.ok(admin, "PUT", &platform_project, Some(json!({"local_only":false,"rules":[keep(&overridden, secrets("monitor")), custom("acme-[a-z]+")]}))).await;
+    c.ok(owner, "PUT", &local_project, Some(with_expected(pool, &local_project, json!({"rules":[{"tightens":overridden,"input":{"action":"block"}}, custom("internal-[0-9]+")]})).await)).await;
+    c.ok(admin, "PUT", &platform_project, Some(with_expected(pool, &platform_project, json!({"local_only":false,"rules":[keep(&overridden, secrets("monitor")), custom("acme-[a-z]+")]})).await)).await;
     c.ok(auditor, "GET", &platform_project, None).await;
     c.ok(owner, "GET", &local_project, None).await;
     // An Auditor who administers a Team reads and writes its local layer with
@@ -4281,7 +4446,7 @@ async fn guardrail_fixtures(
     member(pool, staffed, staff.user_id, "admin").await;
     let staff = browser(pool, &staff).await;
     let staffed = format!("/api/v1/workspaces/{staffed}/guardrails");
-    c.ok(&staff, "PUT", &staffed, Some(json!({"rules":[{"tightens":target,"input":{"action":"block"}}, custom("internal-[0-9]+")]}))).await;
+    c.ok(&staff, "PUT", &staffed, Some(with_expected(pool, &staffed, json!({"rules":[{"tightens":target,"input":{"action":"block"}}, custom("internal-[0-9]+")]})).await)).await;
     c.ok(&staff, "GET", &staffed, None).await;
     // The Team's override leaves both local entries inactive; the type default
     // then drops its custom rule, so removing the override restores one
@@ -4290,7 +4455,14 @@ async fn guardrail_fixtures(
         admin,
         "PUT",
         &platform_team,
-        Some(json!({"local_only":true,"rules":[secrets("block"), custom("acme-[a-z]+")]})),
+        Some(
+            with_expected(
+                pool,
+                &platform_team,
+                json!({"local_only":true,"rules":[secrets("block"), custom("acme-[a-z]+")]}),
+            )
+            .await,
+        ),
     )
     .await;
     c.ok(owner, "GET", &local_team, None).await;
@@ -4299,17 +4471,27 @@ async fn guardrail_fixtures(
         admin,
         "PUT",
         TEAM_TYPE,
-        Some(json!({"local_only":false,"rules":[keep(&target, secrets("monitor")), custom("OTHER-[0-9]{4}")]})),
+        Some(with_expected(pool, TEAM_TYPE, json!({"local_only":false,"rules":[keep(&target, secrets("monitor")), custom("OTHER-[0-9]{4}")]})).await),
     )
     .await;
-    c.ok(admin, "DELETE", &platform_team, None).await;
+    c.ok(
+        admin,
+        "DELETE",
+        &format!(
+            "{}{}",
+            platform_team,
+            reset_query(pool, &platform_team).await
+        ),
+        None,
+    )
+    .await;
     // A personal workspace: its owner's local layer, which platform staff never
     // see; its override (platform-managed) and that override's removal.
     c.ok(
         owner,
         "PUT",
         &local_personal,
-        Some(json!({"rules":[secrets("block")]})),
+        Some(with_expected(pool, &local_personal, json!({"rules":[secrets("block")]})).await),
     )
     .await;
     c.ok(admin, "GET", &platform_personal, None).await;
@@ -4317,10 +4499,27 @@ async fn guardrail_fixtures(
         admin,
         "PUT",
         &platform_personal,
-        Some(json!({"local_only":false,"rules":[secrets("block")]})),
+        Some(
+            with_expected(
+                pool,
+                &platform_personal,
+                json!({"local_only":false,"rules":[secrets("block")]}),
+            )
+            .await,
+        ),
     )
     .await;
-    c.ok(admin, "DELETE", &platform_personal, None).await;
+    c.ok(
+        admin,
+        "DELETE",
+        &format!(
+            "{}{}",
+            platform_personal,
+            reset_query(pool, &platform_personal).await
+        ),
+        None,
+    )
+    .await;
     c.ok(
         auditor,
         "GET",

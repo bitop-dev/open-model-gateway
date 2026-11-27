@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use uuid::Uuid;
 
 pub use super::view::{detectors_json, effective_json, rule_json};
-pub use super::write::{LayerIn, WriteContext, validate};
+pub use super::write::{Expected, LayerIn, WriteContext, validate};
 
 /// Most entries (rules and tightening entries) in one layer.
 pub const MAX_RULES: usize = 50;

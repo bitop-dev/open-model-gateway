@@ -107,7 +107,7 @@ describe("Workspace › Settings › Guardrails", () => {
     expect(screen.queryByRole("switch")).toBeNull();
     await user.click(screen.getByRole("button", { name: "Tighten" }));
     await waitFor(() => expect(writes(fetch)).toHaveLength(1));
-    expect(writes(fetch)[0]).toEqual(["PUT", guardrailsPath(team.id), { rules: [toInput(codes), { tightens: "r-secrets", input: { action: "block" } }] }]);
+    expect(writes(fetch)[0]).toEqual(["PUT", guardrailsPath(team.id), { expected: { rule_set_id: "set-l", revision: 2 }, rules: [toInput(codes), { tightens: "r-secrets", input: { action: "block" } }] }]);
   });
   it("tightening again keeps the existing tightening's other settings", async () => {
     const tightening = { id: "t-1", tightens: "r-secrets", on_error: "fail_closed" as const };
@@ -180,7 +180,7 @@ describe("Workspace › Settings › Guardrails", () => {
     expect(await screen.findByText(/Its platform rule was removed: it no longer applies/)).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Remove Code names" }));
     await user.click(screen.getByRole("button", { name: "Remove" }));
-    await waitFor(() => expect(writes(fetch)).toEqual([["PUT", guardrailsPath(team.id), { rules: [] }]]));
+    await waitFor(() => expect(writes(fetch)).toEqual([["PUT", guardrailsPath(team.id), { expected: { rule_set_id: "set-l", revision: 2 }, rules: [] }]]));
   });
   it("keeps a tightening that applies again since the page loaded", async () => {
     const old = { id: "t-old", tightens: "r-secrets", input: { action: "block" as const } };
@@ -195,7 +195,7 @@ describe("Workspace › Settings › Guardrails", () => {
     expect(await screen.findByText(/Its platform rule was removed/)).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Remove Code names" }));
     await user.click(screen.getByRole("button", { name: "Remove" }));
-    await waitFor(() => expect(writes(fetch)).toEqual([["PUT", guardrailsPath(team.id), { rules: [old] }]]));
+    await waitFor(() => expect(writes(fetch)).toEqual([["PUT", guardrailsPath(team.id), { expected: { rule_set_id: "set-l", revision: 2 }, rules: [old] }]]));
   });
   it("leaves out what a tightening is now weaker than, keeps what equals the platform rule, and marks it", async () => {
     // The platform raised Secrets to Block; the workspace's Monitor tightening of it (once from Off) is weaker.
@@ -206,7 +206,7 @@ describe("Workspace › Settings › Guardrails", () => {
     expect(await screen.findByText(/“Secrets” is now stricter than this: it no longer applies/)).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Remove Code names" }));
     await user.click(screen.getByRole("button", { name: "Remove" }));
-    await waitFor(() => expect(writes(fetch)).toEqual([["PUT", guardrailsPath(team.id), { rules: [] }]]));
+    await waitFor(() => expect(writes(fetch)).toEqual([["PUT", guardrailsPath(team.id), { expected: { rule_set_id: "set-l", revision: 2 }, rules: [] }]]));
     // Equal is kept (the server accepts it, and it holds the level if the platform lowers its rule); weaker goes.
     expect(stricterPart({ id: "t", tightens: "r-secrets", input: { action: "block" }, on_error: "fail_closed" }, { ...secrets, input: { action: "block" } })).toEqual({ id: "t", tightens: "r-secrets", input: { action: "block" }, on_error: "fail_closed" });
     expect(stricterPart({ id: "t", tightens: "r-secrets", input: { action: "monitor" }, on_error: "fail_closed" }, { ...secrets, input: { action: "block" }, on_error: "fail_closed" })).toEqual({ id: "t", tightens: "r-secrets", on_error: "fail_closed" });
@@ -221,14 +221,13 @@ describe("Workspace › Settings › Guardrails", () => {
     await user.click(screen.getByRole("button", { name: "Tighten" }));
     expect(await screen.findByText("This workspace's tightening of “Secrets” is no longer stricter than the platform rule. Remove it, then try again.")).toBeTruthy();
   });
-  it("refuses to save a layer that changed since the page loaded it", async () => {
-    let loads = 0;
-    const fetch = serve({ [guardrailsPath(team.id)]: () => loads++ === 0 ? view() : view({ local: { ...localSet, revision: 3 } }) });
+  it("names the layer as loaded, and says so plainly when the server finds it changed", async () => {
+    const fetch = serve({ [guardrailsPath(team.id)]: init => init?.method === "PUT" ? new Response(JSON.stringify({ error: { code: "409", message: "changed", reason: "guardrail_layer_changed" } }), { status: 409, headers: { "content-type": "application/json" } }) : view() });
     const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
     await user.click(await screen.findByRole("button", { name: "Remove Code names" }));
     await user.click(screen.getByRole("button", { name: "Remove" }));
     expect(await screen.findByText("This changed since you opened it. Reload and try again.")).toBeTruthy();
-    expect(writes(fetch)).toHaveLength(0);
+    expect(writes(fetch)).toEqual([["PUT", guardrailsPath(team.id), { expected: { rule_set_id: "set-l", revision: 2 }, rules: [] }]]);
   });
   it("shows an active rule that is off as Off, never Active", () => {
     const off: StoredRule = { ...secrets, input: { action: "off", redact_scope: "user_text" } };
@@ -279,14 +278,14 @@ describe("Admin › Guardrails", () => {
     await user.click(screen.getByRole("button", { name: "Create override" }));
     await waitFor(() => expect(writes(fetch)).toHaveLength(1));
     const { id: _id, ...withoutId } = toInput(secrets);
-    expect(writes(fetch)[0]).toEqual(["PUT", platformGuardrailsPath(team.id), { local_only: false, rules: [withoutId] }]);
+    expect(writes(fetch)[0]).toEqual(["PUT", platformGuardrailsPath(team.id), { local_only: false, expected: null, rules: [withoutId] }]);
   });
   it("resets an override with a DELETE", async () => {
     const fetch = serve({ [platformGuardrailsPath(team.id)]: init => init?.method === "DELETE" ? platformView() : platformView({ override: { ...platformSet, id: "set-o", layer: "workspace_override" }, platform: { source: "workspace_override", rule_set: platformSet } }) });
     const user = mount(<WorkspaceGuardrailsAdmin id={team.id} writable />);
     await user.click(await screen.findByRole("button", { name: "Reset to default" }));
     await user.click(screen.getByRole("button", { name: "Reset" }));
-    await waitFor(() => expect(writes(fetch)).toEqual([["DELETE", platformGuardrailsPath(team.id), null]]));
+    await waitFor(() => expect(writes(fetch)).toEqual([["DELETE", `${platformGuardrailsPath(team.id)}?rule_set_id=set-o&revision=3`, null]]));
   });
 });
 
@@ -298,15 +297,14 @@ describe("Admin › Guardrails: reach and fresh reads", () => {
     await user.click(await screen.findByRole("button", { name: "Remove Secrets" }));
     expect(screen.getByRole("dialog").textContent).toContain("It stops applying to every team workspace without a platform override, and their tightenings of it stop applying.");
   });
-  it("refuses to change an override that changed since the page loaded it", async () => {
-    let loads = 0;
-    const withOverride = (revision: number) => platformView({ override: { ...platformSet, id: "set-o", layer: "workspace_override", revision }, platform: { source: "workspace_override", rule_set: platformSet } });
-    const fetch = serve({ [platformGuardrailsPath(team.id)]: () => withOverride(loads++ === 0 ? 1 : 2) });
+  it("resets the override as loaded, and says so plainly when the server finds it changed", async () => {
+    const overridden = platformView({ override: { ...platformSet, id: "set-o", layer: "workspace_override", revision: 1 }, platform: { source: "workspace_override", rule_set: platformSet } });
+    const fetch = serve({ [platformGuardrailsPath(team.id)]: init => init?.method === "DELETE" ? new Response(JSON.stringify({ error: { code: "409", message: "changed", reason: "guardrail_layer_changed" } }), { status: 409, headers: { "content-type": "application/json" } }) : overridden });
     const user = mount(<WorkspaceGuardrailsAdmin id={team.id} writable />);
     await user.click(await screen.findByRole("button", { name: "Reset to default" }));
     await user.click(screen.getByRole("button", { name: "Reset" }));
     expect(await screen.findByText("This changed since you opened it. Reload and try again.")).toBeTruthy();
-    expect(writes(fetch)).toHaveLength(0);
+    expect(writes(fetch)).toEqual([["DELETE", `${platformGuardrailsPath(team.id)}?rule_set_id=set-o&revision=1`, null]]);
   });
   it("creates an override from the default as it is when the override is created", async () => {
     let loads = 0;
@@ -317,7 +315,7 @@ describe("Admin › Guardrails: reach and fresh reads", () => {
     await user.click(screen.getByRole("button", { name: "Create override" }));
     await waitFor(() => expect(writes(fetch)).toHaveLength(1));
     const strip = (r: StoredRule) => { const { id: _id, ...rest } = toInput(r); return rest; };
-    expect(writes(fetch)[0]![2]).toEqual({ local_only: true, rules: [strip(secrets), strip(later)] });
+    expect(writes(fetch)[0]![2]).toEqual({ local_only: true, expected: null, rules: [strip(secrets), strip(later)] });
   });
 });
 

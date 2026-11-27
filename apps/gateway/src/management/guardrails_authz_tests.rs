@@ -8,7 +8,7 @@ use super::*;
 /// A full layer of patterns that compile within the limits.
 fn expensive() -> Value {
     let patterns: Vec<String> = (0..50).map(|i| format!(r"(?i)[a-z]{{40}}{i}")).collect();
-    json!({"local_only":false,"rules":[{"name":"Costly","protection":"custom","detector":{"kind":"pattern","categories":["custom"],"patterns":patterns},"input":{"action":"block"}}]})
+    json!({"local_only":false,"expected":null,"rules":[{"name":"Costly","protection":"custom","detector":{"kind":"pattern","categories":["custom"],"patterns":patterns},"input":{"action":"block"}}]})
 }
 
 async fn put(app: &Router, path: &str, s: &Session, body: String) -> (StatusCode, Value) {

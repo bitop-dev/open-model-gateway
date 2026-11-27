@@ -36,12 +36,12 @@ export async function guardrailWrite<T>(write: () => Promise<T>, names: Record<s
     throw error;
   }
 }
-/** A layer that changed since the page loaded it: a PUT built from it would undo the other change. */
-export const changedSinceOpened = () => new ApiError(409, "conflict", "This changed since you opened it. Reload and try again.");
-/** Refuse unless a fresh read of the layer still has the revision the page shows (narrows, does not close, the window). */
-export function unchanged(fresh: RuleSet | null | undefined, shown: RuleSet | null | undefined) {
-  if ((fresh?.revision ?? null) !== (shown?.revision ?? null) || (fresh?.id ?? null) !== (shown?.id ?? null)) throw changedSinceOpened();
-}
+/**
+ * The layer a write was built from (`expected`): the server refuses the
+ * write (409 `guardrail_layer_changed`) when the layer stored now is another
+ * one, so a page loaded before another admin's change never undoes it.
+ */
+export const expectedOf = (set: RuleSet | null | undefined) => set ? { rule_set_id: set.id, revision: set.revision } : null;
 
 const actionTone = (a?: InputAction) => a === "block" ? "danger" as const : a === "monitor" ? "info" as const : "neutral" as const;
 export function ActionBadge({ action }: { action?: InputAction }) { return <Badge size="sm" tone={actionTone(action)}>{actionLabels[action ?? "off"]}</Badge>; }
@@ -143,5 +143,5 @@ export function tightenRule(ask: ReturnType<typeof useAction>, rule: EffectiveEn
     } });
 }
 
-/** PUT a platform layer (type default or override): `local_only` is stated every time. */
-export const putPlatformLayer = (path: string, localOnly: boolean, rules: Record<string, unknown>[], signal: AbortSignal) => api(path, { method: "PUT", body: { local_only: localOnly, rules }, signal });
+/** PUT a platform layer (type default or override) built from `from`: `local_only` is stated every time. */
+export const putPlatformLayer = (path: string, from: RuleSet | null | undefined, localOnly: boolean, rules: Record<string, unknown>[], signal: AbortSignal) => api(path, { method: "PUT", body: { local_only: localOnly, expected: expectedOf(from), rules }, signal });

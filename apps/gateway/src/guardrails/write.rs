@@ -82,10 +82,46 @@ fn supplied<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
 }
 
 /// The body of a layer's PUT. `local_only` is required on platform layers and
-/// refused on a local one. Only a JSON object: a positional array is refused.
+/// refused on a local one. `expected` is required: the layer the body was
+/// built from (`null`: no layer), checked by [`LayerIn::built_from`] under
+/// the write lock, so a body built from an older layer never replaces a newer
+/// one. Its absence is refused by the handler after authorization (a caller
+/// who may not write is told so first). Only a JSON object: a positional
+/// array is refused.
 pub struct LayerIn {
     local_only: Option<Option<bool>>,
+    expected: Option<Option<Expected>>,
     rules: Vec<Value>,
+}
+/// A layer as a writer last read it: its id and revision. Both are compared:
+/// an override removed and created again starts its revisions over, under a
+/// new id.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Expected {
+    pub rule_set_id: Uuid,
+    /// A stored layer's revision starts at 1.
+    #[serde(deserialize_with = "revision")]
+    pub revision: i64,
+}
+fn revision<'de, D: serde::Deserializer<'de>>(d: D) -> Result<i64, D::Error> {
+    let r = i64::deserialize(d)?;
+    if r >= 1 {
+        Ok(r)
+    } else {
+        Err(serde::de::Error::custom("a revision is at least 1"))
+    }
+}
+impl Expected {
+    /// Whether `current` (the layer as stored now, read in the write
+    /// transaction) is the layer this names; `None` names no layer.
+    pub fn matches(expected: Option<Self>, current: Option<&RuleSet>) -> bool {
+        match (expected, current) {
+            (None, None) => true,
+            (Some(e), Some(c)) => e.rule_set_id == c.id && e.revision == c.revision,
+            _ => false,
+        }
+    }
 }
 impl<'de> Deserialize<'de> for LayerIn {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
@@ -94,6 +130,7 @@ impl<'de> Deserialize<'de> for LayerIn {
             LayerFields::deserialize(Value::Object(map)).map_err(serde::de::Error::custom)?;
         Ok(Self {
             local_only: fields.local_only,
+            expected: fields.expected,
             rules: fields.rules,
         })
     }
@@ -104,10 +141,18 @@ struct LayerFields {
     /// Required on platform layers, refused on a local one; null is refused.
     #[serde(default, deserialize_with = "supplied")]
     local_only: Option<Option<bool>>,
+    /// Required; null names no layer.
+    #[serde(default, deserialize_with = "supplied")]
+    expected: Option<Option<Expected>>,
     rules: Vec<Value>,
 }
 
 impl LayerIn {
+    /// Whether the body was built from `current`, the layer as stored now;
+    /// `None` when the body names no `expected` at all.
+    pub fn built_from(&self, current: Option<&RuleSet>) -> Option<bool> {
+        self.expected.map(|e| Expected::matches(e, current))
+    }
     /// The ids the body names (to tell its own rules from other layers').
     pub fn ids(&self) -> Vec<Uuid> {
         self.rules

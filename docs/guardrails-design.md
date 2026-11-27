@@ -243,6 +243,10 @@ Rejection reasons:
 | 400 | `guardrail_detector_unavailable` |
 | 400 | `guardrail_pattern_unbounded` (section 7) |
 | 400 | `guardrail_pattern_invalid`: a custom pattern does not compile within the limits ([§14](#14-implementation-notes-phase-1)) |
+| 400 | `guardrail_expected_required`: a write names no `expected` (#841) |
+| 409 | `guardrail_layer_changed`: the stored layer is not the one the write was built from (#841) |
+
+Every write names the layer it was built from (`expected`: its id and revision, or `null`), compared under the write lock, so a client that read an older layer never replaces a newer one ([management API](management-api.md#guardrail-policies-840)).
 
 Changes are audited as `guardrail_policy.updated`, with layer, rule IDs, actions and modes. For custom patterns only their count is recorded, never their content.
 

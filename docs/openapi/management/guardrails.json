@@ -3,7 +3,7 @@
     "DELETE /api/v1/platform/workspaces/{ws}/guardrails": {
       "access": "PlatformWrite",
       "operation": {
-        "description": "#840: remove the override, restoring the type default (audited with reset true); a workspace without one is unchanged.",
+        "description": "#840: remove the override, restoring the type default (audited with reset true). The request names the override it removes by rule_set_id and revision (both, or neither when there is none); another override stored now, or one when neither is given, is 409 guardrail_layer_changed.",
         "parameters": [
           {
             "in": "path",
@@ -12,6 +12,25 @@
             "schema": {
               "$ref": "#/components/schemas/IdentityUuid"
             }
+          },
+          {
+            "name": "rule_set_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/IdentityUuid"
+            },
+            "description": "The id of the override being removed, as last read; with revision."
+          },
+          {
+            "name": "revision",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "The revision of the override being removed, as last read; with rule_set_id."
           }
         ],
         "responses": {
@@ -34,6 +53,31 @@
               }
             },
             "description": "Missing or hidden by workspace ownership"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "guardrail_layer_changed: the layer stored now is not the one expected names (another write landed, or an override was removed and created again); read it again and retry"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "rule_set_id without revision or the reverse, or a malformed value"
           }
         }
       },
@@ -241,7 +285,7 @@
                 }
               }
             },
-            "description": "Invalid input; guardrail_detector_unavailable (a detector, action, output mode, workload or uninspectable setting this release does not provide); guardrail_pattern_invalid (a custom pattern does not compile within the limits)"
+            "description": "Invalid input; guardrail_detector_unavailable (a detector, action, output mode, workload or uninspectable setting this release does not provide); guardrail_pattern_invalid (a custom pattern does not compile within the limits); guardrail_expected_required (the body names no expected)"
           },
           "403": {
             "content": {
@@ -272,6 +316,16 @@
               }
             },
             "description": "Unknown top-level field or JSON deserialization refusal"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "guardrail_layer_changed: the layer stored now is not the one expected names (another write landed, or an override was removed and created again); read it again and retry"
           }
         }
       },
@@ -326,7 +380,7 @@
                 }
               }
             },
-            "description": "Invalid input; guardrail_detector_unavailable (a detector, action, output mode, workload or uninspectable setting this release does not provide); guardrail_pattern_invalid (a custom pattern does not compile within the limits)"
+            "description": "Invalid input; guardrail_detector_unavailable (a detector, action, output mode, workload or uninspectable setting this release does not provide); guardrail_pattern_invalid (a custom pattern does not compile within the limits); guardrail_expected_required (the body names no expected)"
           },
           "403": {
             "content": {
@@ -367,6 +421,16 @@
               }
             },
             "description": "Unknown top-level field or JSON deserialization refusal"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "guardrail_layer_changed: the layer stored now is not the one expected names (another write landed, or an override was removed and created again); read it again and retry"
           }
         }
       },
@@ -421,7 +485,7 @@
                 }
               }
             },
-            "description": "Invalid input; guardrail_detector_unavailable (a detector, action, output mode, workload or uninspectable setting this release does not provide); guardrail_pattern_invalid (a custom pattern does not compile within the limits)"
+            "description": "Invalid input; guardrail_detector_unavailable (a detector, action, output mode, workload or uninspectable setting this release does not provide); guardrail_pattern_invalid (a custom pattern does not compile within the limits); guardrail_expected_required (the body names no expected)"
           },
           "403": {
             "content": {
@@ -462,6 +526,16 @@
               }
             },
             "description": "Unknown top-level field or JSON deserialization refusal"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "guardrail_layer_changed: the layer stored now is not the one expected names (another write landed, or an override was removed and created again); read it again and retry"
           }
         }
       },
@@ -4275,9 +4349,31 @@
           },
           "maxItems": 50,
           "type": "array"
+        },
+        "expected": {
+          "description": "Required: the layer this body was built from, by id and revision (a removed and re-created override starts over at revision 1 under a new id), or null when there was none. Compared under the write lock: another layer stored now is 409 guardrail_layer_changed. Absent is 400 guardrail_expected_required, after authorization.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "rule_set_id": {
+              "$ref": "#/components/schemas/IdentityUuid"
+            },
+            "revision": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "required": [
+            "rule_set_id",
+            "revision"
+          ]
         }
       },
       "required": [
+        "expected",
         "local_only",
         "rules"
       ],
@@ -4546,9 +4642,31 @@
           },
           "maxItems": 50,
           "type": "array"
+        },
+        "expected": {
+          "description": "Required: the layer this body was built from, by id and revision (a removed and re-created override starts over at revision 1 under a new id), or null when there was none. Compared under the write lock: another layer stored now is 409 guardrail_layer_changed. Absent is 400 guardrail_expected_required, after authorization.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "rule_set_id": {
+              "$ref": "#/components/schemas/IdentityUuid"
+            },
+            "revision": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "required": [
+            "rule_set_id",
+            "revision"
+          ]
         }
       },
       "required": [
+        "expected",
         "local_only",
         "rules"
       ],
@@ -5872,9 +5990,31 @@
           },
           "maxItems": 50,
           "type": "array"
+        },
+        "expected": {
+          "description": "Required: the layer this body was built from, by id and revision (a removed and re-created override starts over at revision 1 under a new id), or null when there was none. Compared under the write lock: another layer stored now is 409 guardrail_layer_changed. Absent is 400 guardrail_expected_required, after authorization.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "rule_set_id": {
+              "$ref": "#/components/schemas/IdentityUuid"
+            },
+            "revision": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "required": [
+            "rule_set_id",
+            "revision"
+          ]
         }
       },
       "required": [
+        "expected",
         "rules"
       ],
       "type": "object"
