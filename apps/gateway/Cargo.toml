@@ -49,18 +49,18 @@ dotenvy = "0.15"
 hex = "0.4"
 # Batch scheduling time windows (IANA zones, DST): the bundled tz database, so
 # window evaluation never depends on the host's zoneinfo.
-jiff = { version = "=1.0.1", default-features = false, features = ["std", "tzdb-bundle-always"] }
+jiff = { version = "=1.0.2", default-features = false, features = ["std", "tzdb-bundle-always"] }
 # Share Jiff's bundled data version with the report scheduler.
 jiff-tzdb = "1"
 # SMTP delivery (invitations, alerts): rustls, async, one connection per message (no pool).
 lettre = { version = "=0.11.24", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"] }
 # The large image input body check reads Content-Type as Axum's Json
 # extractor does; the version Axum already locks.
-mime = "=0.3.17"
+mime = "=0.3.18"
 percent-encoding = "2"
 # The already-locked reqwest transport's typed EOF/closed-connection errors;
 # never classify webhook retryability by attacker-controlled error text.
-hyper = { version = "=1.12.0", default-features = false }
+hyper = { version = "=1.13.0", default-features = false }
 # Prometheus/OpenMetrics exposition on the optional GATEWAY_METRICS_ADDR listener.
 prometheus-client = "=0.26.0"
 # Secrets come only from the OS CSPRNG (rand::rngs::SysRng, fallible; src/entropy.rs).
@@ -91,7 +91,7 @@ regex = "=1.13.1"
 # The parser `regex` itself uses (same locked version): guardrails/patterns.rs
 # refuses a custom pattern whose minimum match length is 0. Tests also use it
 # to tokenize literal SQL for the UUID binding policy.
-regex-syntax = "=0.8.11"
+regex-syntax = "=0.8.12"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["limit", "fs"] }
 tracing = "0.1"
