@@ -51,8 +51,10 @@
 /// properties at about 0.7 MiB. A refused legitimate request costs more than
 /// the memory the budget allows, so it is set above the densest real
 /// requests, not the average. Text an error message shows escaped is
-/// charged at that length (combining marks, as in fully vocalized Arabic,
-/// about eight times), so one such string over about 1.9 MiB is refused.
+/// charged at that length, three times over (fully vocalized Arabic, whose
+/// combining marks are shown as `\u{650}`, is shown at about 2.7 times its
+/// length, so charged at about eight), and one such string over about 1.9
+/// MiB is refused.
 /// Revisit it with the same measurement
 /// (`docs/operations.md`, "Request body structure").
 pub const BUDGET: usize = 16 * 1024 * 1024;
@@ -275,17 +277,30 @@ pub fn within_budget(body: &[u8]) -> bool {
     estimate(body) <= BUDGET
 }
 
-/// Whether a batch line may be parsed: twice its structure within
-/// [`BUDGET`] and `allowance`. A line is parsed into a tree and then
+/// Whether a batch line may be parsed. A line is parsed into a tree and then
 /// converted into its request (`jobs::lines`), the tree still held while the
-/// request is built: two structures at once. Its strings part is not
-/// compared: it is at most about five times the line, which
-/// `BATCH_MAX_LINE_BYTES` bounds (4 MiB), and lines are parsed one at a
-/// time, so a line holding one long escaped string (an image written with
-/// `\/`) is not refused for it.
+/// request is built: two structures at once, which with its strings part
+/// must be within [`BUDGET`] and `allowance`, plus [`LINE_STRINGS`] times the
+/// line. That excess is what one long escaped plain string costs (twice it
+/// for the scratch copy, three times for a refused line's message), which
+/// `BATCH_MAX_LINE_BYTES` bounds (4 MiB), so a line holding one (an image
+/// written with `\/`) is not refused for it; text an error message shows
+/// escaped, which costs more, is still charged beyond it.
 pub fn line_within_budget(line: &[u8], allowance: usize) -> bool {
-    weight(line).structure.saturating_mul(2) <= BUDGET.saturating_add(allowance)
+    let weight = weight(line);
+    weight
+        .structure
+        .saturating_mul(2)
+        .saturating_add(weight.strings)
+        <= BUDGET
+            .saturating_add(allowance)
+            .saturating_add(line.len().saturating_mul(LINE_STRINGS))
 }
+
+/// How many times its own length a batch line's strings part may take
+/// beyond the budget: one long escaped plain string's scratch copy (two)
+/// and a refused line's message showing it (three).
+pub const LINE_STRINGS: usize = 5;
 
 /// What the gateway's own plan adds to a batch work line: one object of a
 /// few fields (`jobs::lines::LinePlan`), well within this, so a line within

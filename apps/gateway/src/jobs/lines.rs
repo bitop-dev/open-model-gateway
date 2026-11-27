@@ -652,5 +652,13 @@ mod tests {
         assert!(escaped.len() > 3 * 1024 * 1024 && escaped.len() < BATCH_MAX_LINE_BYTES);
         assert!(!crate::inference::json_weight::within_budget(&escaped));
         assert!(parse_line(&escaped, BatchEndpoint::ChatCompletions).is_ok());
+        // Text an error message shows escaped (DEL as six bytes) costs more
+        // than a plain string and is still charged beyond the line's own.
+        let mut shown = chat();
+        shown["body"]["messages"][0]["content"] = json!("\u{7f}".repeat(3 * 1024 * 1024));
+        assert_eq!(
+            parse_line(&line(shown), BatchEndpoint::ChatCompletions).err(),
+            Some(LineError::LineTooLarge)
+        );
     }
 }
