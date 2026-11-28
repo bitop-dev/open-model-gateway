@@ -75,7 +75,7 @@ export function WorkspaceRecords({ session, workspace, ctx, period, nav }: { ses
     { id: "request", header: "Request ID", defaultHidden: true, cell: c => <CopyId value={c.root_request_id} label="request ID" /> },
     { id: "cost_center", header: "Cost center", defaultHidden: true, cell: c => <>{c.cost_center_name ?? "Unallocated"}{c.cost_center_code && <span className={s.secondary}>{c.cost_center_code}</span>}</> },
     { id: "meters", header: "Meters", defaultHidden: true, cell: c => meterSummary(c) },
-    { id: "provider_cost", header: "Provider-reported (for checking only)", defaultHidden: true, cell: c => c.provider_cost_microusd == null ? <span className={s.muted}>Not reported</span> : <Money value={c.provider_cost_microusd} /> },
+    { id: "provider_cost", header: "Provider-reported", defaultHidden: true, cell: c => c.provider_cost_microusd == null ? <span className={s.muted}>Not reported</span> : <Money value={c.provider_cost_microusd} /> },
   ];
   const canFix = permissions(session, workspace).reconcileCosts;
   return <Stack gap={4}>

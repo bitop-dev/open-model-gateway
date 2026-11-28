@@ -101,6 +101,7 @@ fn upstream(state: JobState, seconds: Option<u32>) -> UpstreamVideo {
         completed_at: None,
         expires_at: None,
         error: None,
+        cost: None,
     }
 }
 

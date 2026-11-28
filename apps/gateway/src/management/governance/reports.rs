@@ -682,6 +682,9 @@ pub(super) async fn reconcile(
             .as_deref()
             .map(|v| money(v, false))
             .transpose()?,
+        // An operator's resolution is valued at the pinned rates, never as a
+        // provider's figure.
+        provider_cost_is_charge: false,
         reasoning_tokens: None,
         reported_model: None,
     };

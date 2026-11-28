@@ -109,8 +109,8 @@ export function meterRows(usage: MeterUsage | null, components: Partial<MeterCos
   });
 }
 /**
- * Non-token meters (one table: usage and spend side by side), plus provider-reported cost as evidence only (never the
- * charge). Nothing at all when no meter was used (or is unknown) and the provider reported nothing.
+ * Non-token meters (one table: usage and spend side by side), plus provider-reported cost: the charge of an OpenRouter
+ * video, which reports no duration; evidence only for everything else. Nothing at all when no meter was used (or is unknown) and the provider reported nothing.
  */
 export function MeterAccounting({ usage, components, providerCost, relevant, unknown }: { usage: MeterUsage | null; components: Partial<MeterCostComponents> | null; providerCost: string | null; relevant?: Partial<Record<UnitMeter, string>>; unknown?: Partial<Record<UnitMeter, string>> }) {
   const rows = meterRows(usage, components, relevant, unknown);
@@ -120,7 +120,7 @@ export function MeterAccounting({ usage, components, providerCost, relevant, unk
     {rows.length > 0 && <Table caption="Media and unit meters" stack className={u.acctTable} columns={["Meter", { label: "Usage", numeric: true, width: "12rem" }, { label: "Spent", numeric: true, width: "10rem" }]}>
       {rows.map(r => <Tr key={r.key}><Th scope="row">{r.label}</Th><Td numeric>{r.usage}</Td><Td numeric>{r.note ? <TooltipText content={r.note}>{r.spent}</TooltipText> : r.spent}</Td></Tr>)}
     </Table>}
-    {providerCost != null && <p className={u.note}><TooltipText content="What the provider says it charged (for example OpenRouter usage.cost). Used to check estimates, never billed: spent amounts come from configured prices.">Provider-reported (for checking only)</TooltipText>: <span className={u.num}>{formatMicroUsd(providerCost)}</span></p>}
+    {providerCost != null && <p className={u.note}><TooltipText content="What the provider says it charged (for example OpenRouter usage.cost). An OpenRouter video is charged this figure, an estimate like any price; for everything else it only checks estimates, never billed: spent amounts come from configured prices.">Provider-reported</TooltipText>: <span className={u.num}>{formatMicroUsd(providerCost)}</span></p>}
   </Stack>;
 }
 /** Compact per-record meter evidence: only observed counters, "Not reported" when none were. */

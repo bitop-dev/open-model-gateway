@@ -233,7 +233,7 @@ describe("price display and read-only access", () => {
   it("shows meter totals and provider-reported cost as evidence, never as the charge", () => {
     const withMeters = { ...report, meter_usage: { output_images: "12", input_characters: "1234567", input_audio_seconds_ms: "61500", output_audio_seconds_ms: null, search_units: "3", requests: "40" }, provider_reported_cost_microusd: "420000", cost_components: { ...report.cost_components, output_images_microusd: "246000" } };
     const html = markup(<AccountingReport report={withMeters} />);
-    for (const text of ["Media and unit meters", "Images generated", "1,234,567", "1 min 1.5 s", "Provider-reported (for checking only)", "$0.42", "never billed", "$0.246"]) expect(html).toContain(text);
+    for (const text of ["Media and unit meters", "Images generated", "1,234,567", "1 min 1.5 s", "Provider-reported", "$0.42", "An OpenRouter video is charged this figure", "never billed", "$0.246"]) expect(html).toContain(text);
     expect(html).toContain("Unknown"); // unobserved audio output
     expect(markup(<AccountingReport report={report} />)).not.toContain("Provider-reported");
     expect(meterSummary({ meter_usage: { output_images: "2", input_characters: null, input_audio_seconds_ms: null, output_audio_seconds_ms: null, search_units: null, requests: "1" }, output_image_variant: "1024x1024" })).toBe("2 images (1024x1024) · 1 request");

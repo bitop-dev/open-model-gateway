@@ -11,8 +11,9 @@
 //!   (`:free`) endpoints may train on prompts and are unavailable under deny
 //!   (upstream 404 → `upstream_rejected`).
 //! - `usage.cost` is captured from the JSON number's source text as exact
-//!   micro-USD (rounded up) for `provider_cost_microusd` evidence only; it is
-//!   never the gateway charge.
+//!   micro-USD (rounded up) for `provider_cost_microusd` evidence; it is never
+//!   the gateway charge, except for a video (`openrouter::video`), which
+//!   reports its cost and no duration.
 //! - Chat: OpenRouter-only fields (`native_finish_reason`, reasoning traces)
 //!   are normalized away. The `reasoning` text reaches only Messages clients
 //!   (as unsigned thinking); `reasoning_details` is never returned. Reasoning
@@ -239,13 +240,8 @@ impl OpenRouterAdapter {
         let body = serde_json::to_vec(body).map_err(|_| InferenceError::InvalidRequest)?;
         self.post_inner(target, path, body, false).await
     }
-    async fn post_inner(
-        &self,
-        target: &Deployment,
-        path: &str,
-        body: Vec<u8>,
-        messages: bool,
-    ) -> Result<reqwest::Response> {
+    /// The connection checked, then its credential as a Bearer header.
+    fn authorization(&self, target: &Deployment) -> Result<HeaderValue> {
         if target.provider != self.id()
             || !target.credential_ref.starts_with("env:")
             || target
@@ -261,19 +257,47 @@ impl OpenRouterAdapter {
         let mut auth = HeaderValue::from_str(&format!("Bearer {}", secret.expose()))
             .map_err(|_| InferenceError::Configuration)?;
         auth.set_sensitive(true);
-        let mut builder = self
-            .client
-            .post(format!("{}{path}", self.base))
-            .header(header::AUTHORIZATION, auth)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(body);
+        Ok(auth)
+    }
+    /// The server-configured attribution headers.
+    fn attributed(&self, mut builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         if let Some(referer) = &self.config.http_referer {
             builder = builder.header("HTTP-Referer", referer.clone());
         }
         if let Some(title) = &self.config.title {
             builder = builder.header("X-Title", title.clone());
         }
-        let response = builder.send().await.map_err(transport)?;
+        builder
+    }
+    /// Validate the connection before resolving credentials, then GET; a
+    /// non-success status is its class, its body never read.
+    async fn get(&self, target: &Deployment, path: &str) -> Result<reqwest::Response> {
+        let auth = self.authorization(target)?;
+        let builder = self
+            .client
+            .get(format!("{}{path}", self.base))
+            .header(header::AUTHORIZATION, auth);
+        let response = self.attributed(builder).send().await.map_err(transport)?;
+        if !response.status().is_success() {
+            return Err(status_error(response.status().as_u16()));
+        }
+        Ok(response)
+    }
+    async fn post_inner(
+        &self,
+        target: &Deployment,
+        path: &str,
+        body: Vec<u8>,
+        messages: bool,
+    ) -> Result<reqwest::Response> {
+        let auth = self.authorization(target)?;
+        let builder = self
+            .client
+            .post(format!("{}{path}", self.base))
+            .header(header::AUTHORIZATION, auth)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body);
+        let response = self.attributed(builder).send().await.map_err(transport)?;
         if !response.status().is_success() {
             let code = response.status().as_u16();
             // Keep this provider's status meanings (notably account credit,
@@ -486,6 +510,45 @@ impl ProviderAdapter for OpenRouterAdapter {
         images::supports(request)
     }
 
+    fn supports_video_request(
+        &self,
+        target: &Deployment,
+        request: &crate::jobs::types::VideoRequest,
+    ) -> bool {
+        video::supports(target, request)
+    }
+    async fn create_video(
+        &self,
+        target: &Deployment,
+        request: crate::jobs::types::VideoRequest,
+    ) -> Result<crate::jobs::types::UpstreamVideo> {
+        video::create(self, target, &request).await
+    }
+    async fn retrieve_video(
+        &self,
+        target: &Deployment,
+        video: &crate::jobs::types::UpstreamId,
+    ) -> Result<crate::jobs::types::UpstreamVideo> {
+        video::retrieve(self, target, video).await
+    }
+    /// OpenRouter offers no delete: its copy stays until its own expiry.
+    async fn delete_video(
+        &self,
+        target: &Deployment,
+        _video: &crate::jobs::types::UpstreamId,
+    ) -> Result<crate::jobs::types::VideoDeletion> {
+        self.authorization(target)?;
+        Ok(crate::jobs::types::VideoDeletion::NotOffered)
+    }
+    async fn video_content(
+        &self,
+        target: &Deployment,
+        video: &crate::jobs::types::UpstreamId,
+        asset: crate::jobs::types::VideoAsset,
+    ) -> Result<crate::jobs::types::ContentStream> {
+        video::content(self, target, video, asset).await
+    }
+
     async fn execute_images(
         &self,
         target: &Deployment,
@@ -659,3 +722,4 @@ use chat::{decode_chat, decode_chat_stream, messages_controls, require_parameter
 mod images;
 #[cfg(test)]
 mod tests;
+mod video;

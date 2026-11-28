@@ -110,12 +110,13 @@ describe("Add model form", () => {
     expect(protocolSupported("responses", undefined)).toBe(true); expect(protocolSupported("responses", "future-profile")).toBe(true);
     expect(workloadGroups.filter(g => workloadSupported(g.workload, "anthropic")).map(g => g.label)).toEqual(["Text"]);
     expect(workloadGroups.filter(g => !workloadSupported(g.workload, "openai")).map(g => g.label)).toEqual(["Rerank", "System One", "Video"]);
-    // Video: only OpenAI-compatible connections serve it (OpenAI's own Videos API shut down 2026-09-24).
+    // Video: OpenRouter and OpenAI-compatible connections serve it (OpenAI's own Videos API shut down 2026-09-24).
     expect(protocolSupported("videos", "openai_compatible")).toBe(true); expect(protocolSupported("videos", undefined)).toBe(true);
-    for (const profile of ["openai", "openrouter", "anthropic", "vllm"]) expect(workloadDisabledReason("videos", profile, "OpenAI")).toBe("Not available on OpenAI");
+    expect(protocolSupported("videos", "openrouter")).toBe(true);
+    for (const profile of ["openai", "anthropic", "vllm"]) expect(workloadDisabledReason("videos", profile, "OpenAI")).toBe("Not available on OpenAI");
     expect(workloadDisabledReason("videos", "openai_compatible", "Video server")).toBeUndefined();
     expect(workloadDisabledReason("rerank", "openai", "OpenAI")).toBe("Not available on OpenAI"); expect(workloadDisabledReason("batches", "openai", "OpenAI")).toBeUndefined();
-    expect(workloadGroups.filter(g => !workloadSupported(g.workload, "openrouter")).map(g => g.label)).toEqual(["Realtime audio", "Video", "Batch"]);
+    expect(workloadGroups.filter(g => !workloadSupported(g.workload, "openrouter")).map(g => g.label)).toEqual(["Realtime audio", "Batch"]);
     // Local profiles: rerank where the server has a rerank API, System One where it serves TypeSafe's route.
     const local = (profile: string) => workloadGroups.filter(g => workloadSupported(g.workload, profile)).map(g => g.label);
     expect(local("openai_compatible")).toEqual(["Text", "Embeddings", "Rerank", "System One", "Video"]);

@@ -444,6 +444,18 @@ pub struct UpstreamVideo {
     pub completed_at: Option<i64>,
     pub expires_at: Option<i64>,
     pub error: Option<ErrorCode>,
+    /// The provider's own cost of the video, for a provider whose video
+    /// charge is its reported figure (OpenRouter); `None` for a provider
+    /// billed at the route's rate for the seconds it reports.
+    pub cost: Option<ReportedCost>,
+}
+/// A provider's reported cost of a video.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReportedCost {
+    /// Exact micro-USD (more than six decimals rounded up).
+    Known(i64),
+    /// Absent, null, negative, unparseable or out of range: never a zero.
+    Unknown,
 }
 
 // ---------------------------------------------------------------- Batch ----

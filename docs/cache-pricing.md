@@ -111,6 +111,6 @@ The rule only applies to new publications. Earlier prices that omit a meter are 
 
 `GET .../prices` adds `price_lines`, `max_units`, `display_lines` and `display_summary`, computed from integers (for example `$0.10/M input tokens`, `$0.0205/image (768)`, `$15/M characters`, `$0.20/minute`). A zero rate always reads `Requests: Free` (`Output images: Free (1K)`), never `$0/request`. Whole dollars omit decimals; otherwise at least two decimals without trailing zeros.
 
-`provider_cost_microusd` (for example OpenRouter `usage.cost`, rounded up to micro-USD) is stored as evidence only and never used as the charge.
+`provider_cost_microusd` (for example OpenRouter `usage.cost`, rounded up to micro-USD) is stored as evidence only and never used as the charge, except for an OpenRouter video, which reports its cost and no duration: that figure is the video's charge, recorded as its video-seconds component with the ledger evidence `provider_reported_cost` (see [async jobs](async-jobs.md)).
 
 Unresolved attempts retain original/grown holds. A known floor cannot shrink a hold or clear `unbounded_cost`. Failed/cancelled usage is not automatically a settled bill. Evidence refinement must preserve every existing raw/normalized counter and use the pinned price. See [governance](governance.md), [governance API](governance-api.md) and [cost reporting](cost-reporting.md).

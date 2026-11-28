@@ -43,6 +43,7 @@ pub const PROFILES: &[(&str, &[P])] = &[
             P::Images,
             P::AudioTranscriptions,
             P::AudioSpeech,
+            P::Videos,
         ],
     ),
     // Local profiles: Jina/Cohere rerank on compatible and vLLM servers,
@@ -183,14 +184,14 @@ mod tests {
             let distinct: BTreeSet<_> = protocols.iter().map(|p| p.as_str()).collect();
             assert_eq!(distinct.len(), protocols.len(), "{id}");
         }
-        // Video: only OpenAI-compatible connections (OpenAI's own Videos API
-        // shut down on 2026-09-24).
+        // Video: OpenRouter and OpenAI-compatible connections (OpenAI's own
+        // Videos API shut down on 2026-09-24).
         let video: Vec<_> = PROFILES
             .iter()
             .filter(|(_, p)| p.contains(&P::Videos))
             .map(|(id, _)| *id)
             .collect();
-        assert_eq!(video, ["openai_compatible"]);
+        assert_eq!(video, ["openrouter", "openai_compatible"]);
     }
 
     #[test]

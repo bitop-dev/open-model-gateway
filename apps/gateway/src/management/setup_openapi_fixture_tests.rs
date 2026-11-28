@@ -973,8 +973,9 @@ async fn seed_attempt(
     id
 }
 /// A route inserted as an earlier release accepted it (route validation did not
-/// exist): used only for the `videos` route, which no connection profile serves
-/// any more, so the API refuses to create it.
+/// exist), on a connection that may not serve it, so the API would refuse it:
+/// a `videos` route without video options, and a `realtime` route on an
+/// OpenRouter connection.
 async fn legacy_route(
     pool: &PgPool,
     provider: Uuid,
@@ -1280,9 +1281,10 @@ async fn slice3_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
     // A setup without a price publishes none (price_id null).
     let unpriced_setup = j.request("POST", "/api/v1/platform/model-setup", Some(json!({"model":{"public_name":"contract/third","display_name":"Third model","enabled":true},"route":{"provider_connection_id":provider,"upstream_model":"contract/third","enabled":true}}))).await;
     assert!(unpriced_setup["price_id"].is_null());
-    // Chat without any catalog data, created through the API; and one legacy
-    // video route (no profile serves videos any more, so it can only be seeded)
-    // that also anchors the telemetry.
+    // Chat without any catalog data, created through the API; one legacy video
+    // route (without video options, so it can only be seeded) that also
+    // anchors the telemetry; and a legacy realtime route on the OpenRouter
+    // connection, which does not serve it.
     let (_, bare) = api_route(
         &mut j,
         provider,
@@ -1291,12 +1293,20 @@ async fn slice3_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
         "contract/bare",
     )
     .await;
-    let (legacy_model, anchor) = legacy_route(
+    let (_, anchor) = legacy_route(
         &pool,
         provider,
         "contract/legacy-video",
         &["videos"],
         "contract/legacy",
+    )
+    .await;
+    let (legacy_model, _) = legacy_route(
+        &pool,
+        provider,
+        "contract/legacy-realtime",
+        &["realtime"],
+        "contract/legacy-realtime",
     )
     .await;
     // A route on a regional (Bedrock) connection: the deployment shows its region.
@@ -4081,6 +4091,15 @@ async fn slice3_fixtures(pool: PgPool, shard: usize) -> PositiveFixtures {
         .await;
     }
     // Prices: rate bounds, the pair limit, line rules and counts, label controls.
+    // The model PATCH vectors above leave the target model on whichever
+    // protocol they tried last that its OpenRouter route serves (videos, now
+    // that OpenRouter serves video): the price vectors run on an image model.
+    j.request(
+        "PATCH",
+        &format!("/api/v1/platform/models/{vmodel}"),
+        Some(json!({"supported_protocols":["images"]})),
+    )
+    .await;
     let prices_template = "/api/v1/platform/deployments/{deployment}/prices";
     let prices = format!("/api/v1/platform/deployments/{vdep}/prices");
     let line_of = |meter: &str, amount: &str| json!({"meter":meter,"microusd_per_batch":amount,"batch":1_000_000,"unit_label":"/M tokens","sku_label":"Rate"});

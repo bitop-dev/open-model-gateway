@@ -736,6 +736,8 @@ mod batch_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 pub(crate) mod db_tests;
 #[cfg(all(test, feature = "integration-tests"))]
+mod provider_cost_tests;
+#[cfg(all(test, feature = "integration-tests"))]
 mod schedule_db_tests;
 #[cfg(test)]
 mod tests;

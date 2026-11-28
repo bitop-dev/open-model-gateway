@@ -38,7 +38,7 @@ See [realtime](#realtime-audio) below and [realtime](realtime.md).
 | --- | --- | --- |
 | `openai` | **No longer offered.** OpenAI shut down the Sora 2 models and the Videos API on 2026-09-24. The `sora-*` wire code remains only for jobs created before then | OpenAI Batch: chat-like lines as Chat Completions, embeddings as Embeddings; the gateway uploads its copy, collects results into gateway files and deletes the provider's files |
 | `anthropic` | No | Message Batches for Chat Completions, Responses and Messages lines |
-| `openrouter` | Planned: an OpenRouter video adapter (another API shape) | No (no Batch API): gateway-run |
+| `openrouter` | **Yes** (#52): OpenRouter's own video API; each route states the lengths and sizes it accepts. The charge is OpenRouter's reported cost (seconds are not reported); the video only, no thumbnail or spritesheet, and no delete | No (no Batch API): gateway-run |
 | `openai_compatible` | **Yes:** any server of the OpenAI video contract on an approved connection (#52); each route states the lengths and sizes it accepts | No: gateway-run |
 | Others | No | No: gateway-run |
 

@@ -90,7 +90,7 @@ function ReportRunView({ workspace, schedule, run }: { workspace?: Workspace; sc
 }
 function AggregateValues({ totals }: { totals: Aggregate }) {
   return <StatTileGrid columns={3}>
-    <StatTile label="Settled configured-rate estimate" value={formatMicroUsd(totals.known_cost_microusd)} />
+    <StatTile label="Settled estimate" value={formatMicroUsd(totals.known_cost_microusd)} />
     <StatTile label="Held floor" value={formatMicroUsd(totals.held_microusd)} />
     {(["attempts", "unresolved_attempts", "root_requests"] as const).map(key => <StatTile key={key} label={aggregateMeasureLabel(key)} value={countOrUnavailable(totals[key])} />)}
   </StatTileGrid>;

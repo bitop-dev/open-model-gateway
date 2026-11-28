@@ -8,8 +8,7 @@ use super::{store::Observation, *};
 use crate::inference::{types::WorkloadKind, workload::OutputReservation};
 
 /// `POST /v1/videos` when no adapter offers video generation.
-pub const NO_VIDEO_PROVIDER: &str =
-    "Video generation needs a route on a provider connection that serves the OpenAI video contract";
+pub const NO_VIDEO_PROVIDER: &str = "Video generation needs a route on a provider connection that serves video (OpenRouter, or a server of the OpenAI video contract)";
 pub(super) const VIDEO_PRICE_MISSING: &str = "This route has no video rate for this request (a Platform Admin must price its video seconds for every size it may produce)";
 
 fn observation(v: &UpstreamVideo) -> Observation<'_> {
@@ -47,6 +46,28 @@ pub(crate) fn settlement(
     use crate::governance::ReportedSizeRate as Rate;
     let requested = job.video_seconds.and_then(|s| u32::try_from(s).ok())?;
     match v.state {
+        // A provider that reports its cost and no duration (OpenRouter): the
+        // charge is that figure (`governance::settlement` checks it against
+        // the route's rates and the hold), at the admitted size; the length
+        // is recorded unknown (never the requested one as observed), and an
+        // unknown cost keeps the hold.
+        JobState::Completed if v.cost.is_some() => Some(Settlement {
+            outcome: Outcome::Succeeded,
+            error: None,
+            usage: Usage {
+                meters: Some(video_meters(None)),
+                output_image_variant: job
+                    .video_size
+                    .as_deref()
+                    .and_then(crate::billing::MeterVariant::new),
+                provider_cost_microusd: match v.cost {
+                    Some(ReportedCost::Known(cost)) => Some(cost),
+                    _ => None,
+                },
+                provider_cost_is_charge: true,
+                ..Usage::default()
+            },
+        }),
         JobState::Completed => {
             let named = job.video_size.as_deref();
             let reported_size = v.size.as_ref().map(|s| s.as_str());

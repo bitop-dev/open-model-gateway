@@ -150,7 +150,7 @@ export function upstreamPlaceholder(profile?: string, workload: WorkloadKind = "
     rerank: { vllm: "BAAI/bge-reranker-v2-m3", sglang: "BAAI/bge-reranker-v2-m3", openai_compatible: "jina-reranker-v3", default: "cohere/rerank-v3.5" },
     systemone: { ollama: "nimble", openai_compatible: "openjev-latest", default: "typesafe/jev" },
     realtime: { default: "gpt-realtime" },
-    videos: { default: "sora-2" },
+    videos: { openrouter: "openai/sora-2", default: "sora-2" },
     batches: { default: "gpt-4.1-mini" },
   };
   const text: Record<string, string> = { openai: "gpt-4.1-mini", anthropic: "claude-sonnet-4-5", bedrock: "anthropic.claude-3-5-sonnet-20240620-v1:0", openrouter: "openai/gpt-4.1-mini", ollama: "llama3.1:8b", vllm: "meta-llama/Llama-3.1-8B-Instruct", sglang: "meta-llama/Llama-3.1-8B-Instruct", openai_compatible: "meta-llama/Llama-3.1-8B-Instruct", default: "gpt-4.1-mini" };
@@ -338,9 +338,9 @@ export const protocolProfiles: Record<ModelProtocol, string[]> = {
   rerank: ["openai_compatible", "vllm", "sglang", "openrouter"],
   systemone: ["openai_compatible", "ollama", "openrouter"],
   realtime: ["openai"],
-  // Async jobs (docs/async-jobs.md). Video: any server of the OpenAI video contract on an approved
-  // OpenAI-compatible connection (#52); OpenAI's own origin shut down its Videos API on 2026-09-24.
-  videos: ["openai_compatible"],
+  // Async jobs (docs/async-jobs.md). Video: OpenRouter, and any server of the OpenAI video contract on an
+  // approved OpenAI-compatible connection (#52); OpenAI's own origin shut down its Videos API on 2026-09-24.
+  videos: ["openrouter", "openai_compatible"],
   batches: ["openai"],
 };
 

@@ -36,6 +36,20 @@ Notes for changes on `main` after [v0.20.0](v0.20.0.md). They become the next re
 
 - **What a rule does with content it cannot read (#841, migration 0100).** Unchanged by default: a Block rule keeps `uninspectable: deny`, so a request with an image, audio or a document that isn't plain text is still refused with `guardrail_not_supported` after its text is checked, and existing rules are not rewritten. New: `uninspectable: allow` on a rule lets such a request through unread, the text beside an image still checked and blocked on a match, recorded as `skipped` ("Not readable · let through" in the monthly totals, "Let through unread" on the request page). A native batch is still refused by a Block rule under either value: its lines are text a gateway-run batch reads. New: a rule may name the `images`, `audio_transcriptions` and `realtime` workloads, which this release never reads; a Block rule naming them refuses every request of that workload with `guardrail_not_supported` before admission (a realtime session before the WebSocket upgrade), and with `allow` they pass unread and record `skipped`; a realtime session's decisions are recorded with operation `realtime`. Rules that name only generation and embeddings, every rule written before, change nothing for these workloads. `allow` is the weaker value: a workspace's tightening may move a platform rule from `allow` to `deny`, never back (`403 guardrail_loosen_not_allowed`), and composition takes `deny`. Every decision now records its rule's own verdict (`refuses`), and the monthly totals split not readable decisions by it (`refuses`, null on other rows). The rule dialog says before saving when a Block rule would refuse every request of a workload for every workspace its layer reaches. [Content a rule cannot read](../guardrails-design.md#content-a-rule-cannot-read-841)
 
+- **OpenRouter video** (#52, part 2). `/v1/videos` is served on `openrouter` connections, through OpenRouter's own video API, on routes with video options and a video-seconds rate (for the hold).
+  - **What is sent:** the length is always sent, the size only when named.
+  - **Output:** the finished video is stored like any other. There is no thumbnail or spritesheet, and no delete at OpenRouter, so a delete leaves its copy until its own expiry.
+  - **The charge is OpenRouter's reported cost** (`usage.cost`), since it reports no duration: an estimate like every other price.
+    - It is read from the number's text exactly, rounded up to the micro-USD, and recorded with ledger evidence `provider_reported_cost`.
+    - An absent or unreadable cost, or zero on a paid route, keeps the hold as unknown.
+    - A cost above the hold settles as reported and is marked `unbounded_cost`.
+    - On a route whose price prices tokens, the video stays unknown with its hold, as on every video route: mark a video route's token lines not applicable.
+    - An operator resolving an unknown OpenRouter video values it at the route's rates from the seconds recorded, never at a figure entered by hand.
+  - **How a job ended:** `failed`, `cancelled` and `expired` end it as failed, with the error code `upstream_failed`, `upstream_cancelled` or `upstream_expired`.
+  - **Reports and the usage pages** still call the basis `configured_rate_estimate`; the provider-reported column and note now say an OpenRouter video is charged that figure.
+  - Mock-tested only; no live or paid OpenRouter video call was made.
+  - [Provider adapters](../provider-adapters.md#async-jobs-video-batch)
+
 ## Upgrade
 
 - **#52:**

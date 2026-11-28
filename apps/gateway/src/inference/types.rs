@@ -482,8 +482,14 @@ pub struct Usage {
     /// Non-token meters; `None` means no meter observation at all.
     pub meters: Option<crate::billing::MeterUsage>,
     pub output_image_variant: Option<crate::billing::MeterVariant>,
-    /// Provider-reported charge, evidence only; never the gateway charge.
+    /// Provider-reported charge, evidence only; never the gateway charge,
+    /// except where `provider_cost_is_charge` says so.
     pub provider_cost_microusd: Option<i64>,
+    /// The charge is the provider's reported figure, not rate × usage: only
+    /// for a video whose provider reports its cost and no duration
+    /// (OpenRouter, `jobs::video::settlement`), honoured only for a video
+    /// attempt (`governance::settlement::pinned_value`).
+    pub provider_cost_is_charge: bool,
     /// Provider-reported reasoning tokens (a subset of output tokens).
     /// Telemetry only: never charged separately; `None` = not reported.
     pub reasoning_tokens: Option<u64>,

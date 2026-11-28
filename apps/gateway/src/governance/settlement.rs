@@ -1,5 +1,6 @@
 //! Settlement of one attempt: the reservation row, usage evidence, valuation
 //! under the pinned price, and the ledger entry.
+use super::provider_figure::{PROVIDER_REPORTED_COST, charges_nothing, provider_figure};
 use super::*;
 use gateway_datetime_compat::UtcInstant;
 #[derive(sqlx::FromRow)]
@@ -134,6 +135,8 @@ pub(super) struct Valuation {
     pub(super) floor: Option<i64>,
     pub(super) components: Option<CostBreakdown>,
     pub(super) violated: bool,
+    /// `actual` is the provider's reported figure (`provider_figure`).
+    pub(super) provider_figure: bool,
 }
 /// A finite hold must cover every category still possible under the inclusive
 /// ceiling. Unknown-rate categories are possible whenever capacity remains;
@@ -231,6 +234,7 @@ pub(super) async fn pinned_value(
         floor: None,
         components: None,
         violated,
+        provider_figure: false,
     };
     let Some(id) = r.price_id else {
         return Ok(unresolved(false));
@@ -353,6 +357,16 @@ pub(super) async fn pinned_value(
     let output_bound = r.reserved_tokens.and_then(|n| n.checked_sub(input_bound));
     value.violated |= observed_input > input_bound as u64
         || output_bound.is_some_and(|limit| usage.output_tokens.is_some_and(|n| n > limit as u64));
+    if usage.provider_cost_is_charge {
+        // Only a video's provider reports the charge itself; anything else
+        // claiming to is not valued.
+        if r.workload_kind != WorkloadKind::Videos.as_str() || p.pricing_version != 3 {
+            return Ok(unresolved(value.violated));
+        }
+        let (lines, max) = p.lines()?;
+        let free = charges_nothing(&lines, &max, usage).map_err(|_| InferenceError::Storage)?;
+        return Ok(provider_figure(free, usage.provider_cost_microusd));
+    }
     Ok(value)
 }
 #[allow(clippy::too_many_arguments)]
@@ -605,6 +619,28 @@ enum Finished {
         output: Option<i64>,
     },
 }
+/// Whether a provider's reported figure is above the reservation's hold: it
+/// settles as reported and is marked unbounded, as usage above a price's
+/// ceiling is. No hold (an unbounded price) is no ceiling: unbounded already.
+async fn figure_above_hold(
+    tx: &mut Tx<'_>,
+    execution: Uuid,
+    admitted_at: UtcInstant,
+    value: &Valuation,
+) -> Result<bool, InferenceError> {
+    let (true, Some(cost)) = (value.provider_figure, value.actual) else {
+        return Ok(false);
+    };
+    let held: Option<i64> = sqlx::query_scalar(
+        "SELECT held_microusd FROM governance_reservations WHERE execution_id=$1 AND admitted_at=$2",
+    )
+    .bind(execution)
+    .bind(admitted_at)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(storage)?;
+    Ok(held.is_none_or(|held| cost > held))
+}
 async fn finish_unobserved(
     store: &Store,
     record: &ExecutionFinish,
@@ -676,7 +712,13 @@ async fn finish_unobserved(
             Finished::Conflict
         });
     }
-    let value = pinned_value(&mut tx, &r, usage).await?;
+    let mut value = pinned_value(&mut tx, &r, usage).await?;
+    value.violated |= figure_above_hold(&mut tx, record.id, r.admitted_at, &value).await?;
+    let evidence = value.provider_figure.then_some(PROVIDER_REPORTED_COST);
+    // A settled row records its token counts (`reservation_settled_usage`):
+    // a video has them (zero) only when its price marks tokens not
+    // applicable, so on a price that prices tokens a video stays unknown,
+    // a provider's figure too.
     let complete = record.outcome == Outcome::Succeeded && input.is_some() && output.is_some();
     let floor = value.floor;
     let (actual, components, violated) = terminal_amount(value, complete, free, unsent);
@@ -695,12 +737,12 @@ async fn finish_unobserved(
     // execution was still running; anything else fails and rolls back.
     let (executions, reservations, entries): (i64, i64, i64) = sqlx::query_as("WITH e AS (UPDATE inference_executions SET state=$2,error_code=$3,input_tokens=$4,output_tokens=$5,billing_usage=$6,elapsed_ms=$7,completed_at=clock_timestamp(),meter_usage=$8,output_image_variant=$9,provider_cost_microusd=$10,finish_reason=$11,time_to_first_token_ms=$12,generation_ms=$13,reasoning_tokens=$14,reported_upstream_model=$15 WHERE id=$1 AND started_at=$16 AND state='started' RETURNING 1),
       r AS (UPDATE governance_reservations SET state=$17,actual_microusd=$18,input_tokens=$4,output_tokens=$5,billing_usage=$6,cost_components=$19,held_microusd=CASE WHEN $20::bigint IS NULL THEN held_microusd ELSE greatest(held_microusd,$20) END,unbounded_cost=unbounded_cost OR $21,meter_usage=$8,output_image_variant=$9,provider_cost_microusd=$10 WHERE execution_id=$1 AND admitted_at=$16 AND EXISTS(SELECT 1 FROM e) RETURNING 1),
-      l AS (INSERT INTO monetary_ledger(id,execution_id,kind,amount_microusd,input_tokens,output_tokens,billing_usage,cost_components,evidence,meter_usage,output_image_variant,provider_cost_microusd,admitted_at) SELECT $22,$1,$23,$24,$4,$5,$6,$19,NULL,$8,$9,$10,$16 WHERE EXISTS(SELECT 1 FROM r) RETURNING 1)
+      l AS (INSERT INTO monetary_ledger(id,execution_id,kind,amount_microusd,input_tokens,output_tokens,billing_usage,cost_components,evidence,meter_usage,output_image_variant,provider_cost_microusd,admitted_at) SELECT $22,$1,$23,$24,$4,$5,$6,$19,$25,$8,$9,$10,$16 WHERE EXISTS(SELECT 1 FROM r) RETURNING 1)
       SELECT (SELECT count(*) FROM e),(SELECT count(*) FROM r),(SELECT count(*) FROM l)")
         .bind(record.id).bind(record.outcome.as_str()).bind(record.error.map(|e|e.code())).bind(input).bind(output).bind(&billing).bind(record.elapsed_ms.min(i64::MAX as u64)as i64).bind(&m.meters).bind(&m.variant).bind(m.provider_cost)
         .bind(telemetry.finish_reason.map(|f|f.as_str())).bind(ms(telemetry.time_to_first_token_ms)).bind(ms(telemetry.generation_ms)).bind(reasoning).bind(&reported_model).bind(r.admitted_at)
         .bind(if actual.is_some(){"settled"}else{"unknown"}).bind(actual).bind(components.map(|c|c.to_value())).bind(floor.filter(|_|actual.is_none())).bind(violated)
-        .bind(Uuid::now_v7()).bind(if actual.is_some(){"settlement"}else{"unknown"}).bind(actual.or(floor))
+        .bind(Uuid::now_v7()).bind(if actual.is_some(){"settlement"}else{"unknown"}).bind(actual.or(floor)).bind(evidence.filter(|_| actual.is_some()))
         .fetch_one(&mut *tx).await.map_err(storage)?;
     if (executions, reservations, entries) != (1, 1, 1) {
         return Err(InferenceError::Storage);

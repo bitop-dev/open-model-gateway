@@ -8,7 +8,7 @@ use crate::{jobs::types::UpstreamId, store::Store};
 /// URL of its connection (see [`record_video_upstream`]).
 macro_rules! upstream_account {
     ($j:literal) => {
-        concat!("(SELECT CASE WHEN p.provider='openai' THEN 'https://api.openai.com/v1' ELSE coalesce(nullif(rtrim(p.endpoint,'/'),''),'provider:'||p.provider) END FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id WHERE d.id=", $j, ".deployment_id)")
+        concat!("(SELECT CASE WHEN p.provider='openai' THEN 'https://api.openai.com/v1' WHEN p.provider='openrouter' THEN 'https://openrouter.ai/api/v1' ELSE coalesce(nullif(rtrim(p.endpoint,'/'),''),'provider:'||p.provider) END FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id WHERE d.id=", $j, ".deployment_id)")
     };
 }
 #[cfg(all(test, feature = "integration-tests"))]
@@ -134,6 +134,12 @@ mod tests {
                 Some("https://api.openai.com/v1/"),
                 "env:OPENAI_OTHER",
             ),
+            ("openrouter", None, "env:OPENROUTER_API_KEY"),
+            (
+                "openrouter",
+                Some("https://openrouter.ai/api/v1"),
+                "env:OPENROUTER_OTHER",
+            ),
         ] {
             let (connection, route) = (Uuid::new_v4(), Uuid::new_v4());
             sqlx::query("INSERT INTO provider_connections(id,name,provider,credential_ref,endpoint,enabled) VALUES($1,$2,$3,$4,$5,true)")
@@ -162,7 +168,9 @@ mod tests {
                 base,
                 "http://gpu.internal:9000/v1",
                 "https://api.openai.com/v1",
-                "https://api.openai.com/v1"
+                "https://api.openai.com/v1",
+                "https://openrouter.ai/api/v1",
+                "https://openrouter.ai/api/v1"
             ]
         );
     }

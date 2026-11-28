@@ -121,6 +121,7 @@ pub(in crate::providers::openai) fn parse_video(value: &Value) -> Result<Upstrea
         completed_at: timestamp(&value["completed_at"]),
         expires_at: timestamp(&value["expires_at"]),
         error,
+        cost: None,
     })
 }
 

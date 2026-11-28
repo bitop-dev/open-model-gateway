@@ -2372,6 +2372,7 @@ mod jobs_fake {
             completed_at: None,
             expires_at: None,
             error: None,
+            cost: None,
         }
     }
     fn answer() -> ChatResponse {

@@ -121,7 +121,7 @@
             }
           }
         },
-        "description": "Inference-key scoped video objects (servers of the OpenAI video contract on openai_compatible connections; jobs created before OpenAI shut down its Videos API stay readable). The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
+        "description": "Inference-key scoped video objects (servers of the OpenAI video contract on openai_compatible connections, and OpenRouter; jobs created before OpenAI shut down its Videos API stay readable). The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
         "parameters": [
           {
             "in": "query",
@@ -329,7 +329,7 @@
             }
           }
         },
-        "description": "Inference-key scoped video jobs on servers of the OpenAI video contract (openai_compatible connections). The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
+        "description": "Inference-key scoped video jobs on servers of the OpenAI video contract (openai_compatible connections) and OpenRouter. The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
         "x-omg-refusals": [
           {
             "status": 400,
@@ -491,7 +491,7 @@
             }
           }
         },
-        "description": "Inference-key scoped video objects (servers of the OpenAI video contract on openai_compatible connections; jobs created before OpenAI shut down its Videos API stay readable). The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
+        "description": "Inference-key scoped video objects (servers of the OpenAI video contract on openai_compatible connections, and OpenRouter; jobs created before OpenAI shut down its Videos API stay readable). The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
         "x-omg-refusals": [
           {
             "status": 404,
@@ -623,7 +623,7 @@
             }
           }
         },
-        "description": "Inference-key scoped video objects (servers of the OpenAI video contract on openai_compatible connections; jobs created before OpenAI shut down its Videos API stay readable). The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
+        "description": "Inference-key scoped video objects (servers of the OpenAI video contract on openai_compatible connections, and OpenRouter; jobs created before OpenAI shut down its Videos API stay readable). The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
         "x-omg-refusals": [
           {
             "status": 404,
@@ -836,7 +836,7 @@
             }
           }
         },
-        "description": "Inference-key scoped video objects (servers of the OpenAI video contract on openai_compatible connections; jobs created before OpenAI shut down its Videos API stay readable). The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
+        "description": "Inference-key scoped video objects (servers of the OpenAI video contract on openai_compatible connections, and OpenRouter; jobs created before OpenAI shut down its Videos API stay readable). The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
         "x-omg-binary-stream": {
           "late_error": "truncated",
           "positive_requires": "clean transport EOF"

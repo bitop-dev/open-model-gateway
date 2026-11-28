@@ -265,6 +265,7 @@ pub(crate) fn upstream_video(state: JobState, seconds: Option<u32>) -> UpstreamV
         completed_at: None,
         expires_at: None,
         error: None,
+        cost: None,
     }
 }
 async fn lease(f: &Fixture, id: Uuid) -> gateway_datetime_compat::UtcInstant {

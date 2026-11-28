@@ -95,7 +95,7 @@ describe("route order and data policy", () => {
   });
   it("documents every protocol and which adapters carry it", () => {
     for (const p of Object.keys(protocolEndpoints) as (keyof typeof protocolEndpoints)[]) { expect(protocolEndpoints[p].path).toMatch(/^\/v1\//); expect(protocolProfiles[p].length).toBeGreaterThan(0); }
-    expect(protocolProfiles.videos).toEqual(["openai_compatible"]);
+    expect(protocolProfiles.videos).toEqual(["openrouter", "openai_compatible"]);
     expect(protocolEndpoints.messages.headers.map(h => h.name)).toContain("anthropic-version");
     expect(protocolProfiles.responses).toEqual(["openai"]);
   });

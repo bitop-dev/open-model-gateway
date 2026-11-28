@@ -258,6 +258,8 @@ mod policy;
 pub mod pressure;
 /// Price versions, bounds and cost arithmetic.
 mod pricing;
+/// A video charged its provider's reported cost (OpenRouter, #52).
+mod provider_figure;
 /// Maintained per-scope, per-minute rate and in-flight counters.
 pub mod rates;
 /// Expired-lease and evidence-backed reconciliation.
