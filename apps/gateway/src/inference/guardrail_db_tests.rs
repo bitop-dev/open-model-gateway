@@ -334,10 +334,15 @@ async fn a_personal_data_rule_looks_for_its_kinds_only(pool: PgPool) {
     type_default_with(&w, "block", "{personal_data}", &[], &["card"]).await;
     let hits = w.hits.load(Ordering::SeqCst);
     let (status, _, body) = send(&w, "/v1/chat/completions", chat).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    // The response to a request that held a card: asserted without
+    // printing it.
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["code"], "guardrail_input_blocked");
     assert_eq!(body["error"]["guardrail"]["category"], "personal_data");
-    assert!(!body.to_string().contains("4111"), "{body}");
+    assert!(
+        !body.to_string().contains("4111"),
+        "the refusal holds no matched text"
+    );
     assert_eq!(w.hits.load(Ordering::SeqCst), hits, "nothing was sent");
     let blocked: (String, Option<String>, bool) = sqlx::query_as("SELECT action,kind,refused FROM guardrail_events WHERE category='personal_data' AND action='blocked'")
         .fetch_one(&w.f.store.pool)

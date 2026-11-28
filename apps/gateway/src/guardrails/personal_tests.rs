@@ -19,18 +19,29 @@ fn found(text: &str) -> Vec<(Kind, String)> {
 fn kinds_in(text: &str) -> Vec<Kind> {
     found(text).into_iter().map(|(k, _)| k).collect()
 }
+/// What a failed assertion reports: each finding's kind and length, never
+/// the matched text or the text scanned (this module writes neither
+/// anywhere, its tests' messages included). `#[track_caller]` on the
+/// helpers names the case's line.
+fn shape(text: &str) -> Vec<(Kind, usize)> {
+    found(text).into_iter().map(|(k, v)| (k, v.len())).collect()
+}
 #[track_caller]
 fn hit(kind: Kind, value: &str) {
-    for text in [
+    for (case, text) in [
         value.to_owned(),
         format!("see {value} here"),
         format!("\"{value}\","),
         format!("({value})"),
-    ] {
-        assert_eq!(
-            found(&text),
-            [(kind, value.to_owned())],
-            "{kind:?} in {text:?}"
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert!(
+            found(text) == [(kind, value.to_owned())],
+            "{kind:?}: surrounding {case} of a {}-byte value found {:?}",
+            value.len(),
+            shape(text)
         );
     }
 }
@@ -38,8 +49,9 @@ fn hit(kind: Kind, value: &str) {
 fn miss(kind: Kind, text: &str) {
     assert!(
         !kinds_in(text).contains(&kind),
-        "{kind:?} must not match {text:?}: {:?}",
-        found(text)
+        "{kind:?} must not match this {}-byte text; found {:?}",
+        text.len(),
+        shape(text)
     );
 }
 
@@ -77,8 +89,10 @@ fn the_kind_table_matches_the_migration() {
 fn holds(kind: Kind, text: &str, value: &str) {
     assert!(
         found(text).contains(&(kind, value.to_owned())),
-        "{kind:?} {value:?} in {text:?}: {:?}",
-        found(text)
+        "{kind:?}: a {}-byte value not found in this {}-byte text; found {:?}",
+        value.len(),
+        text.len(),
+        shape(text)
     );
 }
 
