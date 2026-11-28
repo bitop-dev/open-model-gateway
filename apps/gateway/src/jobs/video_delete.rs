@@ -4,8 +4,11 @@ use super::*;
 
 impl Jobs {
     /// Delete a finished video. In-progress jobs cannot be deleted (their
-    /// accounting is still open). The gateway's stored output goes first (a
-    /// failure there is an error, never a deletion), then the job is marked
+    /// accounting is still open). The gateway's stored output goes first: a
+    /// database failure there (or a replica without the file store) is an
+    /// error and nothing is deleted; once its row is claimed the copy is
+    /// unreadable, and an object store that fails to remove the object
+    /// leaves it to the file sweeper, the delete going on. Then the job is marked
     /// deleted, which also stops any output being recorded for it (one
     /// recorded since the job was read is claimed for deletion with the mark
     /// and deleted next), then the provider is asked to delete its copy. Once

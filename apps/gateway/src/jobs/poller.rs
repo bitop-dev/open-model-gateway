@@ -283,8 +283,8 @@ impl Jobs {
     /// Run `work` while renewing the claim's lease every `lease.renew`. The
     /// renewal runs beside the work in the same task, so a renewal waiting on
     /// the job row behind one of the work's fenced transactions never keeps
-    /// that transaction from finishing. A refused renewal sets `lost` and the
-    /// work stops at its next safe point; a renewal of a settled batch ends
+    /// that transaction from finishing. A refused renewal, or one that finds
+    /// the job deleted, sets `lost` and the work stops at its next safe point; a renewal of a settled batch ends
     /// the renewals; the work always runs to its end.
     async fn renewing<T>(
         &self,
@@ -302,7 +302,7 @@ impl Jobs {
     }
 
     /// Renew the lease until the claim ended (`lost`) or the batch settled.
-    async fn renew_claim(&self, fence: BatchFence, lease: PollLease, lost: &AtomicBool) {
+    pub(super) async fn renew_claim(&self, fence: BatchFence, lease: PollLease, lost: &AtomicBool) {
         let mut renew =
             tokio::time::interval_at(tokio::time::Instant::now() + lease.renew, lease.renew);
         loop {
@@ -312,6 +312,11 @@ impl Jobs {
                 Ok(Ok(Renewed::Held { .. })) => self.observe_renewal(Renewal::Renewed),
                 Ok(Ok(Renewed::Settled)) => {
                     self.observe_renewal(Renewal::Renewed);
+                    return;
+                }
+                Ok(Ok(Renewed::Deleted)) => {
+                    self.observe_renewal(Renewal::Renewed);
+                    lost.store(true, Ordering::SeqCst);
                     return;
                 }
                 Ok(Ok(Renewed::Fenced)) => {

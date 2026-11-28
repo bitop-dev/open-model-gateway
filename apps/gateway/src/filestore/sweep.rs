@@ -3,7 +3,9 @@
 //! The sweeper removes objects whose file expired (explicit `expires_at` or the
 //! purpose group's current retention), whose deletion is pending, or whose upload
 //! never committed within a day. It also removes public batch results that have
-//! been committed for a day without being linked to a job.
+//! been committed for a day without being linked to a job, and stored video
+//! outputs committed two hours ago that no job names (a copy whose job was
+//! deleted, or whose claim ended, before it was recorded).
 //! Replica-safe without holding row locks across
 //! network I/O: a short transaction claims rows (`last_delete_attempt_at` acts as
 //! a 5-minute lease), the objects are deleted (idempotent), then each row is
@@ -25,6 +27,7 @@ const CANDIDATE_PREFILTER: &str = "(
     (f.committed_at IS NULL AND f.created_at < now()-interval '1 day')
     OR f.expires_at <= now()
     OR (f.api_purpose='batch_output' AND NOT f.batch_result_linked AND f.committed_at < now()-interval '1 day')
+    OR (f.purpose='video_output' AND f.created_at > now()-interval '1 day' AND f.committed_at < now()-interval '2 hours')
     OR (f.purpose IN ('batch_input','batch_output') AND f.created_at <= now()-make_interval(hours => 24*(SELECT file_batch_retention_days FROM installation_settings WHERE singleton)-48))
     OR (f.purpose='video_output' AND f.created_at <= now()-make_interval(hours => 24*(SELECT file_video_retention_days FROM installation_settings WHERE singleton)-48))
     OR (f.purpose='user_file' AND f.created_at <= now()-make_interval(hours => 24*(SELECT file_user_files_retention_days FROM installation_settings WHERE singleton)-48))
@@ -119,14 +122,23 @@ pub async fn sweep_once_fenced(
 fn eligibility_sql() -> String {
     // Unlinked results can be left by a crash after committing the objects.
     // Age them from commit, so time spent streaming does not use up the grace
-    // period. Internal batch work files and segments have no API purpose.
+    // period. Internal batch work files and segments have no API purpose. A
+    // video output is recorded on its job within seconds of its commit (a
+    // download is cut at 25 minutes before it), so two hours unnamed is an
+    // orphan; a job that names it keeps it to its retention. The rule looks
+    // back one day only: a sweep every minute removes each orphan long before
+    // that, and one missed (the sweeper down all day) goes at its retention.
+    // Unbounded, every sweep would probe each live video output.
     let held = crate::legal_holds::file_held("f");
     format!(
         "((f.committed_at IS NULL AND f.created_at < now()-interval '1 day') OR
           ((f.expires_at <= now() OR f.created_at + make_interval(days => {RETENTION_SQL}) <= now()
             OR (f.api_purpose='batch_output' AND f.committed_at < now()-interval '1 day'
                 AND NOT EXISTS(SELECT 1 FROM async_jobs j WHERE j.output_file_id=f.id)
-                AND NOT EXISTS(SELECT 1 FROM async_jobs j WHERE j.error_file_id=f.id)))
+                AND NOT EXISTS(SELECT 1 FROM async_jobs j WHERE j.error_file_id=f.id))
+            OR (f.purpose='video_output' AND f.created_at > now()-interval '1 day'
+                AND f.committed_at < now()-interval '2 hours'
+                AND NOT EXISTS(SELECT 1 FROM async_jobs j WHERE j.output_file_id=f.id)))
            AND NOT {held}))"
     )
 }

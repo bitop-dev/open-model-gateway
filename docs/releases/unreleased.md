@@ -28,8 +28,8 @@ Notes for changes on `main` after [v0.20.0](v0.20.0.md). They become the next re
   3. The server's copy, best effort. A server error no longer fails the delete, and a copy not confirmed gone is logged.
 - **`upstream_deleted`** is `true` for `204`, a `200`, a `404` or a create never sent. It is `false` for `405`, `202` (only queued), a refusal or failure, a disabled route, a create of unknown outcome, or a reused id.
 - **A deleted video keeps its provider id:** a server that gives it out again has the new job refused as `upstream_id_reused`.
-- **Orphaned video outputs are swept:** a stored video output that no job names, two hours old or more, is removed by the file sweeper. That happens after a crash, or after a lost acknowledgement between storing and linking.
-- **A download stops when its job is deleted.**
+- **Orphaned video outputs are swept:** a stored video output that no job names two hours after its commit is removed by the file sweeper (which looks back one day; one missed goes at its retention). That happens after a crash between storing and recording it, or when its job was deleted or its claim ended first.
+- **A download stops when its job is deleted,** at its next chunk: the lease renewal finds the job deleted. Nothing partial is kept.
 - **Outputs are stored by the job poller only.** With the poller disabled on every replica, a finished video stays `in_progress`.
 
 ## Guardrails

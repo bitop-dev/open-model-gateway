@@ -449,6 +449,100 @@ async fn the_claim_s_lease_is_kept_while_an_output_is_stored(pool: PgPool) {
     );
 }
 
+/// A stored video output no job names (its job deleted, or its claim ended,
+/// before it was recorded) is removed by the file sweeper two hours after
+/// its commit; one a job names is kept to its retention. The rule looks back
+/// one day: an older orphan goes at its retention.
+#[dbtest::test]
+async fn the_sweeper_removes_a_video_output_no_job_names(pool: PgPool) {
+    use crate::filestore::{ObjectKey, Purpose, Scope};
+    let s = Setup::new(pool.clone()).await;
+    s.model("company/clips", &[route("{4}", Some("{1280x720}"))])
+        .await;
+    s.mock.content_fails.store(true, Ordering::SeqCst);
+    let id = s.finished("company/clips").await;
+    let workspace: Uuid = sqlx::query_scalar("SELECT workspace_id FROM async_jobs WHERE id=$1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let files = test_files().await;
+    let output = async |committed: &str| -> Uuid {
+        let key = ObjectKey::new(Purpose::VideoOutput, Scope::Workspace(workspace)).unwrap();
+        sqlx::query(&format!("INSERT INTO stored_files(id,object_key,purpose,workspace_id,backend,encryption_key_id,size_bytes,sha256,created_at,committed_at) VALUES($1,$2,'video_output',$3,$4,'test',1,decode(repeat('00',32),'hex'),now()-interval '{committed}',now()-interval '{committed}')"))
+            .bind(key.id()).bind(key.as_str()).bind(workspace).bind(files.backend_name()).execute(&pool).await.unwrap();
+        key.id()
+    };
+    let (linked, orphan, fresh, old) = (
+        output("3 hours").await,
+        output("3 hours").await,
+        output("1 hour").await,
+        output("2 days").await,
+    );
+    sqlx::query("UPDATE async_jobs SET output_file_id=$2,output_pending=false WHERE id=$1")
+        .bind(id)
+        .bind(linked)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let report = crate::filestore::sweep::sweep_once(&s.f.store, &files, 100)
+        .await
+        .unwrap();
+    assert_eq!((report.claimed, report.deleted), (1, 1), "{report:?}");
+    let live: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM stored_files WHERE purpose='video_output' AND deleted_at IS NULL",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(!live.contains(&orphan), "the orphan is removed");
+    assert!(
+        live.contains(&linked) && live.contains(&fresh) && live.contains(&old),
+        "{live:?}"
+    );
+}
+
+/// A video deleted while its output is being stored stops that download at
+/// its next chunk: the renewal finds the job deleted and sets `lost`, which
+/// stops the write (`a_stored_copy_is_bounded_and_fenced`).
+#[dbtest::test]
+async fn a_delete_stops_the_download_of_its_output(pool: PgPool) {
+    let s = Setup::new(pool.clone()).await;
+    s.model("company/clips", &[route("{4}", Some("{1280x720}"))])
+        .await;
+    s.mock.content_fails.store(true, Ordering::SeqCst);
+    let id = s.finished("company/clips").await;
+    sqlx::query("UPDATE async_jobs SET next_poll_at=now() WHERE id=$1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (_, fence) = store::claim_due(&s.f.store, Uuid::new_v4(), 1.0, 60.0)
+        .await
+        .unwrap()
+        .expect("claimed");
+    store::mark_deleted(&s.f.store, id)
+        .await
+        .unwrap()
+        .expect("deleted");
+    assert_eq!(
+        fence.renew(&s.f.store, 60.0).await.unwrap(),
+        super::fence::Renewed::Deleted
+    );
+    let lost = std::sync::atomic::AtomicBool::new(false);
+    let lease = super::poller::PollLease {
+        seconds: 60.0,
+        renew: std::time::Duration::from_millis(50),
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        s.poller.renew_claim(fence, lease, &lost),
+    )
+    .await
+    .expect("the renewals end");
+    assert!(lost.load(Ordering::SeqCst), "the download stops");
+}
+
 /// A create needs the file store accepting video outputs and the workspace
 /// under its storage quota; `/content` serves the stored copy, and answers
 /// for each state it may be in: not stored yet (400), never to be (410 with

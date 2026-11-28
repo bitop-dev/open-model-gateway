@@ -114,6 +114,10 @@ pub(crate) enum Renewed {
     /// (a completed video awaiting its stored output is not: its lease is
     /// renewed while the output is stored).
     Settled,
+    /// The job was deleted (only a video is): nothing it does under the
+    /// claim can be recorded any more, so the work stops at its next safe
+    /// point, a download at its next chunk.
+    Deleted,
     /// The claim ended.
     Fenced,
 }
@@ -223,13 +227,14 @@ impl BatchFence {
         store: &Store,
         lease_seconds: f64,
     ) -> Result<Renewed, sqlx::Error> {
-        let row: Option<(bool, bool)> = sqlx::query_as("UPDATE async_jobs SET runner_lease_until=clock_timestamp()+make_interval(secs=>$4) WHERE id=$1 AND runner_id=$2 AND runner_epoch=$3 AND runner_lease_until IS NOT NULL RETURNING cancel_requested_at IS NOT NULL,settled_at IS NOT NULL AND NOT output_pending")
+        let row: Option<(bool, bool, bool)> = sqlx::query_as("UPDATE async_jobs SET runner_lease_until=clock_timestamp()+make_interval(secs=>$4) WHERE id=$1 AND runner_id=$2 AND runner_epoch=$3 AND runner_lease_until IS NOT NULL RETURNING cancel_requested_at IS NOT NULL,settled_at IS NOT NULL AND NOT output_pending,deleted_at IS NOT NULL")
             .bind(self.job).bind(self.runner).bind(self.epoch).bind(lease_seconds)
             .fetch_optional(&store.pool).await.map_err(job_storage)?;
         Ok(match row {
             None => Renewed::Fenced,
-            Some((_, true)) => Renewed::Settled,
-            Some((cancel, false)) => Renewed::Held { cancel },
+            Some((_, _, true)) => Renewed::Deleted,
+            Some((_, true, false)) => Renewed::Settled,
+            Some((cancel, false, false)) => Renewed::Held { cancel },
         })
     }
 
