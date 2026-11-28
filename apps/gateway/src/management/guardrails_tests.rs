@@ -957,14 +957,16 @@ async fn a_personal_data_rule_is_written_and_read_with_its_kinds(pool: PgPool) {
     );
     // A tightening names only what it tightens: never kinds, which would
     // change what the platform rule looks for.
-    let (_, platform) = put(
+    let (status, platform) = put(
         &f.s,
         &f.admin,
         TYPE_TEAM,
         json!({"local_only":false,"rules":[personal(json!(["card"]))]}),
     )
     .await;
+    assert_eq!(status, StatusCode::OK, "{platform}");
     let target = platform["rule_set"]["rules"][0]["id"].clone();
+    assert!(target.is_string(), "{platform}");
     for tightening in [
         json!({"tightens":target,"kinds":["email"]}),
         json!({"tightens":target,"detector":{"kind":"pattern","categories":["personal_data"],"kinds":["email"]}}),
@@ -978,6 +980,15 @@ async fn a_personal_data_rule_is_written_and_read_with_its_kinds(pool: PgPool) {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{tightening}: {v}");
     }
+    // The same tightening without kinds is accepted.
+    let (status, v) = put(
+        &f.s,
+        &f.owner,
+        &local(f.team),
+        json!({"rules":[{"tightens":target,"input":{"action":"block"}}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
     // A rule may look for personal data and secrets at once (through the
     // API): it keeps both, with its kinds.
     let both = json!({"name":"Both","protection":"personal_data","detector":{"kind":"pattern","categories":["personal_data","secret"],"kinds":["email"]},"input":{"action":"block"}});
@@ -992,7 +1003,7 @@ async fn a_personal_data_rule_is_written_and_read_with_its_kinds(pool: PgPool) {
     let detector = &v["rule_set"]["rules"][0]["detector"];
     assert_eq!(
         detector["categories"],
-        json!(["personal_data", "secret"]),
+        json!(["secret", "personal_data"]),
         "{v}"
     );
     assert_eq!(detector["kinds"], json!(["email"]), "{v}");

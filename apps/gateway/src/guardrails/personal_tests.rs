@@ -220,6 +220,31 @@ fn a_letter_underscore_or_punctuation_beside_a_checksummed_value_does_not_hide_i
         "_DE89370400440532013000.",
         "DE89370400440532013000",
     );
+    // After a token shaped like an IBAN's start, glued or spaced.
+    for text in [
+        "ab12DE89370400440532013000",
+        "REF2024DE89370400440532013000",
+        "Konto01DE89370400440532013000",
+        "AB12 xDE89370400440532013000",
+        "GB82WEST12345698765432DE89370400440532013000",
+    ] {
+        holds(Kind::Iban, text, "DE89370400440532013000");
+    }
+    holds(
+        Kind::Iban,
+        "ab12DE89 3704 0044 0532 0130 00",
+        "DE89 3704 0044 0532 0130 00",
+    );
+    // After a `+`, a card is a phone number only when it reads as one.
+    for text in [
+        "+4111111111111111",
+        "+4111111111111111,12/25,123",
+        "-4000000000000002\n+4111111111111111",
+    ] {
+        holds(Kind::Card, text, "4111111111111111");
+    }
+    holds(Kind::Card, "+4111-1111-1111-1111", "4111-1111-1111-1111");
+    holds(Kind::Card, "+4111 1111 1111 1111", "4111 1111 1111 1111");
     // An address: leading dots and characters beyond the 64 a local part
     // holds are trimmed; a `:` after it is an SSH remote only when what
     // follows is a repository path.
@@ -233,6 +258,21 @@ fn a_letter_underscore_or_punctuation_beside_a_checksummed_value_does_not_hide_i
     );
     holds(Kind::Email, "alice@acme.com:x/y", "alice@acme.com");
     holds(Kind::Email, "alice@acme.com:8080", "alice@acme.com");
+}
+
+#[test]
+fn a_scan_out_of_budget_keeps_what_it_found_and_says_so() {
+    let mut input = Inspection::default();
+    input.push("a@acme.io b@acme.io c@acme.io d@acme.io", Part::Content);
+    // One step for the segment, two candidates, then out.
+    let (found, spent) = findings_of(&input, Kind::Email, &Budget::steps(3));
+    assert!(spent);
+    assert_eq!(found.0.len(), 2);
+    let (found, spent) = findings_of(&input, Kind::Email, &Budget::steps(100));
+    assert!(!spent);
+    assert_eq!(found.0.len(), 4);
+    let (found, spent) = findings_of(&input, Kind::Email, &Budget::steps(0));
+    assert!(spent && found.0.is_empty());
 }
 
 /// What design §14 says still evades, and what it says matches although it
@@ -255,6 +295,19 @@ fn what_is_documented_as_evading_or_matching_holds() {
     );
     holds(Kind::Phone, "+1712345678", "+1712345678");
     holds(Kind::Email, "a@b.zip", "a@b.zip");
+    holds(Kind::Phone, "00000010: 0012 34 5678", "0012 34 5678");
+    miss(Kind::Ip, "ab:cd:2606:4700::1111");
+    miss(Kind::Email, "alice@acme.com-");
+    miss(Kind::Phone, "0049 1234 5678");
+    miss(Kind::Phone, "Tel: 1 0044 20 7946 0958");
+    miss(Kind::Card, "deadbeefdeadbeef4111111111111111");
+    // A grouped card beside hex characters is still a card: a digest has no
+    // separators.
+    holds(
+        Kind::Card,
+        "deadbeefcafe4111-1111-1111-1111",
+        "4111-1111-1111-1111",
+    );
 }
 
 #[test]
@@ -356,6 +409,12 @@ fn phones() {
         "512 256 1024",
         "415 555 2671",
         "00441234567890",
+        "0012345678",
+        "00123456789",
+        "0090012345",
+        "+2026-11-27 10:00:00",
+        "+20261127 10:00",
+        "+2026.11.27 1",
         "DE89 3704 0044 0532 0130 00",
     ] {
         miss(Kind::Phone, text);
@@ -378,7 +437,6 @@ fn cards() {
         "41111 1111 1111 111",
         "94111111111111111",
         "41111111111111110",
-        "+4111111111111111",
         // A digest's digits are no card, however they read.
         "0a1b4111111111111111c2d3e4f5a6b7c8d9e0f1",
     ] {
@@ -590,6 +648,14 @@ fn seeded() -> Vec<(&'static str, Vec<String>)> {
             1 + r.below(28)
         ));
         numeric.push(format!("+{} -{}", r.below(5000), r.below(5000)));
+        numeric.push(format!(
+            "+{}-{:02}-{:02} {:02}:{:02}",
+            1990 + r.below(60),
+            1 + r.below(12),
+            1 + r.below(28),
+            r.below(24),
+            r.below(60)
+        ));
     }
     let digit_runs = (0..10_000)
         .map(|_| {
@@ -601,6 +667,24 @@ fn seeded() -> Vec<(&'static str, Vec<String>)> {
                 .collect()
         })
         .collect();
+    // Tables of four-digit numbers (a dated row of four, a row of twelve):
+    // four groups of four are exactly how a card is written, so some rows
+    // read as one.
+    let mut tables = Vec::new();
+    for _ in 0..5_000 {
+        let four = |r: &mut Seeded| format!("{:04}", r.below(10_000));
+        tables.push(format!(
+            "{}-{:02}-{:02} {} {} {} {}",
+            1990 + r.below(60),
+            1 + r.below(12),
+            1 + r.below(28),
+            four(&mut r),
+            four(&mut r),
+            four(&mut r),
+            four(&mut r)
+        ));
+        tables.push((0..12).map(|_| four(&mut r)).collect::<Vec<_>>().join(" "));
+    }
     vec![
         ("uuids", uuids),
         ("hex digests", digests),
@@ -608,6 +692,7 @@ fn seeded() -> Vec<(&'static str, Vec<String>)> {
         ("jwt shapes", jwts),
         ("numeric text", numeric),
         ("digit runs (13-19 digits)", digit_runs),
+        ("four-digit tables", tables),
     ]
 }
 
@@ -629,10 +714,13 @@ fn measure(items: &[String]) -> std::collections::BTreeMap<Kind, usize> {
 /// The asserted bounds: false positives per 10,000 items, per kind and
 /// corpus. Zero everywhere except card numbers among random digit runs,
 /// where an issuer prefix at an issued length and a valid check digit happen
-/// by chance (measured 158 in 10,000, Maestro's short prefixes included).
+/// by chance (measured 165 in 10,000, Maestro's short prefixes included),
+/// and in tables of four-digit numbers, whose rows of four groups of four
+/// are written as cards are (measured 1,460 in 10,000).
 fn bound(corpus: &str, kind: Kind) -> usize {
     match (corpus, kind) {
         ("digit runs (13-19 digits)", Kind::Card) => 200,
+        ("four-digit tables", Kind::Card) => 1_600,
         _ => 0,
     }
 }

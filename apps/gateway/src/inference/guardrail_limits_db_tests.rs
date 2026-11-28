@@ -120,23 +120,33 @@ async fn a_personal_data_scan_takes_a_slot_above_a_few_kib_and_its_budget_is_enf
     let (status, headers, body) = post(&w.base, &w.token, "/v1/chat/completions", &large).await;
     busy(status, &body);
     assert_eq!(header(&headers, "retry-after"), Some("1"));
-    // A personal-data rule of the workspace's local layer: its scans use the
-    // local pool, which is free.
+    drop(held);
+    // A personal-data rule of a Team's local layer (written by one of its
+    // owners or admins): its scans use the local pool, so the Team's whole
+    // share of the shared pool held does not stop them.
+    let team = w.f.team.workspace_id;
+    let token = team_token(&w).await;
     let local = Uuid::now_v7();
     let mut tx = w.f.store.pool.begin().await.unwrap();
+    let writer: Uuid = sqlx::query_scalar("SELECT user_id FROM effective_workspace_memberships WHERE workspace_id=$1 AND role IN ('owner','admin') LIMIT 1")
+        .bind(team).fetch_one(&mut *tx).await.unwrap();
     sqlx::query("INSERT INTO guardrail_rule_sets(id,layer,workspace_id,updated_by) VALUES($1,'workspace_local',$2,$3)")
-        .bind(local).bind(ws).bind(w.f.owner).execute(&mut *tx).await.unwrap();
+        .bind(local).bind(team).bind(writer).execute(&mut *tx).await.unwrap();
     sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable,kinds) VALUES($1,$2,0,'Mail','personal_data','pattern','{personal_data}','monitor','user_text','off','fail_open','{generation}','deny','{email}')")
         .bind(Uuid::now_v7()).bind(local).execute(&mut *tx).await.unwrap();
     tx.commit().await.unwrap();
-    let (status, _, body) = post(&w.base, &w.token, "/v1/chat/completions", &large).await;
+    let mut held = Vec::new();
+    for _ in 0..SHARE {
+        held.push(SHARED_SCANS.acquire(team).await.unwrap());
+    }
+    let (status, _, body) = post(&w.base, &token, "/v1/chat/completions", &large).await;
     assert_eq!(status, 200, "the local pool: {body}");
     let mut local_held = Vec::new();
     for _ in 0..SHARE {
-        local_held.push(LOCAL_SCANS.acquire(ws).await.unwrap());
+        local_held.push(LOCAL_SCANS.acquire(team).await.unwrap());
     }
     drop(held);
-    let (status, _, body) = post(&w.base, &w.token, "/v1/chat/completions", &large).await;
+    let (status, _, body) = post(&w.base, &token, "/v1/chat/completions", &large).await;
     busy(status, &body);
     drop(local_held);
     // Out of budget: refused, retryable, and nothing is sent.

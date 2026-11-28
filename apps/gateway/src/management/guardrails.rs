@@ -464,9 +464,11 @@ async fn with_totals(s: &Store, ws: Uuid, mut v: Value) -> Result<Value> {
         })?;
     // Per action, category and (for personal data) kind; a personal
     // workspace's per action and category only, without kind: platform
-    // staff see its totals, not which kinds of personal data its owner sent.
+    // staff see its totals, not which kinds of personal data its owner sent,
+    // nor how many (a rule's decision on one request counts once, however
+    // many kinds it found).
     let totals: Vec<(String, String, Option<String>, i64, i64)> = sqlx::query_as(
-        "SELECT action,category,CASE WHEN $2 THEN kind END AS k,count(*),coalesce(sum(count) FILTER(WHERE action IN('monitored','redacted','blocked','stopped')),0)::bigint FROM guardrail_events WHERE workspace_id=$1 AND created_at>=$3 AND ($2 OR (layer<>'workspace_local' AND NOT tightened)) GROUP BY action,category,k ORDER BY action,category,k NULLS FIRST",
+        "SELECT action,category,CASE WHEN $2 THEN kind END AS k,CASE WHEN $2 THEN count(*) ELSE count(DISTINCT (root_request_id,rule_id,stage)) END,coalesce(sum(count) FILTER(WHERE action IN('monitored','redacted','blocked','stopped')),0)::bigint FROM guardrail_events WHERE workspace_id=$1 AND created_at>=$3 AND ($2 OR (layer<>'workspace_local' AND NOT tightened)) GROUP BY action,category,k ORDER BY action,category,k NULLS FIRST",
     )
     .bind(ws)
     .bind(owner_visible)

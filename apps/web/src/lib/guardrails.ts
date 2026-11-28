@@ -113,7 +113,7 @@ export const personalKindLabels: Record<Kind, string> = { email: "Email", phone:
 export const kindLabel = (k: string) => (personalKindLabels as Record<string, string | undefined>)[k] ?? k;
 const kindNoun = (k: string) => (kindNouns as Record<string, string | undefined>)[k] ?? k;
 export const kindMatches: Record<Kind, string> = {
-  email: "Email addresses (local parts in Latin, Greek or Cyrillic letters), except at reserved example domains (example.com, .test, .invalid, .localhost), file names (logo@2x.png) and SSH remotes (git@host:org/repo, …/repo.git).",
+  email: "Email addresses (local parts in Latin, Greek or Cyrillic letters), except at reserved example domains (example.com, .test, .invalid, .localhost), file names (logo@2x.png) and SSH remotes (git@host:org/repo, host:repo.git).",
   phone: "Phone numbers in international form (+ or 00, then 8 to 15 digits) or North American form with dashes, dots or parentheses ((415) 555-2671, 415-555-2671, 1-415-555-2671); fictional 555-01xx numbers and dates after a + (+2026-11-27) excepted. National formats outside North America are not covered.",
   card: "Payment card numbers of the major networks (Visa, Mastercard, Maestro, American Express, Discover, JCB, Diners Club, UnionPay, Mir): 13 to 19 digits, whole or in groups, with a valid check digit (Luhn).",
   iban: "International bank account numbers (IBAN), in either case, with the length of their country and a valid check (mod 97).",
