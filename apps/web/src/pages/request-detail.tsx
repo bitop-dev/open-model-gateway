@@ -132,9 +132,11 @@ function RequestRoute({ session, scope, id }: { session: Session; scope: LogsSco
 export function GuardrailDecisions({ decisions }: { decisions: GuardrailDecision[] }) {
   const categories: Record<string, string> = { secret: "Secrets", custom: "Custom patterns", personal_data: "Personal data", moderation: "Moderation", prompt_injection: "Prompt injection" };
   const layers: Record<string, string> = { type_default: "Workspace-type default", workspace_override: "Platform override", workspace_local: "Workspace's own rule" };
+  // A not-readable decision let its request through only when no decision refused it.
+  const refusedBy = decisions.some(d => d.refused);
   return <Card title="Guardrail decisions" titleAs="h2" description="What each rule decided on the input. Findings count distinct matched values; the matched text is never kept or shown." flush>
     <Table caption="Guardrail decisions" stack columns={["Outcome", "Looked for", "Rule", { label: "Findings", numeric: true }]}>{decisions.map((d, i) => <Tr key={`${d.rule_id}:${d.category}:${i}`}>
-      <Td><StatusBadge size="sm" tone={d.action === "blocked" || d.refused ? "danger" : d.action === "monitored" ? "info" : "warning"}>{guardrailActionLabels[d.action] ?? d.action}</StatusBadge>{d.refused ? <span className={s.secondary}>Refused the request</span> : d.action === "skipped" && <span className={s.secondary}>Let through unread</span>}</Td>
+      <Td><StatusBadge size="sm" tone={d.action === "blocked" || d.refused ? "danger" : d.action === "monitored" ? "info" : "warning"}>{guardrailActionLabels[d.action] ?? d.action}</StatusBadge>{d.refused ? <span className={s.secondary}>Refused the request</span> : d.action === "skipped" && !refusedBy && <span className={s.secondary}>Let through unread</span>}</Td>
       <Td>{categories[d.category] ?? d.category}{d.kind ? ` · ${kindLabel(d.kind)}` : ""}</Td>
       <Td><span className={s.primary}>{layers[d.layer] ?? d.layer}</span><span className={s.secondary}>Revision {d.revision} · <code title={d.rule_id}>{shortId(d.rule_id)}</code></span></Td>
       <Td>{d.action === "monitored" || d.action === "blocked" ? d.count : "—"}</Td>

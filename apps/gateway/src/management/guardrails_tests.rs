@@ -1070,6 +1070,15 @@ async fn a_local_layer_may_refuse_what_a_platform_rule_lets_through_unread(pool:
         (status, reason(&body)),
         (StatusCode::FORBIDDEN, "guardrail_loosen_not_allowed")
     );
+    let (status, body) = put(
+        &f.s,
+        &f.owner,
+        &local(f.team),
+        json!({"rules":[{"tightens":strict,"uninspectable":"deny"}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["effective"][0]["uninspectable"], "deny");
     // The database refuses a direct write of allow on a tightening.
     let set: Uuid = sqlx::query_scalar(
         "SELECT id FROM guardrail_rule_sets WHERE layer='workspace_local' AND workspace_id=$1",
@@ -1093,7 +1102,7 @@ async fn a_local_layer_may_refuse_what_a_platform_rule_lets_through_unread(pool:
         .await
         .unwrap_err();
     assert_eq!(
-        err.as_database_error().and_then(|e| e.code()).as_deref(),
-        Some("23514")
+        err.as_database_error().and_then(|e| e.constraint()),
+        Some("guardrail_rules_tightening")
     );
 }

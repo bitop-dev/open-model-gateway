@@ -30,7 +30,7 @@ const actionNames: Record<string, string> = { monitored: "Monitored", redacted: 
 /** Outcomes that count matched values; the others (could not check, not readable) have no findings. */
 const matching = new Set(["monitored", "redacted", "blocked", "stopped"]);
 /** A total's outcome; a not-readable total says whether its requests were refused or let through. */
-const outcomeName = (t: DecisionTotal) => t.action === "skipped" ? (t.refused ? "Not readable · refused" : "Not readable · let through") : actionNames[t.action] ?? t.action;
+const outcomeName = (t: DecisionTotal) => t.action === "skipped" && t.refuses != null ? (t.refuses ? "Not readable · refused" : "Not readable · let through") : actionNames[t.action] ?? t.action;
 const categoryNames: Record<string, string> = { secret: "Secrets", custom: "Custom patterns", personal_data: "Personal data", moderation: "Moderation", prompt_injection: "Prompt injection" };
 
 /** Admin › Settings › Guardrails. */
@@ -159,9 +159,9 @@ export function WorkspaceGuardrailsAdmin({ id, writable }: { id: string; writabl
       : <LayerEditor title={`${kindLabels[g.kind]} default`} description="Applies here: this workspace has no override. Edit it under Settings › Guardrails." set={g.type_default} writable={false} save={() => Promise.resolve()} empty="No default rules." />}
     {writable && <div><Button size="sm" variant={override ? "ghost" : "secondary"} onClick={override ? reset : create}>{override ? "Reset to default" : "Override the default"}</Button></div>}
     {g.local_visible && g.local && <LayerEditor title="This workspace's rules" description="Set by its owners and admins." set={g.local} writable={false} save={() => Promise.resolve()} empty="None." />}
-    <Card title="Decisions this month" titleAs="h2" description="Counts recorded by the gateway (UTC month). Findings are distinct matched values; no text is kept. Not readable counts requests a rule could not read, refused ones (the rule refuses what it can't read) apart from ones let through unread (it lets it through). A request refused because no check could run then (the gateway was busy) writes no row and is not counted here." flush={g.decisions_this_month.length > 0}>
+    <Card title="Decisions this month" titleAs="h2" description="Counts recorded by the gateway (UTC month). Findings are distinct matched values; no text is kept. Not readable counts the decisions of rules that could not read a request: rules that refuse what they can't read apart from rules that let it through unread. A request refused because no check could run then (the gateway was busy) writes no row and is not counted here." flush={g.decisions_this_month.length > 0}>
       {g.decisions_this_month.length === 0 ? <p className={s.note}>No decisions this month.</p> :
-        <Table caption="Guardrail decisions this month" columns={["Outcome", "Looked for", { label: "Decisions", numeric: true }, { label: "Findings", numeric: true }]}>{g.decisions_this_month.map(t => <Tr key={`${t.action}:${t.category}:${t.kind ?? ""}:${t.refused ? "r" : ""}`}>
+        <Table caption="Guardrail decisions this month" columns={["Outcome", "Looked for", { label: "Decisions", numeric: true }, { label: "Findings", numeric: true }]}>{g.decisions_this_month.map(t => <Tr key={`${t.action}:${t.category}:${t.kind ?? ""}:${t.refuses ?? ""}`}>
           <Td>{outcomeName(t)}</Td><Td>{categoryNames[t.category] ?? t.category}{t.kind ? ` · ${kindLabel(t.kind)}` : ""}</Td><Td>{t.decisions}</Td><Td>{matching.has(t.action) ? t.findings : "—"}</Td>
         </Tr>)}</Table>}
     </Card>

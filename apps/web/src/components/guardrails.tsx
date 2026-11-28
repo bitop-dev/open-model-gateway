@@ -79,7 +79,7 @@ const LAYER_PATTERNS = 50;
 const patternCount = (e: Entry) => isTightening(e) ? 0 : e.detector.pattern_count ?? e.detector.patterns?.length ?? 0;
 
 /** What the rule does with content it can't read (`uninspectable`). */
-const unreadableHelp = "Content the gateway can't read: an image, audio or a document that isn't plain text, a native batch, and every image generation, transcription and realtime request. Let through, it is recorded as not readable; its text is still checked.";
+const unreadableHelp = "Content the gateway can't read: an image, audio or a document that isn't plain text in a request, a native batch, and every image generation, transcription and realtime request. Let through, it is recorded as not readable: the text beside an image is still checked, but an image prompt, audio, a realtime session and a native batch's lines are not read at all. Only a Block rule refuses.";
 /**
  * The rule dialog. `others`: the layer's patterns outside this rule, which
  * share its limit. `audience`: who the layer's rules apply to, for the
@@ -157,7 +157,9 @@ export function tightenRule(ask: ReturnType<typeof useAction>, rule: EffectiveEn
     // With a choice of what it can't read, the action may stay as it is.
     ...(options.length ? [{ name: "action", label: "On input", type: "select" as const, required: !unread, value: unread ? "" : options[options.length - 1] ?? "block",
       options: [...(unread ? [{ value: "", label: `Keep: ${actionLabels[current]}` }] : []), ...options.map(a => ({ value: a, label: `${actionLabels[a]}: ${actionHelp[a]}` }))] }] : []),
-    ...(unread ? [{ name: "uninspectable", label: "What it can't read", type: "select" as const, value: "deny", help: unreadableHelp,
+    // Only a Block rule refuses: offered when the rule blocks, or is made to.
+    ...(unread ? [{ name: "uninspectable", label: "What it can't read", type: "select" as const, value: current === "block" ? "deny" : "", help: unreadableHelp,
+      visibleWhen: (all: Record<string, string | undefined>) => current === "block" || all.action === "block",
       validate: (u: string, all: Record<string, string | undefined>) => !u && !all.action ? "Choose something to make stricter." : undefined,
       options: [{ value: "", label: "Keep: let it through unread" }, { value: "deny", label: "Refuse the request" }] }] : []),
   ],
@@ -165,7 +167,8 @@ export function tightenRule(ask: ReturnType<typeof useAction>, rule: EffectiveEn
     run: (v, signal) => {
       const { input: _input, uninspectable: _unread, ...kept } = existing ? toInput(existing) : {};
       const action = v.action ? { input: { action: v.action } } : existing?.input?.action ? { input: { action: existing.input.action } } : {};
-      const deny = v.uninspectable === "deny" || existing?.uninspectable === "deny" ? { uninspectable: "deny" } : {};
+      const blocks = current === "block" || v.action === "block";
+      const deny = (blocks && v.uninspectable === "deny") || existing?.uninspectable === "deny" ? { uninspectable: "deny" } : {};
       return guardrailWrite(() => save([...others.map(toInput), { ...kept, tightens: rule.id, ...action, ...deny }], signal), names);
     } });
 }

@@ -1269,8 +1269,8 @@ BEGIN
   VALUES(gen_random_uuid(),gen_random_uuid(),ws,k,'chat_completions','probe-model','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','personal_data','monitored',1,'alice@acme.io');
   RAISE EXCEPTION 'matched text stored as a kind'; EXCEPTION WHEN check_violation THEN NULL; END;
  -- #841 (0100): a realtime session's decision names its operation; an unknown one is refused.
- INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count)
-  VALUES(gen_random_uuid(),gen_random_uuid(),ws,k,'realtime','probe-model','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','secret','skipped',1);
+ INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refuses)
+  VALUES(gen_random_uuid(),gen_random_uuid(),ws,k,'realtime','probe-model','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','secret','skipped',1,false);
  BEGIN INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count)
   VALUES(gen_random_uuid(),gen_random_uuid(),ws,k,'probe_operation','probe-model','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','secret','skipped',1);
   RAISE EXCEPTION 'unknown guardrail operation stored'; EXCEPTION WHEN check_violation THEN NULL; END;

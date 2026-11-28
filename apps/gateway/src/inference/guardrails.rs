@@ -195,7 +195,9 @@ impl Store {
 
     /// The guardrail step of a request whose text this release does not read
     /// (a native batch: its lines are encoded for the provider's own batch
-    /// API): an enforcing rule refuses it, a monitor rule records `skipped`.
+    /// API): an enforcing rule refuses it, also under `uninspectable: allow`
+    /// (its text is readable in a gateway-run batch); a monitor rule records
+    /// `skipped`.
     pub(crate) async fn guard_unread(
         &self,
         principal: &Principal,
@@ -206,7 +208,7 @@ impl Store {
             return Ok(());
         }
         throttled(principal)?;
-        let decision = policy.decide(request.workload, None);
+        let decision = policy.decide_unread(request.workload);
         let (events, omitted) = rows(&decision);
         if !events.is_empty() {
             self.record_guardrail_events(&GuardrailRecord {
@@ -242,10 +244,10 @@ impl Store {
             })
             .collect();
         sqlx::query(
-            "INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,streamed,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,tightened,omitted,kind)
-             SELECT id,$2,$3,$4,$5,$6,$16,'input',rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,tightened,omitted,kind
-             FROM unnest($1::uuid[],$7::uuid[],$8::uuid[],$9::bigint[],$10::text[],$11::text[],$12::text[],$13::text[],$14::int[],$15::boolean[],$17::boolean[],$18::int[],$19::text[])
-              AS t(id,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,tightened,omitted,kind)",
+            "INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,streamed,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,tightened,omitted,kind,refuses)
+             SELECT id,$2,$3,$4,$5,$6,$16,'input',rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,tightened,omitted,kind,refuses
+             FROM unnest($1::uuid[],$7::uuid[],$8::uuid[],$9::bigint[],$10::text[],$11::text[],$12::text[],$13::text[],$14::int[],$15::boolean[],$17::boolean[],$18::int[],$19::text[],$20::boolean[])
+              AS t(id,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,tightened,omitted,kind,refuses)",
         )
         .bind(e.iter().map(|_| Uuid::now_v7()).collect::<Vec<_>>())
         .bind(record.root_request_id)
@@ -271,6 +273,8 @@ impl Store {
         .bind(omitted)
         // A personal-data kind's label (never matched text), else null.
         .bind(e.iter().map(|v| v.kind.map(|k| k.as_str())).collect::<Vec<_>>())
+        // Each rule's own verdict (`Event::refuses`).
+        .bind(e.iter().map(|v| v.refuses).collect::<Vec<_>>())
         .execute(&self.pool)
         .await
         .map_err(route_lookup_storage)?;

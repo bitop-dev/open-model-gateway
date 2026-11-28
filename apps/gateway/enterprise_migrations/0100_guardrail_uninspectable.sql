@@ -4,7 +4,8 @@
 -- tightening entry may move a platform rule from `allow` to `deny`, never
 -- the other way. Rules may now name the workloads this release never reads
 -- (images, transcription, realtime), and a realtime session's decisions are
--- recorded like any other request's.
+-- recorded like any other request's. Each decision records its rule's own
+-- verdict, so content refused is counted apart from content let through.
 SET lock_timeout = '10s';
 
 -- A tightening entry names only what it tightens (0092): now also
@@ -21,7 +22,8 @@ BEGIN
  END LOOP;
  IF n <> 1 THEN
   RAISE EXCEPTION '0100: expected one tightening-entry CHECK on guardrail_rules, found %', n
-   USING ERRCODE = '23514';
+   USING ERRCODE = '23514',
+   HINT = 'Compare with SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = ''public.guardrail_rules''::regclass AND contype = ''c''; the 0092 CHECK names what a tightening entry may set.';
  END IF;
 END $$;
 
@@ -53,10 +55,20 @@ BEGIN
  END LOOP;
  IF n <> 1 THEN
   RAISE EXCEPTION '0100: expected one operation CHECK on guardrail_events, found %', n
-   USING ERRCODE = '23514';
+   USING ERRCODE = '23514',
+   HINT = 'Compare with SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = ''public.guardrail_events''::regclass AND contype = ''c''; the 0095 CHECK lists the operations.';
  END IF;
 END $$;
 ALTER TABLE guardrail_events ADD CONSTRAINT guardrail_events_operation CHECK (
  operation IN ('chat_completions','responses','messages','count_tokens','embeddings',
   'rerank','systemone','audio_speech','images','audio_transcriptions','realtime')) NOT VALID;
+
+-- Whether the decision's rule refuses the request (its own verdict).
+-- `refused` marks the one decision the client was refused with, so it
+-- cannot tell a rule that let unreadable content through from one whose
+-- refusal another decision outranked; this can. Added without a default, so
+-- no row is rewritten; null on every row written before (their rule's
+-- verdict was not recorded).
+ALTER TABLE guardrail_events ADD COLUMN refuses boolean;
+COMMENT ON COLUMN guardrail_events.refuses IS 'Whether the decision''s rule refuses its request (its own verdict, whatever other decisions did); null on rows written before migration 0100.';
 RESET lock_timeout;

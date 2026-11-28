@@ -467,11 +467,15 @@ async fn with_totals(s: &Store, ws: Uuid, mut v: Value) -> Result<Value> {
     // staff see its totals, not which kinds of personal data its owner sent,
     // nor how many (a rule's decision on one request counts once, however
     // many kinds it found).
-    // Refused decisions are counted apart from the others of their action:
-    // content a rule could not read was refused (`uninspectable: deny`) or
-    // let through unread (`allow`).
-    let totals: Vec<(String, String, Option<String>, bool, i64, i64)> = sqlx::query_as(
-        "SELECT action,category,CASE WHEN $2 THEN kind END AS k,refused,CASE WHEN $2 THEN count(*) ELSE count(DISTINCT (root_request_id,rule_id,stage)) END,coalesce(sum(count) FILTER(WHERE action IN('monitored','redacted','blocked','stopped')),0)::bigint FROM guardrail_events WHERE workspace_id=$1 AND created_at>=$3 AND ($2 OR (layer<>'workspace_local' AND NOT tightened)) GROUP BY action,category,k,refused ORDER BY action,category,k NULLS FIRST,refused",
+    // Not readable (`skipped`) totals are split by their rule's own verdict
+    // (`refuses`): decisions of rules that refuse what they cannot read are
+    // never added to those of rules that let it through, whatever other
+    // decisions did to the request (so nothing about an owner's own rules
+    // shows through a platform rule's row). Other actions are not split
+    // (`refuses` is null), so one decision of a rule counts once. Rows
+    // written before migration 0100 have no verdict (null).
+    let totals: Vec<(String, String, Option<String>, Option<bool>, i64, i64)> = sqlx::query_as(
+        "SELECT action,category,CASE WHEN $2 THEN kind END AS k,CASE WHEN action='skipped' THEN refuses END AS r,CASE WHEN $2 THEN count(*) ELSE count(DISTINCT (root_request_id,rule_id,stage)) END,coalesce(sum(count) FILTER(WHERE action IN('monitored','redacted','blocked','stopped')),0)::bigint FROM guardrail_events WHERE workspace_id=$1 AND created_at>=$3 AND ($2 OR (layer<>'workspace_local' AND NOT tightened)) GROUP BY action,category,k,r ORDER BY action,category,k NULLS FIRST,r NULLS FIRST",
     )
     .bind(ws)
     .bind(owner_visible)
@@ -480,8 +484,8 @@ async fn with_totals(s: &Store, ws: Uuid, mut v: Value) -> Result<Value> {
     .await?;
     v["decisions_this_month"] = totals
         .into_iter()
-        .map(|(action, category, kind, refused, decisions, findings)| {
-            json!({"action":action,"category":category,"kind":kind,"refused":refused,"decisions":decisions,"findings":findings})
+        .map(|(action, category, kind, refuses, decisions, findings)| {
+            json!({"action":action,"category":category,"kind":kind,"refuses":refuses,"decisions":decisions,"findings":findings})
         })
         .collect();
     Ok(v)

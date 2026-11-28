@@ -501,6 +501,7 @@ async fn concurrent_guardrail_events_lock_no_parent_rows(pool: PgPool) {
         action: crate::guardrails::enforce::Action::Monitored,
         count: 1,
         refused: false,
+        refuses: false,
         tightened: false,
     }];
     let mut tasks = Vec::new();

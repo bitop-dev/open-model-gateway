@@ -150,6 +150,14 @@ async fn a_native_batch_is_refused_by_an_enforcing_rule(pool: PgPool) {
 
 /// One type-default rule of the principal's workspace kind.
 async fn rule_set(f: &crate::governance::tests::db::Fixture, action: &str) {
+    rule_set_unread(f, action, "deny").await;
+}
+/// As [`rule_set`], with what the rule does with content it cannot read.
+async fn rule_set_unread(
+    f: &crate::governance::tests::db::Fixture,
+    action: &str,
+    uninspectable: &str,
+) {
     let kind: String = sqlx::query_scalar("SELECT kind FROM workspaces WHERE id=$1")
         .bind(f.principal.workspace_id)
         .fetch_one(&f.store.pool)
@@ -164,9 +172,48 @@ async fn rule_set(f: &crate::governance::tests::db::Fixture, action: &str) {
     let mut tx = f.store.pool.begin().await.unwrap();
     sqlx::query("INSERT INTO guardrail_rule_sets(id,layer,kind,local_only,updated_by) VALUES($1,'type_default',$2,false,$3)")
         .bind(set).bind(&kind).bind(f.owner).execute(&mut *tx).await.unwrap();
-    sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable) VALUES($1,$2,0,'Secrets','secrets','pattern','{secret}',$3,'user_text','off',$4,'{generation}','deny')")
-        .bind(Uuid::now_v7()).bind(set).bind(action).bind(on_error).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable) VALUES($1,$2,0,'Secrets','secrets','pattern','{secret}',$3,'user_text','off',$4,'{generation}',$5)")
+        .bind(Uuid::now_v7()).bind(set).bind(action).bind(on_error).bind(uninspectable).execute(&mut *tx).await.unwrap();
     tx.commit().await.unwrap();
+}
+
+/// #841: `uninspectable: allow` does not let a native batch through. Its
+/// lines are text a gateway-run batch reads, so an enforcing rule refuses it
+/// whatever its `uninspectable`; gateway-run mode checks each line.
+#[dbtest::test]
+async fn a_native_batch_is_refused_by_an_enforcing_rule_even_under_allow(pool: PgPool) {
+    let w = world_with(pool, true, false, 1, None).await;
+    let f = &w.f;
+    rule_set_unread(f, "block", "allow").await;
+    let file = w
+        .upload(&f.principal, &[chat_line("a", "company/smart", "hello")])
+        .await;
+    let refused = w
+        .create(f.principal, &file, BatchEndpoint::ChatCompletions, None)
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(CreateError::Job(JobError::Inference(InferenceError::Guardrail(r))))
+                if r.kind == crate::guardrails::enforce::RefusalKind::NotSupported
+        ),
+        "a native batch is refused"
+    );
+    let recorded: (String, bool, Option<bool>) =
+        sqlx::query_as("SELECT action,refused,refuses FROM guardrail_events")
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(recorded, ("skipped".into(), true, Some(true)));
+    let job = w
+        .create(
+            f.principal,
+            &file,
+            BatchEndpoint::ChatCompletions,
+            Some(json!({"omg_mode": "gateway"})),
+        )
+        .await;
+    assert!(job.is_ok());
 }
 
 /// A monitor rule does not enforce: a native batch runs natively, and its

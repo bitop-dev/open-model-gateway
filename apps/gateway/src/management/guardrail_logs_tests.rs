@@ -171,8 +171,8 @@ async fn refused_requests_are_listed_as_blocked_with_logs_visibility(pool: PgPoo
     assert_eq!(
         totals["decisions_this_month"],
         json!([
-            {"action":"monitored","category":"personal_data","kind":null,"refused":false,"decisions":2,"findings":8},
-            {"action":"monitored","category":"secret","kind":null,"refused":false,"decisions":1,"findings":3}
+            {"action":"monitored","category":"personal_data","kind":null,"refuses":null,"decisions":2,"findings":8},
+            {"action":"monitored","category":"secret","kind":null,"refuses":null,"decisions":1,"findings":3}
         ])
     );
     assert!(!totals.to_string().contains("us_ssn"), "{totals}");
@@ -238,4 +238,219 @@ async fn refused_requests_are_listed_as_blocked_with_logs_visibility(pool: PgPoo
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
     }
+}
+
+/// #841: the monthly totals split only not readable (`skipped`) decisions,
+/// by their rule's own verdict (`refuses`), whatever other decisions did to
+/// the request; a rule's decision on one request counts once otherwise,
+/// also when only one of its events is the refusing one.
+#[dbtest::test]
+async fn not_readable_totals_tell_refusing_rules_from_ones_that_let_through(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let event = "INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,kind,action,count,refused,refuses) VALUES(gen_random_uuid(),$1,$2,$3,'chat_completions','company/smart','input',$4,$4,1,$5,'pattern',$6,$7,$8,1,$9,$10)";
+    // (workspace, key, request, rule, layer, category, kind, action, refused, refuses)
+    type Row<'a> = (
+        Uuid,
+        Uuid,
+        Uuid,
+        Uuid,
+        &'a str,
+        &'a str,
+        Option<&'a str>,
+        &'a str,
+        bool,
+        bool,
+    );
+    let insert = async |row: Row<'_>| {
+        let (ws, key, root, rule, layer, category, kind, action, refused, refuses) = row;
+        sqlx::query(event)
+            .bind(root)
+            .bind(ws)
+            .bind(key)
+            .bind(rule)
+            .bind(layer)
+            .bind(category)
+            .bind(kind)
+            .bind(action)
+            .bind(refused)
+            .bind(refuses)
+            .execute(&pool)
+            .await
+            .unwrap();
+    };
+    let totals = async |ws: Uuid| {
+        let (status, v) = call(
+            &f.s,
+            &f.auditor,
+            "GET",
+            &format!("/api/v1/platform/workspaces/{ws}/guardrails"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        v["decisions_this_month"].clone()
+    };
+    let k = key(&pool, f.team, f.owner.user_id).await;
+    let (deny, allow, other) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+    let (a, b, c, d) = (
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+    );
+    // A deny rule refusing what it can't read; one outranked by a finding
+    // of another rule (still a refusing verdict); an allow rule letting it
+    // through, alone and on a request another rule refused.
+    insert((
+        f.team,
+        k,
+        a,
+        deny,
+        "type_default",
+        "secret",
+        None,
+        "skipped",
+        true,
+        true,
+    ))
+    .await;
+    insert((
+        f.team,
+        k,
+        b,
+        deny,
+        "type_default",
+        "secret",
+        None,
+        "skipped",
+        false,
+        true,
+    ))
+    .await;
+    insert((
+        f.team,
+        k,
+        b,
+        other,
+        "type_default",
+        "custom",
+        None,
+        "blocked",
+        true,
+        true,
+    ))
+    .await;
+    insert((
+        f.team,
+        k,
+        c,
+        allow,
+        "type_default",
+        "secret",
+        None,
+        "skipped",
+        false,
+        false,
+    ))
+    .await;
+    insert((
+        f.team,
+        k,
+        d,
+        allow,
+        "type_default",
+        "secret",
+        None,
+        "skipped",
+        false,
+        false,
+    ))
+    .await;
+    insert((
+        f.team,
+        k,
+        d,
+        other,
+        "type_default",
+        "custom",
+        None,
+        "blocked",
+        true,
+        true,
+    ))
+    .await;
+    assert_eq!(
+        totals(f.team).await,
+        json!([
+            {"action":"blocked","category":"custom","kind":null,"refuses":null,"decisions":2,"findings":2},
+            {"action":"skipped","category":"secret","kind":null,"refuses":false,"decisions":2,"findings":0},
+            {"action":"skipped","category":"secret","kind":null,"refuses":true,"decisions":2,"findings":0}
+        ])
+    );
+    // A personal workspace: a platform personal-data rule blocked one
+    // request for two kinds (one event is the refusing one): platform staff
+    // see one blocked decision, not one per kind. A platform deny rule whose
+    // refusal the owner's own rule outranked still reads as refusing, so
+    // nothing of the owner's rules shows.
+    let pk = key(&pool, f.personal, f.owner.user_id).await;
+    let (pd, e, g) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+    insert((
+        f.personal,
+        pk,
+        e,
+        pd,
+        "type_default",
+        "personal_data",
+        Some("email"),
+        "blocked",
+        true,
+        true,
+    ))
+    .await;
+    insert((
+        f.personal,
+        pk,
+        e,
+        pd,
+        "type_default",
+        "personal_data",
+        Some("phone"),
+        "blocked",
+        false,
+        true,
+    ))
+    .await;
+    insert((
+        f.personal,
+        pk,
+        g,
+        deny,
+        "type_default",
+        "secret",
+        None,
+        "skipped",
+        false,
+        true,
+    ))
+    .await;
+    insert((
+        f.personal,
+        pk,
+        g,
+        other,
+        "workspace_local",
+        "custom",
+        None,
+        "blocked",
+        true,
+        true,
+    ))
+    .await;
+    assert_eq!(
+        totals(f.personal).await,
+        json!([
+            {"action":"blocked","category":"personal_data","kind":null,"refuses":null,"decisions":1,"findings":2},
+            {"action":"skipped","category":"secret","kind":null,"refuses":true,"decisions":1,"findings":0}
+        ])
+    );
 }

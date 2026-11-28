@@ -16,7 +16,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::guardrail_db_tests::{
-    World, chat_with_image, images_on, secret, send, type_default_on, world,
+    PNG, World, chat_with_image, images_on, secret, send, type_default_on, world, world_on,
 };
 
 /// The decisions recorded: operation, action and whether each refused.
@@ -125,27 +125,54 @@ async fn a_block_rule_naming_transcription_refuses_every_transcription(pool: PgP
     .await;
     // A multipart form with a model and a file, assembled here.
     let boundary = "omg-unread-boundary";
-    let form = format!(
-        "--{boundary}\r\ncontent-disposition: form-data; name=\"model\"\r\n\r\ncompany/smart\r\n--{boundary}\r\ncontent-disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\ncontent-type: audio/wav\r\n\r\nRIFF....WAVE\r\n--{boundary}--\r\n"
-    );
-    let response = reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .unwrap()
-        .post(format!("{}/v1/audio/transcriptions", w.base))
-        .bearer_auth(&w.token)
-        .header(
-            "content-type",
-            format!("multipart/form-data; boundary={boundary}"),
+    let transcribe = async || {
+        let form = format!(
+            "--{boundary}\r\ncontent-disposition: form-data; name=\"model\"\r\n\r\ncompany/smart\r\n--{boundary}\r\ncontent-disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\ncontent-type: audio/wav\r\n\r\nRIFF....WAVE\r\n--{boundary}--\r\n"
+        );
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(format!("{}/v1/audio/transcriptions", w.base))
+            .bearer_auth(&w.token)
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(form)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        (
+            status,
+            response.json::<Value>().await.unwrap_or(Value::Null),
         )
-        .body(form)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body: Value = response.json().await.unwrap();
+    };
+    let (status, body) = transcribe().await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["code"], "guardrail_not_supported");
     assert_eq!(w.hits.load(Ordering::SeqCst), 0, "nothing was sent");
+    assert_eq!(
+        decisions(&w).await,
+        [("audio_transcriptions".into(), "skipped".into(), true)]
+    );
+    type_default_on(
+        &w,
+        "block",
+        "{secret}",
+        &[],
+        &[],
+        "{audio_transcriptions}",
+        "allow",
+    )
+    .await;
+    let (_, body) = transcribe().await;
+    assert_ne!(body["error"]["code"], "guardrail_not_supported", "{body}");
+    assert_eq!(
+        decisions(&w).await[1..],
+        [("audio_transcriptions".into(), "skipped".into(), false)]
+    );
 }
 
 #[dbtest::test]
@@ -181,9 +208,74 @@ async fn under_allow_an_image_goes_on_with_its_text_still_read(pool: PgPool) {
     assert_eq!(w.hits.load(Ordering::SeqCst), hits, "nothing was sent");
 }
 
-fn sqlstate(r: Result<(), sqlx::Error>) -> String {
+/// A token count with an image goes on under `allow` (it is a generation
+/// request, its text read) and is recorded as skipped, not refused.
+#[dbtest::test]
+async fn under_allow_a_token_count_with_an_image_goes_on(pool: PgPool) {
+    let w = world_on(pool, "'messages'", "anthropic").await;
+    images_on(&w).await;
+    let body = || {
+        let data = PNG.split_once(',').unwrap().1;
+        json!({"model":"company/smart","messages":[{"role":"user","content":[
+            {"type":"text","text":"how many tokens?"},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":data}}]}]})
+    };
+    type_default_on(&w, "block", "{secret}", &[], &[], "{generation}", "deny").await;
+    let (_, _, refused) = send(&w, "/v1/messages/count_tokens", body()).await;
+    assert_eq!(
+        refused["error"]["guardrail"]["category"], "secret",
+        "{refused}"
+    );
+    type_default_on(&w, "block", "{secret}", &[], &[], "{generation}", "allow").await;
+    let (_, _, value) = send(&w, "/v1/messages/count_tokens", body()).await;
+    assert!(value["error"]["guardrail"].is_null(), "{value}");
+    assert_eq!(
+        decisions(&w).await,
+        [
+            ("count_tokens".into(), "skipped".into(), true),
+            ("count_tokens".into(), "skipped".into(), false)
+        ]
+    );
+}
+
+/// 0100 stops, applying nothing, when the CHECK it replaces is not found
+/// exactly once (a database whose tightening CHECK was changed by hand).
+#[sqlx::test(migrations = false)]
+async fn the_uninspectable_migration_stops_on_an_unexpected_check(pool: PgPool) {
+    let all = sqlx::migrate!("./enterprise_migrations");
+    let through = |last: i64| sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            all.iter().filter(|m| m.version <= last).cloned().collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    through(99).run(&pool).await.unwrap();
+    // A second CHECK of the same shape.
+    sqlx::query("ALTER TABLE guardrail_rules ADD CONSTRAINT hand_made CHECK (tightens_rule_id IS NULL OR (name IS NULL AND uninspectable IS NULL))")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let err = through(i64::MAX).run(&pool).await.unwrap_err().to_string();
+    assert!(
+        err.contains("expected one tightening-entry CHECK on guardrail_rules, found 2"),
+        "{err}"
+    );
+    let version: i64 =
+        sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations WHERE success")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(version, 99, "nothing of 0100 applied");
+}
+
+/// The CHECK that refused a write (its SQLSTATE is 23514).
+fn constraint(r: Result<(), sqlx::Error>) -> String {
     match r {
-        Err(sqlx::Error::Database(e)) => e.code().map(|c| c.into_owned()).unwrap_or_default(),
+        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23514") => {
+            e.constraint().unwrap_or_default().to_owned()
+        }
         other => format!("{other:?}"),
     }
 }
@@ -279,7 +371,10 @@ async fn the_uninspectable_migration_keeps_rules_tightenings_and_decisions(pool:
         }
     };
     tightening(1, "deny").await.unwrap();
-    assert_eq!(sqlstate(tightening(2, "allow").await), "23514");
+    assert_eq!(
+        constraint(tightening(2, "allow").await),
+        "guardrail_rules_tightening"
+    );
     // Realtime decisions, in the existing month partition and in one
     // created after the migration; an unknown operation is refused.
     let created: Vec<(String, String)> = sqlx::query_as(
@@ -314,12 +409,24 @@ async fn the_uninspectable_migration_keeps_rules_tightenings_and_decisions(pool:
             }
         };
         insert("realtime").await.expect(at);
-        assert_eq!(sqlstate(insert("probe_operation").await), "23514", "{at}");
+        assert_eq!(
+            constraint(insert("probe_operation").await),
+            "guardrail_events_operation",
+            "{at}"
+        );
     }
-    let operations: Vec<String> =
-        sqlx::query_scalar("SELECT operation FROM guardrail_events ORDER BY created_at")
+    let operations: Vec<(String, Option<bool>)> =
+        sqlx::query_as("SELECT operation,refuses FROM guardrail_events ORDER BY created_at")
             .fetch_all(&pool)
             .await
             .unwrap();
-    assert_eq!(operations, ["images", "realtime", "realtime"]);
+    assert_eq!(
+        operations,
+        [
+            ("images".into(), None),
+            ("realtime".into(), None),
+            ("realtime".into(), None)
+        ],
+        "a decision written without its verdict (all of them before 0100) reads null"
+    );
 }

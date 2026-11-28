@@ -6973,7 +6973,7 @@
             "type": "null"
           },
           "uninspectable": {
-            "description": "What an enforcing rule does with content it cannot read (an image, audio, a realtime session; the images, transcription and realtime workloads are never read): deny refuses the request (guardrail_not_supported), allow lets it through recorded as skipped, its text still checked (#841). Default deny.",
+            "description": "What an enforcing rule does with content it cannot read: deny refuses the request (guardrail_not_supported); allow lets it through recorded as skipped. Under allow the text beside an image in a generation request is still checked; an image prompt, an audio file, a realtime session and the lines of a native batch are not read at all (the images, transcription and realtime workloads are never read) (#841). Default deny.",
             "enum": [
               "allow",
               "deny"
@@ -45888,9 +45888,16 @@
                     }
                   ]
                 },
-                "refused": {
-                  "description": "Whether these decisions refused their requests: a skipped (not readable) total is split into requests refused (uninspectable: deny) and requests let through unread (allow) (#841).",
-                  "type": "boolean"
+                "refuses": {
+                  "description": "Not readable (skipped) totals only: whether the decisions' rules refuse what they cannot read (a Block rule with uninspectable: deny) or let it through unread, each rule's own verdict whatever other rules did to the request; null for every other action, which is not split, and for decisions recorded before migration 0100 (#841).",
+                  "oneOf": [
+                    {
+                      "type": "boolean"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 }
               },
               "required": [
@@ -45899,7 +45906,7 @@
                 "decisions",
                 "findings",
                 "kind",
-                "refused"
+                "refuses"
               ],
               "type": "object"
             },
@@ -50437,9 +50444,16 @@
                     }
                   ]
                 },
-                "refused": {
-                  "description": "Whether these decisions refused their requests: a skipped (not readable) total is split into requests refused (uninspectable: deny) and requests let through unread (allow) (#841).",
-                  "type": "boolean"
+                "refuses": {
+                  "description": "Not readable (skipped) totals only: whether the decisions' rules refuse what they cannot read (a Block rule with uninspectable: deny) or let it through unread, each rule's own verdict whatever other rules did to the request; null for every other action, which is not split, and for decisions recorded before migration 0100 (#841).",
+                  "oneOf": [
+                    {
+                      "type": "boolean"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 }
               },
               "required": [
@@ -50448,7 +50462,7 @@
                 "decisions",
                 "findings",
                 "kind",
-                "refused"
+                "refuses"
               ],
               "type": "object"
             },
@@ -59348,9 +59362,16 @@
                     }
                   ]
                 },
-                "refused": {
-                  "description": "Whether these decisions refused their requests: a skipped (not readable) total is split into requests refused (uninspectable: deny) and requests let through unread (allow) (#841).",
-                  "type": "boolean"
+                "refuses": {
+                  "description": "Not readable (skipped) totals only: whether the decisions' rules refuse what they cannot read (a Block rule with uninspectable: deny) or let it through unread, each rule's own verdict whatever other rules did to the request; null for every other action, which is not split, and for decisions recorded before migration 0100 (#841).",
+                  "oneOf": [
+                    {
+                      "type": "boolean"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 }
               },
               "required": [
@@ -59359,7 +59380,7 @@
                 "decisions",
                 "findings",
                 "kind",
-                "refused"
+                "refuses"
               ],
               "type": "object"
             },

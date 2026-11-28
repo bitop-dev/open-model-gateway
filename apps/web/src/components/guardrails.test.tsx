@@ -476,7 +476,7 @@ describe("What a rule can't read (#841)", () => {
     expect(inspectionSentence(images)).toBe("Image generation requests are never read: it refuses every one. If the rule can't run, the request is refused. Checked inside the gateway; nothing is sent anywhere else.");
     expect(inspectionSentence({ ...images, uninspectable: "allow" })).toContain("Image generation requests are never read: it lets them through unread and records each as not readable.");
     const both = { ...codes, workloads: ["generation", "realtime"] as Workload[], uninspectable: "allow" as const };
-    expect(inspectionSentence(both)).toContain("in the input of generation requests and refuses a request that has one. A request it can't read (one with an image, audio or a document that isn't plain text) goes on with its text checked, and is recorded as not readable");
+    expect(inspectionSentence(both)).toContain("in the input of generation requests and refuses a request that has one. A request with an image, audio or a document that isn't plain text goes on with its text checked, recorded as not readable; a native batch is created without its lines being read");
     expect(inspectionSentence(both)).toContain("Realtime requests are never read: it lets them through unread");
     expect(refusesWhole({ action: "block", workloads: ["images", "realtime"] }, "every team workspace")).toBe("This refuses all image generation and realtime requests for every team workspace: their content is never read, so a Block rule that refuses what it can't read refuses every one.");
     expect(refusesWhole({ action: "block", uninspectable: "allow", workloads: ["images"] }, "x")).toBeUndefined();
@@ -511,14 +511,34 @@ describe("What a rule can't read (#841)", () => {
     expect(stricterPart({ tightens: "r-lets", uninspectable: "deny" }, lets)).toEqual({ tightens: "r-lets", uninspectable: "deny" });
     expect(stricterPart({ tightens: "r-lets", uninspectable: "allow" }, lets)).toBeNull();
   });
+  it("offers refusing what it can't read only when the tightened rule blocks", async () => {
+    const watch: StoredRule = { ...secrets, id: "r-watch", name: "Watches", uninspectable: "allow" };
+    const fetch = serve({ [guardrailsPath(team.id)]: () => view({ platform: { source: "type_default", rule_set: { ...platformSet, rules: [watch] } }, local: { ...localSet, rules: [] }, effective: [effective(watch, "type_default", "set-p")] }) });
+    const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
+    await user.click(await screen.findByRole("button", { name: "Tighten Watches" }));
+    // A Monitor rule never refuses, so the choice appears only with Block.
+    expect(screen.queryByLabelText("What it can't read")).toBeNull();
+    await user.selectOptions(screen.getByLabelText("On input"), "block");
+    expect((screen.getByLabelText("What it can't read") as HTMLSelectElement).value).toBe("");
+    await user.selectOptions(screen.getByLabelText("What it can't read"), "deny");
+    await user.click(screen.getByRole("button", { name: "Tighten" }));
+    await waitFor(() => expect(writes(fetch)).toHaveLength(1));
+    expect(writes(fetch)[0]![2].rules).toEqual([{ tightens: "r-watch", input: { action: "block" }, uninspectable: "deny" }]);
+  });
   it("counts not readable requests refused apart from those let through, and the request page says which", async () => {
-    serve({ [platformGuardrailsPath(team.id)]: () => platformView({ decisions_this_month: [{ action: "skipped", category: "secret", refused: true, decisions: 2, findings: 0 }, { action: "skipped", category: "secret", refused: false, decisions: 5, findings: 0 }] }) });
+    serve({ [platformGuardrailsPath(team.id)]: () => platformView({ decisions_this_month: [{ action: "skipped", category: "secret", refuses: true, decisions: 2, findings: 0 }, { action: "skipped", category: "secret", refuses: false, decisions: 5, findings: 0 }] }) });
     mount(<WorkspaceGuardrailsAdmin id={team.id} writable />);
     const table = await screen.findByRole("table", { name: "Guardrail decisions this month" });
     expect(table.textContent).toContain("Not readable · refused");
     expect(table.textContent).toContain("Not readable · let through");
-    expect(screen.getByText(/refused ones \(the rule refuses what it can't read\) apart from ones let through unread/)).toBeTruthy();
+    expect(screen.getByText(/rules that refuse what they can't read apart from rules that let it through unread/)).toBeTruthy();
     const html = markup(<GuardrailDecisions decisions={[{ rule_set_id: "set-p", rule_id: "11111111-2222-4333-8444-555555555555", revision: 3, layer: "type_default", stage: "input", detector: "pattern", category: "secret", kind: null, action: "skipped", count: 1, refused: false, created_at: "2026-11-26T00:00:00Z" }]} />);
     expect(html).toContain("Let through unread");
+    // On a request another decision refused, a skip let nothing through.
+    const refused = markup(<GuardrailDecisions decisions={[
+      { rule_set_id: "set-p", rule_id: "11111111-2222-4333-8444-555555555555", revision: 3, layer: "type_default", stage: "input", detector: "pattern", category: "secret", kind: null, action: "blocked", count: 1, refused: true, created_at: "2026-11-26T00:00:00Z" },
+      { rule_set_id: "set-p", rule_id: "11111111-2222-4333-8444-555555555555", revision: 3, layer: "type_default", stage: "input", detector: "pattern", category: "secret", kind: null, action: "skipped", count: 1, refused: false, created_at: "2026-11-26T00:00:00Z" }]} />);
+    expect(refused).toContain("Refused the request");
+    expect(refused).not.toContain("Let through unread");
   });
 });

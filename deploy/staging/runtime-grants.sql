@@ -251,7 +251,7 @@ GRANT EXECUTE ON FUNCTION public.guardrail_kinds_valid(text[]) TO gateway_runtim
 -- Guardrail decisions (0095): appended by the engine, read by Logs; never
 -- changed or removed (append-only history, archived by the owner).
 -- #841 (0099): a personal-data decision's kind (a fixed label) is appended with it.
-GRANT SELECT,INSERT(id,root_request_id,workspace_id,api_key_id,operation,model,streamed,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,tightened,omitted,kind) ON public.guardrail_events TO gateway_runtime;
+GRANT SELECT,INSERT(id,root_request_id,workspace_id,api_key_id,operation,model,streamed,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,tightened,omitted,kind,refuses) ON public.guardrail_events TO gateway_runtime;
 -- Installation spend rules (0026) edit their period and reference amount.
 GRANT UPDATE(name,enabled,budget_layers,thresholds,spike_factor_percent,min_spend_microusd,
  window_minutes,error_rate_percent,min_requests,consecutive_failures,provider_connection_id,
