@@ -325,23 +325,22 @@ impl ImageBuffer {
         }
     }
     /// Admits `n` file reads for `key` in this UTC minute (a fixed window),
-    /// or the seconds until the next minute once its reads are spent. The
-    /// reads admitted before the refusal stay spent: the request reads none.
-    pub fn admit_file_reads(&self, key: Uuid, n: usize) -> Result<(), u32> {
+    /// all or none: `Err(Some(seconds))` until the next minute when the
+    /// minute's reads cannot take them, `Err(None)` when no minute can.
+    pub fn admit_file_reads(&self, key: Uuid, n: usize) -> Result<(), Option<u32>> {
+        let limit = self.limits.file_reads_per_key_per_minute;
+        let n = u32::try_from(n).ok().filter(|n| *n <= limit).ok_or(None)?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         let minute = i64::try_from(now / 60).unwrap_or(i64::MAX);
-        for _ in 0..n {
-            if !self
-                .file_reads
-                .admit(key, minute, self.limits.file_reads_per_key_per_minute)
-            {
-                return Err(u32::try_from(60 - now % 60).unwrap_or(60));
-            }
+        if self.file_reads.admit_many(key, minute, limit, n) {
+            Ok(())
+        } else {
+            Err(Some(u32::try_from(60 - now % 60).unwrap_or(60)))
         }
-        Ok(())
     }
+
     /// The MiB one key may hold at once: half the buffer, and never less
     /// than one body at the route cap, so every key can always send one.
     pub fn key_share(&self) -> usize {

@@ -543,6 +543,17 @@ async fn reads_are_bounded_per_key_and_by_the_buffer_before_anything_is_read(poo
     );
     let seconds: u32 = retry.unwrap().parse().unwrap();
     assert!((1..=60).contains(&seconds));
+    // More references than the minute's limit can never be read: refused
+    // for good, by name, and nothing is charged.
+    let (status, _, value) = chat(&w, &me, &refs(4)).await;
+    assert_eq!(
+        (status, value["error"]["message"].as_str()),
+        (
+            StatusCode::BAD_REQUEST,
+            Some("messages.content.file.file_id")
+        ),
+        "{value}"
+    );
     assert_eq!(w.upstream.bodies.lock().unwrap().len(), 1);
 }
 
@@ -620,6 +631,7 @@ async fn a_revoked_key_reads_no_file_even_while_its_cache_entry_lives(pool: PgPo
         &buffer,
         &w.f.principal,
         std::slice::from_ref(&reference),
+        0,
     )
     .await
     .err();
@@ -632,4 +644,32 @@ async fn a_revoked_key_reads_no_file_even_while_its_cache_entry_lives(pool: PgPo
         0,
         "no file read"
     );
+}
+
+#[dbtest::test]
+async fn a_large_body_and_its_references_that_can_never_fit_are_refused_for_good(pool: PgPool) {
+    let w = files_world(pool, ImageInputLimits::default()).await;
+    let me = bearer(&w);
+    let id = upload(&w, &me, "vision", &png(5 * MIB, "together")).await;
+    // Two inline 5 MiB images (about 14 MiB of body) and one 5 MiB file
+    // (about 12 MiB) pass the key's 24 MiB share however long it waits.
+    let inline = png_url(5 * MIB, "inline");
+    let body = json!({"model":"company/smart","max_tokens":16,"messages":[{"role":"user","content":[
+        {"type":"image_url","image_url":{"url":inline}},
+        {"type":"image_url","image_url":{"url":inline}},
+        {"type":"file","file":{"file_id":id}}]}]});
+    let (status, retry, value, _) = super::image_input_http_tests::send(
+        &w,
+        "/v1/chat/completions",
+        Some(&w.token),
+        serde_json::to_vec(&body).unwrap(),
+        true,
+    )
+    .await;
+    assert_eq!(
+        (status, retry, value["error"]["code"].as_str()),
+        (StatusCode::PAYLOAD_TOO_LARGE, None, Some("file_too_large")),
+        "{value}"
+    );
+    assert!(w.upstream.bodies.lock().unwrap().is_empty());
 }

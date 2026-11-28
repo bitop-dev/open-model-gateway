@@ -9366,7 +9366,7 @@
             "code": "invalid_request_error",
             "envelope": "OpenAiErrorEnvelope",
             "status": 400,
-            "trigger": "an image_url that is not a PNG/JPEG/WebP/GIF base64 data URL whose bytes match its type (remote URLs included), over 5 MiB decoded, past 20 images, or outside a user message; a part carrying input_audio; a file part with inline file_data or a filename (messages.content.file.file_data, messages.content.file.filename), or with a file_id outside a user message (messages.content.file.file_id); more than 20 referenced files; the message names the messages.content field"
+            "trigger": "an image_url that is not a PNG/JPEG/WebP/GIF base64 data URL whose bytes match its type (remote URLs included), over 5 MiB decoded, past 20 images, or outside a user message; a part carrying input_audio; a file part with inline file_data or a filename (messages.content.file.file_data, messages.content.file.filename), or with a file_id outside a user message (messages.content.file.file_id); more than 20 referenced files, or more than a key may have read in a minute; the message names the messages.content field"
           },
           {
             "code": "file_not_found",
@@ -9390,13 +9390,13 @@
             "code": "file_too_large",
             "envelope": "OpenAiErrorEnvelope",
             "status": 413,
-            "trigger": "a referenced file over 5 MiB, or a request's referenced files together (their bytes and base64) more than one key may ever hold of the image input buffer (refused for good, before any read); the message begins with messages.content.file.file_id"
+            "trigger": "a referenced file over 5 MiB, or a request's referenced files together (their bytes and base64), with what its own large body holds, more than one key may ever hold of the image input buffer (refused for good, before any read); the message begins with messages.content.file.file_id"
           },
           {
             "code": "file_reads_rate_limited",
             "envelope": "OpenAiErrorEnvelope",
             "status": 429,
-            "trigger": "this API key's file reads in the current UTC minute on this replica (GATEWAY_FILE_INPUT_READS_PER_KEY_PER_MINUTE, default 120; a fixed window, charged only for reads that will happen) are spent; nothing was read or sent; Retry-After until the next minute"
+            "trigger": "this API key's file reads in the current UTC minute on this replica (GATEWAY_FILE_INPUT_READS_PER_KEY_PER_MINUTE, default 120; a fixed window, charged all or nothing and only for reads that will happen) cannot take the request's files; nothing was read or sent; Retry-After until the next minute"
           },
           {
             "code": "file_store_unavailable",
@@ -12305,7 +12305,7 @@
             "code": "invalid_request_error",
             "envelope": "OpenAiErrorEnvelope",
             "status": 400,
-            "trigger": "an input_image whose image_url is not a PNG/JPEG/WebP/GIF base64 data URL whose bytes match its type (remote URLs included), over 5 MiB decoded, past 20 images, or outside a user message; an input_image with both image_url and file_id; an input_file with inline file_data or a file_url (input.content.file_data, input.content.file_url), or a file reference outside a user message (input.content.file_id); more than 20 referenced files; the message names the input.content field"
+            "trigger": "an input_image whose image_url is not a PNG/JPEG/WebP/GIF base64 data URL whose bytes match its type (remote URLs included), over 5 MiB decoded, past 20 images, or outside a user message; an input_image with both image_url and file_id; an input_file with inline file_data or a file_url (input.content.file_data, input.content.file_url), or a file reference outside a user message (input.content.file_id); more than 20 referenced files, or more than a key may have read in a minute; the message names the input.content field"
           },
           {
             "code": "file_not_found",
@@ -12329,13 +12329,13 @@
             "code": "file_too_large",
             "envelope": "OpenAiErrorEnvelope",
             "status": 413,
-            "trigger": "a referenced file over 5 MiB, or a request's referenced files together (their bytes and base64) more than one key may ever hold of the image input buffer (refused for good, before any read); the message begins with input.content.file_id"
+            "trigger": "a referenced file over 5 MiB, or a request's referenced files together (their bytes and base64), with what its own large body holds, more than one key may ever hold of the image input buffer (refused for good, before any read); the message begins with input.content.file_id"
           },
           {
             "code": "file_reads_rate_limited",
             "envelope": "OpenAiErrorEnvelope",
             "status": 429,
-            "trigger": "this API key's file reads in the current UTC minute on this replica (GATEWAY_FILE_INPUT_READS_PER_KEY_PER_MINUTE, default 120; a fixed window, charged only for reads that will happen) are spent; nothing was read or sent; Retry-After until the next minute"
+            "trigger": "this API key's file reads in the current UTC minute on this replica (GATEWAY_FILE_INPUT_READS_PER_KEY_PER_MINUTE, default 120; a fixed window, charged all or nothing and only for reads that will happen) cannot take the request's files; nothing was read or sent; Retry-After until the next minute"
           },
           {
             "code": "file_store_unavailable",

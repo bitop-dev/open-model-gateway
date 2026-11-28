@@ -191,12 +191,15 @@ fn data_url_len(bytes: u64) -> usize {
 }
 
 /// Resolves `references` for `principal` (see the module for the order).
+/// `body_mib` is what the request's own large body holds of the same key's
+/// share (`image_buffer::LargeBody`), 0 for a text body.
 pub async fn resolve(
     store: &crate::store::Store,
     files: &FileStorage,
     buffer: &ImageBuffer,
     principal: &Principal,
     references: &[Reference],
+    body_mib: usize,
 ) -> Result<Files, Refusal> {
     if references.is_empty() {
         return Ok(Files {
@@ -242,40 +245,18 @@ pub async fn resolve(
             return Err(Refusal::TooLarge(field));
         }
     }
-    // The stored bytes and their base64 form are held at once. More than a
-    // key may ever hold is refused for good, not as a busy buffer.
-    let held: usize = stored
-        .iter()
-        .map(|(file, _)| {
-            usize::try_from(file.size_bytes).unwrap_or(usize::MAX) + data_url_len(file.size_bytes)
-        })
-        .fold(0, usize::saturating_add);
-    let first = references[0].field;
-    if held.div_ceil(crate::inference::image_buffer::MIB) > buffer.key_share() {
-        return Err(Refusal::TooLargeTogether(first));
-    }
-    let permit = match buffer.reserve(held, principal.key_id) {
-        Admission::Large(permit) => permit,
-        Admission::KeyShare => {
-            crate::metrics::METRICS.image_input_refused("key_share");
-            return Err(Refusal::Busy);
-        }
-        Admission::TooLarge => return Err(Refusal::TooLargeTogether(first)),
-        Admission::Busy | Admission::Text => {
-            crate::metrics::METRICS.image_input_refused("busy");
-            return Err(Refusal::Busy);
-        }
-    };
-    // Charged only for reads that will happen (the permit drops on refusal).
-    if let Err(seconds) = buffer.admit_file_reads(principal.key_id, stored.len()) {
-        crate::metrics::METRICS.image_input_refused("file_reads");
-        return Err(Refusal::Throttled(seconds));
-    }
+    let permit = hold(buffer, principal, &stored, references[0].field, body_mib)?;
     // One deadline for every read of the request.
     let deadline = tokio::time::Instant::now() + READ_TOTAL;
     let mut read_all = Vec::with_capacity(stored.len());
     for (file, _) in &stored {
-        read_all.push(read(files, file, deadline).await);
+        let read = read(files, file, deadline).await;
+        let failed = read.is_err();
+        read_all.push(read);
+        // The request fails at its first failed read: the rest are not read.
+        if failed {
+            break;
+        }
     }
     // Visible when the reads began and still visible now that all of them
     // ended: a file deleted, expired or hidden meanwhile (its read may have
@@ -307,6 +288,51 @@ pub async fn resolve(
         permit: Some(permit),
         data_bytes,
     })
+}
+
+/// The buffer share `stored`'s bytes and their base64 need, and the key's
+/// reads for them (see the module for the order and the refusals).
+fn hold(
+    buffer: &ImageBuffer,
+    principal: &Principal,
+    stored: &[(StoredFile, &'static str)],
+    first: &'static str,
+    body_mib: usize,
+) -> Result<BufferPermit, Refusal> {
+    // The stored bytes and their base64 form are held at once. More than a
+    // key may ever hold is refused for good, not as a busy buffer.
+    let held: usize = stored
+        .iter()
+        .map(|(file, _)| {
+            usize::try_from(file.size_bytes).unwrap_or(usize::MAX) + data_url_len(file.size_bytes)
+        })
+        .fold(0, usize::saturating_add);
+    if held.div_ceil(crate::inference::image_buffer::MIB) + body_mib > buffer.key_share() {
+        return Err(Refusal::TooLargeTogether(first));
+    }
+    let permit = match buffer.reserve(held, principal.key_id) {
+        Admission::Large(permit) => permit,
+        Admission::KeyShare => {
+            crate::metrics::METRICS.image_input_refused("key_share");
+            return Err(Refusal::Busy);
+        }
+        Admission::TooLarge => return Err(Refusal::TooLargeTogether(first)),
+        Admission::Busy | Admission::Text => {
+            crate::metrics::METRICS.image_input_refused("busy");
+            return Err(Refusal::Busy);
+        }
+    };
+    // Charged only for reads that will happen (the permit drops on refusal).
+    match buffer.admit_file_reads(principal.key_id, stored.len()) {
+        Ok(()) => {}
+        Err(Some(seconds)) => {
+            crate::metrics::METRICS.image_input_refused("file_reads");
+            return Err(Refusal::Throttled(seconds));
+        }
+        // More files than a key may have read in any minute: never served.
+        Err(None) => return Err(Refusal::TooMany(first)),
+    }
+    Ok(permit)
 }
 
 /// Whether `principal`'s key is valid now, read live (`auth::revalidate_admission`).
@@ -412,6 +438,8 @@ pub struct Context {
     store: crate::store::Store,
     runtime: Option<crate::filestore::FileStoreRuntime>,
     buffer: Option<ImageBuffer>,
+    /// MiB the request's own large body holds of its key's share.
+    body_mib: usize,
 }
 
 impl axum::extract::FromRequestParts<crate::store::Store> for Context {
@@ -427,6 +455,12 @@ impl axum::extract::FromRequestParts<crate::store::Store> for Context {
                 .get::<crate::filestore::FileStoreRuntime>()
                 .cloned(),
             buffer: parts.extensions.get::<ImageBuffer>().cloned(),
+            body_mib: parts
+                .extensions
+                .get::<crate::inference::image_buffer::LargeBody>()
+                .map_or(0, |large| {
+                    large.0.div_ceil(crate::inference::image_buffer::MIB)
+                }),
         })
     }
 }
@@ -453,7 +487,15 @@ impl Context {
             self.runtime
                 .unwrap_or_else(crate::filestore::FileStoreRuntime::off),
         );
-        resolve(&self.store, &files, &buffer, principal, references).await
+        resolve(
+            &self.store,
+            &files,
+            &buffer,
+            principal,
+            references,
+            self.body_mib,
+        )
+        .await
     }
 }
 

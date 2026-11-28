@@ -150,6 +150,10 @@ impl<K> Default for Limiter<K> {
 }
 impl<K: Hash + Eq> Limiter<K> {
     pub(crate) fn admit(&self, key: K, minute: i64, limit: u32) -> bool {
+        self.admit_many(key, minute, limit, 1)
+    }
+    /// Admits `n` at once, or none of them.
+    pub(crate) fn admit_many(&self, key: K, minute: i64, limit: u32, n: u32) -> bool {
         let mut windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
         if windows.len() >= TRACKED_KEYS && !windows.contains_key(&key) {
             windows.retain(|_, (m, _)| *m == minute);
@@ -161,10 +165,10 @@ impl<K: Hash + Eq> Limiter<K> {
         if window.0 != minute {
             *window = (minute, 0);
         }
-        if window.1 >= limit {
+        if window.1.saturating_add(n) > limit {
             return false;
         }
-        window.1 += 1;
+        window.1 += n;
         true
     }
 }
