@@ -330,6 +330,9 @@ pub enum VideoDeletion {
     /// The provider offers no delete (`405`): its copy stays until its own
     /// expiry.
     NotOffered,
+    /// The provider accepted the delete without confirming it (`202`, or
+    /// another success that is neither `200` nor `204`): its copy may remain.
+    Unconfirmed,
 }
 
 /// A route's video options (deployments, 0097): the clip lengths it accepts

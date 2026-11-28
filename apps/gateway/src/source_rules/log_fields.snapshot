@@ -49,6 +49,8 @@ jobs/schedule.rs :: impl Scheduler::record_signal :: warn :: deployment_id=%depl
 jobs/video.rs :: impl Jobs::create_video :: error :: execution_id=%request_id
 jobs/video.rs :: impl Jobs::unrecorded_upstream :: error :: execution_id=%execution
 jobs/video.rs :: impl Jobs::unrecorded_upstream :: error :: execution_id=%execution
+jobs/video_delete.rs :: impl Jobs::delete_upstream :: warn :: job_id=%job.id
+jobs/video_delete.rs :: impl Jobs::delete_video :: warn :: job_id=%job.id
 jobs/video_output.rs :: impl Jobs::refresh_output :: warn :: cause=f.as_str() ; job_id=%job.id
 jobs/video_output.rs :: impl Jobs::publish :: warn :: job_id=%job.id
 jobs/video_output.rs :: impl Jobs::give_up_output :: warn :: cause=cause.as_str() ; job_id=%job.id

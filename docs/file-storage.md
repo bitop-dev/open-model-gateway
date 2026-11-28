@@ -159,6 +159,8 @@ Rows are never deleted. Deleting a file removes the object, then sets `deleted_a
 
 If the upload fails, the row is marked deleted. If the gateway crashes mid-upload, it leaves a pending row, and the sweeper removes the object after a day.
 
+A stored video output is recorded on its job right after its commit. One that no job names two hours after its commit (its job deleted, its claim ended, or the gateway stopped between the commit and the record) is removed by the sweeper, as an unlinked batch result is after a day. The rule looks back one day (so a sweep does not probe every live video output); an orphan the sweeper missed in that day, because it was stopped, goes at its retention.
+
 `serve` sweeps every minute, at most 200 files per run. It claims due rows in a short transaction, where `last_delete_attempt_at` acts as a 5-minute lease, so replicas don't collide and no lock is held across network I/O. It then deletes the objects (idempotently) and marks each row deleted, or increments `delete_attempts` and records `last_delete_error` (`store_off`, `backend_mismatch`, `unavailable`, `denied`, …). Rows recorded under another backend than the one configured are never marked deleted without deleting their object.
 
 ```sh

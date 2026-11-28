@@ -451,19 +451,6 @@ impl Jobs {
     }
 }
 
-impl Jobs {
-    /// Delete a video's stored output (it is unreadable from then on, and
-    /// the file sweeper finishes a delete the store could not complete).
-    pub(super) async fn delete_output(&self, job: &JobRow, file: Uuid) -> JobResult<()> {
-        let files = self.files.as_ref().ok_or(InferenceError::Storage)?;
-        files
-            .delete(file, Some(job.workspace_id))
-            .await
-            .map_err(|_| InferenceError::Storage)?;
-        Ok(())
-    }
-}
-
 /// The types a video output is stored and served as: the video types as the
 /// server labels them, anything else as [`GENERIC`].
 const STORED_TYPES: [&str; 4] = [

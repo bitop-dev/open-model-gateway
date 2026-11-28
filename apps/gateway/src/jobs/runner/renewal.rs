@@ -60,7 +60,8 @@ impl Trust {
                 Step::Held { cancel }
             }
             Ok(Renewed::Settled) => Step::Done,
-            Ok(Renewed::Fenced) => Step::Fenced,
+            // Only a video is deleted; a run stops either way.
+            Ok(Renewed::Fenced | Renewed::Deleted) => Step::Fenced,
             Err(()) => Step::Failed {
                 stop_dispatch: now.duration_since(self.renewed) >= RENEW_TRUST,
             },

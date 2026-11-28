@@ -4290,7 +4290,7 @@
             "const": "video.deleted"
           },
           "upstream_deleted": {
-            "description": "Whether the provider's copy is gone: `false` when the provider offers no delete (it answered `405`), or a create whose outcome is unknown left no provider id to delete; the copy then stays until the provider's own expiry. A `404` counts as gone.",
+            "description": "Whether the provider's copy is gone: `true` when it answered `204`, or `200` with a deletion object or without a JSON body, or no longer had it (`404`), or the create was never sent. `false` when it offers no delete (`405`), only queued the delete (`202`), refused or failed it, the route is disabled, a create of unknown outcome left no id to ask about, or the server gave the id to another job (never asked again); the copy then stays until the provider's own expiry. The gateway's delete stands either way, and cannot be retried.",
             "type": "boolean"
           }
         },

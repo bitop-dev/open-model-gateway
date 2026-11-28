@@ -547,7 +547,7 @@ impl Jobs {
         self.limits.poll_interval.map_or(30.0, |d| d.as_secs_f64())
     }
 
-    async fn own_video(&self, principal: &Principal, id: &str) -> JobResult<JobRow> {
+    pub(super) async fn own_video(&self, principal: &Principal, id: &str) -> JobResult<JobRow> {
         let id = parse_client_id(JobKind::Video.prefix(), id).ok_or(JobError::NotFound)?;
         store::job(
             &self.store,
@@ -712,62 +712,5 @@ impl Jobs {
         let upstream_id = job.upstream().ok_or(InferenceError::Storage)?;
         let content = call(adapter.video_content(&target, &upstream_id, asset)).await?;
         Ok(super::content_bounds::bounded_content(content, asset)?)
-    }
-
-    /// Delete a finished video's provider assets. In-progress jobs cannot be
-    /// deleted (their accounting is still open). Returns whether the
-    /// provider's copy is gone: `false` when the provider offers no delete
-    /// (`405`), whose copy then stays until its own expiry, or when a create
-    /// whose outcome is unknown left no provider id to delete; a `404` counts
-    /// as gone.
-    pub async fn delete_video(&self, principal: &Principal, id: &str) -> JobResult<(JobRow, bool)> {
-        let job = self.own_video(principal, id).await?;
-        if !crate::visibility::may_modify_job(
-            &self.store.pool,
-            principal.workspace_id,
-            crate::visibility::Viewer::of(principal),
-            job.id,
-        )
-        .await?
-        {
-            return Err(JobError::Forbidden(
-                "video_not_owned",
-                "Only the creator or a workspace admin can delete this video",
-            ));
-        }
-        if !job.job_state().is_terminal() {
-            return Err(JobError::Conflict(
-                "video_in_progress",
-                "A video can be deleted once it is completed or failed",
-            ));
-        }
-        // A video that never got a provider id has no provider assets only
-        // when its create is known to have left none (`create_failed`: nothing
-        // sent, or refused); after an unknown outcome (`create_unconfirmed`,
-        // `create_interrupted`) the server may still have it. A job whose id
-        // the server gave another job is never asked about again
-        // (`Jobs::target`): only the record goes, and the copy may remain.
-        let mut upstream_deleted = job.error_code.as_deref() == Some("create_failed");
-        if job.upstream_id.is_some() && job.error_code.as_deref() != Some(super::UPSTREAM_ID_REUSED)
-        {
-            match self.target(&job).await {
-                // Marked since `job` was read: the record goes, the copy may
-                // remain.
-                Err(InferenceError::InvalidUpstream) => {}
-                Err(e) => return Err(e.into()),
-                Ok((target, adapter)) => {
-                    let upstream_id = job.upstream().ok_or(InferenceError::Storage)?;
-                    upstream_deleted = call(adapter.delete_video(&target, &upstream_id)).await?
-                        == VideoDeletion::Deleted;
-                }
-            }
-        }
-        // The gateway's stored copy goes with the record: a failure to delete
-        // it is an error, never a deletion.
-        if let Some(file) = job.output_file_id {
-            self.delete_output(&job, file).await?;
-        }
-        store::mark_deleted(&self.store, job.id).await?;
-        Ok((job, upstream_deleted))
     }
 }
