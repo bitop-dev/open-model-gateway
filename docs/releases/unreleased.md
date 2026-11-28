@@ -1,3 +1,7 @@
 # Open Model Gateway: unreleased
 
 Notes for changes on `main` after [v0.20.0](v0.20.0.md). They become the next release's notes.
+
+## Gateway behavior
+
+- **Images referenced by `file_id`** (#51, part 1). A Chat Completions `file` part, or a Responses `input_image` or `input_file` with a `file_id`, may now reference an image uploaded through the Files API (purposes `user_data`, `vision` and `assistants`, at most 5 MiB). The file is looked up in the key's own workspace with the Files API's visibility; every way a key may not have it (no such id, another workspace's, deleted, expired, hidden by the workspace's object visibility) is the same 400 `file_not_found`. Its type is decided from its bytes, and it then goes through every check of an inline image; neither its id nor its name is sent to a provider. The bytes are read before admission, bounded by the image input buffer and the key's share of it (503 `image_input_busy`) and by the new `GATEWAY_FILE_INPUT_READS_PER_KEY_PER_MINUTE` (default 120 per replica; 429 `file_reads_rate_limited`). Other refusals: 400 `file_purpose_not_supported`, 413 `file_too_large`, 400 `unsupported_file_type` (anything but a PNG, JPEG, WebP or GIF image, for now), and, naming the field, inline `file_data`, a `filename`, a Responses `file_url` and a reference in a batch line. Refusals whose field was `messages.content.file` or `input.content.input_file` now name the precise field. No migration, runtime grant or route change. [Stored files](../protocol-matrix.md#stored-files-referenced-by-file_id)

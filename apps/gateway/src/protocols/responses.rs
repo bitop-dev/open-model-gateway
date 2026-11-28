@@ -237,8 +237,21 @@ fn message_content(
             )?));
             continue;
         }
+        // A file reference that reached here was not resolved (outside a
+        // user message, in a batch line, or with inline data or a URL):
+        // refused by name, never dropped.
         if part["type"] == "input_file" {
-            return Err(InferenceError::InvalidField("input.content.input_file"));
+            return Err(InferenceError::InvalidField(
+                if part.get("file_data").is_some() {
+                    "input.content.file_data"
+                } else if part.get("file_url").is_some() {
+                    "input.content.file_url"
+                } else if part.get("file_id").is_some() {
+                    FILE_ID_FIELD
+                } else {
+                    "input.content.input_file"
+                },
+            ));
         }
         if role == Role::Assistant && part["type"] == "output_text" {
             fields(&part, &["type", "text", "annotations"])?;
@@ -370,7 +383,21 @@ impl Request {
         })
     }
 }
+/// The field a Responses file reference is named by.
+pub(crate) const FILE_ID_FIELD: &str = "input.content.file_id";
+
+impl Request {
+    /// The file references of user message items, in order: what
+    /// `file_input` resolves.
+    fn file_parts(&mut self) -> impl Iterator<Item = &mut Value> {
+        super::file_input::responses_references(&mut self.input)
+    }
+}
+
 pub async fn handle(
+    axum::extract::State(store): axum::extract::State<crate::store::Store>,
+    runtime: Option<Extension<crate::filestore::FileStoreRuntime>>,
+    buffer: Option<Extension<crate::inference::image_buffer::ImageBuffer>>,
     Extension(engine): Extension<Engine>,
     Extension(principal): Extension<Principal>,
     Extension(request_id): Extension<RequestId>,
@@ -378,13 +405,53 @@ pub async fn handle(
     weight: Option<Extension<crate::http::BodyWeight>>,
     input: std::result::Result<crate::http::json_body::JsonBody<Request>, JsonBodyRejection>,
 ) -> Response {
-    let wire = match input {
+    let mut wire = match input {
         Ok(crate::http::json_body::JsonBody(v)) => v,
         Err(e) => return rejection(e),
     };
     if !client::valid_openai_metadata(wire.metadata.as_ref()) {
         return error_response(InferenceError::InvalidRequest);
     }
+    // Referenced files become inline images before normalization checks
+    // them as such (`file_input`).
+    let references: Vec<super::file_input::Reference> = wire
+        .file_parts()
+        .filter_map(|part| Some(part.get("file_id")?.as_str()?.to_owned()))
+        .map(|id| super::file_input::Reference {
+            id,
+            field: FILE_ID_FIELD,
+        })
+        .collect();
+    let files =
+        match super::file_input::resolve_request(store, runtime, buffer, &principal, &references)
+            .await
+        {
+            Ok(files) => files,
+            Err(refused) => return refused,
+        };
+    let permit = files.permit;
+    let from_files = files.data_bytes;
+    for (part, super::file_input::Resolved::Image(url)) in wire.file_parts().zip(files.contents) {
+        super::file_input::responses_image(part, url);
+    }
+
+    let after = engine.limits().request_timeout + crate::inference::SETTLEMENT_DEADLINE;
+    let response = respond(
+        engine, principal, request_id, large, weight, wire, from_files,
+    )
+    .await;
+    super::file_input::holding(response, permit, after)
+}
+
+async fn respond(
+    engine: Engine,
+    principal: Principal,
+    request_id: RequestId,
+    large: Option<Extension<crate::inference::image_buffer::LargeBody>>,
+    weight: Option<Extension<crate::http::BodyWeight>>,
+    wire: Request,
+    from_files: usize,
+) -> Response {
     let labels = client::current().with_body_session(client::openai_session(
         wire.metadata.as_ref(),
         wire.user.as_deref(),
@@ -394,7 +461,7 @@ pub async fn handle(
         Err(e) => return error_response(e),
     };
     // Only image data may take a body past the shared text limit.
-    if large.is_some_and(|Extension(large)| !large.allows(&request)) {
+    if large.is_some_and(|Extension(large)| !large.allows(&request, from_files)) {
         crate::metrics::METRICS.image_input_refused("too_large");
         return super::payload_too_large();
     }
@@ -688,7 +755,19 @@ mod tests;
 
 #[cfg(test)]
 pub(crate) fn openapi_normalize(value: Value) -> Result<ChatRequest> {
-    serde_json::from_value::<Request>(value)
-        .map_err(|_| InferenceError::InvalidRequest)?
-        .normalize()
+    let mut wire =
+        serde_json::from_value::<Request>(value).map_err(|_| InferenceError::InvalidRequest)?;
+    // No stored file can be read offline: each reference the handler would
+    // resolve stands in as the inline image it becomes when its file holds one.
+    for part in wire.file_parts() {
+        super::file_input::responses_image(
+            part,
+            format!(
+                "data:image/png;base64,{}",
+                crate::inference::images::fixtures::PNG_1X1
+            ),
+        );
+    }
+
+    wire.normalize()
 }

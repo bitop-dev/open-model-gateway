@@ -892,7 +892,7 @@
         "type": "object"
       },
       "GenChatContentParts": {
-        "description": "Content parts of a user message: text and inline images. Parts of type file or input_audio are refused with 400 naming the field.",
+        "description": "Content parts of a user message: text, inline images and stored files referenced by file_id. Parts of type input_audio are refused with 400 naming the field.",
         "items": {
           "oneOf": [
             {
@@ -900,12 +900,117 @@
             },
             {
               "$ref": "#/components/schemas/GenChatImagePart"
+            },
+            {
+              "$ref": "#/components/schemas/GenChatFilePart"
             }
           ]
         },
         "maxItems": 256,
         "minItems": 1,
         "type": "array"
+      },
+      "GenChatFilePart": {
+        "description": "A stored file referenced by file_id, on user messages only (400 naming messages.content.file.file_id elsewhere). Resolved before routing inside the key's workspace with the Files API's visibility (the creator, a service key, a workspace owner or admin, as the workspace's object visibility allows), from purposes user_data, vision and assistants, at most 5 MiB. Its bytes, read whole and checked against the stored digest, must be a PNG, JPEG, WebP or GIF image: it is then the inline image a data URL would be (the same checks, routes with image_input only). The file's name and id are not sent upstream.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "file": {
+                "$ref": "#/components/schemas/GenChatFileRef"
+              },
+              "image_url": {
+                "type": "null"
+              },
+              "input_audio": {
+                "type": "null"
+              },
+              "text": {
+                "type": "null"
+              },
+              "type": {
+                "const": "file"
+              }
+            },
+            "required": [
+              "type",
+              "file"
+            ],
+            "type": "object"
+          },
+          {
+            "items": false,
+            "maxItems": 5,
+            "minItems": 5,
+            "prefixItems": [
+              {
+                "const": "file"
+              },
+              {
+                "type": "null"
+              },
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GenChatFileRef"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "type": "array"
+          }
+        ]
+      },
+      "GenChatFileRef": {
+        "description": "A stored file referenced by id.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "file_data": {
+                "description": "Accepted only as null: inline file data is refused with 400 naming messages.content.file.file_data.",
+                "type": "null"
+              },
+              "file_id": {
+                "description": "A Files API id (file-…). Never sent upstream: the file's contents are.",
+                "maxLength": 37,
+                "minLength": 37,
+                "pattern": "^file-[0-9a-f]{32}$",
+                "type": "string"
+              },
+              "filename": {
+                "description": "Accepted only as null: a filename is refused with 400 naming messages.content.file.filename (the file's name is never sent).",
+                "type": "null"
+              }
+            },
+            "required": [
+              "file_id"
+            ],
+            "type": "object"
+          },
+          {
+            "items": false,
+            "maxItems": 3,
+            "minItems": 3,
+            "prefixItems": [
+              {
+                "maxLength": 37,
+                "minLength": 37,
+                "pattern": "^file-[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "type": "array"
+          }
+        ]
       },
       "GenChatImagePart": {
         "description": "An inline image, on user messages only (400 naming messages.content.image_url elsewhere). The request goes only to routes whose adapter carries images and whose deployment allows image_input; with none left it is refused with 501 unsupported_capability before admission.",
@@ -914,7 +1019,7 @@
             "additionalProperties": false,
             "properties": {
               "file": {
-                "description": "Accepted only as null. A part that carries a file is refused with 400 naming messages.content.file, whatever its type.",
+                "description": "Accepted only as null. A text or image part that also carries a file is refused with 400 naming messages.content.file.file_id (a reference), messages.content.file.file_data (inline data), messages.content.file.filename or messages.content.file.",
                 "type": "null"
               },
               "image_url": {
@@ -1286,7 +1391,7 @@
             "additionalProperties": false,
             "properties": {
               "file": {
-                "description": "Accepted only as null. A part that carries a file is refused with 400 naming messages.content.file, whatever its type.",
+                "description": "Accepted only as null. A text or image part that also carries a file is refused with 400 naming messages.content.file.file_id (a reference), messages.content.file.file_data (inline data), messages.content.file.filename or messages.content.file.",
                 "type": "null"
               },
               "image_url": {
@@ -2678,12 +2783,52 @@
           }
         ]
       },
+      "GenResponseInputFile": {
+        "additionalProperties": false,
+        "description": "A stored file referenced by file_id, on user messages only, resolved as an input_image's file_id is: in this release it must hold an image. Inline file_data and file_url are refused with 400 naming input.content.file_data or input.content.file_url.",
+        "properties": {
+          "file_id": {
+            "description": "A Files API id; never sent upstream.",
+            "maxLength": 37,
+            "minLength": 37,
+            "pattern": "^file-[0-9a-f]{32}$",
+            "type": "string"
+          },
+          "type": {
+            "const": "input_file"
+          }
+        },
+        "required": [
+          "type",
+          "file_id"
+        ],
+        "type": "object"
+      },
       "GenResponseInputImage": {
         "additionalProperties": false,
-        "description": "An inline image, on user messages only (400 naming input.content.input_image elsewhere). A file_id is refused with 400 naming input.content.file_id, an input_file part with 400 naming input.content.input_file. The request goes only to routes whose adapter carries images and whose deployment allows image_input; with none left it is refused with 501 unsupported_capability before admission.",
+        "description": "An image, inline (image_url) or a stored file (file_id), on user messages only (400 naming input.content.input_image elsewhere). A file_id is resolved before routing inside the key's workspace with the Files API's visibility, from purposes user_data, vision and assistants, at most 5 MiB, and must hold a PNG, JPEG, WebP or GIF image (decided from its bytes); it is then the inline image a data URL would be. The request goes only to routes whose adapter carries images and whose deployment allows image_input; with none left it is refused with 501 unsupported_capability before admission.",
+        "oneOf": [
+          {
+            "required": [
+              "image_url"
+            ]
+          },
+          {
+            "required": [
+              "file_id"
+            ]
+          }
+        ],
         "properties": {
           "detail": {
             "$ref": "#/components/schemas/GenImageDetail"
+          },
+          "file_id": {
+            "description": "A Files API id, resolved as an input_file's is; never sent upstream.",
+            "maxLength": 37,
+            "minLength": 37,
+            "pattern": "^file-[0-9a-f]{32}$",
+            "type": "string"
           },
           "image_url": {
             "$ref": "#/components/schemas/GenImageDataUrl"
@@ -2693,8 +2838,7 @@
           }
         },
         "required": [
-          "type",
-          "image_url"
+          "type"
         ],
         "type": "object"
       },
@@ -2760,6 +2904,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/GenResponseInputImage"
+                    },
+                    {
+                      "$ref": "#/components/schemas/GenResponseInputFile"
                     }
                   ]
                 },
@@ -3673,6 +3820,10 @@
           "authentication_error",
           "budget_exceeded",
           "context_length_exceeded",
+          "file_not_found",
+          "file_purpose_not_supported",
+          "file_reads_rate_limited",
+          "file_too_large",
           "guardrail_detector_failed",
           "guardrail_input_blocked",
           "guardrail_not_supported",
@@ -3696,6 +3847,7 @@
           "token_reservation_exceeds_limit",
           "unresolved_usage",
           "unsupported_capability",
+          "unsupported_file_type",
           "upstream_rejected",
           "upstream_unavailable"
         ],
@@ -9213,7 +9365,37 @@
             "code": "invalid_request_error",
             "envelope": "OpenAiErrorEnvelope",
             "status": 400,
-            "trigger": "an image_url that is not a PNG/JPEG/WebP/GIF base64 data URL whose bytes match its type (remote URLs included), over 5 MiB decoded, past 20 images, or outside a user message; a part carrying file or input_audio; the message names the messages.content field"
+            "trigger": "an image_url that is not a PNG/JPEG/WebP/GIF base64 data URL whose bytes match its type (remote URLs included), over 5 MiB decoded, past 20 images, or outside a user message; a part carrying input_audio; a file part with inline file_data or a filename (messages.content.file.file_data, messages.content.file.filename), or with a file_id outside a user message (messages.content.file.file_id); more than 20 referenced files; the message names the messages.content field"
+          },
+          {
+            "code": "file_not_found",
+            "envelope": "OpenAiErrorEnvelope",
+            "status": 400,
+            "trigger": "a file_id this key may not read, all with one answer: no such file, a malformed id, another workspace's file, a deleted or expired one, or one the workspace's object visibility hides from this key; the message begins with messages.content.file.file_id"
+          },
+          {
+            "code": "file_purpose_not_supported",
+            "envelope": "OpenAiErrorEnvelope",
+            "status": 400,
+            "trigger": "a referenced file whose purpose is not user_data, vision or assistants; the message begins with messages.content.file.file_id"
+          },
+          {
+            "code": "unsupported_file_type",
+            "envelope": "OpenAiErrorEnvelope",
+            "status": 400,
+            "trigger": "a referenced file whose bytes are not a PNG, JPEG, WebP or GIF image (decided from the bytes, whatever its declared type); the message begins with messages.content.file.file_id"
+          },
+          {
+            "code": "file_too_large",
+            "envelope": "OpenAiErrorEnvelope",
+            "status": 413,
+            "trigger": "a referenced file over 5 MiB; the message begins with messages.content.file.file_id"
+          },
+          {
+            "code": "file_reads_rate_limited",
+            "envelope": "OpenAiErrorEnvelope",
+            "status": 429,
+            "trigger": "this API key's file reads this minute on this replica (GATEWAY_FILE_INPUT_READS_PER_KEY_PER_MINUTE, default 120) are spent; nothing was read or sent; Retry-After until the next minute"
           },
           {
             "code": "request_timeout",
@@ -9231,7 +9413,7 @@
             "code": "image_input_busy",
             "envelope": "OpenAiErrorEnvelope",
             "status": 503,
-            "trigger": "the replica's image input buffer is full for a declared body over 2 MiB; Retry-After: 1"
+            "trigger": "the replica's image input buffer is full for a declared body over 2 MiB; Retry-After: 1; or a request's referenced files (their bytes and base64) do not fit the buffer or this key's share of it, refused before any file is read"
           },
           {
             "code": "unsupported_capability",
@@ -12116,7 +12298,37 @@
             "code": "invalid_request_error",
             "envelope": "OpenAiErrorEnvelope",
             "status": 400,
-            "trigger": "an input_image whose image_url is not a PNG/JPEG/WebP/GIF base64 data URL whose bytes match its type (remote URLs included), over 5 MiB decoded, past 20 images, or outside a user message; a file_id or an input_file part; the message names the input.content field"
+            "trigger": "an input_image whose image_url is not a PNG/JPEG/WebP/GIF base64 data URL whose bytes match its type (remote URLs included), over 5 MiB decoded, past 20 images, or outside a user message; an input_image with both image_url and file_id; an input_file with inline file_data or a file_url (input.content.file_data, input.content.file_url), or a file reference outside a user message (input.content.file_id); more than 20 referenced files; the message names the input.content field"
+          },
+          {
+            "code": "file_not_found",
+            "envelope": "OpenAiErrorEnvelope",
+            "status": 400,
+            "trigger": "a file_id this key may not read, all with one answer: no such file, a malformed id, another workspace's file, a deleted or expired one, or one the workspace's object visibility hides from this key; the message begins with input.content.file_id"
+          },
+          {
+            "code": "file_purpose_not_supported",
+            "envelope": "OpenAiErrorEnvelope",
+            "status": 400,
+            "trigger": "a referenced file whose purpose is not user_data, vision or assistants; the message begins with input.content.file_id"
+          },
+          {
+            "code": "unsupported_file_type",
+            "envelope": "OpenAiErrorEnvelope",
+            "status": 400,
+            "trigger": "a referenced file whose bytes are not a PNG, JPEG, WebP or GIF image (decided from the bytes, whatever its declared type); the message begins with input.content.file_id"
+          },
+          {
+            "code": "file_too_large",
+            "envelope": "OpenAiErrorEnvelope",
+            "status": 413,
+            "trigger": "a referenced file over 5 MiB; the message begins with input.content.file_id"
+          },
+          {
+            "code": "file_reads_rate_limited",
+            "envelope": "OpenAiErrorEnvelope",
+            "status": 429,
+            "trigger": "this API key's file reads this minute on this replica (GATEWAY_FILE_INPUT_READS_PER_KEY_PER_MINUTE, default 120) are spent; nothing was read or sent; Retry-After until the next minute"
           },
           {
             "code": "request_timeout",
@@ -12134,7 +12346,7 @@
             "code": "image_input_busy",
             "envelope": "OpenAiErrorEnvelope",
             "status": 503,
-            "trigger": "the replica's image input buffer is full for a declared body over 2 MiB; Retry-After: 1"
+            "trigger": "the replica's image input buffer is full for a declared body over 2 MiB; Retry-After: 1; or a request's referenced files (their bytes and base64) do not fit the buffer or this key's share of it, refused before any file is read"
           },
           {
             "code": "unsupported_capability",

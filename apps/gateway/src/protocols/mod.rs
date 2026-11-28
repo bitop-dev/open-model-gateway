@@ -2,6 +2,7 @@ pub mod audio;
 pub mod batches;
 pub mod chat_completions;
 pub mod embeddings;
+pub mod file_input;
 pub mod files;
 pub mod image_input;
 pub mod images;
@@ -12,6 +13,8 @@ pub mod responses;
 pub mod systemone;
 pub mod videos;
 
+#[cfg(all(test, feature = "integration-tests"))]
+mod file_input_http_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod image_input_http_tests;
 #[cfg(all(test, feature = "integration-tests"))]

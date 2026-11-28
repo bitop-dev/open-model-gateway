@@ -133,6 +133,32 @@ pub(super) const OPENAI_TRANSPORT: &[(&str, &str, &str)] = &[
         "src/protocols/mod.rs",
     ),
     ("server_error", "image_input_busy", "src/protocols/mod.rs"),
+    // Files referenced by file_id (`protocols::file_input`).
+    (
+        "invalid_request_error",
+        "file_not_found",
+        "src/protocols/file_input.rs",
+    ),
+    (
+        "invalid_request_error",
+        "file_purpose_not_supported",
+        "src/protocols/file_input.rs",
+    ),
+    (
+        "invalid_request_error",
+        "unsupported_file_type",
+        "src/protocols/file_input.rs",
+    ),
+    (
+        "invalid_request_error",
+        "file_too_large",
+        "src/protocols/file_input.rs",
+    ),
+    (
+        "rate_limit_error",
+        "file_reads_rate_limited",
+        "src/protocols/file_input.rs",
+    ),
 ];
 /// Anthropic `error.type` values rendered outside `error_body`.
 pub(super) const ANTHROPIC_TRANSPORT: &[(&str, &str)] = &[

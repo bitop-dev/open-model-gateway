@@ -197,6 +197,9 @@ async fn image_input_body(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
     let (mut parts, body) = request.into_parts();
+    // Files a request references take their share of the same buffer
+    // (`protocols::file_input`).
+    parts.extensions.insert(buffer.clone());
     // Authentication ran first (`image_input_routes`): the key is known.
     let Some(key) = parts
         .extensions
@@ -312,9 +315,9 @@ fn json_content_type(headers: &HeaderMap) -> bool {
 
 /// A response body that keeps its request's share of the image input budget
 /// until it ends or is dropped.
-struct Holding {
-    body: axum::body::Body,
-    _permit: crate::inference::image_buffer::BufferPermit,
+pub(crate) struct Holding {
+    pub(crate) body: axum::body::Body,
+    pub(crate) _permit: crate::inference::image_buffer::BufferPermit,
 }
 impl http_body::Body for Holding {
     type Data = axum::body::Bytes;

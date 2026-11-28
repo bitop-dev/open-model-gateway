@@ -134,10 +134,20 @@ fn content(
     };
     let mut out: Vec<Part> = Vec::new();
     for part in parts {
-        // A file or audio reference is refused by name, whatever the part's
+        // A file that reached here was not resolved (inline data, a
+        // reference outside a user message or in a batch line) and an audio
+        // part is not taken: each is refused by name, whatever the part's
         // type, never dropped beside it.
-        if part.file.is_some() {
-            return Err(InferenceError::InvalidField("messages.content.file"));
+        if let Some(file) = &part.file {
+            return Err(InferenceError::InvalidField(if file.file_data.is_some() {
+                "messages.content.file.file_data"
+            } else if file.filename.is_some() {
+                "messages.content.file.filename"
+            } else if file.file_id.is_some() {
+                FILE_ID_FIELD
+            } else {
+                "messages.content.file"
+            }));
         }
         if part.input_audio.is_some() {
             return Err(InferenceError::InvalidField("messages.content.input_audio"));
@@ -339,7 +349,37 @@ impl Request {
     }
 }
 
+/// The field a Chat `file` part's reference is named by.
+pub(crate) const FILE_ID_FIELD: &str = "messages.content.file.file_id";
+
+impl Request {
+    /// The `file` parts of user messages that reference a stored file
+    /// (and nothing else), in order: what `file_input` resolves.
+    fn file_parts(&mut self) -> impl Iterator<Item = &mut super::image_input::WirePart> {
+        self.messages
+            .iter_mut()
+            .filter(|m| m.role == Role::User)
+            .filter_map(|m| match &mut m.content {
+                Some(super::image_input::WireContent::Parts(parts)) => Some(parts),
+                _ => None,
+            })
+            .flatten()
+            .filter(|p| {
+                p.kind == "file"
+                    && p.text.is_none()
+                    && p.image_url.is_none()
+                    && p.input_audio.is_none()
+                    && p.file.as_ref().is_some_and(|f| {
+                        f.file_id.is_some() && f.file_data.is_none() && f.filename.is_none()
+                    })
+            })
+    }
+}
+
 pub async fn handle(
+    axum::extract::State(store): axum::extract::State<crate::store::Store>,
+    runtime: Option<Extension<crate::filestore::FileStoreRuntime>>,
+    buffer: Option<Extension<crate::inference::image_buffer::ImageBuffer>>,
     Extension(engine): Extension<Engine>,
     Extension(principal): Extension<Principal>,
     Extension(request_id): Extension<RequestId>,
@@ -347,7 +387,7 @@ pub async fn handle(
     weight: Option<Extension<crate::http::BodyWeight>>,
     input: Result<crate::http::json_body::JsonBody<Request>, JsonBodyRejection>,
 ) -> Response {
-    let wire = match input {
+    let mut wire = match input {
         Ok(crate::http::json_body::JsonBody(request)) => request,
         Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
             return super::payload_too_large();
@@ -357,6 +397,47 @@ pub async fn handle(
     if !client::valid_openai_metadata(wire.metadata.as_ref()) {
         return error_response(InferenceError::InvalidRequest);
     }
+    // Referenced files become inline images before normalization checks
+    // them as such (`file_input`).
+    let references: Vec<super::file_input::Reference> = wire
+        .file_parts()
+        .filter_map(|p| p.file.as_ref()?.file_id.clone())
+        .map(|id| super::file_input::Reference {
+            id,
+            field: FILE_ID_FIELD,
+        })
+        .collect();
+    let files =
+        match super::file_input::resolve_request(store, runtime, buffer, &principal, &references)
+            .await
+        {
+            Ok(files) => files,
+            Err(refused) => return refused,
+        };
+    let permit = files.permit;
+    let from_files = files.data_bytes;
+    for (part, super::file_input::Resolved::Image(url)) in wire.file_parts().zip(files.contents) {
+        part.kind = "image_url".to_owned();
+        part.file = None;
+        part.image_url = Some(super::image_input::WireImageUrl { url, detail: None });
+    }
+    let after = engine.limits().request_timeout + crate::inference::SETTLEMENT_DEADLINE;
+    let response = respond(
+        engine, principal, request_id, large, weight, wire, from_files,
+    )
+    .await;
+    super::file_input::holding(response, permit, after)
+}
+
+async fn respond(
+    engine: Engine,
+    principal: Principal,
+    request_id: RequestId,
+    large: Option<Extension<crate::inference::image_buffer::LargeBody>>,
+    weight: Option<Extension<crate::http::BodyWeight>>,
+    wire: Request,
+    from_files: usize,
+) -> Response {
     let labels = client::current().with_body_session(client::openai_session(
         wire.metadata.as_ref(),
         wire.user.as_deref(),
@@ -370,7 +451,7 @@ pub async fn handle(
         Err(error) => return error_response(error),
     };
     // Only image data may take a body past the shared text limit.
-    if large.is_some_and(|Extension(large)| !large.allows(&request)) {
+    if large.is_some_and(|Extension(large)| !large.allows(&request, from_files)) {
         crate::metrics::METRICS.image_input_refused("too_large");
         return super::payload_too_large();
     }
@@ -517,11 +598,25 @@ pub(super) fn error_response(error: InferenceError) -> Response {
     super::error_with_body(error, super::openai_error_body(error))
 }
 
+/// The interactive contract offline (`inference_openapi`): no stored file
+/// can be read here, so each reference the handler would resolve stands in
+/// as the inline image it becomes when its file holds one.
 #[cfg(test)]
 pub(crate) fn openapi_normalize(value: Value) -> Result<ChatRequest, InferenceError> {
-    serde_json::from_value::<Request>(value)
-        .map_err(|_| InferenceError::InvalidRequest)?
-        .normalize()
+    let mut wire =
+        serde_json::from_value::<Request>(value).map_err(|_| InferenceError::InvalidRequest)?;
+    for part in wire.file_parts() {
+        part.kind = "image_url".to_owned();
+        part.file = None;
+        part.image_url = Some(super::image_input::WireImageUrl {
+            url: format!(
+                "data:image/png;base64,{}",
+                crate::inference::images::fixtures::PNG_1X1
+            ),
+            detail: None,
+        });
+    }
+    wire.normalize()
 }
 
 #[cfg(test)]
@@ -773,7 +868,7 @@ mod tests {
         }
         assert_eq!(
             field(json!([{"type":"file","file":{"file_id":"file-1"}}]), "user"),
-            Some(InferenceError::InvalidField("messages.content.file"))
+            Some(InferenceError::InvalidField(FILE_ID_FIELD))
         );
         // A reference beside another part's type is refused, never dropped.
         assert_eq!(
@@ -781,7 +876,7 @@ mod tests {
                 json!([{"type":"text","text":"hi","file":{"file_id":"file-1"}}]),
                 "user"
             ),
-            Some(InferenceError::InvalidField("messages.content.file"))
+            Some(InferenceError::InvalidField(FILE_ID_FIELD))
         );
         assert_eq!(
             field(

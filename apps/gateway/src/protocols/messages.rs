@@ -494,7 +494,7 @@ fn beyond_images(
     request: &crate::inference::types::ChatRequest,
 ) -> Option<Response> {
     let Extension(large) = large?;
-    if large.allows(request) {
+    if large.allows(request, 0) {
         return None;
     }
     crate::metrics::METRICS.image_input_refused("too_large");

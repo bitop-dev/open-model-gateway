@@ -82,9 +82,11 @@ pub enum WireContent {
     Parts(Vec<WirePart>),
 }
 
-/// One Chat Completions content part (`text` or `image_url`), checked by
-/// [`WirePart::kind`] after deserialization. `file` and `input_audio` parts
-/// are read only to be refused by name.
+/// One Chat Completions content part (`text`, `image_url`, or a `file` that
+/// references a stored file by id, resolved before normalization by
+/// `file_input`), checked by [`WirePart::kind`] after deserialization.
+/// `input_audio` parts, and `file` parts with inline data, are read only to
+/// be refused by name.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WirePart {
@@ -92,8 +94,18 @@ pub struct WirePart {
     pub kind: String,
     pub text: Option<String>,
     pub image_url: Option<WireImageUrl>,
-    pub file: Option<serde::de::IgnoredAny>,
+    pub file: Option<WireFile>,
     pub input_audio: Option<serde::de::IgnoredAny>,
+}
+
+/// A `file` part's file: a stored file's id (`protocols::file_input`);
+/// inline `file_data` and its `filename` are read only to be refused.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireFile {
+    pub file_id: Option<String>,
+    pub file_data: Option<serde::de::IgnoredAny>,
+    pub filename: Option<serde::de::IgnoredAny>,
 }
 
 #[derive(serde::Deserialize)]

@@ -47,7 +47,7 @@ impl SecretResolver for Resolves {
 
 /// A PNG of `decoded` bytes (signature, then filler that spells `marker`),
 /// as a data URL.
-fn png_url(decoded: usize, marker: &str) -> String {
+pub(super) fn png_url(decoded: usize, marker: &str) -> String {
     let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
     while bytes.len() < decoded {
         bytes.extend_from_slice(marker.as_bytes());
@@ -68,10 +68,10 @@ fn chat_body(url: &str, stream: bool) -> Value {
 /// The bodies the upstream received, and a gate that holds a streamed reply
 /// open until released.
 #[derive(Default)]
-struct Upstream {
-    bodies: Mutex<Vec<Value>>,
+pub(super) struct Upstream {
+    pub(super) bodies: Mutex<Vec<Value>>,
     /// The path of each body, in the same order.
-    paths: Mutex<Vec<String>>,
+    pub(super) paths: Mutex<Vec<String>>,
     /// Paths answered 429 (`Busy`: failover needs no ambiguity opt-in).
     failing: Mutex<Vec<&'static str>>,
     release: tokio::sync::Notify,
@@ -123,17 +123,17 @@ fn upstream(state: Arc<Upstream>) -> Router {
     .layer(axum::extract::DefaultBodyLimit::disable())
 }
 
-struct World {
-    f: Fixture,
-    token: String,
-    router: Router,
-    deployment: Uuid,
-    upstream: Arc<Upstream>,
+pub(super) struct World {
+    pub(super) f: Fixture,
+    pub(super) token: String,
+    pub(super) router: Router,
+    pub(super) deployment: Uuid,
+    pub(super) upstream: Arc<Upstream>,
     _servers: Vec<Server>,
     _counters: tokio::sync::MutexGuard<'static, ()>,
 }
 
-async fn world(pool: PgPool, limits: ImageInputLimits, priced: bool) -> World {
+pub(super) async fn world(pool: PgPool, limits: ImageInputLimits, priced: bool) -> World {
     world_for(pool, limits, priced, "openai").await
 }
 
@@ -146,7 +146,7 @@ async fn world_for(pool: PgPool, limits: ImageInputLimits, priced: bool, provide
 
 /// [`world_for`] with the adapters sent to `upstream` instead of the
 /// in-process mock.
-async fn world_at(
+pub(super) async fn world_at(
     pool: PgPool,
     limits: ImageInputLimits,
     priced: bool,
@@ -225,7 +225,7 @@ async fn route(f: &Fixture, provider: &str, order: i64, priced: bool) -> Uuid {
     }
 }
 
-async fn allow_images(w: &World, allowed: bool) {
+pub(super) async fn allow_images(w: &World, allowed: bool) {
     sqlx::query("UPDATE deployments SET image_input=$2 WHERE id=$1")
         .bind(w.deployment)
         .bind(allowed)
@@ -248,7 +248,7 @@ fn counted(bytes: Vec<u8>, pulled: Arc<AtomicUsize>) -> Body {
     )))
 }
 
-async fn send(
+pub(super) async fn send(
     w: &World,
     path: &str,
     token: Option<&str>,
@@ -287,7 +287,7 @@ async fn send(
     )
 }
 
-async fn executions(w: &World) -> i64 {
+pub(super) async fn executions(w: &World) -> i64 {
     sqlx::query_scalar("SELECT count(*) FROM inference_executions")
         .fetch_one(&w.f.store.pool)
         .await
@@ -577,7 +577,11 @@ async fn an_image_reaches_no_log_table_metric_or_error_body(pool: PgPool) {
 
 /// `data` (an image's base64) is in no table (partitions included), metric
 /// or captured log line.
-async fn assert_nowhere(w: &World, data: &str, capture: &crate::log_capture_test::Capture) {
+pub(super) async fn assert_nowhere(
+    w: &World,
+    data: &str,
+    capture: &crate::log_capture_test::Capture,
+) {
     // Every table, partitions included.
     let tables: Vec<String> = sqlx::query_scalar(
         "SELECT format('%I.%I',n.nspname,c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p') ORDER BY 1",
@@ -614,6 +618,7 @@ async fn a_stalled_large_body_times_out_and_returns_its_share(pool: PgPool) {
             body_idle: std::time::Duration::from_millis(300),
             body_total: std::time::Duration::from_secs(5),
             body_min_rate: crate::inference::image_buffer::BODY_MIN_RATE,
+            ..ImageInputLimits::default()
         },
         true,
     )
@@ -661,6 +666,7 @@ async fn a_trickled_large_body_is_cut_by_the_rate_floor(pool: PgPool) {
             body_idle: std::time::Duration::from_millis(300),
             body_total: std::time::Duration::from_secs(30),
             body_min_rate: 64 * 1024,
+            ..ImageInputLimits::default()
         },
         true,
     )
@@ -703,7 +709,7 @@ async fn a_trickled_large_body_is_cut_by_the_rate_floor(pool: PgPool) {
 
 /// Bytes of the process's image input buffers in use. Exact while the
 /// World's lock keeps the other tests that send large bodies out.
-fn in_use() -> i64 {
+pub(super) fn in_use() -> i64 {
     crate::metrics::METRICS.image_input_buffer().0.get()
 }
 
@@ -871,6 +877,7 @@ async fn every_large_body_refusal_is_counted_by_reason(pool: PgPool) {
             body_idle: std::time::Duration::from_secs(2),
             body_total: std::time::Duration::from_secs(10),
             body_min_rate: crate::inference::image_buffer::BODY_MIN_RATE,
+            ..ImageInputLimits::default()
         },
         true,
     )

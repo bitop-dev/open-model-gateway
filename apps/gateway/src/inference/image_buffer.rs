@@ -67,6 +67,10 @@ pub struct ImageInputLimits {
     /// A large body's slowest average rate, from its start and after
     /// [`BODY_RATE_ALLOWANCE`] ([`BODY_MIN_RATE`], bytes per second).
     pub body_min_rate: usize,
+    /// Files one key may have read for its requests per UTC minute in this
+    /// process (`GATEWAY_FILE_INPUT_READS_PER_KEY_PER_MINUTE`,
+    /// `protocols::file_input`).
+    pub file_reads_per_key_per_minute: u32,
 }
 
 impl Default for ImageInputLimits {
@@ -77,9 +81,13 @@ impl Default for ImageInputLimits {
             body_idle: BODY_IDLE,
             body_total: BODY_TOTAL,
             body_min_rate: BODY_MIN_RATE,
+            file_reads_per_key_per_minute: FILE_READS_PER_KEY_PER_MINUTE,
         }
     }
 }
+
+/// The default of [`ImageInputLimits::file_reads_per_key_per_minute`].
+pub const FILE_READS_PER_KEY_PER_MINUTE: u32 = 120;
 
 /// A large body holds its share of the budget only while it keeps arriving:
 /// past this pause between frames, below [`BODY_MIN_RATE`] on average from
@@ -139,6 +147,12 @@ impl ImageInputLimits {
                 "GATEWAY_IMAGE_INPUT_BUFFER_BYTES",
                 Self::default().buffer_bytes,
             )?,
+            file_reads_per_key_per_minute: lookup("GATEWAY_FILE_INPUT_READS_PER_KEY_PER_MINUTE")
+                .map_or(Ok(FILE_READS_PER_KEY_PER_MINUTE), |v| {
+                    v.trim().parse::<u32>().ok().filter(|n| (1..=100_000).contains(n)).with_context(|| {
+                        "GATEWAY_FILE_INPUT_READS_PER_KEY_PER_MINUTE must be a whole number from 1 to 100000"
+                    })
+                })?,
             ..Self::default()
         };
         ensure!(
@@ -189,14 +203,17 @@ pub struct LargeBody(pub usize);
 impl LargeBody {
     /// Whether this body is within the text limit once `request`'s image
     /// data is set aside.
-    pub fn allows(self, request: &crate::inference::types::ChatRequest) -> bool {
+    /// `from_files` bytes of image data came from referenced files
+    /// (`protocols::file_input`), not from this body.
+    pub fn allows(self, request: &crate::inference::types::ChatRequest, from_files: usize) -> bool {
         let images: usize = request
             .messages
             .iter()
             .filter_map(|m| m.content.as_ref())
             .flat_map(crate::inference::types::Content::images)
             .map(|image| image.data_url().len())
-            .sum();
+            .sum::<usize>()
+            .saturating_sub(from_files);
         images > 0 && self.0.saturating_sub(images) <= TEXT_BODY_BYTES
     }
 }
@@ -284,6 +301,8 @@ pub struct ImageBuffer {
     in_use: Gauge,
     /// MiB each key holds now; a key without large bodies has no entry.
     keys: Arc<Mutex<HashMap<Uuid, usize>>>,
+    /// Each key's file reads in the current UTC minute.
+    file_reads: Arc<crate::inference::count::Limiter<Uuid>>,
 }
 
 impl ImageBuffer {
@@ -301,7 +320,25 @@ impl ImageBuffer {
             limits,
             in_use,
             keys: Arc::default(),
+            file_reads: Arc::default(),
         }
+    }
+    /// Admits `n` file reads for `key` in this minute, or the seconds until
+    /// the next minute when its reads are spent (each refused read counts).
+    pub fn admit_file_reads(&self, key: Uuid, n: usize) -> Result<(), u32> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let minute = i64::try_from(now / 60).unwrap_or(i64::MAX);
+        for _ in 0..n {
+            if !self
+                .file_reads
+                .admit(key, minute, self.limits.file_reads_per_key_per_minute)
+            {
+                return Err(u32::try_from(60 - now % 60).unwrap_or(60));
+            }
+        }
+        Ok(())
     }
     /// The MiB one key may hold at once: half the buffer, and never less
     /// than one body at the route cap, so every key can always send one.
@@ -328,8 +365,16 @@ impl ImageBuffer {
         if length <= TEXT_BODY_BYTES {
             return Admission::Text;
         }
+        if length > self.limits.body_bytes {
+            return Admission::TooLarge;
+        }
+        self.reserve(length, key)
+    }
+    /// `length` bytes of the buffer for `key`, under its share: a large
+    /// body's, or the files a request references (`protocols::file_input`).
+    pub fn reserve(&self, length: usize, key: Uuid) -> Admission {
         let mib = length.div_ceil(MIB);
-        if length > self.limits.body_bytes || mib > self.total_mib {
+        if mib > self.total_mib {
             return Admission::TooLarge;
         }
         let Ok(count) = u32::try_from(mib) else {
@@ -595,6 +640,27 @@ mod tests {
         ])
         .unwrap();
         assert_eq!((set.body_bytes, set.buffer_bytes), (8 * MIB, 0));
+        // File reads per key per minute: 1 to 100000, whole numbers only.
+        assert_eq!(
+            ImageInputLimits::default().file_reads_per_key_per_minute,
+            FILE_READS_PER_KEY_PER_MINUTE
+        );
+        for (value, read) in [
+            ("1", Some(1)),
+            (" 100000 ", Some(100_000)),
+            ("0", None),
+            ("100001", None),
+            ("-1", None),
+            ("1.5", None),
+            ("", None),
+        ] {
+            let got = limits(&[("GATEWAY_FILE_INPUT_READS_PER_KEY_PER_MINUTE", value)]);
+            assert_eq!(
+                got.ok().map(|l| l.file_reads_per_key_per_minute),
+                read,
+                "{value:?}"
+            );
+        }
         // The route cap stops at the largest body the pre-parse bound passes.
         assert_eq!(MAX_BODY_BYTES, 141_907_772);
         let most = MAX_BODY_BYTES.to_string();

@@ -898,14 +898,61 @@ async fn generation_gateway_with(
         .bind(cache).execute(pool).await.unwrap();
     let mut registry = ProviderRegistry::default();
     registry.register(Arc::new(GenerationAdapter)).unwrap();
-    // The vector journeys send many token counts with one key.
+    // The vector journeys send many token counts, and read the referenced
+    // file many times, with one key.
     let limits = EngineLimits {
         counts_per_key_per_minute: u32::MAX,
-        image_input,
+        image_input: crate::inference::image_buffer::ImageInputLimits {
+            file_reads_per_key_per_minute: u32::MAX,
+            ..image_input
+        },
         ..EngineLimits::default()
     };
     let engine = Engine::new(Arc::new(store.clone()), registry, limits).unwrap();
-    (http::router_with_engine(store, None, engine), keys)
+    // User files on, in an encrypted in-memory store: the image cases
+    // reference one by file_id (#51).
+    sqlx::query("UPDATE installation_settings SET file_user_files_enabled=true")
+        .execute(pool)
+        .await
+        .unwrap();
+    let app = http::router_with_engine(store, None, engine)
+        .layer(axum::Extension(crate::filestore::FileStoreRuntime::memory()));
+    (app, keys)
+}
+
+/// A 1x1 PNG uploaded through the Files API with `key`: the stored image
+/// the generation cases reference by `file_id`.
+async fn fixture_file(app: &axum::Router, key: &str) -> String {
+    use base64::Engine as _;
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(PNG_1X1)
+        .unwrap();
+    let boundary = "fixtureFileBoundary";
+    let mut form = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\nvision\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"pixel.png\"\r\nContent-Type: image/png\r\n\r\n").into_bytes();
+    form.extend_from_slice(&png);
+    form.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/files")
+                .header("authorization", format!("Bearer {key}"))
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(form))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice::<Value>(&bytes).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
 }
 
 fn generation_body(path: &str, mode: &str, stream: bool) -> Value {
@@ -950,6 +997,7 @@ const GENERATION_SHARDS: usize = 3;
 async fn generation_real_handler_fixtures(pool: PgPool, shard: usize) -> Fixtures {
     let (app, keys) = generation_gateway(&pool).await;
     let key = keys.personal_key.token;
+    let file = fixture_file(&app, &key).await;
     let mut fixtures = Fixtures::sharded(shard, GENERATION_SHARDS);
     for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
         let mut event_kinds = std::collections::BTreeSet::new();
@@ -1035,7 +1083,7 @@ async fn generation_real_handler_fixtures(pool: PgPool, shard: usize) -> Fixture
         fixtures
             .body_vectors("POST", path, body, &[], &[], send)
             .await;
-        for valid in generation_full_requests(path) {
+        for valid in generation_full_requests(path, &file) {
             super::generation::validate_request(r::artifact(), path, &valid)
                 .expect("full generation request fixture");
             let send = async |body: Value| {
@@ -1095,7 +1143,7 @@ async fn count_tokens_fixtures(app: &axum::Router, key: &str, fixtures: &mut Fix
     let mut bodies =
         vec![json!({"model":"company/smart","messages":[{"role":"user","content":"text"}]})];
     bodies.extend(
-        generation_full_requests("/v1/messages")
+        generation_full_requests("/v1/messages", "")
             .iter()
             .map(count_body),
     );
@@ -1430,6 +1478,7 @@ async fn inference_openapi_generation_image_input_transport(pool: PgPool) {
             body_idle: std::time::Duration::from_millis(300),
             body_total: std::time::Duration::from_secs(5),
             body_min_rate: crate::inference::image_buffer::BODY_MIN_RATE,
+            ..ImageInputLimits::default()
         },
     )
     .await;
@@ -1641,7 +1690,7 @@ fn generation_positional(path: &str, body: &Value) -> Value {
     )
 }
 
-fn generation_full_requests(path: &str) -> Vec<Value> {
+fn generation_full_requests(path: &str, file: &str) -> Vec<Value> {
     let parameters = json!({"type":"object","properties":{"value":{"type":"string"}}});
     let cache = json!({"type":"ephemeral","ttl":"5m"});
     let image = json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":PNG_1X1},"cache_control":cache});
@@ -1820,7 +1869,7 @@ fn generation_full_requests(path: &str) -> Vec<Value> {
         cases.push(nested.clone());
         cases.push(generation_positional(path, &nested));
     }
-    if let Some(parts) = generation_image_request(path, &full) {
+    if let Some(parts) = generation_image_request(path, &full, file) {
         let nested = generation_nested_positional(path, parts.clone());
         cases.push(generation_positional(path, &parts));
         cases.push(generation_positional(path, &nested));
@@ -1830,10 +1879,11 @@ fn generation_full_requests(path: &str) -> Vec<Value> {
     cases
 }
 
-/// `full` with content parts and inline images (#24): every part form on
-/// every role that takes parts, images on a user message only. The last
-/// message keeps the adapter's mode text.
-fn generation_image_request(path: &str, full: &Value) -> Option<Value> {
+/// `full` with content parts, inline images (#24) and the stored image
+/// `file` referenced by id (#51): every part form on every role that takes
+/// parts, images on a user message only. The last message keeps the
+/// adapter's mode text.
+fn generation_image_request(path: &str, full: &Value, file: &str) -> Option<Value> {
     let url = format!("data:image/png;base64,{PNG_1X1}");
     let mut parts = full.clone();
     match path {
@@ -1850,6 +1900,9 @@ fn generation_image_request(path: &str, full: &Value) -> Option<Value> {
                 ["image_url", null, [url, null], null, null],
                 {"type":"image_url","image_url":[url, "high"]},
                 {"type":"image_url","image_url":{"url":url,"detail":null}},
+                {"type":"file","file":{"file_id":file,"file_data":null,"filename":null},"text":null,"image_url":null,"input_audio":null},
+                {"type":"file","file":{"file_id":file}},
+                ["file", null, null, [file, null, null], null],
                 ["text", "this?", null, null, null]
             ]);
             messages[2]["tool_calls"] = json!([]);
@@ -1864,7 +1917,9 @@ fn generation_image_request(path: &str, full: &Value) -> Option<Value> {
                 {"type":"input_text","text":"what is"},
                 {"type":"input_image","image_url":url,"detail":"high"},
                 {"type":"input_image","image_url":url,"detail":null},
-                {"type":"input_image","image_url":url}
+                {"type":"input_image","image_url":url},
+                {"type":"input_image","file_id":file,"detail":"low"},
+                {"type":"input_file","file_id":file}
             ]);
             input.insert(
                 0,

@@ -64,7 +64,7 @@ pub(super) fn validate_request(
     };
     let parsed = parsed.map_err(|_| anyhow::anyhow!("generation request semantic constraint"))?;
     anyhow::ensure!(
-        !large || LargeBody(bytes).allows(&parsed),
+        !large || LargeBody(bytes).allows(&parsed, 0),
         "generation JSON body cap outside image data"
     );
     if !super::generator::ANTHROPIC_PATHS.contains(&path) {

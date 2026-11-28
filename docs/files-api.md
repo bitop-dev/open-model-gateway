@@ -7,7 +7,7 @@ What you can use a file for **today**:
 | OpenAI purpose | Stored as | Usable today |
 | --- | --- | --- |
 | `batch` | `batch_input` | Yes: as `input_file_id` of a batch ([async jobs](async-jobs.md)). |
-| `user_data`, `vision`, `assistants`, `evals` | `user_file` | Stored, listed and downloadable only. Referencing a `file_id` in Chat Completions or Responses is phase 2 and is not implemented yet. |
+| `user_data`, `vision`, `assistants`, `evals` | `user_file` | Stored, listed and downloadable. An image file may be referenced by `file_id` in Chat Completions and Responses ([stored files](protocol-matrix.md#stored-files-referenced-by-file_id), #51); `evals` files may not. |
 | `batch_output` | `batch_output` | Written by the batch engine (results and errors). Listed and downloadable; clients can't upload it. |
 
 `fine-tune` and anything else is refused (`400 unsupported_capability` for `fine-tune`, otherwise `400 invalid_request_error`).

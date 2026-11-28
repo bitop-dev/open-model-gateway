@@ -628,7 +628,7 @@ fn file_and_remote_images_and_images_outside_user_messages_are_refused_by_name()
     );
     assert_eq!(
         refused(json!([{"type":"input_file","file_id":"file-1"}]), "user"),
-        Some(InferenceError::InvalidField("input.content.input_file"))
+        Some(InferenceError::InvalidField("input.content.file_id"))
     );
     assert_eq!(
         refused(
