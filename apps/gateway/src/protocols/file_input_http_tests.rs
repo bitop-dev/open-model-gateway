@@ -371,13 +371,26 @@ fn a_batch_line_does_not_resolve_a_reference_and_refuses_it_by_name() {
     }
 }
 
-/// The in-memory store, expiring a file while it is read.
-struct Hiding {
+/// What [`Wrapped`] does to a file's read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Expires the file while it is read.
+    Hide,
+    /// Serves half of the file's bytes.
+    Truncate,
+    /// Counts reads only.
+    Count,
+}
+
+/// The in-memory store with a hook on each read.
+struct Wrapped {
     inner: Arc<dyn FileStore>,
     pool: PgPool,
+    mode: Mode,
+    reads: Arc<std::sync::atomic::AtomicUsize>,
 }
 #[async_trait::async_trait]
-impl FileStore for Hiding {
+impl FileStore for Wrapped {
     async fn put(
         &self,
         key: &crate::filestore::ObjectKey,
@@ -387,14 +400,28 @@ impl FileStore for Hiding {
         self.inner.put(key, body, meta).await
     }
     async fn get(&self, key: &crate::filestore::ObjectKey) -> Result<ByteStream, FileStoreError> {
-        sqlx::query(
-            "UPDATE stored_files SET expires_at=now()-interval '1 second' WHERE object_key=$1",
-        )
-        .bind(key.to_string())
-        .execute(&self.pool)
-        .await
-        .unwrap();
-        self.inner.get(key).await
+        use futures_util::StreamExt as _;
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.mode == Mode::Hide {
+            sqlx::query(
+                "UPDATE stored_files SET expires_at=now()-interval '1 second' WHERE object_key=$1",
+            )
+            .bind(key.to_string())
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        }
+        let stream = self.inner.get(key).await?;
+        if self.mode != Mode::Truncate {
+            return Ok(stream);
+        }
+        let mut whole = Vec::new();
+        let mut stream = stream;
+        while let Some(chunk) = stream.next().await {
+            whole.extend_from_slice(&chunk?);
+        }
+        whole.truncate(whole.len() / 2);
+        Ok(futures_util::stream::iter([Ok(bytes::Bytes::from(whole))]).boxed())
     }
     async fn delete(&self, key: &crate::filestore::ObjectKey) -> Result<(), FileStoreError> {
         self.inner.delete(key).await
@@ -417,17 +444,32 @@ impl FileStore for Hiding {
     }
 }
 
-#[dbtest::test]
-async fn a_file_hidden_while_it_is_read_is_not_found(pool: PgPool) {
+/// A files world whose store is [`Wrapped`] in `mode`, and its read count.
+async fn wrapped_world(
+    pool: PgPool,
+    mode: Mode,
+) -> (World, Arc<std::sync::atomic::AtomicUsize>, FileStoreRuntime) {
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let rt = FileStoreRuntime::from_store(
-        Arc::new(Hiding {
+        Arc::new(Wrapped {
             inner: crate::filestore::memory_store(),
             pool: pool.clone(),
+            mode,
+            reads: reads.clone(),
         }),
         crate::filestore::BackendKind::Memory,
         vec!["memory".into()],
     );
-    let w = files_world_on(pool, ImageInputLimits::default(), rt).await;
+    (
+        files_world_on(pool, ImageInputLimits::default(), rt.clone()).await,
+        reads,
+        rt,
+    )
+}
+
+#[dbtest::test]
+async fn a_file_hidden_while_it_is_read_is_not_found(pool: PgPool) {
+    let (w, _, _) = wrapped_world(pool, Mode::Hide).await;
     let me = bearer(&w);
     let id = upload(&w, &me, "vision", &png(256, "hidden")).await;
     let (status, _, value) = chat(&w, &me, &chat_file(&id)).await;
@@ -471,24 +513,26 @@ async fn reads_are_bounded_per_key_and_by_the_buffer_before_anything_is_read(poo
     };
     let w = files_world(pool, limits).await;
     let me = bearer(&w);
-    // Its stored bytes and their base64 (about 4.7 MiB) pass the 4 MiB buffer.
+    // Its stored bytes and their base64 (about 4.7 MiB) can never fit the
+    // key's 4 MiB share: refused for good, before any read, and not charged.
     let big = upload(&w, &me, "vision", &png(2 * MIB, "big")).await;
     let (status, retry, value) = chat(&w, &me, &chat_file(&big)).await;
     assert_eq!(
-        (status, retry.as_deref(), value["error"]["code"].as_str()),
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Some("1"),
-            Some("image_input_busy")
-        )
+        (status, retry, value["error"]["code"].as_str()),
+        (StatusCode::PAYLOAD_TOO_LARGE, None, Some("file_too_large")),
+        "{value}"
     );
     let small = upload(&w, &me, "vision", &png(256, "small")).await;
-    let refs: Vec<Value> = (0..3)
-        .map(|_| json!({"type":"file","file":{"file_id":small}}))
-        .collect();
-    let body = json!({"model":"company/smart","messages":[{"role":"user","content":refs}]});
-    // The refused request above counted one read; three more pass the limit.
-    let (status, retry, value) = chat(&w, &me, &body).await;
+    let refs = |n: usize| {
+        let parts: Vec<Value> = (0..n)
+            .map(|_| json!({"type":"file","file":{"file_id":small}}))
+            .collect();
+        json!({"model":"company/smart","messages":[{"role":"user","content":parts}]})
+    };
+    // Three reads fit the minute's limit; one more does not.
+    let (status, _, value) = chat(&w, &me, &refs(3)).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let (status, retry, value) = chat(&w, &me, &refs(1)).await;
     assert_eq!(
         (status, value["error"]["code"].as_str()),
         (
@@ -499,8 +543,7 @@ async fn reads_are_bounded_per_key_and_by_the_buffer_before_anything_is_read(poo
     );
     let seconds: u32 = retry.unwrap().parse().unwrap();
     assert!((1..=60).contains(&seconds));
-    assert!(w.upstream.bodies.lock().unwrap().is_empty());
-    assert_eq!(executions(&w).await, 0);
+    assert_eq!(w.upstream.bodies.lock().unwrap().len(), 1);
 }
 
 #[dbtest::test]
@@ -533,4 +576,60 @@ async fn a_referenced_image_reaches_no_log_table_metric_or_answer(pool: PgPool) 
     );
     assert_nowhere(&w, &data, &capture).await;
     assert!(!capture.text().contains("FileCanary"));
+}
+
+#[dbtest::test]
+async fn a_short_read_is_refused_and_nothing_is_sent(pool: PgPool) {
+    let (w, reads, _) = wrapped_world(pool, Mode::Truncate).await;
+    let me = bearer(&w);
+    let id = upload(&w, &me, "vision", &png(64 * 1024, "short")).await;
+    let (status, _, value) = chat(&w, &me, &chat_file(&id)).await;
+    assert_eq!(
+        (status, value["error"]["code"].as_str()),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some("file_store_unavailable")
+        ),
+        "{value}"
+    );
+    assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(w.upstream.bodies.lock().unwrap().is_empty());
+    assert_eq!(executions(&w).await, 0);
+}
+
+#[dbtest::test]
+async fn a_revoked_key_reads_no_file_even_while_its_cache_entry_lives(pool: PgPool) {
+    let (w, reads, rt) = wrapped_world(pool, Mode::Count).await;
+    let me = bearer(&w);
+    let id = upload(&w, &me, "vision", &png(256, "revoked")).await;
+    sqlx::query("UPDATE api_keys SET revoked_at=now() WHERE id=$1")
+        .bind(w.f.principal.key_id)
+        .execute(&w.f.store.pool)
+        .await
+        .unwrap();
+    // The principal a cached authentication would still hand the handler.
+    let files = crate::filestore::FileStorage::new(w.f.store.clone(), rt);
+    let buffer = crate::inference::image_buffer::ImageBuffer::new(ImageInputLimits::default());
+    let reference = crate::protocols::file_input::Reference {
+        id,
+        field: "messages.content.file.file_id",
+    };
+    let refused = crate::protocols::file_input::resolve(
+        &w.f.store,
+        &files,
+        &buffer,
+        &w.f.principal,
+        std::slice::from_ref(&reference),
+    )
+    .await
+    .err();
+    assert_eq!(
+        refused,
+        Some(crate::protocols::file_input::Refusal::Unauthenticated)
+    );
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no file read"
+    );
 }

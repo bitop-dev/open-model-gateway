@@ -8,14 +8,20 @@
 //! to this key) is the same refusal, `file_not_found`, decided by one
 //! lookup before anything else about the file is looked at.
 //!
-//! Then, in this order: the purpose (`user_data`, `vision`, `assistants`),
-//! the size, the key's file reads this minute, the replica's large input
-//! buffer (the stored size and its base64 form, under the key's share), a
-//! bounded read of the whole file, the same visibility check again (a file
-//! deleted, expired or hidden while it was read is `file_not_found`, never
-//! a partial body) and the type, decided from the bytes alone. An image
-//! becomes the request's inline image (`image_input::Images::take` checks
-//! it as one); bytes of any other type are refused naming the field.
+//! Before the lookup the key is re-checked live: these routes authenticate
+//! through the replica's key cache, which only the engine's admission
+//! re-checks, and the files are workspace data read outside the engine.
+//! After it, in this order: the purpose (`user_data`, `vision`,
+//! `assistants`), the size, the replica's large input buffer (the stored
+//! sizes and their base64 together, under the key's share; more than a key
+//! may ever hold is refused for good), the key's file reads this minute
+//! (charged only once the reads will happen), a bounded read of every file
+//! under one deadline for the request, the same visibility check again for
+//! every file once all are read (a file deleted, expired or hidden meanwhile
+//! is `file_not_found`, never a partial body) and each file's type, decided
+//! from its bytes alone. An image becomes the request's inline image
+//! (`image_input::Images::take` checks it as one); bytes of any other type
+//! are refused naming the field.
 //!
 //! Nothing of a file reaches a log, a metric label, an error, a trace or the
 //! database: the bytes live in the request only, and errors carry fixed
@@ -49,7 +55,7 @@ pub const MAX_FILE_BYTES: u64 = super::image_input::MAX_DECODED_BYTES as u64;
 pub const PURPOSES: [&str; 3] = ["user_data", "vision", "assistants"];
 /// A read that receives nothing for this long fails.
 const READ_IDLE: Duration = Duration::from_secs(10);
-/// A file's read in all.
+/// Every read of one request, in all.
 const READ_TOTAL: Duration = Duration::from_secs(30);
 
 /// One `file_id` of a request and the field that names it in a refusal.
@@ -74,6 +80,11 @@ pub enum Refusal {
     Busy,
     /// The key's file reads this minute are spent: nothing was read.
     Throttled(u32),
+    /// The references together need more of the buffer than one key may
+    /// ever hold: refused for good, not as a busy buffer.
+    TooLargeTogether(&'static str),
+    /// The key is no longer valid, read live.
+    Unauthenticated,
     /// The database or the file store failed.
     Storage,
 }
@@ -126,8 +137,22 @@ impl Refusal {
                     .insert(header::RETRY_AFTER, HeaderValue::from(seconds.max(1)));
                 return response;
             }
+            Self::TooLargeTogether(field) => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "invalid_request_error",
+                "file_too_large",
+                "The referenced files together are more than this gateway holds for one request",
+                field,
+            ),
+            Self::Unauthenticated => {
+                return super::chat_completions::error_response(InferenceError::Unauthenticated);
+            }
             Self::Storage => {
-                return super::chat_completions::error_response(InferenceError::Storage);
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(serde_json::json!({"error":{"message":"A referenced file could not be read; nothing was sent","type":"server_error","code":"file_store_unavailable","param":null}})),
+                )
+                    .into_response();
             }
         };
         let mut response = (
@@ -167,6 +192,7 @@ fn data_url_len(bytes: u64) -> usize {
 
 /// Resolves `references` for `principal` (see the module for the order).
 pub async fn resolve(
+    store: &crate::store::Store,
     files: &FileStorage,
     buffer: &ImageBuffer,
     principal: &Principal,
@@ -181,6 +207,12 @@ pub async fn resolve(
     }
     if let Some(extra) = references.get(MAX_FILES) {
         return Err(Refusal::TooMany(extra.field));
+    }
+    // These routes authenticate through the per-replica key cache, which
+    // only the engine's admission re-checks: workspace data read outside the
+    // engine needs the key live first.
+    if !live(store, principal).await? {
+        return Err(Refusal::Unauthenticated);
     }
     let viewer = Viewer::of(principal);
     let workspace = principal.workspace_id;
@@ -210,41 +242,55 @@ pub async fn resolve(
             return Err(Refusal::TooLarge(field));
         }
     }
-    if let Err(seconds) = buffer.admit_file_reads(principal.key_id, stored.len()) {
-        crate::metrics::METRICS.image_input_refused("file_reads");
-        return Err(Refusal::Throttled(seconds));
-    }
-    // The stored bytes and their base64 form are held at once.
+    // The stored bytes and their base64 form are held at once. More than a
+    // key may ever hold is refused for good, not as a busy buffer.
     let held: usize = stored
         .iter()
         .map(|(file, _)| {
             usize::try_from(file.size_bytes).unwrap_or(usize::MAX) + data_url_len(file.size_bytes)
         })
         .fold(0, usize::saturating_add);
+    let first = references[0].field;
+    if held.div_ceil(crate::inference::image_buffer::MIB) > buffer.key_share() {
+        return Err(Refusal::TooLargeTogether(first));
+    }
     let permit = match buffer.reserve(held, principal.key_id) {
         Admission::Large(permit) => permit,
         Admission::KeyShare => {
             crate::metrics::METRICS.image_input_refused("key_share");
             return Err(Refusal::Busy);
         }
-        Admission::Busy | Admission::TooLarge | Admission::Text => {
+        Admission::TooLarge => return Err(Refusal::TooLargeTogether(first)),
+        Admission::Busy | Admission::Text => {
             crate::metrics::METRICS.image_input_refused("busy");
             return Err(Refusal::Busy);
         }
     };
-    let mut contents = Vec::with_capacity(stored.len());
-    let mut data_bytes = 0usize;
+    // Charged only for reads that will happen (the permit drops on refusal).
+    if let Err(seconds) = buffer.admit_file_reads(principal.key_id, stored.len()) {
+        crate::metrics::METRICS.image_input_refused("file_reads");
+        return Err(Refusal::Throttled(seconds));
+    }
+    // One deadline for every read of the request.
+    let deadline = tokio::time::Instant::now() + READ_TOTAL;
+    let mut read_all = Vec::with_capacity(stored.len());
+    for (file, _) in &stored {
+        read_all.push(read(files, file, deadline).await);
+    }
+    // Visible when the reads began and still visible now that all of them
+    // ended: a file deleted, expired or hidden meanwhile (its read may have
+    // failed for that reason) is not found, whatever any read gave.
     for (file, field) in &stored {
-        let read = read(files, file).await;
-        // Visible when its read began and still visible now that it ended:
-        // a file deleted, expired or hidden meanwhile (its read may have
-        // failed for that reason) is not found, whatever the read gave.
         if visible(files, &public_id(file.id), workspace, viewer)
             .await?
             .is_none()
         {
             return Err(Refusal::NotFound(field));
         }
+    }
+    let mut contents = Vec::with_capacity(stored.len());
+    let mut data_bytes = 0usize;
+    for ((file, field), read) in stored.iter().zip(read_all) {
         let bytes = read?;
         let Some(kind) = ImageType::ALL.into_iter().find(|t| t.matches(&bytes)) else {
             return Err(Refusal::UnsupportedType(field));
@@ -263,54 +309,83 @@ pub async fn resolve(
     })
 }
 
+/// Whether `principal`'s key is valid now, read live (`auth::revalidate_admission`).
+async fn live(store: &crate::store::Store, principal: &Principal) -> Result<bool, Refusal> {
+    let mut tx = crate::db::begin(&store.pool)
+        .await
+        .map_err(|_| storage_failed("database"))?;
+    let valid = crate::auth::revalidate_admission(&mut tx, principal)
+        .await
+        .map_err(|_| storage_failed("database"))?
+        .is_some();
+    let _ = tx.rollback().await;
+    Ok(valid)
+}
+
 /// The live Files API file `id` names in `workspace`, if this viewer may
-/// read it. A malformed id is no file.
+/// read it. A malformed id is no file, after the same query as any other.
 async fn visible(
     files: &FileStorage,
     id: &str,
     workspace: uuid::Uuid,
     viewer: Viewer,
 ) -> Result<Option<StoredFile>, Refusal> {
-    let Some(id) = parse_public_id(id) else {
-        return Ok(None);
-    };
-    match files.get_visible(id, workspace, viewer).await {
-        Ok(file) => Ok(file.filter(|f| f.api_purpose.is_some())),
-        Err(_) => Err(Refusal::Storage),
+    let parsed = parse_public_id(id);
+    match files
+        .get_visible(parsed.unwrap_or_else(uuid::Uuid::nil), workspace, viewer)
+        .await
+    {
+        Ok(file) => Ok(file.filter(|f| parsed.is_some() && f.api_purpose.is_some())),
+        Err(_) => Err(storage_failed("database")),
     }
 }
 
-/// The whole decrypted file, within its stored size and the read deadlines,
-/// checked against its stored length and digest.
-async fn read(files: &FileStorage, file: &StoredFile) -> Result<Vec<u8>, Refusal> {
-    let store = files.runtime().store().ok_or(Refusal::Storage)?;
-    let limit = usize::try_from(file.size_bytes).map_err(|_| Refusal::Storage)?;
-    let deadline = tokio::time::Instant::now() + READ_TOTAL;
+/// A failed read of a referenced file, logged with its fixed reason only.
+fn storage_failed(reason: &'static str) -> Refusal {
+    tracing::warn!(reason, "referenced file could not be read");
+    Refusal::Storage
+}
+
+/// The whole decrypted file, by `deadline` and without a pause over
+/// [`READ_IDLE`], checked against its stored length and digest.
+async fn read(
+    files: &FileStorage,
+    file: &StoredFile,
+    deadline: tokio::time::Instant,
+) -> Result<Vec<u8>, Refusal> {
+    let store = files
+        .runtime()
+        .store()
+        .ok_or_else(|| storage_failed("disabled"))?;
+    let limit = usize::try_from(file.size_bytes).map_err(|_| storage_failed("length"))?;
     let read = async {
-        let mut stream = store.get(&file.key).await.map_err(|_| Refusal::Storage)?;
+        let mut stream = store
+            .get(&file.key)
+            .await
+            .map_err(|_| storage_failed("store"))?;
         let mut bytes = Vec::with_capacity(limit);
         loop {
             let next = tokio::time::timeout(READ_IDLE, stream.next())
                 .await
-                .map_err(|_| Refusal::Storage)?;
+                .map_err(|_| storage_failed("timeout"))?;
             match next {
                 None => break,
                 Some(Ok(chunk)) => {
                     if bytes.len() + chunk.len() > limit {
-                        return Err(Refusal::Storage);
+                        return Err(storage_failed("length"));
                     }
                     bytes.extend_from_slice(&chunk);
                 }
-                Some(Err(_)) => return Err(Refusal::Storage),
+                Some(Err(_)) => return Err(storage_failed("store")),
             }
         }
         Ok(bytes)
     };
     let bytes = tokio::time::timeout_at(deadline, read)
         .await
-        .map_err(|_| Refusal::Storage)??;
+        .map_err(|_| storage_failed("timeout"))??;
     if bytes.len() != limit || sha2::Sha256::digest(&bytes).as_slice() != file.sha256 {
-        return Err(Refusal::Storage);
+        return Err(storage_failed("digest"));
     }
     Ok(bytes)
 }
@@ -321,7 +396,7 @@ pub fn holding(response: Response, permit: Option<BufferPermit>, after: Duration
     let Some(permit) = permit else {
         return response;
     };
-    permit.release_after(READ_TOTAL + after);
+    permit.release_after(after);
     response.map(|body| {
         axum::body::Body::new(crate::http::Holding {
             body,
@@ -330,30 +405,56 @@ pub fn holding(response: Response, permit: Option<BufferPermit>, after: Duration
     })
 }
 
-/// [`resolve`] for a handler: the file store and the buffer from its
-/// extensions, and the refusal as the response to send.
-pub async fn resolve_request(
+/// What a handler resolves its references with: the store, and the file
+/// store and the buffer from the request's extensions (the buffer is there
+/// only behind `http::image_input_routes`).
+pub struct Context {
     store: crate::store::Store,
-    runtime: Option<axum::Extension<crate::filestore::FileStoreRuntime>>,
-    buffer: Option<axum::Extension<ImageBuffer>>,
-    principal: &Principal,
-    references: &[Reference],
-) -> Result<Files, Response> {
-    if references.is_empty() {
-        return Ok(Files {
-            contents: Vec::new(),
-            permit: None,
-            data_bytes: 0,
-        });
+    runtime: Option<crate::filestore::FileStoreRuntime>,
+    buffer: Option<ImageBuffer>,
+}
+
+impl axum::extract::FromRequestParts<crate::store::Store> for Context {
+    type Rejection = std::convert::Infallible;
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        store: &crate::store::Store,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self {
+            store: store.clone(),
+            runtime: parts
+                .extensions
+                .get::<crate::filestore::FileStoreRuntime>()
+                .cloned(),
+            buffer: parts.extensions.get::<ImageBuffer>().cloned(),
+        })
     }
-    // Mounted only behind the buffer's layer (`http::image_input_routes`).
-    let Some(axum::Extension(buffer)) = buffer else {
-        return Err(Refusal::Storage.response());
-    };
-    let files = super::files::storage(store, runtime);
-    resolve(&files, &buffer, principal, references)
-        .await
-        .map_err(Refusal::response)
+}
+
+impl Context {
+    /// [`resolve`] in this request's context.
+    pub async fn resolve(
+        self,
+        principal: &Principal,
+        references: &[Reference],
+    ) -> Result<Files, Refusal> {
+        if references.is_empty() {
+            return Ok(Files {
+                contents: Vec::new(),
+                permit: None,
+                data_bytes: 0,
+            });
+        }
+        let Some(buffer) = self.buffer else {
+            return Err(storage_failed("no buffer"));
+        };
+        let files = FileStorage::new(
+            self.store.clone(),
+            self.runtime
+                .unwrap_or_else(crate::filestore::FileStoreRuntime::off),
+        );
+        resolve(&self.store, &files, &buffer, principal, references).await
+    }
 }
 
 /// Whether a Responses content `part` references a stored file and nothing

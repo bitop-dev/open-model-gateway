@@ -159,6 +159,11 @@ pub(super) const OPENAI_TRANSPORT: &[(&str, &str, &str)] = &[
         "file_reads_rate_limited",
         "src/protocols/file_input.rs",
     ),
+    (
+        "server_error",
+        "file_store_unavailable",
+        "src/protocols/file_input.rs",
+    ),
 ];
 /// Anthropic `error.type` values rendered outside `error_body`.
 pub(super) const ANTHROPIC_TRANSPORT: &[(&str, &str)] = &[

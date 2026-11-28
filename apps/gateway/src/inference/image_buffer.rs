@@ -203,6 +203,7 @@ pub struct LargeBody(pub usize);
 impl LargeBody {
     /// Whether this body is within the text limit once `request`'s image
     /// data is set aside.
+    ///
     /// `from_files` bytes of image data came from referenced files
     /// (`protocols::file_input`), not from this body.
     pub fn allows(self, request: &crate::inference::types::ChatRequest, from_files: usize) -> bool {
@@ -323,8 +324,9 @@ impl ImageBuffer {
             file_reads: Arc::default(),
         }
     }
-    /// Admits `n` file reads for `key` in this minute, or the seconds until
-    /// the next minute when its reads are spent (each refused read counts).
+    /// Admits `n` file reads for `key` in this UTC minute (a fixed window),
+    /// or the seconds until the next minute once its reads are spent. The
+    /// reads admitted before the refusal stay spent: the request reads none.
     pub fn admit_file_reads(&self, key: Uuid, n: usize) -> Result<(), u32> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

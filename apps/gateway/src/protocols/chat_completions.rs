@@ -377,9 +377,7 @@ impl Request {
 }
 
 pub async fn handle(
-    axum::extract::State(store): axum::extract::State<crate::store::Store>,
-    runtime: Option<Extension<crate::filestore::FileStoreRuntime>>,
-    buffer: Option<Extension<crate::inference::image_buffer::ImageBuffer>>,
+    files_context: super::file_input::Context,
     Extension(engine): Extension<Engine>,
     Extension(principal): Extension<Principal>,
     Extension(request_id): Extension<RequestId>,
@@ -407,13 +405,10 @@ pub async fn handle(
             field: FILE_ID_FIELD,
         })
         .collect();
-    let files =
-        match super::file_input::resolve_request(store, runtime, buffer, &principal, &references)
-            .await
-        {
-            Ok(files) => files,
-            Err(refused) => return refused,
-        };
+    let files = match files_context.resolve(&principal, &references).await {
+        Ok(files) => files,
+        Err(refused) => return refused.response(),
+    };
     let permit = files.permit;
     let from_files = files.data_bytes;
     for (part, super::file_input::Resolved::Image(url)) in wire.file_parts().zip(files.contents) {

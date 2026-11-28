@@ -49,5 +49,6 @@ jobs/schedule.rs :: impl Scheduler::record_signal :: warn :: deployment_id=%depl
 jobs/video.rs :: impl Jobs::create_video :: error :: execution_id=%request_id
 jobs/video.rs :: impl Jobs::unrecorded_upstream :: error :: execution_id=%execution
 jobs/video.rs :: impl Jobs::unrecorded_upstream :: error :: execution_id=%execution
+protocols/file_input.rs :: storage_failed :: warn :: reason=reason
 protocols/realtime.rs :: handle :: error :: -
 providers/anthropic.rs :: encode_within :: error :: -

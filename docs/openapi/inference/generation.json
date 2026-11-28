@@ -218,13 +218,19 @@
             "status": 413,
             "envelope": "OpenAiErrorEnvelope",
             "code": "file_too_large",
-            "trigger": "a referenced file over 5 MiB; the message begins with messages.content.file.file_id"
+            "trigger": "a referenced file over 5 MiB, or a request's referenced files together (their bytes and base64) more than one key may ever hold of the image input buffer (refused for good, before any read); the message begins with messages.content.file.file_id"
           },
           {
             "status": 429,
             "envelope": "OpenAiErrorEnvelope",
             "code": "file_reads_rate_limited",
-            "trigger": "this API key's file reads this minute on this replica (GATEWAY_FILE_INPUT_READS_PER_KEY_PER_MINUTE, default 120) are spent; nothing was read or sent; Retry-After until the next minute"
+            "trigger": "this API key's file reads in the current UTC minute on this replica (GATEWAY_FILE_INPUT_READS_PER_KEY_PER_MINUTE, default 120; a fixed window, charged only for reads that will happen) are spent; nothing was read or sent; Retry-After until the next minute"
+          },
+          {
+            "status": 503,
+            "envelope": "OpenAiErrorEnvelope",
+            "code": "file_store_unavailable",
+            "trigger": "a referenced file could not be read in full: the file store failed, its read took more than 30 s for the request or paused more than 10 s, or its bytes did not match the stored length and digest; nothing was sent"
           },
           {
             "status": 408,
@@ -242,7 +248,7 @@
             "status": 503,
             "envelope": "OpenAiErrorEnvelope",
             "code": "image_input_busy",
-            "trigger": "the replica's image input buffer is full for a declared body over 2 MiB; Retry-After: 1; or a request's referenced files (their bytes and base64) do not fit the buffer or this key's share of it, refused before any file is read"
+            "trigger": "the replica's image input buffer is full for a declared body over 2 MiB; Retry-After: 1; or the buffer, or this key's share of it, is taken by other requests for a request's referenced files, refused before any file is read"
           },
           {
             "status": 501,
@@ -552,13 +558,19 @@
             "status": 413,
             "envelope": "OpenAiErrorEnvelope",
             "code": "file_too_large",
-            "trigger": "a referenced file over 5 MiB; the message begins with input.content.file_id"
+            "trigger": "a referenced file over 5 MiB, or a request's referenced files together (their bytes and base64) more than one key may ever hold of the image input buffer (refused for good, before any read); the message begins with input.content.file_id"
           },
           {
             "status": 429,
             "envelope": "OpenAiErrorEnvelope",
             "code": "file_reads_rate_limited",
-            "trigger": "this API key's file reads this minute on this replica (GATEWAY_FILE_INPUT_READS_PER_KEY_PER_MINUTE, default 120) are spent; nothing was read or sent; Retry-After until the next minute"
+            "trigger": "this API key's file reads in the current UTC minute on this replica (GATEWAY_FILE_INPUT_READS_PER_KEY_PER_MINUTE, default 120; a fixed window, charged only for reads that will happen) are spent; nothing was read or sent; Retry-After until the next minute"
+          },
+          {
+            "status": 503,
+            "envelope": "OpenAiErrorEnvelope",
+            "code": "file_store_unavailable",
+            "trigger": "a referenced file could not be read in full: the file store failed, its read took more than 30 s for the request or paused more than 10 s, or its bytes did not match the stored length and digest; nothing was sent"
           },
           {
             "status": 408,
@@ -576,7 +588,7 @@
             "status": 503,
             "envelope": "OpenAiErrorEnvelope",
             "code": "image_input_busy",
-            "trigger": "the replica's image input buffer is full for a declared body over 2 MiB; Retry-After: 1; or a request's referenced files (their bytes and base64) do not fit the buffer or this key's share of it, refused before any file is read"
+            "trigger": "the replica's image input buffer is full for a declared body over 2 MiB; Retry-After: 1; or the buffer, or this key's share of it, is taken by other requests for a request's referenced files, refused before any file is read"
           },
           {
             "status": 501,
