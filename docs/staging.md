@@ -59,7 +59,7 @@ cosign verify ghcr.io/ncecere/open-model-gateway@sha256:<digest> \
 
 Use cosign v3 or newer and the **exact identity**, not a pattern accepting either owner. Development images (`dev-<sha12>` and `dev-<sha12>-arm64`) are unsigned and skip the release scan/rehearsal. `main` images use `@refs/heads/main` in the certificate identity instead of a release tag. The loadtest image is a separate development artifact at `ghcr.io/bitop-dev/open-model-gateway-loadtest`.
 
-The v0.19.0 chart defaults to `ghcr.io/bitop-dev/open-model-gateway`. Set `image.repository` and the verified digest together in rollout values, including migration jobs. Keep the old repository and digest for rollback and follow the [v0.19.0 upgrade and restore guidance](releases/v0.19.0.md#upgrade).
+The v0.20.0 chart defaults to `ghcr.io/bitop-dev/open-model-gateway`. Set `image.repository` and the verified digest together in rollout values, including migration jobs. Keep the old repository and digest for rollback and follow the [v0.20.0 upgrade and restore guidance](releases/v0.20.0.md#upgrade).
 
 ## First local HTTPS rehearsal
 

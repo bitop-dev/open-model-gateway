@@ -16,7 +16,7 @@ image:
   # before a real rollout.
   repository: ghcr.io/bitop-dev/open-model-gateway
   digest: ""
-  tag: v0.19.0
+  tag: v0.20.0
   pullPolicy: IfNotPresent
   pullSecrets: []
 
