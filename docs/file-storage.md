@@ -12,7 +12,7 @@ What's implemented today:
 - The gateway-owned **[Files API](files-api.md)** (`/v1/files`, migration 0020), with a stacked per-workspace storage quota and storage usage tracking (GB-days, not charged).
 - The **installation logo** (Admin › Settings › General, migration 0023), purpose `branding`.
 
-The batch engine, CSV exports and video outputs use or will use the store as they're built (see [Consumers](#consumers)).
+The batch engine and finished videos use the store; CSV exports will (see [Consumers](#consumers)).
 
 ## Configuration
 

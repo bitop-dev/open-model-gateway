@@ -231,15 +231,23 @@ async fn an_output_that_cannot_be_stored_is_given_up_for_good_and_the_job_stays_
     s.model("company/clips", &[route("{4}", Some("{1280x720}"))])
         .await;
     let mp4 = MP4.to_vec();
-    for (content, reason) in [
-        ((200, "video/mp4", Vec::new(), None), "empty_output"),
-        (
-            (200, "video/mp4", mp4.clone(), Some(600 * 1024 * 1024)),
-            "too_large",
-        ),
-    ] {
-        *s.mock.content.lock().unwrap() = Some(content);
-        let id = s.finished("company/clips").await;
+    let read = async |id: Uuid| -> Value {
+        s.get(&format!("/v1/videos/video_{}", id.simple()))
+            .await
+            .json()
+            .await
+            .unwrap()
+    };
+    let past_window = async |id: Uuid| {
+        sqlx::query(
+            "UPDATE async_jobs SET completed_at=now()-interval '6 hours 1 second' WHERE id=$1",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    };
+    let given_up = async |id: Uuid, reason: &str| {
         let (failure, file, _, _) = s.job(id).await;
         assert_eq!((failure.as_deref(), file), (Some(reason), None), "{reason}");
         // Charged as the server reported it (4 s at 1280x720, $0.20/s).
@@ -253,13 +261,8 @@ async fn an_output_that_cannot_be_stored_is_given_up_for_good_and_the_job_stays_
         let error: Value = response.json().await.unwrap();
         assert_eq!(error["error"]["code"], "video_output_unavailable");
         assert_eq!(error["error"]["reason"], reason);
-        let v: Value = s
-            .get(&format!("/v1/videos/video_{}", id.simple()))
-            .await
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(v["status"], "completed");
+        let v = read(id).await;
+        assert_eq!(v["status"], "completed", "{reason}");
         assert_eq!(v["output_unavailable"], json!({"reason": reason}));
         // Given up for good: never downloaded again.
         let downloads = s.mock.contents.load(Ordering::SeqCst);
@@ -269,59 +272,121 @@ async fn an_output_that_cannot_be_stored_is_given_up_for_good_and_the_job_stays_
             downloads,
             "{reason}"
         );
-    }
-    *s.mock.content.lock().unwrap() = None;
+    };
+    // Larger than the gateway stores: given up at once.
+    *s.mock.content.lock().unwrap() =
+        Some((200, "video/mp4", mp4.clone(), Some(600 * 1024 * 1024)));
+    let id = s.finished("company/clips").await;
+    given_up(id, "too_large").await;
 
-    // Video outputs turned off after the job was created.
-    let (status, v) = s
-        .create(json!({"model":"company/clips","prompt":"a"}))
-        .await;
-    assert_eq!(status, StatusCode::OK, "{v}");
-    sqlx::query("UPDATE installation_settings SET file_video_enabled=false WHERE singleton")
-        .execute(&pool)
-        .await
-        .unwrap();
-    let upstream: String = sqlx::query_scalar("SELECT upstream_id FROM async_jobs WHERE id=$1")
-        .bind(job_id(&v))
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    set_status(&s.mock, &upstream, "completed");
-    s.poll().await;
-    assert_eq!(
-        s.job(job_id(&v)).await.0.as_deref(),
-        Some("storage_disabled")
-    );
-    sqlx::query("UPDATE installation_settings SET file_video_enabled=true WHERE singleton")
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    // A download that keeps failing, or that the server keeps refusing (its
-    // content endpoint may lag the status), backs off after each attempt and
-    // is given up after six, with the last attempt's cause.
-    for (fail, reason) in [
-        (None, "download_failed"),
+    // Every other cause is retried, with backoff, until 6 hours after the
+    // video completed: an empty body, a server that refuses it (its content
+    // endpoint may lag the status), a download that keeps failing, video
+    // outputs turned off. Meanwhile the video reads in progress and its
+    // content is not ready; then the last cause is recorded.
+    for (fail, storage_off, reason) in [
+        (
+            Some((200, "video/mp4", Vec::new(), None)),
+            false,
+            "empty_output",
+        ),
         (
             Some((404, "video/mp4", Vec::new(), None)),
+            false,
             "upstream_refused",
         ),
+        (None, false, "download_failed"),
+        (None, true, "storage_disabled"),
     ] {
-        s.mock.content_fails.store(fail.is_none(), Ordering::SeqCst);
+        s.mock
+            .content_fails
+            .store(fail.is_none() && !storage_off, Ordering::SeqCst);
         *s.mock.content.lock().unwrap() = fail;
-        let id = s.finished("company/clips").await;
-        for attempt in 1..super::video_output::VIDEO_OUTPUT_ATTEMPTS {
+        let (status, v) = s
+            .create(json!({"model":"company/clips","prompt":"a"}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let id = job_id(&v);
+        sqlx::query("UPDATE installation_settings SET file_video_enabled=$1 WHERE singleton")
+            .bind(!storage_off)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let upstream: String = sqlx::query_scalar("SELECT upstream_id FROM async_jobs WHERE id=$1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        set_status(&s.mock, &upstream, "completed");
+        for attempt in 1..=3 {
+            s.poll().await;
             let (failure, _, failures, later) = s.job(id).await;
             assert_eq!(
                 (failure, failures, later),
                 (None, attempt, true),
                 "{reason}: attempt {attempt}"
             );
-            s.poll().await;
         }
-        assert_eq!(s.job(id).await.0.as_deref(), Some(reason));
-        assert_eq!(s.charge(id).await.1, Some(800_000));
+        let v = read(id).await;
+        assert_eq!(
+            (v["status"].clone(), v["completed_at"].clone()),
+            (json!("in_progress"), Value::Null),
+            "{reason}: {v}"
+        );
+        let response = s.content(id).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{reason}");
+        let error: Value = response.json().await.unwrap();
+        assert_eq!(error["error"]["code"], "video_not_ready", "{reason}");
+        past_window(id).await;
+        s.poll().await;
+        sqlx::query("UPDATE installation_settings SET file_video_enabled=true WHERE singleton")
+            .execute(&pool)
+            .await
+            .unwrap();
+        given_up(id, reason).await;
     }
+}
+
+/// Past its window an awaited output is given up even while the job cannot
+/// be refreshed, so it leaves the claim and its 512 MiB hold: a completed
+/// video whose settlement never landed and whose route is now disabled.
+#[dbtest::test]
+async fn an_awaited_output_past_its_window_leaves_the_claim(pool: PgPool) {
+    let s = Setup::new(pool.clone()).await;
+    let routes = s
+        .model("company/clips", &[route("{4}", Some("{1280x720}"))])
+        .await;
+    let (status, v) = s
+        .create(json!({"model":"company/clips","prompt":"a"}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let id = job_id(&v);
+    // Completed (as a poll records it) but never settled, past its poll
+    // deadline and its output window; its route disabled.
+    sqlx::query("UPDATE async_jobs SET state='completed',upstream_status='completed',completed_at=now()-interval '7 hours',output_pending=true,poll_deadline_at=now()-interval '1 second',next_poll_at=now() WHERE id=$1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE deployments SET enabled=false WHERE id=$1")
+        .bind(routes[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+    let _ = s.poller.poll_once().await;
+    let (failure, file, _, _) = s.job(id).await;
+    assert_eq!((failure.as_deref(), file), (Some("download_failed"), None));
+    let pending: bool = sqlx::query_scalar("SELECT output_pending FROM async_jobs WHERE id=$1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!pending, "it left the awaiting head");
+    assert_eq!(
+        s.charge(id).await.0,
+        "pending",
+        "its settlement stays as it is"
+    );
 }
 
 #[dbtest::test]
@@ -468,7 +533,7 @@ async fn content_and_create_answer_for_the_stored_copy(pool: PgPool) {
     let response = s.content(pending).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let error: Value = response.json().await.unwrap();
-    assert_eq!(error["error"]["code"], "video_content_unavailable");
+    assert_eq!(error["error"]["code"], "video_not_ready");
     // The server gives that video's id to another job: the awaited output
     // is given up at the next claim, without a download.
     let upstream: String = sqlx::query_scalar("SELECT upstream_id FROM async_jobs WHERE id=$1")
@@ -662,4 +727,118 @@ async fn a_stored_copy_is_bounded_and_fenced(pool: PgPool) {
         .unwrap()
         .expect("claimed for its output");
     assert_eq!((claimed.id, claimed.settled_at), (unsettled, None));
+}
+
+/// Downloads take at most half the poll slots: a job that finds none free
+/// waits for its next turn, no attempt counted. The stored copy is served
+/// `no-store`; a live file row whose object is gone is data loss (503), not
+/// retention; a recorded failure this release does not know reads
+/// `unknown`.
+#[dbtest::test]
+async fn downloads_are_capped_and_content_answers_honestly(pool: PgPool) {
+    let s = Setup::new(pool.clone()).await;
+    s.model("company/clips", &[route("{4}", Some("{1280x720}"))])
+        .await;
+    // Every download slot taken: the awaited output waits, nothing counted.
+    let slots: Vec<_> = (0..s.poller.downloads.available_permits())
+        .map(|_| s.poller.downloads.clone().try_acquire_owned().unwrap())
+        .collect();
+    let id = s.finished("company/clips").await;
+    let (failure, file, failures, _) = s.job(id).await;
+    assert_eq!((failure, file, failures), (None, None, 0));
+    assert_eq!(s.mock.contents.load(Ordering::SeqCst), 0, "no download");
+    drop(slots);
+    s.poll().await;
+    let stored = s.job(id).await.1.expect("stored once a slot is free");
+    let response = s.content(id).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    // The object behind a live row is gone.
+    let key: String = sqlx::query_scalar("SELECT object_key FROM stored_files WHERE id=$1")
+        .bind(stored)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    std::fs::remove_file(
+        super::db_tests::TEST_FILES_DIR
+            .path()
+            .join("files")
+            .join(key),
+    )
+    .unwrap();
+    assert_eq!(
+        s.content(id).await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    // A recorded failure code from another release.
+    s.mock.content_fails.store(true, Ordering::SeqCst);
+    let other = s.finished("company/clips").await;
+    sqlx::query("UPDATE async_jobs SET output_failure='from_a_later_release',output_pending=false WHERE id=$1")
+        .bind(other)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let response = s.content(other).await;
+    assert_eq!(response.status(), StatusCode::GONE);
+    let error: Value = response.json().await.unwrap();
+    assert_eq!(error["error"]["reason"], "unknown");
+}
+
+/// The claim's two heads (unsettled jobs; awaited outputs) are merged in
+/// `next_poll_at` order: a limited claim takes the oldest across both, and
+/// no row is claimed twice.
+#[dbtest::test]
+async fn the_merged_claim_takes_the_oldest_of_both_heads_once(pool: PgPool) {
+    let s = Setup::new(pool.clone()).await;
+    s.model("company/clips", &[route("{4}", Some("{1280x720}"))])
+        .await;
+    // Three awaited outputs and three unsettled (queued) videos (no storage
+    // quota, which three awaited outputs would fill).
+    sqlx::query("UPDATE workspace_type_policies SET storage_bytes=NULL WHERE kind='personal'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    s.mock.content_fails.store(true, Ordering::SeqCst);
+    let mut awaiting = Vec::new();
+    for _ in 0..3 {
+        awaiting.push(s.finished("company/clips").await);
+    }
+    let mut queued = Vec::new();
+    for _ in 0..3 {
+        let (status, v) = s
+            .create(json!({"model":"company/clips","prompt":"a"}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        queued.push(job_id(&v));
+    }
+    // Interleaved ages: q0 a0 q1 a1 q2 a2, oldest first.
+    let order: Vec<Uuid> = (0..3).flat_map(|i| [queued[i], awaiting[i]]).collect();
+    for (age, id) in order.iter().enumerate() {
+        sqlx::query("UPDATE async_jobs SET next_poll_at=now()-make_interval(mins=>$2),runner_lease_until=NULL WHERE id=$1")
+            .bind(id)
+            .bind(60 - age as i32)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let claim = async |limit| {
+        store::claim_due_many(&s.f.store, Uuid::new_v4(), 60.0, 60.0, limit, &[])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(job, _)| job.id)
+            .collect::<Vec<_>>()
+    };
+    let first = claim(4).await;
+    let mut expected = order[..4].to_vec();
+    let mut got = first.clone();
+    expected.sort();
+    got.sort();
+    assert_eq!(got, expected, "the four oldest across both heads");
+    let rest = claim(10).await;
+    let mut rest_sorted = rest.clone();
+    rest_sorted.sort();
+    let mut tail = order[4..].to_vec();
+    tail.sort();
+    assert_eq!(rest_sorted, tail, "the rest, none claimed twice");
 }

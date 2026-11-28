@@ -233,6 +233,9 @@ pub struct Jobs {
     /// Approved local endpoints: batch scheduling reads server load signals
     /// only from their origins (pinned addresses).
     pub(crate) approvals: Option<Arc<crate::providers::local::endpoints::ApprovedEndpoints>>,
+    /// Video output downloads at once: half the poll slots, at least one
+    /// (`video_output::refresh_output`).
+    pub(crate) downloads: Arc<tokio::sync::Semaphore>,
     /// Test-only counters proving `plan::every_candidate_route_refuses`'s
     /// model-level lookups are memoized at most once per scan (#238
     /// follow-up), not once per explicit-maximum line. Never read outside
@@ -339,6 +342,9 @@ impl Jobs {
             files: None,
             engine: None,
             approvals: None,
+            downloads: Arc::new(tokio::sync::Semaphore::new(
+                (limits.poll_concurrency.max(1) / 2).max(1),
+            )),
             #[cfg(test)]
             plan_lookup_counts: Arc::new(plan::PlanLookupCounts::default()),
             #[cfg(test)]

@@ -887,13 +887,31 @@
             "status": 400,
             "envelope": "JobErrorEnvelope",
             "code": "video_not_ready",
-            "trigger": "Job state is not completed, including failed, cancelled or expired jobs"
+            "trigger": "Job state is not completed (failed, cancelled or expired jobs too), or a completed video's output is still awaited (it reads in_progress)"
           },
           {
             "status": 400,
             "envelope": "OpenAiErrorEnvelope",
             "code": "invalid_request_error",
             "trigger": "Unknown query parameter or unsupported asset variant"
+          },
+          {
+            "status": 410,
+            "envelope": "JobErrorEnvelope",
+            "code": "video_output_unavailable",
+            "trigger": "A completed video whose output will never be stored (reason: why, completed_before_storage, or unknown)"
+          },
+          {
+            "status": 410,
+            "envelope": "JobErrorEnvelope",
+            "code": "video_output_expired",
+            "trigger": "The stored copy was removed by the video retention (file_video_retention_days)"
+          },
+          {
+            "status": 503,
+            "envelope": "OpenAiErrorEnvelope",
+            "code": "accounting_unavailable",
+            "trigger": "The file store is unavailable, or a stored copy's object is missing (data loss, logged at error)"
           }
         ]
       }

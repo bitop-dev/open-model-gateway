@@ -305,12 +305,17 @@ pub(crate) fn stream_response(content: crate::jobs::types::ContentStream) -> Res
             .headers_mut()
             .insert(header::CONTENT_LENGTH, HeaderValue::from(n));
     }
-    // The body is the provider's: never sniffed into
-    // another type than the one stated.
+    // A generated body (the gateway's stored copy of a video, or a
+    // provider's thumbnail): never sniffed into another type than the one
+    // stated, and never cached on the way. `Range` is not served: always the
+    // whole body.
     response.headers_mut().insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 

@@ -185,10 +185,11 @@ pub(crate) const FAKE_VIDEO: &[u8] = b"fake mp4 bytes";
 /// A local, encrypted file store for job tests: one directory per test
 /// process (each test's database has its own rows and object keys).
 pub(crate) async fn test_files() -> crate::filestore::FileStoreRuntime {
-    static DIR: std::sync::LazyLock<tempfile::TempDir> =
-        std::sync::LazyLock::new(|| tempfile::tempdir().unwrap());
-    super::batch_tests::durable::local_files(DIR.path()).await
+    super::batch_tests::durable::local_files(TEST_FILES_DIR.path()).await
 }
+/// The directory of [`test_files`]; its objects are under `files/`.
+pub(crate) static TEST_FILES_DIR: std::sync::LazyLock<tempfile::TempDir> =
+    std::sync::LazyLock::new(|| tempfile::tempdir().unwrap());
 /// Jobs with `fake` as their only provider and the test file store.
 pub(crate) async fn jobs(f: &Fixture, fake: &Fake, poll: bool) -> Jobs {
     let mut registry = ProviderRegistry::default();

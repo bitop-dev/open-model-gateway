@@ -28,12 +28,22 @@ use super::{
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Failed attempts after which an output that could not be stored is given
-/// up (the last attempt's cause is recorded).
-pub(crate) const VIDEO_OUTPUT_ATTEMPTS: i32 = 6;
+/// The answer to `/content` while a video's output is awaited.
+pub(super) const NOT_READY: &str = "Video content is available once the video is completed";
+/// How long after its completion a video's output is retried: past this, the
+/// last attempt's cause is recorded for good.
+pub(crate) const VIDEO_OUTPUT_WINDOW: gateway_datetime_compat::SignedDuration =
+    gateway_datetime_compat::SignedDuration::hours(6);
 const VIDEO_STORAGE_UNAVAILABLE: &str =
     "Video generation needs the gateway file store with video outputs allowed";
 const VIDEO_STORAGE_FULL: &str = "The workspace's storage is full: a finished video is stored in it, so no video is created until space is freed";
+
+/// Whether a video's output retry window ([`VIDEO_OUTPUT_WINDOW`]) has
+/// passed since it completed.
+pub(crate) fn past_output_window(job: &JobRow) -> bool {
+    let completed = job.completed_at.unwrap_or(job.created_at);
+    gateway_datetime_compat::UtcInstant::now() >= completed + VIDEO_OUTPUT_WINDOW
+}
 
 /// Why a finished video's output is not stored (the job's
 /// `output_failure`, a fixed code).
@@ -110,13 +120,26 @@ pub(crate) fn unavailable_reason(job: &JobRow) -> Option<&'static str> {
             .and_then(OutputFailure::parse)
             .map_or(COMPLETED_BEFORE_STORAGE, OutputFailure::as_str),
     )
+    .map(|reason| {
+        // A recorded code this release does not know is not a video
+        // completed before stored outputs.
+        if job.output_failure.is_some() && reason == COMPLETED_BEFORE_STORAGE {
+            UNKNOWN_FAILURE
+        } else {
+            reason
+        }
+    })
 }
 /// The reason of a video completed before the gateway stored outputs.
 const COMPLETED_BEFORE_STORAGE: &str = "completed_before_storage";
+/// The reason of a recorded failure this release does not know.
+const UNKNOWN_FAILURE: &str = "unknown";
 /// Every reason a completed video's output is unavailable: the
-/// [`OutputFailure`] codes and [`COMPLETED_BEFORE_STORAGE`].
-pub const UNAVAILABLE_REASONS: [&str; OutputFailure::ALL.len() + 1] = {
-    let mut reasons = [COMPLETED_BEFORE_STORAGE; OutputFailure::ALL.len() + 1];
+/// [`OutputFailure`] codes, [`COMPLETED_BEFORE_STORAGE`] and
+/// [`UNKNOWN_FAILURE`].
+pub const UNAVAILABLE_REASONS: [&str; OutputFailure::ALL.len() + 2] = {
+    let mut reasons = [COMPLETED_BEFORE_STORAGE; OutputFailure::ALL.len() + 2];
+    reasons[OutputFailure::ALL.len() + 1] = UNKNOWN_FAILURE;
     let mut i = 0;
     while i < OutputFailure::ALL.len() {
         reasons[i] = OutputFailure::ALL[i].as_str();
@@ -181,20 +204,36 @@ impl Jobs {
         fence: &BatchFence,
         lost: &AtomicBool,
     ) -> JobResult<JobRow> {
+        // At most half the poll slots download at once, so the others keep
+        // polling; without a free one the job waits for its next turn, no
+        // attempt counted.
+        let Ok(_download) = self.downloads.clone().try_acquire_owned() else {
+            return Ok(job);
+        };
         let failure = match self.store_output(&job, fence, lost).await {
             Ok(()) => None,
             Err(Try::Permanent(f)) => Some(f),
-            Err(Try::Transient(f)) if job.poll_failures + 1 >= VIDEO_OUTPUT_ATTEMPTS => Some(f),
+            Err(Try::Transient(f)) if past_output_window(&job) => Some(f),
             Err(Try::Transient(f)) => {
                 tracing::warn!(job_id = %job.id, cause = f.as_str(), "video output not stored; retried after backoff");
                 return Err(InferenceError::UpstreamUnavailable.into());
             }
         };
         if let Some(f) = failure {
-            tracing::warn!(job_id = %job.id, cause = f.as_str(), "video output given up; the job stays completed and charged");
-            store::set_output_failure(&self.store, fence, job.id, f.as_str()).await?;
+            self.give_up_output(&job, fence, f).await?;
         }
         Ok(store::reload(&self.store, job.id).await?)
+    }
+
+    /// Give a video's awaited output up for good with `cause`.
+    pub(super) async fn give_up_output(
+        &self,
+        job: &JobRow,
+        fence: &BatchFence,
+        cause: OutputFailure,
+    ) -> JobResult<()> {
+        tracing::warn!(job_id = %job.id, cause = cause.as_str(), "video output given up; the job stays completed and charged");
+        Ok(store::set_output_failure(&self.store, fence, job.id, cause.as_str()).await?)
     }
 
     /// Download the output into the file store (encrypted, at most
@@ -221,7 +260,9 @@ impl Jobs {
             InferenceError::Storage => Transient(F::StorageFailed),
             _ => Transient(F::RouteUnavailable),
         })?;
-        let files = self.files.as_ref().ok_or(Permanent(F::StorageDisabled))?;
+        // A replica without a store, or video outputs turned off, may be
+        // fixed within the window: retried.
+        let files = self.files.as_ref().ok_or(Transient(F::StorageDisabled))?;
         // The storage policy now, not at create: video outputs may have been
         // turned off since.
         if !files
@@ -229,7 +270,7 @@ impl Jobs {
             .await
             .map_err(|_| Transient(F::StorageFailed))?
         {
-            return Err(Permanent(F::StorageDisabled));
+            return Err(Transient(F::StorageDisabled));
         }
         let upstream = job.upstream().ok_or(Transient(F::DownloadFailed))?;
         let content = call(adapter.video_content(&target, &upstream, VideoAsset::Video))
@@ -254,7 +295,7 @@ impl Jobs {
                 .flatten(),
         };
         match content.content_length {
-            Some(0) => return Err(Permanent(F::Empty)),
+            Some(0) => return Err(Transient(F::Empty)),
             Some(n) if n > VIDEO_OUTPUT_MAX_BYTES => return Err(Permanent(F::TooLarge)),
             _ => {}
         }
@@ -306,11 +347,11 @@ impl Jobs {
         };
         let stored = created.map_err(|e| match cut.get() {
             Some(Cut::TooLarge) => Permanent(F::TooLarge),
-            Some(Cut::Empty) => Permanent(F::Empty),
+            Some(Cut::Empty) => Transient(F::Empty),
             Some(Cut::Idle | Cut::Total | Cut::Source) => Transient(F::DownloadFailed),
             None => match e {
                 crate::filestore::FileError::TooLarge => Permanent(F::TooLarge),
-                crate::filestore::FileError::Disabled => Permanent(F::StorageDisabled),
+                crate::filestore::FileError::Disabled => Transient(F::StorageDisabled),
                 _ => Transient(F::StorageFailed),
             },
         })?;
@@ -363,22 +404,31 @@ impl Jobs {
                 Some(reason),
             ));
         }
+        // Awaited (the job reads in progress, `video::render`): not ready.
         let Some(file) = job.output_file_id else {
-            return Err(JobError::Conflict(
-                "video_content_unavailable",
-                "The video's output is not stored yet; try again later",
-            ));
+            return Err(JobError::Conflict("video_not_ready", NOT_READY));
         };
         let files = self.files.as_ref().ok_or(InferenceError::Storage)?;
+        // The job is not deleted, so a file row no longer live ended by
+        // retention.
+        if files
+            .get(file, Some(job.workspace_id))
+            .await
+            .map_err(|_| InferenceError::Storage)?
+            .is_none()
+        {
+            return Err(JobError::Gone(
+                "video_output_expired",
+                "The video's stored output has expired",
+                None,
+            ));
+        }
         let (stored, body) = match files.open(file, Some(job.workspace_id)).await {
             Ok(opened) => opened,
-            // The job is not deleted, so its copy ended by retention.
+            // A live row whose object is missing is data loss, not retention.
             Err(crate::filestore::FileError::NotFound) => {
-                return Err(JobError::Gone(
-                    "video_output_expired",
-                    "The video's stored output has expired",
-                    None,
-                ));
+                tracing::error!(job_id = %job.id, "a stored video output's object is missing");
+                return Err(InferenceError::Storage.into());
             }
             Err(_) => return Err(InferenceError::Storage.into()),
         };

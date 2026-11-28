@@ -240,6 +240,21 @@ Each claim holds a 60 s lease, renewed every 15 s on the shared database pool. `
 
 A provider can accept a native batch after the gateway ended it as `submission_interrupted` (its submitter stalled past the 40-minute grace). The id is not written to the ended batch, whose unknown hold stays; the provider batch then runs and is billed, but nothing polls it. `gateway_batches_total{mode="native",event="late_submission"}` counts it, the WARN log line `native batch accepted after it ended` carries the job id and the provider batch id, and the example rule `GatewayBatchAcceptedAfterEnd` fires on one. Cancel the provider batch with its provider.
 
+### Stored video outputs (#52)
+
+A finished video is stored, encrypted, in the file store: up to 512 MiB per video, for `file_video_retention_days` (default 7).
+
+**Sizing**
+- While a completed video's output is awaited (downloading or retried, for at most 6 hours after it completed), it holds 512 MiB against its workspace's storage quota at create time. With the default 1 GiB workspace quota, two awaited outputs block new videos (`storage_quota_exceeded`) until one is stored.
+- A stored output itself is written without a quota check, since it is paid for. So a workspace can exceed its quota by up to 512 MiB per video it has running. With no job limit (no `concurrent_jobs` on the workspace or its type), that overshoot has no bound.
+- Downloads take at most half of a replica's `GATEWAY_JOB_POLL_CONCURRENCY` slots (at least one). Each holds a slot for up to 25 minutes.
+
+**What to watch**
+- Awaited outputs: `SELECT count(*) FROM async_jobs WHERE output_pending`. Steady growth means downloads are failing or slots are too few.
+- `storage_quota_exceeded` refusals of `POST /v1/videos`, in request logs by code.
+- Given-up outputs: `SELECT output_failure, count(*) FROM async_jobs WHERE output_failure IS NOT NULL GROUP BY 1`. Also the WARN line `video output given up`, with the job id and its cause.
+- The ERROR line `a stored video output's object is missing`: a live file row without its object, which is data loss.
+
 ## Audit export
 
 With `GATEWAY_AUDIT_WEBHOOK_URL` and `GATEWAY_AUDIT_WEBHOOK_SECRET_ENV` set, the gateway streams the audit log to a SIEM (#106). [Syslog over TLS](#syslog-over-tls) (`GATEWAY_AUDIT_SYSLOG_URL`, #107) and [OTLP logs](#otlp-logs) (`GATEWAY_AUDIT_OTLP_URL`, #108) are the alternatives; there is one destination at a time. The operator controls the destination; Admin › Settings › Audit export shows the transport and status and sends a test, but can't change or stop it.

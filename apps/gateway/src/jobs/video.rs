@@ -136,8 +136,14 @@ pub fn render(job: &JobRow) -> Value {
     // A job whose provider id the server gave another job is no longer
     // served, whatever it had reached (its charge, if settled, stands).
     let reused = job.error_code.as_deref() == Some(super::UPSTREAM_ID_REUSED);
+    // A completed video whose output is still awaited reads in progress, so
+    // a client that downloads once it reads completed finds the output (the
+    // charge is made when the provider completes it).
+    let awaited = job.output_pending && job.job_state() == JobState::Completed;
     let state = if reused {
         JobState::Failed
+    } else if awaited {
+        JobState::InProgress
     } else {
         job.job_state()
     };
@@ -146,9 +152,9 @@ pub fn render(job: &JobRow) -> Value {
         "object": "video",
         "model": job.public_model,
         "status": state.as_str(),
-        "progress": job.progress.map(i64::from).unwrap_or(if state == JobState::Completed { 100 } else { 0 }),
+        "progress": if awaited { 99 } else { job.progress.map(i64::from).unwrap_or(if state == JobState::Completed { 100 } else { 0 }) },
         "created_at": job.created_at.timestamp(),
-        "completed_at": unix(job.completed_at),
+        "completed_at": unix(job.completed_at.filter(|_| !awaited)),
         "expires_at": unix(job.expires_at),
         "seconds": job.video_seconds.map(|s| s.to_string()),
         "size": job.video_size,
@@ -591,18 +597,24 @@ impl Jobs {
             // A finished, settled video is claimed only to store its output.
             job
         } else {
-            match self.target(&job).await {
-                // Marked since `job` was read: the only `InvalidUpstream` of
-                // `target`.
-                Err(InferenceError::InvalidUpstream) => {
-                    let now = store::reload(&self.store, job.id).await?;
-                    self.settle_reused(now, observer).await?
-                }
-                Err(e) => return Err(e.into()),
-                Ok((target, adapter)) => {
-                    let upstream_id = job.upstream().ok_or(InferenceError::Storage)?;
-                    let upstream = call(adapter.retrieve_video(&target, &upstream_id)).await?;
-                    self.apply_video(&job, &upstream, observer).await?
+            match self.refresh_upstream(&job, observer).await {
+                Ok(refreshed) => refreshed,
+                Err(e) => {
+                    // An awaited output past its window is given up even when
+                    // the job cannot be refreshed, so it leaves the claim
+                    // (its settlement stays as it is).
+                    if let store::Observer::Claim(fence) = observer
+                        && job.output_pending
+                        && super::video_output::past_output_window(&job)
+                    {
+                        self.give_up_output(
+                            &job,
+                            fence,
+                            super::video_output::OutputFailure::DownloadFailed,
+                        )
+                        .await?;
+                    }
+                    return Err(e);
                 }
             }
         };
@@ -613,6 +625,28 @@ impl Jobs {
                 self.refresh_output(job, fence, lost).await
             }
             _ => Ok(job),
+        }
+    }
+
+    /// The job as the provider reports it now, observed and settled.
+    async fn refresh_upstream(
+        &self,
+        job: &JobRow,
+        observer: store::Observer<'_>,
+    ) -> JobResult<JobRow> {
+        match self.target(job).await {
+            // Marked since `job` was read: the only `InvalidUpstream` of
+            // `target`.
+            Err(InferenceError::InvalidUpstream) => {
+                let now = store::reload(&self.store, job.id).await?;
+                self.settle_reused(now, observer).await
+            }
+            Err(e) => Err(e.into()),
+            Ok((target, adapter)) => {
+                let upstream_id = job.upstream().ok_or(InferenceError::Storage)?;
+                let upstream = call(adapter.retrieve_video(&target, &upstream_id)).await?;
+                self.apply_video(job, &upstream, observer).await
+            }
         }
     }
 
@@ -657,12 +691,14 @@ impl Jobs {
     ) -> JobResult<ContentStream> {
         let job = self.own_video(principal, id).await?;
         // A job marked `upstream_id_reused` reads failed (`render`).
+        // So does one whose output is still awaited (in progress).
         if job.job_state() != JobState::Completed
+            || job.output_pending
             || job.error_code.as_deref() == Some(super::UPSTREAM_ID_REUSED)
         {
             return Err(JobError::Conflict(
                 "video_not_ready",
-                "Video content is available once the video is completed",
+                super::video_output::NOT_READY,
             ));
         }
         if asset == VideoAsset::Video {
