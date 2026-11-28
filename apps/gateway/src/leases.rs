@@ -329,7 +329,9 @@ impl Leases {
     }
 }
 
-/// The renewal task of [`Leases::start`].
+/// The renewal task of [`Leases::start`]. Dropping it stops renewing, so
+/// the terms end within one term: keep it until [`Renewal::stop`].
+#[must_use = "dropping the handle stops renewing the leases"]
 pub struct Renewal {
     task: tokio::task::JoinHandle<()>,
     stop: tokio::sync::watch::Sender<bool>,
