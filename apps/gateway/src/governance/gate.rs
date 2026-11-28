@@ -139,11 +139,17 @@ impl FairGate {
     /// Give back a permit of `workspace`, and hand freed permits to waiters.
     fn release(&self, workspace: Uuid) {
         let mut state = self.lock();
-        state.update(workspace, |s| {
-            debug_assert!(s.held > 0, "a released permit was held");
+        let held = state.update(workspace, |s| {
+            let held = s.held > 0;
             s.held = s.held.saturating_sub(1);
+            held
         });
-        state.free += 1;
+        // Every release ends one held permit; one with nothing held would
+        // add a permit the gate never had, so it adds none.
+        debug_assert!(held, "a released permit was held");
+        if held {
+            state.free += 1;
+        }
         state.dispatch();
     }
 

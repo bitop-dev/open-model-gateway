@@ -304,7 +304,10 @@ async fn permits_are_conserved_under_cancellation_and_deadlines() {
             tasks.push(tokio::spawn(async move {
                 let deadline = Instant::now() + Duration::from_micros(mix % 3000);
                 let work = async {
-                    if let Some(permit) = gate.acquire(workspace, deadline).await {
+                    if let Some(_permit) = gate.acquire(workspace, deadline).await {
+                        // Declared after the permit, so it is counted out
+                        // before the permit is given back, also when the
+                        // task is cancelled.
                         let now = holding.fetch_add(1, Ordering::SeqCst) + 1;
                         let _held = Holding(holding.clone());
                         most.fetch_max(now, Ordering::SeqCst);
@@ -313,7 +316,6 @@ async fn permits_are_conserved_under_cancellation_and_deadlines() {
                         } else {
                             tokio::time::sleep(Duration::from_micros(mix % 500)).await;
                         }
-                        drop(permit);
                     }
                 };
                 if mix % 4 == 0 {
