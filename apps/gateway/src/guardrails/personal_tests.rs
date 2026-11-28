@@ -1,0 +1,833 @@
+//! #841: the personal-data kinds. Positives are synthetic or published test
+//! values (issuer test cards, the IBAN registry's examples, public resolver
+//! addresses), never real data. The negative corpus measures false positives:
+//! seeded, deterministic corpora (UUIDs, digests, base64, JWT shapes, numeric
+//! text, digit runs) with asserted bounds per kind, and this repository's own
+//! source and docs, measured and reported with no bound (an address added to
+//! a doc never fails a build).
+use super::*;
+use crate::guardrails::detector::Part;
+
+fn found(text: &str) -> Vec<(Kind, String)> {
+    let mut input = Inspection::default();
+    input.push(text, Part::Content);
+    let f = findings(&input);
+    f.0.iter()
+        .map(|x| (x.kind.unwrap(), text[x.span.clone()].to_owned()))
+        .collect()
+}
+fn kinds_in(text: &str) -> Vec<Kind> {
+    found(text).into_iter().map(|(k, _)| k).collect()
+}
+/// What a failed assertion reports: each finding's kind and length, never
+/// the matched text or the text scanned (this module writes neither
+/// anywhere, its tests' messages included). `#[track_caller]` on the
+/// helpers names the case's line.
+fn shape(text: &str) -> Vec<(Kind, usize)> {
+    found(text).into_iter().map(|(k, v)| (k, v.len())).collect()
+}
+#[track_caller]
+fn hit(kind: Kind, value: &str) {
+    for (case, text) in [
+        value.to_owned(),
+        format!("see {value} here"),
+        format!("\"{value}\","),
+        format!("({value})"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert!(
+            found(text) == [(kind, value.to_owned())],
+            "{kind:?}: surrounding {case} of a {}-byte value found {:?}",
+            value.len(),
+            shape(text)
+        );
+    }
+}
+#[track_caller]
+fn miss(kind: Kind, text: &str) {
+    assert!(
+        !kinds_in(text).contains(&kind),
+        "{kind:?} must not match this {}-byte text; found {:?}",
+        text.len(),
+        shape(text)
+    );
+}
+
+#[test]
+fn the_kind_table_matches_the_migration() {
+    // Migration 0099's list of kinds (rules and events) is this table's.
+    let sql = include_str!("../../enterprise_migrations/0099_guardrail_personal_data_kinds.sql");
+    let list = format!(
+        "ARRAY[{}]",
+        Kind::ALL
+            .iter()
+            .map(|k| format!("'{}'", k.as_str()))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    assert!(sql.contains(&list), "rules list: {list}");
+    let events = format!(
+        "kind IN ({})",
+        Kind::ALL
+            .iter()
+            .map(|k| format!("'{}'", k.as_str()))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    assert!(sql.contains(&events), "events list: {events}");
+    assert_eq!(KINDS.len(), Kind::ALL.len());
+    for k in Kind::ALL {
+        assert_eq!(def(*k).kind, *k);
+        assert!(!def(*k).matches.is_empty() && !def(*k).label.is_empty());
+    }
+}
+
+/// `text` holds `value` as a `kind` finding (among others it may hold).
+#[track_caller]
+fn holds(kind: Kind, text: &str, value: &str) {
+    assert!(
+        found(text).contains(&(kind, value.to_owned())),
+        "{kind:?}: a {}-byte value not found in this {}-byte text; found {:?}",
+        value.len(),
+        text.len(),
+        shape(text)
+    );
+}
+
+#[test]
+fn the_dashboard_says_what_each_kind_matches_in_the_same_words() {
+    let ts = include_str!("../../../web/src/lib/guardrails.ts");
+    for d in KINDS {
+        assert!(
+            ts.contains(&format!("\"{}\"", d.matches)),
+            "{:?}: {}",
+            d.kind,
+            d.matches
+        );
+    }
+}
+
+#[test]
+fn values_next_to_other_text_are_still_found() {
+    holds(
+        Kind::Card,
+        "4111 1111 1111 1111 12/27",
+        "4111 1111 1111 1111",
+    );
+    holds(Kind::Card, "4242 4242 4242 4242 123", "4242 4242 4242 4242");
+    holds(Kind::Card, "4111111111111111 12/27", "4111111111111111");
+    holds(Kind::Card, "2 4111 1111 1111 1111", "4111 1111 1111 1111");
+    holds(
+        Kind::Phone,
+        "+44 20 7946 0958. 3 people",
+        "+44 20 7946 0958",
+    );
+    holds(Kind::Phone, "call 1-415-555-2671", "1-415-555-2671");
+    holds(Kind::Phone, "or 1.415.555.2671", "1.415.555.2671");
+    holds(
+        Kind::Iban,
+        "BE68 5390 0754 7034 SWIFT",
+        "BE68 5390 0754 7034",
+    );
+    holds(
+        Kind::Iban,
+        "ES91 2100 0418 4502 0005 1332 BIC CAIXESBBXXX",
+        "ES91 2100 0418 4502 0005 1332",
+    );
+    holds(
+        Kind::Iban,
+        "de89 3704 0044 0532 0130 00",
+        "de89 3704 0044 0532 0130 00",
+    );
+    holds(Kind::Ip, "ip:8.8.8.8", "8.8.8.8");
+    holds(Kind::Ip, "X-Forwarded-For:8.8.4.4", "8.8.4.4");
+    holds(Kind::Ip, "client ::ffff:8.8.8.8 connected", "8.8.8.8");
+    holds(
+        Kind::Ip,
+        "2001:4860:4860::8888: down",
+        "2001:4860:4860::8888",
+    );
+    holds(
+        Kind::Email,
+        "andré.dupont@gmail.com",
+        "andré.dupont@gmail.com",
+    );
+    holds(
+        Kind::Email,
+        "write to alice@acme.com: now",
+        "alice@acme.com",
+    );
+    holds(Kind::Email, "user@gmail.com:hunter2", "user@gmail.com");
+    holds(Kind::Email, "请联系alice@acme.io", "alice@acme.io");
+    holds(
+        Kind::Card,
+        "Order 12345 4111 1111 1111 1111",
+        "4111 1111 1111 1111",
+    );
+    holds(Kind::Card, "12345 4111111111111111", "4111111111111111");
+    holds(Kind::Ip, "ip:2606:4700::1111", "2606:4700::1111");
+    holds(
+        Kind::Ip,
+        "X-Forwarded-For:2001:4860:4860::8888",
+        "2001:4860:4860::8888",
+    );
+    holds(Kind::Ip, "id:2606:4700::1111", "2606:4700::1111");
+    // A card after a date, a table row or an order line: each later group
+    // of the candidate is a start.
+    for text in [
+        "2024-01-15 4111111111111111 $12.00",
+        "12 34 56 78 4111111111111111",
+        "order 778812 qty 2 on 2026-11-27 4111111111111111",
+    ] {
+        holds(Kind::Card, text, "4111111111111111");
+    }
+    holds(
+        Kind::Card,
+        "10 20 30 40 50 4111 1111 1111 1111",
+        "4111 1111 1111 1111",
+    );
+    // An IBAN after a token that reads as its start.
+    for (text, iban) in [
+        (
+            "Ref12 DE89 3704 0044 0532 0130 00",
+            "DE89 3704 0044 0532 0130 00",
+        ),
+        (
+            "FY24 DE89 3704 0044 0532 0130 00",
+            "DE89 3704 0044 0532 0130 00",
+        ),
+        (
+            "ID99 GB82 WEST 1234 5698 7654 32",
+            "GB82 WEST 1234 5698 7654 32",
+        ),
+    ] {
+        holds(Kind::Iban, text, iban);
+    }
+}
+
+#[test]
+fn a_letter_underscore_or_punctuation_beside_a_checksummed_value_does_not_hide_it() {
+    for text in [
+        "x4111111111111111",
+        "id_4111111111111111",
+        "ref-4111111111111111",
+        "4111111111111111_x",
+        "card:4111111111111111.",
+    ] {
+        holds(Kind::Card, text, "4111111111111111");
+    }
+    holds(Kind::Card, "cc-4111-1111-1111-1111", "4111-1111-1111-1111");
+    holds(
+        Kind::Iban,
+        "refDE89370400440532013000",
+        "DE89370400440532013000",
+    );
+    holds(
+        Kind::Iban,
+        "IDDE89370400440532013000",
+        "DE89370400440532013000",
+    );
+    holds(
+        Kind::Iban,
+        "_DE89370400440532013000.",
+        "DE89370400440532013000",
+    );
+    // After a token shaped like an IBAN's start, glued or spaced.
+    for text in [
+        "ab12DE89370400440532013000",
+        "REF2024DE89370400440532013000",
+        "Konto01DE89370400440532013000",
+        "AB12 xDE89370400440532013000",
+        "GB82WEST12345698765432DE89370400440532013000",
+    ] {
+        holds(Kind::Iban, text, "DE89370400440532013000");
+    }
+    holds(
+        Kind::Iban,
+        "ab12DE89 3704 0044 0532 0130 00",
+        "DE89 3704 0044 0532 0130 00",
+    );
+    // After a `+`, a card is a phone number only when it reads as one.
+    for text in [
+        "+4111111111111111",
+        "+4111111111111111,12/25,123",
+        "-4000000000000002\n+4111111111111111",
+    ] {
+        holds(Kind::Card, text, "4111111111111111");
+    }
+    holds(Kind::Card, "+4111-1111-1111-1111", "4111-1111-1111-1111");
+    holds(Kind::Card, "+4111 1111 1111 1111", "4111 1111 1111 1111");
+    // An address: leading dots and characters beyond the 64 a local part
+    // holds are trimmed; a `:` after it is an SSH remote only when what
+    // follows is a repository path.
+    holds(Kind::Email, ".alice@acme.com", "alice@acme.com");
+    holds(Kind::Email, "...alice@acme.com", "alice@acme.com");
+    let long = format!("{}alice@acme.com", "a".repeat(65));
+    holds(
+        Kind::Email,
+        &long,
+        &long[long.len() - "@acme.com".len() - 64..],
+    );
+    holds(Kind::Email, "alice@acme.com:x/y", "alice@acme.com");
+    holds(Kind::Email, "alice@acme.com:8080", "alice@acme.com");
+}
+
+#[test]
+fn a_scan_out_of_budget_keeps_what_it_found_and_says_so() {
+    let mut input = Inspection::default();
+    input.push("a@acme.io b@acme.io c@acme.io d@acme.io", Part::Content);
+    // One step for the segment, two candidates, then out.
+    let (found, spent) = findings_of(&input, Kind::Email, &Budget::steps(3));
+    assert!(spent);
+    assert_eq!(found.0.len(), 2);
+    let (found, spent) = findings_of(&input, Kind::Email, &Budget::steps(100));
+    assert!(!spent);
+    assert_eq!(found.0.len(), 4);
+    let (found, spent) = findings_of(&input, Kind::Email, &Budget::steps(0));
+    assert!(spent && found.0.is_empty());
+}
+
+/// What design §14 says still evades, and what it says matches although it
+/// may not be personal data: kept true by these.
+#[test]
+fn what_is_documented_as_evading_or_matching_holds() {
+    holds(Kind::Phone, "tel:+1 415 555 2671", "+1 415 555 2671");
+    holds(Kind::Ip, "ip:8.8.8.8", "8.8.8.8");
+    miss(Kind::Phone, "x415-555-2671");
+    miss(Kind::Phone, "415 555 2671");
+    miss(Kind::UsSsn, "ssn_512-34-5678");
+    miss(Kind::UsSsn, "id-512-34-5678");
+    miss(Kind::Ip, "ip_8.8.8.8");
+    holds(Kind::Ip, "4.0.0.0", "4.0.0.0");
+    holds(Kind::Card, "4242 4242 4242 4242", "4242 4242 4242 4242");
+    holds(
+        Kind::Iban,
+        "GB82 WEST 1234 5698 7654 32",
+        "GB82 WEST 1234 5698 7654 32",
+    );
+    holds(Kind::Phone, "+1712345678", "+1712345678");
+    holds(Kind::Email, "a@b.zip", "a@b.zip");
+    holds(Kind::Phone, "00000010: 0012 34 5678", "0012 34 5678");
+    miss(Kind::Ip, "ab:cd:2606:4700::1111");
+    miss(Kind::Email, "alice@acme.com-");
+    miss(Kind::Phone, "0049 1234 5678");
+    miss(Kind::Phone, "Tel: 1 0044 20 7946 0958");
+    miss(Kind::Card, "deadbeefdeadbeef4111111111111111");
+    // A grouped card beside hex characters is still a card: a digest has no
+    // separators.
+    holds(
+        Kind::Card,
+        "deadbeefcafe4111-1111-1111-1111",
+        "4111-1111-1111-1111",
+    );
+}
+
+#[test]
+fn one_kind_never_hides_or_crowds_out_another() {
+    // A value two kinds match counts for both.
+    holds(Kind::Card, "4111111111111111@pay.io", "4111111111111111");
+    holds(
+        Kind::Email,
+        "4111111111111111@pay.io",
+        "4111111111111111@pay.io",
+    );
+    // Each kind has its own cap: a request full of one kind's values still
+    // has the other kinds' found.
+    let text = format!(
+        "{}4111 1111 1111 1111",
+        "x@acme.io ".repeat(MAX_FINDINGS + 5)
+    );
+    let mut input = Inspection::default();
+    input.push(&text, Part::Content);
+    let f = findings(&input);
+    assert_eq!(f.distinct_kind(&input, Kind::Card), 1);
+    // A repeated value counts once and takes no room from distinct ones.
+    assert_eq!(
+        f.0.iter().filter(|x| x.kind == Some(Kind::Email)).count(),
+        1
+    );
+    let many = format!(
+        "{}{}",
+        "x@acme.io ".repeat(MAX_FINDINGS + 5),
+        (0..50)
+            .map(|i| format!("u{i}@acme.io "))
+            .collect::<String>()
+    );
+    let mut input = Inspection::default();
+    input.push(&many, Part::Content);
+    assert_eq!(findings(&input).distinct_kind(&input, Kind::Email), 51);
+    // At the cap: more distinct addresses than a kind keeps, then a card.
+    // Email stops at its cap; the card is still found.
+    let full = format!(
+        "{}4111 1111 1111 1111",
+        (0..MAX_FINDINGS + 50)
+            .map(|i| format!("u{i}@acme.io "))
+            .collect::<String>()
+    );
+    let mut input = Inspection::default();
+    input.push(&full, Part::Content);
+    let f = findings(&input);
+    assert_eq!(f.distinct_kind(&input, Kind::Email), MAX_FINDINGS);
+    assert_eq!(f.distinct_kind(&input, Kind::Card), 1);
+}
+
+#[test]
+fn emails() {
+    hit(Kind::Email, "alice.smith@acme-corp.io");
+    hit(Kind::Email, "a+tag@mail.co.uk");
+    for text in [
+        "user@example.com",
+        "ops@sub.example.org",
+        "x@service.test",
+        "x@host.invalid",
+        "x@app.localhost",
+        "left-pad@1.3.0",
+        "@types/node",
+        "git@github.com:acme/repo.git",
+        "git@github.com:acme/repo",
+        "deploy@build.acme.io:infra.git",
+        "nginx@sha256:abc",
+        "a..b@acme.io",
+        "logo@2x.png",
+        "icon@3x.png",
+        "spinner@2x.svg",
+    ] {
+        miss(Kind::Email, text);
+    }
+}
+
+#[test]
+fn phones() {
+    hit(Kind::Phone, "+1 415 555 2671");
+    hit(Kind::Phone, "0044 20 7946 0958");
+    hit(Kind::Phone, "0049 30 1234567");
+    hit(Kind::Phone, "+44 20 7946 0958");
+    hit(Kind::Phone, "+4915112345678");
+    hit(Kind::Phone, "(415) 555-2671");
+    hit(Kind::Phone, "415-555-2671");
+    hit(Kind::Phone, "415.555.2671");
+    for text in [
+        "555-0123",
+        "415-555-0123",
+        "(415) 555-0199",
+        "2026-11-27",
+        "415-555.2671",
+        "+1 234",
+        "call +12  345 678 90",
+        "id 1415-555-2671",
+        "123-456-7890",
+        "+2026-11-27",
+        "+20240101",
+        "512 256 1024",
+        "415 555 2671",
+        "00441234567890",
+        "0012345678",
+        "00123456789",
+        "0090012345",
+        "+2026-11-27 10:00:00",
+        "+20261127 10:00",
+        "+2026.11.27 1",
+        "DE89 3704 0044 0532 0130 00",
+    ] {
+        miss(Kind::Phone, text);
+    }
+}
+
+#[test]
+fn cards() {
+    hit(Kind::Card, "4111 1111 1111 1111");
+    hit(Kind::Card, "5555555555554444");
+    hit(Kind::Card, "3782 822463 10005");
+    hit(Kind::Card, "6011-1111-1111-1117");
+    // Maestro and Mir.
+    hit(Kind::Card, "6759649826438453");
+    hit(Kind::Card, "2200000000000004");
+    for text in [
+        "4111111111111112",
+        "1234567890123456",
+        "4111-1111 1111-1111",
+        "41111 1111 1111 111",
+        "94111111111111111",
+        "41111111111111110",
+        // A digest's digits are no card, however they read.
+        "0a1b4111111111111111c2d3e4f5a6b7c8d9e0f1",
+    ] {
+        miss(Kind::Card, text);
+    }
+}
+
+#[test]
+fn ibans() {
+    hit(Kind::Iban, "DE89 3704 0044 0532 0130 00");
+    hit(Kind::Iban, "GB82WEST12345698765432");
+    hit(Kind::Iban, "FR1420041010050500013M02606");
+    for text in [
+        "DE89 3704 0044 0532 0130 01",
+        "XX89370400440532013000",
+        "DE8937040044053201300",
+        "DE89 370 40044 0532 0130 00",
+        "DE89370400440532013000X",
+        "DE893704004405320130001",
+    ] {
+        miss(Kind::Iban, text);
+    }
+}
+
+#[test]
+fn us_ssns() {
+    hit(Kind::UsSsn, "512-34-5678");
+    for text in [
+        "512 34 5678",
+        "128 64 2048",
+        "000-12-3456",
+        "666-12-3456",
+        "912-34-5678",
+        "512-00-5678",
+        "512-34-0000",
+        "078-05-1120",
+        "219-09-9999",
+        "512-34 5678",
+        "512345678",
+        "1512-34-5678",
+        "512-34-56789",
+    ] {
+        miss(Kind::UsSsn, text);
+    }
+}
+
+#[test]
+fn ips_are_public_addresses_only() {
+    hit(Kind::Ip, "8.8.8.8");
+    hit(Kind::Ip, "1.1.1.1");
+    hit(Kind::Ip, "2606:4700:4700::1111");
+    assert_eq!(
+        kinds_in("dial 8.8.8.8:53 or 1.1.1.1/32"),
+        [Kind::Ip, Kind::Ip]
+    );
+    for text in [
+        "10.0.0.1",
+        "127.0.0.1",
+        "192.168.1.1",
+        "172.16.0.1",
+        "169.254.1.1",
+        "100.64.0.1",
+        "198.18.0.1",
+        "192.0.2.1",
+        "198.51.100.7",
+        "203.0.113.9",
+        "224.0.0.1",
+        "255.255.255.255",
+        "0.0.0.0",
+        "::1",
+        "::",
+        "fe80::1",
+        "fd00::1",
+        "ff02::1",
+        "2001:db8::1",
+        "3fff::1",
+        "3fff:0fff::1",
+        "2002:c000:0204::1",
+        "v8.8.8.8",
+        "8.8.8.8.5",
+        "8.8.8.8-rc1",
+        "300.1.1.1",
+        "08.8.8.8",
+        "std::io::Error",
+        "12:30:45",
+        "dead::beef",
+    ] {
+        miss(Kind::Ip, text);
+    }
+}
+
+#[test]
+fn a_value_counts_once_and_kinds_do_not_overlap() {
+    let mut input = Inspection::default();
+    input.push("8.8.8.8 and 8.8.8.8, mail alice@acme.io", Part::Content);
+    input.push("alice@acme.io again", Part::Content);
+    let f = findings(&input);
+    assert_eq!(f.distinct_kind(&input, Kind::Ip), 1);
+    assert_eq!(f.distinct_kind(&input, Kind::Email), 1);
+    assert_eq!(f.distinct_kind(&input, Kind::Card), 0);
+}
+
+// --- False positives ---------------------------------------------------------------
+
+/// A deterministic generator (xorshift64*), so the corpora are the same on
+/// every run.
+struct Seeded(u64);
+impl Seeded {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+    fn bytes(&mut self, n: usize) -> Vec<u8> {
+        (0..n).map(|_| self.next() as u8).collect()
+    }
+}
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+fn b64(b: &[u8], url: bool) -> String {
+    use base64::Engine;
+    if url {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+    } else {
+        base64::engine::general_purpose::STANDARD.encode(b)
+    }
+}
+
+/// The seeded corpora: (name, items).
+fn seeded() -> Vec<(&'static str, Vec<String>)> {
+    let mut r = Seeded(0x0841_0841_0841_0841);
+    let uuids = (0..20_000)
+        .map(|_| {
+            let h = hex(&r.bytes(16));
+            format!(
+                "{}-{}-4{}-a{}-{}",
+                &h[..8],
+                &h[8..12],
+                &h[13..16],
+                &h[17..20],
+                &h[20..32]
+            )
+        })
+        .collect();
+    let digests = (0..10_000)
+        .map(|i| hex(&r.bytes([20, 32, 64][i % 3])))
+        .collect();
+    let base64 = (0..10_000)
+        .map(|i| b64(&r.bytes(12 + (i % 48)), i % 2 == 0))
+        .collect();
+    let jwts = (0..2_000)
+        .map(|_| {
+            format!(
+                "eyJ{}.eyJ{}.{}",
+                b64(&r.bytes(18), true),
+                b64(&r.bytes(60), true),
+                b64(&r.bytes(32), true)
+            )
+        })
+        .collect();
+    let mut numeric = Vec::new();
+    for _ in 0..2_000 {
+        let s = 1_600_000_000 + r.below(200_000_000);
+        numeric.push(format!("{s}"));
+        numeric.push(format!("{}", s * 1000 + r.below(1000)));
+        numeric.push(format!(
+            "2026-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            1 + r.below(12),
+            1 + r.below(28),
+            r.below(24),
+            r.below(60),
+            r.below(60),
+            r.below(1000)
+        ));
+        numeric.push(format!("{}.{}.{}", r.below(30), r.below(40), r.below(200)));
+        numeric.push(format!("{}.{:02} USD", r.below(1_000_000), r.below(100)));
+        numeric.push(format!(
+            "ports {},{},{}",
+            1024 + r.below(60000),
+            1024 + r.below(60000),
+            1024 + r.below(60000)
+        ));
+        numeric.push(format!(
+            "src/main.rs:{}:{}",
+            1 + r.below(5000),
+            1 + r.below(120)
+        ));
+        numeric.push(format!(
+            "HTTP/1.1 {} in {} ms",
+            200 + r.below(400),
+            r.below(100000)
+        ));
+        // Added lines of a diff: a date, a compact date, a diffstat.
+        numeric.push(format!(
+            "+{}-{:02}-{:02}",
+            1990 + r.below(60),
+            1 + r.below(12),
+            1 + r.below(28)
+        ));
+        numeric.push(format!(
+            "+{}{:02}{:02}",
+            1990 + r.below(60),
+            1 + r.below(12),
+            1 + r.below(28)
+        ));
+        numeric.push(format!("+{} -{}", r.below(5000), r.below(5000)));
+        numeric.push(format!(
+            "+{}-{:02}-{:02} {:02}:{:02}",
+            1990 + r.below(60),
+            1 + r.below(12),
+            1 + r.below(28),
+            r.below(24),
+            r.below(60)
+        ));
+    }
+    let digit_runs = (0..10_000)
+        .map(|_| {
+            let n = 13 + r.below(7) as usize;
+            (0..n)
+                .map(|i| {
+                    char::from(b'0' + (if i == 0 { 1 + r.below(9) } else { r.below(10) }) as u8)
+                })
+                .collect()
+        })
+        .collect();
+    // Tables of four-digit numbers (a dated row of four, a row of twelve):
+    // four groups of four are exactly how a card is written, so some rows
+    // read as one.
+    let mut tables = Vec::new();
+    for _ in 0..5_000 {
+        let four = |r: &mut Seeded| format!("{:04}", r.below(10_000));
+        tables.push(format!(
+            "{}-{:02}-{:02} {} {} {} {}",
+            1990 + r.below(60),
+            1 + r.below(12),
+            1 + r.below(28),
+            four(&mut r),
+            four(&mut r),
+            four(&mut r),
+            four(&mut r)
+        ));
+        tables.push((0..12).map(|_| four(&mut r)).collect::<Vec<_>>().join(" "));
+    }
+    vec![
+        ("uuids", uuids),
+        ("hex digests", digests),
+        ("base64", base64),
+        ("jwt shapes", jwts),
+        ("numeric text", numeric),
+        ("digit runs (13-19 digits)", digit_runs),
+        ("four-digit tables", tables),
+    ]
+}
+
+/// Findings per kind in `items` (each item a segment of its own).
+fn measure(items: &[String]) -> std::collections::BTreeMap<Kind, usize> {
+    let mut by = std::collections::BTreeMap::new();
+    for chunk in items.chunks(500) {
+        let mut input = Inspection::default();
+        for item in chunk {
+            input.push(item, Part::Content);
+        }
+        for f in findings(&input).0 {
+            *by.entry(f.kind.unwrap()).or_insert(0) += 1;
+        }
+    }
+    by
+}
+
+/// The asserted bounds: false positives per 10,000 items, per kind and
+/// corpus. Zero everywhere except card numbers among random digit runs,
+/// where an issuer prefix at an issued length and a valid check digit happen
+/// by chance (measured 165 in 10,000, Maestro's short prefixes included),
+/// and in tables of four-digit numbers, whose rows of four groups of four
+/// are written as cards are (measured 1,460 in 10,000).
+fn bound(corpus: &str, kind: Kind) -> usize {
+    match (corpus, kind) {
+        ("digit runs (13-19 digits)", Kind::Card) => 200,
+        ("four-digit tables", Kind::Card) => 1_600,
+        _ => 0,
+    }
+}
+
+#[test]
+fn false_positives_stay_within_their_bounds_on_the_seeded_corpora() {
+    let mut report = String::from(
+        "corpus | items | email | phone | card | iban | us_ssn | ip (per 10k items)\n",
+    );
+    let mut over = Vec::new();
+    for (name, items) in seeded() {
+        let by = measure(&items);
+        let per = |k: Kind| by.get(&k).copied().unwrap_or(0) * 10_000 / items.len().max(1);
+        report.push_str(&format!(
+            "{name} | {} | {} | {} | {} | {} | {} | {}\n",
+            items.len(),
+            per(Kind::Email),
+            per(Kind::Phone),
+            per(Kind::Card),
+            per(Kind::Iban),
+            per(Kind::UsSsn),
+            per(Kind::Ip)
+        ));
+        for k in Kind::ALL {
+            if per(*k) > bound(name, *k) {
+                over.push(format!(
+                    "{name}: {k:?} {} per 10k > {}",
+                    per(*k),
+                    bound(name, *k)
+                ));
+            }
+        }
+    }
+    eprintln!("{report}");
+    assert!(over.is_empty(), "{over:?}\n{report}");
+}
+
+/// This repository's source and docs, measured and reported (per MB), never
+/// bounded: real text where an example address or a version string may
+/// appear at any time. Report only, and ignored: it reads about 20 MB and
+/// needs the whole tree (docs/guardrails-design.md §14 has the command).
+#[test]
+#[ignore = "report only: reads the repository's source and docs"]
+fn the_repository_source_and_docs_are_measured() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut sources = Vec::new();
+    for (dir, exts) in [
+        ("apps/gateway/src", &["rs"][..]),
+        ("apps/web/src", &["ts", "tsx"][..]),
+        ("docs", &["md"][..]),
+    ] {
+        let mut stack = vec![root.join(dir)];
+        while let Some(d) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .is_some_and(|x| exts.contains(&x))
+                    && let Ok(text) = std::fs::read_to_string(&p)
+                {
+                    sources.push((dir, text));
+                }
+            }
+        }
+    }
+    let mut report =
+        String::from("source | MB | email | phone | card | iban | us_ssn | ip (findings per MB)\n");
+    for dir in ["apps/gateway/src", "apps/web/src", "docs"] {
+        let texts: Vec<String> = sources
+            .iter()
+            .filter(|(d, _)| *d == dir)
+            .map(|(_, t)| t.clone())
+            .collect();
+        let bytes: usize = texts.iter().map(String::len).sum();
+        let by = measure(&texts);
+        let mb = bytes as f64 / 1_000_000.0;
+        let per = |k: Kind| by.get(&k).copied().unwrap_or(0) as f64 / mb.max(0.001);
+        report.push_str(&format!(
+            "{dir} | {mb:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1}\n",
+            per(Kind::Email),
+            per(Kind::Phone),
+            per(Kind::Card),
+            per(Kind::Iban),
+            per(Kind::UsSsn),
+            per(Kind::Ip)
+        ));
+        assert!(bytes > 0, "{dir} read");
+    }
+    eprintln!("{report}");
+}

@@ -20,6 +20,17 @@ pub fn rule_json(id: Uuid, entry: &Entry, show_patterns: bool) -> Value {
             if show_patterns {
                 detector["patterns"] = json!(r.detector.patterns);
             }
+            // The kinds a personal-data rule looks for: configuration every
+            // reader of the rule may see (labels, never patterns or text).
+            if !r.detector.kinds.is_empty() {
+                detector["kinds"] = json!(
+                    r.detector
+                        .kinds
+                        .iter()
+                        .map(|k| k.as_str())
+                        .collect::<Vec<_>>()
+                );
+            }
             json!({
                 "id": id,
                 "name": r.name,

@@ -446,7 +446,8 @@ async fn put_type_guardrails(
 /// after the management transaction committed (a month-wide aggregate never
 /// runs while the installation row is held). Totals only, never request
 /// detail, so also for a personal workspace; never of what its owner chose:
-/// its local layer's rules, or a platform rule its owner tightened.
+/// its local layer's rules, or a platform rule its owner tightened, and
+/// never per personal-data kind (`kind` is null).
 /// `findings` sums the distinct matches of decisions that found something.
 async fn with_totals(s: &Store, ws: Uuid, mut v: Value) -> Result<Value> {
     let owner_visible = v["kind"] != "personal";
@@ -461,8 +462,13 @@ async fn with_totals(s: &Store, ws: Uuid, mut v: Value) -> Result<Value> {
                 "Management storage unavailable",
             )
         })?;
-    let totals: Vec<(String, String, i64, i64)> = sqlx::query_as(
-        "SELECT action,category,count(*),coalesce(sum(count) FILTER(WHERE action IN('monitored','redacted','blocked','stopped')),0)::bigint FROM guardrail_events WHERE workspace_id=$1 AND created_at>=$3 AND ($2 OR (layer<>'workspace_local' AND NOT tightened)) GROUP BY action,category ORDER BY action,category",
+    // Per action, category and (for personal data) kind; a personal
+    // workspace's per action and category only, without kind: platform
+    // staff see its totals, not which kinds of personal data its owner sent,
+    // nor how many (a rule's decision on one request counts once, however
+    // many kinds it found).
+    let totals: Vec<(String, String, Option<String>, i64, i64)> = sqlx::query_as(
+        "SELECT action,category,CASE WHEN $2 THEN kind END AS k,CASE WHEN $2 THEN count(*) ELSE count(DISTINCT (root_request_id,rule_id,stage)) END,coalesce(sum(count) FILTER(WHERE action IN('monitored','redacted','blocked','stopped')),0)::bigint FROM guardrail_events WHERE workspace_id=$1 AND created_at>=$3 AND ($2 OR (layer<>'workspace_local' AND NOT tightened)) GROUP BY action,category,k ORDER BY action,category,k NULLS FIRST",
     )
     .bind(ws)
     .bind(owner_visible)
@@ -471,8 +477,8 @@ async fn with_totals(s: &Store, ws: Uuid, mut v: Value) -> Result<Value> {
     .await?;
     v["decisions_this_month"] = totals
         .into_iter()
-        .map(|(action, category, decisions, findings)| {
-            json!({"action":action,"category":category,"decisions":decisions,"findings":findings})
+        .map(|(action, category, kind, decisions, findings)| {
+            json!({"action":action,"category":category,"kind":kind,"decisions":decisions,"findings":findings})
         })
         .collect();
     Ok(v)

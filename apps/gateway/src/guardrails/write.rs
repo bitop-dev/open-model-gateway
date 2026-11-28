@@ -14,6 +14,8 @@ struct DetectorIn {
     categories: Vec<String>,
     #[serde(default, deserialize_with = "not_null")]
     patterns: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "not_null")]
+    kinds: Option<Vec<String>>,
 }
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -196,6 +198,24 @@ fn needs<T: PartialEq>(allowed: &[T], v: &T) -> Result<(), Refusal> {
     }
 }
 
+/// A personal-data rule's kinds: at least one, each once; no other rule
+/// names any.
+fn kinds_of(
+    listed: Vec<String>,
+    categories: &BTreeSet<Category>,
+) -> Result<BTreeSet<Kind>, Refusal> {
+    let kinds = listed
+        .iter()
+        .map(|k| name_of(Kind::parse, k))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if kinds.len() != listed.len()
+        || categories.contains(&Category::PersonalData) != !kinds.is_empty()
+    {
+        return Err(Refusal::Invalid);
+    }
+    Ok(kinds)
+}
+
 fn parse_rule(e: EntryIn) -> Result<Rule, Refusal> {
     let name = e.name.filter(|n| valid_name(n)).ok_or(Refusal::Invalid)?;
     let protection = name_of(
@@ -268,6 +288,7 @@ fn parse_rule(e: EntryIn) -> Result<Rule, Refusal> {
         // Custom rules carry their patterns; built-in categories carry none.
         return Err(Refusal::Invalid);
     }
+    let kinds = kinds_of(d.kinds.unwrap_or_default(), &categories)?;
     if patterns.len() > MAX_PATTERNS
         || patterns
             .iter()
@@ -286,6 +307,7 @@ fn parse_rule(e: EntryIn) -> Result<Rule, Refusal> {
             kind,
             categories,
             patterns,
+            kinds,
             reference: None,
         },
         input_action,

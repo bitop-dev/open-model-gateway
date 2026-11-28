@@ -95,6 +95,9 @@ impl Drop for Load {
 /// Inputs above this many bytes, and any input a custom pattern scans (its
 /// cost may be any user's), are scanned off the async workers in scan slots.
 const LARGE_INPUT: usize = 64 * 1024;
+/// A personal-data scan costs up to six passes of the input: one above this
+/// many bytes is scanned in a slot too.
+const PERSONAL_INLINE: usize = 4 * 1024;
 
 impl Store {
     /// A workspace's compiled guardrail policy (empty ones too): a cache hit
@@ -239,10 +242,10 @@ impl Store {
             })
             .collect();
         sqlx::query(
-            "INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,streamed,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,tightened,omitted)
-             SELECT id,$2,$3,$4,$5,$6,$16,'input',rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,tightened,omitted
-             FROM unnest($1::uuid[],$7::uuid[],$8::uuid[],$9::bigint[],$10::text[],$11::text[],$12::text[],$13::text[],$14::int[],$15::boolean[],$17::boolean[],$18::int[])
-              AS t(id,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,tightened,omitted)",
+            "INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,streamed,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,tightened,omitted,kind)
+             SELECT id,$2,$3,$4,$5,$6,$16,'input',rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,tightened,omitted,kind
+             FROM unnest($1::uuid[],$7::uuid[],$8::uuid[],$9::bigint[],$10::text[],$11::text[],$12::text[],$13::text[],$14::int[],$15::boolean[],$17::boolean[],$18::int[],$19::text[])
+              AS t(id,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,tightened,omitted,kind)",
         )
         .bind(e.iter().map(|_| Uuid::now_v7()).collect::<Vec<_>>())
         .bind(record.root_request_id)
@@ -266,6 +269,8 @@ impl Store {
         .bind(record.streamed)
         .bind(e.iter().map(|v| v.tightened).collect::<Vec<_>>())
         .bind(omitted)
+        // A personal-data kind's label (never matched text), else null.
+        .bind(e.iter().map(|v| v.kind.map(|k| k.as_str())).collect::<Vec<_>>())
         .execute(&self.pool)
         .await
         .map_err(route_lookup_storage)?;
@@ -381,8 +386,12 @@ impl super::Engine {
             // Off the async workers, in a bounded slot that moves into the
             // scan (held until the scan ends even when the request is
             // dropped). No slot in time: every rule is unavailable.
-            Some(input) if input.len() > LARGE_INPUT || policy.has_custom() => {
-                let slots = if policy.has_local_custom() {
+            Some(input)
+                if input.len() > LARGE_INPUT
+                    || policy.has_custom()
+                    || (policy.has_personal() && input.len() > PERSONAL_INLINE) =>
+            {
+                let slots = if policy.has_local_custom() || policy.has_local_personal() {
                     &LOCAL_SCANS
                 } else {
                     &SHARED_SCANS

@@ -21,6 +21,7 @@ import { ApiError, platformPath, wsPath, type Session } from "../lib/api";
 import { formatUsd } from "../lib/governance";
 import { Money } from "../components/templates/money";
 import { costText, countText, guardrailActionLabels, type GuardrailDecision, dataPolicyOf, finishReasonLabel, jobStateTone, jobText, type JobDetail, latencyText, logPaths, logsSearch, requestFilters, requestQuery, requestStatusLabel, requestStatusTone, requestTarget, servedModel, sessionTarget, timelineStatus, tokensText, tpsText, unresolvedText, workloadText, modalityText, realtimeResponseState, realtimeStatusLabel, type LogsScope, type RealtimeResponse, type RequestAttempt, type RequestDetail, type RequestPage } from "../lib/requests";
+import { kindLabel } from "../lib/guardrails";
 import type { DashboardSearch } from "../lib/permissions";
 import { Button, ErrorNotice, Stack, useAction, useApi } from "../components/ui";
 import { canResolveRealtime, canSettleRealtimeSession, realtimeResolveAction, realtimeSessionAction } from "../lib/realtime-resolution";
@@ -134,7 +135,7 @@ export function GuardrailDecisions({ decisions }: { decisions: GuardrailDecision
   return <Card title="Guardrail decisions" titleAs="h2" description="What each rule decided on the input. Findings count distinct matched values; the matched text is never kept or shown." flush>
     <Table caption="Guardrail decisions" stack columns={["Outcome", "Looked for", "Rule", { label: "Findings", numeric: true }]}>{decisions.map((d, i) => <Tr key={`${d.rule_id}:${d.category}:${i}`}>
       <Td><StatusBadge size="sm" tone={d.action === "blocked" || d.refused ? "danger" : d.action === "monitored" ? "info" : "warning"}>{guardrailActionLabels[d.action] ?? d.action}</StatusBadge>{d.refused && <span className={s.secondary}>Refused the request</span>}</Td>
-      <Td>{categories[d.category] ?? d.category}</Td>
+      <Td>{categories[d.category] ?? d.category}{d.kind ? ` · ${kindLabel(d.kind)}` : ""}</Td>
       <Td><span className={s.primary}>{layers[d.layer] ?? d.layer}</span><span className={s.secondary}>Revision {d.revision} · <code title={d.rule_id}>{shortId(d.rule_id)}</code></span></Td>
       <Td>{d.action === "monitored" || d.action === "blocked" ? d.count : "—"}</Td>
     </Tr>)}</Table>

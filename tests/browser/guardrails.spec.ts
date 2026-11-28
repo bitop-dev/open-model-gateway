@@ -170,6 +170,29 @@ test("a workspace rule blocks a request and the admin pages show the layers", as
     await expect(late).toBeHidden();
     expect((await (await api(alex.page, "GET", local)).json()).local.rules).toEqual([expect.objectContaining({ name: `Late rule ${unique}` })]);
 
+    // #841: a personal-data rule looks only for the kinds ticked (none to
+    // begin with): Block on payment cards refuses a card and lets an email through.
+    await alex.page.getByRole("button", { name: "Add rule" }).click();
+    const pd = alex.page.getByRole("dialog", { name: "Add a rule to this workspace's rules" });
+    await pd.getByRole("textbox", { name: "Name" }).fill(`No cards ${unique}`);
+    await pd.getByRole("combobox", { name: "Looks for" }).selectOption("personal");
+    const boxes = pd.getByRole("checkbox", { name: /^(Email|Phone|Payment card|IBAN|US SSN|IP address):/ });
+    await expect(boxes).toHaveCount(6);
+    for (const box of await boxes.all()) await expect(box).not.toBeChecked();
+    await expect(pd.getByText(/Public IP addresses .*only: never loopback/)).toBeVisible();
+    await pd.getByRole("checkbox", { name: /^Payment card:/ }).check();
+    await pd.getByRole("combobox", { name: "On input" }).selectOption("block");
+    await pd.getByRole("button", { name: "Add rule" }).click();
+    await expect(pd).toBeHidden();
+    await expect(effective.getByText(/Looks for personal data: payment card numbers/)).toBeVisible();
+    const card = await send("charge 4111 1111 1111 1111 please");
+    expect(card.status).toBe(400);
+    expect(JSON.stringify(await card.json())).not.toContain("4111");
+    expect((await send("mail alice.smith@acme-corp.io")).status).toBe(200);
+    const refusedCard = (await (await api(blair.page, "GET", `/workspaces/${ws}/requests?status=blocked&limit=5`)).json()).data[0];
+    await blair.page.goto(`/workspaces/${ws}/requests/${refusedCard.root_request_id}`);
+    await expect(blair.page.getByRole("table", { name: "Guardrail decisions" }).getByText("Personal data · Payment card")).toBeVisible();
+
     // The type defaults: Platform Admins edit them, Auditors read them.
     await operator.page.goto("/admin/settings/guardrails");
     await expect(operator.page.getByRole("heading", { name: "Guardrails" })).toBeVisible();

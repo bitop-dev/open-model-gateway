@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use super::limits::WAIT;
 use super::patterns::{LOCAL_COMPILES, Limit, PLATFORM_COMPILES, in_slot_within};
-use super::policy::{Category, DetectorKind, EffectiveRule, Layer};
+use super::policy::{Category, DetectorKind, EffectiveRule, Kind, Layer};
 use super::secrets::PatternDetector;
 
 /// The compiled detector of one stored rule: `None` when its patterns no
@@ -78,6 +78,7 @@ pub async fn detectors(effective: &[EffectiveRule]) -> Result<HashMap<Uuid, Comp
             continue;
         }
         let categories: Vec<Category> = rule.detector.categories.iter().copied().collect();
+        let kinds: Vec<Kind> = rule.detector.kinds.iter().copied().collect();
         let patterns = rule.detector.patterns.clone();
         let limit = Limit::of(e.layer);
         let slots = if e.layer == Layer::WorkspaceLocal {
@@ -97,7 +98,7 @@ pub async fn detectors(effective: &[EffectiveRule]) -> Result<HashMap<Uuid, Comp
                 in_slot_within(slots, Some(wait), move || {
                     #[cfg(test)]
                     counted(set);
-                    PatternDetector::within(&categories, &patterns, limit).map(Arc::new)
+                    PatternDetector::within(&categories, &kinds, &patterns, limit).map(Arc::new)
                 })
                 .await
                 .ok_or(NoSlot)

@@ -112,7 +112,7 @@ fn found(text: &str) -> usize {
     builtin(&input(text)).0.len()
 }
 fn custom(pattern: &str) -> PatternDetector {
-    PatternDetector::new(&[Category::Custom], &[pattern.to_owned()]).unwrap()
+    PatternDetector::new(&[Category::Custom], &[], &[pattern.to_owned()]).unwrap()
 }
 fn spans(d: &PatternDetector, text: &str) -> Vec<String> {
     let input = input(text);
@@ -326,7 +326,7 @@ fn custom_patterns_match_only_for_their_rule() {
     );
     // A custom-only rule never runs the built-in shapes.
     assert!(spans(&d, &format!("{}_{}", "ghp", alnum(36))).is_empty());
-    assert!(PatternDetector::new(&[Category::Custom], &["(unclosed".to_owned()]).is_none());
+    assert!(PatternDetector::new(&[Category::Custom], &[], &["(unclosed".to_owned()]).is_none());
 }
 
 #[test]
@@ -430,4 +430,43 @@ fn a_scan_keeps_a_bounded_number_of_matches() {
     let out = d.custom_findings(&input(&text), &Budget::steps(u64::MAX));
     assert_eq!(out.findings.0.len(), MAX_FINDINGS);
     assert!(d.has_custom());
+}
+
+#[test]
+fn a_spent_budget_names_the_scan_it_stopped() {
+    use crate::guardrails::detector::{DetectContext, Detector};
+    use crate::guardrails::policy::Kind;
+    let text = "a@acme.io ACME-1 b@acme.io";
+    let input_ = input(text);
+    let inspect = |d: &PatternDetector, budget: &Budget| {
+        let builtin = std::cell::OnceCell::new();
+        let personal = std::cell::RefCell::new(std::collections::HashMap::new());
+        let ctx = DetectContext {
+            budget,
+            builtin: &builtin,
+            personal: &personal,
+        };
+        d.inspect(&ctx, &input_).unwrap()
+    };
+    let pd = PatternDetector::new(&[Category::PersonalData], &[Kind::Email], &[]).unwrap();
+    let out = inspect(&pd, &Budget::steps(0));
+    assert_eq!(out.spent, Some(Category::PersonalData));
+    // Part way: what was found until then still counts.
+    let out = inspect(&pd, &Budget::steps(2));
+    assert_eq!(out.spent, Some(Category::PersonalData));
+    assert_eq!(out.counts, [(Category::PersonalData, Some(Kind::Email), 1)]);
+    let out = inspect(&pd, &Budget::steps(100));
+    assert_eq!(out.spent, None);
+    assert_eq!(out.counts, [(Category::PersonalData, Some(Kind::Email), 2)]);
+    // Custom patterns run first: when they spend the budget, they are named.
+    let both = PatternDetector::new(
+        &[Category::PersonalData, Category::Custom],
+        &[Kind::Email],
+        &["ACME-[0-9]".to_owned()],
+    )
+    .unwrap();
+    assert_eq!(
+        inspect(&both, &Budget::steps(0)).spent,
+        Some(Category::Custom)
+    );
 }

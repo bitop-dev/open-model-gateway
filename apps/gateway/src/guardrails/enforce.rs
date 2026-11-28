@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use super::detector::{Budget, DetectContext, Detector, Findings, Inspection, Part};
 use super::policy::{
-    Category, DetectorKind, EffectiveRule, InactiveReason, InputAction, Layer, OnError,
+    Category, DetectorKind, EffectiveRule, InactiveReason, InputAction, Kind, Layer, OnError,
     Uninspectable, Workload,
 };
 use super::secrets::PatternDetector;
@@ -45,6 +45,10 @@ pub struct CompiledRule {
     /// The rule has custom patterns from a local layer (user-written).
     local_custom: bool,
     custom: bool,
+    /// The rule looks for personal data (its scan's cost is the input's,
+    /// like custom patterns'); `local_personal` when a local layer wrote it.
+    personal: bool,
+    local_personal: bool,
 }
 
 /// A workspace's effective input rules. Empty when nothing applies, which is
@@ -88,6 +92,7 @@ impl Policy {
                     Some(shared) => shared.clone().map(|d| d as std::sync::Arc<dyn Detector>),
                     None => PatternDetector::within(
                         &categories,
+                        &rule.detector.kinds.iter().copied().collect::<Vec<_>>(),
                         &rule.detector.patterns,
                         super::patterns::Limit::of(e.layer),
                     )
@@ -96,6 +101,7 @@ impl Policy {
                 _ => None,
             };
             let custom = !rule.detector.patterns.is_empty();
+            let personal = !rule.detector.kinds.is_empty();
             rules.push(CompiledRule {
                 id: e.id,
                 rule_set_id: e.rule_set_id,
@@ -111,6 +117,8 @@ impl Policy {
                 detector,
                 local_custom: custom && e.layer == Layer::WorkspaceLocal,
                 custom,
+                personal,
+                local_personal: personal && e.layer == Layer::WorkspaceLocal,
             });
         }
         Self { rules }
@@ -137,6 +145,15 @@ impl Policy {
     /// (their scans use their own slots).
     pub fn has_local_custom(&self) -> bool {
         self.rules.iter().any(|r| r.local_custom)
+    }
+    /// Whether any rule looks for personal data.
+    pub fn has_personal(&self) -> bool {
+        self.rules.iter().any(|r| r.personal)
+    }
+    /// Whether a local layer's writer chose a personal-data rule (its scans
+    /// use the local slots, as local custom patterns do).
+    pub fn has_local_personal(&self) -> bool {
+        self.rules.iter().any(|r| r.local_personal)
     }
 }
 
@@ -191,6 +208,8 @@ pub struct Event {
     pub layer: Layer,
     pub detector: DetectorKind,
     pub category: Category,
+    /// The personal-data kind of a personal-data finding; `None` otherwise.
+    pub kind: Option<Kind>,
     pub action: Action,
     pub count: u32,
     /// The decision the client was refused with.
@@ -269,6 +288,7 @@ impl CompiledRule {
             layer: self.layer,
             detector: self.kind,
             category,
+            kind: None,
             action,
             count,
             refused: false,
@@ -339,9 +359,11 @@ impl Policy {
     ) -> Decision {
         let mut decision = Decision::default();
         let builtin: OnceCell<Findings> = OnceCell::new();
+        let personal = std::cell::RefCell::new(std::collections::HashMap::new());
         let ctx = DetectContext {
             budget,
             builtin: &builtin,
+            personal: &personal,
         };
         for r in self
             .rules
@@ -358,12 +380,13 @@ impl Policy {
                     failed(&mut decision, r, r.first(), RefusalKind::DetectorFailed);
                     continue;
                 };
-                if !inspected.complete {
-                    // The budget ran out: the custom patterns gave no verdict
-                    // now (what they found until then still counts below).
-                    failed(&mut decision, r, Category::Custom, RefusalKind::Unavailable);
+                if let Some(category) = inspected.spent {
+                    // The budget ran out: the custom patterns or the
+                    // personal-data scan gave no verdict now (what they
+                    // found until then still counts below).
+                    failed(&mut decision, r, category, RefusalKind::Unavailable);
                 }
-                for (category, count) in inspected.counts {
+                for (category, kind, count) in inspected.counts {
                     if count == 0 {
                         continue;
                     }
@@ -373,7 +396,10 @@ impl Policy {
                         Action::Monitored
                     };
                     let count = u32::try_from(count).unwrap_or(u32::MAX).min(1_000_000);
-                    decision.events.push(r.event(category, action, count));
+                    decision.events.push(Event {
+                        kind,
+                        ..r.event(category, action, count)
+                    });
                     if blocking {
                         refuse(&mut decision, r, RefusalKind::InputBlocked, category);
                     }

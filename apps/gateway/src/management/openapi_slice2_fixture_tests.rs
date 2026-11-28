@@ -4163,6 +4163,31 @@ async fn guardrail_fixtures(
     const PROJECT_TYPE: &str = "/api/v1/platform/workspace-types/project/guardrails";
     let secrets = |action: &str| json!({"name":"Secrets","protection":"secrets","detector":{"kind":"pattern","categories":["secret"]},"input":{"action":action}});
     let custom = |pattern: &str| json!({"name":"Code names","protection":"custom","detector":{"kind":"pattern","categories":["custom"],"patterns":[pattern]},"input":{"action":"block","redact_scope":"user_text"},"output":{"mode":"off"},"threshold":null,"on_error":"fail_open","timeout_ms":null,"workloads":["generation"],"uninspectable":"deny"});
+    // This month's decisions on the Team and the personal workspace, with
+    // and without a personal-data kind, for the totals (#841).
+    for ws in [f.team, f.personal] {
+        let key = Uuid::now_v7();
+        sqlx::query("INSERT INTO api_keys(id,workspace_id,issued_to_user_id,name,secret_hash) VALUES($1,$2,$3,'Guardrail totals key',decode(repeat('cd',32),'hex'))")
+            .bind(key)
+            .bind(ws)
+            .bind(f.owner.user_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        for (category, kind) in [("secret", None), ("personal_data", Some("email"))] {
+            sqlx::query("INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,kind,action,count) VALUES(gen_random_uuid(),gen_random_uuid(),$1,$2,'chat_completions','contract-guardrails','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern',$3,$4,'monitored',1)")
+                .bind(ws)
+                .bind(key)
+                .bind(category)
+                .bind(kind)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
+    // A personal-data rule in every layer written, so every response
+    // location of its kinds is observed (#841).
+    let personal = || json!({"name":"Personal data","protection":"personal_data","detector":{"kind":"pattern","categories":["personal_data"],"kinds":["email","card"]},"input":{"action":"monitor"}});
     let local_team = format!("/api/v1/workspaces/{}/guardrails", f.team);
     let local_project = format!("/api/v1/workspaces/{}/guardrails", f.project);
     let local_personal = format!("/api/v1/workspaces/{}/guardrails", f.personal);
@@ -4205,6 +4230,18 @@ async fn guardrail_fixtures(
                     return true;
                 }
                 continue;
+            }
+            // A personal-data rule names its kinds; no other rule names any.
+            let personal_data = rule
+                .pointer("/detector/categories")
+                .and_then(Value::as_array)
+                .is_some_and(|c| c.iter().any(|v| v == "personal_data"));
+            let kinds = rule
+                .pointer("/detector/kinds")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            if personal_data != (kinds > 0) {
+                return true;
             }
             let custom = rule
                 .pointer("/detector/categories")
@@ -4271,7 +4308,7 @@ async fn guardrail_fixtures(
         let mut o = c.observed.lock().await;
         c.guarded(
             "PUT /platform/workspace-types/{kind}/guardrails",
-            body_vectors_seeded(&mut o, "PUT", "/api/v1/platform/workspace-types/{kind}/guardrails", json!({"local_only":false,"expected":{"rule_set_id":"00000000-0000-4000-8000-000000000000","revision":1},"rules":[secrets("monitor"), custom("PROJECT-[0-9]{4}")]}), &[("/rules/0/id", json!(seeded))], async |body| probe(admin, TEAM_TYPE, body, &none).await),
+            body_vectors_seeded(&mut o, "PUT", "/api/v1/platform/workspace-types/{kind}/guardrails", json!({"local_only":false,"expected":{"rule_set_id":"00000000-0000-4000-8000-000000000000","revision":1},"rules":[secrets("monitor"), custom("PROJECT-[0-9]{4}"), personal()]}), &[("/rules/0/id", json!(seeded))], async |body| probe(admin, TEAM_TYPE, body, &none).await),
         )
         .await;
         c.guarded(
@@ -4280,7 +4317,7 @@ async fn guardrail_fixtures(
                 &mut o,
                 "PUT",
                 "/api/v1/platform/workspaces/{ws}/guardrails",
-                json!({"local_only":true,"expected":{"rule_set_id":"00000000-0000-4000-8000-000000000000","revision":1},"rules":[secrets("block"), custom("acme-[a-z]+")]}),
+                json!({"local_only":true,"expected":{"rule_set_id":"00000000-0000-4000-8000-000000000000","revision":1},"rules":[secrets("block"), custom("acme-[a-z]+"), personal()]}),
                 &[("/rules/0/id", json!(seeded))],
                 async |body| probe(admin, &platform_project, body, &none).await,
             ),
@@ -4295,7 +4332,7 @@ async fn guardrail_fixtures(
             admin,
             "PUT",
             TEAM_TYPE,
-            Some(with_expected(pool, TEAM_TYPE, json!({"local_only":false,"rules":[{"name":"Secrets","protection":"secrets","detector":{"kind":"pattern","categories":["secret"]},"input":{"action":"off"},"on_error":"fail_open"}, custom("PROJECT-[0-9]{4}")]})).await),
+            Some(with_expected(pool, TEAM_TYPE, json!({"local_only":false,"rules":[{"name":"Secrets","protection":"secrets","detector":{"kind":"pattern","categories":["secret"]},"input":{"action":"off"},"on_error":"fail_open"}, custom("PROJECT-[0-9]{4}"), personal()]})).await),
         )
         .await;
     let rules = platform_rules(&team_type["rule_set"]);
@@ -4305,7 +4342,7 @@ async fn guardrail_fixtures(
         let mut o = c.observed.lock().await;
         c.guarded(
             "PUT /workspaces/{ws}/guardrails",
-            body_vectors_seeded(&mut o, "PUT", "/api/v1/workspaces/{ws}/guardrails", json!({"expected":{"rule_set_id":"00000000-0000-4000-8000-000000000000","revision":1},"rules":[{"tightens":target,"input":{"action":"block"},"output":{"mode":"off"},"on_error":"fail_closed","threshold":null}, custom("internal-[0-9]+")]}), &[("/rules/0/id", json!(seeded)), ("/rules/1/id", json!(seeded))], async |body| probe(owner, &local_team, body, &rules).await),
+            body_vectors_seeded(&mut o, "PUT", "/api/v1/workspaces/{ws}/guardrails", json!({"expected":{"rule_set_id":"00000000-0000-4000-8000-000000000000","revision":1},"rules":[{"tightens":target,"input":{"action":"block"},"output":{"mode":"off"},"on_error":"fail_closed","threshold":null}, custom("internal-[0-9]+"), personal()]}), &[("/rules/0/id", json!(seeded)), ("/rules/1/id", json!(seeded))], async |body| probe(owner, &local_team, body, &rules).await),
         )
         .await;
     }
@@ -4331,7 +4368,7 @@ async fn guardrail_fixtures(
                     let body = with_expected(
                         pool,
                         &resettable,
-                        json!({"local_only":false,"rules":[secrets("monitor")]}),
+                        json!({"local_only":false,"rules":[secrets("monitor"), personal()]}),
                     )
                     .await;
                     c.setup(admin, "PUT", &resettable, Some(body)).await;
@@ -4396,12 +4433,12 @@ async fn guardrail_fixtures(
         rule
     };
     // Type defaults with custom patterns (the personal one stays unwritten).
-    c.ok(admin, "PUT", TEAM_TYPE, Some(with_expected(pool, TEAM_TYPE, json!({"local_only":false,"rules":[keep(&target, secrets("monitor")), keep(&custom_rule, custom("PROJECT-[0-9]{4}"))]})).await)).await;
+    c.ok(admin, "PUT", TEAM_TYPE, Some(with_expected(pool, TEAM_TYPE, json!({"local_only":false,"rules":[keep(&target, secrets("monitor")), keep(&custom_rule, custom("PROJECT-[0-9]{4}")), personal()]})).await)).await;
     c.ok(
         admin,
         "PUT",
         PROJECT_TYPE,
-        Some(with_expected(pool, PROJECT_TYPE, json!({"local_only":false,"rules":[secrets("monitor"), custom("PROJECT-[0-9]{4}")]})).await),
+        Some(with_expected(pool, PROJECT_TYPE, json!({"local_only":false,"rules":[secrets("monitor"), custom("PROJECT-[0-9]{4}"), personal()]})).await),
     )
     .await;
     c.ok(auditor, "GET", TEAM_TYPE, None).await;
@@ -4413,7 +4450,7 @@ async fn guardrail_fixtures(
     )
     .await;
     // The Team's local layer tightens both type-default rules and adds a pattern.
-    c.ok(owner, "PUT", &local_team, Some(with_expected(pool, &local_team, json!({"rules":[{"tightens":target,"input":{"action":"block"}}, {"tightens":custom_rule,"on_error":"fail_closed"}, custom("internal-[0-9]+")]})).await)).await;
+    c.ok(owner, "PUT", &local_team, Some(with_expected(pool, &local_team, json!({"rules":[{"tightens":target,"input":{"action":"block"}}, {"tightens":custom_rule,"on_error":"fail_closed"}, custom("internal-[0-9]+"), personal()]})).await)).await;
     c.ok(regular, "GET", &local_team, None).await;
     // A personal workspace with no rules in any layer.
     c.ok(owner, "GET", &local_personal, None).await;
@@ -4428,15 +4465,15 @@ async fn guardrail_fixtures(
                 with_expected(
                     pool,
                     &platform_project,
-                    json!({"local_only":false,"rules":[secrets("monitor"), custom("acme-[a-z]+")]}),
+                    json!({"local_only":false,"rules":[secrets("monitor"), custom("acme-[a-z]+"), personal()]}),
                 )
                 .await,
             ),
         )
         .await;
     let overridden = first["override"]["rules"][0]["id"].clone();
-    c.ok(owner, "PUT", &local_project, Some(with_expected(pool, &local_project, json!({"rules":[{"tightens":overridden,"input":{"action":"block"}}, custom("internal-[0-9]+")]})).await)).await;
-    c.ok(admin, "PUT", &platform_project, Some(with_expected(pool, &platform_project, json!({"local_only":false,"rules":[keep(&overridden, secrets("monitor")), custom("acme-[a-z]+")]})).await)).await;
+    c.ok(owner, "PUT", &local_project, Some(with_expected(pool, &local_project, json!({"rules":[{"tightens":overridden,"input":{"action":"block"}}, custom("internal-[0-9]+"), personal()]})).await)).await;
+    c.ok(admin, "PUT", &platform_project, Some(with_expected(pool, &platform_project, json!({"local_only":false,"rules":[keep(&overridden, secrets("monitor")), custom("acme-[a-z]+"), personal()]})).await)).await;
     c.ok(auditor, "GET", &platform_project, None).await;
     c.ok(owner, "GET", &local_project, None).await;
     // An Auditor who administers a Team reads and writes its local layer with
@@ -4446,7 +4483,7 @@ async fn guardrail_fixtures(
     member(pool, staffed, staff.user_id, "admin").await;
     let staff = browser(pool, &staff).await;
     let staffed = format!("/api/v1/workspaces/{staffed}/guardrails");
-    c.ok(&staff, "PUT", &staffed, Some(with_expected(pool, &staffed, json!({"rules":[{"tightens":target,"input":{"action":"block"}}, custom("internal-[0-9]+")]})).await)).await;
+    c.ok(&staff, "PUT", &staffed, Some(with_expected(pool, &staffed, json!({"rules":[{"tightens":target,"input":{"action":"block"}}, custom("internal-[0-9]+"), personal()]})).await)).await;
     c.ok(&staff, "GET", &staffed, None).await;
     // The Team's override leaves both local entries inactive; the type default
     // then drops its custom rule, so removing the override restores one
@@ -4459,7 +4496,7 @@ async fn guardrail_fixtures(
             with_expected(
                 pool,
                 &platform_team,
-                json!({"local_only":true,"rules":[secrets("block"), custom("acme-[a-z]+")]}),
+                json!({"local_only":true,"rules":[secrets("block"), custom("acme-[a-z]+"), personal()]}),
             )
             .await,
         ),
@@ -4471,7 +4508,7 @@ async fn guardrail_fixtures(
         admin,
         "PUT",
         TEAM_TYPE,
-        Some(with_expected(pool, TEAM_TYPE, json!({"local_only":false,"rules":[keep(&target, secrets("monitor")), custom("OTHER-[0-9]{4}")]})).await),
+        Some(with_expected(pool, TEAM_TYPE, json!({"local_only":false,"rules":[keep(&target, secrets("monitor")), custom("OTHER-[0-9]{4}"), personal()]})).await),
     )
     .await;
     c.ok(
@@ -4491,7 +4528,14 @@ async fn guardrail_fixtures(
         owner,
         "PUT",
         &local_personal,
-        Some(with_expected(pool, &local_personal, json!({"rules":[secrets("block")]})).await),
+        Some(
+            with_expected(
+                pool,
+                &local_personal,
+                json!({"rules":[secrets("block"), personal()]}),
+            )
+            .await,
+        ),
     )
     .await;
     c.ok(admin, "GET", &platform_personal, None).await;
@@ -4503,7 +4547,7 @@ async fn guardrail_fixtures(
             with_expected(
                 pool,
                 &platform_personal,
-                json!({"local_only":false,"rules":[secrets("block")]}),
+                json!({"local_only":false,"rules":[secrets("block"), personal()]}),
             )
             .await,
         ),

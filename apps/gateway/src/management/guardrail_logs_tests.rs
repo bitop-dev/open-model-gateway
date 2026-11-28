@@ -135,6 +135,22 @@ async fn refused_requests_are_listed_as_blocked_with_logs_visibility(pool: PgPoo
         .execute(&pool)
         .await
         .unwrap();
+    // One request's decision of a platform personal-data rule that found
+    // two kinds, and another request's: platform staff see two decisions
+    // per action and category, never which kinds were sent or how many.
+    let personal_kind = "INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,kind,action,count) SELECT gen_random_uuid(),$4,workspace_id,api_key_id,'embeddings','company/smart','input',$5,$5,1,'type_default','pattern','personal_data',$2,'monitored',$3 FROM guardrail_events WHERE root_request_id=$1";
+    let (one, other, pd_rule) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+    for (root, kind, count) in [(one, "us_ssn", 2), (one, "email", 5), (other, "email", 1)] {
+        sqlx::query(personal_kind)
+            .bind(private)
+            .bind(kind)
+            .bind(count)
+            .bind(root)
+            .bind(pd_rule)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
     // A platform rule a local tightening made stricter decided this one: its
     // outcome may be the owner's choice, so it is left out too.
     let tightened = "INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,tightened) SELECT gen_random_uuid(),gen_random_uuid(),workspace_id,api_key_id,'chat_completions','company/smart','input',gen_random_uuid(),gen_random_uuid(),1,'workspace_override','pattern','secret','blocked',1,true,true FROM guardrail_events WHERE root_request_id=$1";
@@ -154,11 +170,25 @@ async fn refused_requests_are_listed_as_blocked_with_logs_visibility(pool: PgPoo
     assert_eq!(status, StatusCode::OK, "{totals}");
     assert_eq!(
         totals["decisions_this_month"],
-        json!([{"action":"monitored","category":"secret","decisions":1,"findings":3}])
+        json!([
+            {"action":"monitored","category":"personal_data","kind":null,"decisions":2,"findings":8},
+            {"action":"monitored","category":"secret","kind":null,"decisions":1,"findings":3}
+        ])
     );
-    // A shared workspace's totals count every layer and tightening.
+    assert!(!totals.to_string().contains("us_ssn"), "{totals}");
+    // A shared workspace's totals count every layer and tightening, and
+    // name the kind.
     sqlx::query(tightened)
         .bind(own)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(personal_kind)
+        .bind(own)
+        .bind("us_ssn")
+        .bind(2)
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
         .execute(&pool)
         .await
         .unwrap();
@@ -187,6 +217,14 @@ async fn refused_requests_are_listed_as_blocked_with_logs_visibility(pool: PgPoo
     assert!(
         seen.contains(&("blocked".into(), "secret".into(), 1)),
         "{seen:?}"
+    );
+    assert!(
+        totals["decisions_this_month"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["category"] == "personal_data" && t["kind"] == "us_ssn"),
+        "{totals}"
     );
     // Attempt lists have nothing a refused request could match.
     for path in ["generations", "sessions"] {

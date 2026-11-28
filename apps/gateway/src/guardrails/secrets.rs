@@ -20,7 +20,7 @@ use super::detector::{
     Budget, BudgetSpent, DetectContext, Detector, DetectorError, Finding, Findings, Inspected,
     Inspection,
 };
-use super::policy::{Category, DetectorKind, Egress};
+use super::policy::{Category, DetectorKind, Egress, Kind};
 
 /// The built-in secret shapes, by name (names are for tests and docs only;
 /// a decision records the rule and the category `secret`).
@@ -186,6 +186,7 @@ pub fn builtin(input: &Inspection<'_>) -> Findings {
                 }
                 found.push(Finding {
                     category: Category::Secret,
+                    kind: None,
                     segment: index,
                     span: m.range(),
                 });
@@ -196,11 +197,13 @@ pub fn builtin(input: &Inspection<'_>) -> Findings {
 }
 
 /// One rule's pattern detector: the built-in secret shapes when the rule has
-/// the `secret` category, and its custom patterns (compiled within the limits
+/// the `secret` category, its personal-data kinds for `personal_data`
+/// (`super::personal`), and its custom patterns (compiled within the limits
 /// of `patterns::compile_within`) for `custom`.
 pub struct PatternDetector {
     categories: Vec<Category>,
     secrets: bool,
+    kinds: Vec<Kind>,
     custom: Vec<Regex>,
 }
 
@@ -237,12 +240,13 @@ fn boundary_up(text: &str, mut i: usize) -> usize {
 impl PatternDetector {
     /// `None` when a custom pattern no longer compiles within a local
     /// layer's limits (the rule then fails like a detector that cannot run).
-    pub fn new(categories: &[Category], patterns: &[String]) -> Option<Self> {
-        Self::within(categories, patterns, super::patterns::Limit::Local)
+    pub fn new(categories: &[Category], kinds: &[Kind], patterns: &[String]) -> Option<Self> {
+        Self::within(categories, kinds, patterns, super::patterns::Limit::Local)
     }
     /// As [`PatternDetector::new`], for patterns of a layer with `limit`.
     pub fn within(
         categories: &[Category],
+        kinds: &[Kind],
         patterns: &[String],
         limit: super::patterns::Limit,
     ) -> Option<Self> {
@@ -253,6 +257,11 @@ impl PatternDetector {
         Some(Self {
             categories: categories.to_vec(),
             secrets: categories.contains(&Category::Secret),
+            kinds: if categories.contains(&Category::PersonalData) {
+                kinds.to_vec()
+            } else {
+                Vec::new()
+            },
             custom,
         })
     }
@@ -327,6 +336,7 @@ impl PatternDetector {
                         }
                         found.push(Finding {
                             category: Category::Custom,
+                            kind: None,
                             segment: index,
                             span: m.range(),
                         });
@@ -354,8 +364,9 @@ impl Detector for PatternDetector {
         &self.categories
     }
     /// Distinct values per category: the shared built-in findings for
-    /// `secret`, the rule's custom patterns for `custom` (incomplete when the
-    /// budget ran out first).
+    /// `secret`, the shared personal-data findings for `personal_data` (one
+    /// count per kind the rule names), the rule's custom patterns for
+    /// `custom` (incomplete when the budget ran out first).
     fn inspect(
         &self,
         ctx: &DetectContext<'_>,
@@ -364,26 +375,37 @@ impl Detector for PatternDetector {
         let custom = self
             .has_custom()
             .then(|| self.custom_findings(input, ctx.budget));
-        let counts = self
-            .categories
-            .iter()
-            .map(|&category| {
-                let n = if category == Category::Secret && self.secrets {
-                    ctx.builtin
-                        .get_or_init(|| builtin(input))
-                        .distinct(input, category)
-                } else {
-                    custom
-                        .as_ref()
-                        .map_or(0, |c| c.findings.distinct(input, category))
-                };
-                (category, n)
-            })
-            .collect();
-        Ok(Inspected {
-            counts,
-            complete: custom.is_none_or(|c| !c.spent),
-        })
+        let mut counts = Vec::new();
+        let mut spent = custom
+            .as_ref()
+            .is_some_and(|c| c.spent)
+            .then_some(Category::Custom);
+        for &category in &self.categories {
+            if category == Category::PersonalData {
+                let mut found = ctx.personal.borrow_mut();
+                for &kind in &self.kinds {
+                    let (findings, kind_spent) = found
+                        .entry(kind)
+                        .or_insert_with(|| super::personal::findings_of(input, kind, ctx.budget));
+                    if *kind_spent {
+                        spent = spent.or(Some(Category::PersonalData));
+                    }
+                    counts.push((category, Some(kind), findings.distinct_kind(input, kind)));
+                }
+                continue;
+            }
+            let n = if category == Category::Secret && self.secrets {
+                ctx.builtin
+                    .get_or_init(|| builtin(input))
+                    .distinct(input, category)
+            } else {
+                custom
+                    .as_ref()
+                    .map_or(0, |c| c.findings.distinct(input, category))
+            };
+            counts.push((category, None, n));
+        }
+        Ok(Inspected { counts, spent })
     }
 }
 
