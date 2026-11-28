@@ -464,6 +464,11 @@ GRANT UPDATE(paused_reason,checked_at,live_in_flight,metrics_checked_at,metrics_
 GRANT SELECT,INSERT,DELETE ON public.batch_route_waits TO gateway_runtime;
 GRANT UPDATE(waiting_lines,reason,ready,last_claim_at,updated_at) ON public.batch_route_waits TO gateway_runtime;
 GRANT UPDATE(last_waited_at) ON public.async_jobs TO gateway_runtime;
+-- #52 (0098): a video's stored output. The poller marks a completed video
+-- as awaiting its output when the provider reports it, and clears the mark
+-- when it stores it (`output_file_id`, above) or gives it up for good
+-- (`output_failure`, written once: trigger); a delete clears it too.
+GRANT UPDATE(output_pending,output_failure) ON public.async_jobs TO gateway_runtime;
 -- Installation logo (0023). The settings row references the current branding
 -- file (a live, committed installation branding object; trigger) with its
 -- dimensions; uploads/removals go through the reviewed stored_files grants.

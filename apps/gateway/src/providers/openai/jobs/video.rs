@@ -250,8 +250,11 @@ pub(crate) async fn video_content(
         .map_err(|e| lost(wire.kind, &e))?;
     check_status(response.status())?;
     // The whole content or nothing: an empty (`204`) or partial (`206`)
-    // answer is not passed on as a complete one.
-    if response.status() != reqwest::StatusCode::OK {
+    // answer, or a `200` that says it holds a range, is not taken as a
+    // complete one.
+    if response.status() != reqwest::StatusCode::OK
+        || response.headers().contains_key(header::CONTENT_RANGE)
+    {
         return Err(InferenceError::InvalidUpstream);
     }
     let media = match asset {

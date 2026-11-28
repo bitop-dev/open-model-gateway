@@ -69,11 +69,14 @@ impl Rig {
         }
         let engine =
             Engine::new(Arc::new(f.store.clone()), registry, EngineLimits::default()).unwrap();
-        let (gateway, gateway_server) = serve(crate::http::router_with_engine(
-            f.store.clone(),
-            None,
-            engine,
-        ))
+        sqlx::query("UPDATE installation_settings SET file_video_enabled=true WHERE singleton")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (gateway, gateway_server) = serve(
+            crate::http::router_with_engine(f.store.clone(), None, engine)
+                .layer(axum::Extension(super::db_tests::test_files().await)),
+        )
         .await;
         let key = crate::auth::NewApiKey::generate().unwrap();
         sqlx::query("INSERT INTO api_keys(id,workspace_id,issued_to_user_id,name,secret_hash) VALUES($1,$2,$3,'http',$4)")

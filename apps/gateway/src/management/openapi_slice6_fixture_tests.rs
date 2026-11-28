@@ -1339,12 +1339,13 @@ async fn slice6_fixtures(pool: PgPool, shard: usize) -> (PositiveFixtures, Vec<S
         &pool, "batch", f.team, log_key, deployment, j5root, None, None, None, None, None,
     )
     .await;
-    // Videos: one running with progress, one finished, cancelled and deleted.
+    // Videos: one completed whose output was given up (0098), one finished,
+    // cancelled and deleted.
     let v1 = job(
         &pool, "video", f.team, log_key, deployment, jv1, None, None, None, None, None,
     )
     .await;
-    sqlx::query("UPDATE async_jobs SET state='in_progress',upstream_status='processing',progress=40,expires_at=now()+interval '1 hour' WHERE id=$1").bind(v1).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE async_jobs SET state='completed',upstream_status='processing',progress=40,expires_at=now()+interval '1 hour',completed_at=now(),settled_at=now(),output_failure='too_large' WHERE id=$1").bind(v1).execute(&pool).await.unwrap();
     let v2 = job(
         &pool, "video", f.team, log_key, deployment, jv2, None, None, None, None, None,
     )
@@ -1459,7 +1460,7 @@ async fn slice6_fixtures(pool: PgPool, shard: usize) -> (PositiveFixtures, Vec<S
         None,
     )
     .await;
-    sqlx::query("UPDATE async_jobs SET state='in_progress',upstream_status='processing',progress=40,expires_at=now()+interval '1 hour' WHERE id=$1").bind(jp3).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE async_jobs SET state='completed',upstream_status='processing',progress=40,expires_at=now()+interval '1 hour',completed_at=now(),settled_at=now(),output_failure='too_large' WHERE id=$1").bind(jp3).execute(&pool).await.unwrap();
     let jp4 = job(
         &pool,
         "video",

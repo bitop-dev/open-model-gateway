@@ -31,6 +31,7 @@ pub mod schedule;
 mod store;
 pub mod types;
 pub mod video;
+pub mod video_output;
 mod video_route;
 
 use gateway_datetime_compat::UtcInstant;
@@ -200,6 +201,9 @@ pub enum JobError {
         &'static str,
         crate::inference::error::FieldName,
     ),
+    /// The object exists but its content is gone for good (HTTP 410): code,
+    /// message, and the reason code when there is one.
+    Gone(&'static str, &'static str, Option<&'static str>),
     /// Visible but not the caller's to change: delete or cancel needs the
     /// creating user, a workspace owner/admin or a service-account key (HTTP 403).
     Forbidden(&'static str, &'static str),
@@ -730,5 +734,7 @@ mod schedule_db_tests;
 mod tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod video_contract_tests;
+#[cfg(all(test, feature = "integration-tests"))]
+mod video_output_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod video_routing_tests;

@@ -110,7 +110,9 @@ pub(super) enum Publication {
 pub(crate) enum Renewed {
     /// The claim is current; whether a cancel was requested.
     Held { cancel: bool },
-    /// The batch is settled: nothing is left to renew.
+    /// The job is settled and nothing else is left to do under the claim
+    /// (a completed video awaiting its stored output is not: its lease is
+    /// renewed while the output is stored).
     Settled,
     /// The claim ended.
     Fenced,
@@ -215,13 +217,13 @@ impl BatchFence {
         Ok(())
     }
 
-    /// Renew the lease.
+    /// Renew the lease (see [`Renewed`]).
     pub(crate) async fn renew(
         &self,
         store: &Store,
         lease_seconds: f64,
     ) -> Result<Renewed, sqlx::Error> {
-        let row: Option<(bool, bool)> = sqlx::query_as("UPDATE async_jobs SET runner_lease_until=clock_timestamp()+make_interval(secs=>$4) WHERE id=$1 AND runner_id=$2 AND runner_epoch=$3 AND runner_lease_until IS NOT NULL RETURNING cancel_requested_at IS NOT NULL,settled_at IS NOT NULL")
+        let row: Option<(bool, bool)> = sqlx::query_as("UPDATE async_jobs SET runner_lease_until=clock_timestamp()+make_interval(secs=>$4) WHERE id=$1 AND runner_id=$2 AND runner_epoch=$3 AND runner_lease_until IS NOT NULL RETURNING cancel_requested_at IS NOT NULL,settled_at IS NOT NULL AND NOT output_pending")
             .bind(self.job).bind(self.runner).bind(self.epoch).bind(lease_seconds)
             .fetch_optional(&store.pool).await.map_err(job_storage)?;
         Ok(match row {

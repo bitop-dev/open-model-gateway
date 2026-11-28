@@ -41,7 +41,9 @@ fn inference_openapi_video_create_documents_success_and_refusals() {
         [
             "unsupported_capability",
             "unsupported_video_parameter",
-            "video_price_missing"
+            "video_price_missing",
+            "video_storage_unavailable",
+            "storage_quota_exceeded"
         ]
     );
 }
@@ -598,7 +600,7 @@ mod legacy {
         body::{Body, Bytes},
         http::{Request, StatusCode},
     };
-    use serde_json::json;
+    use serde_json::{Value, json};
     use sqlx::PgPool;
     use std::sync::Arc;
     use tower::ServiceExt;
@@ -668,7 +670,7 @@ mod legacy {
         let f = fixture(pool).await;
         video_setup(&f).await;
         let fake = Fake::default();
-        let jobs = jobs(&f, &fake, false);
+        let jobs = jobs(&f, &fake, false).await;
         // Create historical rows through the existing test-only provider, not
         // through the refusal-only public create operation.
         fake.push_video(upstream_video(JobState::Completed, Some(8)));
@@ -701,11 +703,44 @@ mod legacy {
             .await
             .unwrap();
         let failed_id = client_id("video_", failed.id);
+        // A completed video whose output was given up for good, and one
+        // completed before the gateway stored outputs (written as such a
+        // row was: never awaiting an output).
+        fake.push_video(upstream_video(JobState::Completed, Some(8)));
+        let given_up = jobs
+            .create_video(f.principal, video_request(), uuid::Uuid::new_v4())
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE async_jobs SET output_pending=false,output_failure='too_large' WHERE id=$1",
+        )
+        .bind(given_up.id)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+        let given_up_id = client_id("video_", given_up.id);
+        let old = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO inference_executions(id,workspace_id,api_key_id,deployment_id,public_model,provider,streamed,state,root_request_id,started_at,completed_at,input_tokens,output_tokens) VALUES($1,$2,$3,$4,'company/smart',$5,false,'succeeded',$1,now(),now(),0,0)")
+            .bind(old).bind(f.principal.workspace_id).bind(f.principal.key_id).bind(f.deployment).bind(&job.provider)
+            .execute(&f.store.pool).await.unwrap();
+        sqlx::query("INSERT INTO async_jobs(id,kind,workspace_id,api_key_id,deployment_id,execution_id,public_model,provider,upstream_id,state,upstream_status,poll_deadline_at,video_seconds,video_size,completed_at,settled_at) VALUES($1,'video',$2,$3,$4,$1,'company/smart',$5,'video_before_storage','completed','completed',now()+interval '1 hour',8,'720x1280',now(),now())")
+            .bind(old).bind(f.principal.workspace_id).bind(f.principal.key_id).bind(f.deployment).bind(&job.provider)
+            .execute(&f.store.pool).await.unwrap();
+        let old_id = client_id("video_", old);
+        // The poller stores the completed video's output (its content is
+        // then served from the gateway's copy).
+        sqlx::query("UPDATE async_jobs SET next_poll_at=now() WHERE id=$1")
+            .bind(job.id)
+            .execute(&f.store.pool)
+            .await
+            .unwrap();
+        jobs.poll_once().await.unwrap();
         let mut registry = ProviderRegistry::default();
         registry.register(Arc::new(Legacy(fake.clone()))).unwrap();
         let engine =
             Engine::new(Arc::new(f.store.clone()), registry, EngineLimits::default()).unwrap();
-        let app = crate::http::router_with_engine(f.store.clone(), None, engine);
+        let app = crate::http::router_with_engine(f.store.clone(), None, engine)
+            .layer(axum::Extension(crate::jobs::db_tests::test_files().await));
         let key = bearer(&f, f.principal.workspace_id).await;
         let send = async |method: &str, path: String| {
             capture(
@@ -740,6 +775,19 @@ mod legacy {
         let c = send("GET", format!("/v1/videos/{failed_id}")).await;
         assert_eq!(c.status, StatusCode::OK, "failed legacy read status");
         fixtures.observe(&c);
+        for (id, reason) in [
+            (&given_up_id, json!("too_large")),
+            (&old_id, json!("completed_before_storage")),
+        ] {
+            let c = send("GET", format!("/v1/videos/{id}")).await;
+            assert_eq!(c.status, StatusCode::OK, "unavailable read status");
+            fixtures.observe(&c);
+            let c = send("GET", format!("/v1/videos/{id}/content")).await;
+            assert_eq!(c.status, StatusCode::GONE, "unavailable content status");
+            let body: Value = serde_json::from_slice(&c.bytes).unwrap();
+            assert_eq!(body["error"]["reason"], reason);
+            fixtures.observe(&c);
+        }
         for variant in ["video", "thumbnail", "spritesheet"] {
             let c = send("GET", format!("/v1/videos/{id}/content?variant={variant}")).await;
             assert_eq!(c.status, StatusCode::OK, "legacy content status");

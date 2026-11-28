@@ -42,7 +42,7 @@ enum Case {
 }
 
 // A fresh worker process reopens the same encrypted files and disposable database.
-async fn local_files(dir: &std::path::Path) -> FileStoreRuntime {
+pub(crate) async fn local_files(dir: &std::path::Path) -> FileStoreRuntime {
     use base64::Engine as _;
     let config = crate::filestore::FileStoreConfig::from_lookup(&|key| match key {
         "GATEWAY_FILE_STORE" => Some("local".into()),

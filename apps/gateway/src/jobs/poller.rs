@@ -330,7 +330,7 @@ impl Jobs {
     async fn poll_job(&self, job: JobRow, fence: BatchFence, lost: &AtomicBool) -> JobResult<()> {
         match job.job_kind() {
             Some(JobKind::Video) => {
-                self.refresh_video(job, store::Observer::Claim(&fence))
+                self.refresh_video_until(job, store::Observer::Claim(&fence), lost)
                     .await?;
             }
             Some(JobKind::Batch) => match job.mode() {

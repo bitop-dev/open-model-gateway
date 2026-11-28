@@ -20,7 +20,7 @@ import { FileQuestion } from "lucide-react";
 import { ApiError, platformPath, wsPath, type Session } from "../lib/api";
 import { formatUsd } from "../lib/governance";
 import { Money } from "../components/templates/money";
-import { costText, countText, guardrailActionLabels, type GuardrailDecision, dataPolicyOf, finishReasonLabel, jobStateTone, jobText, type JobDetail, latencyText, logPaths, logsSearch, requestFilters, requestQuery, requestStatusLabel, requestStatusTone, requestTarget, servedModel, sessionTarget, timelineStatus, tokensText, tpsText, unresolvedText, workloadText, modalityText, realtimeResponseState, realtimeStatusLabel, type LogsScope, type RealtimeResponse, type RequestAttempt, type RequestDetail, type RequestPage } from "../lib/requests";
+import { costText, countText, videoOutputText, guardrailActionLabels, type GuardrailDecision, dataPolicyOf, finishReasonLabel, jobStateTone, jobText, type JobDetail, latencyText, logPaths, logsSearch, requestFilters, requestQuery, requestStatusLabel, requestStatusTone, requestTarget, servedModel, sessionTarget, timelineStatus, tokensText, tpsText, unresolvedText, workloadText, modalityText, realtimeResponseState, realtimeStatusLabel, type LogsScope, type RealtimeResponse, type RequestAttempt, type RequestDetail, type RequestPage } from "../lib/requests";
 import { kindLabel } from "../lib/guardrails";
 import type { DashboardSearch } from "../lib/permissions";
 import { Button, ErrorNotice, Stack, useAction, useApi } from "../components/ui";
@@ -147,11 +147,12 @@ export function GuardrailDecisions({ decisions }: { decisions: GuardrailDecision
 export function JobCard({ job }: { job: JobDetail }) {
   const when = (v: string | null | undefined, missing: string) => v ? <DetailTime value={v} fallback={v} /> : <span className={s.secondary}>{missing}</span>;
   const counts = job.request_counts;
-  return <Card title={job.kind === "video" ? "Video job" : "Batch job"} titleAs="h2" description="Created by this request. The hold stays until the provider reports a final state; unknown usage keeps it. Prompts, batch lines and outputs are never stored."><DescriptionList dividers items={[
+  return <Card title={job.kind === "video" ? "Video job" : "Batch job"} titleAs="h2" description="Created by this request. The hold stays until the provider reports a final state; unknown usage keeps it. Prompts and batch lines are never stored; a finished video is stored, encrypted, in the file store."><DescriptionList dividers items={[
     { label: "Job ID", value: <CopyId value={job.id} label="job ID" head={14} tail={6} /> },
     { label: "State", value: <StatusBadge tone={jobStateTone(job.state)} size="sm">{jobText(job)}</StatusBadge> },
     ...(job.kind === "video" && job.video_seconds != null ? [{ label: "Requested", value: `${job.video_seconds} s · ${job.video_size ?? "default size"}` }] : []),
     ...(job.kind === "batch" ? [{ label: "Requests", value: counts ? `${countText(counts.completed)} completed · ${countText(counts.failed)} failed · ${countText(counts.total)} total` : "Not reported yet" }] : []),
+    ...(job.kind === "video" && job.state === "completed" ? [{ label: "Output", value: videoOutputText(job) }] : []),
     ...(job.error_code ? [{ label: "Provider error code", value: job.error_code }] : []),
     { label: "Finished", value: when(job.completed_at, "Not yet") },
     ...(job.cancel_requested_at ? [{ label: "Cancel requested", value: when(job.cancel_requested_at, "") }] : []),

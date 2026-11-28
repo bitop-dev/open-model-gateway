@@ -141,7 +141,7 @@ pub fn render(job: &JobRow) -> Value {
     } else {
         job.job_state()
     };
-    json!({
+    let mut rendered = json!({
         "id": client_id(JobKind::Video.prefix(), job.id),
         "object": "video",
         "model": job.public_model,
@@ -154,7 +154,17 @@ pub fn render(job: &JobRow) -> Value {
         "size": job.video_size,
         "remixed_from_video_id": Value::Null,
         "error": job.error_code.as_ref().filter(|_| state == JobState::Failed).map(|code| json!({"code": code, "message": if reused { "The provider gave this video's id to another job; it is no longer served" } else { "Video generation failed" }})),
-    })
+    });
+    // A completed video whose output will never be available from the
+    // gateway, with why (`video_output::unavailable_reason`); absent while
+    // the output is stored or still awaited, and for a job that reads
+    // failed.
+    if state == JobState::Completed
+        && let Some(reason) = super::video_output::unavailable_reason(job)
+    {
+        rendered["output_unavailable"] = json!({ "reason": reason });
+    }
+    rendered
 }
 
 impl Jobs {
@@ -173,6 +183,7 @@ impl Jobs {
                 NO_VIDEO_PROVIDER,
             ));
         }
+        self.require_video_storage(principal.workspace_id).await?;
         let original = request.clone();
         let (target, adapter, request) = self.video_route(&principal, &request, request_id).await?;
         let model = request.model.clone();
@@ -559,24 +570,50 @@ impl Jobs {
         job: JobRow,
         observer: store::Observer<'_>,
     ) -> JobResult<JobRow> {
+        self.refresh_video_until(job, observer, &std::sync::atomic::AtomicBool::new(false))
+            .await
+    }
+
+    /// [`Self::refresh_video`] for a claim whose renewal sets `lost` once it
+    /// ended: a download of its output stops then.
+    pub(crate) async fn refresh_video_until(
+        &self,
+        job: JobRow,
+        observer: store::Observer<'_>,
+        lost: &std::sync::atomic::AtomicBool,
+    ) -> JobResult<JobRow> {
         if job.upstream_id.is_none() {
             return self.refresh_unrecorded_video(job, observer).await;
         }
-        if job.error_code.as_deref() == Some(super::UPSTREAM_ID_REUSED) {
-            return self.settle_reused(job, observer).await;
-        }
-        let (target, adapter) = match self.target(&job).await {
-            // Marked since `job` was read: the only `InvalidUpstream` of
-            // `target`.
-            Err(InferenceError::InvalidUpstream) => {
-                let now = store::reload(&self.store, job.id).await?;
-                return self.settle_reused(now, observer).await;
+        let job = if job.error_code.as_deref() == Some(super::UPSTREAM_ID_REUSED) {
+            self.settle_reused(job, observer).await?
+        } else if job.job_state().is_terminal() && job.settled_at.is_some() {
+            // A finished, settled video is claimed only to store its output.
+            job
+        } else {
+            match self.target(&job).await {
+                // Marked since `job` was read: the only `InvalidUpstream` of
+                // `target`.
+                Err(InferenceError::InvalidUpstream) => {
+                    let now = store::reload(&self.store, job.id).await?;
+                    self.settle_reused(now, observer).await?
+                }
+                Err(e) => return Err(e.into()),
+                Ok((target, adapter)) => {
+                    let upstream_id = job.upstream().ok_or(InferenceError::Storage)?;
+                    let upstream = call(adapter.retrieve_video(&target, &upstream_id)).await?;
+                    self.apply_video(&job, &upstream, observer).await?
+                }
             }
-            other => other?,
         };
-        let upstream_id = job.upstream().ok_or(InferenceError::Storage)?;
-        let upstream = call(adapter.retrieve_video(&target, &upstream_id)).await?;
-        self.apply_video(&job, &upstream, observer).await
+        // Only the poller that holds the claim stores the output (a client
+        // read never waits on a download); a marked job's is given up there.
+        match observer {
+            store::Observer::Claim(fence) if job.output_pending => {
+                self.refresh_output(job, fence, lost).await
+            }
+            _ => Ok(job),
+        }
     }
 
     /// A job marked `upstream_id_reused` settles as interrupted (unknown
@@ -628,6 +665,13 @@ impl Jobs {
                 "Video content is available once the video is completed",
             ));
         }
+        if asset == VideoAsset::Video {
+            // The stored copy only: the provider's may be gone, and reading
+            // it again would be a second download.
+            return self.stored_output(&job).await;
+        }
+        // Thumbnails and spritesheets are not stored: they come from the
+        // provider while it keeps them, size- and time-bounded.
         let (target, adapter) = self.target(&job).await?;
         let upstream_id = job.upstream().ok_or(InferenceError::Storage)?;
         let content = call(adapter.video_content(&target, &upstream_id, asset)).await?;
@@ -681,6 +725,11 @@ impl Jobs {
                         == VideoDeletion::Deleted;
                 }
             }
+        }
+        // The gateway's stored copy goes with the record: a failure to delete
+        // it is an error, never a deletion.
+        if let Some(file) = job.output_file_id {
+            self.delete_output(&job, file).await?;
         }
         store::mark_deleted(&self.store, job.id).await?;
         Ok((job, upstream_deleted))
