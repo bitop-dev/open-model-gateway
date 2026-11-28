@@ -670,7 +670,7 @@
           "type": "null"
         },
         "uninspectable": {
-          "description": "What an enforcing rule does with content it cannot read: deny refuses the request (guardrail_not_supported); allow lets it through recorded as skipped. Under allow the text beside an image in a generation request is still checked; an image prompt, an audio file, a realtime session and the lines of a native batch are not read at all (the images, transcription and realtime workloads are never read) (#841). Default deny.",
+          "description": "What an enforcing rule does with content it cannot read: deny refuses the request (guardrail_not_supported); allow lets it through recorded as skipped. Under allow the text beside an image in a generation request is still checked; an image prompt, an audio file and a realtime session are not read at all (the images, transcription and realtime workloads are never read). A native batch is refused by an enforcing rule under either value: its lines are text a gateway-run batch reads (#841). Default deny.",
           "enum": [
             "allow",
             "deny"

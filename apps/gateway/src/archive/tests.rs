@@ -222,7 +222,7 @@ async fn guardrail_decisions_archive_as_their_own_group_after_legal_holds(pool: 
     let later = next.checked_add_months(1).unwrap();
     let label = month.format("%Y-%m").to_string();
     for day in 1..=3 {
-        sqlx::query("INSERT INTO guardrail_events(id,created_at,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused) VALUES($1,$2,$1,$3,$4,'chat_completions','company/smart','input',$1,$1,1,'type_default','pattern','secret','blocked',1,true)")
+        sqlx::query("INSERT INTO guardrail_events(id,created_at,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,refuses) VALUES($1,$2,$1,$3,$4,'chat_completions','company/smart','input',$1,$1,1,'type_default','pattern','secret','blocked',1,true,true)")
             .bind(Uuid::now_v7())
             .bind(month + gateway_datetime_compat::SignedDuration::days(day))
             .bind(f.principal.workspace_id)

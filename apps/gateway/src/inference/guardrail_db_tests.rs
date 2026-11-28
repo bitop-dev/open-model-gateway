@@ -843,7 +843,7 @@ async fn the_kinds_migration_keeps_earlier_rules_and_decisions(pool: PgPool) {
         let insert = |category: &'static str, kind: &'static str| {
             let pool = pool.clone();
             let sql = format!(
-                "INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,kind,action,count,created_at) VALUES($1,$2,$3,$4,'chat_completions','company/smart','input',$5,$6,1,'type_default','pattern',$7,$8,'monitored',1,{at})"
+                "INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,kind,action,count,created_at,refuses) VALUES($1,$2,$3,$4,'chat_completions','company/smart','input',$5,$6,1,'type_default','pattern',$7,$8,'monitored',1,{at},false)"
             );
             async move {
                 sqlx::query(&sql)

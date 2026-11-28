@@ -321,6 +321,7 @@ async fn the_uninspectable_migration_keeps_rules_tightenings_and_decisions(pool:
         .bind(Uuid::now_v7()).bind(local).bind(rule).execute(&mut *tx).await.unwrap();
     tx.commit().await.unwrap();
     let event = "INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,created_at) VALUES($1,$2,$3,$4,$5,'company/smart','input',$6,$7,1,'type_default','pattern','secret','skipped',1,";
+    let after = "INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refuses,created_at) VALUES($1,$2,$3,$4,$5,'company/smart','input',$6,$7,1,'type_default','pattern','secret','skipped',1,false,";
     sqlx::query(&format!("{event}clock_timestamp())"))
         .bind(Uuid::now_v7())
         .bind(Uuid::now_v7())
@@ -392,8 +393,9 @@ async fn the_uninspectable_migration_keeps_rules_tightenings_and_decisions(pool:
         "clock_timestamp())",
         "clock_timestamp()+interval '14 months')",
     ] {
+        // Written from now on with its verdict (`guardrail_events_refuses`).
         let insert = |operation: &'static str| {
-            let (pool, sql) = (pool.clone(), format!("{event}{at}"));
+            let (pool, sql) = (pool.clone(), format!("{after}{at}"));
             async move {
                 sqlx::query(&sql)
                     .bind(Uuid::now_v7())
@@ -414,6 +416,20 @@ async fn the_uninspectable_migration_keeps_rules_tightenings_and_decisions(pool:
             "guardrail_events_operation",
             "{at}"
         );
+        // Without its verdict, or a refusal that does not refuse.
+        let row = format!("{event}{at}");
+        let bare = sqlx::query(&row)
+            .bind(Uuid::now_v7())
+            .bind(Uuid::now_v7())
+            .bind(ws)
+            .bind(key)
+            .bind("realtime")
+            .bind(set)
+            .bind(rule)
+            .execute(&pool)
+            .await
+            .map(|_| ());
+        assert_eq!(constraint(bare), "guardrail_events_refuses", "{at}");
     }
     let operations: Vec<(String, Option<bool>)> =
         sqlx::query_as("SELECT operation,refuses FROM guardrail_events ORDER BY created_at")
@@ -424,9 +440,9 @@ async fn the_uninspectable_migration_keeps_rules_tightenings_and_decisions(pool:
         operations,
         [
             ("images".into(), None),
-            ("realtime".into(), None),
-            ("realtime".into(), None)
+            ("realtime".into(), Some(false)),
+            ("realtime".into(), Some(false))
         ],
-        "a decision written without its verdict (all of them before 0100) reads null"
+        "a decision written before 0100 has no verdict"
     );
 }

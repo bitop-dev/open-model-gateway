@@ -4175,7 +4175,7 @@ async fn guardrail_fixtures(
             .await
             .unwrap();
         for (category, kind) in [("secret", None), ("personal_data", Some("email"))] {
-            sqlx::query("INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,kind,action,count) VALUES(gen_random_uuid(),gen_random_uuid(),$1,$2,'chat_completions','contract-guardrails','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern',$3,$4,'monitored',1)")
+            sqlx::query("INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,kind,action,count,refuses) VALUES(gen_random_uuid(),gen_random_uuid(),$1,$2,'chat_completions','contract-guardrails','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern',$3,$4,'monitored',1,false)")
                 .bind(ws)
                 .bind(key)
                 .bind(category)

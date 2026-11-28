@@ -463,7 +463,7 @@ async fn concurrent_guardrail_events_lock_no_parent_rows(pool: PgPool) {
         .await
         .unwrap();
     let f = fixture(pool.clone()).await;
-    const INSERT: &str = "INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count) VALUES(gen_random_uuid(),gen_random_uuid(),$1,$2,'chat_completions','m','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','secret','blocked',1)";
+    const INSERT: &str = "INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refuses) VALUES(gen_random_uuid(),gen_random_uuid(),$1,$2,'chat_completions','m','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','secret','blocked',1,true)";
     let before = (
         xmax(&pool, "workspaces").await,
         xmax(&pool, "api_keys").await,

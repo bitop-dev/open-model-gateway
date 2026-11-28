@@ -476,7 +476,7 @@ describe("What a rule can't read (#841)", () => {
     expect(inspectionSentence(images)).toBe("Image generation requests are never read: it refuses every one. If the rule can't run, the request is refused. Checked inside the gateway; nothing is sent anywhere else.");
     expect(inspectionSentence({ ...images, uninspectable: "allow" })).toContain("Image generation requests are never read: it lets them through unread and records each as not readable.");
     const both = { ...codes, workloads: ["generation", "realtime"] as Workload[], uninspectable: "allow" as const };
-    expect(inspectionSentence(both)).toContain("in the input of generation requests and refuses a request that has one. A request with an image, audio or a document that isn't plain text goes on with its text checked, recorded as not readable; a native batch is created without its lines being read");
+    expect(inspectionSentence(both)).toContain("in the input of generation requests and refuses a request that has one. A request with an image, audio or a document that isn't plain text goes on with its text checked, recorded as not readable. It still refuses a native batch when it is created");
     expect(inspectionSentence(both)).toContain("Realtime requests are never read: it lets them through unread");
     expect(refusesWhole({ action: "block", workloads: ["images", "realtime"] }, "every team workspace")).toBe("This refuses all image generation and realtime requests for every team workspace: their content is never read, so a Block rule that refuses what it can't read refuses every one.");
     expect(refusesWhole({ action: "block", uninspectable: "allow", workloads: ["images"] }, "x")).toBeUndefined();

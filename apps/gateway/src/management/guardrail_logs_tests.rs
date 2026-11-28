@@ -17,7 +17,7 @@ async fn key(pool: &PgPool, ws: Uuid, user: Uuid) -> Uuid {
 }
 async fn refused(pool: &PgPool, ws: Uuid, key: Uuid) -> Uuid {
     let root = Uuid::now_v7();
-    sqlx::query("INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,streamed,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused) VALUES(gen_random_uuid(),$1,$2,$3,'messages','company/smart',true,'input',gen_random_uuid(),gen_random_uuid(),4,'workspace_local','pattern','custom','blocked',2,true)")
+    sqlx::query("INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,streamed,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,refuses) VALUES(gen_random_uuid(),$1,$2,$3,'messages','company/smart',true,'input',gen_random_uuid(),gen_random_uuid(),4,'workspace_local','pattern','custom','blocked',2,true,true)")
         .bind(root)
         .bind(ws)
         .bind(key)
@@ -130,7 +130,7 @@ async fn refused_requests_are_listed_as_blocked_with_logs_visibility(pool: PgPoo
     assert!(staff.contains(&own.to_string()) && !staff.contains(&private.to_string()));
     // For a personal workspace they see this month's totals only, and never
     // of its local layer (the refused request above was decided there).
-    sqlx::query("INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count) SELECT gen_random_uuid(),gen_random_uuid(),workspace_id,api_key_id,'embeddings','company/smart','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','secret','monitored',3 FROM guardrail_events WHERE root_request_id=$1")
+    sqlx::query("INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refuses) SELECT gen_random_uuid(),gen_random_uuid(),workspace_id,api_key_id,'embeddings','company/smart','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','secret','monitored',3,false FROM guardrail_events WHERE root_request_id=$1")
         .bind(private)
         .execute(&pool)
         .await
@@ -138,7 +138,7 @@ async fn refused_requests_are_listed_as_blocked_with_logs_visibility(pool: PgPoo
     // One request's decision of a platform personal-data rule that found
     // two kinds, and another request's: platform staff see two decisions
     // per action and category, never which kinds were sent or how many.
-    let personal_kind = "INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,kind,action,count) SELECT gen_random_uuid(),$4,workspace_id,api_key_id,'embeddings','company/smart','input',$5,$5,1,'type_default','pattern','personal_data',$2,'monitored',$3 FROM guardrail_events WHERE root_request_id=$1";
+    let personal_kind = "INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,kind,action,count,refuses) SELECT gen_random_uuid(),$4,workspace_id,api_key_id,'embeddings','company/smart','input',$5,$5,1,'type_default','pattern','personal_data',$2,'monitored',$3,false FROM guardrail_events WHERE root_request_id=$1";
     let (one, other, pd_rule) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
     for (root, kind, count) in [(one, "us_ssn", 2), (one, "email", 5), (other, "email", 1)] {
         sqlx::query(personal_kind)
@@ -153,7 +153,7 @@ async fn refused_requests_are_listed_as_blocked_with_logs_visibility(pool: PgPoo
     }
     // A platform rule a local tightening made stricter decided this one: its
     // outcome may be the owner's choice, so it is left out too.
-    let tightened = "INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,tightened) SELECT gen_random_uuid(),gen_random_uuid(),workspace_id,api_key_id,'chat_completions','company/smart','input',gen_random_uuid(),gen_random_uuid(),1,'workspace_override','pattern','secret','blocked',1,true,true FROM guardrail_events WHERE root_request_id=$1";
+    let tightened = "INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,tightened,refuses) SELECT gen_random_uuid(),gen_random_uuid(),workspace_id,api_key_id,'chat_completions','company/smart','input',gen_random_uuid(),gen_random_uuid(),1,'workspace_override','pattern','secret','blocked',1,true,true,true FROM guardrail_events WHERE root_request_id=$1";
     sqlx::query(tightened)
         .bind(private)
         .execute(&pool)

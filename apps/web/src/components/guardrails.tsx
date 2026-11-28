@@ -79,7 +79,7 @@ const LAYER_PATTERNS = 50;
 const patternCount = (e: Entry) => isTightening(e) ? 0 : e.detector.pattern_count ?? e.detector.patterns?.length ?? 0;
 
 /** What the rule does with content it can't read (`uninspectable`). */
-const unreadableHelp = "Content the gateway can't read: an image, audio or a document that isn't plain text in a request, a native batch, and every image generation, transcription and realtime request. Let through, it is recorded as not readable: the text beside an image is still checked, but an image prompt, audio, a realtime session and a native batch's lines are not read at all. Only a Block rule refuses.";
+const unreadableHelp = "Content the gateway can't read: an image, audio or a document that isn't plain text in a request, and every image generation, transcription and realtime request. Let through, it is recorded as not readable: the text beside an image is still checked, but an image prompt, audio and a realtime session are not read at all. Only a Block rule refuses, and it refuses a native batch either way (a batch run in the gateway has each line checked).";
 /**
  * The rule dialog. `others`: the layer's patterns outside this rule, which
  * share its limit. `audience`: who the layer's rules apply to, for the
@@ -160,7 +160,8 @@ export function tightenRule(ask: ReturnType<typeof useAction>, rule: EffectiveEn
     // Only a Block rule refuses: offered when the rule blocks, or is made to.
     ...(unread ? [{ name: "uninspectable", label: "What it can't read", type: "select" as const, value: current === "block" ? "deny" : "", help: unreadableHelp,
       visibleWhen: (all: Record<string, string | undefined>) => current === "block" || all.action === "block",
-      validate: (u: string, all: Record<string, string | undefined>) => !u && !all.action ? "Choose something to make stricter." : undefined,
+      // With the action kept too, there is nothing to make stricter.
+      requiredWhen: (all: Record<string, string | undefined>) => !all.action,
       options: [{ value: "", label: "Keep: let it through unread" }, { value: "deny", label: "Refuse the request" }] }] : []),
   ],
     submitLabel: "Tighten", successNotice: "Rule tightened.",

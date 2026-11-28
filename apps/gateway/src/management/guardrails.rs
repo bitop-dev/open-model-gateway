@@ -474,7 +474,9 @@ async fn with_totals(s: &Store, ws: Uuid, mut v: Value) -> Result<Value> {
     // shows through a platform rule's row). Other actions are not split
     // (`refuses` is null), so one decision of a rule counts once. Rows
     // written before migration 0100 have no verdict (null).
-    let totals: Vec<(String, String, Option<String>, Option<bool>, i64, i64)> = sqlx::query_as(
+    // action, category, kind, refuses, decisions, findings
+    type Total = (String, String, Option<String>, Option<bool>, i64, i64);
+    let totals: Vec<Total> = sqlx::query_as(
         "SELECT action,category,CASE WHEN $2 THEN kind END AS k,CASE WHEN action='skipped' THEN refuses END AS r,CASE WHEN $2 THEN count(*) ELSE count(DISTINCT (root_request_id,rule_id,stage)) END,coalesce(sum(count) FILTER(WHERE action IN('monitored','redacted','blocked','stopped')),0)::bigint FROM guardrail_events WHERE workspace_id=$1 AND created_at>=$3 AND ($2 OR (layer<>'workspace_local' AND NOT tightened)) GROUP BY action,category,k,r ORDER BY action,category,k NULLS FIRST,r NULLS FIRST",
     )
     .bind(ws)

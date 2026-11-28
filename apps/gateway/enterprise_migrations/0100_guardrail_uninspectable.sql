@@ -70,5 +70,11 @@ ALTER TABLE guardrail_events ADD CONSTRAINT guardrail_events_operation CHECK (
 -- no row is rewritten; null on every row written before (their rule's
 -- verdict was not recorded).
 ALTER TABLE guardrail_events ADD COLUMN refuses boolean;
+-- Every decision written from now on states its verdict, and the decision
+-- the client was refused with is one that refuses. NOT VALID, on every
+-- partition: earlier rows have no verdict, and validating would scan the
+-- history under this lock.
+ALTER TABLE guardrail_events ADD CONSTRAINT guardrail_events_refuses CHECK (
+ refuses IS NOT NULL AND (refuses OR NOT refused)) NOT VALID;
 COMMENT ON COLUMN guardrail_events.refuses IS 'Whether the decision''s rule refuses its request (its own verdict, whatever other decisions did); null on rows written before migration 0100.';
 RESET lock_timeout;
