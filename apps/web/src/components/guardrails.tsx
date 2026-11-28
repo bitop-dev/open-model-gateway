@@ -9,10 +9,10 @@
  */
 import { api, ApiError } from "../lib/api";
 import {
-  actionHelp, actionLabels, inactiveLabels, inspectionSentence, isTightening, looksFor, looksForLabels, onErrorHelp, refusalMessages, ruleInput, sourceLabels, stricterActions, toInput,
+  actionHelp, actionLabels, inactiveLabels, inspectionSentence, isTightening, kindMatches, kinds, personalKindLabels, looksFor, looksForLabels, onErrorHelp, refusalMessages, ruleInput, sourceLabels, stricterActions, toInput,
   type EffectiveEntry, type Entry, type InputAction, type RuleSet, type StoredRule, type Tightening,
 } from "../lib/guardrails";
-import type { Field } from "../lib/forms";
+import { parseCheckboxValues, type Field } from "../lib/forms";
 import { Button, Inline, useAction } from "./ui";
 import { Badge } from "./ui/badge/badge";
 import { Card } from "./ui/card/card";
@@ -85,10 +85,13 @@ const ruleFields = (rule: StoredRule | undefined, others: number, actions: Input
     { name: "name", label: "Name", required: true, maxLength: 100, value: rule?.name ?? "" },
     { name: "protection", label: "Looks for", type: "select", required: true, value: looks, options: [
       { value: "secrets", label: "Secrets (keys, tokens, private keys, connection strings)" }, { value: "custom", label: "Custom patterns" },
+      { value: "personal", label: "Personal data (choose the kinds)" },
       // Offered only to a rule that already has both (written through the API).
       ...(looks === "both" ? [{ value: "both", label: "Secrets and custom patterns" }] : []),
     ] },
-    { name: "patterns", label: "Patterns", type: "textarea", value: rule?.detector.patterns?.join("\n") ?? "", visibleWhen: v => v.protection !== "secrets", requiredWhen: v => v.protection !== "secrets", help: `Regular expressions, one per line, 512 bytes each: at most ${LAYER_PATTERNS} in this layer, ${left} for this rule. Use ASCII classes like [0-9].`, validate: (v, all) => all.protection === "secrets" ? undefined : v.split("\n").filter(p => p.trim()).length > left ? `This layer allows ${LAYER_PATTERNS} patterns in all; ${left} are left for this rule.` : undefined },
+    // No kind is ticked to begin with: a rule looks only for what is chosen, so a Block rule never refuses more than its writer picked.
+    { name: "kinds", label: "Kinds", type: "checkboxes", value: JSON.stringify(rule?.detector.kinds ?? []), visibleWhen: v => v.protection === "personal", requiredWhen: v => v.protection === "personal", help: "Coding traffic is full of email addresses and IP addresses: start with Monitor and read the decisions before blocking a kind.", validate: (v, all) => all.protection === "personal" && parseCheckboxValues(v).length === 0 ? "Choose at least one kind: the rule looks only for the kinds chosen." : undefined, options: kinds.map(k => ({ value: k, label: `${personalKindLabels[k]}: ${kindMatches[k]}` })) },
+    { name: "patterns", label: "Patterns", type: "textarea", value: rule?.detector.patterns?.join("\n") ?? "", visibleWhen: v => v.protection === "custom" || v.protection === "both", requiredWhen: v => v.protection === "custom" || v.protection === "both", help: `Regular expressions, one per line, 512 bytes each: at most ${LAYER_PATTERNS} in this layer, ${left} for this rule. Use ASCII classes like [0-9].`, validate: (v, all) => all.protection !== "custom" && all.protection !== "both" ? undefined : v.split("\n").filter(p => p.trim()).length > left ? `This layer allows ${LAYER_PATTERNS} patterns in all; ${left} are left for this rule.` : undefined },
     { name: "action", label: "On input", type: "select", required: true, value: rule?.input.action ?? "monitor", options: actions.map(a => ({ value: a, label: `${actionLabels[a]}: ${actionHelp[a]}` })) },
     // A stored value that is its action's default shows as the default, so changing the action changes it too.
     { name: "on_error", label: "If the rule can't run", type: "select", value: rule?.on_error && rule.on_error !== defaultOnError(rule) ? rule.on_error : "", help: onErrorHelp, options: [{ value: "", label: "Default: refused for Block, goes on for Monitor" }, { value: "fail_closed", label: "Refuse the request" }, { value: "fail_open", label: "Let the request go on and record it" }] },

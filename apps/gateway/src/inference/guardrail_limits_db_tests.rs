@@ -11,10 +11,12 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::guardrail_db_tests::{World, events, secret, type_default, world};
+use super::guardrail_db_tests::{World, events, secret, type_default, type_default_with, world};
 use crate::auth::NewApiKey;
 use crate::guardrails::detector::Inspection;
-use crate::guardrails::limits::{self, RECORDED, RECORDED_PER_MINUTE, SHARE, SHARED_SCANS};
+use crate::guardrails::limits::{
+    self, LOCAL_SCANS, RECORDED, RECORDED_PER_MINUTE, SHARE, SHARED_SCANS,
+};
 use crate::guardrails::policy::Workload;
 use crate::store::Store;
 
@@ -86,6 +88,77 @@ async fn team_token(w: &World) -> String {
         .bind(key.id).bind(w.f.team.workspace_id).bind(w.f.team.user_id).bind(key.digest.as_slice())
         .execute(&w.f.store.pool).await.unwrap();
     key.token
+}
+
+/// A personal-data scan of more than a few KiB runs in a scan slot (a
+/// local layer's rule in the local pool), one of less runs inline, and a
+/// scan whose budget ran out is the same retryable 503 as a busy gateway's.
+#[dbtest::test]
+async fn a_personal_data_scan_takes_a_slot_above_a_few_kib_and_its_budget_is_enforced(
+    pool: PgPool,
+) {
+    let w = world(pool, "'chat_completions'").await;
+    let (_, rule) = type_default_with(&w, "block", "{personal_data}", &[], &["card"]).await;
+    let ws = w.f.principal.workspace_id;
+    let chat = |content: String| json!({"model":"company/smart","messages":[{"role":"user","content":content}]});
+    let (small, large) = (chat("hello".into()), chat("word ".repeat(2_000)));
+    let busy = |status: u16, body: &Value| {
+        assert_eq!(status, 503, "{body}");
+        assert_eq!(error(body)["code"], "guardrail_unavailable", "{body}");
+        assert_eq!(
+            error(body)["guardrail"]["category"],
+            "personal_data",
+            "{body}"
+        );
+    };
+    let mut held = Vec::new();
+    for _ in 0..SHARE {
+        held.push(SHARED_SCANS.acquire(ws).await.unwrap());
+    }
+    let (status, _, body) = post(&w.base, &w.token, "/v1/chat/completions", &small).await;
+    assert_eq!(status, 200, "inline below a few KiB: {body}");
+    let (status, headers, body) = post(&w.base, &w.token, "/v1/chat/completions", &large).await;
+    busy(status, &body);
+    assert_eq!(header(&headers, "retry-after"), Some("1"));
+    drop(held);
+    // A personal-data rule of a Team's local layer (written by one of its
+    // owners or admins): its scans use the local pool, so the Team's whole
+    // share of the shared pool held does not stop them.
+    let team = w.f.team.workspace_id;
+    let token = team_token(&w).await;
+    let local = Uuid::now_v7();
+    let mut tx = w.f.store.pool.begin().await.unwrap();
+    let writer: Uuid = sqlx::query_scalar("SELECT user_id FROM effective_workspace_memberships WHERE workspace_id=$1 AND role IN ('owner','admin') LIMIT 1")
+        .bind(team).fetch_one(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO guardrail_rule_sets(id,layer,workspace_id,updated_by) VALUES($1,'workspace_local',$2,$3)")
+        .bind(local).bind(team).bind(writer).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable,kinds) VALUES($1,$2,0,'Mail','personal_data','pattern','{personal_data}','monitor','user_text','off','fail_open','{generation}','deny','{email}')")
+        .bind(Uuid::now_v7()).bind(local).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    let mut held = Vec::new();
+    for _ in 0..SHARE {
+        held.push(SHARED_SCANS.acquire(team).await.unwrap());
+    }
+    let (status, _, body) = post(&w.base, &token, "/v1/chat/completions", &large).await;
+    assert_eq!(status, 200, "the local pool: {body}");
+    let mut local_held = Vec::new();
+    for _ in 0..SHARE {
+        local_held.push(LOCAL_SCANS.acquire(team).await.unwrap());
+    }
+    drop(held);
+    let (status, _, body) = post(&w.base, &token, "/v1/chat/completions", &large).await;
+    busy(status, &body);
+    drop(local_held);
+    // Out of budget: refused, retryable, and nothing is sent.
+    let hits = w.hits.load(Ordering::SeqCst);
+    crate::guardrails::enforce::SPEND_BUDGET
+        .lock()
+        .unwrap()
+        .insert(rule, [true].into());
+    let (status, headers, body) = post(&w.base, &w.token, "/v1/chat/completions", &small).await;
+    busy(status, &body);
+    assert_ne!(header(&headers, "x-should-retry"), Some("false"));
+    assert_eq!(w.hits.load(Ordering::SeqCst), hits, "nothing was sent");
 }
 
 /// While one workspace holds its whole share of the scan slots, its next

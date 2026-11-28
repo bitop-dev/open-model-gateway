@@ -127,6 +127,16 @@ pub(super) async fn type_default(
     categories: &str,
     patterns: &[String],
 ) -> (Uuid, Uuid) {
+    type_default_with(w, action, categories, patterns, &[]).await
+}
+/// As [`type_default`], for a personal-data rule naming `kinds`.
+pub(super) async fn type_default_with(
+    w: &World,
+    action: &str,
+    categories: &str,
+    patterns: &[String],
+    kinds: &[&str],
+) -> (Uuid, Uuid) {
     let pool = &w.f.store.pool;
     let kind: String = sqlx::query_scalar("SELECT kind FROM workspaces WHERE id=$1")
         .bind(w.f.principal.workspace_id)
@@ -166,7 +176,9 @@ pub(super) async fn type_default(
         }
     };
     let rule = Uuid::now_v7();
-    let protection = if patterns.is_empty() {
+    let protection = if !kinds.is_empty() {
+        "personal_data"
+    } else if patterns.is_empty() {
         "secrets"
     } else {
         "custom"
@@ -176,8 +188,8 @@ pub(super) async fn type_default(
     } else {
         "fail_open"
     };
-    sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable,patterns) VALUES($1,$2,0,'Rule',$3,'pattern',$4::text[],$5,'user_text','off',$6,'{generation,embeddings}','deny',$7)")
-        .bind(rule).bind(set).bind(protection).bind(categories).bind(action).bind(on_error).bind(patterns)
+    sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable,patterns,kinds) VALUES($1,$2,0,'Rule',$3,'pattern',$4::text[],$5,'user_text','off',$6,'{generation,embeddings}','deny',$7,$8)")
+        .bind(rule).bind(set).bind(protection).bind(categories).bind(action).bind(on_error).bind(patterns).bind(kinds)
         .execute(&mut *tx).await.unwrap();
     tx.commit().await.unwrap();
     (set, rule)
@@ -290,6 +302,58 @@ async fn embeddings_inputs_are_inspected(pool: PgPool) {
         "the body never echoes the match"
     );
     assert_eq!(events(&w).await[0].0, "embeddings");
+}
+
+/// #841: a personal-data rule looks only for the kinds it names, records a
+/// decision per kind it found (with the kind, never the value), and blocks on
+/// its kinds only.
+#[dbtest::test]
+async fn a_personal_data_rule_looks_for_its_kinds_only(pool: PgPool) {
+    let w = world(pool, "'chat_completions'").await;
+    let kinds = async |w: &World| -> Vec<(String, Option<String>, i32)> {
+        sqlx::query_as("SELECT action,kind,count FROM guardrail_events WHERE category='personal_data' ORDER BY kind")
+            .fetch_all(&w.f.store.pool)
+            .await
+            .unwrap()
+    };
+    let text = "mail alice.smith@acme-corp.io or bob@acme-corp.io from 8.8.8.8 (and 10.0.0.1), card 4111 1111 1111 1111";
+    type_default_with(&w, "monitor", "{personal_data}", &[], &["email", "ip"]).await;
+    let chat = json!({"model":"company/smart","messages":[{"role":"user","content":text}]});
+    let (status, _, _) = send(&w, "/v1/chat/completions", chat.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        kinds(&w).await,
+        [
+            ("monitored".into(), Some("email".into()), 2),
+            ("monitored".into(), Some("ip".into()), 1),
+        ],
+        "the card is not a kind this rule names; the private address is not personal data"
+    );
+    // A blocking rule on cards refuses the same text before anything is sent,
+    // and lets through text without a card.
+    type_default_with(&w, "block", "{personal_data}", &[], &["card"]).await;
+    let hits = w.hits.load(Ordering::SeqCst);
+    let (status, _, body) = send(&w, "/v1/chat/completions", chat).await;
+    // The response to a request that held a card: asserted without
+    // printing it.
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "guardrail_input_blocked");
+    assert_eq!(body["error"]["guardrail"]["category"], "personal_data");
+    assert!(
+        !body.to_string().contains("4111"),
+        "the refusal holds no matched text"
+    );
+    assert_eq!(w.hits.load(Ordering::SeqCst), hits, "nothing was sent");
+    let blocked: (String, Option<String>, bool) = sqlx::query_as("SELECT action,kind,refused FROM guardrail_events WHERE category='personal_data' AND action='blocked'")
+        .fetch_one(&w.f.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(blocked, ("blocked".into(), Some("card".into()), true));
+    let clean = json!({"model":"company/smart","messages":[{"role":"user","content":"mail alice.smith@acme-corp.io"}]});
+    assert_eq!(
+        send(&w, "/v1/chat/completions", clean).await.0,
+        StatusCode::OK
+    );
 }
 
 #[dbtest::test]
@@ -641,4 +705,208 @@ async fn an_image_under_a_monitor_rule_passes_and_is_recorded_skipped(pool: PgPo
     last.sort();
     assert_eq!(last, [("monitored".into(), 1), ("skipped".into(), 1)]);
     assert_eq!(w.hits.load(Ordering::SeqCst), 2);
+}
+
+/// #841 (0099) on an installation with guardrails: rules written before the
+/// migration (secrets, custom, a tightening) and their decisions are kept and
+/// read as before (no kinds, no kind); a personal-data rule can then be
+/// stored with its kinds, and only with them.
+#[sqlx::test(migrations = false)]
+async fn the_kinds_migration_keeps_earlier_rules_and_decisions(pool: PgPool) {
+    let all = sqlx::migrate!("./enterprise_migrations");
+    let through = |last: i64| sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            all.iter().filter(|m| m.version <= last).cloned().collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    // Every migration before this one.
+    through(98).run(&pool).await.unwrap();
+    let f = crate::governance::tests::db::fixture(pool.clone()).await;
+    let ws = f.principal.workspace_id;
+    // The type default of the Team's kind, which its local layer tightens.
+    let kind: String = sqlx::query_scalar("SELECT kind FROM workspaces WHERE id=$1")
+        .bind(f.team.workspace_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (set, local) = (Uuid::now_v7(), Uuid::now_v7());
+    let (secrets, custom) = (Uuid::now_v7(), Uuid::now_v7());
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("INSERT INTO guardrail_rule_sets(id,layer,kind,local_only,updated_by) VALUES($1,'type_default',$2,false,$3)")
+        .bind(set).bind(&kind).bind(f.owner).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable) VALUES($1,$2,0,'Secrets','secrets','pattern','{secret}','monitor','user_text','off','fail_open','{generation}','deny')")
+        .bind(secrets).bind(set).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable,patterns) VALUES($1,$2,1,'Codes','custom','pattern','{custom}','block','user_text','off','fail_closed','{generation}','deny','{ACME-[0-9]+}')")
+        .bind(custom).bind(set).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    // A local layer is written by one of the workspace's owners or admins.
+    let team = f.team.workspace_id;
+    let admin: Uuid = sqlx::query_scalar("SELECT user_id FROM effective_workspace_memberships WHERE workspace_id=$1 AND role IN ('owner','admin') LIMIT 1")
+        .bind(team).fetch_one(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO guardrail_rule_sets(id,layer,workspace_id,updated_by) VALUES($1,'workspace_local',$2,$3)")
+        .bind(local).bind(team).bind(admin).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,tightens_rule_id,input_action) VALUES($1,$2,0,$3,'block')")
+        .bind(Uuid::now_v7()).bind(local).bind(secrets).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    sqlx::query("INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count) VALUES($1,$2,$3,$4,'chat_completions','company/smart','input',$5,$6,1,'type_default','pattern','secret','monitored',2)")
+        .bind(Uuid::now_v7()).bind(Uuid::now_v7()).bind(ws).bind(f.principal.key_id).bind(set).bind(secrets)
+        .execute(&pool).await.unwrap();
+
+    through(i64::MAX).run(&pool).await.unwrap();
+    let kinds: Vec<Vec<String>> =
+        sqlx::query_scalar("SELECT kinds FROM guardrail_rules ORDER BY rule_set_id,position")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        kinds,
+        [Vec::<String>::new(), vec![], vec![]],
+        "earlier rules name no kinds"
+    );
+    let event: Option<String> = sqlx::query_scalar("SELECT kind FROM guardrail_events")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(event, None);
+    let mut conn = pool.acquire().await.unwrap();
+    let read =
+        crate::guardrails::stored::load(&mut conn, crate::guardrails::stored::Scope::Type(&kind))
+            .await
+            .unwrap()
+            .expect("readable")
+            .expect("the type default");
+    assert_eq!(read.rules.len(), 2);
+    drop(conn);
+    // A personal-data rule is stored with its kinds, and not without them.
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("UPDATE guardrail_rule_sets SET revision=revision+1,updated_by=$2 WHERE id=$1")
+        .bind(set)
+        .bind(f.owner)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable,kinds) VALUES($1,$2,2,'Cards','personal_data','pattern','{personal_data}','block','user_text','off','fail_closed','{generation}','deny','{card}')")
+        .bind(Uuid::now_v7()).bind(set).execute(&mut *tx).await.unwrap();
+    let missing = sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable) VALUES($1,$2,3,'All','personal_data','pattern','{personal_data}','block','user_text','off','fail_closed','{generation}','deny')")
+        .bind(Uuid::now_v7()).bind(set).execute(&mut *tx).await;
+    assert_eq!(
+        sqlstate(missing.map(|_| ())),
+        "23514",
+        "a personal-data rule without kinds"
+    );
+    drop(tx);
+    // A decision's kind is checked in the month partition that existed
+    // before the migration and in one created after it: only a known kind,
+    // and only on a personal-data decision.
+    let created: Vec<(String, String)> = sqlx::query_as(
+        "SELECT parent,partition FROM omg_ensure_partitions(0,clock_timestamp()+interval '14 months')",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(
+        created
+            .iter()
+            .any(|(parent, _)| parent == "guardrail_events"),
+        "{created:?}"
+    );
+    for at in [
+        "clock_timestamp()",
+        "clock_timestamp()+interval '14 months'",
+    ] {
+        let insert = |category: &'static str, kind: &'static str| {
+            let pool = pool.clone();
+            let sql = format!(
+                "INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,kind,action,count,created_at) VALUES($1,$2,$3,$4,'chat_completions','company/smart','input',$5,$6,1,'type_default','pattern',$7,$8,'monitored',1,{at})"
+            );
+            async move {
+                sqlx::query(&sql)
+                    .bind(Uuid::now_v7())
+                    .bind(Uuid::now_v7())
+                    .bind(ws)
+                    .bind(f.principal.key_id)
+                    .bind(set)
+                    .bind(secrets)
+                    .bind(category)
+                    .bind(kind)
+                    .execute(&pool)
+                    .await
+                    .map(|_| ())
+            }
+        };
+        assert_eq!(sqlstate(insert("secret", "email").await), "23514", "{at}");
+        assert_eq!(
+            sqlstate(insert("personal_data", "passport").await),
+            "23514",
+            "{at}"
+        );
+        insert("personal_data", "email").await.expect(at);
+    }
+}
+
+/// 0099 on a database where a rule already looks for personal data (no
+/// release wrote one: it was written directly) stops and names the rows,
+/// and applies once they are gone.
+#[sqlx::test(migrations = false)]
+async fn the_kinds_migration_stops_on_a_personal_data_rule_written_directly(pool: PgPool) {
+    let all = sqlx::migrate!("./enterprise_migrations");
+    let through = |last: i64| sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            all.iter().filter(|m| m.version <= last).cloned().collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    through(98).run(&pool).await.unwrap();
+    let f = crate::governance::tests::db::fixture(pool.clone()).await;
+    let kind: String = sqlx::query_scalar("SELECT kind FROM workspaces WHERE id=$1")
+        .bind(f.team.workspace_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let set = Uuid::now_v7();
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("INSERT INTO guardrail_rule_sets(id,layer,kind,local_only,updated_by) VALUES($1,'type_default',$2,false,$3)")
+        .bind(set).bind(&kind).bind(f.owner).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable) VALUES($1,$2,0,'PII','personal_data','pattern','{personal_data}','block','user_text','off','fail_closed','{generation}','deny')")
+        .bind(Uuid::now_v7()).bind(set).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    let err = through(i64::MAX).run(&pool).await.unwrap_err().to_string();
+    assert!(
+        err.contains("1 guardrail rule(s) already look for personal_data"),
+        "{err}"
+    );
+    let version: i64 =
+        sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations WHERE success")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(version, 98, "nothing of 0099 applied");
+    // Removed (by the set's writer, which moves its revision), it applies.
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("UPDATE guardrail_rule_sets SET revision=revision+1,updated_by=$2 WHERE id=$1")
+        .bind(set)
+        .bind(f.owner)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM guardrail_rules WHERE rule_set_id=$1")
+        .bind(set)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    through(i64::MAX).run(&pool).await.unwrap();
+}
+
+fn sqlstate(r: Result<(), sqlx::Error>) -> String {
+    match r {
+        Err(sqlx::Error::Database(e)) => e.code().map(|c| c.into_owned()).unwrap_or_default(),
+        other => format!("{other:?}"),
+    }
 }

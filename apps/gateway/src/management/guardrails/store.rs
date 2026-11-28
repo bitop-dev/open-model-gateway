@@ -99,7 +99,7 @@ pub(super) async fn store(
         }
     };
     for (position, r) in rules.iter().enumerate() {
-        let q = sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,tightens_rule_id,name,protection,detector_kind,detector_ref,categories,input_action,redact_scope,output_mode,threshold,on_error,timeout_ms,workloads,uninspectable,patterns) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::numeric/1000,$14,$15,$16,$17,$18)")
+        let q = sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,tightens_rule_id,name,protection,detector_kind,detector_ref,categories,input_action,redact_scope,output_mode,threshold,on_error,timeout_ms,workloads,uninspectable,patterns,kinds) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::numeric/1000,$14,$15,$16,$17,$18,$19)")
             .bind(r.id)
             .bind(id)
             .bind(i16::try_from(position).map_err(|_| invalid())?);
@@ -119,6 +119,7 @@ pub(super) async fn store(
                 .bind(None::<i32>)
                 .bind(None::<Vec<String>>)
                 .bind(None::<String>)
+                .bind(Vec::<String>::new())
                 .bind(Vec::<String>::new()),
             Entry::Rule(rule) => q
                 .bind(None::<Uuid>)
@@ -146,7 +147,14 @@ pub(super) async fn store(
                         .collect::<Vec<_>>(),
                 ))
                 .bind(Some(rule.uninspectable.as_str()))
-                .bind(&rule.detector.patterns),
+                .bind(&rule.detector.patterns)
+                .bind(
+                    rule.detector
+                        .kinds
+                        .iter()
+                        .map(|k| k.as_str().to_owned())
+                        .collect::<Vec<_>>(),
+                ),
         };
         q.execute(&mut **tx).await?;
     }

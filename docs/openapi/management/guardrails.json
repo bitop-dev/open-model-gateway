@@ -555,6 +555,7 @@
               "items": {
                 "enum": [
                   "secret",
+                  "personal_data",
                   "custom"
                 ]
               },
@@ -575,6 +576,21 @@
               },
               "maxItems": 50,
               "type": "array"
+            },
+            "kinds": {
+              "description": "Required for the personal_data category, with at least one kind, each once; empty or absent for other categories. There is no all-kinds value, so a later kind never changes an existing rule.",
+              "items": {
+                "enum": [
+                  "email",
+                  "phone",
+                  "card",
+                  "iban",
+                  "us_ssn",
+                  "ip"
+                ]
+              },
+              "type": "array",
+              "uniqueItems": true
             }
           },
           "required": [
@@ -643,6 +659,7 @@
         "protection": {
           "enum": [
             "secrets",
+            "personal_data",
             "custom"
           ]
         },
@@ -733,7 +750,7 @@
       "additionalProperties": false,
       "properties": {
         "decisions_this_month": {
-          "description": "This month's guardrail decisions on the workspace (UTC month), per action and category: totals only, never request detail, also for a personal workspace, but never of a personal workspace's local layer (#840).",
+          "description": "This month's guardrail decisions on the workspace (UTC month), per action, category and personal-data kind: totals only, never request detail, also for a personal workspace (per action and category only), but never of a personal workspace's local layer (#840, #841).",
           "items": {
             "additionalProperties": false,
             "properties": {
@@ -764,18 +781,36 @@
                 "description": "Distinct matches of the decisions that found something (0 for skipped or failed rules).",
                 "minimum": 0,
                 "type": "integer"
+              },
+              "kind": {
+                "description": "#841: the personal-data kind of a personal_data total that found something; null for other categories, for skipped or failed decisions, and for every total of a personal workspace (whose totals are per action and category only).",
+                "oneOf": [
+                  {
+                    "enum": [
+                      "email",
+                      "phone",
+                      "card",
+                      "iban",
+                      "us_ssn",
+                      "ip"
+                    ]
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               }
             },
             "required": [
               "action",
               "category",
               "decisions",
-              "findings"
+              "findings",
+              "kind"
             ],
             "type": "object"
           },
-          "type": "array",
-          "x-omg-may-be-empty": "No guardrail decision this month."
+          "type": "array"
         },
         "effective": {
           "anyOf": [
@@ -833,6 +868,23 @@
                           "type": "string"
                         },
                         "maxItems": 50,
+                        "type": "array"
+                      },
+                      "kinds": {
+                        "description": "#841: the personal-data kinds a personal_data rule looks for (at least one, each once); absent for other rules.",
+                        "items": {
+                          "enum": [
+                            "email",
+                            "phone",
+                            "card",
+                            "iban",
+                            "us_ssn",
+                            "ip"
+                          ]
+                        },
+                        "minItems": 1,
+                        "maxItems": 6,
+                        "uniqueItems": true,
                         "type": "array"
                       }
                     },
@@ -1117,6 +1169,23 @@
                                   "type": "string"
                                 },
                                 "maxItems": 50,
+                                "type": "array"
+                              },
+                              "kinds": {
+                                "description": "#841: the personal-data kinds a personal_data rule looks for (at least one, each once); absent for other rules.",
+                                "items": {
+                                  "enum": [
+                                    "email",
+                                    "phone",
+                                    "card",
+                                    "iban",
+                                    "us_ssn",
+                                    "ip"
+                                  ]
+                                },
+                                "minItems": 1,
+                                "maxItems": 6,
+                                "uniqueItems": true,
                                 "type": "array"
                               }
                             },
@@ -1414,6 +1483,23 @@
                                 },
                                 "maxItems": 50,
                                 "type": "array"
+                              },
+                              "kinds": {
+                                "description": "#841: the personal-data kinds a personal_data rule looks for (at least one, each once); absent for other rules.",
+                                "items": {
+                                  "enum": [
+                                    "email",
+                                    "phone",
+                                    "card",
+                                    "iban",
+                                    "us_ssn",
+                                    "ip"
+                                  ]
+                                },
+                                "minItems": 1,
+                                "maxItems": 6,
+                                "uniqueItems": true,
+                                "type": "array"
                               }
                             },
                             "required": [
@@ -1647,6 +1733,23 @@
                               "type": "string"
                             },
                             "maxItems": 50,
+                            "type": "array"
+                          },
+                          "kinds": {
+                            "description": "#841: the personal-data kinds a personal_data rule looks for (at least one, each once); absent for other rules.",
+                            "items": {
+                              "enum": [
+                                "email",
+                                "phone",
+                                "card",
+                                "iban",
+                                "us_ssn",
+                                "ip"
+                              ]
+                            },
+                            "minItems": 1,
+                            "maxItems": 6,
+                            "uniqueItems": true,
                             "type": "array"
                           }
                         },
@@ -2027,6 +2130,23 @@
                             },
                             "maxItems": 50,
                             "type": "array"
+                          },
+                          "kinds": {
+                            "description": "#841: the personal-data kinds a personal_data rule looks for (at least one, each once); absent for other rules.",
+                            "items": {
+                              "enum": [
+                                "email",
+                                "phone",
+                                "card",
+                                "iban",
+                                "us_ssn",
+                                "ip"
+                              ]
+                            },
+                            "minItems": 1,
+                            "maxItems": 6,
+                            "uniqueItems": true,
+                            "type": "array"
                           }
                         },
                         "required": [
@@ -2195,7 +2315,7 @@
       "additionalProperties": false,
       "properties": {
         "decisions_this_month": {
-          "description": "This month's guardrail decisions on the workspace (UTC month), per action and category: totals only, never request detail, also for a personal workspace, but never of a personal workspace's local layer (#840).",
+          "description": "This month's guardrail decisions on the workspace (UTC month), per action, category and personal-data kind: totals only, never request detail, also for a personal workspace (per action and category only), but never of a personal workspace's local layer (#840, #841).",
           "items": {
             "additionalProperties": false,
             "properties": {
@@ -2226,18 +2346,36 @@
                 "description": "Distinct matches of the decisions that found something (0 for skipped or failed rules).",
                 "minimum": 0,
                 "type": "integer"
+              },
+              "kind": {
+                "description": "#841: the personal-data kind of a personal_data total that found something; null for other categories, for skipped or failed decisions, and for every total of a personal workspace (whose totals are per action and category only).",
+                "oneOf": [
+                  {
+                    "enum": [
+                      "email",
+                      "phone",
+                      "card",
+                      "iban",
+                      "us_ssn",
+                      "ip"
+                    ]
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               }
             },
             "required": [
               "action",
               "category",
               "decisions",
-              "findings"
+              "findings",
+              "kind"
             ],
             "type": "object"
           },
-          "type": "array",
-          "x-omg-may-be-empty": "No guardrail decision this month."
+          "type": "array"
         },
         "effective": {
           "anyOf": [
@@ -2295,6 +2433,23 @@
                           "type": "string"
                         },
                         "maxItems": 50,
+                        "type": "array"
+                      },
+                      "kinds": {
+                        "description": "#841: the personal-data kinds a personal_data rule looks for (at least one, each once); absent for other rules.",
+                        "items": {
+                          "enum": [
+                            "email",
+                            "phone",
+                            "card",
+                            "iban",
+                            "us_ssn",
+                            "ip"
+                          ]
+                        },
+                        "minItems": 1,
+                        "maxItems": 6,
+                        "uniqueItems": true,
                         "type": "array"
                       }
                     },
@@ -2579,6 +2734,23 @@
                                   "type": "string"
                                 },
                                 "maxItems": 50,
+                                "type": "array"
+                              },
+                              "kinds": {
+                                "description": "#841: the personal-data kinds a personal_data rule looks for (at least one, each once); absent for other rules.",
+                                "items": {
+                                  "enum": [
+                                    "email",
+                                    "phone",
+                                    "card",
+                                    "iban",
+                                    "us_ssn",
+                                    "ip"
+                                  ]
+                                },
+                                "minItems": 1,
+                                "maxItems": 6,
+                                "uniqueItems": true,
                                 "type": "array"
                               }
                             },
@@ -2870,6 +3042,23 @@
                             },
                             "maxItems": 50,
                             "type": "array"
+                          },
+                          "kinds": {
+                            "description": "#841: the personal-data kinds a personal_data rule looks for (at least one, each once); absent for other rules.",
+                            "items": {
+                              "enum": [
+                                "email",
+                                "phone",
+                                "card",
+                                "iban",
+                                "us_ssn",
+                                "ip"
+                              ]
+                            },
+                            "minItems": 1,
+                            "maxItems": 6,
+                            "uniqueItems": true,
+                            "type": "array"
                           }
                         },
                         "required": [
@@ -3099,6 +3288,23 @@
                                   "type": "string"
                                 },
                                 "maxItems": 50,
+                                "type": "array"
+                              },
+                              "kinds": {
+                                "description": "#841: the personal-data kinds a personal_data rule looks for (at least one, each once); absent for other rules.",
+                                "items": {
+                                  "enum": [
+                                    "email",
+                                    "phone",
+                                    "card",
+                                    "iban",
+                                    "us_ssn",
+                                    "ip"
+                                  ]
+                                },
+                                "minItems": 1,
+                                "maxItems": 6,
+                                "uniqueItems": true,
                                 "type": "array"
                               }
                             },
@@ -3337,6 +3543,23 @@
                             },
                             "maxItems": 50,
                             "type": "array"
+                          },
+                          "kinds": {
+                            "description": "#841: the personal-data kinds a personal_data rule looks for (at least one, each once); absent for other rules.",
+                            "items": {
+                              "enum": [
+                                "email",
+                                "phone",
+                                "card",
+                                "iban",
+                                "us_ssn",
+                                "ip"
+                              ]
+                            },
+                            "minItems": 1,
+                            "maxItems": 6,
+                            "uniqueItems": true,
+                            "type": "array"
                           }
                         },
                         "required": [
@@ -3570,6 +3793,23 @@
                       "type": "string"
                     },
                     "maxItems": 50,
+                    "type": "array"
+                  },
+                  "kinds": {
+                    "description": "#841: the personal-data kinds a personal_data rule looks for (at least one, each once); absent for other rules.",
+                    "items": {
+                      "enum": [
+                        "email",
+                        "phone",
+                        "card",
+                        "iban",
+                        "us_ssn",
+                        "ip"
+                      ]
+                    },
+                    "minItems": 1,
+                    "maxItems": 6,
+                    "uniqueItems": true,
                     "type": "array"
                   }
                 },
@@ -3852,6 +4092,23 @@
                                   "type": "string"
                                 },
                                 "maxItems": 50,
+                                "type": "array"
+                              },
+                              "kinds": {
+                                "description": "#841: the personal-data kinds a personal_data rule looks for (at least one, each once); absent for other rules.",
+                                "items": {
+                                  "enum": [
+                                    "email",
+                                    "phone",
+                                    "card",
+                                    "iban",
+                                    "us_ssn",
+                                    "ip"
+                                  ]
+                                },
+                                "minItems": 1,
+                                "maxItems": 6,
+                                "uniqueItems": true,
                                 "type": "array"
                               }
                             },
@@ -4148,6 +4405,23 @@
                                   "type": "string"
                                 },
                                 "maxItems": 50,
+                                "type": "array"
+                              },
+                              "kinds": {
+                                "description": "#841: the personal-data kinds a personal_data rule looks for (at least one, each once); absent for other rules.",
+                                "items": {
+                                  "enum": [
+                                    "email",
+                                    "phone",
+                                    "card",
+                                    "iban",
+                                    "us_ssn",
+                                    "ip"
+                                  ]
+                                },
+                                "minItems": 1,
+                                "maxItems": 6,
+                                "uniqueItems": true,
                                 "type": "array"
                               }
                             },
@@ -4467,6 +4741,23 @@
                         },
                         "maxItems": 50,
                         "type": "array"
+                      },
+                      "kinds": {
+                        "description": "#841: the personal-data kinds a personal_data rule looks for (at least one, each once); absent for other rules.",
+                        "items": {
+                          "enum": [
+                            "email",
+                            "phone",
+                            "card",
+                            "iban",
+                            "us_ssn",
+                            "ip"
+                          ]
+                        },
+                        "minItems": 1,
+                        "maxItems": 6,
+                        "uniqueItems": true,
+                        "type": "array"
                       }
                     },
                     "required": [
@@ -4676,7 +4967,7 @@
       "additionalProperties": false,
       "properties": {
         "decisions_this_month": {
-          "description": "This month's guardrail decisions on the workspace (UTC month), per action and category: totals only, never request detail, also for a personal workspace, but never of a personal workspace's local layer (#840).",
+          "description": "This month's guardrail decisions on the workspace (UTC month), per action, category and personal-data kind: totals only, never request detail, also for a personal workspace (per action and category only), but never of a personal workspace's local layer (#840, #841).",
           "items": {
             "additionalProperties": false,
             "properties": {
@@ -4707,18 +4998,36 @@
                 "description": "Distinct matches of the decisions that found something (0 for skipped or failed rules).",
                 "minimum": 0,
                 "type": "integer"
+              },
+              "kind": {
+                "description": "#841: the personal-data kind of a personal_data total that found something; null for other categories, for skipped or failed decisions, and for every total of a personal workspace (whose totals are per action and category only).",
+                "oneOf": [
+                  {
+                    "enum": [
+                      "email",
+                      "phone",
+                      "card",
+                      "iban",
+                      "us_ssn",
+                      "ip"
+                    ]
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               }
             },
             "required": [
               "action",
               "category",
               "decisions",
-              "findings"
+              "findings",
+              "kind"
             ],
             "type": "object"
           },
-          "type": "array",
-          "x-omg-may-be-empty": "No guardrail decision this month."
+          "type": "array"
         },
         "effective": {
           "anyOf": [
@@ -4776,6 +5085,23 @@
                           "type": "string"
                         },
                         "maxItems": 50,
+                        "type": "array"
+                      },
+                      "kinds": {
+                        "description": "#841: the personal-data kinds a personal_data rule looks for (at least one, each once); absent for other rules.",
+                        "items": {
+                          "enum": [
+                            "email",
+                            "phone",
+                            "card",
+                            "iban",
+                            "us_ssn",
+                            "ip"
+                          ]
+                        },
+                        "minItems": 1,
+                        "maxItems": 6,
+                        "uniqueItems": true,
                         "type": "array"
                       }
                     },
@@ -5060,6 +5386,23 @@
                                   "type": "string"
                                 },
                                 "maxItems": 50,
+                                "type": "array"
+                              },
+                              "kinds": {
+                                "description": "#841: the personal-data kinds a personal_data rule looks for (at least one, each once); absent for other rules.",
+                                "items": {
+                                  "enum": [
+                                    "email",
+                                    "phone",
+                                    "card",
+                                    "iban",
+                                    "us_ssn",
+                                    "ip"
+                                  ]
+                                },
+                                "minItems": 1,
+                                "maxItems": 6,
+                                "uniqueItems": true,
                                 "type": "array"
                               }
                             },
@@ -5346,6 +5689,23 @@
                         },
                         "maxItems": 50,
                         "type": "array"
+                      },
+                      "kinds": {
+                        "description": "#841: the personal-data kinds a personal_data rule looks for (at least one, each once); absent for other rules.",
+                        "items": {
+                          "enum": [
+                            "email",
+                            "phone",
+                            "card",
+                            "iban",
+                            "us_ssn",
+                            "ip"
+                          ]
+                        },
+                        "minItems": 1,
+                        "maxItems": 6,
+                        "uniqueItems": true,
+                        "type": "array"
                       }
                     },
                     "required": [
@@ -5565,6 +5925,23 @@
                               "type": "string"
                             },
                             "maxItems": 50,
+                            "type": "array"
+                          },
+                          "kinds": {
+                            "description": "#841: the personal-data kinds a personal_data rule looks for (at least one, each once); absent for other rules.",
+                            "items": {
+                              "enum": [
+                                "email",
+                                "phone",
+                                "card",
+                                "iban",
+                                "us_ssn",
+                                "ip"
+                              ]
+                            },
+                            "minItems": 1,
+                            "maxItems": 6,
+                            "uniqueItems": true,
                             "type": "array"
                           }
                         },
@@ -5797,6 +6174,23 @@
                               "type": "string"
                             },
                             "maxItems": 50,
+                            "type": "array"
+                          },
+                          "kinds": {
+                            "description": "#841: the personal-data kinds a personal_data rule looks for (at least one, each once); absent for other rules.",
+                            "items": {
+                              "enum": [
+                                "email",
+                                "phone",
+                                "card",
+                                "iban",
+                                "us_ssn",
+                                "ip"
+                              ]
+                            },
+                            "minItems": 1,
+                            "maxItems": 6,
+                            "uniqueItems": true,
                             "type": "array"
                           }
                         },
@@ -6077,6 +6471,23 @@
                     },
                     "maxItems": 50,
                     "type": "array"
+                  },
+                  "kinds": {
+                    "description": "#841: the personal-data kinds a personal_data rule looks for (at least one, each once); absent for other rules.",
+                    "items": {
+                      "enum": [
+                        "email",
+                        "phone",
+                        "card",
+                        "iban",
+                        "us_ssn",
+                        "ip"
+                      ]
+                    },
+                    "minItems": 1,
+                    "maxItems": 6,
+                    "uniqueItems": true,
+                    "type": "array"
                   }
                 },
                 "required": [
@@ -6354,6 +6765,23 @@
                               "type": "string"
                             },
                             "maxItems": 50,
+                            "type": "array"
+                          },
+                          "kinds": {
+                            "description": "#841: the personal-data kinds a personal_data rule looks for (at least one, each once); absent for other rules.",
+                            "items": {
+                              "enum": [
+                                "email",
+                                "phone",
+                                "card",
+                                "iban",
+                                "us_ssn",
+                                "ip"
+                              ]
+                            },
+                            "minItems": 1,
+                            "maxItems": 6,
+                            "uniqueItems": true,
                             "type": "array"
                           }
                         },
@@ -6648,6 +7076,23 @@
                                   "type": "string"
                                 },
                                 "maxItems": 50,
+                                "type": "array"
+                              },
+                              "kinds": {
+                                "description": "#841: the personal-data kinds a personal_data rule looks for (at least one, each once); absent for other rules.",
+                                "items": {
+                                  "enum": [
+                                    "email",
+                                    "phone",
+                                    "card",
+                                    "iban",
+                                    "us_ssn",
+                                    "ip"
+                                  ]
+                                },
+                                "minItems": 1,
+                                "maxItems": 6,
+                                "uniqueItems": true,
                                 "type": "array"
                               }
                             },

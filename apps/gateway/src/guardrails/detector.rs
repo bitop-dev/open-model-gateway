@@ -8,7 +8,7 @@
 use std::borrow::Cow;
 use std::ops::Range;
 
-use super::policy::{Category, DetectorKind, Egress};
+use super::policy::{Category, DetectorKind, Egress, Kind};
 
 /// Where a segment's text came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,9 +97,11 @@ impl<'a> Inspection<'a> {
     }
 }
 
-/// One match: its category, segment index and byte span in that segment.
+/// One match: its category (and, for personal data, its kind), segment
+/// index and byte span in that segment.
 pub struct Finding {
     pub category: Category,
+    pub kind: Option<Kind>,
     pub segment: usize,
     pub span: Range<usize>,
 }
@@ -111,8 +113,15 @@ impl Findings {
     /// Distinct matched values of `category` (a value repeated in several
     /// places counts once). The values are compared in memory only.
     pub fn distinct(&self, input: &Inspection<'_>, category: Category) -> usize {
+        self.distinct_where(input, |f| f.category == category)
+    }
+    /// Distinct matched values of personal-data `kind`.
+    pub fn distinct_kind(&self, input: &Inspection<'_>, kind: Kind) -> usize {
+        self.distinct_where(input, |f| f.kind == Some(kind))
+    }
+    fn distinct_where(&self, input: &Inspection<'_>, keep: impl Fn(&Finding) -> bool) -> usize {
         let mut seen = std::collections::HashSet::new();
-        for f in self.0.iter().filter(|f| f.category == category) {
+        for f in self.0.iter().filter(|f| keep(f)) {
             if let Some(text) = input
                 .segments
                 .get(f.segment)
@@ -126,11 +135,12 @@ impl Findings {
 }
 
 /// What one detector found in a request: distinct matched values per
-/// category, and whether it read everything (`false`: its budget ran out
-/// first; the counts found until then still stand).
+/// category (per kind for personal data), and the category whose scan the
+/// request's budget ran out in, if any (the counts found until then still
+/// stand).
 pub struct Inspected {
-    pub counts: Vec<(Category, usize)>,
-    pub complete: bool,
+    pub counts: Vec<(Category, Option<Kind>, usize)>,
+    pub spent: Option<Category>,
 }
 
 /// Why a detector gave no verdict at all (it cannot run in this release).
@@ -180,10 +190,14 @@ impl Budget {
 pub struct BudgetSpent;
 
 /// What a detector shares within one request: the budget, and the built-in
-/// secret findings (scanned once for every rule that uses them).
+/// secret and personal-data findings (each scanned once for every rule that
+/// uses them; personal data per kind, only for the kinds some rule names).
 pub struct DetectContext<'a> {
     pub budget: &'a Budget,
     pub builtin: &'a std::cell::OnceCell<Findings>,
+    /// Per kind: its findings, and whether the budget ran out before the
+    /// end of its scan.
+    pub personal: &'a std::cell::RefCell<std::collections::HashMap<Kind, (Findings, bool)>>,
 }
 
 /// Implemented by the built-in detectors (and, in later phases, model and

@@ -1496,6 +1496,20 @@ async fn slice6_fixtures(pool: PgPool, shard: usize) -> (PositiveFixtures, Vec<S
             .await
             .unwrap();
     }
+    // A personal-data decision carries its kind (#841).
+    for (root, ws, key) in [
+        (a, f.team, log_key),
+        (refused_root, f.team, log_key),
+        (private_root, f.personal, private_key),
+    ] {
+        sqlx::query("INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,kind,action,count) VALUES(gen_random_uuid(),$1,$2,$3,'chat_completions','contract-log','input',gen_random_uuid(),gen_random_uuid(),2,'type_default','pattern','personal_data','email','monitored',2)")
+            .bind(root)
+            .bind(ws)
+            .bind(key)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
     w.json(
         &owner,
         "GET",
