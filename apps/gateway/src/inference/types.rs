@@ -141,13 +141,18 @@ pub struct EmbeddingResponse {
 
 // These types describe gateway semantics, not any provider's HTTP payload.
 // No Debug on prompt-bearing or credential-reference-bearing structures.
+//
+// The tool definitions and the Messages envelopes, which hold a request's
+// largest JSON trees, are shared (`Arc`): each attempt's clone of the
+// request (`inference::attempt`) shares them instead of copying them (#872).
+// A change to either after normalization goes through `Arc::make_mut`.
 #[derive(Clone)]
 pub struct ChatRequest {
     /// Validated Messages semantics, never serialized as an upstream payload.
-    pub messages_options: Option<Box<MessagesOptions>>,
+    pub messages_options: Option<std::sync::Arc<MessagesOptions>>,
     pub model: String,
     pub messages: Vec<Message>,
-    pub tools: Vec<FunctionTool>,
+    pub tools: std::sync::Arc<Vec<FunctionTool>>,
     pub tool_choice: Option<ToolChoice>,
     pub temperature: Option<f64>,
     pub max_output_tokens: Option<u32>,
@@ -164,6 +169,9 @@ pub struct MessagesOptions {
     pub beta_headers: Vec<String>,
     /// Validated native message/tool envelopes; no caller transport or metadata.
     pub native_messages: Vec<serde_json::Value>,
+    /// Each validated tool definition, its `input_schema` (when it had one)
+    /// left `null`: the schema is the canonical tool's `parameters`, at the
+    /// same index of `ChatRequest::tools`, which the native encoder puts back.
     pub native_tools: Vec<serde_json::Value>,
     pub system: Option<serde_json::Value>,
     pub cache_controls: Vec<serde_json::Value>,

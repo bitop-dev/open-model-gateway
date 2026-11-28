@@ -1,5 +1,6 @@
 //! Mock-upstream contract tests for OpenAI videos, files and batches (no
 //! network beyond 127.0.0.1, no paid calls).
+use super::video::parse_video;
 use super::*;
 use crate::providers::{
     ProviderAdapter,
@@ -117,8 +118,8 @@ fn video_request() -> VideoRequest {
     VideoRequest {
         model: "company/video".into(),
         prompt: "a calm lake".into(),
-        seconds: 8,
-        size: VideoSize::P1280x720,
+        seconds: Some(8),
+        size: Some("1280x720".into()),
     }
 }
 fn video(status: &str) -> Value {
@@ -241,7 +242,8 @@ async fn error_statuses_map_without_reading_bodies_or_following_redirects() {
         InferenceError::Busy,
         InferenceError::UpstreamUnavailable,
         InferenceError::UpstreamRejected,
-        InferenceError::Configuration,
+        // A redirect to a create may follow its success: an unknown outcome.
+        InferenceError::InvalidUpstream,
     ] {
         assert_eq!(
             a.create_video(&t, video_request()).await.err(),
@@ -321,7 +323,7 @@ fn chat_request() -> BatchRequest {
             tool_call_id: None,
             tool_result_is_error: false,
         }],
-        tools: vec![],
+        tools: std::sync::Arc::new(vec![]),
         tool_choice: None,
         temperature: None,
         max_output_tokens: Some(16),
@@ -733,4 +735,75 @@ async fn a_batch_status_body_with_a_duplicate_member_is_refused() {
         let result = mock.adapter().retrieve_batch(&t, &upstream.id).await;
         assert_eq!(result.is_ok(), ok, "duplicate refused: {}", !ok);
     }
+}
+
+/// The generated duration is the usage the server reports when it does,
+/// else the video's length; a size the gateway cannot read leaves the
+/// duration unknown (the hold is then kept), never billed at another size.
+#[test]
+fn the_reported_duration_and_size_are_read_or_left_unknown() {
+    let mut v = video("completed");
+    assert_eq!(parse_video(&v).unwrap().seconds, Some(8));
+    v["usage"] = json!({"output_video_seconds": 4, "cost": "0.288"});
+    assert_eq!(parse_video(&v).unwrap().seconds, Some(4), "usage first");
+    // A usage value the gateway cannot use is an unknown duration, never
+    // the video's length in its place.
+    for bad in [json!(3601), json!(0), json!(4.5), json!("four"), json!(-4)] {
+        let mut w = v.clone();
+        w["usage"]["output_video_seconds"] = bad.clone();
+        assert_eq!(parse_video(&w).unwrap().seconds, None, "{bad}");
+    }
+    for size in [json!("1920×1080"), json!("1280 x 720"), json!(1920)] {
+        v["size"] = size.clone();
+        let p = parse_video(&v).unwrap();
+        assert_eq!((p.seconds, p.size), (None, None), "{size}");
+    }
+    v["size"] = Value::Null;
+    assert_eq!(parse_video(&v).unwrap().seconds, Some(4));
+}
+
+/// Only a complete answer is content: an empty (`204`) or partial (`206`)
+/// one is an upstream error, never passed on as a whole video.
+#[tokio::test]
+async fn video_content_is_only_a_complete_answer() {
+    let mock = Mock::new(vec![
+        Reply {
+            status: 204,
+            content_type: "video/mp4",
+            body: Vec::new(),
+        },
+        Reply {
+            status: 206,
+            content_type: "video/mp4",
+            body: b"\x00\x00".to_vec(),
+        },
+    ])
+    .await;
+    let a = mock.adapter();
+    let (t, id) = (target("sora-2"), UpstreamId::parse("video_abc123").unwrap());
+    for _ in 0..2 {
+        assert_eq!(
+            a.video_content(&t, &id, VideoAsset::Video).await.err(),
+            Some(InferenceError::InvalidUpstream)
+        );
+    }
+}
+
+/// A redirect after a create may follow its success: its outcome is unknown
+/// (`InvalidUpstream`, so the job keeps its hold), never a refused create.
+#[tokio::test]
+async fn a_redirected_create_has_an_unknown_outcome() {
+    let mock = Mock::new(vec![Reply {
+        status: 303,
+        content_type: "text/plain",
+        body: Vec::new(),
+    }])
+    .await;
+    assert_eq!(
+        mock.adapter()
+            .create_video(&target("sora-2"), video_request())
+            .await
+            .err(),
+        Some(InferenceError::InvalidUpstream)
+    );
 }

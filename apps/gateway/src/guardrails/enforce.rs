@@ -528,7 +528,7 @@ pub fn chat_inspection(request: &ChatRequest) -> Inspection<'_> {
         }
     }
     join(&mut input, &mut system, Part::System);
-    for tool in &request.tools {
+    for tool in request.tools.iter() {
         input.push(&tool.name, Part::ToolDescription);
         if let Some(d) = &tool.description {
             input.push(d, Part::ToolDescription);

@@ -331,31 +331,6 @@ fn set_tools(value: &mut Value, request: &ChatRequest) {
         );
     }
 }
-/// Native Messages envelopes replace the translated ones.
-fn set_native_overrides(value: &mut Value, request: &ChatRequest) {
-    if let Some(options) = &request.messages_options {
-        // Only fully grammar-validated envelopes retained by the Messages
-        // normalizer; metadata.user_id was intentionally never retained here.
-        if !options.native_messages.is_empty() {
-            value["messages"] = json!(options.native_messages);
-        }
-        if let Some(system) = &options.system {
-            value["system"] = system.clone();
-        }
-        if !options.native_tools.is_empty() {
-            value["tools"] = json!(options.native_tools);
-        }
-        if let Some(thinking) = &options.thinking {
-            value["thinking"] = thinking.clone();
-        }
-        if let Some(output) = &options.output_config {
-            value["output_config"] = output.clone();
-        }
-        if let Some(context) = &options.context_management {
-            value["context_management"] = context.clone();
-        }
-    }
-}
 fn set_tool_choice(value: &mut Value, request: &ChatRequest) {
     if let Some(choice) = &request.tool_choice {
         value["tool_choice"] = match choice {
@@ -395,7 +370,22 @@ fn encode_within(
         value["system"] = system.into();
     }
     set_sampling(&mut value, request);
-    set_tools(&mut value, request);
+    // A native request's tools are its validated envelope
+    // (`set_native_overrides`): the translated copy would only be replaced.
+    let native_tools = request
+        .messages_options
+        .as_ref()
+        .map_or(0, |o| o.native_tools.len());
+    // The native definitions take their schemas from the canonical tools,
+    // one for one: a request where the two differ is not encoded.
+    if native_tools > 0 && native_tools != request.tools.len() {
+        // Only a change to the request after it was normalized can do this.
+        tracing::error!("native and canonical tool definitions differ in count");
+        return Err(InferenceError::InvalidRequest);
+    }
+    if native_tools == 0 {
+        set_tools(&mut value, request);
+    }
     set_native_overrides(&mut value, request);
     set_tool_choice(&mut value, request);
     if request.has_images() {
@@ -797,6 +787,9 @@ mod batches;
 #[cfg(test)]
 mod fidelity_tests;
 mod images;
+/// The native Messages envelope in the body (`set_native_overrides`).
+mod native;
+use native::set_native_overrides;
 #[cfg(test)]
 mod stream_property_tests;
 #[cfg(all(test, feature = "integration-tests"))]

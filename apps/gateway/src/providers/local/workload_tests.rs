@@ -624,7 +624,7 @@ async fn dropping_rerank_or_systemone_cancels_the_upstream_body() {
         server.abort();
     }
 }
-/// The rerank wire and System One routing agree with the shared capability
+/// The rerank and video wires and System One routing agree with the shared capability
 /// table that `supports_protocol`, route validation and readiness use.
 #[test]
 fn local_workload_wires_match_the_capability_table() {
@@ -650,6 +650,21 @@ fn local_workload_wires_match_the_capability_table() {
             crate::providers::capabilities::serves(id, ApiProtocol::Systemone),
             "{id}"
         );
+        let video = Deployment {
+            image_input: false,
+            id: uuid::Uuid::new_v4(),
+            provider: id.into(),
+            upstream_model: "clips".into(),
+            credential_ref: "none".into(),
+            endpoint: Some("http://127.0.0.1:9/v1".into()),
+            region: None,
+            supported_protocols: vec!["videos".into()],
+        };
+        assert_eq!(
+            adapter.video_wire(&video).is_ok(),
+            crate::providers::capabilities::serves(id, ApiProtocol::Videos),
+            "{id}"
+        );
         for protocol in ApiProtocol::ALL {
             assert_eq!(
                 adapter.supports_protocol(protocol),
@@ -658,5 +673,67 @@ fn local_workload_wires_match_the_capability_table() {
                 protocol.as_str()
             );
         }
+    }
+}
+
+/// Only `openai_compatible` has the OpenAI video wire, and only with no
+/// credential (no `Authorization` sent) or an environment reference (sent as
+/// a bearer token, resolved before anything is sent); any other reference
+/// is refused.
+#[test]
+fn the_video_wire_is_openai_compatible_with_none_or_an_env_credential() {
+    let base = "http://127.0.0.1:9/v1";
+    let target = |profile: Profile, credential: &str| Deployment {
+        image_input: false,
+        id: uuid::Uuid::new_v4(),
+        provider: profile.id().into(),
+        upstream_model: "clips".into(),
+        credential_ref: credential.into(),
+        endpoint: Some(base.into()),
+        region: None,
+        supported_protocols: vec!["videos".into()],
+    };
+    for profile in [
+        Profile::OpenAiCompatible,
+        Profile::Vllm,
+        Profile::Sglang,
+        Profile::Ollama,
+    ] {
+        let resolver = Arc::new(Resolver(AtomicUsize::new(0)));
+        let adapter = LocalAdapter::new(
+            profile,
+            resolver.clone(),
+            Arc::new(ApprovedEndpoints::for_test(base)),
+        );
+        let none = adapter.video_wire(&target(profile, "none"));
+        if !matches!(profile, Profile::OpenAiCompatible) {
+            assert_eq!(
+                none.err(),
+                Some(InferenceError::Unsupported),
+                "{}",
+                profile.id()
+            );
+            continue;
+        }
+        assert!(none.unwrap().auth.is_none(), "no credential, no header");
+        let env = adapter
+            .video_wire(&target(profile, "env:VIDEO_KEY"))
+            .unwrap();
+        let auth = env.auth.unwrap();
+        assert_eq!(auth.to_str().unwrap(), "Bearer fixture-only");
+        assert!(auth.is_sensitive());
+        assert_eq!(resolver.0.load(Ordering::SeqCst), 1);
+        for other in ["aws:default", "file:/etc/key", "plain-secret"] {
+            assert_eq!(
+                adapter.video_wire(&target(profile, other)).err(),
+                Some(InferenceError::Configuration),
+                "{other}"
+            );
+        }
+        assert_eq!(
+            resolver.0.load(Ordering::SeqCst),
+            1,
+            "nothing else resolved"
+        );
     }
 }

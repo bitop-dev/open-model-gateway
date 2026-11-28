@@ -332,7 +332,7 @@ impl World {
                 tool_call_id: None,
                 tool_result_is_error: false,
             }],
-            tools: vec![],
+            tools: std::sync::Arc::new(vec![]),
             tool_choice: None,
             temperature: None,
             max_output_tokens: Some(10),

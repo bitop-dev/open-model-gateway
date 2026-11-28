@@ -233,7 +233,7 @@ fn request() -> ChatRequest {
             message(Role::System, "instructions"),
             message(Role::User, "hello"),
         ],
-        tools: Vec::new(),
+        tools: std::sync::Arc::new(Vec::new()),
         tool_choice: None,
         temperature: Some(0.5),
         max_output_tokens: Some(100),
@@ -395,7 +395,7 @@ async fn no_argument_tool_defaults_preserve_converse_wire_and_correlation() {
     for request in super::super::contract::no_argument_tool_requests() {
         for strict in [None, Some(false), Some(true)] {
             let mut r = request.clone();
-            r.tools[0].strict = strict;
+            std::sync::Arc::make_mut(&mut r.tools)[0].strict = strict;
             adapter.execute(&target(), r).await.unwrap();
         }
         // Empty content is not permission to detach a result from its call.
@@ -520,7 +520,7 @@ async fn tools_json_and_stream_tool_indices_usage_after_finish() {
     let mock = Mock::serve(complete(true), wire(events(true)), 200).await;
     let adapter = mock.adapter();
     let mut req = request();
-    req.tools.push(tool());
+    std::sync::Arc::make_mut(&mut req.tools).push(tool());
     req.tool_choice = Some(ToolChoice::Required);
     let ProviderOutput::Complete(result) = adapter.execute(&target(), req.clone()).await.unwrap()
     else {
@@ -584,7 +584,7 @@ async fn tools_json_and_stream_tool_indices_usage_after_finish() {
 async fn tool_history_preserves_json_input_and_result_text() {
     let mock = Mock::serve(complete(false), wire(events(false)), 200).await;
     let mut req = request();
-    req.tools.push(tool());
+    std::sync::Arc::make_mut(&mut req.tools).push(tool());
     req.messages.push(Message {
         role: Role::Assistant,
         content: None,
@@ -721,7 +721,7 @@ async fn messages_bedrock_context_envelope_does_not_match_quoted_client_text() {
     ] {
         let mock = Mock::serve(json!({"__type":code,"message":text}), Vec::new(), 400).await;
         let mut r = request();
-        r.messages_options = Some(Box::default());
+        r.messages_options = Some(std::sync::Arc::default());
         assert!(
             matches!(mock.adapter().execute(&target(), r).await, Err(error) if error == expected)
         );
@@ -807,18 +807,18 @@ fn validates_semantics_without_silent_loss() {
     req.messages[0].role = Role::Developer;
     check(req);
     let mut req = request();
-    req.tools.push(tool());
-    req.tools[0].parameters = json!({"type":"array"});
+    std::sync::Arc::make_mut(&mut req.tools).push(tool());
+    std::sync::Arc::make_mut(&mut req.tools)[0].parameters = json!({"type":"array"});
     check(req);
     let mut req = request();
-    req.tools.push(tool());
+    std::sync::Arc::make_mut(&mut req.tools).push(tool());
     req.tool_choice = Some(ToolChoice::None);
     check(req);
     let mut req = request();
     req.tool_choice = Some(ToolChoice::Required);
     check(req);
     let mut req = request();
-    req.tools.push(tool());
+    std::sync::Arc::make_mut(&mut req.tools).push(tool());
     req.tool_choice = Some(ToolChoice::Function("missing".into()));
     check(req);
     let mut req = request();
@@ -831,7 +831,7 @@ fn validates_semantics_without_silent_loss() {
     req.messages[1].content = Some("x".repeat(OUTPUT_LIMIT + 1).into());
     check(req);
     let mut req = request();
-    req.tools.push(tool());
+    std::sync::Arc::make_mut(&mut req.tools).push(tool());
     req.tool_choice = Some(ToolChoice::Function("weather".into()));
     assert!(encode(&req).is_ok());
     assert_eq!(
@@ -1327,12 +1327,12 @@ async fn the_request_size_counts_images_and_everything_else_sent() {
                 .map(|_| Part::Image(images.take(url.clone(), None, "image").unwrap()))
                 .collect(),
         ));
-        r.tools = vec![FunctionTool {
+        r.tools = std::sync::Arc::new(vec![FunctionTool {
             name: "lookup".into(),
             description: Some("d".repeat(description)),
             parameters: serde_json::json!({"type":"object"}),
             strict: None,
-        }];
+        }]);
         r
     };
     let adapter = BedrockAdapter::for_test("http://127.0.0.1:9");

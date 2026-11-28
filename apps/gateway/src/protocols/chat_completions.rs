@@ -330,7 +330,7 @@ impl Request {
             messages_options: None,
             model: self.model,
             messages,
-            tools,
+            tools: std::sync::Arc::new(tools),
             tool_choice,
             temperature: self.temperature,
             max_output_tokens,

@@ -95,7 +95,7 @@ fn request(stream: bool) -> ChatRequest {
             tool_call_id: None,
             tool_result_is_error: false,
         }],
-        tools: vec![],
+        tools: std::sync::Arc::new(vec![]),
         tool_choice: None,
         temperature: None,
         max_output_tokens: Some(7),
@@ -136,7 +136,7 @@ async fn no_argument_tool_defaults_preserve_all_local_profile_wires() {
         for request in super::super::contract::no_argument_tool_requests() {
             for strict in [None, Some(false), Some(true)] {
                 let mut r = request.clone();
-                r.tools[0].strict = strict;
+                std::sync::Arc::make_mut(&mut r.tools)[0].strict = strict;
                 if strict == Some(true) {
                     assert!(!adapter.supports_chat_request(&r));
                     assert!(matches!(
@@ -332,7 +332,7 @@ async fn ollama_and_generic_uncertified_controls_rejected_before_dispatch() {
         ));
     }
     let mut r = request(false);
-    r.tools.push(FunctionTool {
+    std::sync::Arc::make_mut(&mut r.tools).push(FunctionTool {
         name: "f".into(),
         description: None,
         parameters: json!({"type":"object"}),
@@ -371,7 +371,7 @@ async fn preadmission_checks_and_execute_defense_need_no_connection_or_handler()
         };
         assert!(adapter.supports_chat_request(&request(false)));
         let mut strict = request(false);
-        strict.tools.push(FunctionTool {
+        std::sync::Arc::make_mut(&mut strict.tools).push(FunctionTool {
             name: "f".into(),
             description: None,
             parameters: json!({"type":"object"}),

@@ -26,17 +26,23 @@ fn inference_openapi_batch_endpoint_is_closed() {
 }
 
 #[test]
-fn inference_openapi_video_create_is_refusal_only() {
+fn inference_openapi_video_create_documents_success_and_refusals() {
     let doc = generated();
-    let responses = &doc["paths"]["/v1/videos"]["post"]["responses"];
-    assert!(
-        responses.get("200").is_none(),
-        "video creation promises success"
-    );
-    assert_eq!(responses["400"]["x-omg-positive-kind"], "refusal");
+    let post = &doc["paths"]["/v1/videos"]["post"];
+    assert!(post["responses"].get("200").is_some(), "a created video");
+    let codes: Vec<_> = post["x-omg-refusals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["code"].as_str().unwrap())
+        .collect();
     assert_eq!(
-        doc["paths"]["/v1/videos"]["post"]["x-omg-refusals"][0]["code"],
-        "unsupported_capability"
+        codes,
+        [
+            "unsupported_capability",
+            "unsupported_video_parameter",
+            "video_price_missing"
+        ]
     );
 }
 
@@ -616,6 +622,16 @@ mod legacy {
         ) -> Result<ProviderOutput, InferenceError> {
             Err(InferenceError::Unsupported)
         }
+        fn supports_video_request(&self, d: &Deployment, r: &VideoRequest) -> bool {
+            self.0.supports_video_request(d, r)
+        }
+        async fn create_video(
+            &self,
+            d: &Deployment,
+            r: VideoRequest,
+        ) -> Result<UpstreamVideo, InferenceError> {
+            self.0.create_video(d, r).await
+        }
         async fn retrieve_video(
             &self,
             d: &Deployment,
@@ -627,7 +643,7 @@ mod legacy {
             &self,
             d: &Deployment,
             id: &UpstreamId,
-        ) -> Result<(), InferenceError> {
+        ) -> Result<crate::jobs::types::VideoDeletion, InferenceError> {
             self.0.delete_video(d, id).await
         }
         async fn video_content(
@@ -662,8 +678,13 @@ mod legacy {
             .unwrap();
         let id = client_id("video_", job.id);
         fake.push_video(upstream_video(JobState::Queued, Some(8)));
+        // Named no size: none is recorded (or sent), and it reads `null`.
+        let no_size = crate::jobs::types::VideoRequest {
+            size: None,
+            ..video_request()
+        };
         let queued = jobs
-            .create_video(f.principal, video_request(), uuid::Uuid::new_v4())
+            .create_video(f.principal, no_size, uuid::Uuid::new_v4())
             .await
             .unwrap();
         let queued_id = client_id("video_", queued.id);
@@ -756,8 +777,37 @@ mod legacy {
         let c = send("DELETE", format!("/v1/videos/{id}")).await;
         assert_eq!(c.status, StatusCode::OK, "legacy delete status");
         fixtures.observe(&c);
-        // Public create is exercised with the actual registry, which has no
-        // video provider, rather than the historical read fixture above.
+        // Creates on a route that serves them: the created video (the fake
+        // answers each with its next observation, the last one queued).
+        for body in [
+            json!({"model":"company/smart","prompt":"a calm lake","seconds":"8","size":"720x1280"}),
+            json!({"model":"company/smart","prompt":"a calm lake","seconds":"8"}),
+        ] {
+            fake.push_video(upstream_video(JobState::Queued, Some(8)));
+            let created = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/videos")
+                        .header("authorization", &key)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let c = capture("POST", "/v1/videos", created).await;
+            assert_eq!(
+                c.status,
+                StatusCode::OK,
+                "video create status: {}",
+                String::from_utf8_lossy(&c.bytes)
+            );
+            fixtures.observe(&c);
+        }
+        // Refusals are exercised with the actual registry, which has no
+        // video provider, rather than the read fixture above.
         let refusal = crate::http::router(f.store.clone())
             .oneshot(
                 Request::builder()
@@ -1007,7 +1057,8 @@ fn inference_openapi_followup_video_multipart_matches_json_bounds() {
         "valid video multipart fields rejected"
     );
     for (field, value) in [
-        ("seconds", json!("5")),
+        ("seconds", json!("0")),
+        ("seconds", json!("3601")),
         ("size", json!("auto")),
         ("model", json!("m".repeat(201))),
         ("prompt", json!("p".repeat(32769))),

@@ -19,6 +19,7 @@
 //! by the principal's workspace, so another workspace's id is "not found".
 //! Client ids are gateway ids; upstream ids never leave the gateway.
 pub mod batch;
+pub(crate) mod content_bounds;
 pub(crate) mod fence;
 pub(crate) mod io;
 pub(crate) mod lines;
@@ -30,6 +31,7 @@ pub mod schedule;
 mod store;
 pub mod types;
 pub mod video;
+mod video_route;
 
 use gateway_datetime_compat::UtcInstant;
 use std::{
@@ -62,6 +64,8 @@ pub(crate) fn job_columns() -> &'static str {
 }
 use types::*;
 
+/// The mark of a job whose provider id the server gave another job too.
+pub(crate) const UPSTREAM_ID_REUSED: &str = "upstream_id_reused";
 /// Video jobs are polled (and their lease kept) for at most this long.
 pub const VIDEO_POLL_WINDOW: TimeDelta = TimeDelta::hours(6);
 /// Batches: the 24 h completion window plus finalization.
@@ -189,6 +193,13 @@ pub enum JobError {
     Conflict(&'static str, &'static str),
     /// A client error with a specific code and fixed message (HTTP 400).
     Invalid(&'static str, &'static str),
+    /// A client error naming the request parameter it is about (HTTP 400):
+    /// code, message, parameter.
+    InvalidParameter(
+        &'static str,
+        &'static str,
+        crate::inference::error::FieldName,
+    ),
     /// Visible but not the caller's to change: delete or cancel needs the
     /// creating user, a workspace owner/admin or a service-account key (HTTP 403).
     Forbidden(&'static str, &'static str),
@@ -461,31 +472,48 @@ impl Jobs {
         model: &str,
         target: &Deployment,
         admission: &WorkloadAdmission,
+        video: Option<&crate::governance::VideoCheck>,
     ) -> Result<Attempt, InferenceError> {
         let upstream_model = (1..=512)
             .contains(&target.upstream_model.chars().count())
             .then(|| target.upstream_model.clone());
         // Covers the create call; extended to the poll deadline on acceptance.
         let lease_seconds = CALL_TIMEOUT.as_secs() as i64 + 60;
-        crate::governance::admit_workload_for_deployment(
-            &self.store,
-            &ExecutionStart {
-                id: execution,
-                root_request_id: execution,
-                attempt_number: 1,
-                principal,
-                deployment_id: target.id,
-                provider: target.provider.clone(),
-                model: model.to_owned(),
-                streamed: false,
-                upstream_model,
-                client: crate::inference::client::current(),
-            },
-            admission,
-            lease_seconds,
-            target,
-        )
-        .await?;
+        let start = ExecutionStart {
+            id: execution,
+            root_request_id: execution,
+            attempt_number: 1,
+            principal,
+            deployment_id: target.id,
+            provider: target.provider.clone(),
+            model: model.to_owned(),
+            streamed: false,
+            upstream_model,
+            client: crate::inference::client::current(),
+        };
+        match video {
+            Some(check) => {
+                crate::governance::admit_video_for_deployment(
+                    &self.store,
+                    &start,
+                    admission,
+                    lease_seconds,
+                    target,
+                    check,
+                )
+                .await?
+            }
+            None => {
+                crate::governance::admit_workload_for_deployment(
+                    &self.store,
+                    &start,
+                    admission,
+                    lease_seconds,
+                    target,
+                )
+                .await?
+            }
+        }
         Ok(Attempt {
             store: self.store.clone(),
             id: execution,
@@ -501,9 +529,28 @@ impl Jobs {
         &self,
         job: &JobRow,
     ) -> Result<(Deployment, Arc<dyn ProviderAdapter>), InferenceError> {
-        let target = store::target(&self.store, job.deployment_id)
+        // The server answered another job's create with this job's id: what
+        // it holds behind the id may be another workspace's video, so it is
+        // never asked about it again (`store::record_video_upstream`). The
+        // mark is read again with the deployment, in the statement before
+        // the call, never only from `job`, which may predate it.
+        if job.error_code.as_deref() == Some(UPSTREAM_ID_REUSED) {
+            return Err(InferenceError::InvalidUpstream);
+        }
+        let target = store::target(&self.store, job.id, job.deployment_id)
             .await
-            .map_err(|_| InferenceError::Storage)?
+            .map_err(|_| InferenceError::Storage)?;
+        let Some(target) = target else {
+            let now = store::reload(&self.store, job.id)
+                .await
+                .map_err(|_| InferenceError::Storage)?;
+            return Err(if now.error_code.as_deref() == Some(UPSTREAM_ID_REUSED) {
+                InferenceError::InvalidUpstream
+            } else {
+                InferenceError::ModelUnavailable
+            });
+        };
+        let target = Some(target)
             .filter(|d| d.provider == job.provider)
             .ok_or(InferenceError::ModelUnavailable)?;
         let adapter = self
@@ -681,3 +728,7 @@ pub(crate) mod db_tests;
 mod schedule_db_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, feature = "integration-tests"))]
+mod video_contract_tests;
+#[cfg(all(test, feature = "integration-tests"))]
+mod video_routing_tests;

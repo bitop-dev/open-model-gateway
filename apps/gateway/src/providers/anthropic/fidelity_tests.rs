@@ -27,7 +27,12 @@ async fn native_fidelity_exact_upstream_wire_and_headers() {
         let mut wire = fixture();
         wire["thinking"] = thinking;
         let mut request = native(wire.clone());
-        request.messages_options.as_mut().unwrap().beta_headers = vec![
+        request
+            .messages_options
+            .as_mut()
+            .map(std::sync::Arc::make_mut)
+            .unwrap()
+            .beta_headers = vec![
             "interleaved-thinking-2025-05-14, context-management-2025-06-27".into(),
             "claude-code-20250219, extended-cache-ttl-2025-04-11, effort-2025-11-24".into(),
         ];
@@ -344,4 +349,149 @@ async fn structured_output_sdk_anthropic_upstream_refusal(pool: sqlx::PgPool) {
     task.abort();
     assert_eq!(attempts, 2);
     assert_eq!(capture.lock().unwrap().len(), 2);
+}
+
+/// The native Anthropic bodies for a tools-heavy request (strict and plain
+/// tools, one without a description, cache controls,
+/// thinking, a tool round trip and an image) are byte for byte the bodies
+/// recorded beside this file, generated from the gateway as it was before
+/// #872 changed how a request is held: the generation body, the
+/// `count_tokens` body, and a native batch line (without its cache
+/// controls, which batch lines refuse). `OMG_REGENERATE_GOLDEN=1` rewrites
+/// the records (only to accept a deliberate wire change).
+#[test]
+fn the_native_envelope_is_byte_identical_to_its_record() {
+    use base64::Engine as _;
+    let png = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\ngolden-image");
+    let tool = |i: usize| {
+        json!({
+            "name": format!("tool_{i}"),
+            "description": format!("Tool number {i}, which does a thing."),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Where."},
+                    "lines": {"type": "array", "items": {"type": "integer"}},
+                    "options": {"type": "object", "properties": {"deep": {"type": "boolean"}}}
+                },
+                "required": ["path"]
+            }
+        })
+    };
+    let request = |cached: bool| {
+        let mut tools: Vec<Value> = (0..12).map(tool).collect();
+        tools[4]["strict"] = json!(true);
+        tools[5]["strict"] = json!(false);
+        tools[6].as_object_mut().unwrap().remove("description");
+        let mut system = json!([
+            {"type": "text", "text": "You are careful."},
+            {"type": "text", "text": "Long instructions."}
+        ]);
+        let mut result = json!({"type": "tool_result", "tool_use_id": "toolu_1", "content": [{"type": "text", "text": "fn main() {}"}]});
+        if cached {
+            tools[11]["cache_control"] = json!({"type": "ephemeral"});
+            system[1]["cache_control"] = json!({"type": "ephemeral", "ttl": "1h"});
+            result["cache_control"] = json!({"type": "ephemeral"});
+        }
+        json!({
+            "model": "m",
+            "max_tokens": 4096,
+            "system": system,
+            "tools": tools,
+            "tool_choice": {"type": "auto"},
+            "thinking": {"type": "enabled", "budget_tokens": 2048},
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Look at this and read the file."},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": png}}
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "I should read it.", "signature": "sig-1"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "tool_3", "input": {"path": "src/main.rs", "lines": [1, 40]}}
+                ]},
+                {"role": "user", "content": [result, {"type": "text", "text": "And now?"}]}
+            ]
+        })
+    };
+    let r = native(request(true));
+    let generation =
+        super::super::image_body::json_body_base64(&encode("private", &r).unwrap(), &r).unwrap();
+    // As `count_input_tokens` sends it.
+    let mut count = encode("private", &r).unwrap();
+    let fields = count.as_object_mut().unwrap();
+    fields.remove("max_tokens");
+    fields.remove("stream");
+    let count = super::super::image_body::json_body_base64(&count, &r).unwrap();
+    let target = Deployment {
+        image_input: false,
+        id: uuid::Uuid::nil(),
+        provider: "anthropic".into(),
+        upstream_model: "private".into(),
+        credential_ref: "env:KEY".into(),
+        endpoint: None,
+        region: None,
+        supported_protocols: vec!["messages".into()],
+    };
+    let line = super::batches::encode_native_line(
+        &target,
+        crate::jobs::types::BatchEndpoint::Messages,
+        "line-1",
+        &crate::jobs::types::BatchRequest::Chat(native(request(false))),
+    )
+    .unwrap();
+    for (name, sent) in [
+        ("native_envelope", generation),
+        ("native_count", count),
+        ("native_batch_line", line),
+    ] {
+        let record = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("src/providers/anthropic/{name}.golden.json"));
+        if std::env::var_os("OMG_REGENERATE_GOLDEN").is_some() {
+            std::fs::write(&record, &sent).unwrap();
+        }
+        assert_eq!(
+            String::from_utf8(sent).unwrap(),
+            std::fs::read_to_string(&record).unwrap(),
+            "{name} changed"
+        );
+    }
+}
+
+/// A native tool definition holds no second copy of its schema (the
+/// canonical tool holds it), and the body sent restores it exactly as the
+/// client wrote it; a definition whose schema is `null` or absent is either
+/// refused or sent as written, never with a schema it did not have.
+#[test]
+fn native_tool_schemas_are_held_once_and_sent_as_written() {
+    let schema = json!({"type": "object", "properties": {"q": {"type": "string"}}});
+    let tools = [
+        json!({"name": "with_schema", "input_schema": schema}),
+        json!({"name": "null_schema", "input_schema": null}),
+        json!({"name": "no_schema"}),
+    ];
+    for tool in tools {
+        let body = json!({"model": "m", "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [tool]});
+        let Ok(r) = crate::protocols::messages::batch_request(body.clone()) else {
+            assert!(
+                body["tools"][0]["input_schema"].is_null(),
+                "only a missing schema is refused"
+            );
+            continue;
+        };
+        let options = r.messages_options.as_ref().unwrap();
+        assert!(
+            options.native_tools[0]
+                .get("input_schema")
+                .is_none_or(Value::is_null),
+            "held once: the definition keeps no copy"
+        );
+        let sent: Value = serde_json::from_slice(
+            &super::super::image_body::json_body_base64(&encode("private", &r).unwrap(), &r)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sent["tools"], body["tools"]);
+    }
 }

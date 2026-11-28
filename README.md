@@ -22,7 +22,7 @@ The dashboard follows Grounded's Bitop UI and Workspace/Admin composition, with 
 - **Provider-reported cost reconciliation:** Admin › Usage & costs › Provider reconciliation; Admins upload Anthropic Cost Report JSON, attest mappings and freeze comparisons, Auditors read only. Signed charges, unknown variance, separate holds and identity-free personal totals; no financial-history rewrite or verified invoice. Anthropic/USD only; OpenAI Costs export is follow-up #393 ([workflow](docs/provider-cost-reconciliation.md)).
 - **Checks:** Rust unit/integration tests on real PostgreSQL, mock-provider and SDK contracts, Vitest, and a Playwright journey with axe accessibility scans for every persona ([verification](docs/verification.md), [accessibility](docs/accessibility.md)).
 
-**Planned, not implemented:** content guardrails beyond input secrets, personal data and custom patterns (redaction, output inspection and model detectors: #841–#846), an OpenRouter video adapter (video has no supported provider: OpenAI shut down the Sora 2 models and the Videos API on 2026-09-24), video remix/edits/references, native batches beyond OpenAI and Anthropic, image edits, token-by-token Responses/Messages streaming, OpenAI Costs export support (#393). See [roadmap](docs/roadmap.md).
+**Planned, not implemented:** content guardrails beyond input secrets, personal data and custom patterns (redaction, output inspection and model detectors: #841–#846), an OpenRouter video adapter, video remix/edits/references, native batches beyond OpenAI and Anthropic, image edits, token-by-token Responses/Messages streaming, OpenAI Costs export support (#393). See [roadmap](docs/roadmap.md).
 
 ## Local account picker
 
@@ -79,7 +79,7 @@ Keep the binary and compiled SPA from the same verified revision. Use a separate
 | `POST /v1/embeddings` | String/string-batch input, float or base64 vectors; declared embedding profiles |
 | `POST /v1/rerank` | `{model,query,documents,top_n?}` → scored indices; OpenRouter |
 | `POST /v1/systemone` | TypeSafe System One contract (TypeSafe SDK compatible); OpenRouter |
-| `/v1/videos`, `/v1/files`, `/v1/batches` | Gateway Files API; batches for any model (native OpenAI/Anthropic batch APIs or gateway-run lines, [batches](docs/batches.md)), workspace-owned gateway ids. `/v1/videos` returns `unsupported_capability`: no supported video provider since OpenAI's Videos API shutdown (2026-09-24) ([async jobs](docs/async-jobs.md)) |
+| `/v1/videos`, `/v1/files`, `/v1/batches` | Gateway Files API; batches for any model (native OpenAI/Anthropic batch APIs or gateway-run lines, [batches](docs/batches.md)), workspace-owned gateway ids. `/v1/videos` on any server of the OpenAI video contract behind an approved OpenAI-compatible connection, with per-route lengths and sizes ([async jobs](docs/async-jobs.md)) |
 | `/api/v1/*` | Browser-session management with exact-Origin/CSRF checks |
 
 Inference keys never authorize management. Model-declared protocols must intersect adapter support. OpenAI, Anthropic, AWS Bedrock and OpenRouter have separate adapters; local vLLM, SGLang, Ollama and generic-compatible profiles have explicit, narrow contracts. Local HTTP requires exact server-controlled endpoint approval and pinned IP destinations; cloud requires HTTPS. Redirects, ambient proxies and implicit retries are disabled.

@@ -85,7 +85,7 @@ async fn openrouter_live_chat_embeddings_rerank_systemone() {
             tool_call_id: None,
             tool_result_is_error: false,
         }],
-        tools: vec![],
+        tools: Default::default(),
         tool_choice: None,
         temperature: None,
         max_output_tokens: Some(16),

@@ -194,10 +194,10 @@ fn request(
     options: MessagesOptions,
 ) -> ChatRequest {
     ChatRequest {
-        messages_options: Some(Box::new(options)),
+        messages_options: Some(std::sync::Arc::new(options)),
         model: "m".into(),
         messages,
-        tools,
+        tools: std::sync::Arc::new(tools),
         tool_choice: None,
         temperature: None,
         max_output_tokens: None,

@@ -19,7 +19,7 @@ mod deployment_bulk;
 mod deployment_configuration;
 mod deployment_history;
 mod deployment_image_input;
-mod deployment_video;
+pub(crate) mod deployment_video;
 mod directory;
 mod drain;
 mod errors;
