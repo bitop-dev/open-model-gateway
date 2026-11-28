@@ -207,11 +207,19 @@ impl Leases {
 
     /// Take or renew every lease once. Returns how many this replica holds.
     pub async fn renew_once(&self, pool: &PgPool) -> usize {
+        self.renew(pool, || false).await
+    }
+
+    /// [`Leases::renew_once`], sending no further acquire once `stopping`.
+    async fn renew(&self, pool: &PgPool, stopping: impl Fn() -> bool) -> usize {
         let mut held = 0;
         for lease in Lease::ALL
             .into_iter()
             .filter(|l| !self.excluded.contains(l))
         {
+            if stopping() {
+                break;
+            }
             // Observed takeover/expiry only: a graceful `release_all` never
             // goes through this comparison.
             let was_held = self.held(lease).is_some();
@@ -298,16 +306,48 @@ impl Leases {
         }
     }
 
-    /// Renew every `every` until aborted.
-    pub fn start(self: Arc<Self>, pool: PgPool, every: Duration) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
+    /// Renew every `every` (the first time at once) until
+    /// [`Renewal::stop`], or until the returned handle is dropped.
+    pub fn start(self: Arc<Self>, pool: PgPool, every: Duration) -> Renewal {
+        let (stop, mut stopped) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move {
             let mut tick = tokio::time::interval(every);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                tick.tick().await;
-                self.renew_once(&pool).await;
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    // A stop, or the handle dropped.
+                    _ = stopped.changed() => return,
+                }
+                self.renew(&pool, || {
+                    *stopped.borrow() || stopped.has_changed().is_err()
+                })
+                .await;
             }
-        })
+        });
+        Renewal { task, stop }
+    }
+}
+
+/// The renewal task of [`Leases::start`].
+pub struct Renewal {
+    task: tokio::task::JoinHandle<()>,
+    stop: tokio::sync::watch::Sender<bool>,
+}
+
+impl Renewal {
+    /// Stop renewing: no further acquire is sent, and the one in flight, if
+    /// any, is waited for (each is bounded by its own timeout) and its term
+    /// recorded. Only then may [`Leases::release_all`] run. Were the task
+    /// dropped mid-acquire instead, the statement it already sent could
+    /// still run at the server after the release, on another connection,
+    /// and take a new term this process never learns of, held until it
+    /// expires (an acquire of a released term starts the next one). An
+    /// acquire that timed out is the remaining case: its outcome is unknown,
+    /// and such a term ends at its expiry.
+    pub async fn stop(self) {
+        let _ = self.stop.send(true);
+        let _ = self.task.await;
     }
 }
 

@@ -13,7 +13,7 @@ use open_model_gateway::{
     http,
     identity::{IdentityConfig, IdentityState},
     inference::Engine,
-    leases::Leases,
+    leases::{Leases, Renewal},
     providers::{
         ProviderRegistry, local::endpoints::ApprovedEndpoints, openrouter::OpenRouterConfig,
         secrets::EnvSecrets, served_adapters,
@@ -42,7 +42,7 @@ pub(crate) async fn serve(
         files,
         settings,
     } = prepare(store.clone()).await?;
-    let (leases, lease_task) = take_leases(&settings.audit_setting, pool).await;
+    let (leases, renewal) = take_leases(&settings.audit_setting, pool).await;
     // The leases are held from here on: a failure of any later start-up
     // step hands them back before its error is returned (#527).
     let Started {
@@ -62,7 +62,7 @@ pub(crate) async fn serve(
     {
         Ok(started) => started,
         Err(error) => {
-            release_leases(lease_task, &leases, pool).await;
+            release_leases(renewal, &leases, pool).await;
             return Err(error);
         }
     };
@@ -72,7 +72,7 @@ pub(crate) async fn serve(
     let signals = match Signals::register() {
         Ok(signals) => signals,
         Err(error) => {
-            shutdown(traces, tasks, lease_task, &leases, pool).await;
+            shutdown(traces, tasks, renewal, &leases, pool).await;
             return Err(anyhow::Error::new(error).context("could not register shutdown signals"));
         }
     };
@@ -92,7 +92,7 @@ pub(crate) async fn serve(
     )
     .with_graceful_shutdown(drain::shutdown(signals, draining, config.shutdown_drain))
     .await;
-    shutdown(traces, tasks, lease_task, &leases, pool).await;
+    shutdown(traces, tasks, renewal, &leases, pool).await;
     served?;
     Ok(())
 }
@@ -212,17 +212,17 @@ async fn prepare(store: Store) -> Result<Prepared> {
 async fn take_leases(
     audit_setting: &open_model_gateway::audit_export::Setting,
     pool: &PgPool,
-) -> (Arc<Leases>, JoinHandle<()>) {
+) -> (Arc<Leases>, Renewal) {
     let leases = open_model_gateway::leases::Leases::new();
     let leases = Arc::new(match audit_setting {
         open_model_gateway::audit_export::Setting::On(_) => leases,
         _ => leases.without(open_model_gateway::leases::Lease::AuditExport),
     });
     leases.renew_once(pool).await;
-    let lease_task = leases
+    let renewal = leases
         .clone()
         .start(pool.clone(), open_model_gateway::leases::RENEW);
-    (leases, lease_task)
+    (leases, renewal)
 }
 
 /// What [`start`] started.
@@ -538,7 +538,7 @@ struct Tasks {
 async fn shutdown(
     traces: Option<telemetry::Runtime>,
     tasks: Tasks,
-    lease_task: JoinHandle<()>,
+    renewal: Renewal,
     leases: &Arc<Leases>,
     pool: &PgPool,
 ) {
@@ -617,16 +617,17 @@ async fn shutdown(
         notifications.abort();
         let _ = notifications.await;
     }
-    release_leases(lease_task, leases, pool).await;
+    release_leases(renewal, leases, pool).await;
 }
 
 /// Stop renewing, then end every term this replica holds, so another replica
 /// takes the singleton work now instead of at expiry: on shutdown and on
 /// every start-up failure after [`take_leases`]. Bounded, and never fails
 /// the caller: an unreleased term still ends at its expiry.
-async fn release_leases(lease_task: JoinHandle<()>, leases: &Arc<Leases>, pool: &PgPool) {
-    lease_task.abort();
-    let _ = lease_task.await;
+async fn release_leases(renewal: Renewal, leases: &Arc<Leases>, pool: &PgPool) {
+    // Never abort it: a renewal it already sent must end before the release
+    // (`Renewal::stop`).
+    renewal.stop().await;
     // Each release is bounded on its own (`Leases::release_all`), so one
     // release waiting behind a running job cannot cost the others theirs.
     leases.release_all(pool).await;
