@@ -118,7 +118,7 @@ pub(super) async fn store(
                 .bind(t.on_error.map(|o| o.as_str()))
                 .bind(None::<i32>)
                 .bind(None::<Vec<String>>)
-                .bind(None::<String>)
+                .bind(t.uninspectable.map(|u| u.as_str()))
                 .bind(Vec::<String>::new())
                 .bind(Vec::<String>::new()),
             Entry::Rule(rule) => q

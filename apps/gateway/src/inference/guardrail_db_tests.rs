@@ -137,6 +137,28 @@ pub(super) async fn type_default_with(
     patterns: &[String],
     kinds: &[&str],
 ) -> (Uuid, Uuid) {
+    type_default_on(
+        w,
+        action,
+        categories,
+        patterns,
+        kinds,
+        "{generation,embeddings}",
+        "deny",
+    )
+    .await
+}
+/// As [`type_default_with`], for the workloads named and with what the rule
+/// does with content it cannot read.
+pub(super) async fn type_default_on(
+    w: &World,
+    action: &str,
+    categories: &str,
+    patterns: &[String],
+    kinds: &[&str],
+    workloads: &str,
+    uninspectable: &str,
+) -> (Uuid, Uuid) {
     let pool = &w.f.store.pool;
     let kind: String = sqlx::query_scalar("SELECT kind FROM workspaces WHERE id=$1")
         .bind(w.f.principal.workspace_id)
@@ -188,8 +210,8 @@ pub(super) async fn type_default_with(
     } else {
         "fail_open"
     };
-    sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable,patterns,kinds) VALUES($1,$2,0,'Rule',$3,'pattern',$4::text[],$5,'user_text','off',$6,'{generation,embeddings}','deny',$7,$8)")
-        .bind(rule).bind(set).bind(protection).bind(categories).bind(action).bind(on_error).bind(patterns).bind(kinds)
+    sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable,patterns,kinds) VALUES($1,$2,0,'Rule',$3,'pattern',$4::text[],$5,'user_text','off',$6,$9::text[],$10,$7,$8)")
+        .bind(rule).bind(set).bind(protection).bind(categories).bind(action).bind(on_error).bind(patterns).bind(kinds).bind(workloads).bind(uninspectable)
         .execute(&mut *tx).await.unwrap();
     tx.commit().await.unwrap();
     (set, rule)
@@ -463,12 +485,12 @@ async fn a_token_count_is_inspected_before_it_reaches_the_provider(pool: PgPool)
 }
 
 /// A one-pixel PNG as a data URL (an image the gateway accepts).
-const PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
-fn chat_with_image(text: &str) -> Value {
+pub(super) const PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+pub(super) fn chat_with_image(text: &str) -> Value {
     json!({"model":"company/smart","messages":[{"role":"user","content":[
         {"type":"text","text":text},{"type":"image_url","image_url":{"url":PNG}}]}]})
 }
-async fn images_on(w: &World) {
+pub(super) async fn images_on(w: &World) {
     sqlx::query("UPDATE deployments SET image_input=true")
         .execute(&w.f.store.pool)
         .await

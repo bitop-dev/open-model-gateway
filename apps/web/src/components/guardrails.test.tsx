@@ -9,8 +9,8 @@ import { DashboardNavigationProvider } from "./navigation-link";
 import { AdminGuardrails, WorkspaceGuardrailsAdmin, WorkspaceGuardrailsTab } from "../pages/guardrails";
 import { GuardrailDecisions } from "../pages/request-detail";
 import {
-  guardrailsPath, inspectedSentence, inspectionSentence, platformGuardrailsPath, ruleInput, stricterActions, stricterPart, toInput, typeDefaultPath,
-  type EffectiveEntry, type Kind, type PlatformWorkspaceGuardrails, type RuleSet, type StoredRule, type TypeDefault, type WorkspaceGuardrails,
+  guardrailsPath, inspectedSentence, inspectionSentence, platformGuardrailsPath, refusesWhole, ruleInput, stricterActions, stricterPart, toInput, typeDefaultPath,
+  type EffectiveEntry, type Kind, type Workload, type PlatformWorkspaceGuardrails, type RuleSet, type StoredRule, type TypeDefault, type WorkspaceGuardrails,
 } from "../lib/guardrails";
 import { attemptFilters, logsSearch, requestFilters, requestQuery } from "../lib/requests";
 import { dashboardHref, parseDashboardLocation } from "../lib/locations";
@@ -89,7 +89,7 @@ describe("Workspace › Settings › Guardrails", () => {
     expect(html).toContain("This workspace&#x27;s rules");
     expect(html).toContain("Add rule");
     // Other workloads and response text are said to be unchecked.
-    expect(html).toContain("Other workloads are not checked yet");
+    expect(html).toContain("A rule may also name image generation, transcription and realtime, whose content is never read");
   });
   it("shows members the rules and a count of patterns, never an editor", () => {
     const counted: StoredRule = { ...codes, detector: { kind: "pattern", categories: ["custom"], pattern_count: 1, egress: "local" } };
@@ -467,5 +467,58 @@ describe("Logs: guardrail filters and decisions", () => {
     expect(html).toContain("Refused the request");
     expect(html).toContain("Custom patterns");
     expect(html).toContain("Workspace&#x27;s own rule");
+  });
+});
+
+describe("What a rule can't read (#841)", () => {
+  const images: StoredRule = { ...codes, id: "r-img", name: "No images", workloads: ["images"], uninspectable: "deny" };
+  it("says a Block rule naming a never-read workload refuses every request of it, or lets them through under allow", () => {
+    expect(inspectionSentence(images)).toBe("Image generation requests are never read: it refuses every one. If the rule can't run, the request is refused. Checked inside the gateway; nothing is sent anywhere else.");
+    expect(inspectionSentence({ ...images, uninspectable: "allow" })).toContain("Image generation requests are never read: it lets them through unread and records each as not readable.");
+    const both = { ...codes, workloads: ["generation", "realtime"] as Workload[], uninspectable: "allow" as const };
+    expect(inspectionSentence(both)).toContain("in the input of generation requests and refuses a request that has one. A request it can't read (one with an image, audio or a document that isn't plain text) goes on with its text checked, and is recorded as not readable");
+    expect(inspectionSentence(both)).toContain("Realtime requests are never read: it lets them through unread");
+    expect(refusesWhole({ action: "block", workloads: ["images", "realtime"] }, "every team workspace")).toBe("This refuses all image generation and realtime requests for every team workspace: their content is never read, so a Block rule that refuses what it can't read refuses every one.");
+    expect(refusesWhole({ action: "block", uninspectable: "allow", workloads: ["images"] }, "x")).toBeUndefined();
+    expect(refusesWhole({ action: "monitor", workloads: ["images"] }, "x")).toBeUndefined();
+  });
+  it("warns before a type default's Block rule switches image generation off for every workspace of the kind", async () => {
+    const data: TypeDefault = { kind: "team", rule_set: platformSet, inspected_workloads: ["generation", "embeddings"] };
+    const fetch = serve({ [typeDefaultPath("team")]: () => data });
+    const user = mount(<AdminGuardrails session={admin} tab="team" onTabChange={() => {}} />);
+    await user.click(await screen.findByRole("button", { name: "Add rule" }));
+    await user.type(screen.getByLabelText("Name"), "No images");
+    await user.selectOptions(screen.getByLabelText("On input"), "block");
+    await user.click(screen.getByRole("checkbox", { name: /^Image generation/ }));
+    expect(screen.getByRole("dialog").textContent).toContain("This refuses all image generation requests for every team workspace without a platform override");
+    // Letting what it can't read through: no warning, and the choice is sent.
+    await user.selectOptions(screen.getByLabelText("What it can't read"), "allow");
+    expect(screen.getByRole("dialog").textContent).not.toContain("This refuses all image generation requests");
+    await user.click(screen.getByRole("button", { name: "Add rule" }));
+    await waitFor(() => expect(writes(fetch)).toHaveLength(1));
+    expect(writes(fetch)[0]![2].rules[1]).toMatchObject({ name: "No images", input: { action: "block" }, uninspectable: "allow", workloads: ["generation", "embeddings", "images"] });
+  });
+  it("tightens a platform rule that lets unreadable content through to refuse it", async () => {
+    const lets: StoredRule = { ...codes, id: "r-lets", name: "Lets through", uninspectable: "allow" };
+    const fetch = serve({ [guardrailsPath(team.id)]: () => view({ platform: { source: "type_default", rule_set: { ...platformSet, rules: [lets] } }, local: { ...localSet, rules: [] }, effective: [effective(lets, "type_default", "set-p")] }) });
+    const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
+    await user.click(await screen.findByRole("button", { name: "Tighten Lets through" }));
+    expect((screen.getByLabelText("What it can't read") as HTMLSelectElement).value).toBe("deny");
+    await user.click(screen.getByRole("button", { name: "Tighten" }));
+    await waitFor(() => expect(writes(fetch)).toHaveLength(1));
+    expect(writes(fetch)[0]![2].rules).toEqual([{ tightens: "r-lets", uninspectable: "deny" }]);
+    // A tightening keeps deny against its platform rule; allow is never sent.
+    expect(stricterPart({ tightens: "r-lets", uninspectable: "deny" }, lets)).toEqual({ tightens: "r-lets", uninspectable: "deny" });
+    expect(stricterPart({ tightens: "r-lets", uninspectable: "allow" }, lets)).toBeNull();
+  });
+  it("counts not readable requests refused apart from those let through, and the request page says which", async () => {
+    serve({ [platformGuardrailsPath(team.id)]: () => platformView({ decisions_this_month: [{ action: "skipped", category: "secret", refused: true, decisions: 2, findings: 0 }, { action: "skipped", category: "secret", refused: false, decisions: 5, findings: 0 }] }) });
+    mount(<WorkspaceGuardrailsAdmin id={team.id} writable />);
+    const table = await screen.findByRole("table", { name: "Guardrail decisions this month" });
+    expect(table.textContent).toContain("Not readable · refused");
+    expect(table.textContent).toContain("Not readable · let through");
+    expect(screen.getByText(/refused ones \(the rule refuses what it can't read\) apart from ones let through unread/)).toBeTruthy();
+    const html = markup(<GuardrailDecisions decisions={[{ rule_set_id: "set-p", rule_id: "11111111-2222-4333-8444-555555555555", revision: 3, layer: "type_default", stage: "input", detector: "pattern", category: "secret", kind: null, action: "skipped", count: 1, refused: false, created_at: "2026-11-26T00:00:00Z" }]} />);
+    expect(html).toContain("Let through unread");
   });
 });

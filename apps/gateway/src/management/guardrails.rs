@@ -467,8 +467,11 @@ async fn with_totals(s: &Store, ws: Uuid, mut v: Value) -> Result<Value> {
     // staff see its totals, not which kinds of personal data its owner sent,
     // nor how many (a rule's decision on one request counts once, however
     // many kinds it found).
-    let totals: Vec<(String, String, Option<String>, i64, i64)> = sqlx::query_as(
-        "SELECT action,category,CASE WHEN $2 THEN kind END AS k,CASE WHEN $2 THEN count(*) ELSE count(DISTINCT (root_request_id,rule_id,stage)) END,coalesce(sum(count) FILTER(WHERE action IN('monitored','redacted','blocked','stopped')),0)::bigint FROM guardrail_events WHERE workspace_id=$1 AND created_at>=$3 AND ($2 OR (layer<>'workspace_local' AND NOT tightened)) GROUP BY action,category,k ORDER BY action,category,k NULLS FIRST",
+    // Refused decisions are counted apart from the others of their action:
+    // content a rule could not read was refused (`uninspectable: deny`) or
+    // let through unread (`allow`).
+    let totals: Vec<(String, String, Option<String>, bool, i64, i64)> = sqlx::query_as(
+        "SELECT action,category,CASE WHEN $2 THEN kind END AS k,refused,CASE WHEN $2 THEN count(*) ELSE count(DISTINCT (root_request_id,rule_id,stage)) END,coalesce(sum(count) FILTER(WHERE action IN('monitored','redacted','blocked','stopped')),0)::bigint FROM guardrail_events WHERE workspace_id=$1 AND created_at>=$3 AND ($2 OR (layer<>'workspace_local' AND NOT tightened)) GROUP BY action,category,k,refused ORDER BY action,category,k NULLS FIRST,refused",
     )
     .bind(ws)
     .bind(owner_visible)
@@ -477,8 +480,8 @@ async fn with_totals(s: &Store, ws: Uuid, mut v: Value) -> Result<Value> {
     .await?;
     v["decisions_this_month"] = totals
         .into_iter()
-        .map(|(action, category, kind, decisions, findings)| {
-            json!({"action":action,"category":category,"kind":kind,"decisions":decisions,"findings":findings})
+        .map(|(action, category, kind, refused, decisions, findings)| {
+            json!({"action":action,"category":category,"kind":kind,"refused":refused,"decisions":decisions,"findings":findings})
         })
         .collect();
     Ok(v)

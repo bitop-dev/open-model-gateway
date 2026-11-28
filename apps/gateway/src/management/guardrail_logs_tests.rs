@@ -171,8 +171,8 @@ async fn refused_requests_are_listed_as_blocked_with_logs_visibility(pool: PgPoo
     assert_eq!(
         totals["decisions_this_month"],
         json!([
-            {"action":"monitored","category":"personal_data","kind":null,"decisions":2,"findings":8},
-            {"action":"monitored","category":"secret","kind":null,"decisions":1,"findings":3}
+            {"action":"monitored","category":"personal_data","kind":null,"refused":false,"decisions":2,"findings":8},
+            {"action":"monitored","category":"secret","kind":null,"refused":false,"decisions":1,"findings":3}
         ])
     );
     assert!(!totals.to_string().contains("us_ssn"), "{totals}");

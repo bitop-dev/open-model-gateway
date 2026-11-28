@@ -6973,7 +6973,9 @@
             "type": "null"
           },
           "uninspectable": {
+            "description": "What an enforcing rule does with content it cannot read (an image, audio, a realtime session; the images, transcription and realtime workloads are never read): deny refuses the request (guardrail_not_supported), allow lets it through recorded as skipped, its text still checked (#841). Default deny.",
             "enum": [
+              "allow",
               "deny"
             ]
           },
@@ -6981,7 +6983,10 @@
             "items": {
               "enum": [
                 "generation",
-                "embeddings"
+                "embeddings",
+                "images",
+                "audio_transcriptions",
+                "realtime"
               ]
             },
             "minItems": 1,
@@ -6999,7 +7004,7 @@
       },
       "GuardrailTighteningInput": {
         "additionalProperties": false,
-        "description": "A tightening entry (local layers only). Rules the schema cannot state: tightens names a rule of the workspace's current platform layer, once; at least one of input.action, output.mode and on_error is given; each is at least as strict as the platform rule's (guardrail_loosen_not_allowed).",
+        "description": "A tightening entry (local layers only). Rules the schema cannot state: tightens names a rule of the workspace's current platform layer, once; at least one of input.action, output.mode, on_error and uninspectable is given; each is at least as strict as the platform rule's (guardrail_loosen_not_allowed). uninspectable is only ever deny: allow is the weaker value, so a tightening that names it is refused as a loosening (403 guardrail_loosen_not_allowed), whatever the platform rule says (#841).",
         "properties": {
           "id": {
             "$ref": "#/components/schemas/IdentityUuid"
@@ -7041,6 +7046,11 @@
           },
           "tightens": {
             "$ref": "#/components/schemas/IdentityUuid"
+          },
+          "uninspectable": {
+            "enum": [
+              "deny"
+            ]
           }
         },
         "required": [
@@ -45877,6 +45887,10 @@
                       "type": "null"
                     }
                   ]
+                },
+                "refused": {
+                  "description": "Whether these decisions refused their requests: a skipped (not readable) total is split into requests refused (uninspectable: deny) and requests let through unread (allow) (#841).",
+                  "type": "boolean"
                 }
               },
               "required": [
@@ -45884,7 +45898,8 @@
                 "category",
                 "decisions",
                 "findings",
-                "kind"
+                "kind",
+                "refused"
               ],
               "type": "object"
             },
@@ -46458,6 +46473,11 @@
                             },
                             "tightens": {
                               "$ref": "#/components/schemas/IdentityUuid"
+                            },
+                            "uninspectable": {
+                              "enum": [
+                                "deny"
+                              ]
                             }
                           },
                           "required": [
@@ -50416,6 +50436,10 @@
                       "type": "null"
                     }
                   ]
+                },
+                "refused": {
+                  "description": "Whether these decisions refused their requests: a skipped (not readable) total is split into requests refused (uninspectable: deny) and requests let through unread (allow) (#841).",
+                  "type": "boolean"
                 }
               },
               "required": [
@@ -50423,7 +50447,8 @@
                 "category",
                 "decisions",
                 "findings",
-                "kind"
+                "kind",
+                "refused"
               ],
               "type": "object"
             },
@@ -50997,6 +51022,11 @@
                             },
                             "tightens": {
                               "$ref": "#/components/schemas/IdentityUuid"
+                            },
+                            "uninspectable": {
+                              "enum": [
+                                "deny"
+                              ]
                             }
                           },
                           "required": [
@@ -52612,6 +52642,11 @@
                             },
                             "tightens": {
                               "$ref": "#/components/schemas/IdentityUuid"
+                            },
+                            "uninspectable": {
+                              "enum": [
+                                "deny"
+                              ]
                             }
                           },
                           "required": [
@@ -59312,6 +59347,10 @@
                       "type": "null"
                     }
                   ]
+                },
+                "refused": {
+                  "description": "Whether these decisions refused their requests: a skipped (not readable) total is split into requests refused (uninspectable: deny) and requests let through unread (allow) (#841).",
+                  "type": "boolean"
                 }
               },
               "required": [
@@ -59319,7 +59358,8 @@
                 "category",
                 "decisions",
                 "findings",
-                "kind"
+                "kind",
+                "refused"
               ],
               "type": "object"
             },
@@ -59893,6 +59933,11 @@
                             },
                             "tightens": {
                               "$ref": "#/components/schemas/IdentityUuid"
+                            },
+                            "uninspectable": {
+                              "enum": [
+                                "deny"
+                              ]
                             }
                           },
                           "required": [
@@ -61591,6 +61636,11 @@
                         },
                         "tightens": {
                           "$ref": "#/components/schemas/IdentityUuid"
+                        },
+                        "uninspectable": {
+                          "enum": [
+                            "deny"
+                          ]
                         }
                       },
                       "required": [

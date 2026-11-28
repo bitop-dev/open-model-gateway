@@ -84,6 +84,10 @@ fn decode(row: RuleRow) -> Result<StoredRule, Unreadable> {
                     .map(|v| OnError::parse(v).ok_or_else(bad))
                     .transpose()?,
                 threshold,
+                uninspectable: uninspectable
+                    .as_deref()
+                    .map(|v| Uninspectable::parse(v).ok_or_else(bad))
+                    .transpose()?,
             },
         ),
         None => Entry::Rule(Box::new(Rule {

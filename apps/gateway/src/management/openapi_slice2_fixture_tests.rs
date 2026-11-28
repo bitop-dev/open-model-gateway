@@ -4342,7 +4342,7 @@ async fn guardrail_fixtures(
         let mut o = c.observed.lock().await;
         c.guarded(
             "PUT /workspaces/{ws}/guardrails",
-            body_vectors_seeded(&mut o, "PUT", "/api/v1/workspaces/{ws}/guardrails", json!({"expected":{"rule_set_id":"00000000-0000-4000-8000-000000000000","revision":1},"rules":[{"tightens":target,"input":{"action":"block"},"output":{"mode":"off"},"on_error":"fail_closed","threshold":null}, custom("internal-[0-9]+"), personal()]}), &[("/rules/0/id", json!(seeded)), ("/rules/1/id", json!(seeded))], async |body| probe(owner, &local_team, body, &rules).await),
+            body_vectors_seeded(&mut o, "PUT", "/api/v1/workspaces/{ws}/guardrails", json!({"expected":{"rule_set_id":"00000000-0000-4000-8000-000000000000","revision":1},"rules":[{"tightens":target,"input":{"action":"block"},"output":{"mode":"off"},"on_error":"fail_closed","threshold":null,"uninspectable":"deny"}, custom("internal-[0-9]+"), personal()]}), &[("/rules/0/id", json!(seeded)), ("/rules/1/id", json!(seeded))], async |body| probe(owner, &local_team, body, &rules).await),
         )
         .await;
     }
@@ -4450,7 +4450,7 @@ async fn guardrail_fixtures(
     )
     .await;
     // The Team's local layer tightens both type-default rules and adds a pattern.
-    c.ok(owner, "PUT", &local_team, Some(with_expected(pool, &local_team, json!({"rules":[{"tightens":target,"input":{"action":"block"}}, {"tightens":custom_rule,"on_error":"fail_closed"}, custom("internal-[0-9]+"), personal()]})).await)).await;
+    c.ok(owner, "PUT", &local_team, Some(with_expected(pool, &local_team, json!({"rules":[{"tightens":target,"input":{"action":"block"}}, {"tightens":custom_rule,"on_error":"fail_closed","uninspectable":"deny"}, custom("internal-[0-9]+"), personal()]})).await)).await;
     c.ok(regular, "GET", &local_team, None).await;
     // A personal workspace with no rules in any layer.
     c.ok(owner, "GET", &local_personal, None).await;

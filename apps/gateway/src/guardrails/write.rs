@@ -327,7 +327,6 @@ fn parse_tightening(e: &EntryIn) -> Result<Tightening, Refusal> {
         || e.detector.is_some()
         || e.timeout_ms.is_some()
         || e.workloads.is_some()
-        || e.uninspectable.is_some()
         || e.input.as_ref().is_some_and(|i| i.redact_scope.is_some())
     {
         // A tightening entry names only what it tightens.
@@ -352,6 +351,11 @@ fn parse_tightening(e: &EntryIn) -> Result<Tightening, Refusal> {
             .map(|v| name_of(OnError::parse, v))
             .transpose()?,
         threshold: e.threshold.flatten().map(threshold).transpose()?,
+        uninspectable: e
+            .uninspectable
+            .as_deref()
+            .map(|v| name_of(Uninspectable::parse, v))
+            .transpose()?,
     };
     if t == Tightening::default() {
         return Err(Refusal::Invalid);
@@ -495,8 +499,11 @@ pub fn validate(
 }
 
 /// Whether a tightening entry would make its platform rule weaker anywhere.
+/// `uninspectable: allow` is the weaker value, never a tightening, whatever
+/// the platform rule says.
 fn loosens(base: &Rule, t: &Tightening) -> bool {
-    t.input_action.is_some_and(|a| a < base.input_action)
+    t.uninspectable == Some(Uninspectable::Allow)
+        || t.input_action.is_some_and(|a| a < base.input_action)
         || t.output_mode.is_some_and(|m| m < base.output_mode)
         || t.on_error.is_some_and(|o| o < base.on_error)
         || match (t.threshold, base.threshold) {
