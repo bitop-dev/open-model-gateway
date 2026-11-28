@@ -131,7 +131,7 @@
             "1011": "Fatal upstream/server failure, including invalid or unaccounted upstream events."
           }
         },
-        "description": "OpenAI GA Realtime WebSocket. HTTP errors precede upgrade; errors after upgrade are events and closes, not HTTP responses. Declared Content-Length above the fixed 2 MiB root limit is refused with plain text 413, including GET.",
+        "description": "OpenAI GA Realtime WebSocket. HTTP errors precede upgrade; errors after upgrade are events and closes, not HTTP responses. Declared Content-Length above the fixed 2 MiB root limit is refused with plain text 413, including GET. Guardrails decide on a session once, before the upgrade: a rule applies to sessions opened after it is saved, and a session already open runs on to its idle timeout or max_session (#841).",
         "x-omg-limits": {
           "session_seconds": {
             "default": 900,
@@ -172,6 +172,24 @@
             "envelope": "OpenAiErrorEnvelope",
             "code": "invalid_request_error",
             "trigger": "Invalid model query, unknown query parameter or missing WebSocket upgrade"
+          },
+          {
+            "status": 400,
+            "envelope": "OpenAiErrorEnvelope",
+            "code": "guardrail_not_supported",
+            "trigger": "An enforcing guardrail rule names realtime and refuses what it cannot read (uninspectable: deny): a session's events are never read, so it is refused before the upgrade and before admission, with error.guardrail naming the rule (#841)"
+          },
+          {
+            "status": 429,
+            "envelope": "OpenAiErrorEnvelope",
+            "code": "guardrail_rate_limited",
+            "trigger": "The key reached its per-minute bound of guardrail-recorded requests that were never admitted, before the upgrade"
+          },
+          {
+            "status": 503,
+            "envelope": "OpenAiErrorEnvelope",
+            "code": "guardrail_unavailable",
+            "trigger": "The workspace's guardrail policy cannot be read now, before the upgrade; retry after Retry-After"
           }
         ]
       }

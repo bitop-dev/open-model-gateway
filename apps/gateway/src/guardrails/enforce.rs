@@ -175,8 +175,9 @@ pub const CUSTOM_BUDGET: std::time::Duration = if cfg!(test) {
 };
 
 /// The workloads whose input this release inspects (also through
-/// `/v1/messages/count_tokens` and gateway-run batch lines). A rule that
-/// names another workload does not cover it yet.
+/// `/v1/messages/count_tokens` and gateway-run batch lines). A rule may also
+/// name images, transcription and realtime, which are never read: it decides
+/// on them unread (`uninspectable`). Other workloads cannot be named.
 pub const INSPECTED_WORKLOADS: [&str; 2] = ["generation", "embeddings"];
 
 /// What a decision records (`guardrail_events.action`).
@@ -214,6 +215,10 @@ pub struct Event {
     pub count: u32,
     /// The decision the client was refused with.
     pub refused: bool,
+    /// This rule's own verdict: the decision refuses its request, whether
+    /// or not it is the one the client was refused with (several rules, or
+    /// a finding and unreadable content, can each refuse one request).
+    pub refuses: bool,
     /// The rule was a platform rule a local tightening made stricter.
     pub tightened: bool,
 }
@@ -292,6 +297,7 @@ impl CompiledRule {
             action,
             count,
             refused: false,
+            refuses: false,
             tightened: self.tightened,
         }
     }
@@ -312,6 +318,24 @@ fn refuse(d: &mut Decision, r: &CompiledRule, kind: RefusalKind, category: Categ
     };
     if d.refusal.is_none_or(|c| rank(kind) < rank(c.kind)) {
         d.refusal = Some(refusal);
+    }
+    // The refusing decision was just recorded.
+    let action = refusing_action(kind);
+    if let Some(e) = d
+        .events
+        .iter_mut()
+        .rev()
+        .find(|e| e.rule_id == r.id && e.category == category && e.action == action)
+    {
+        e.refuses = true;
+    }
+}
+/// The action a refusal of `kind` records.
+fn refusing_action(kind: RefusalKind) -> Action {
+    match kind {
+        RefusalKind::InputBlocked => Action::Blocked,
+        RefusalKind::NotSupported => Action::Skipped,
+        RefusalKind::DetectorFailed | RefusalKind::Unavailable => Action::DetectorFailed,
     }
 }
 
@@ -350,12 +374,31 @@ impl Policy {
                 .unwrap_or(false)
         })
     }
+    /// The decision on a request whose text this release could read but
+    /// does not (a native batch, sent to the provider's own batch API): an
+    /// enforcing rule refuses it whatever its `uninspectable`, since letting
+    /// it through would pass text the rule checks everywhere else (the
+    /// client can run the batch in the gateway, which reads each line).
+    pub fn decide_unread(&self, workload: Workload) -> Decision {
+        self.decide_in(workload, None, &Budget::time(CUSTOM_BUDGET), true)
+    }
     /// As [`Policy::decide`], within `budget`.
     pub fn decide_with(
         &self,
         workload: Workload,
         input: Option<&Inspection<'_>>,
         budget: &Budget,
+    ) -> Decision {
+        self.decide_in(workload, input, budget, false)
+    }
+    /// `readable_text`: the content is text the rule could read, sent
+    /// unread (`decide_unread`), so `uninspectable: allow` does not pass it.
+    fn decide_in(
+        &self,
+        workload: Workload,
+        input: Option<&Inspection<'_>>,
+        budget: &Budget,
+        readable_text: bool,
     ) -> Decision {
         let mut decision = Decision::default();
         let builtin: OnceCell<Findings> = OnceCell::new();
@@ -408,7 +451,7 @@ impl Policy {
             if input.is_none_or(|i| i.uninspectable) {
                 // Nothing was found: the rule could not read the request.
                 decision.events.push(r.event(r.first(), Action::Skipped, 1));
-                if blocking && r.uninspectable == Uninspectable::Deny {
+                if blocking && (r.uninspectable == Uninspectable::Deny || readable_text) {
                     refuse(&mut decision, r, RefusalKind::NotSupported, r.first());
                 }
             }
@@ -445,11 +488,7 @@ impl Policy {
 /// Mark the event the request was refused with.
 fn mark_refused(decision: &mut Decision) {
     if let Some(r) = decision.refusal {
-        let action = match r.kind {
-            RefusalKind::InputBlocked => Action::Blocked,
-            RefusalKind::NotSupported => Action::Skipped,
-            RefusalKind::DetectorFailed | RefusalKind::Unavailable => Action::DetectorFailed,
-        };
+        let action = refusing_action(r.kind);
         if let Some(e) = decision
             .events
             .iter_mut()

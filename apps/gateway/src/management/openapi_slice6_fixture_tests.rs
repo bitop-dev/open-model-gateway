@@ -1486,7 +1486,7 @@ async fn slice6_fixtures(pool: PgPool, shard: usize) -> (PositiveFixtures, Vec<S
         (private_root, f.personal, private_key, "monitored", false),
         (refused_private, f.personal, private_key, "blocked", true),
     ] {
-        sqlx::query("INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused) VALUES(gen_random_uuid(),$1,$2,$3,'chat_completions','contract-log','input',gen_random_uuid(),gen_random_uuid(),2,'type_default','pattern','secret',$4,1,$5)")
+        sqlx::query("INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,refuses) VALUES(gen_random_uuid(),$1,$2,$3,'chat_completions','contract-log','input',gen_random_uuid(),gen_random_uuid(),2,'type_default','pattern','secret',$4,1,$5,$5)")
             .bind(root)
             .bind(ws)
             .bind(key)
@@ -1502,7 +1502,7 @@ async fn slice6_fixtures(pool: PgPool, shard: usize) -> (PositiveFixtures, Vec<S
         (refused_root, f.team, log_key),
         (private_root, f.personal, private_key),
     ] {
-        sqlx::query("INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,kind,action,count) VALUES(gen_random_uuid(),$1,$2,$3,'chat_completions','contract-log','input',gen_random_uuid(),gen_random_uuid(),2,'type_default','pattern','personal_data','email','monitored',2)")
+        sqlx::query("INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,kind,action,count,refuses) VALUES(gen_random_uuid(),$1,$2,$3,'chat_completions','contract-log','input',gen_random_uuid(),gen_random_uuid(),2,'type_default','pattern','personal_data','email','monitored',2,false)")
             .bind(root)
             .bind(ws)
             .bind(key)

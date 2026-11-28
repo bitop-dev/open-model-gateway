@@ -4174,12 +4174,21 @@ async fn guardrail_fixtures(
             .execute(pool)
             .await
             .unwrap();
-        for (category, kind) in [("secret", None), ("personal_data", Some("email"))] {
-            sqlx::query("INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,kind,action,count) VALUES(gen_random_uuid(),gen_random_uuid(),$1,$2,'chat_completions','contract-guardrails','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern',$3,$4,'monitored',1)")
+        // Monitored decisions with and without a kind, and not readable ones
+        // of a rule that refuses and of one that lets through (#841).
+        for (category, kind, action, refuses) in [
+            ("secret", None, "monitored", false),
+            ("personal_data", Some("email"), "monitored", false),
+            ("secret", None, "skipped", true),
+            ("secret", None, "skipped", false),
+        ] {
+            sqlx::query("INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,kind,action,count,refused,refuses) VALUES(gen_random_uuid(),gen_random_uuid(),$1,$2,'chat_completions','contract-guardrails','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern',$3,$4,$5,1,$6,$6)")
                 .bind(ws)
                 .bind(key)
                 .bind(category)
                 .bind(kind)
+                .bind(action)
+                .bind(refuses)
                 .execute(pool)
                 .await
                 .unwrap();
@@ -4342,7 +4351,7 @@ async fn guardrail_fixtures(
         let mut o = c.observed.lock().await;
         c.guarded(
             "PUT /workspaces/{ws}/guardrails",
-            body_vectors_seeded(&mut o, "PUT", "/api/v1/workspaces/{ws}/guardrails", json!({"expected":{"rule_set_id":"00000000-0000-4000-8000-000000000000","revision":1},"rules":[{"tightens":target,"input":{"action":"block"},"output":{"mode":"off"},"on_error":"fail_closed","threshold":null}, custom("internal-[0-9]+"), personal()]}), &[("/rules/0/id", json!(seeded)), ("/rules/1/id", json!(seeded))], async |body| probe(owner, &local_team, body, &rules).await),
+            body_vectors_seeded(&mut o, "PUT", "/api/v1/workspaces/{ws}/guardrails", json!({"expected":{"rule_set_id":"00000000-0000-4000-8000-000000000000","revision":1},"rules":[{"tightens":target,"input":{"action":"block"},"output":{"mode":"off"},"on_error":"fail_closed","threshold":null,"uninspectable":"deny"}, custom("internal-[0-9]+"), personal()]}), &[("/rules/0/id", json!(seeded)), ("/rules/1/id", json!(seeded))], async |body| probe(owner, &local_team, body, &rules).await),
         )
         .await;
     }
@@ -4450,7 +4459,7 @@ async fn guardrail_fixtures(
     )
     .await;
     // The Team's local layer tightens both type-default rules and adds a pattern.
-    c.ok(owner, "PUT", &local_team, Some(with_expected(pool, &local_team, json!({"rules":[{"tightens":target,"input":{"action":"block"}}, {"tightens":custom_rule,"on_error":"fail_closed"}, custom("internal-[0-9]+"), personal()]})).await)).await;
+    c.ok(owner, "PUT", &local_team, Some(with_expected(pool, &local_team, json!({"rules":[{"tightens":target,"input":{"action":"block"}}, {"tightens":custom_rule,"on_error":"fail_closed","uninspectable":"deny"}, custom("internal-[0-9]+"), personal()]})).await)).await;
     c.ok(regular, "GET", &local_team, None).await;
     // A personal workspace with no rules in any layer.
     c.ok(owner, "GET", &local_personal, None).await;

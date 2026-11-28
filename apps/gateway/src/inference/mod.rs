@@ -746,6 +746,8 @@ mod guardrail_db_tests;
 mod guardrail_inner_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod guardrail_limits_db_tests;
+#[cfg(all(test, feature = "integration-tests"))]
+mod guardrail_unread_db_tests;
 mod route_use;
 use route_use::after;
 pub(crate) use route_use::{Passed, RouteUse, exhausted, route_use};

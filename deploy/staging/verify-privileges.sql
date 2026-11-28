@@ -1242,6 +1242,9 @@ BEGIN
   BEGIN INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable,kinds) VALUES(gen_random_uuid(),gl,7,'Personal data','personal_data','pattern','{personal_data}','monitor','user_text','off','fail_open','{generation}','deny','{email,email}'); RAISE EXCEPTION 'personal-data kind stored twice'; EXCEPTION WHEN check_violation THEN NULL; END;
   BEGIN INSERT INTO guardrail_rules(id,rule_set_id,position,name,protection,detector_kind,categories,input_action,redact_scope,output_mode,on_error,workloads,uninspectable,kinds) VALUES(gen_random_uuid(),gl,7,'Secrets','secrets','pattern','{secret}','monitor','user_text','off','fail_open','{generation}','deny','{email}'); RAISE EXCEPTION 'kinds stored on a secrets rule'; EXCEPTION WHEN check_violation THEN NULL; END;
   BEGIN INSERT INTO guardrail_rules(id,rule_set_id,position,tightens_rule_id,input_action,kinds) VALUES(gen_random_uuid(),gl,7,gr,'block','{email}'); RAISE EXCEPTION 'kinds stored on a tightening entry'; EXCEPTION WHEN check_violation THEN NULL; END;
+  -- #841 (0100): a tightening entry may set uninspectable, only to deny (allow is never stricter).
+  INSERT INTO guardrail_rules(id,rule_set_id,position,tightens_rule_id,uninspectable) VALUES(gen_random_uuid(),gl,7,gr,'deny');
+  BEGIN INSERT INTO guardrail_rules(id,rule_set_id,position,tightens_rule_id,input_action,uninspectable) VALUES(gen_random_uuid(),gl,8,gr,'block','allow'); RAISE EXCEPTION 'uninspectable allow stored on a tightening entry'; EXCEPTION WHEN check_violation THEN NULL; END;
   BEGIN UPDATE guardrail_rules SET input_action='off' WHERE id=gr; RAISE EXCEPTION 'guardrail rule edited in place'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
   BEGIN UPDATE guardrail_rule_sets SET workspace_id=gother WHERE id=gl; RAISE EXCEPTION 'guardrail layer moved'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
   BEGIN UPDATE guardrail_rule_sets SET revision=revision+2,updated_by=t_author WHERE id=gl; RAISE EXCEPTION 'guardrail revision skipped'; EXCEPTION WHEN check_violation THEN NULL; END;
@@ -1254,24 +1257,36 @@ BEGIN
  END;
  -- Guardrail decisions (0095): appended as runtime, never changed, removed or
  -- back-dated, and scoped to the key's own workspace.
- INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count)
-  VALUES(gen_random_uuid(),gen_random_uuid(),ws,k,'chat_completions','probe-model','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','secret','blocked',1);
+ INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refuses)
+  VALUES(gen_random_uuid(),gen_random_uuid(),ws,k,'chat_completions','probe-model','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','secret','blocked',1,true);
  -- #841 (0099): a personal-data decision carries its kind, a fixed label; no other decision carries one.
- INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,kind)
-  VALUES(gen_random_uuid(),gen_random_uuid(),ws,k,'chat_completions','probe-model','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','personal_data','monitored',1,'email');
- BEGIN INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,kind)
-  VALUES(gen_random_uuid(),gen_random_uuid(),ws,k,'chat_completions','probe-model','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','secret','blocked',1,'email');
+ INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,kind,refuses)
+  VALUES(gen_random_uuid(),gen_random_uuid(),ws,k,'chat_completions','probe-model','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','personal_data','monitored',1,'email',false);
+ BEGIN INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,kind,refuses)
+  VALUES(gen_random_uuid(),gen_random_uuid(),ws,k,'chat_completions','probe-model','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','secret','blocked',1,'email',true);
   RAISE EXCEPTION 'kind stored on a secret decision'; EXCEPTION WHEN check_violation THEN NULL; END;
- BEGIN INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,kind)
-  VALUES(gen_random_uuid(),gen_random_uuid(),ws,k,'chat_completions','probe-model','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','personal_data','monitored',1,'alice@acme.io');
+ BEGIN INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,kind,refuses)
+  VALUES(gen_random_uuid(),gen_random_uuid(),ws,k,'chat_completions','probe-model','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','personal_data','monitored',1,'alice@acme.io',false);
   RAISE EXCEPTION 'matched text stored as a kind'; EXCEPTION WHEN check_violation THEN NULL; END;
+ -- #841 (0100): a realtime session's decision names its operation; an unknown one is refused.
+ INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refuses)
+  VALUES(gen_random_uuid(),gen_random_uuid(),ws,k,'realtime','probe-model','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','secret','skipped',1,false);
+ BEGIN INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refuses)
+  VALUES(gen_random_uuid(),gen_random_uuid(),ws,k,'probe_operation','probe-model','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','secret','skipped',1,false);
+  RAISE EXCEPTION 'unknown guardrail operation stored'; EXCEPTION WHEN check_violation THEN NULL; END;
+ BEGIN INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count)
+  VALUES(gen_random_uuid(),gen_random_uuid(),ws,k,'chat_completions','probe-model','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','secret','monitored',1);
+  RAISE EXCEPTION 'guardrail decision stored without its verdict'; EXCEPTION WHEN check_violation THEN NULL; END;
+ BEGIN INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refused,refuses)
+  VALUES(gen_random_uuid(),gen_random_uuid(),ws,k,'chat_completions','probe-model','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','secret','blocked',1,true,false);
+  RAISE EXCEPTION 'guardrail refusal stored as not refusing'; EXCEPTION WHEN check_violation THEN NULL; END;
  BEGIN UPDATE guardrail_events SET count=2 WHERE workspace_id=ws; RAISE EXCEPTION 'guardrail event changed'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
  BEGIN DELETE FROM guardrail_events WHERE workspace_id=ws; RAISE EXCEPTION 'guardrail event removed'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
- BEGIN INSERT INTO guardrail_events(id,created_at,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count)
-  VALUES(gen_random_uuid(),now()-interval '400 days',gen_random_uuid(),ws,k,'chat_completions','probe-model','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','secret','blocked',1);
+ BEGIN INSERT INTO guardrail_events(id,created_at,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refuses)
+  VALUES(gen_random_uuid(),now()-interval '400 days',gen_random_uuid(),ws,k,'chat_completions','probe-model','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','secret','blocked',1,true);
   RAISE EXCEPTION 'guardrail event back-dated'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
- BEGIN INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count)
-  VALUES(gen_random_uuid(),gen_random_uuid(),personal,k,'chat_completions','probe-model','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','secret','blocked',1);
+ BEGIN INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,action,count,refuses)
+  VALUES(gen_random_uuid(),gen_random_uuid(),personal,k,'chat_completions','probe-model','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern','secret','blocked',1,true);
   RAISE EXCEPTION 'guardrail event names another workspace''s key'; EXCEPTION WHEN foreign_key_violation THEN NULL; END;
  SET CONSTRAINTS ALL IMMEDIATE;
  IF (SELECT bool_or((versions_before->>topic)::bigint+1<>version) FROM config_versions) THEN RAISE EXCEPTION 'configuration versions not bumped once per transaction'; END IF;

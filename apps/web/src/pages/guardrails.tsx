@@ -14,7 +14,7 @@
 import { api, type Session, type Workspace } from "../lib/api";
 import {
   detectorsPath, guardrailsPath, inspectedSentence, isTightening, kindLabel, platformGuardrailsPath, stricterPart, toInput, typeDefaultPath, workloadLabels,
-  type Detectors, type PlatformWorkspaceGuardrails, type RuleSet, type StoredRule, type TypeDefault, type WorkspaceGuardrails, type WorkspaceKind,
+  type DecisionTotal, type Detectors, type PlatformWorkspaceGuardrails, type RuleSet, type StoredRule, type TypeDefault, type WorkspaceGuardrails, type WorkspaceKind,
 } from "../lib/guardrails";
 import { kindLabels } from "../lib/people";
 import { ResourcePage } from "../components/resource-page";
@@ -29,6 +29,8 @@ const kinds: WorkspaceKind[] = ["team", "project", "personal"];
 const actionNames: Record<string, string> = { monitored: "Monitored", redacted: "Redacted", blocked: "Blocked", stopped: "Stopped", detector_failed: "Could not check", skipped: "Not readable" };
 /** Outcomes that count matched values; the others (could not check, not readable) have no findings. */
 const matching = new Set(["monitored", "redacted", "blocked", "stopped"]);
+/** A total's outcome; a not-readable total says whether its requests were refused or let through. */
+const outcomeName = (t: DecisionTotal) => t.action === "skipped" && t.refuses != null ? (t.refuses ? "Not readable · refused" : "Not readable · let through") : actionNames[t.action] ?? t.action;
 const categoryNames: Record<string, string> = { secret: "Secrets", custom: "Custom patterns", personal_data: "Personal data", moderation: "Moderation", prompt_injection: "Prompt injection" };
 
 /** Admin › Settings › Guardrails. */
@@ -49,7 +51,7 @@ function TypeDefaultTab({ kind, writable }: { kind: WorkspaceKind; writable: boo
   const fresh = refetchOnConflict(() => q.refetch());
   return <Stack gap={6}>
     <Alert tone="info" title="What is checked">{inspectedSentence(q.data.inspected_workloads)}</Alert>
-    <LayerEditor title={`${kindLabels[kind]} default`} description={`Applies to ${every}.`} set={set} writable={writable}
+    <LayerEditor title={`${kindLabels[kind]} default`} description={`Applies to ${every}.`} set={set} writable={writable} audience={every}
       reach={{ change: `This applies to ${every}.`, remove: `It stops applying to ${every}, and their tightenings of it stop applying.` }}
       save={(rules, signal) => fresh(putPlatformLayer(path, set, localOnly, rules, signal))} localOnly={localOnly}
       onLocalOnly={(value, signal) => fresh(putPlatformLayer(path, set, value, (set?.rules ?? []).map(toInput), signal))} empty="No default rules." />
@@ -150,17 +152,17 @@ export function WorkspaceGuardrailsAdmin({ id, writable }: { id: string; writabl
   return <Stack gap={6}>
     <Alert tone="info" title="What is checked">{inspectedSentence(g.inspected_workloads)}</Alert>
     {override
-      ? <LayerEditor title="Platform override" description={`Replaces the ${kindLabels[g.kind].toLowerCase()} default for this workspace.`} set={override} writable={writable}
+      ? <LayerEditor title="Platform override" description={`Replaces the ${kindLabels[g.kind].toLowerCase()} default for this workspace.`} set={override} writable={writable} audience="this workspace"
           reach={{ change: "This applies to this workspace only.", remove: "This workspace's tightenings of it stop applying." }}
           save={(rules, signal) => fresh(putPlatformLayer(path, override, localOnly, rules, signal))} localOnly={localOnly}
           onLocalOnly={(value, signal) => fresh(putPlatformLayer(path, override, value, override.rules.map(toInput), signal))} />
       : <LayerEditor title={`${kindLabels[g.kind]} default`} description="Applies here: this workspace has no override. Edit it under Settings › Guardrails." set={g.type_default} writable={false} save={() => Promise.resolve()} empty="No default rules." />}
     {writable && <div><Button size="sm" variant={override ? "ghost" : "secondary"} onClick={override ? reset : create}>{override ? "Reset to default" : "Override the default"}</Button></div>}
     {g.local_visible && g.local && <LayerEditor title="This workspace's rules" description="Set by its owners and admins." set={g.local} writable={false} save={() => Promise.resolve()} empty="None." />}
-    <Card title="Decisions this month" titleAs="h2" description="Counts recorded by the gateway (UTC month). Findings are distinct matched values; no text is kept. A request refused because no check could run then (the gateway was busy) writes no row and is not counted here." flush={g.decisions_this_month.length > 0}>
+    <Card title="Decisions this month" titleAs="h2" description="Counts recorded by the gateway (UTC month). Findings are distinct matched values; no text is kept. Not readable counts the decisions of rules that could not read a request: rules that refuse what they can't read apart from rules that let it through unread. A request refused because no check could run then (the gateway was busy) writes no row and is not counted here." flush={g.decisions_this_month.length > 0}>
       {g.decisions_this_month.length === 0 ? <p className={s.note}>No decisions this month.</p> :
-        <Table caption="Guardrail decisions this month" columns={["Outcome", "Looked for", { label: "Decisions", numeric: true }, { label: "Findings", numeric: true }]}>{g.decisions_this_month.map(t => <Tr key={`${t.action}:${t.category}:${t.kind ?? ""}`}>
-          <Td>{actionNames[t.action] ?? t.action}</Td><Td>{categoryNames[t.category] ?? t.category}{t.kind ? ` · ${kindLabel(t.kind)}` : ""}</Td><Td>{t.decisions}</Td><Td>{matching.has(t.action) ? t.findings : "—"}</Td>
+        <Table caption="Guardrail decisions this month" columns={["Outcome", "Looked for", { label: "Decisions", numeric: true }, { label: "Findings", numeric: true }]}>{g.decisions_this_month.map(t => <Tr key={`${t.action}:${t.category}:${t.kind ?? ""}:${t.refuses ?? ""}`}>
+          <Td>{outcomeName(t)}</Td><Td>{categoryNames[t.category] ?? t.category}{t.kind ? ` · ${kindLabel(t.kind)}` : ""}</Td><Td>{t.decisions}</Td><Td>{matching.has(t.action) ? t.findings : "—"}</Td>
         </Tr>)}</Table>}
     </Card>
   </Stack>;

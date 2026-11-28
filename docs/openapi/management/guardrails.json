@@ -440,7 +440,7 @@
     "PUT /api/v1/workspaces/{ws}/guardrails": {
       "access": "WorkspaceAdmin",
       "operation": {
-        "description": "#840: replace the workspace's local layer (full set): rules of its own, and tightening entries ({tightens: <platform rule id>} with only input.action, output.mode, on_error or threshold) that make a platform rule stricter. Composition takes the stricter value of each field, so an entry never weakens the current platform rule. Shared owners/admins and a personal workspace's owner; browser only. local_only is a platform field (400). Input rules are enforced by the engine for generation and embeddings (enforced is true); output is not inspected in this release.",
+        "description": "#840: replace the workspace's local layer (full set): rules of its own, and tightening entries ({tightens: <platform rule id>} with only input.action, output.mode, on_error, threshold or uninspectable, the last only as deny: allow on a tightening is 403 guardrail_loosen_not_allowed, #841) that make a platform rule stricter. Composition takes the stricter value of each field, so an entry never weakens the current platform rule. Shared owners/admins and a personal workspace's owner; browser only. local_only is a platform field (400). Input rules are enforced by the engine for generation and embeddings (enforced is true); output is not inspected in this release.",
         "parameters": [
           {
             "in": "path",
@@ -670,7 +670,9 @@
           "type": "null"
         },
         "uninspectable": {
+          "description": "What an enforcing rule does with content it cannot read: deny refuses the request (guardrail_not_supported); allow lets it through recorded as skipped. Under allow the text beside an image in a generation request is still checked; an image prompt, an audio file and a realtime session are not read at all (the images, transcription and realtime workloads are never read). A native batch is refused by an enforcing rule under either value: its lines are text a gateway-run batch reads (#841). Default deny.",
           "enum": [
+            "allow",
             "deny"
           ]
         },
@@ -678,7 +680,10 @@
           "items": {
             "enum": [
               "generation",
-              "embeddings"
+              "embeddings",
+              "images",
+              "audio_transcriptions",
+              "realtime"
             ]
           },
           "minItems": 1,
@@ -696,7 +701,7 @@
     },
     "GuardrailTighteningInput": {
       "additionalProperties": false,
-      "description": "A tightening entry (local layers only). Rules the schema cannot state: tightens names a rule of the workspace's current platform layer, once; at least one of input.action, output.mode and on_error is given; each is at least as strict as the platform rule's (guardrail_loosen_not_allowed).",
+      "description": "A tightening entry (local layers only). Rules the schema cannot state: tightens names a rule of the workspace's current platform layer, once; at least one of input.action, output.mode, on_error and uninspectable is given; each is at least as strict as the platform rule's (guardrail_loosen_not_allowed). uninspectable is only ever deny: allow is the weaker value, so a tightening that names it is refused as a loosening (403 guardrail_loosen_not_allowed), whatever the platform rule says (#841).",
       "properties": {
         "id": {
           "$ref": "#/components/schemas/IdentityUuid"
@@ -738,6 +743,11 @@
         },
         "tightens": {
           "$ref": "#/components/schemas/IdentityUuid"
+        },
+        "uninspectable": {
+          "enum": [
+            "deny"
+          ]
         }
       },
       "required": [
@@ -799,6 +809,17 @@
                     "type": "null"
                   }
                 ]
+              },
+              "refuses": {
+                "description": "Not readable (skipped) totals only: whether the decisions' rules refuse what they cannot read (a Block rule with uninspectable: deny) or let it through unread, each rule's own verdict whatever other rules did to the request; null for every other action, which is not split, and for decisions recorded before migration 0100 (#841).",
+                "oneOf": [
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               }
             },
             "required": [
@@ -806,7 +827,8 @@
               "category",
               "decisions",
               "findings",
-              "kind"
+              "kind",
+              "refuses"
             ],
             "type": "object"
           },
@@ -1380,6 +1402,11 @@
                           },
                           "tightens": {
                             "$ref": "#/components/schemas/IdentityUuid"
+                          },
+                          "uninspectable": {
+                            "enum": [
+                              "deny"
+                            ]
                           }
                         },
                         "required": [
@@ -2364,6 +2391,17 @@
                     "type": "null"
                   }
                 ]
+              },
+              "refuses": {
+                "description": "Not readable (skipped) totals only: whether the decisions' rules refuse what they cannot read (a Block rule with uninspectable: deny) or let it through unread, each rule's own verdict whatever other rules did to the request; null for every other action, which is not split, and for decisions recorded before migration 0100 (#841).",
+                "oneOf": [
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               }
             },
             "required": [
@@ -2371,7 +2409,8 @@
               "category",
               "decisions",
               "findings",
-              "kind"
+              "kind",
+              "refuses"
             ],
             "type": "object"
           },
@@ -2945,6 +2984,11 @@
                           },
                           "tightens": {
                             "$ref": "#/components/schemas/IdentityUuid"
+                          },
+                          "uninspectable": {
+                            "enum": [
+                              "deny"
+                            ]
                           }
                         },
                         "required": [
@@ -4303,6 +4347,11 @@
                           },
                           "tightens": {
                             "$ref": "#/components/schemas/IdentityUuid"
+                          },
+                          "uninspectable": {
+                            "enum": [
+                              "deny"
+                            ]
                           }
                         },
                         "required": [
@@ -5016,6 +5065,17 @@
                     "type": "null"
                   }
                 ]
+              },
+              "refuses": {
+                "description": "Not readable (skipped) totals only: whether the decisions' rules refuse what they cannot read (a Block rule with uninspectable: deny) or let it through unread, each rule's own verdict whatever other rules did to the request; null for every other action, which is not split, and for decisions recorded before migration 0100 (#841).",
+                "oneOf": [
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               }
             },
             "required": [
@@ -5023,7 +5083,8 @@
               "category",
               "decisions",
               "findings",
-              "kind"
+              "kind",
+              "refuses"
             ],
             "type": "object"
           },
@@ -5597,6 +5658,11 @@
                           },
                           "tightens": {
                             "$ref": "#/components/schemas/IdentityUuid"
+                          },
+                          "uninspectable": {
+                            "enum": [
+                              "deny"
+                            ]
                           }
                         },
                         "required": [
@@ -6976,6 +7042,11 @@
                       },
                       "tightens": {
                         "$ref": "#/components/schemas/IdentityUuid"
+                      },
+                      "uninspectable": {
+                        "enum": [
+                          "deny"
+                        ]
                       }
                     },
                     "required": [

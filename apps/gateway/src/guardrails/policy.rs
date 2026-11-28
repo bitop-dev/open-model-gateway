@@ -147,10 +147,12 @@ impl DetectorKind {
 }
 
 /// What this release can enforce: the pattern detector, on input only, for
-/// secrets, personal data (#841) and custom patterns, with monitor and block,
-/// for generation and embeddings, refusing uninspectable content. A rule that needs
-/// more is refused on write (`guardrail_detector_unavailable`), never stored and
-/// ignored.
+/// secrets, personal data (#841) and custom patterns, with monitor and block.
+/// Generation and embeddings are read; images, transcription and realtime are
+/// never read, so a rule naming them decides on content it cannot inspect
+/// (`uninspectable`: refuse it, or let it through recorded as skipped). A
+/// rule that needs more is refused on write (`guardrail_detector_unavailable`),
+/// never stored and ignored.
 pub mod available {
     use super::*;
     pub const DETECTORS: &[DetectorKind] = &[DetectorKind::Pattern];
@@ -164,8 +166,14 @@ pub mod available {
     pub const INPUT_ACTIONS: &[InputAction] =
         &[InputAction::Off, InputAction::Monitor, InputAction::Block];
     pub const OUTPUT_MODES: &[OutputMode] = &[OutputMode::Off];
-    pub const WORKLOADS: &[Workload] = &[Workload::Generation, Workload::Embeddings];
-    pub const UNINSPECTABLE: &[Uninspectable] = &[Uninspectable::Deny];
+    pub const WORKLOADS: &[Workload] = &[
+        Workload::Generation,
+        Workload::Embeddings,
+        Workload::Images,
+        Workload::AudioTranscriptions,
+        Workload::Realtime,
+    ];
+    pub const UNINSPECTABLE: &[Uninspectable] = &[Uninspectable::Allow, Uninspectable::Deny];
 }
 
 /// A threshold in thousandths (0..=1000), for detectors that score.
@@ -205,6 +213,8 @@ pub struct Tightening {
     pub output_mode: Option<OutputMode>,
     pub on_error: Option<OnError>,
     pub threshold: Option<Threshold>,
+    /// Only `deny`: `allow` is never stricter than a platform rule's value.
+    pub uninspectable: Option<Uninspectable>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -259,6 +269,9 @@ pub fn tighten(base: &Rule, t: &Tightening) -> Rule {
     }
     if let (Some(a), Some(b)) = (t.threshold, r.threshold) {
         r.threshold = Some(a.min(b));
+    }
+    if let Some(u) = t.uninspectable {
+        r.uninspectable = r.uninspectable.max(u);
     }
     r
 }

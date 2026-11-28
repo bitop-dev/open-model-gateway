@@ -29,7 +29,7 @@ export type StoredRule = {
   workloads?: Workload[]; uninspectable?: "allow" | "deny"; threshold?: number | null; timeout_ms?: number | null;
 };
 /** A local layer's entry that makes a platform rule stricter. */
-export type Tightening = { id: string; tightens: string; input?: { action?: InputAction }; output?: { mode: string }; on_error?: "fail_open" | "fail_closed"; threshold?: number | null };
+export type Tightening = { id: string; tightens: string; input?: { action?: InputAction }; output?: { mode: string }; on_error?: "fail_open" | "fail_closed"; threshold?: number | null; /** Only ever deny: allow is never stricter (#841). */ uninspectable?: "deny" };
 export type Entry = StoredRule | Tightening;
 export type RuleSet = { id: string; layer: Layer; revision: number; local_only: boolean | null; rules: Entry[] };
 /** An effective entry: a rule as it runs (tightened), with its provenance. */
@@ -42,7 +42,7 @@ export type WorkspaceGuardrails = {
   platform: { source: "type_default" | "workspace_override"; rule_set: RuleSet | null }; egress: { local_only: boolean };
   local: RuleSet | null; effective: EffectiveEntry[];
 };
-export type DecisionTotal = { action: string; category: Category; kind?: Kind | null; decisions: number; findings: number };
+export type DecisionTotal = { action: string; category: Category; kind?: Kind | null; /** Not readable (skipped) totals only: whether their rules refuse what they can't read, or let it through unread; null otherwise. */ refuses?: boolean | null; decisions: number; findings: number };
 export type PlatformWorkspaceGuardrails = Omit<WorkspaceGuardrails, "can_edit" | "effective"> & {
   type_default: RuleSet | null; override: RuleSet | null; local_visible: boolean; effective: EffectiveEntry[] | null; decisions_this_month: DecisionTotal[];
 };
@@ -61,7 +61,21 @@ export const actionLabels: Record<InputAction, string> = { off: "Off", monitor: 
 export const actionHelp: Record<InputAction, string> = { off: "Not checked on input.", monitor: "Recorded; the request goes on.", redact: "Matches are replaced before sending.", block: "The request is refused before anything is sent." };
 export const protectionLabels: Record<Protection, string> = { secrets: "Secrets", personal_data: "Personal data", moderation: "Moderation", output_dlp: "Output DLP", prompt_injection: "Prompt injection", custom: "Custom patterns" };
 export const sourceLabels: Record<Layer, string> = { type_default: "Workspace-type default", workspace_override: "Platform override", workspace_local: "This workspace" };
-export const workloadLabels: Partial<Record<Workload, string>> = { generation: "Generation", embeddings: "Embeddings" };
+export const workloadLabels: Partial<Record<Workload, string>> = { generation: "Generation", embeddings: "Embeddings", images: "Image generation", audio_transcriptions: "Transcription", realtime: "Realtime" };
+/** Workloads a rule may name whose content this release never reads (#841): a rule decides on them unread. */
+export const unreadWorkloads: Workload[] = ["images", "audio_transcriptions", "realtime"];
+const workloadNoun = (w: Workload) => workloadLabels[w]?.toLowerCase() ?? w.replace(/_/g, " ");
+/**
+ * What a Block rule naming never-read workloads does to all of them, said
+ * before it is saved: with `deny` it refuses every request of each, so a
+ * type default written that way switches the workload off for every
+ * workspace of the kind (`audience`). `undefined` when it refuses none.
+ */
+export function refusesWhole(v: { action?: string; uninspectable?: string; workloads?: Workload[] }, audience: string): string | undefined {
+  const unread = (v.workloads ?? []).filter(w => unreadWorkloads.includes(w));
+  if (v.action !== "block" || (v.uninspectable ?? "deny") !== "deny" || unread.length === 0) return undefined;
+  return `This refuses all ${list(unread.map(workloadNoun))} requests for ${audience}: their content is never read, so a Block rule that refuses what it can't read refuses every one.`;
+}
 export const inactiveLabels: Record<InactiveReason, string> = { egress_not_allowed: "Off: would send text out of the gateway", tightened_rule_missing: "Off: its platform rule was removed", not_runnable: "Needs a later release" };
 /** Strictness of input actions, for the tighten-only choices. */
 const strictness: InputAction[] = ["off", "monitor", "redact", "block"];
@@ -82,15 +96,21 @@ export function inspectionSentence(e: Partial<StoredRule>): string {
   const cats = e.detector?.categories ?? [];
   const parts = cats.length ? [...(cats.includes("personal_data") ? [personal] : []), ...(cats.includes("secret") ? [secrets] : []), ...(cats.includes("custom") ? [custom] : [])] : [];
   const what = parts.length ? list(parts) : looks === "personal" ? personal : looks === "both" ? `${secrets} and ${custom}` : looks === "custom" ? custom : secrets;
-  const where = list((e.workloads ?? ["generation", "embeddings"]).map(w => workloadLabels[w]?.toLowerCase() ?? w.replace(/_/g, " ")));
-  const how = e.input?.action === "block" ? "and refuses a request that has one" : e.input?.action === "monitor" ? "and records what it finds; the request goes on" : "";
-  const unreadable = e.input?.action === "block" ? " It also refuses a request it can't read (one with an image, audio or a document that isn't plain text), and a native batch when it is created." : "";
+  const workloads = e.workloads ?? ["generation", "embeddings"], block = e.input?.action === "block", allow = e.uninspectable === "allow";
+  const read = workloads.filter(w => !unreadWorkloads.includes(w)), unread = workloads.filter(w => unreadWorkloads.includes(w));
+  const how = block ? "and refuses a request that has one" : e.input?.action === "monitor" ? "and records what it finds; the request goes on" : "";
+  const looking = read.length ? `Looks for ${what} in the input of ${list(read.map(workloadNoun))} requests${how ? ` ${how}` : ""}.` : "";
+  // Content it can't read: an image, audio or a document beside text, a native batch.
+  const unreadable = !read.length ? "" : block && !allow ? " It also refuses a request it can't read (one with an image, audio or a document that isn't plain text), and a native batch when it is created."
+    : block ? " A request with an image, audio or a document that isn't plain text goes on with its text checked, recorded as not readable. It still refuses a native batch when it is created: its lines are text a batch run in the gateway reads." : "";
+  // Workloads whose content is never read.
+  const never = !unread.length ? "" : ` ${list(unread.map(workloadNoun)).replace(/^./, c => c.toUpperCase())} requests are never read: ${block && !allow ? "it refuses every one" : block ? "it lets them through unread and records each as not readable" : "it records each as not readable; they go on"}.`;
   const egress = e.detector?.egress && e.detector.egress !== "local" ? "Text is sent out of the gateway to be checked." : "Checked inside the gateway; nothing is sent anywhere else.";
   // `on_error` covers only a rule that can't run at all (`onErrorHelp`).
   const failure = e.on_error === "fail_closed" ? " If the rule can't run, the request is refused." : e.on_error === "fail_open" ? " If the rule can't run, the request goes on and that is recorded." : "";
-  return `Looks for ${what} in the input of ${where} requests${how ? ` ${how}` : ""}.${unreadable}${failure} ${egress}`;
+  return `${looking}${unreadable}${never}${failure} ${egress}`.trim();
 }
-export const inspectedSentence = (workloads: Workload[]) => `Guardrails check the input of ${list(workloads.map(w => workloadLabels[w]?.toLowerCase() ?? w))} requests (also token counts and gateway-run batch lines). Other workloads are not checked yet, and response text is never checked in this release. A Block rule also refuses a request it can't read (one with an image, audio or a document that isn't plain text) and a native batch when it is created. When the gateway is too busy to check a request, or a custom pattern takes too long on it, the request is refused with a 503 under any rule, Monitor included: nothing goes on unchecked.`;
+export const inspectedSentence = (workloads: Workload[]) => `Guardrails check the input of ${list(workloads.map(w => workloadLabels[w]?.toLowerCase() ?? w))} requests (also token counts and gateway-run batch lines). A rule may also name image generation, transcription and realtime, whose content is never read; other workloads (speech, rerank, video) are not checked. Response text is never checked in this release. A Block rule refuses a request it can't read (one with an image, audio or a document that isn't plain text, or any request of a workload that is never read) unless it lets such content through unread, recorded as not readable, and refuses a native batch when it is created whatever it says: a batch run in the gateway has each line checked. When the gateway is too busy to check a request, or a custom pattern takes too long on it, the request is refused with a 503 under any rule, Monitor included: nothing goes on unchecked.`;
 /**
  * What a rule's `on_error` covers (enforce.rs `failed`, design §4): only a
  * rule that can't run at all. A busy gateway or a spent check budget refuses
@@ -129,7 +149,7 @@ const present = <T,>(key: string, value: T | null | undefined) => value === null
  * value.
  */
 export function toInput(e: Entry): Record<string, unknown> {
-  if (isTightening(e)) return { id: e.id, tightens: e.tightens, ...(e.input?.action ? { input: { action: e.input.action } } : {}), ...present("output", e.output), ...present("on_error", e.on_error), ...present("threshold", e.threshold) };
+  if (isTightening(e)) return { id: e.id, tightens: e.tightens, ...(e.input?.action ? { input: { action: e.input.action } } : {}), ...present("output", e.output), ...present("on_error", e.on_error), ...present("threshold", e.threshold), ...present("uninspectable", e.uninspectable) };
   const rule = e as StoredRule;
   return {
     id: rule.id, name: rule.name, protection: rule.protection,
@@ -167,6 +187,8 @@ export function ruleInput(v: Record<string, string | undefined>, base?: Record<s
   return {
     ...kept, name: (v.name ?? "").trim(), protection, detector,
     input: { ...(base?.input as object | undefined), action: v.action }, ...(v.on_error ? { on_error: v.on_error } : {}), ...(workloads.length ? { workloads } : {}),
+    // A new rule leaves out the default (deny); an edited one sends what is chosen.
+    ...(v.uninspectable && (base || v.uninspectable !== "deny") ? { uninspectable: v.uninspectable } : {}),
   };
 }
 
@@ -188,6 +210,8 @@ export function stricterPart(t: Record<string, unknown>, base: StoredRule): Reco
     ...(onError !== undefined && base.on_error !== undefined && errorRank(onError) >= errorRank(base.on_error) ? { on_error: onError } : {}),
     // A threshold for a rule that does not score is refused (`write.rs`).
     ...(threshold !== undefined && base.threshold !== null && base.threshold !== undefined && threshold <= base.threshold ? { threshold } : {}),
+    // deny is never weaker than the rule's value; allow is never sent.
+    ...(t.uninspectable === "deny" ? { uninspectable: "deny" } : {}),
   };
   return Object.keys(keep).length ? { ...(t.id ? { id: t.id } : {}), tightens: t.tightens, ...keep } : null;
 }

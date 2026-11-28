@@ -602,6 +602,26 @@ impl Engine {
         if candidates.is_empty() {
             return Err(InferenceError::Unsupported);
         }
+        // Guardrails, before the route plan, any admission and the WebSocket
+        // upgrade: this release reads no realtime event, so an enforcing rule
+        // naming realtime refuses the session (`uninspectable: deny`) or lets
+        // it open recorded as skipped (`allow`).
+        let unadmitted = timeout_at(
+            deadline,
+            self.guard_input(
+                &principal,
+                super::guardrails::Guarded {
+                    request_id,
+                    operation: "realtime",
+                    model,
+                    streamed: true,
+                    workload: crate::guardrails::policy::Workload::Realtime,
+                },
+                || None,
+            ),
+        )
+        .await
+        .map_err(|_| InferenceError::Timeout)??;
         let plan = timeout_at(
             deadline,
             self.repository
@@ -680,6 +700,7 @@ impl Engine {
                 }
                 other => other?,
             };
+            unadmitted.admitted();
             // From here the attempt is durable: every exit records it.
             let mut session = RealtimeSession {
                 repository: self.repository.clone(),

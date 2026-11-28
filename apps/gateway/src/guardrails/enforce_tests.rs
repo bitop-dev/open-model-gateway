@@ -395,6 +395,7 @@ fn composed_layers_are_enforced_with_tightenings_and_local_only() {
                         output_mode: None,
                         on_error: None,
                         threshold: None,
+                        uninspectable: None,
                     },
                 ),
             ),
@@ -649,4 +650,128 @@ fn text_parts_are_read_alone_and_joined_and_an_image_part_is_uninspectable() {
         "nothing of the image is read"
     );
     assert!(found(&input));
+}
+
+#[test]
+fn allow_passes_unreadable_content_recorded_as_skipped_and_deny_refuses_it() {
+    let unread = |action, uninspectable, workload| {
+        let mut r = rule(&[Category::Secret], &[], action);
+        r.workloads = [workload].into_iter().collect();
+        r.uninspectable = uninspectable;
+        policy(vec![r]).decide(workload, None)
+    };
+    for workload in [
+        Workload::Images,
+        Workload::AudioTranscriptions,
+        Workload::Realtime,
+    ] {
+        // Block with deny: every request of the workload is refused, and the
+        // skipped decision is the refusing one.
+        let d = unread(InputAction::Block, Uninspectable::Deny, workload);
+        assert_eq!(d.refusal.map(|r| r.kind), Some(RefusalKind::NotSupported));
+        assert_eq!(
+            (d.events.len(), d.events[0].action, d.events[0].refused),
+            (1, Action::Skipped, true)
+        );
+        // Block with allow: let through, recorded as skipped, not refused.
+        let d = unread(InputAction::Block, Uninspectable::Allow, workload);
+        assert!(d.refusal.is_none());
+        assert_eq!(
+            (d.events.len(), d.events[0].action, d.events[0].refused),
+            (1, Action::Skipped, false)
+        );
+    }
+    // Text parts are still read under allow: a finding still blocks, and an
+    // image beside it is recorded as skipped.
+    let mut r = rule(&[Category::Custom], &["ACME-[0-9]{4}"], InputAction::Block);
+    r.uninspectable = Uninspectable::Allow;
+    let p = policy(vec![r]);
+    let mut input = text("ACME-1234");
+    input.uninspectable = true;
+    let d = p.decide(Workload::Generation, Some(&input));
+    assert_eq!(d.refusal.map(|r| r.kind), Some(RefusalKind::InputBlocked));
+    let mut clean = text("hello");
+    clean.uninspectable = true;
+    let d = p.decide(Workload::Generation, Some(&clean));
+    assert!(d.refusal.is_none());
+    assert_eq!(
+        d.events
+            .iter()
+            .map(|e| (e.action, e.refused))
+            .collect::<Vec<_>>(),
+        [(Action::Skipped, false)]
+    );
+}
+
+#[test]
+fn each_decision_records_its_rules_own_verdict() {
+    // One deny Block rule, a finding and an image: the finding answers
+    // (it outranks unreadable content), and both decisions refuse.
+    let p = policy(vec![rule(
+        &[Category::Custom],
+        &["ACME-[0-9]{4}"],
+        InputAction::Block,
+    )]);
+    let mut input = text("ACME-1234");
+    input.uninspectable = true;
+    let d = p.decide(Workload::Generation, Some(&input));
+    assert_eq!(d.refusal.map(|r| r.kind), Some(RefusalKind::InputBlocked));
+    assert_eq!(
+        d.events
+            .iter()
+            .map(|e| (e.action, e.refused, e.refuses))
+            .collect::<Vec<_>>(),
+        [
+            (Action::Blocked, true, true),
+            (Action::Skipped, false, true)
+        ]
+    );
+    // A monitor rule and an allow rule refuse nothing.
+    let mut allow = rule(&[Category::Secret], &[], InputAction::Block);
+    allow.uninspectable = Uninspectable::Allow;
+    let monitor = rule(&[Category::Secret], &[], InputAction::Monitor);
+    let d = policy(vec![allow, monitor]).decide(Workload::Generation, None);
+    assert!(d.refusal.is_none());
+    assert!(d.events.iter().all(|e| !e.refused && !e.refuses));
+}
+
+#[test]
+fn a_native_batch_is_refused_by_an_enforcing_rule_even_under_allow() {
+    // Its lines are text a gateway-run batch reads: letting it through
+    // unread would pass what the rule checks everywhere else.
+    let mut r = rule(&[Category::Secret], &[], InputAction::Block);
+    r.uninspectable = Uninspectable::Allow;
+    let d = policy(vec![r]).decide_unread(Workload::Generation);
+    assert_eq!(d.refusal.map(|r| r.kind), Some(RefusalKind::NotSupported));
+    assert!(d.events[0].refused && d.events[0].refuses);
+    let monitor = policy(vec![rule(&[Category::Secret], &[], InputAction::Monitor)]);
+    assert!(
+        monitor
+            .decide_unread(Workload::Generation)
+            .refusal
+            .is_none()
+    );
+}
+
+#[test]
+fn of_two_block_rules_on_one_request_only_the_deny_one_refuses() {
+    // An allow rule and a deny rule, both naming image generation: the deny
+    // rule refuses, and each decision records its own rule's verdict.
+    let mut allow = rule(&[Category::Secret], &[], InputAction::Block);
+    allow.uninspectable = Uninspectable::Allow;
+    allow.workloads = [Workload::Images].into_iter().collect();
+    let mut deny = rule(&[Category::Custom], &["ACME-[0-9]{4}"], InputAction::Block);
+    deny.workloads = [Workload::Images].into_iter().collect();
+    let d = policy(vec![allow, deny]).decide(Workload::Images, None);
+    assert_eq!(d.refusal.map(|r| r.kind), Some(RefusalKind::NotSupported));
+    assert_eq!(
+        d.events
+            .iter()
+            .map(|e| (e.category, e.action, e.refused, e.refuses))
+            .collect::<Vec<_>>(),
+        [
+            (Category::Secret, Action::Skipped, false, false),
+            (Category::Custom, Action::Skipped, true, true)
+        ]
+    );
 }

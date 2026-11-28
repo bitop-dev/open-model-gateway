@@ -134,9 +134,8 @@ fn rules_that_need_a_later_phase_are_refused_not_stored() {
         json!({"input":{"action":"redact"}}),
         json!({"output":{"mode":"monitor"}}),
         json!({"output":{"mode":"block"}}),
-        json!({"workloads":["images"]}),
+        json!({"workloads":["audio_speech"]}),
         json!({"workloads":["generation","rerank"]}),
-        json!({"uninspectable":"allow"}),
     ];
     for v in variants {
         let mut rule = secrets("block");
@@ -675,4 +674,105 @@ fn null_and_positional_forms_are_refused() {
             .unwrap()
             .is_err()
     );
+}
+
+#[test]
+fn uninspectable_allow_is_the_weaker_value() {
+    // A platform rule that lets unreadable content through.
+    let allow = {
+        let mut r = secrets("block");
+        r["uninspectable"] = json!("allow");
+        r["workloads"] = json!(["generation", "images"]);
+        let (_, rules) = write(
+            Layer::TypeDefault,
+            None,
+            None,
+            body(Some(false), json!([r])),
+        )
+        .unwrap();
+        set(Layer::TypeDefault, Some(false), rules)
+    };
+    let (target, rule) = only_rule(&allow);
+    assert_eq!(rule.uninspectable, Uninspectable::Allow);
+    let tighten = |p: &RuleSet, target: Uuid, v: &str| {
+        write(
+            Layer::WorkspaceLocal,
+            Some(p),
+            None,
+            body(None, json!([{"tightens": target, "uninspectable": v}])),
+        )
+    };
+    // allow -> deny is a tightening; composition takes deny.
+    let (_, local) = tighten(&allow, target, "deny").unwrap();
+    let local = set(Layer::WorkspaceLocal, None, local);
+    let eff = compose(Some(&allow), Some(&local));
+    assert_eq!(
+        eff[0].rule.as_ref().unwrap().uninspectable,
+        Uninspectable::Deny
+    );
+    // deny -> allow is a loosening; so is allow on a tightening at all.
+    let deny = platform_with("block", false);
+    let (strict, _) = only_rule(&deny);
+    assert_eq!(
+        tighten(&deny, strict, "allow").unwrap_err(),
+        Refusal::LoosenNotAllowed(strict)
+    );
+    assert_eq!(
+        tighten(&allow, target, "allow").unwrap_err(),
+        Refusal::LoosenNotAllowed(target)
+    );
+    // A stored entry composed under a platform rule that is already deny
+    // changes nothing, and never makes it allow.
+    let stale = set(
+        Layer::WorkspaceLocal,
+        None,
+        vec![StoredRule {
+            id: Uuid::now_v7(),
+            entry: Entry::Tightens(
+                strict,
+                Tightening {
+                    uninspectable: Some(Uninspectable::Allow),
+                    ..Default::default()
+                },
+            ),
+        }],
+    );
+    let eff = compose(Some(&deny), Some(&stale));
+    assert_eq!(
+        eff[0].rule.as_ref().unwrap().uninspectable,
+        Uninspectable::Deny
+    );
+}
+
+#[test]
+fn rules_may_name_the_workloads_this_release_never_reads() {
+    for workload in ["images", "audio_transcriptions", "realtime"] {
+        let mut r = secrets("block");
+        r["workloads"] = json!([workload]);
+        assert!(
+            write(
+                Layer::TypeDefault,
+                None,
+                None,
+                body(Some(false), json!([r]))
+            )
+            .is_ok(),
+            "{workload}"
+        );
+    }
+    for workload in ["rerank", "systemone", "audio_speech"] {
+        let mut r = secrets("block");
+        r["workloads"] = json!([workload]);
+        assert_eq!(
+            write(
+                Layer::TypeDefault,
+                None,
+                None,
+                body(Some(false), json!([r]))
+            )
+            .unwrap_err(),
+            Refusal::DetectorUnavailable,
+            "{workload}"
+        );
+    }
 }

@@ -231,8 +231,13 @@ async fn audit(
     let summary: Vec<Value> = rules
         .iter()
         .map(|r| match &r.entry {
-            Entry::Rule(rule) => json!({"id": r.id, "action": rule.input_action.as_str(), "output_mode": rule.output_mode.as_str()}),
-            Entry::Tightens(target, t) => json!({"id": r.id, "tightens": target, "action": t.input_action.map(|a| a.as_str()), "output_mode": t.output_mode.map(|m| m.as_str())}),
+            // What a rule refuses: its actions, what it does with content it
+            // cannot read, and the workloads it covers (naming a never-read
+            // one with Block switches that workload off).
+            Entry::Rule(rule) => json!({"id": r.id, "action": rule.input_action.as_str(), "output_mode": rule.output_mode.as_str(),
+                "uninspectable": rule.uninspectable.as_str(), "workloads": rule.workloads.iter().map(|w| w.as_str()).collect::<Vec<_>>()}),
+            Entry::Tightens(target, t) => json!({"id": r.id, "tightens": target, "action": t.input_action.map(|a| a.as_str()), "output_mode": t.output_mode.map(|m| m.as_str()),
+                "uninspectable": t.uninspectable.map(|u| u.as_str())}),
         })
         .collect();
     let patterns: usize = rules
@@ -291,11 +296,30 @@ pub(super) fn audit_field(action: &str, k: &str, v: &Value) -> bool {
                 && rules.iter().all(|r| {
                     r.as_object().is_some_and(|o| {
                         o.keys().all(|k| {
-                            matches!(k.as_str(), "id" | "tightens" | "action" | "output_mode")
+                            matches!(
+                                k.as_str(),
+                                "id" | "tightens"
+                                    | "action"
+                                    | "output_mode"
+                                    | "uninspectable"
+                                    | "workloads"
+                            )
                         }) && id(o.get("id"))
                             && (o.get("tightens").is_none() || id(o.get("tightens")))
                             && closed(o.get("action"), &["off", "monitor", "redact", "block"])
                             && closed(o.get("output_mode"), &["off", "monitor", "stop", "block"])
+                            && closed(o.get("uninspectable"), &["allow", "deny"])
+                            && o.get("workloads").is_none_or(|w| {
+                                w.as_array().is_some_and(|w| {
+                                    w.len() <= 8
+                                        && w.iter().all(|w| {
+                                            w.as_str().is_some_and(|w| {
+                                                crate::guardrails::policy::Workload::parse(w)
+                                                    .is_some()
+                                            })
+                                        })
+                                })
+                            })
                     })
                 })
         }),
@@ -467,8 +491,17 @@ async fn with_totals(s: &Store, ws: Uuid, mut v: Value) -> Result<Value> {
     // staff see its totals, not which kinds of personal data its owner sent,
     // nor how many (a rule's decision on one request counts once, however
     // many kinds it found).
-    let totals: Vec<(String, String, Option<String>, i64, i64)> = sqlx::query_as(
-        "SELECT action,category,CASE WHEN $2 THEN kind END AS k,CASE WHEN $2 THEN count(*) ELSE count(DISTINCT (root_request_id,rule_id,stage)) END,coalesce(sum(count) FILTER(WHERE action IN('monitored','redacted','blocked','stopped')),0)::bigint FROM guardrail_events WHERE workspace_id=$1 AND created_at>=$3 AND ($2 OR (layer<>'workspace_local' AND NOT tightened)) GROUP BY action,category,k ORDER BY action,category,k NULLS FIRST",
+    // Not readable (`skipped`) totals are split by their rule's own verdict
+    // (`refuses`): decisions of rules that refuse what they cannot read are
+    // never added to those of rules that let it through, whatever other
+    // decisions did to the request (so nothing about an owner's own rules
+    // shows through a platform rule's row). Other actions are not split
+    // (`refuses` is null), so one decision of a rule counts once. Rows
+    // written before migration 0100 have no verdict (null).
+    // action, category, kind, refuses, decisions, findings
+    type Total = (String, String, Option<String>, Option<bool>, i64, i64);
+    let totals: Vec<Total> = sqlx::query_as(
+        "SELECT action,category,CASE WHEN $2 THEN kind END AS k,CASE WHEN action='skipped' THEN refuses END AS r,CASE WHEN $2 THEN count(*) ELSE count(DISTINCT (root_request_id,rule_id,stage)) END,coalesce(sum(count) FILTER(WHERE action IN('monitored','redacted','blocked','stopped')),0)::bigint FROM guardrail_events WHERE workspace_id=$1 AND created_at>=$3 AND ($2 OR (layer<>'workspace_local' AND NOT tightened)) GROUP BY action,category,k,r ORDER BY action,category,k NULLS FIRST,r NULLS FIRST",
     )
     .bind(ws)
     .bind(owner_visible)
@@ -477,8 +510,8 @@ async fn with_totals(s: &Store, ws: Uuid, mut v: Value) -> Result<Value> {
     .await?;
     v["decisions_this_month"] = totals
         .into_iter()
-        .map(|(action, category, kind, decisions, findings)| {
-            json!({"action":action,"category":category,"kind":kind,"decisions":decisions,"findings":findings})
+        .map(|(action, category, kind, refuses, decisions, findings)| {
+            json!({"action":action,"category":category,"kind":kind,"refuses":refuses,"decisions":decisions,"findings":findings})
         })
         .collect();
     Ok(v)

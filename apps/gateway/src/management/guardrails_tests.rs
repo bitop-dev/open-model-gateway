@@ -1008,3 +1008,111 @@ async fn a_personal_data_rule_is_written_and_read_with_its_kinds(pool: PgPool) {
     );
     assert_eq!(detector["kinds"], json!(["email"]), "{v}");
 }
+
+/// #841: `allow` is the weaker value of `uninspectable`. A local layer may
+/// move a platform rule from `allow` to `deny` and the rule runs with
+/// `deny`; `allow` on a tightening is refused as a loosening.
+#[dbtest::test]
+async fn a_local_layer_may_refuse_what_a_platform_rule_lets_through_unread(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let mut lets = secrets("block");
+    lets["uninspectable"] = json!("allow");
+    lets["workloads"] = json!(["generation", "images"]);
+    let (status, platform) = put(
+        &f.s,
+        &f.admin,
+        TYPE_TEAM,
+        json!({"local_only":false,"rules":[lets]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{platform}");
+    let target = platform["rule_set"]["rules"][0]["id"].clone();
+    assert_eq!(platform["rule_set"]["rules"][0]["uninspectable"], "allow");
+    let (status, body) = put(
+        &f.s,
+        &f.owner,
+        &local(f.team),
+        json!({"rules":[{"tightens":target,"uninspectable":"allow"}]}),
+    )
+    .await;
+    assert_eq!(
+        (status, reason(&body)),
+        (StatusCode::FORBIDDEN, "guardrail_loosen_not_allowed")
+    );
+    let (status, body) = put(
+        &f.s,
+        &f.owner,
+        &local(f.team),
+        json!({"rules":[{"tightens":target,"uninspectable":"deny"}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["local"]["rules"][0]["uninspectable"], "deny");
+    assert_eq!(body["effective"][0]["uninspectable"], "deny", "{body}");
+    // Audited: a rule's uninspectable and workloads (naming a never-read
+    // workload with Block switches it off), a tightening's uninspectable.
+    let audits: Vec<Value> = sqlx::query_scalar("SELECT metadata FROM audit_events WHERE action='guardrail_policy.updated' ORDER BY created_at")
+        .fetch_all(&pool).await.unwrap();
+    let platform_audit = &audits[audits.len() - 2]["rules"][0];
+    assert_eq!(platform_audit["uninspectable"], "allow", "{audits:?}");
+    assert_eq!(platform_audit["workloads"], json!(["generation", "images"]));
+    let local_audit = &audits[audits.len() - 1]["rules"][0];
+    assert_eq!(local_audit["tightens"], target);
+    assert_eq!(local_audit["uninspectable"], "deny", "{audits:?}");
+    // A platform rule that already refuses it: deny again is accepted and
+    // changes nothing; allow is refused.
+    let (_, platform) = put(
+        &f.s,
+        &f.admin,
+        TYPE_TEAM,
+        json!({"local_only":false,"rules":[secrets("block")]}),
+    )
+    .await;
+    let strict = platform["rule_set"]["rules"][0]["id"].clone();
+    let (status, body) = put(
+        &f.s,
+        &f.owner,
+        &local(f.team),
+        json!({"rules":[{"tightens":strict,"uninspectable":"allow"}]}),
+    )
+    .await;
+    assert_eq!(
+        (status, reason(&body)),
+        (StatusCode::FORBIDDEN, "guardrail_loosen_not_allowed")
+    );
+    let (status, body) = put(
+        &f.s,
+        &f.owner,
+        &local(f.team),
+        json!({"rules":[{"tightens":strict,"uninspectable":"deny"}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["effective"][0]["uninspectable"], "deny");
+    // The database refuses a direct write of allow on a tightening.
+    let set: Uuid = sqlx::query_scalar(
+        "SELECT id FROM guardrail_rule_sets WHERE layer='workspace_local' AND workspace_id=$1",
+    )
+    .bind(f.team)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("UPDATE guardrail_rule_sets SET revision=revision+1,updated_by=$2 WHERE id=$1")
+        .bind(set)
+        .bind(f.owner.user_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let err = sqlx::query("INSERT INTO guardrail_rules(id,rule_set_id,position,tightens_rule_id,uninspectable) VALUES($1,$2,10,$3,'allow')")
+        .bind(Uuid::now_v7())
+        .bind(set)
+        .bind(Uuid::parse_str(strict.as_str().unwrap()).unwrap())
+        .execute(&mut *tx)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_database_error().and_then(|e| e.constraint()),
+        Some("guardrail_rules_tightening")
+    );
+}

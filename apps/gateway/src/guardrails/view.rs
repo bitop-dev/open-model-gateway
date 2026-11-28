@@ -59,6 +59,9 @@ pub fn rule_json(id: Uuid, entry: &Entry, show_patterns: bool) -> Value {
             if let Some(th) = t.threshold {
                 v["threshold"] = json!(f64::from(th) / 1000.0);
             }
+            if let Some(u) = t.uninspectable {
+                v["uninspectable"] = json!(u.as_str());
+            }
             v
         }
     }
