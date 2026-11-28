@@ -10,7 +10,7 @@ Changes after v0.20.0: [unreleased notes](docs/releases/unreleased.md).
 
 ## [0.20.0]
 
-Video generation on OpenAI-contract servers, inline image input on every protocol and provider family, guardrail policies with secret and custom-pattern detection on input, Messages token counting, route probes and drains, scheduled access reviews, and admission that sheds a stalled request; the global admission mode is removed. Drain replicas, apply migrations **0088–0098**, and apply the runtime grants before starting the new binary. [Notes](docs/releases/v0.20.0.md).
+Video generation on OpenAI-contract servers, inline image input on every protocol and provider family, guardrail policies with secret, personal-data and custom-pattern detection on input, Messages token counting, route probes and drains, scheduled access reviews, and admission that sheds a stalled request; the global admission mode is removed. Drain replicas, apply migrations **0088–0099**, and apply the runtime grants before starting the new binary. [Notes](docs/releases/v0.20.0.md).
 
 ## [0.19.0]
 
