@@ -2555,6 +2555,7 @@ async fn async_jobs_run_as_runtime(pool: &PgPool) {
  INSERT INTO deployment_prices(id,deployment_id,input_token_limit,output_token_limit,pricing_version,price_lines,max_units) VALUES(gen_random_uuid(),dv,0,1,3,
   '[{{"meter":"input_tokens","not_applicable":true}},{{"meter":"output_tokens","not_applicable":true}},{{"meter":"cache_read_tokens","not_applicable":true}},{{"meter":"cache_write_tokens","not_applicable":true}},{{"meter":"cache_write_5m_tokens","not_applicable":true}},{{"meter":"cache_write_1h_tokens","not_applicable":true}},{{"meter":"output_images","not_applicable":true}},{{"meter":"input_characters","not_applicable":true}},{{"meter":"input_audio_seconds_ms","not_applicable":true}},{{"meter":"output_audio_seconds_ms","not_applicable":true}},{{"meter":"search_units","not_applicable":true}},{{"meter":"requests","microusd_per_batch":"0","batch":1,"unit_label":"/request","sku_label":"Request"}},{{"meter":"output_video_seconds_ms","microusd_per_batch":"100000","batch":1000,"unit_label":"/second","sku_label":"Video"}}]','{{}}');
  INSERT INTO deployment_prices(id,deployment_id,input_microusd_per_million,output_microusd_per_million,input_token_limit,output_token_limit,pricing_version) VALUES(gen_random_uuid(),db,1000000,1000000,100,50,1);
+ UPDATE deployments SET video_seconds='{{4}}' WHERE id=dv;
  END $$"#))
     .execute(pool)
     .await
@@ -2575,8 +2576,8 @@ async fn async_jobs_run_as_runtime(pool: &PgPool) {
         VideoRequest {
             model: format!("video-{video_model}"),
             prompt: "probe".into(),
-            seconds: 4,
-            size: VideoSize::DEFAULT,
+            seconds: Some(4),
+            size: None,
         },
         video,
     )
@@ -2597,8 +2598,8 @@ async fn async_jobs_run_as_runtime(pool: &PgPool) {
             VideoRequest {
                 model: format!("video-{video_model}"),
                 prompt: "probe".into(),
-                seconds: 4,
-                size: VideoSize::DEFAULT,
+                seconds: Some(4),
+                size: None,
             },
             uuid::Uuid::new_v4(),
         )

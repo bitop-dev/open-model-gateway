@@ -1011,6 +1011,11 @@
             "type": "string"
           }
         },
+        "video_routes_not_set_up": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Video models: enabled routes whose profile serves video but that have no video options or no video-seconds rate yet, so they serve nothing (not counted in serving_routes)."
+        },
         "type_tokens_per_minute": {
           "anyOf": [
             {
@@ -1055,6 +1060,7 @@
         "catalogs",
         "direct_workspaces",
         "unsupported_profiles",
+        "video_routes_not_set_up",
         "type_tokens_per_minute",
         "connections"
       ],

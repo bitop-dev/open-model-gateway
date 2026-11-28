@@ -102,7 +102,10 @@ impl ProviderAdapter for OpenAiAdapter {
         target: &Deployment,
         request: VideoRequest,
     ) -> Result<UpstreamVideo> {
-        jobs::create_video(self, target, request).await
+        if !jobs::supports_video(target, &request) {
+            return Err(InferenceError::Unsupported);
+        }
+        jobs::create_video(&jobs::openai_wire(self, target)?, target, request).await
     }
 
     async fn retrieve_video(
@@ -110,11 +113,15 @@ impl ProviderAdapter for OpenAiAdapter {
         target: &Deployment,
         video: &UpstreamId,
     ) -> Result<UpstreamVideo> {
-        jobs::retrieve_video(self, target, video).await
+        jobs::retrieve_video(&jobs::openai_wire(self, target)?, video).await
     }
 
-    async fn delete_video(&self, target: &Deployment, video: &UpstreamId) -> Result<()> {
-        jobs::delete_video(self, target, video).await
+    async fn delete_video(
+        &self,
+        target: &Deployment,
+        video: &UpstreamId,
+    ) -> Result<crate::jobs::types::VideoDeletion> {
+        jobs::delete_video(&jobs::openai_wire(self, target)?, video).await
     }
 
     async fn video_content(
@@ -123,7 +130,7 @@ impl ProviderAdapter for OpenAiAdapter {
         video: &UpstreamId,
         asset: VideoAsset,
     ) -> Result<ContentStream> {
-        jobs::video_content(self, target, video, asset).await
+        jobs::video_content(&jobs::openai_wire(self, target)?, video, asset).await
     }
 
     fn native_batch(&self, target: &Deployment, _endpoint: BatchEndpoint) -> bool {
@@ -771,7 +778,7 @@ mod chat_controls;
 mod chat_stream;
 pub(super) use chat_stream::StreamState;
 mod images;
-mod jobs;
+pub(crate) mod jobs;
 mod local_fields;
 pub(crate) mod realtime;
 #[cfg(test)]

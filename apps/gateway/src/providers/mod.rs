@@ -263,11 +263,13 @@ pub trait ProviderAdapter: Send + Sync {
     ) -> Result<UpstreamVideo, InferenceError> {
         Err(InferenceError::Unsupported)
     }
+    /// Delete the provider's copy of a finished video; `NotOffered` when
+    /// the provider has no delete (its copy is left to its own expiry).
     async fn delete_video(
         &self,
         _target: &Deployment,
         _video: &UpstreamId,
-    ) -> Result<(), InferenceError> {
+    ) -> Result<crate::jobs::types::VideoDeletion, InferenceError> {
         Err(InferenceError::Unsupported)
     }
     /// Asset body passed through unbuffered.

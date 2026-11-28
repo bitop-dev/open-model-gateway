@@ -47,6 +47,7 @@ jobs/runner/segments.rs :: impl Writer::record_flush :: warn :: job_id=%self.job
 jobs/runner/segments.rs :: impl Writer::record_flush :: warn :: job_id=%self.job.id
 jobs/schedule.rs :: impl Scheduler::record_signal :: warn :: deployment_id=%deployment
 jobs/video.rs :: impl Jobs::create_video :: error :: execution_id=%request_id
-jobs/video.rs :: impl Jobs::create_video :: error :: execution_id=%request_id
+jobs/video.rs :: impl Jobs::unrecorded_upstream :: error :: execution_id=%execution
+jobs/video.rs :: impl Jobs::unrecorded_upstream :: error :: execution_id=%execution
 protocols/realtime.rs :: handle :: error :: -
 providers/anthropic.rs :: encode_within :: error :: -

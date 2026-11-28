@@ -138,9 +138,13 @@ impl ProviderAdapter for Fake {
         self.call("retrieve_video");
         self.next_video()
     }
-    async fn delete_video(&self, _: &Deployment, _: &UpstreamId) -> Result<(), InferenceError> {
+    async fn delete_video(
+        &self,
+        _: &Deployment,
+        _: &UpstreamId,
+    ) -> Result<VideoDeletion, InferenceError> {
         self.call("delete_video");
-        Ok(())
+        Ok(VideoDeletion::Deleted)
     }
     async fn retrieve_batch(
         &self,
@@ -172,15 +176,22 @@ pub(crate) fn jobs(f: &Fixture, fake: &Fake, poll: bool) -> Jobs {
         },
     )
 }
-fn line(meter: Meter, amount: &str, batch: u64) -> Value {
+pub(crate) fn line(meter: Meter, amount: &str, batch: u64) -> Value {
     json!({"meter":meter.as_str(),"microusd_per_batch":amount,"batch":batch,"unit_label":meter.unit_label(batch).unwrap(),"sku_label":"Line"})
 }
-fn na(meter: Meter) -> Value {
+pub(crate) fn na(meter: Meter) -> Value {
     json!({"meter":meter.as_str(),"not_applicable":true})
 }
-/// Per-second video price: 720p $0.10/s, 1792x1024 $0.50/s; tokens NA.
+/// Per-second video price: 720p sizes $0.10/s, the larger sizes $0.50/s; tokens NA. The
+/// route takes 4, 8 and 12 seconds (4 by default) and the four Sora sizes
+/// (its video options, 0097).
 pub(crate) async fn video_setup(f: &Fixture) {
     sqlx::query("UPDATE models SET supported_protocols=ARRAY['videos'] WHERE id=$1")
+        .bind(f.model)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE deployments SET video_seconds='{4,8,12}',video_sizes='{720x1280,1280x720,1024x1792,1792x1024}' WHERE model_id=$1")
         .bind(f.model)
         .execute(&f.store.pool)
         .await
@@ -191,20 +202,25 @@ pub(crate) async fn video_setup(f: &Fixture) {
         .map(na)
         .collect();
     lines.push(line(Meter::Requests, "0", 1));
-    let mut v = line(Meter::OutputVideoSecondsMs, "100000", 1000);
-    v["variant"] = json!("720x1280");
-    lines.push(v);
-    let mut v = line(Meter::OutputVideoSecondsMs, "500000", 1000);
-    v["variant"] = json!("1792x1024");
-    lines.push(v);
+    // Every size the route lists has a rate (a video route must price each).
+    for (size, rate) in [
+        ("720x1280", "100000"),
+        ("1280x720", "100000"),
+        ("1024x1792", "500000"),
+        ("1792x1024", "500000"),
+    ] {
+        let mut v = line(Meter::OutputVideoSecondsMs, rate, 1000);
+        v["variant"] = json!(size);
+        lines.push(v);
+    }
     sqlx::query("INSERT INTO deployment_prices(id,deployment_id,input_token_limit,output_token_limit,pricing_version,price_lines,max_units) VALUES($1,$2,0,1,3,$3,'{}')").bind(Uuid::new_v4()).bind(f.deployment).bind(json!(lines)).execute(&f.store.pool).await.unwrap();
 }
 pub(crate) fn video_request() -> VideoRequest {
     VideoRequest {
         model: "company/smart".into(),
         prompt: "a calm lake".into(),
-        seconds: 8,
-        size: VideoSize::P720x1280,
+        seconds: Some(8),
+        size: Some("720x1280".into()),
     }
 }
 pub(crate) fn upstream_video(state: JobState, seconds: Option<u32>) -> UpstreamVideo {
@@ -617,9 +633,18 @@ async fn http_video_routes_render_gateway_ids_and_scope_by_key(pool: PgPool) {
         400
     );
     let (status, body) = send(&app, "POST", "/v1/videos", &mine, Some(json!({"model":"company/smart","prompt":"x","input_reference":{"image_url":"https://x"}}))).await;
+    // An option the gateway does not take is refused by name.
     assert_eq!(
-        (status.as_u16(), body["error"]["code"].as_str()),
-        (400, Some("unsupported_capability"))
+        (
+            status.as_u16(),
+            body["error"]["code"].as_str(),
+            body["error"]["param"].as_str()
+        ),
+        (
+            400,
+            Some("unsupported_video_parameter"),
+            Some("input_reference")
+        )
     );
     // Batch routes answer explicitly too.
     // Without the file store, batches are refused explicitly.
@@ -750,7 +775,7 @@ async fn video_without_a_supported_provider_is_refused_before_admission(pool: Pg
     {
         Err(JobError::Conflict(code, message)) => {
             assert_eq!(code, "unsupported_capability");
-            assert!(message.contains("2026-09-24") && message.contains("OpenRouter"));
+            assert_eq!(message, crate::jobs::video::NO_VIDEO_PROVIDER);
         }
         other => panic!("expected an explicit refusal, got {:?}", other.map(|_| ())),
     }
@@ -2303,5 +2328,97 @@ async fn concurrent_settlements_never_exhaust_the_pool(pool: PgPool) {
         ledger(&f, execution).await,
         [("hold".into(), held), ("unknown".into(), Some(0))],
         "settled once"
+    );
+}
+
+/// Recording a provider id takes the advisory lock of (upstream account,
+/// id): while another transaction holds it, the record waits, so two
+/// creates answered with one id are checked one after the other.
+#[dbtest::test]
+async fn recording_a_provider_id_waits_for_its_account_lock(pool: PgPool) {
+    let f = fixture(pool).await;
+    video_setup(&f).await;
+    let fake = Fake::default();
+    let j = jobs(&f, &fake, true);
+    let (execution, _hold, create) =
+        held_create(&f, &j, &fake, upstream_video(JobState::Queued, Some(8))).await;
+    std::mem::forget(create);
+    let row = row_of(&f, execution).await;
+    let account: String = sqlx::query_scalar(concat!(
+        "SELECT ",
+        super::store::upstream_account!("j"),
+        " FROM async_jobs j WHERE j.id=$1"
+    ))
+    .bind(row.id)
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    let mut holder = f.store.pool.acquire().await.unwrap();
+    sqlx::query(
+        "SELECT pg_advisory_lock(hashtextextended('video_upstream:'||$1||':'||'video_locked',0))",
+    )
+    .bind(&account)
+    .execute(&mut *holder)
+    .await
+    .unwrap();
+    let upstream = UpstreamId::parse("video_locked").unwrap();
+    let waited = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        super::store::record_video_upstream(&f.store, row.id, &upstream),
+    )
+    .await;
+    assert!(waited.is_err(), "the record waits for the lock");
+    sqlx::query("SELECT pg_advisory_unlock_all()")
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let recorded = super::store::record_video_upstream(&f.store, row.id, &upstream)
+        .await
+        .unwrap()
+        .expect("recorded once the lock is free");
+    assert_eq!(recorded.upstream_id.as_deref(), Some("video_locked"));
+}
+
+/// A reported size for a request that named none is valued by the price
+/// pinned at admission, never a later one.
+#[dbtest::test]
+async fn a_reported_size_is_valued_by_the_admitted_price(pool: PgPool) {
+    let f = fixture(pool).await;
+    video_setup(&f).await;
+    let fake = Fake::default();
+    let j = jobs(&f, &fake, true);
+    fake.push_video(upstream_video(JobState::Queued, Some(8)));
+    let no_size = VideoRequest {
+        size: None,
+        ..video_request()
+    };
+    let job = j
+        .create_video(f.principal, no_size, Uuid::new_v4())
+        .await
+        .unwrap();
+    // A later price without size-specific lines (one rate for all) would
+    // value any size; the admitted one names 1792x1024 itself.
+    let mut lines: Vec<Value> = Meter::ALL
+        .into_iter()
+        .filter(|m| *m != Meter::Requests)
+        .map(na)
+        .collect();
+    lines.push(line(Meter::Requests, "0", 1));
+    lines.push(line(Meter::OutputVideoSecondsMs, "100000", 1000));
+    sqlx::query("INSERT INTO deployment_prices(id,deployment_id,input_token_limit,output_token_limit,pricing_version,price_lines,max_units) VALUES($1,$2,0,1,3,$3,'{}')")
+        .bind(Uuid::new_v4()).bind(f.deployment).bind(json!(lines)).execute(&f.store.pool).await.unwrap();
+    use crate::governance::{ReportedSizeRate, pinned_video_size_rate};
+    assert_eq!(
+        pinned_video_size_rate(&f.store, job.execution_id, Some("1792x1024"))
+            .await
+            .unwrap(),
+        ReportedSizeRate::Named
+    );
+    assert_eq!(
+        pinned_video_size_rate(&f.store, job.execution_id, Some("640x360"))
+            .await
+            .unwrap(),
+        ReportedSizeRate::Unpriced,
+        "not the later flat price"
     );
 }

@@ -1,6 +1,6 @@
 # Local provider profiles
 
-Local adapters expose Chat and string-batch embeddings on every profile, rerank on `openai_compatible`, `vllm` and `sglang`, and System One on `openai_compatible` and `ollama` (wire mapping in `workloads.rs`, details in [provider adapters](../../../../../docs/provider-adapters.md#local-rerank-and-system-one)); never Responses or Messages. Every request uses the exact server-approved base URL, the approval's pinned destination addresses, and a dedicated client with no redirects, proxy or automatic retries. `credential_ref: none` does not resolve a secret or send authentication. Optional `env:` authentication is explicit; inference-key and cloud credentials are never reused.
+Local adapters expose Chat and string-batch embeddings on every profile, rerank on `openai_compatible`, `vllm` and `sglang`, System One on `openai_compatible` and `ollama`, and the OpenAI video contract on `openai_compatible` (`openai::jobs::VideoWire`; wire mapping in `workloads.rs`, details in [provider adapters](../../../../../docs/provider-adapters.md#local-rerank-and-system-one)); never Responses or Messages. Every request uses the exact server-approved base URL, the approval's pinned destination addresses, and a dedicated client with no redirects, proxy or automatic retries. `credential_ref: none` does not resolve a secret or send authentication. Optional `env:` authentication is explicit; inference-key and cloud credentials are never reused.
 
 ## Ollama: compatible Chat plus native embeddings
 
