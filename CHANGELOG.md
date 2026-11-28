@@ -6,7 +6,11 @@ The project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). 
 
 ## [Unreleased]
 
-Changes after v0.19.0: [unreleased notes](docs/releases/unreleased.md).
+Changes after v0.20.0: [unreleased notes](docs/releases/unreleased.md).
+
+## [0.20.0]
+
+Video generation on OpenAI-contract servers, inline image input on every protocol and provider family, guardrail policies with secret, personal-data and custom-pattern detection on input, Messages token counting, route probes and drains, scheduled access reviews, and admission that sheds a stalled request; the global admission mode is removed. Drain replicas, apply migrations **0088–0099**, and apply the runtime grants before starting the new binary. [Notes](docs/releases/v0.20.0.md).
 
 ## [0.19.0]
 
@@ -130,7 +134,8 @@ Alerts, key safety, model compare, SCIM, JWKS refresh, metrics and backup toolin
 
 The single-enterprise rebuild: Team, Project and personal workspaces, OIDC platform roles, catalogs, multimodal workloads across five provider families, immutable micro-USD accounting, logs and Admin settings. Migrations `0001` to `0010`. Notes: [`docs/releases/v0.1.0.md`](docs/releases/v0.1.0.md).
 
-[Unreleased]: https://github.com/bitop-dev/open-model-gateway/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/bitop-dev/open-model-gateway/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/bitop-dev/open-model-gateway/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/bitop-dev/open-model-gateway/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/bitop-dev/open-model-gateway/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/bitop-dev/open-model-gateway/compare/v0.16.0...v0.17.0

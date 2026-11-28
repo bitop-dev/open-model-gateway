@@ -28,6 +28,76 @@ fn holders_with_ttl(n: usize, ttl: Duration) -> Vec<Arc<Leases>> {
     (0..n).map(|_| Arc::new(Leases::with_ttl(ttl))).collect()
 }
 
+/// Server sessions still running a lease acquire.
+async fn acquires_running(pool: &PgPool, sleeping: bool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND state='active' \
+         AND query LIKE 'SELECT omg_lease_acquire%' AND (NOT $1 OR wait_event='PgSleep')",
+    )
+    .bind(sleeping)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Waits (bounded) until `ready` holds.
+async fn until<F: std::future::Future<Output = bool>>(what: &str, ready: impl Fn() -> F) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !ready().await {
+        assert!(Instant::now() < deadline, "timed out waiting: {what}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// A renewal already sent when renewing stops ends before the release, so
+/// no term outlives it (#885). The renewal task's first renewal runs at
+/// once, so a start-up that fails just after taking the leases stops it
+/// mid-renewal; dropped there, the acquire it had sent could run at the
+/// server after the release and take a new term nobody releases. Here each
+/// acquire is held at the server before it locks its row, so a release that
+/// did not wait for it would run first.
+#[dbtest::test]
+async fn a_renewal_in_flight_when_renewing_stops_never_outlives_the_release(pool: PgPool) {
+    let leases = Arc::new(Leases::with_ttl(Duration::from_secs(60)));
+    assert_eq!(leases.renew_once(&pool).await, Lease::ALL.len());
+    // Statement level, so the delay comes before any row is locked; for
+    // acquires only, so a release is not delayed.
+    sqlx::raw_sql(
+        r#"CREATE FUNCTION test_delay_lease_acquire() RETURNS trigger LANGUAGE plpgsql AS $$
+           BEGIN IF current_query() LIKE '%omg_lease_acquire%' THEN PERFORM pg_sleep(0.5); END IF; RETURN NULL; END $$;
+           CREATE TRIGGER test_delay_lease_acquire BEFORE UPDATE ON work_leases
+             FOR EACH STATEMENT EXECUTE FUNCTION test_delay_lease_acquire();"#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let renewal = leases
+        .clone()
+        .start(pool.clone(), Duration::from_secs(3600));
+    until("the first renewal is held at the server", || {
+        let pool = pool.clone();
+        async move { acquires_running(&pool, true).await == 1 }
+    })
+    .await;
+    renewal.stop().await;
+    leases.release_all(&pool).await;
+    until("no acquire runs at the server", || {
+        let pool = pool.clone();
+        async move { acquires_running(&pool, false).await == 0 }
+    })
+    .await;
+    let current: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM work_leases WHERE expires_at>clock_timestamp() ORDER BY name",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(
+        current.is_empty(),
+        "terms outlived the release: {current:?}"
+    );
+}
+
 /// Concurrent elections: every lease has exactly one holder; renewals keep
 /// the holder and its epoch.
 #[dbtest::test]
