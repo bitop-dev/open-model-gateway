@@ -2344,11 +2344,15 @@ async fn recording_a_provider_id_waits_for_its_account_lock(pool: PgPool) {
         held_create(&f, &j, &fake, upstream_video(JobState::Queued, Some(8))).await;
     std::mem::forget(create);
     let row = row_of(&f, execution).await;
-    let account: String = sqlx::query_scalar("SELECT p.provider||':'||coalesce(p.endpoint,'')||':'||p.credential_ref FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id WHERE d.id=$1")
-        .bind(row.deployment_id)
-        .fetch_one(&f.store.pool)
-        .await
-        .unwrap();
+    let account: String = sqlx::query_scalar(concat!(
+        "SELECT ",
+        super::store::upstream_account!("j"),
+        " FROM async_jobs j WHERE j.id=$1"
+    ))
+    .bind(row.id)
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
     let mut holder = f.store.pool.acquire().await.unwrap();
     sqlx::query(
         "SELECT pg_advisory_lock(hashtextextended('video_upstream:'||$1||':'||'video_locked',0))",
@@ -2405,13 +2409,13 @@ async fn a_reported_size_is_valued_by_the_admitted_price(pool: PgPool) {
         .bind(Uuid::new_v4()).bind(f.deployment).bind(json!(lines)).execute(&f.store.pool).await.unwrap();
     use crate::governance::{ReportedSizeRate, pinned_video_size_rate};
     assert_eq!(
-        pinned_video_size_rate(&f.store, job.execution_id, "1792x1024")
+        pinned_video_size_rate(&f.store, job.execution_id, Some("1792x1024"))
             .await
             .unwrap(),
         ReportedSizeRate::Named
     );
     assert_eq!(
-        pinned_video_size_rate(&f.store, job.execution_id, "640x360")
+        pinned_video_size_rate(&f.store, job.execution_id, Some("640x360"))
             .await
             .unwrap(),
         ReportedSizeRate::Unpriced,

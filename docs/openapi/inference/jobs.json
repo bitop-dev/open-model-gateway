@@ -200,7 +200,7 @@
             }
           },
           "400": {
-            "description": "Validation or an explicit refusal before admission: a length or size none of the caller's routes takes, or an option the gateway does not take (unsupported_video_parameter, param names it), no video route (unsupported_capability), or a route without a video rate for the request (video_price_missing).",
+            "description": "Validation or an explicit refusal before admission: a length or size none of the caller's routes takes, or a length and size no route takes together (unsupported_video_parameter, param null), an option the gateway does not take (unsupported_video_parameter, param names it), no video route (unsupported_capability), or a route without a video rate for the request (video_price_missing).",
             "headers": {
               "x-request-id": {
                 "$ref": "#/components/headers/RequestId"
@@ -341,13 +341,13 @@
             "status": 400,
             "envelope": "JobErrorEnvelope",
             "code": "unsupported_video_parameter",
-            "trigger": "A length or size none of the caller's routes takes (param seconds or size), or a field other than model, prompt, seconds and size (param names it; input_reference unless null)."
+            "trigger": "A length or size none of the caller's routes takes (param seconds or size), a length and a size each taken by some route but never together (param null), or a field other than model, prompt, seconds and size (param names it; input_reference unless null; a field name that is not a plain identifier of up to 64 letters, digits and underscores is invalid_request_error without param)."
           },
           {
             "status": 400,
             "envelope": "JobErrorEnvelope",
             "code": "video_price_missing",
-            "trigger": "The chosen route's price has no video-seconds rate for every size the request may produce."
+            "trigger": "None of the caller's routes that take the request has a price valuing video seconds for every size the request may produce, as settlement values it."
           }
         ],
         "x-omg-limits": {

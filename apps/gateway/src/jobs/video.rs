@@ -36,7 +36,9 @@ fn observation(v: &UpstreamVideo) -> Observation<'_> {
 /// nor rates flat, keeps the hold (cost unknown), as a longer clip than
 /// requested and an unknown duration do: none is what was admitted or can
 /// be valued, and the price line without a size is never used in place of a
-/// size's own. A shorter clip is billed as reported.
+/// size's own. So does a request that named no size completing with none
+/// reported, unless the price is flat: the size made is unknown. A shorter
+/// clip is billed as reported.
 pub(crate) fn settlement(
     job: &JobRow,
     v: &UpstreamVideo,
@@ -50,8 +52,9 @@ pub(crate) fn settlement(
             let reported_size = v.size.as_ref().map(|s| s.as_str());
             let off_size = match (named, reported_size) {
                 (Some(n), Some(r)) => n != r,
-                (None, Some(_)) => reported == Rate::Unpriced,
-                (_, None) => false,
+                // Not reported: unknown unless one rate values every size.
+                (None, _) => reported == Rate::Unpriced,
+                (Some(_), None) => false,
             };
             // A flat rate values any size: billed without one.
             let variant = match (named, reported) {
@@ -130,7 +133,14 @@ fn interrupted() -> Settlement {
 
 pub fn render(job: &JobRow) -> Value {
     let unix = |t: Option<gateway_datetime_compat::UtcInstant>| t.map(|t| t.timestamp());
-    let state = job.job_state();
+    // A job whose provider id the server gave another job is no longer
+    // served, whatever it had reached (its charge, if settled, stands).
+    let reused = job.error_code.as_deref() == Some(super::UPSTREAM_ID_REUSED);
+    let state = if reused {
+        JobState::Failed
+    } else {
+        job.job_state()
+    };
     json!({
         "id": client_id(JobKind::Video.prefix(), job.id),
         "object": "video",
@@ -143,7 +153,7 @@ pub fn render(job: &JobRow) -> Value {
         "seconds": job.video_seconds.map(|s| s.to_string()),
         "size": job.video_size,
         "remixed_from_video_id": Value::Null,
-        "error": job.error_code.as_ref().filter(|_| state == JobState::Failed).map(|code| json!({"code": code, "message": "Video generation failed"})),
+        "error": job.error_code.as_ref().filter(|_| state == JobState::Failed).map(|code| json!({"code": code, "message": if reused { "The provider gave this video's id to another job; it is no longer served" } else { "Video generation failed" }})),
     })
 }
 
@@ -468,14 +478,15 @@ impl Jobs {
         job: &JobRow,
         upstream: &UpstreamVideo,
     ) -> JobResult<crate::governance::ReportedSizeRate> {
-        match (&job.video_size, &upstream.size) {
-            (None, Some(size)) => Ok(crate::governance::pinned_video_size_rate(
+        match &job.video_size {
+            None => Ok(crate::governance::pinned_video_size_rate(
                 &self.store,
                 job.execution_id,
-                size.as_str(),
+                upstream.size.as_ref().map(|s| s.as_str()),
             )
             .await?),
-            _ => Ok(crate::governance::ReportedSizeRate::Unpriced),
+            // A named size is billed as named.
+            Some(_) => Ok(crate::governance::ReportedSizeRate::Unpriced),
         }
     }
 
@@ -551,10 +562,32 @@ impl Jobs {
         if job.upstream_id.is_none() {
             return self.refresh_unrecorded_video(job, observer).await;
         }
-        let (target, adapter) = self.target(&job).await?;
+        if job.error_code.as_deref() == Some(super::UPSTREAM_ID_REUSED) {
+            return self.settle_reused(job, observer).await;
+        }
+        let (target, adapter) = match self.target(&job).await {
+            // Marked since `job` was read: the only `InvalidUpstream` of
+            // `target`.
+            Err(InferenceError::InvalidUpstream) => {
+                let now = store::reload(&self.store, job.id).await?;
+                return self.settle_reused(now, observer).await;
+            }
+            other => other?,
+        };
         let upstream_id = job.upstream().ok_or(InferenceError::Storage)?;
         let upstream = call(adapter.retrieve_video(&target, &upstream_id)).await?;
         self.apply_video(&job, &upstream, observer).await
+    }
+
+    /// A job marked `upstream_id_reused` settles as interrupted (unknown
+    /// usage, its hold kept), without the server being asked; a job already
+    /// settled keeps its settlement.
+    async fn settle_reused(&self, job: JobRow, observer: store::Observer<'_>) -> JobResult<JobRow> {
+        if job.settled_at.is_some() || !job.job_state().is_terminal() {
+            return Ok(job);
+        }
+        self.settle_as(&job, interrupted(), observer).await?;
+        Ok(store::reload(&self.store, job.id).await?)
     }
 
     pub async fn list_videos(
@@ -586,7 +619,10 @@ impl Jobs {
         asset: VideoAsset,
     ) -> JobResult<ContentStream> {
         let job = self.own_video(principal, id).await?;
-        if job.job_state() != JobState::Completed {
+        // A job marked `upstream_id_reused` reads failed (`render`).
+        if job.job_state() != JobState::Completed
+            || job.error_code.as_deref() == Some(super::UPSTREAM_ID_REUSED)
+        {
             return Err(JobError::Conflict(
                 "video_not_ready",
                 "Video content is available once the video is completed",
@@ -594,7 +630,8 @@ impl Jobs {
         }
         let (target, adapter) = self.target(&job).await?;
         let upstream_id = job.upstream().ok_or(InferenceError::Storage)?;
-        Ok(call(adapter.video_content(&target, &upstream_id, asset)).await?)
+        let content = call(adapter.video_content(&target, &upstream_id, asset)).await?;
+        Ok(super::content_bounds::bounded_content(content, asset)?)
     }
 
     /// Delete a finished video's provider assets. In-progress jobs cannot be
@@ -633,10 +670,17 @@ impl Jobs {
         let mut upstream_deleted = job.error_code.as_deref() == Some("create_failed");
         if job.upstream_id.is_some() && job.error_code.as_deref() != Some(super::UPSTREAM_ID_REUSED)
         {
-            let (target, adapter) = self.target(&job).await?;
-            let upstream_id = job.upstream().ok_or(InferenceError::Storage)?;
-            upstream_deleted =
-                call(adapter.delete_video(&target, &upstream_id)).await? == VideoDeletion::Deleted;
+            match self.target(&job).await {
+                // Marked since `job` was read: the record goes, the copy may
+                // remain.
+                Err(InferenceError::InvalidUpstream) => {}
+                Err(e) => return Err(e.into()),
+                Ok((target, adapter)) => {
+                    let upstream_id = job.upstream().ok_or(InferenceError::Storage)?;
+                    upstream_deleted = call(adapter.delete_video(&target, &upstream_id)).await?
+                        == VideoDeletion::Deleted;
+                }
+            }
         }
         store::mark_deleted(&self.store, job.id).await?;
         Ok((job, upstream_deleted))

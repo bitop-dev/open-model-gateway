@@ -11,10 +11,14 @@ use super::*;
 const NO_VIDEO_ROUTE: &str = "No route of this model is set up for video generation";
 const SECONDS_NOT_TAKEN: &str = "No route of this model accepts this clip length";
 const SIZE_NOT_TAKEN: &str = "No route of this model accepts this size";
+const COMBINATION_NOT_TAKEN: &str =
+    "No route of this model accepts this clip length with this size";
 
 /// Why none of the caller's routes of the model (enabled, allowed to its
 /// workspace and key, serving video) took a video request: none is set up
-/// for video, none takes its length, or none takes its size. When some route
+/// for video, none takes its length, none takes its size, or each is taken
+/// by some route but no route takes both (`param` then names neither, as
+/// neither alone is wrong). When some route
 /// takes both, the request was refused for another reason (its routes do not
 /// serve it): `Unsupported`, which the caller answers with the routing
 /// outcome.
@@ -22,25 +26,24 @@ fn refusal(routes: &HashMap<Uuid, VideoRoute>, request: &VideoRequest) -> JobErr
     if routes.is_empty() {
         return JobError::Conflict("unsupported_capability", NO_VIDEO_ROUTE);
     }
-    let answers: Vec<_> = routes.values().map(|r| r.accepts(request)).collect();
-    if answers.iter().any(Result::is_ok) {
+    if routes.values().any(|r| r.accepts(request).is_ok()) {
         return InferenceError::Unsupported.into();
     }
-    if answers
-        .iter()
-        .all(|a| matches!(a, Err(VideoParameter::Seconds)))
-    {
+    let takes: Vec<_> = routes.values().map(|r| r.takes(request)).collect();
+    if !takes.iter().any(|(seconds, _)| *seconds) {
         JobError::InvalidParameter(
             "unsupported_video_parameter",
             SECONDS_NOT_TAKEN,
             VideoParameter::Seconds.field(),
         )
-    } else {
+    } else if !takes.iter().any(|(_, size)| *size) {
         JobError::InvalidParameter(
             "unsupported_video_parameter",
             SIZE_NOT_TAKEN,
             VideoParameter::Size.field(),
         )
+    } else {
+        JobError::Conflict("unsupported_video_parameter", COMBINATION_NOT_TAKEN)
     }
 }
 

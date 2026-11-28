@@ -355,6 +355,18 @@ impl VideoParameter {
     }
 }
 impl VideoRoute {
+    /// Whether this route takes the request's length (any, when it names
+    /// none) and its size (none named, or one it lists), each on its own.
+    pub fn takes(&self, request: &VideoRequest) -> (bool, bool) {
+        (
+            request.seconds.is_none_or(|s| self.seconds.contains(&s)),
+            request.size.as_ref().is_none_or(|size| {
+                self.sizes
+                    .as_ref()
+                    .is_some_and(|sizes| sizes.contains(size))
+            }),
+        )
+    }
     /// The request as this route sends it (its length resolved), or the
     /// option it does not take.
     pub fn accepts(&self, request: &VideoRequest) -> Result<VideoRequest, VideoParameter> {

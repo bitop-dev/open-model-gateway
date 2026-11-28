@@ -49,6 +49,8 @@ pub(super) struct Contract {
     pub(super) delete_status: Mutex<Option<u16>>,
     /// The id every create answers with (`vid_<n>` when unset).
     pub(super) fixed_id: Mutex<Option<String>>,
+    /// The create's status instead of `200` (an error object then).
+    pub(super) create_status: Mutex<Option<u16>>,
     pub(super) retrieves: AtomicUsize,
     pub(super) contents: AtomicUsize,
     pub(super) deletes: AtomicUsize,
@@ -68,6 +70,14 @@ pub(super) fn contract(state: Arc<Contract>) -> Router {
             axum::routing::post(
                 async |State(c): State<Arc<Contract>>, body: axum::body::Bytes| {
                     let form = String::from_utf8_lossy(&body).into_owned();
+                    if let Some(status) = *c.create_status.lock().unwrap() {
+                        c.forms.lock().unwrap().push(form);
+                        return (
+                            StatusCode::from_u16(status).unwrap(),
+                            axum::Json(json!({"error":{"message":"refused"}})),
+                        )
+                            .into_response();
+                    }
                     let id =
                         c.fixed_id.lock().unwrap().clone().unwrap_or_else(|| {
                             format!("vid_{}", c.forms.lock().unwrap().len() + 1)
@@ -79,7 +89,7 @@ pub(super) fn contract(state: Arc<Contract>) -> Router {
                     let video = ("queued", seconds, size);
                     let body = object(&id, &video);
                     c.videos.lock().unwrap().insert(id, video);
-                    axum::Json(body)
+                    axum::Json(body).into_response()
                 },
             ),
         )
@@ -427,9 +437,16 @@ async fn one_upstream_video_belongs_to_one_job(pool: PgPool) {
     let mock = Arc::new(Contract::default());
     let (upstream, _upstream) = serve(contract(mock.clone())).await;
     let base = format!("{upstream}/v1");
-    let connection = Uuid::new_v4();
-    sqlx::query("INSERT INTO provider_connections(id,name,provider,credential_ref,endpoint,enabled) VALUES($1,'Clip server','openai_compatible','none',$2,true)")
-        .bind(connection).bind(&base).execute(&pool).await.unwrap();
+    // Two connection records to one server, its base spelt with and
+    // without a trailing slash: one account.
+    let (connection, other_record) = (Uuid::new_v4(), Uuid::new_v4());
+    for (id, name, endpoint) in [
+        (connection, "Clip server", base.clone()),
+        (other_record, "Clip server again", format!("{base}/")),
+    ] {
+        sqlx::query("INSERT INTO provider_connections(id,name,provider,credential_ref,endpoint,enabled) VALUES($1,$2,'openai_compatible','none',$3,true)")
+            .bind(id).bind(name).bind(endpoint).execute(&pool).await.unwrap();
+    }
     let mut lines: Vec<Value> = Meter::ALL
         .into_iter()
         .filter(|m| *m != Meter::Requests)
@@ -437,10 +454,10 @@ async fn one_upstream_video_belongs_to_one_job(pool: PgPool) {
         .collect();
     lines.push(line(Meter::Requests, "0", 1));
     lines.push(line(Meter::OutputVideoSecondsMs, "100000", 1000));
-    // One model per workspace, each with its own route on the connection.
-    for (name, workspace) in [
-        ("company/mine", f.principal.workspace_id),
-        ("company/theirs", f.team.workspace_id),
+    // One model per workspace, each with its own route, on its own record.
+    for (name, workspace, record) in [
+        ("company/mine", f.principal.workspace_id, connection),
+        ("company/theirs", f.team.workspace_id, other_record),
     ] {
         let (model, route) = (Uuid::new_v4(), Uuid::new_v4());
         sqlx::query(
@@ -454,7 +471,7 @@ async fn one_upstream_video_belongs_to_one_job(pool: PgPool) {
         sqlx::query("INSERT INTO workspace_model_grants(workspace_id,model_id,source) VALUES($1,$2,'direct')")
             .bind(workspace).bind(model).execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO deployments(id,model_id,provider_connection_id,upstream_model,enabled,video_seconds) VALUES($1,$2,$3,'clip-1',true,'{4}')")
-            .bind(route).bind(model).bind(connection).execute(&pool).await.unwrap();
+            .bind(route).bind(model).bind(record).execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO deployment_prices(id,deployment_id,input_token_limit,output_token_limit,pricing_version,price_lines,max_units) VALUES($1,$2,0,1,3,$3,'{}')")
             .bind(Uuid::new_v4()).bind(route).bind(json!(lines)).execute(&pool).await.unwrap();
     }
@@ -591,13 +608,26 @@ async fn one_upstream_video_belongs_to_one_job(pool: PgPool) {
         mock.contents.load(Ordering::SeqCst),
         mock.retrieves.load(Ordering::SeqCst),
     );
+    // It reads failed with its error, and settles with its hold kept as
+    // unknown cost, without the server being asked.
     let read = client
         .get(&path)
         .header("authorization", &mine)
         .send()
         .await
         .unwrap();
-    assert_eq!(read.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(read.status(), StatusCode::OK);
+    let read: Value = read.json().await.unwrap();
+    assert_eq!(
+        (read["status"].clone(), read["error"]["code"].clone()),
+        (json!("failed"), json!("upstream_id_reused")),
+        "{read}"
+    );
+    let (held, settled): (String, bool) = sqlx::query_as("SELECT r.state,j.settled_at IS NOT NULL FROM async_jobs j JOIN governance_reservations r ON r.execution_id=j.execution_id WHERE j.upstream_id='vid_same'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!((held.as_str(), settled), ("unknown", true));
     let deleted: Value = client
         .delete(&path)
         .header("authorization", &mine)
@@ -698,4 +728,101 @@ async fn one_upstream_video_belongs_to_one_job(pool: PgPool) {
         ),
         (json!(true), json!(true))
     );
+    // A completed, settled video whose id the server then gives another
+    // job: it reads failed from then on, its charge stands, and neither its
+    // content nor the server is reached for it. Its content was first
+    // refused for declaring more than the limit.
+    *mock.fixed_id.lock().unwrap() = None;
+    let (status, kept) = create(&mine, "company/mine").await;
+    assert_eq!(status, StatusCode::OK, "{kept}");
+    let kept_id =
+        Uuid::parse_str(kept["id"].as_str().unwrap().strip_prefix("video_").unwrap()).unwrap();
+    let kept_upstream: String =
+        sqlx::query_scalar("SELECT upstream_id FROM async_jobs WHERE id=$1")
+            .bind(kept_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    set_status(&mock, &kept_upstream, "completed");
+    let kept_path = format!("{gateway}/v1/videos/{}", kept["id"].as_str().unwrap());
+    let get = async |path: &str, auth: &str| -> (StatusCode, Value) {
+        let response = client
+            .get(path)
+            .header("authorization", auth)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        (status, response.json().await.unwrap_or(Value::Null))
+    };
+    assert_eq!(get(&kept_path, &mine).await.1["status"], "completed");
+    *mock.content.lock().unwrap() = Some((
+        200,
+        "video/mp4",
+        MP4.to_vec(),
+        Some(crate::jobs::content_bounds::VIDEO_OUTPUT_MAX_BYTES + 1),
+    ));
+    let (status, _) = get(&format!("{kept_path}/content"), &mine).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "a declared length over the limit"
+    );
+    *mock.content.lock().unwrap() = None;
+    *mock.fixed_id.lock().unwrap() = Some(kept_upstream.clone());
+    let (status, body) = create(&theirs, "company/theirs").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    let (calls, read) = (
+        mock.retrieves.load(Ordering::SeqCst),
+        get(&kept_path, &mine).await,
+    );
+    assert_eq!(
+        (
+            read.0,
+            read.1["status"].clone(),
+            read.1["error"]["code"].clone()
+        ),
+        (StatusCode::OK, json!("failed"), json!("upstream_id_reused")),
+        "{}",
+        read.1
+    );
+    let charged: (String, Option<i64>) = sqlx::query_as("SELECT r.state,r.actual_microusd FROM async_jobs j JOIN governance_reservations r ON r.execution_id=j.execution_id WHERE j.id=$1")
+        .bind(kept_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        charged,
+        ("settled".to_owned(), Some(400_000)),
+        "the charge stands"
+    );
+    let (status, body) = get(&format!("{kept_path}/content"), &mine).await;
+    assert_eq!(
+        (status, body["error"]["code"].clone()),
+        (StatusCode::BAD_REQUEST, json!("video_not_ready"))
+    );
+    assert_eq!(
+        mock.retrieves.load(Ordering::SeqCst),
+        calls,
+        "nothing asked"
+    );
+    // The deleted, settled fresh video's id may be given out again: the new
+    // job records it. A delete answered `204` counts as deleted.
+    *mock.fixed_id.lock().unwrap() = Some(upstream.clone());
+    let (status, reissued) = create(&theirs, "company/theirs").await;
+    assert_eq!(status, StatusCode::OK, "{reissued}");
+    set_status(&mock, &upstream, "completed");
+    let reissued_path = format!("{gateway}/v1/videos/{}", reissued["id"].as_str().unwrap());
+    assert_eq!(get(&reissued_path, &theirs).await.1["status"], "completed");
+    *mock.delete_status.lock().unwrap() = Some(204);
+    let deleted: Value = client
+        .delete(&reissued_path)
+        .header("authorization", &theirs)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(deleted["upstream_deleted"], json!(true), "{deleted}");
 }

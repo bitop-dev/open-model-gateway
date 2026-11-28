@@ -165,7 +165,9 @@ fn a_video_is_billed_only_at_an_admitted_size() {
         (Outcome::Succeeded, Some(4000))
     );
     // None named: a reported size is billed only when the job's pinned price
-    // names it; none reported bills the line without a size.
+    // names it or is flat; none reported only under a flat price (the size
+    // made is otherwise unknown, and the line without a size may be cheaper
+    // than every sized one).
     let unnamed = JobRow {
         video_size: None,
         ..row("completed")
@@ -184,7 +186,10 @@ fn a_video_is_billed_only_at_an_admitted_size() {
         (s.outcome, s.usage.output_image_variant),
         (Outcome::Succeeded, None)
     );
-    let s = video::settlement(&unnamed, &reported(None, Some(8)), R::Unpriced).unwrap();
+    assert!(kept(
+        video::settlement(&unnamed, &reported(None, Some(8)), R::Unpriced).unwrap()
+    ));
+    let s = video::settlement(&unnamed, &reported(None, Some(8)), R::Flat).unwrap();
     assert_eq!(
         (s.outcome, s.usage.output_image_variant),
         (Outcome::Succeeded, None)

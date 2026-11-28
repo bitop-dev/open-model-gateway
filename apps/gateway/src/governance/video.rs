@@ -3,11 +3,12 @@
 //!
 //! "Missing rates are not zero": a video route must price the video-seconds
 //! meter (`output_video_seconds_ms`, pricing v3) for every size the request
-//! may produce. A request that names a size needs a rate for that size or
-//! the line without a size; one that names none may be served at any of the
-//! route's sizes, so each needs a rate or the line without a size, and a
-//! route without sizes needs the line without a size. Anything else is
-//! refused before anything is written, budgeted or not.
+//! may produce, as settlement values it. A request that names a size needs
+//! a rate for that size or the line without a size; one that names none may
+//! be served at any size, so the price must have one rate for every size (no
+//! size-specific line) or name each size the route lists, and a route
+//! without sizes needs that one rate. Anything else is refused before
+//! anything is written, budgeted or not.
 use super::*;
 use crate::billing::v3::Meter;
 
@@ -102,12 +103,13 @@ pub enum ReportedSizeRate {
 }
 
 /// For a video whose request named no size: how the price version pinned at
-/// its admission values the reported `size`. The price is fixed at
-/// admission, so a later change of the route's sizes never changes it.
+/// its admission values the reported `size` (`None`: the server reported
+/// none, which only a flat price values). The price is fixed at admission,
+/// so a later change of the route's sizes never changes it.
 pub async fn pinned_video_size_rate(
     store: &Store,
     execution: Uuid,
-    size: &str,
+    size: Option<&str>,
 ) -> Result<ReportedSizeRate, InferenceError> {
     let mut tx = crate::db::begin(&store.pool).await.map_err(begin_storage)?;
     let pinned: Option<(Option<Uuid>, Uuid)> = sqlx::query_as(
@@ -130,8 +132,8 @@ pub async fn pinned_video_size_rate(
     tx.commit().await.map_err(storage)?;
     Ok(rate)
 }
-fn reported_rate(lines: &crate::billing::v3::PriceLines, size: &str) -> ReportedSizeRate {
-    if size_named(lines, size) {
+fn reported_rate(lines: &crate::billing::v3::PriceLines, size: Option<&str>) -> ReportedSizeRate {
+    if size.is_some_and(|s| size_named(lines, s)) {
         ReportedSizeRate::Named
     } else if flat(lines) {
         ReportedSizeRate::Flat
@@ -260,24 +262,33 @@ mod tests {
         assert!(!video_priced(Some(&na), None, None));
         let (lines, _) = one.lines().unwrap();
         assert!(size_named(&lines, "1280x720"));
-        assert_eq!(reported_rate(&lines, "1280x720"), ReportedSizeRate::Named);
         assert_eq!(
-            reported_rate(&lines, "720x1280"),
+            reported_rate(&lines, Some("1280x720")),
+            ReportedSizeRate::Named
+        );
+        assert_eq!(
+            reported_rate(&lines, Some("720x1280")),
             ReportedSizeRate::Unpriced
         );
         let (flat_lines, _) = default.lines().unwrap();
         assert_eq!(
-            reported_rate(&flat_lines, "1280x720"),
+            reported_rate(&flat_lines, Some("1280x720")),
             ReportedSizeRate::Flat,
             "one rate for any size"
         );
         let both = price(serde_json::json!([line(None), line(Some("1280x720"))]));
         let (lines, _) = both.lines().unwrap();
         assert_eq!(
-            reported_rate(&lines, "1920x1080"),
+            reported_rate(&lines, Some("1920x1080")),
             ReportedSizeRate::Unpriced,
             "never the fallback"
         );
+        assert_eq!(
+            reported_rate(&lines, None),
+            ReportedSizeRate::Unpriced,
+            "no size reported: only a flat price values it"
+        );
+        assert_eq!(reported_rate(&flat_lines, None), ReportedSizeRate::Flat);
         let (lines, _) = default.lines().unwrap();
         assert!(
             !size_named(&lines, "1280x720"),
@@ -391,5 +402,125 @@ mod db {
             .await
             .unwrap();
         assert_eq!(admit(ok).await, (Err(InferenceError::PriceUnbounded), 0));
+    }
+
+    /// Readiness (`deployment_video::NOT_SET_UP`, SQL) and admission
+    /// (`video_priced`) agree on every price shape: a video route counts as
+    /// set up exactly when some request on it would be admitted (with no
+    /// size named, or naming one of its sizes).
+    #[dbtest::test]
+    async fn readiness_and_admission_agree_on_every_price_shape(pool: PgPool) {
+        use crate::jobs::db_tests::{line, na};
+        use serde_json::{Value, json};
+        let f = fixture(pool.clone()).await;
+        crate::jobs::db_tests::video_setup(&f).await;
+        let (model, connection): (Uuid, Uuid) =
+            sqlx::query_as("SELECT model_id,provider_connection_id FROM deployments WHERE id=$1")
+                .bind(f.deployment)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let video = |variant: Option<&str>, tier: Option<u64>| {
+            let mut l = line(Meter::OutputVideoSecondsMs, "100000", 1000);
+            if let Some(v) = variant {
+                l["variant"] = json!(v);
+            }
+            if let Some(t) = tier {
+                l["min_prompt_tokens"] = json!(t);
+            }
+            l
+        };
+        let (a, b) = ("1280x720", "720x1280");
+        // (label, pricing version, video lines); `None`: no price at all.
+        type PriceShape<'a> = (&'a str, Option<(i16, Vec<Value>)>);
+        type RouteShape<'a> = (&'a str, Option<Vec<i32>>, Option<Vec<&'a str>>);
+        let prices: Vec<PriceShape> = vec![
+            ("no price", None),
+            ("v1", Some((1, vec![]))),
+            ("tokens only", Some((3, vec![]))),
+            (
+                "not applicable",
+                Some((3, vec![na(Meter::OutputVideoSecondsMs)])),
+            ),
+            ("flat", Some((3, vec![video(None, None)]))),
+            ("sized only", Some((3, vec![video(Some(a), None)]))),
+            (
+                "every listed size",
+                Some((3, vec![video(Some(a), None), video(Some(b), None)])),
+            ),
+            (
+                "sized and flat",
+                Some((3, vec![video(None, None), video(Some(a), None)])),
+            ),
+            ("tiered flat", Some((3, vec![video(None, Some(1000))]))),
+            ("tiered size", Some((3, vec![video(Some(a), Some(1000))]))),
+            (
+                "tiered fallback",
+                Some((3, vec![video(None, Some(1000)), video(Some(a), None)])),
+            ),
+            (
+                "flat and a tier",
+                Some((3, vec![video(None, None), video(None, Some(1000))])),
+            ),
+        ];
+        let shapes: [RouteShape; 6] = [
+            ("no options", None, None),
+            ("no sizes", Some(vec![4]), None),
+            ("its size", Some(vec![4]), Some(vec![a])),
+            ("both sizes", Some(vec![4]), Some(vec![a, b])),
+            ("another size", Some(vec![4]), Some(vec!["640x360"])),
+            ("one priced of two", Some(vec![4]), Some(vec!["640x360", a])),
+        ];
+        let mut checked = 0;
+        for (label, price) in &prices {
+            for (shape, seconds, sizes) in &shapes {
+                let route = Uuid::new_v4();
+                sqlx::query("INSERT INTO deployments(id,model_id,provider_connection_id,upstream_model,enabled,video_seconds,video_sizes) VALUES($1,$2,$3,'clips',true,$4,$5)")
+                    .bind(route).bind(model).bind(connection).bind(seconds).bind(sizes)
+                    .execute(&pool).await.unwrap();
+                match price {
+                    None => {}
+                    Some((1, _)) => {
+                        sqlx::query("INSERT INTO deployment_prices(id,deployment_id,input_microusd_per_million,output_microusd_per_million,input_token_limit,output_token_limit,pricing_version) VALUES($1,$2,1000000,1000000,100,50,1)")
+                            .bind(Uuid::new_v4()).bind(route).execute(&pool).await.unwrap();
+                    }
+                    Some((_, video_lines)) => {
+                        let mut lines: Vec<Value> = Meter::ALL
+                            .into_iter()
+                            .filter(|m| *m != Meter::Requests)
+                            .map(na)
+                            .collect();
+                        lines.push(line(Meter::Requests, "0", 1));
+                        lines.extend(video_lines.iter().cloned());
+                        sqlx::query("INSERT INTO deployment_prices(id,deployment_id,input_token_limit,output_token_limit,pricing_version,price_lines,max_units) VALUES($1,$2,0,1,3,$3,'{}')")
+                            .bind(Uuid::new_v4()).bind(route).bind(json!(lines))
+                            .execute(&pool).await.unwrap();
+                    }
+                }
+                let not_set_up: bool = sqlx::query_scalar(&format!(
+                    "SELECT {} FROM deployments d WHERE d.id=$1",
+                    crate::management::deployment_video::NOT_SET_UP
+                ))
+                .bind(route)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                let mut tx = pool.begin().await.unwrap();
+                let latest = latest_price(&mut tx, route).await.unwrap();
+                let opts = options(&mut *tx, route).await.unwrap();
+                tx.commit().await.unwrap();
+                let admitted = opts.is_some_and(|(_, sizes)| {
+                    let sizes = sizes.as_deref();
+                    video_priced(latest.as_ref(), sizes, None)
+                        || sizes
+                            .into_iter()
+                            .flatten()
+                            .any(|s| video_priced(latest.as_ref(), sizes, Some(s)))
+                });
+                assert_eq!(not_set_up, !admitted, "{label}, {shape}");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, prices.len() * shapes.len());
     }
 }

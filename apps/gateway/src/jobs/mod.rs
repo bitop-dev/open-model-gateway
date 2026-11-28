@@ -19,6 +19,7 @@
 //! by the principal's workspace, so another workspace's id is "not found".
 //! Client ids are gateway ids; upstream ids never leave the gateway.
 pub mod batch;
+pub(crate) mod content_bounds;
 pub(crate) mod fence;
 pub(crate) mod io;
 pub(crate) mod lines;
@@ -63,9 +64,9 @@ pub(crate) fn job_columns() -> &'static str {
 }
 use types::*;
 
-/// Video jobs are polled (and their lease kept) for at most this long.
 /// The mark of a job whose provider id the server gave another job too.
 pub(crate) const UPSTREAM_ID_REUSED: &str = "upstream_id_reused";
+/// Video jobs are polled (and their lease kept) for at most this long.
 pub const VIDEO_POLL_WINDOW: TimeDelta = TimeDelta::hours(6);
 /// Batches: the 24 h completion window plus finalization.
 pub const BATCH_POLL_WINDOW: TimeDelta = TimeDelta::hours(26);
@@ -530,13 +531,26 @@ impl Jobs {
     ) -> Result<(Deployment, Arc<dyn ProviderAdapter>), InferenceError> {
         // The server answered another job's create with this job's id: what
         // it holds behind the id may be another workspace's video, so it is
-        // never asked about it again (`store::record_video_upstream`).
+        // never asked about it again (`store::record_video_upstream`). The
+        // mark is read again with the deployment, in the statement before
+        // the call, never only from `job`, which may predate it.
         if job.error_code.as_deref() == Some(UPSTREAM_ID_REUSED) {
             return Err(InferenceError::InvalidUpstream);
         }
-        let target = store::target(&self.store, job.deployment_id)
+        let target = store::target(&self.store, job.id, job.deployment_id)
             .await
-            .map_err(|_| InferenceError::Storage)?
+            .map_err(|_| InferenceError::Storage)?;
+        let Some(target) = target else {
+            let now = store::reload(&self.store, job.id)
+                .await
+                .map_err(|_| InferenceError::Storage)?;
+            return Err(if now.error_code.as_deref() == Some(UPSTREAM_ID_REUSED) {
+                InferenceError::InvalidUpstream
+            } else {
+                InferenceError::ModelUnavailable
+            });
+        };
+        let target = Some(target)
             .filter(|d| d.provider == job.provider)
             .ok_or(InferenceError::ModelUnavailable)?;
         let adapter = self
@@ -716,3 +730,5 @@ mod schedule_db_tests;
 mod tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod video_contract_tests;
+#[cfg(all(test, feature = "integration-tests"))]
+mod video_routing_tests;

@@ -20,6 +20,11 @@ use crate::{
 pub(super) use crate::db::accounting_failure::{job_settlement, job_storage};
 type Result<T> = std::result::Result<T, sqlx::Error>;
 
+mod video_ids;
+pub(crate) use video_ids::record_video_upstream;
+#[cfg(all(test, feature = "integration-tests"))]
+pub(crate) use video_ids::upstream_account;
+
 pub(crate) const JOB_COLUMNS: &str = "id,kind,workspace_id,api_key_id,deployment_id,execution_id,public_model,provider,upstream_id,state,upstream_status,progress,error_code,created_at,completed_at,expires_at,cancel_requested_at,deleted_at,poll_deadline_at,settled_at,video_seconds,video_size,batch_endpoint,request_total,request_completed,request_failed,batch_mode,user_id,input_file_id,work_file_id,output_file_id,error_file_id,price_tier,retry_limit,submit_started_at,in_progress_at,finalizing_at,last_progress_at,completion_window_hours";
 
 #[derive(Clone, Debug, FromRow)]
@@ -153,57 +158,6 @@ pub(crate) async fn insert_job(conn: &mut sqlx::PgConnection, job: &NewJob<'_>) 
     sqlx::query_as(&format!("INSERT INTO async_jobs(id,kind,workspace_id,api_key_id,deployment_id,execution_id,public_model,provider,upstream_id,poll_deadline_at,video_seconds,video_size,batch_endpoint,submit_started_at,next_poll_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,CASE WHEN $9::text IS NULL THEN clock_timestamp() END,clock_timestamp()+make_interval(secs=>$14)) RETURNING {JOB_COLUMNS}"))
         .bind(job.id).bind(job.kind.as_str()).bind(job.workspace_id).bind(job.api_key_id).bind(job.deployment_id).bind(job.execution_id).bind(job.public_model).bind(job.provider).bind(job.upstream_id.map(UpstreamId::as_str)).bind(job.poll_deadline_at).bind(job.video_seconds).bind(job.video_size).bind(job.batch_endpoint).bind(first_poll)
         .fetch_one(conn).await.map_err(job_storage)
-}
-/// Fill in the provider id of a video recorded before its create (#662).
-/// `None` when the row is no longer a queued video without an id (the
-/// create-grace rule already failed it), or when another job of the same
-/// upstream account (provider, endpoint and credential: two connection
-/// records may name one server) already has that id. One upstream object is
-/// never reachable through two jobs (their routes may serve different
-/// workspaces): the id is not recorded for this job, which ends `failed`
-/// `upstream_id_reused` (hold kept), and every earlier job with that id is
-/// marked `upstream_id_reused` (and ended `failed` if still running, its
-/// hold kept), after which the gateway never contacts the server for it
-/// again ([`super::Jobs::target`]); the server may have put another
-/// workspace's video behind it. The check runs under an advisory
-/// lock of (account, id), so two creates answered with one id cannot both
-/// record it. The provider has accepted the job at this point, so a failure
-/// is counted at `job_settlement`.
-pub(crate) async fn record_video_upstream(
-    store: &Store,
-    id: Uuid,
-    upstream: &UpstreamId,
-) -> Result<Option<JobRow>> {
-    // The upstream account of a job: its connection's provider, endpoint
-    // and credential reference.
-    const ACCOUNT: &str = "(SELECT p.provider||':'||coalesce(p.endpoint,'')||':'||p.credential_ref FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id WHERE d.id=j.deployment_id)";
-    let mut tx = crate::db::begin(&store.pool)
-        .await
-        .map_err(job_settlement)?;
-    sqlx::query(&format!("SELECT pg_advisory_xact_lock(hashtextextended('video_upstream:'||{ACCOUNT}||':'||$2,0)) FROM async_jobs j WHERE j.id=$1"))
-        .bind(id).bind(upstream.as_str())
-        .execute(&mut *tx).await.map_err(job_settlement)?;
-    let others: Vec<Uuid> = sqlx::query_scalar(&format!("SELECT o.id FROM async_jobs o JOIN async_jobs j ON j.id=$1 WHERE o.upstream_id=$2 AND o.id<>$1 AND o.kind='video' AND {} = {ACCOUNT}", ACCOUNT.replace("j.deployment_id", "o.deployment_id")))
-        .bind(id).bind(upstream.as_str())
-        .fetch_all(&mut *tx).await.map_err(job_settlement)?;
-    let recorded: Option<JobRow> = if others.is_empty() {
-        sqlx::query_as(&format!("UPDATE async_jobs SET upstream_id=$2 WHERE id=$1 AND kind='video' AND upstream_id IS NULL AND state='queued' RETURNING {JOB_COLUMNS}"))
-            .bind(id).bind(upstream.as_str())
-            .fetch_optional(&mut *tx).await.map_err(job_settlement)?
-    } else {
-        // Marked for good, and ended if still running (its hold is kept: no
-        // settlement is ever read from the server for it).
-        sqlx::query("UPDATE async_jobs SET error_code='upstream_id_reused',state=CASE WHEN state IN('queued','in_progress') THEN 'failed' ELSE state END,completed_at=CASE WHEN state IN('queued','in_progress') THEN coalesce(completed_at,clock_timestamp()) ELSE completed_at END WHERE id=ANY($1)")
-            .bind(&others)
-            .execute(&mut *tx).await.map_err(job_settlement)?;
-        // This job too: the server's answer gives it no object of its own.
-        sqlx::query("UPDATE async_jobs SET state='failed',upstream_status='failed',error_code='upstream_id_reused',completed_at=clock_timestamp() WHERE id=$1 AND kind='video' AND upstream_id IS NULL AND state='queued'")
-            .bind(id)
-            .execute(&mut *tx).await.map_err(job_settlement)?;
-        None
-    };
-    tx.commit().await.map_err(job_settlement)?;
-    Ok(recorded)
 }
 /// End a video that has no provider id as `failed` with `code`, only while it
 /// is still queued without one, with `older_than` only once its create
@@ -533,9 +487,17 @@ pub(crate) async fn reservation_pending(store: &Store, execution: Uuid) -> Resul
     .await.map_err(job_storage)
 }
 /// The job's pinned deployment while it and its connection are enabled.
-pub(crate) async fn target(store: &Store, deployment: Uuid) -> Result<Option<Deployment>> {
-    sqlx::query_as("SELECT d.id,p.provider,d.upstream_model,p.credential_ref,p.endpoint,p.region,m.supported_protocols FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id JOIN models m ON m.id=d.model_id WHERE d.id=$1 AND d.enabled AND p.enabled")
+/// The deployment of `job`, enabled, read in the statement before each
+/// upstream call, and only while the job is not marked `upstream_id_reused`
+/// (read in the same statement, never from an earlier copy of the row).
+pub(crate) async fn target(
+    store: &Store,
+    job: Uuid,
+    deployment: Uuid,
+) -> Result<Option<Deployment>> {
+    sqlx::query_as("SELECT d.id,p.provider,d.upstream_model,p.credential_ref,p.endpoint,p.region,m.supported_protocols FROM deployments d JOIN provider_connections p ON p.id=d.provider_connection_id JOIN models m ON m.id=d.model_id WHERE d.id=$1 AND d.enabled AND p.enabled AND NOT EXISTS(SELECT 1 FROM async_jobs j WHERE j.id=$2 AND j.error_code='upstream_id_reused')")
         .bind(deployment)
+        .bind(job)
         .fetch_optional(&store.pool)
         .await.map_err(job_storage)
 }

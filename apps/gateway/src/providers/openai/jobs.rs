@@ -59,8 +59,17 @@ fn media_type(response: &reqwest::Response) -> Option<String> {
     crate::providers::audio::media_type(response)
 }
 
-/// Bounded JSON object (status already checked).
+/// Bounded JSON object (status already checked), from OpenAI's client.
 async fn read_object(response: reqwest::Response) -> Result<Value> {
+    read_object_from(crate::egress::UpstreamClient::Openai, response).await
+}
+
+/// Bounded JSON object (status already checked); a transport failure while
+/// it is read is counted against `kind`'s client.
+async fn read_object_from(
+    kind: crate::egress::UpstreamClient,
+    response: reqwest::Response,
+) -> Result<Value> {
     check_status(response.status())?;
     if media_type(&response).as_deref() != Some("application/json")
         || response
@@ -72,7 +81,14 @@ async fn read_object(response: reqwest::Response) -> Result<Value> {
     let mut body = Vec::new();
     let mut chunks = response.bytes_stream();
     while let Some(chunk) = chunks.next().await {
-        let chunk = chunk.map_err(transport_error)?;
+        let chunk = chunk.map_err(|e| {
+            kind.lost_before_response(&e);
+            if e.is_timeout() {
+                InferenceError::Timeout
+            } else {
+                InferenceError::UpstreamUnavailable
+            }
+        })?;
         if chunk.len() > OBJECT_LIMIT - body.len() {
             return Err(InferenceError::InvalidUpstream);
         }

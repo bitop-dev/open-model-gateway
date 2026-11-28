@@ -156,7 +156,7 @@ pub(crate) async fn create_video(
     if response.status().is_redirection() {
         return Err(InferenceError::InvalidUpstream);
     }
-    parse_video(&read_object(response).await?)
+    parse_video(&read_object_from(wire.kind, response).await?)
 }
 
 pub(crate) async fn retrieve_video(
@@ -171,7 +171,7 @@ pub(crate) async fn retrieve_video(
         .send()
         .await
         .map_err(|e| lost(wire.kind, &e))?;
-    let parsed = parse_video(&read_object(response).await?)?;
+    let parsed = parse_video(&read_object_from(wire.kind, response).await?)?;
     if &parsed.id != video {
         return Err(InferenceError::InvalidUpstream);
     }
@@ -200,7 +200,15 @@ pub(crate) async fn delete_video(
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(VideoDeletion::Deleted);
     }
-    let value = read_object(response).await?;
+    // A success without a deletion object (`204`, or a body that is not
+    // JSON) is the server's confirmation too; a JSON body must be one.
+    check_status(response.status())?;
+    if response.status() == reqwest::StatusCode::NO_CONTENT
+        || media_type(&response).as_deref() != Some("application/json")
+    {
+        return Ok(VideoDeletion::Deleted);
+    }
+    let value = read_object_from(wire.kind, response).await?;
     object_kind(&value, "video.deleted")?;
     if value["deleted"] != json!(true) || &id(&value["id"])? != video {
         return Err(InferenceError::InvalidUpstream);
