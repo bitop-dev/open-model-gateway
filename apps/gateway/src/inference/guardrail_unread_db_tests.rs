@@ -19,12 +19,15 @@ use super::guardrail_db_tests::{
     PNG, World, chat_with_image, images_on, secret, send, type_default_on, world, world_on,
 };
 
-/// The decisions recorded: operation, action and whether each refused.
-async fn decisions(w: &World) -> Vec<(String, String, bool)> {
-    sqlx::query_as("SELECT operation,action,refused FROM guardrail_events ORDER BY created_at,id")
-        .fetch_all(&w.f.store.pool)
-        .await
-        .unwrap()
+/// The decisions recorded: operation, action, whether each is the one the
+/// client was refused with, and its rule's own verdict.
+async fn decisions(w: &World) -> Vec<(String, String, bool, Option<bool>)> {
+    sqlx::query_as(
+        "SELECT operation,action,refused,refuses FROM guardrail_events ORDER BY created_at,id",
+    )
+    .fetch_all(&w.f.store.pool)
+    .await
+    .unwrap()
 }
 
 async fn realtime(w: &World) -> (StatusCode, Value) {
@@ -70,7 +73,7 @@ async fn a_block_rule_naming_images_refuses_every_image_request_unless_it_lets_t
     assert_eq!(w.hits.load(Ordering::SeqCst), 0, "nothing was sent");
     assert_eq!(
         decisions(&w).await,
-        [("images".into(), "skipped".into(), true)]
+        [("images".into(), "skipped".into(), true, Some(true))]
     );
     // Let through unread: sent, and recorded as skipped, not refused.
     type_default_on(&w, "block", "{secret}", &[], &[], "{images}", "allow").await;
@@ -79,7 +82,7 @@ async fn a_block_rule_naming_images_refuses_every_image_request_unless_it_lets_t
     assert_eq!(w.hits.load(Ordering::SeqCst), 1, "sent upstream");
     assert_eq!(
         decisions(&w).await[1..],
-        [("images".into(), "skipped".into(), false)]
+        [("images".into(), "skipped".into(), false, Some(false))]
     );
 }
 
@@ -98,7 +101,7 @@ async fn a_block_rule_naming_realtime_refuses_the_session_before_the_upgrade(poo
     assert_eq!(admitted, 0, "nothing was admitted");
     assert_eq!(
         decisions(&w).await,
-        [("realtime".into(), "skipped".into(), true)]
+        [("realtime".into(), "skipped".into(), true, Some(true))]
     );
     // Let through unread: the session goes on past the guardrail step.
     type_default_on(&w, "block", "{secret}", &[], &[], "{realtime}", "allow").await;
@@ -106,7 +109,7 @@ async fn a_block_rule_naming_realtime_refuses_the_session_before_the_upgrade(poo
     assert_ne!(body["error"]["code"], "guardrail_not_supported", "{body}");
     assert_eq!(
         decisions(&w).await[1..],
-        [("realtime".into(), "skipped".into(), false)]
+        [("realtime".into(), "skipped".into(), false, Some(false))]
     );
 }
 
@@ -155,7 +158,12 @@ async fn a_block_rule_naming_transcription_refuses_every_transcription(pool: PgP
     assert_eq!(w.hits.load(Ordering::SeqCst), 0, "nothing was sent");
     assert_eq!(
         decisions(&w).await,
-        [("audio_transcriptions".into(), "skipped".into(), true)]
+        [(
+            "audio_transcriptions".into(),
+            "skipped".into(),
+            true,
+            Some(true)
+        )]
     );
     type_default_on(
         &w,
@@ -171,7 +179,12 @@ async fn a_block_rule_naming_transcription_refuses_every_transcription(pool: PgP
     assert_ne!(body["error"]["code"], "guardrail_not_supported", "{body}");
     assert_eq!(
         decisions(&w).await[1..],
-        [("audio_transcriptions".into(), "skipped".into(), false)]
+        [(
+            "audio_transcriptions".into(),
+            "skipped".into(),
+            false,
+            Some(false)
+        )]
     );
 }
 
@@ -193,7 +206,12 @@ async fn under_allow_an_image_goes_on_with_its_text_still_read(pool: PgPool) {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         decisions(&w).await,
-        [("chat_completions".into(), "skipped".into(), false)]
+        [(
+            "chat_completions".into(),
+            "skipped".into(),
+            false,
+            Some(false)
+        )]
     );
     // A secret beside the image is still found, and refuses.
     let hits = w.hits.load(Ordering::SeqCst);
@@ -206,6 +224,61 @@ async fn under_allow_an_image_goes_on_with_its_text_still_read(pool: PgPool) {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["code"], "guardrail_input_blocked");
     assert_eq!(w.hits.load(Ordering::SeqCst), hits, "nothing was sent");
+    // The finding refused; the allow rule's skip refuses nothing.
+    assert_eq!(
+        decisions(&w).await[1..],
+        [
+            (
+                "chat_completions".into(),
+                "blocked".into(),
+                true,
+                Some(true)
+            ),
+            (
+                "chat_completions".into(),
+                "skipped".into(),
+                false,
+                Some(false)
+            )
+        ]
+    );
+    // Under deny the same request is refused by the finding, which
+    // outranks the unreadable image: the skip is not the refusal returned,
+    // and still records that its rule refuses.
+    type_default_on(
+        &w,
+        "block",
+        "{secret}",
+        &[],
+        &[],
+        "{generation,embeddings}",
+        "deny",
+    )
+    .await;
+    let (_, _, body) = send(
+        &w,
+        "/v1/chat/completions",
+        chat_with_image(&format!("use {}", secret())),
+    )
+    .await;
+    assert_eq!(body["error"]["code"], "guardrail_input_blocked");
+    assert_eq!(
+        decisions(&w).await[3..],
+        [
+            (
+                "chat_completions".into(),
+                "blocked".into(),
+                true,
+                Some(true)
+            ),
+            (
+                "chat_completions".into(),
+                "skipped".into(),
+                false,
+                Some(true)
+            )
+        ]
+    );
 }
 
 /// A token count with an image goes on under `allow` (it is a generation
@@ -232,8 +305,8 @@ async fn under_allow_a_token_count_with_an_image_goes_on(pool: PgPool) {
     assert_eq!(
         decisions(&w).await,
         [
-            ("count_tokens".into(), "skipped".into(), true),
-            ("count_tokens".into(), "skipped".into(), false)
+            ("count_tokens".into(), "skipped".into(), true, Some(true)),
+            ("count_tokens".into(), "skipped".into(), false, Some(false))
         ]
     );
 }

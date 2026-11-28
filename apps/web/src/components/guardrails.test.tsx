@@ -511,19 +511,33 @@ describe("What a rule can't read (#841)", () => {
     expect(stricterPart({ tightens: "r-lets", uninspectable: "deny" }, lets)).toEqual({ tightens: "r-lets", uninspectable: "deny" });
     expect(stricterPart({ tightens: "r-lets", uninspectable: "allow" }, lets)).toBeNull();
   });
-  it("offers refusing what it can't read only when the tightened rule blocks", async () => {
-    const watch: StoredRule = { ...secrets, id: "r-watch", name: "Watches", uninspectable: "allow" };
+  it("never sends a tightening that changes nothing, and warns before one switches a workload off", async () => {
+    // A Monitor platform rule that lets unreadable content through and names image generation.
+    const watch: StoredRule = { ...secrets, id: "r-watch", name: "Watches", uninspectable: "allow", workloads: ["generation", "images"] };
     const fetch = serve({ [guardrailsPath(team.id)]: () => view({ platform: { source: "type_default", rule_set: { ...platformSet, rules: [watch] } }, local: { ...localSet, rules: [] }, effective: [effective(watch, "type_default", "set-p")] }) });
     const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
     await user.click(await screen.findByRole("button", { name: "Tighten Watches" }));
-    // A Monitor rule never refuses, so the choice appears only with Block.
-    expect(screen.queryByLabelText("What it can't read")).toBeNull();
-    await user.selectOptions(screen.getByLabelText("On input"), "block");
-    expect((screen.getByLabelText("What it can't read") as HTMLSelectElement).value).toBe("");
-    await user.selectOptions(screen.getByLabelText("What it can't read"), "deny");
+    // Only Block refuses, so a rule that does not block is tightened to Block: there is no "keep".
+    const action = screen.getByLabelText("On input") as HTMLSelectElement;
+    expect([...action.options].filter(o => o.value).map(o => o.value)).toEqual(["block"]);
+    expect([...action.options].some(o => /Keep/.test(o.textContent ?? ""))).toBe(false);
+    // Blocking and refusing what it can't read switches image generation off here: said before saving.
+    expect(screen.getByRole("dialog").textContent).toContain("This refuses all image generation requests for this workspace");
+    await user.selectOptions(screen.getByLabelText("What it can't read"), "");
+    expect(screen.getByRole("dialog").textContent).not.toContain("This refuses all image generation requests");
     await user.click(screen.getByRole("button", { name: "Tighten" }));
     await waitFor(() => expect(writes(fetch)).toHaveLength(1));
-    expect(writes(fetch)[0]![2].rules).toEqual([{ tightens: "r-watch", input: { action: "block" }, uninspectable: "deny" }]);
+    expect(writes(fetch)[0]![2].rules).toEqual([{ tightens: "r-watch", input: { action: "block" } }]);
+  });
+  it("tightens a Block rule only by refusing what it can't read, with no empty choice", async () => {
+    const lets: StoredRule = { ...codes, id: "r-lets", name: "Lets through", uninspectable: "allow" };
+    serve({ [guardrailsPath(team.id)]: () => view({ platform: { source: "type_default", rule_set: { ...platformSet, rules: [lets] } }, local: { ...localSet, rules: [] }, effective: [effective(lets, "type_default", "set-p")] }) });
+    const user = mount(<WorkspaceGuardrailsTab workspace={team} />);
+    await user.click(await screen.findByRole("button", { name: "Tighten Lets through" }));
+    expect(screen.queryByLabelText("On input")).toBeNull();
+    const choices = [...(screen.getByLabelText("What it can't read") as HTMLSelectElement).options];
+    expect(choices.filter(o => o.value).map(o => o.value)).toEqual(["deny"]);
+    expect(choices.some(o => /Keep/.test(o.textContent ?? ""))).toBe(false);
   });
   it("counts not readable requests refused apart from those let through, and the request page says which", async () => {
     serve({ [platformGuardrailsPath(team.id)]: () => platformView({ decisions_this_month: [{ action: "skipped", category: "secret", refuses: true, decisions: 2, findings: 0 }, { action: "skipped", category: "secret", refuses: false, decisions: 5, findings: 0 }] }) });

@@ -88813,7 +88813,7 @@
         "x-omg-token-policy": "Scope"
       },
       "put": {
-        "description": "#840: replace the workspace's local layer (full set): rules of its own, and tightening entries ({tightens: <platform rule id>} with only input.action, output.mode, on_error or threshold) that make a platform rule stricter. Composition takes the stricter value of each field, so an entry never weakens the current platform rule. Shared owners/admins and a personal workspace's owner; browser only. local_only is a platform field (400). Input rules are enforced by the engine for generation and embeddings (enforced is true); output is not inspected in this release.",
+        "description": "#840: replace the workspace's local layer (full set): rules of its own, and tightening entries ({tightens: <platform rule id>} with only input.action, output.mode, on_error, threshold or uninspectable, the last only as deny: allow on a tightening is 403 guardrail_loosen_not_allowed, #841) that make a platform rule stricter. Composition takes the stricter value of each field, so an entry never weakens the current platform rule. Shared owners/admins and a personal workspace's owner; browser only. local_only is a platform field (400). Input rules are enforced by the engine for generation and embeddings (enforced is true); output is not inspected in this release.",
         "operationId": "put_api_v1_workspaces_by_ws_guardrails",
         "parameters": [
           {

@@ -153,16 +153,16 @@ export function tightenRule(ask: ReturnType<typeof useAction>, rule: EffectiveEn
   const existing = (local?.rules ?? []).find((e): e is Tightening => isTightening(e) && e.tightens === rule.id);
   // Refusing what it can't read is stricter than letting it through: offered when the rule lets it through.
   const unread = rule.uninspectable === "allow";
+  // A rule that names a workload this release never reads refuses all of it once it blocks and refuses what it can't read.
+  const warning = (v: Record<string, string | undefined>) => refusesWhole({ action: v.action || current, uninspectable: v.uninspectable || rule.uninspectable, workloads: rule.workloads }, "this workspace");
   ask({ title: `Tighten ${rule.name}`, description: "This workspace can make a platform rule stricter, never weaker.", fields: [
-    // With a choice of what it can't read, the action may stay as it is.
-    ...(options.length ? [{ name: "action", label: "On input", type: "select" as const, required: !unread, value: unread ? "" : options[options.length - 1] ?? "block",
-      options: [...(unread ? [{ value: "", label: `Keep: ${actionLabels[current]}` }] : []), ...options.map(a => ({ value: a, label: `${actionLabels[a]}: ${actionHelp[a]}` }))] }] : []),
-    // Only a Block rule refuses: offered when the rule blocks, or is made to.
-    ...(unread ? [{ name: "uninspectable", label: "What it can't read", type: "select" as const, value: current === "block" ? "deny" : "", help: unreadableHelp,
+    // A rule that does not block has nothing else to tighten: its action is always chosen (only Block refuses what it can't read).
+    ...(options.length ? [{ name: "action", label: "On input", type: "select" as const, required: true, value: options[options.length - 1] ?? "block", helpFor: warning,
+      options: options.map(a => ({ value: a, label: `${actionLabels[a]}: ${actionHelp[a]}` })) }] : []),
+    // Only a Block rule refuses: offered when the rule blocks, or is made to. A rule that already blocks has only this to tighten.
+    ...(unread ? [{ name: "uninspectable", label: "What it can't read", type: "select" as const, value: "deny", help: unreadableHelp, helpFor: warning, required: current === "block",
       visibleWhen: (all: Record<string, string | undefined>) => current === "block" || all.action === "block",
-      // With the action kept too, there is nothing to make stricter.
-      requiredWhen: (all: Record<string, string | undefined>) => !all.action,
-      options: [{ value: "", label: "Keep: let it through unread" }, { value: "deny", label: "Refuse the request" }] }] : []),
+      options: [...(current === "block" ? [] : [{ value: "", label: "Keep: let it through unread" }]), { value: "deny", label: "Refuse the request" }] }] : []),
   ],
     submitLabel: "Tighten", successNotice: "Rule tightened.",
     run: (v, signal) => {

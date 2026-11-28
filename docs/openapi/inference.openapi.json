@@ -11452,7 +11452,7 @@
     },
     "/v1/realtime": {
       "get": {
-        "description": "OpenAI GA Realtime WebSocket. HTTP errors precede upgrade; errors after upgrade are events and closes, not HTTP responses. Declared Content-Length above the fixed 2 MiB root limit is refused with plain text 413, including GET.",
+        "description": "OpenAI GA Realtime WebSocket. HTTP errors precede upgrade; errors after upgrade are events and closes, not HTTP responses. Declared Content-Length above the fixed 2 MiB root limit is refused with plain text 413, including GET. Guardrails decide on a session once, before the upgrade: a rule applies to sessions opened after it is saved, and a session already open runs on to its idle timeout or max_session (#841).",
         "operationId": "get_v1_realtime",
         "parameters": [
           {
@@ -11584,6 +11584,24 @@
             "envelope": "OpenAiErrorEnvelope",
             "status": 400,
             "trigger": "Invalid model query, unknown query parameter or missing WebSocket upgrade"
+          },
+          {
+            "code": "guardrail_not_supported",
+            "envelope": "OpenAiErrorEnvelope",
+            "status": 400,
+            "trigger": "An enforcing guardrail rule names realtime and refuses what it cannot read (uninspectable: deny): a session's events are never read, so it is refused before the upgrade and before admission, with error.guardrail naming the rule (#841)"
+          },
+          {
+            "code": "guardrail_rate_limited",
+            "envelope": "OpenAiErrorEnvelope",
+            "status": 429,
+            "trigger": "The key reached its per-minute bound of guardrail-recorded requests that were never admitted, before the upgrade"
+          },
+          {
+            "code": "guardrail_unavailable",
+            "envelope": "OpenAiErrorEnvelope",
+            "status": 503,
+            "trigger": "The workspace's guardrail policy cannot be read now, before the upgrade; retry after Retry-After"
           }
         ],
         "x-omg-request-schema": {

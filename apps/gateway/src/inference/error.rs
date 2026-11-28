@@ -280,7 +280,7 @@ impl InferenceError {
                     "A guardrail detector could not run and its rule fails closed; error.guardrail names the rule"
                 }
                 crate::guardrails::enforce::RefusalKind::NotSupported => {
-                    "A guardrail policy enforces on this request, but part of it (an image, audio or an encoded document) cannot be inspected; nothing was matched"
+                    "A guardrail policy enforces on this request, but it cannot be inspected: it holds an image, audio or an encoded document, or it is a request this release never reads (image generation, transcription, a realtime session, a native batch); nothing was matched; error.guardrail names the rule"
                 }
                 crate::guardrails::enforce::RefusalKind::Unavailable => {
                     "A guardrail rule could not finish inspecting the request now; nothing was sent. Retry after the indicated delay"

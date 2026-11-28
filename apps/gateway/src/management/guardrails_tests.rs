@@ -1049,6 +1049,16 @@ async fn a_local_layer_may_refuse_what_a_platform_rule_lets_through_unread(pool:
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["local"]["rules"][0]["uninspectable"], "deny");
     assert_eq!(body["effective"][0]["uninspectable"], "deny", "{body}");
+    // Audited: a rule's uninspectable and workloads (naming a never-read
+    // workload with Block switches it off), a tightening's uninspectable.
+    let audits: Vec<Value> = sqlx::query_scalar("SELECT metadata FROM audit_events WHERE action='guardrail_policy.updated' ORDER BY created_at")
+        .fetch_all(&pool).await.unwrap();
+    let platform_audit = &audits[audits.len() - 2]["rules"][0];
+    assert_eq!(platform_audit["uninspectable"], "allow", "{audits:?}");
+    assert_eq!(platform_audit["workloads"], json!(["generation", "images"]));
+    let local_audit = &audits[audits.len() - 1]["rules"][0];
+    assert_eq!(local_audit["tightens"], target);
+    assert_eq!(local_audit["uninspectable"], "deny", "{audits:?}");
     // A platform rule that already refuses it: deny again is accepted and
     // changes nothing; allow is refused.
     let (_, platform) = put(

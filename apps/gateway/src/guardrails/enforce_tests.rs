@@ -752,3 +752,26 @@ fn a_native_batch_is_refused_by_an_enforcing_rule_even_under_allow() {
             .is_none()
     );
 }
+
+#[test]
+fn of_two_block_rules_on_one_request_only_the_deny_one_refuses() {
+    // An allow rule and a deny rule, both naming image generation: the deny
+    // rule refuses, and each decision records its own rule's verdict.
+    let mut allow = rule(&[Category::Secret], &[], InputAction::Block);
+    allow.uninspectable = Uninspectable::Allow;
+    allow.workloads = [Workload::Images].into_iter().collect();
+    let mut deny = rule(&[Category::Custom], &["ACME-[0-9]{4}"], InputAction::Block);
+    deny.workloads = [Workload::Images].into_iter().collect();
+    let d = policy(vec![allow, deny]).decide(Workload::Images, None);
+    assert_eq!(d.refusal.map(|r| r.kind), Some(RefusalKind::NotSupported));
+    assert_eq!(
+        d.events
+            .iter()
+            .map(|e| (e.category, e.action, e.refused, e.refuses))
+            .collect::<Vec<_>>(),
+        [
+            (Category::Secret, Action::Skipped, false, false),
+            (Category::Custom, Action::Skipped, true, true)
+        ]
+    );
+}

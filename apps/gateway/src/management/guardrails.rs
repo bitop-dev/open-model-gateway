@@ -231,8 +231,13 @@ async fn audit(
     let summary: Vec<Value> = rules
         .iter()
         .map(|r| match &r.entry {
-            Entry::Rule(rule) => json!({"id": r.id, "action": rule.input_action.as_str(), "output_mode": rule.output_mode.as_str()}),
-            Entry::Tightens(target, t) => json!({"id": r.id, "tightens": target, "action": t.input_action.map(|a| a.as_str()), "output_mode": t.output_mode.map(|m| m.as_str())}),
+            // What a rule refuses: its actions, what it does with content it
+            // cannot read, and the workloads it covers (naming a never-read
+            // one with Block switches that workload off).
+            Entry::Rule(rule) => json!({"id": r.id, "action": rule.input_action.as_str(), "output_mode": rule.output_mode.as_str(),
+                "uninspectable": rule.uninspectable.as_str(), "workloads": rule.workloads.iter().map(|w| w.as_str()).collect::<Vec<_>>()}),
+            Entry::Tightens(target, t) => json!({"id": r.id, "tightens": target, "action": t.input_action.map(|a| a.as_str()), "output_mode": t.output_mode.map(|m| m.as_str()),
+                "uninspectable": t.uninspectable.map(|u| u.as_str())}),
         })
         .collect();
     let patterns: usize = rules
@@ -291,11 +296,30 @@ pub(super) fn audit_field(action: &str, k: &str, v: &Value) -> bool {
                 && rules.iter().all(|r| {
                     r.as_object().is_some_and(|o| {
                         o.keys().all(|k| {
-                            matches!(k.as_str(), "id" | "tightens" | "action" | "output_mode")
+                            matches!(
+                                k.as_str(),
+                                "id" | "tightens"
+                                    | "action"
+                                    | "output_mode"
+                                    | "uninspectable"
+                                    | "workloads"
+                            )
                         }) && id(o.get("id"))
                             && (o.get("tightens").is_none() || id(o.get("tightens")))
                             && closed(o.get("action"), &["off", "monitor", "redact", "block"])
                             && closed(o.get("output_mode"), &["off", "monitor", "stop", "block"])
+                            && closed(o.get("uninspectable"), &["allow", "deny"])
+                            && o.get("workloads").is_none_or(|w| {
+                                w.as_array().is_some_and(|w| {
+                                    w.len() <= 8
+                                        && w.iter().all(|w| {
+                                            w.as_str().is_some_and(|w| {
+                                                crate::guardrails::policy::Workload::parse(w)
+                                                    .is_some()
+                                            })
+                                        })
+                                })
+                            })
                     })
                 })
         }),
