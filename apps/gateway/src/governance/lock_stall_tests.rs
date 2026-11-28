@@ -6,9 +6,12 @@
 //! - [`cold_bucket_admission_contention`]: bursts of concurrent requests on
 //!   one workspace and key whose `budget_totals`, minute and in-flight rows do
 //!   not exist yet (a period boundary, at its widest: every period at once)
-//!   against the same bursts on rows that exist. Every admission locks the
+//!   against requests on rows that exist, sent in the same burst and
+//!   interleaved, round by round. Every admission locks the
 //!   same rows either way (`omg_lock_scope_rows`); the question is whether
-//!   creating them adds a stall of its own. It measures how long admissions
+//!   creating them adds a stall of its own, and whether one scope's burst
+//!   holds the replica's admission gate from another's (#876; also two warm
+//!   scopes, one sent 15 ms after the other). It measures how long admissions
 //!   take, so it runs with an admission bound longer than any burst; it
 //!   prints the server's commit latency, the first burst of the process and,
 //!   per burst, how many requests took longer than the production bound.
@@ -475,6 +478,45 @@ async fn burst(h: &Harness, key: &str, n: usize) -> (Vec<Duration>, (i64, i64, i
     (latencies, waits)
 }
 
+/// `n` requests with each of `first` and `second` at once, sent alternately
+/// (so both sides meet the same server, pool and runner), the `second` side's
+/// each `delay` after its `first` partner; each side's latencies (each from
+/// its own send) after asserting each request succeeded, and the lock waits
+/// sampled meanwhile (both sides together).
+async fn paired_burst(
+    h: &Harness,
+    first: &str,
+    second: &str,
+    n: usize,
+    delay: Duration,
+) -> (Vec<Duration>, Vec<Duration>, (i64, i64, i64, i64)) {
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sampler = tokio::spawn(sample_waits(h.observer.clone(), done.clone()));
+    let start = Instant::now();
+    let mut sends = Vec::with_capacity(2 * n);
+    for _ in 0..n {
+        for (key, wait) in [(first, Duration::ZERO), (second, delay)] {
+            let (client, url, key) = (h.client.clone(), h.url.clone(), key.to_owned());
+            sends.push(tokio::spawn(async move {
+                tokio::time::sleep(wait).await;
+                send(client, url, key, start).await
+            }));
+        }
+    }
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    for (i, s) in sends.into_iter().enumerate() {
+        let s = tokio::time::timeout(GUARD, s).await.unwrap().unwrap();
+        assert_eq!(s.status, 200, "{s:?}");
+        if i % 2 == 0 {
+            a.push(s.latency);
+        } else {
+            b.push(s.latency);
+        }
+    }
+    done.store(true, Ordering::SeqCst);
+    (a, b, sampler.await.unwrap())
+}
+
 /// A measured burst, never asserted: the latencies of the requests that
 /// succeeded (the printed quantiles and `latency_over_admission_bound` are
 /// theirs), and how many did not, by outcome (`scope_busy`,
@@ -598,59 +640,72 @@ async fn cold_buckets(setup: Setup) {
     let (_, warm_key) = new_scope(&h).await;
     // Warm: its rows exist after one request.
     burst(&h, &warm_key, 1).await;
-    // (p50s, maxima) of each side's bursts.
-    let (mut warm, mut cold) = ((Vec::new(), Vec::new()), (Vec::new(), Vec::new()));
-    for round in 0..ROUNDS {
-        let (_, cold_key) = new_scope(&h).await;
-        // Alternate the order so neither always runs on a warmer server.
-        let (c, w) = if round % 2 == 0 {
-            let c = burst(&h, &cold_key, BURST).await;
-            (c, burst(&h, &warm_key, BURST).await)
-        } else {
-            let w = burst(&h, &warm_key, BURST).await;
-            (burst(&h, &cold_key, BURST).await, w)
-        };
-        for (label, (mut latencies, (most, at_rows, any, samples)), into) in
-            [("cold", c, &mut cold), ("warm", w, &mut warm)]
-        {
-            let (p50, max) = (quantile(&mut latencies, 0.5), quantile(&mut latencies, 1.0));
+    // Each round sends a burst on a new scope (cold: none of its rows exist)
+    // and one on the warm scope together, their requests interleaved, so
+    // whatever slows the runner or the server during the round slows both
+    // alike; each round compares its two sides. A cold-bucket stall would
+    // show as the cold side well slower than the warm side of its own round.
+    // So would a burst of one scope holding the replica's admission gate
+    // while the other's wait (#876): admissions of one workspace run one at
+    // a time past its row locks, and the cold side reaches the gate slightly
+    // later (its first requests load the workspace's guardrail policy).
+    // Then the same with two warm scopes, the second sent 15 ms after the
+    // first: a scope that arrives a little later waits its own turn, not
+    // for the other's burst. Every round must pass, so a stall that shows in
+    // one round only still fails.
+    let bound = |earlier: Duration| earlier * 3 / 2 + Duration::from_millis(50);
+    let (_, later_key) = new_scope(&h).await;
+    burst(&h, &later_key, 1).await;
+    let mut stalls = Vec::new();
+    for (label, delay) in [
+        ("cold", Duration::ZERO),
+        ("later", Duration::from_millis(15)),
+    ] {
+        for round in 0..ROUNDS {
+            let (first, second) = if delay.is_zero() {
+                (new_scope(&h).await.1, warm_key.clone())
+            } else {
+                (warm_key.clone(), later_key.clone())
+            };
+            // `slow` is the side expected to be the slower one: the cold
+            // scope, or the scope sent later.
+            let (mut a, mut b, (most, at_rows, any, samples)) =
+                paired_burst(&h, &first, &second, BURST, delay).await;
+            let (slow, other) = if delay.is_zero() {
+                (&mut a, &mut b)
+            } else {
+                (&mut b, &mut a)
+            };
+            let (slow_p50, slow_max) = (quantile(slow, 0.5), quantile(slow, 1.0));
+            let (other_p50, other_max) = (quantile(other, 0.5), quantile(other, 1.0));
             eprintln!(
-                "lock_stall cold_bucket round={round} buckets={label} requests={BURST} p50_ms={} max_ms={} latency_over_admission_bound={} most_lock_waiters={most} samples_waiting_at_scope_rows={at_rows} samples_waiting={any} samples={samples}",
-                ms(p50),
-                ms(max),
-                over_bound(&latencies)
+                "lock_stall cold_bucket {label} round={round} requests={BURST}+{BURST} {label}_p50_ms={} {label}_max_ms={} other_p50_ms={} other_max_ms={} {label}_over_admission_bound={} other_over_admission_bound={} most_lock_waiters={most} samples_waiting_at_scope_rows={at_rows} samples_waiting={any} samples={samples}",
+                ms(slow_p50),
+                ms(slow_max),
+                ms(other_p50),
+                ms(other_max),
+                over_bound(slow),
+                over_bound(other)
             );
-            into.0.push(p50);
-            into.1.push(max);
+            if slow_p50 > bound(other_p50) || slow_max > bound(other_max) {
+                stalls.push(format!(
+                    "{label} round {round}: p50 {}ms vs {}ms, max {}ms vs {}ms",
+                    ms(slow_p50),
+                    ms(other_p50),
+                    ms(slow_max),
+                    ms(other_max)
+                ));
+            }
         }
     }
-    let median = |v: &mut Vec<Duration>| quantile(v, 0.5);
-    let (warm_p50, cold_p50) = (median(&mut warm.0), median(&mut cold.0));
-    let (warm_max, cold_max) = (median(&mut warm.1), median(&mut cold.1));
-    eprintln!(
-        "lock_stall cold_bucket median_p50_ms warm={} cold={} median_max_ms warm={} cold={}",
-        ms(warm_p50),
-        ms(cold_p50),
-        ms(warm_max),
-        ms(cold_max)
-    );
-    // A cold-bucket stall of its own would show as cold bursts well slower
-    // than warm ones; the same serialization on existing rows would not.
-    // (A cold scope also misses the key and authority caches, which can only
-    // make the cold side slower.)
-    let bound = |warm: Duration| warm * 3 / 2 + Duration::from_millis(50);
     assert!(
-        cold_p50 <= bound(warm_p50) && cold_max <= bound(warm_max),
-        "cold-bucket admissions stall beyond warm ones: p50 {}ms vs {}ms, max {}ms vs {}ms",
-        ms(cold_p50),
-        ms(warm_p50),
-        ms(cold_max),
-        ms(warm_max)
+        stalls.is_empty(),
+        "admissions of one scope wait beyond another's in the same burst: {stalls:?}"
     );
     let (settled, unknown) = assert_exact(&h, &[]).await;
     assert_eq!(
         (settled, unknown),
-        ((BURST + 1 + 2 * ROUNDS * BURST) as i64, 0),
+        ((BURST + 2 + 4 * ROUNDS * BURST) as i64, 0),
         "every burst request settled"
     );
     // A measurement, never asserted: a new gateway on the same database (its
