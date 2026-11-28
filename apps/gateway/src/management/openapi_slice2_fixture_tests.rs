@@ -4174,12 +4174,21 @@ async fn guardrail_fixtures(
             .execute(pool)
             .await
             .unwrap();
-        for (category, kind) in [("secret", None), ("personal_data", Some("email"))] {
-            sqlx::query("INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,kind,action,count,refuses) VALUES(gen_random_uuid(),gen_random_uuid(),$1,$2,'chat_completions','contract-guardrails','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern',$3,$4,'monitored',1,false)")
+        // Monitored decisions with and without a kind, and not readable ones
+        // of a rule that refuses and of one that lets through (#841).
+        for (category, kind, action, refuses) in [
+            ("secret", None, "monitored", false),
+            ("personal_data", Some("email"), "monitored", false),
+            ("secret", None, "skipped", true),
+            ("secret", None, "skipped", false),
+        ] {
+            sqlx::query("INSERT INTO guardrail_events(id,root_request_id,workspace_id,api_key_id,operation,model,stage,rule_set_id,rule_id,revision,layer,detector_kind,category,kind,action,count,refused,refuses) VALUES(gen_random_uuid(),gen_random_uuid(),$1,$2,'chat_completions','contract-guardrails','input',gen_random_uuid(),gen_random_uuid(),1,'type_default','pattern',$3,$4,$5,1,$6,$6)")
                 .bind(ws)
                 .bind(key)
                 .bind(category)
                 .bind(kind)
+                .bind(action)
+                .bind(refuses)
                 .execute(pool)
                 .await
                 .unwrap();
