@@ -266,11 +266,13 @@ mod reconcile;
 mod settlement;
 /// Maintained per-scope, per-period budget totals and their consistency check.
 pub mod totals;
+/// Video admission: the route's options and video rate (#52).
+mod video;
 pub(crate) use admission::generation_bound;
 use admission::{LimitMode, enforce_limits, reservation_bounds};
 pub use admission::{
     admit, admit_embeddings_for_deployment, admit_for_deployment, admit_generation,
-    admit_workload_for_deployment,
+    admit_video_for_deployment, admit_workload_for_deployment,
 };
 pub(crate) use policy::BUDGETS;
 pub use policy::BudgetPeriod;
@@ -288,6 +290,7 @@ use settlement::{
 };
 pub use settlement::{finish, finish_with_telemetry};
 pub(crate) use settlement::{finish_accepted_job, validate_token_usage};
+pub use video::{ReportedSizeRate, VideoCheck, pinned_video_size_rate, video_route_priced};
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(test), expect(clippy::too_many_lines, reason = "#499"))]
 async fn admit_unobserved(
@@ -299,6 +302,7 @@ async fn admit_unobserved(
     output_limit: u32,
     forwards_cache_controls: bool,
     generation_request: Option<&ChatRequest>,
+    video: Option<&VideoCheck>,
     timer: &mut crate::metrics::PhaseTimer,
 ) -> Result<crate::inference::repository::GenerationAdmission, InferenceError> {
     if !(1..=86_400).contains(&lease_seconds) {
@@ -392,6 +396,9 @@ async fn admit_unobserved(
             .any(|p| ApiProtocol::parse(p).is_some_and(|p| p.workload() == workload.kind))
     {
         return Err(InferenceError::Configuration);
+    }
+    if let Some(check) = video {
+        video::admit_check(&mut tx, current.id, price.as_ref(), check).await?;
     }
     // Only an adapter that forwards these hints to the live, validated
     // deployment (`current.provider == record.provider`, the adapter's id)

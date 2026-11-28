@@ -254,7 +254,8 @@ impl<'ast> Visit<'ast> for JobCodes<'_> {
                 .collect();
             if let [.., owner, variant] = segments.as_slice()
                 && owner == "JobError"
-                && ["Conflict", "Invalid", "Forbidden"].contains(&variant.as_str())
+                && ["Conflict", "Invalid", "InvalidParameter", "Forbidden"]
+                    .contains(&variant.as_str())
             {
                 match call.args.first() {
                     Some(syn::Expr::Lit(syn::ExprLit {
@@ -297,7 +298,7 @@ pub(super) fn components() -> Result<Value> {
     schemas.insert("AnthropicErrorType".into(), json!({"type":"string","enum":strings(&v.anthropic_types),
         "description":"Anthropic error.type. Anthropic's shape has no machine code, so a budget denial is a rate_limit_error distinguishable only by its message."}));
     schemas.insert("JobErrorCode".into(), json!({"type":"string","enum":strings(&v.job_codes),
-        "description":"Code of a job error: not_found plus the JobError::{Conflict,Invalid,Forbidden} literals scanned from src/jobs."}));
+        "description":"Code of a job error: not_found plus the JobError::{Conflict,Invalid,InvalidParameter,Forbidden} literals scanned from src/jobs."}));
     schemas.insert(
         "OpenAiErrorEnvelope".into(),
         {
@@ -317,9 +318,9 @@ pub(super) fn components() -> Result<Value> {
             let mut schema = envelope(
                 json!({"type":"string","enum":["invalid_request_error","permission_error"]}),
                 json!({"$ref":"#/components/schemas/JobErrorCode"}),
-                json!({"type":"null"}),
+                json!({"type":["string","null"],"pattern":"^[A-Za-z0-9_]{1,64}$"}),
             );
-            schema["description"] = json!("Job (video and batch) error: 404 and 400 are invalid_request_error, 403 permission_error (protocols/videos.rs job_error). Inference errors of a job route use OpenAiErrorEnvelope.");
+            schema["description"] = json!("Job (video and batch) error: 404 and 400 are invalid_request_error, 403 permission_error (protocols/videos.rs job_error). param names the request parameter of an unsupported_video_parameter refusal (seconds, size, or the option the gateway does not take) and is null for every other code. Inference errors of a job route use OpenAiErrorEnvelope.");
             schema
         },
     );

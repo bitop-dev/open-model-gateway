@@ -636,7 +636,7 @@ impl Store {
     /// The eligible deployments of `model` for the principal, read live
     /// (revalidation, catalog eligibility and key restrictions in one
     /// transaction). `Unauthenticated` when the key is no longer valid.
-    async fn live_deployments(
+    pub(crate) async fn live_deployments(
         &self,
         principal: &Principal,
         model: &str,

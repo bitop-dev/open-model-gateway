@@ -28,6 +28,7 @@ pub async fn admit(
         u32::MAX,
         false,
         Some(request),
+        None,
     )
     .await
     .map(|_| ())
@@ -76,6 +77,7 @@ pub async fn admit_generation(
         output_limit,
         forwards_cache_controls,
         Some(request),
+        None,
     )
     .await
 }
@@ -130,6 +132,35 @@ pub async fn admit_embeddings_for_deployment(
         u32::MAX,
         false,
         None,
+        None,
+    )
+    .await
+    .map(|_| ())
+}
+/// Video admission ([`super::video`]): as [`admit_workload_for_deployment`],
+/// and under the same lock the route must still take `check` and its price
+/// must value it.
+pub async fn admit_video_for_deployment(
+    store: &Store,
+    record: &ExecutionStart,
+    admission: &WorkloadAdmission,
+    lease_seconds: i64,
+    deployment: &Deployment,
+    check: &super::VideoCheck,
+) -> Result<(), InferenceError> {
+    if admission.kind != WorkloadKind::Videos {
+        return Err(InferenceError::Configuration);
+    }
+    admit_checked(
+        store,
+        record,
+        *admission,
+        lease_seconds,
+        Some(deployment),
+        u32::MAX,
+        false,
+        None,
+        Some(check),
     )
     .await
     .map(|_| ())
@@ -155,6 +186,7 @@ pub async fn admit_workload_for_deployment(
         u32::MAX,
         false,
         None,
+        None,
     )
     .await
     .map(|_| ())
@@ -169,6 +201,7 @@ async fn admit_checked(
     output_limit: u32,
     forwards_cache_controls: bool,
     generation_request: Option<&ChatRequest>,
+    video: Option<&super::VideoCheck>,
 ) -> Result<crate::inference::repository::GenerationAdmission, InferenceError> {
     let mut timer = crate::metrics::PhaseTimer::start();
     let result = locks::retry_deadlocks!(
@@ -182,6 +215,7 @@ async fn admit_checked(
             output_limit,
             forwards_cache_controls,
             generation_request,
+            video,
             &mut timer
         )
         .await

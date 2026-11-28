@@ -1,11 +1,12 @@
 //! OpenAI async jobs at the fixed origin (shapes from the official OpenAPI
 //! spec via openai-python, 2026-10-08):
-//! - Videos: `POST /videos` (multipart `model, prompt, seconds, size`; the
-//!   gateway builds the form itself and always sends explicit seconds/size),
-//!   `GET /videos/{id}`, `DELETE /videos/{id}`, `GET /videos/{id}/content`.
-//!   OpenAI shut down the Sora 2 models and this API on 2026-09-24, so the
-//!   adapter no longer offers the `videos` protocol: new jobs are refused
-//!   before admission. These calls remain for jobs created earlier.
+//! - Videos (the OpenAI video contract, [`VideoWire`]): `POST /videos`
+//!   (multipart `model, prompt, seconds` and `size` only when the request
+//!   named one; the gateway builds the form itself), `GET /videos/{id}`,
+//!   `DELETE /videos/{id}`, `GET /videos/{id}/content`. Served on
+//!   `openai_compatible` connections; OpenAI shut down its own API on
+//!   2026-09-24, so its adapter no longer offers `videos` and these calls
+//!   remain there only for jobs created earlier.
 //! - Native batches (`jobs::native`): `POST /files` (multipart
 //!   `purpose=batch` + a streamed JSONL `file` the gateway encodes), `POST
 //!   /batches`, `GET /batches/{id}`, `POST /batches/{id}/cancel`, `GET
@@ -58,8 +59,17 @@ fn media_type(response: &reqwest::Response) -> Option<String> {
     crate::providers::audio::media_type(response)
 }
 
-/// Bounded JSON object (status already checked).
+/// Bounded JSON object (status already checked), from OpenAI's client.
 async fn read_object(response: reqwest::Response) -> Result<Value> {
+    read_object_from(crate::egress::UpstreamClient::Openai, response).await
+}
+
+/// Bounded JSON object (status already checked); a transport failure while
+/// it is read is counted against `kind`'s client.
+async fn read_object_from(
+    kind: crate::egress::UpstreamClient,
+    response: reqwest::Response,
+) -> Result<Value> {
     check_status(response.status())?;
     if media_type(&response).as_deref() != Some("application/json")
         || response
@@ -71,7 +81,14 @@ async fn read_object(response: reqwest::Response) -> Result<Value> {
     let mut body = Vec::new();
     let mut chunks = response.bytes_stream();
     while let Some(chunk) = chunks.next().await {
-        let chunk = chunk.map_err(transport_error)?;
+        let chunk = chunk.map_err(|e| {
+            kind.lost_before_response(&e);
+            if e.is_timeout() {
+                InferenceError::Timeout
+            } else {
+                InferenceError::UpstreamUnavailable
+            }
+        })?;
         if chunk.len() > OBJECT_LIMIT - body.len() {
             return Err(InferenceError::InvalidUpstream);
         }
@@ -110,120 +127,9 @@ fn timestamp(value: &Value) -> Option<i64> {
 
 // ---------------------------------------------------------------- Video ----
 
-/// The Sora family only; other upstream models are not this profile.
-pub(super) fn supports_video(target: &Deployment, request: &VideoRequest) -> bool {
-    target.upstream_model.starts_with("sora-") && request.validate().is_ok()
-}
-
-pub(super) fn parse_video(value: &Value) -> Result<UpstreamVideo> {
-    object_kind(value, "video")?;
-    let state = match value["status"].as_str() {
-        Some("queued") => JobState::Queued,
-        Some("in_progress") => JobState::InProgress,
-        Some("completed") => JobState::Completed,
-        Some("failed") => JobState::Failed,
-        _ => return Err(InferenceError::InvalidUpstream),
-    };
-    // `seconds` is a decimal string ("8"); accept a whole JSON number too.
-    let seconds = match &value["seconds"] {
-        Value::String(s)
-            if !s.is_empty() && s.len() <= 5 && s.bytes().all(|b| b.is_ascii_digit()) =>
-        {
-            s.parse().ok()
-        }
-        Value::Number(n) => n.as_u64().and_then(|n| u32::try_from(n).ok()),
-        _ => None,
-    }
-    .filter(|n| (1..=3600).contains(n));
-    let error = match &value["error"] {
-        Value::Null => None,
-        Value::Object(e) => Some(ErrorCode::parse(
-            e.get("code").and_then(Value::as_str).unwrap_or(""),
-        )),
-        _ => return Err(InferenceError::InvalidUpstream),
-    };
-    Ok(UpstreamVideo {
-        id: id(&value["id"])?,
-        state,
-        progress: value["progress"]
-            .as_u64()
-            .filter(|n| *n <= 100)
-            .map(|n| n as u8),
-        seconds,
-        size: value["size"].as_str().and_then(MeterVariant::new),
-        completed_at: timestamp(&value["completed_at"]),
-        expires_at: timestamp(&value["expires_at"]),
-        error,
-    })
-}
-
-pub(super) async fn create_video(
-    adapter: &OpenAiAdapter,
-    target: &Deployment,
-    request: VideoRequest,
-) -> Result<UpstreamVideo> {
-    if !supports_video(target, &request) {
-        return Err(InferenceError::Unsupported);
-    }
-    let auth = authorization(adapter, target)?;
-    let mut form = Multipart::new(request.prompt.len());
-    form.text("model", &target.upstream_model);
-    form.text("prompt", &request.prompt);
-    form.text("seconds", &request.seconds.to_string());
-    form.text("size", request.size.as_str());
-    let (content_type, body) = form.finish();
-    let response = adapter
-        .client
-        .post(format!("{}/videos", adapter.base))
-        .header(header::AUTHORIZATION, auth)
-        .header(header::CONTENT_TYPE, content_type)
-        .body(body)
-        .send()
-        .await
-        .map_err(transport_error)?;
-    parse_video(&read_object(response).await?)
-}
-
-pub(super) async fn retrieve_video(
-    adapter: &OpenAiAdapter,
-    target: &Deployment,
-    video: &UpstreamId,
-) -> Result<UpstreamVideo> {
-    let auth = authorization(adapter, target)?;
-    let response = adapter
-        .client
-        .get(format!("{}/videos/{}", adapter.base, video.as_str()))
-        .header(header::AUTHORIZATION, auth)
-        .send()
-        .await
-        .map_err(transport_error)?;
-    let parsed = parse_video(&read_object(response).await?)?;
-    if &parsed.id != video {
-        return Err(InferenceError::InvalidUpstream);
-    }
-    Ok(parsed)
-}
-
-pub(super) async fn delete_video(
-    adapter: &OpenAiAdapter,
-    target: &Deployment,
-    video: &UpstreamId,
-) -> Result<()> {
-    let auth = authorization(adapter, target)?;
-    let response = adapter
-        .client
-        .delete(format!("{}/videos/{}", adapter.base, video.as_str()))
-        .header(header::AUTHORIZATION, auth)
-        .send()
-        .await
-        .map_err(transport_error)?;
-    let value = read_object(response).await?;
-    object_kind(&value, "video.deleted")?;
-    if value["deleted"] != json!(true) || &id(&value["id"])? != video {
-        return Err(InferenceError::InvalidUpstream);
-    }
-    Ok(())
-}
+mod video;
+pub(crate) use video::{VideoWire, create_video, delete_video, retrieve_video, video_content};
+pub(in crate::providers::openai) use video::{openai_wire, supports_video};
 
 /// Allowlisted pass-through media types (normalized).
 fn content_type(response: &reqwest::Response, allowed: &[&'static str]) -> Result<&'static str> {
@@ -234,63 +140,6 @@ fn content_type(response: &reqwest::Response, allowed: &[&'static str]) -> Resul
         .find(|t| *t == actual)
         .ok_or(InferenceError::InvalidUpstream)
 }
-fn stream(response: reqwest::Response, media: &'static str) -> ContentStream {
-    ContentStream {
-        content_type: media,
-        content_length: response.content_length(),
-        body: Box::pin(
-            response
-                .bytes_stream()
-                .map(|chunk| chunk.map_err(transport_error)),
-        ),
-    }
-}
-
-pub(super) async fn video_content(
-    adapter: &OpenAiAdapter,
-    target: &Deployment,
-    video: &UpstreamId,
-    asset: VideoAsset,
-) -> Result<ContentStream> {
-    let auth = authorization(adapter, target)?;
-    let response = adapter
-        .client
-        .get(format!(
-            "{}/videos/{}/content?variant={}",
-            adapter.base,
-            video.as_str(),
-            asset.as_str()
-        ))
-        .header(header::AUTHORIZATION, auth)
-        .header(header::ACCEPT, "application/binary")
-        .send()
-        .await
-        .map_err(transport_error)?;
-    check_status(response.status())?;
-    let allowed: &[&'static str] = match asset {
-        VideoAsset::Video => &[
-            "video/mp4",
-            "application/octet-stream",
-            "application/binary",
-        ],
-        VideoAsset::Thumbnail | VideoAsset::Spritesheet => &[
-            "image/webp",
-            "image/jpeg",
-            "image/png",
-            "application/octet-stream",
-            "application/binary",
-        ],
-    };
-    let media = content_type(&response, allowed)?;
-    // Generic binary types are labeled by the requested asset.
-    let media = match (media, asset) {
-        ("application/octet-stream" | "application/binary", VideoAsset::Video) => "video/mp4",
-        ("application/octet-stream" | "application/binary", _) => "application/octet-stream",
-        (m, _) => m,
-    };
-    Ok(stream(response, media))
-}
-
 // ---------------------------------------------------------------- Batch ----
 //
 // Native batches (`jobs::native`): the gateway encodes each validated line

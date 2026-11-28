@@ -8,7 +8,9 @@ use super::{store::Observation, *};
 use crate::inference::{types::WorkloadKind, workload::OutputReservation};
 
 /// `POST /v1/videos` when no adapter offers video generation.
-pub const NO_VIDEO_PROVIDER: &str = "Video generation has no supported provider: OpenAI shut down the Sora 2 models and the Videos API on 2026-09-24. An OpenRouter video adapter is planned.";
+pub const NO_VIDEO_PROVIDER: &str =
+    "Video generation needs a route on a provider connection that serves the OpenAI video contract";
+pub(super) const VIDEO_PRICE_MISSING: &str = "This route has no video rate for this request (a Platform Admin must price its video seconds for every size it may produce)";
 
 fn observation(v: &UpstreamVideo) -> Observation<'_> {
     Observation {
@@ -22,34 +24,64 @@ fn observation(v: &UpstreamVideo) -> Observation<'_> {
     }
 }
 
-/// Accounting of a terminal video observation.
-pub(crate) fn settlement(job: &JobRow, v: &UpstreamVideo) -> Option<Settlement> {
+/// Accounting of a terminal video observation. `reported`: how the job's
+/// pinned price values a size the provider reports for a request that named
+/// none (`governance::pinned_video_size_rate`).
+///
+/// The size billed is the one the request named, or the one the provider
+/// reports when the request named none, and then only when the job's price,
+/// fixed at admission, names that size itself or has one rate for every size
+/// (so a later change of the route's sizes never changes it). A reported
+/// size that differs from the named one, or that the price neither names
+/// nor rates flat, keeps the hold (cost unknown), as a longer clip than
+/// requested and an unknown duration do: none is what was admitted or can
+/// be valued, and the price line without a size is never used in place of a
+/// size's own. So does a request that named no size completing with none
+/// reported, unless the price is flat: the size made is unknown. A shorter
+/// clip is billed as reported.
+pub(crate) fn settlement(
+    job: &JobRow,
+    v: &UpstreamVideo,
+    reported: crate::governance::ReportedSizeRate,
+) -> Option<Settlement> {
+    use crate::governance::ReportedSizeRate as Rate;
     let requested = job.video_seconds.and_then(|s| u32::try_from(s).ok())?;
     match v.state {
         JobState::Completed => {
-            let variant = v.size.or_else(|| {
-                job.video_size
-                    .as_deref()
-                    .and_then(crate::billing::MeterVariant::new)
-            });
+            let named = job.video_size.as_deref();
+            let reported_size = v.size.as_ref().map(|s| s.as_str());
+            let off_size = match (named, reported_size) {
+                (Some(n), Some(r)) => n != r,
+                // Not reported: unknown unless one rate values every size.
+                (None, _) => reported == Rate::Unpriced,
+                (Some(_), None) => false,
+            };
+            // A flat rate values any size: billed without one.
+            let variant = match (named, reported) {
+                (None, Rate::Flat) => None,
+                _ => v
+                    .size
+                    .or_else(|| named.and_then(crate::billing::MeterVariant::new)),
+            };
             let usage = |ms: Option<u64>| Usage {
                 meters: Some(video_meters(ms)),
                 output_image_variant: variant,
                 ..Usage::default()
             };
+            let kept = |ms: Option<u64>| Settlement {
+                outcome: Outcome::Failed,
+                error: Some(InferenceError::InvalidUpstream),
+                usage: usage(ms),
+            };
             Some(match v.seconds {
-                // A longer clip than requested is not covered by the hold:
-                // keep the evidence and the hold (never settle it).
-                Some(s) if s > requested => Settlement {
-                    outcome: Outcome::Failed,
-                    error: Some(InferenceError::InvalidUpstream),
-                    usage: usage(Some(u64::from(s) * 1000)),
-                },
-                // Unknown duration stays unknown (hold retained).
-                seconds => Settlement {
+                // Not what was admitted, or not known: keep the evidence and
+                // the hold (never settle it), whatever the rates.
+                Some(s) if s > requested || off_size => kept(Some(u64::from(s) * 1000)),
+                None => kept(None),
+                Some(s) => Settlement {
                     outcome: Outcome::Succeeded,
                     error: None,
-                    usage: usage(seconds.map(|s| u64::from(s) * 1000)),
+                    usage: usage(Some(u64::from(s) * 1000)),
                 },
             })
         }
@@ -101,7 +133,14 @@ fn interrupted() -> Settlement {
 
 pub fn render(job: &JobRow) -> Value {
     let unix = |t: Option<gateway_datetime_compat::UtcInstant>| t.map(|t| t.timestamp());
-    let state = job.job_state();
+    // A job whose provider id the server gave another job is no longer
+    // served, whatever it had reached (its charge, if settled, stands).
+    let reused = job.error_code.as_deref() == Some(super::UPSTREAM_ID_REUSED);
+    let state = if reused {
+        JobState::Failed
+    } else {
+        job.job_state()
+    };
     json!({
         "id": client_id(JobKind::Video.prefix(), job.id),
         "object": "video",
@@ -114,7 +153,7 @@ pub fn render(job: &JobRow) -> Value {
         "seconds": job.video_seconds.map(|s| s.to_string()),
         "size": job.video_size,
         "remixed_from_video_id": Value::Null,
-        "error": job.error_code.as_ref().filter(|_| state == JobState::Failed).map(|code| json!({"code": code, "message": "Video generation failed"})),
+        "error": job.error_code.as_ref().filter(|_| state == JobState::Failed).map(|code| json!({"code": code, "message": if reused { "The provider gave this video's id to another job; it is no longer served" } else { "Video generation failed" }})),
     })
 }
 
@@ -126,34 +165,32 @@ impl Jobs {
         request_id: Uuid,
     ) -> JobResult<JobRow> {
         request.validate()?;
-        // No registered adapter offers video generation (OpenAI retired its
-        // Videos API): refuse explicitly before admission, never a job.
+        // No registered adapter offers video generation: refuse explicitly
+        // before admission, never a job.
         if !self.registry.supports(ApiProtocol::Videos) {
             return Err(JobError::Conflict(
                 "unsupported_capability",
                 NO_VIDEO_PROVIDER,
             ));
         }
+        let original = request.clone();
+        let (target, adapter, request) = self.video_route(&principal, &request, request_id).await?;
         let model = request.model.clone();
-        let (target, adapter) = self
-            .select(
-                &principal,
-                &model,
-                ApiProtocol::Videos,
-                request_id,
-                |a, d| a.supports_video_request(d, &request),
-            )
-            .await?;
+        let seconds = request.seconds.ok_or(InferenceError::Configuration)?;
         let admission = WorkloadAdmission {
             kind: WorkloadKind::Videos,
             output: OutputReservation::None,
-            unit_ceilings: unit_ceilings(1, u64::from(request.seconds) * 1000),
+            unit_ceilings: unit_ceilings(1, u64::from(seconds) * 1000),
+        };
+        let check = crate::governance::VideoCheck {
+            seconds,
+            size: request.size.clone(),
         };
         let attempt = self
-            .admit(principal, request_id, &model, &target, &admission)
+            .admit_video(
+                principal, request_id, &original, &target, &admission, &check,
+            )
             .await?;
-        let size = request.size;
-        let seconds = request.seconds;
         let deadline = UtcInstant::now() + VIDEO_POLL_WINDOW;
         let grace = self.video_create_grace();
         let new = store::NewJob {
@@ -168,8 +205,8 @@ impl Jobs {
             upstream_id: None,
             first_poll_after: grace,
             poll_deadline_at: deadline,
-            video_seconds: Some(seconds as i32),
-            video_size: Some(size.as_str()),
+            video_seconds: i32::try_from(seconds).ok(),
+            video_size: request.size.as_deref(),
             batch_endpoint: None,
         };
         let (job, attempt) = self
@@ -221,8 +258,7 @@ impl Jobs {
                 tracing::error!(execution_id = %request_id, "video provider id not recorded after upstream acceptance; the job ends interrupted with its hold kept");
             })?;
         let Some(job) = recorded else {
-            tracing::error!(execution_id = %request_id, "video provider id arrived after the job ended; hold kept");
-            return Err(InferenceError::Storage.into());
+            return Err(self.unrecorded_upstream(job.id, request_id).await);
         };
         // The creator's first observation (`Observer::Creator`): inside the
         // create grace no poller can hold the row (it is first due at the
@@ -335,6 +371,31 @@ impl Jobs {
         self.video_create_grace
     }
 
+    /// The provider accepted a create whose id could not be recorded. The
+    /// id was another job's (`store::record_video_upstream` ended this job
+    /// `upstream_id_reused`): the server's answer is invalid, so this job
+    /// settles now as interrupted, hold kept. Otherwise the job had already
+    /// ended, or the write failed: a gateway failure, the hold kept by the
+    /// create-grace rule.
+    async fn unrecorded_upstream(&self, id: Uuid, execution: Uuid) -> JobError {
+        let job = match store::reload(&self.store, id).await {
+            Ok(job) => job,
+            Err(e) => return e.into(),
+        };
+        if job.error_code.as_deref() != Some(super::UPSTREAM_ID_REUSED) {
+            tracing::error!(execution_id = %execution, "video provider id arrived after the job ended; hold kept");
+            return InferenceError::Storage.into();
+        }
+        tracing::error!(execution_id = %execution, "the video provider answered with another job's id; neither job is served from it, holds kept");
+        match self
+            .settle_as(&job, interrupted(), store::Observer::Creator)
+            .await
+        {
+            Ok(_) => InferenceError::InvalidUpstream.into(),
+            Err(e) => e,
+        }
+    }
+
     /// A video recorded before its create that has no provider id. It is
     /// never sent upstream (there is nothing to poll): while its create may
     /// still be running it stays queued; once the grace has passed without
@@ -398,12 +459,35 @@ impl Jobs {
         if recorded
             && job.job_state().is_terminal()
             && job.settled_at.is_none()
-            && let Some(s) = settlement(&job, upstream)
+            && let Some(s) = settlement(
+                &job,
+                upstream,
+                self.reported_size_rate(&job, upstream).await?,
+            )
         {
             self.settle_as(&job, s, observer).await?;
             return Ok(store::reload(&self.store, job.id).await?);
         }
         Ok(job)
+    }
+
+    /// For a request that named no size and a reported size: how the job's
+    /// pinned price values it ([`settlement`]).
+    async fn reported_size_rate(
+        &self,
+        job: &JobRow,
+        upstream: &UpstreamVideo,
+    ) -> JobResult<crate::governance::ReportedSizeRate> {
+        match &job.video_size {
+            None => Ok(crate::governance::pinned_video_size_rate(
+                &self.store,
+                job.execution_id,
+                upstream.size.as_ref().map(|s| s.as_str()),
+            )
+            .await?),
+            // A named size is billed as named.
+            Some(_) => Ok(crate::governance::ReportedSizeRate::Unpriced),
+        }
     }
 
     /// Settle `job` while `observer` holds its row (`store::hold_writer`), so
@@ -456,6 +540,8 @@ impl Jobs {
             crate::visibility::Viewer::of(principal),
         )
         .await?
+        // A deleted video is gone for its owner (its row stays for history).
+        .filter(|job| job.deleted_at.is_none())
         .ok_or(JobError::NotFound)
     }
 
@@ -476,10 +562,32 @@ impl Jobs {
         if job.upstream_id.is_none() {
             return self.refresh_unrecorded_video(job, observer).await;
         }
-        let (target, adapter) = self.target(&job).await?;
+        if job.error_code.as_deref() == Some(super::UPSTREAM_ID_REUSED) {
+            return self.settle_reused(job, observer).await;
+        }
+        let (target, adapter) = match self.target(&job).await {
+            // Marked since `job` was read: the only `InvalidUpstream` of
+            // `target`.
+            Err(InferenceError::InvalidUpstream) => {
+                let now = store::reload(&self.store, job.id).await?;
+                return self.settle_reused(now, observer).await;
+            }
+            other => other?,
+        };
         let upstream_id = job.upstream().ok_or(InferenceError::Storage)?;
         let upstream = call(adapter.retrieve_video(&target, &upstream_id)).await?;
         self.apply_video(&job, &upstream, observer).await
+    }
+
+    /// A job marked `upstream_id_reused` settles as interrupted (unknown
+    /// usage, its hold kept), without the server being asked; a job already
+    /// settled keeps its settlement.
+    async fn settle_reused(&self, job: JobRow, observer: store::Observer<'_>) -> JobResult<JobRow> {
+        if job.settled_at.is_some() || !job.job_state().is_terminal() {
+            return Ok(job);
+        }
+        self.settle_as(&job, interrupted(), observer).await?;
+        Ok(store::reload(&self.store, job.id).await?)
     }
 
     pub async fn list_videos(
@@ -511,27 +619,29 @@ impl Jobs {
         asset: VideoAsset,
     ) -> JobResult<ContentStream> {
         let job = self.own_video(principal, id).await?;
-        if job.job_state() != JobState::Completed {
+        // A job marked `upstream_id_reused` reads failed (`render`).
+        if job.job_state() != JobState::Completed
+            || job.error_code.as_deref() == Some(super::UPSTREAM_ID_REUSED)
+        {
             return Err(JobError::Conflict(
                 "video_not_ready",
                 "Video content is available once the video is completed",
             ));
         }
-        if job.deleted_at.is_some() {
-            return Err(JobError::NotFound);
-        }
         let (target, adapter) = self.target(&job).await?;
         let upstream_id = job.upstream().ok_or(InferenceError::Storage)?;
-        Ok(call(adapter.video_content(&target, &upstream_id, asset)).await?)
+        let content = call(adapter.video_content(&target, &upstream_id, asset)).await?;
+        Ok(super::content_bounds::bounded_content(content, asset)?)
     }
 
     /// Delete a finished video's provider assets. In-progress jobs cannot be
-    /// deleted (their accounting is still open).
-    pub async fn delete_video(&self, principal: &Principal, id: &str) -> JobResult<JobRow> {
+    /// deleted (their accounting is still open). Returns whether the
+    /// provider's copy is gone: `false` when the provider offers no delete
+    /// (`405`), whose copy then stays until its own expiry, or when a create
+    /// whose outcome is unknown left no provider id to delete; a `404` counts
+    /// as gone.
+    pub async fn delete_video(&self, principal: &Principal, id: &str) -> JobResult<(JobRow, bool)> {
         let job = self.own_video(principal, id).await?;
-        if job.deleted_at.is_some() {
-            return Err(JobError::NotFound);
-        }
         if !crate::visibility::may_modify_job(
             &self.store.pool,
             principal.workspace_id,
@@ -551,13 +661,28 @@ impl Jobs {
                 "A video can be deleted once it is completed or failed",
             ));
         }
-        // A video that never got a provider id has no provider assets.
-        if job.upstream_id.is_some() {
-            let (target, adapter) = self.target(&job).await?;
-            let upstream_id = job.upstream().ok_or(InferenceError::Storage)?;
-            call(adapter.delete_video(&target, &upstream_id)).await?;
+        // A video that never got a provider id has no provider assets only
+        // when its create is known to have left none (`create_failed`: nothing
+        // sent, or refused); after an unknown outcome (`create_unconfirmed`,
+        // `create_interrupted`) the server may still have it. A job whose id
+        // the server gave another job is never asked about again
+        // (`Jobs::target`): only the record goes, and the copy may remain.
+        let mut upstream_deleted = job.error_code.as_deref() == Some("create_failed");
+        if job.upstream_id.is_some() && job.error_code.as_deref() != Some(super::UPSTREAM_ID_REUSED)
+        {
+            match self.target(&job).await {
+                // Marked since `job` was read: the record goes, the copy may
+                // remain.
+                Err(InferenceError::InvalidUpstream) => {}
+                Err(e) => return Err(e.into()),
+                Ok((target, adapter)) => {
+                    let upstream_id = job.upstream().ok_or(InferenceError::Storage)?;
+                    upstream_deleted = call(adapter.delete_video(&target, &upstream_id)).await?
+                        == VideoDeletion::Deleted;
+                }
+            }
         }
         store::mark_deleted(&self.store, job.id).await?;
-        Ok(job)
+        Ok((job, upstream_deleted))
     }
 }

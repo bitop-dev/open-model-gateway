@@ -44,6 +44,26 @@ impl FieldName {
     pub fn as_str(&self) -> &str {
         std::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or_default()
     }
+    /// A fixed name, checked as [`Self::parse`] checks one. Meant for
+    /// constants, where an invalid name fails the build.
+    pub const fn from_static(name: &'static str) -> Self {
+        let src = name.as_bytes();
+        assert!(!src.is_empty() && src.len() <= 64, "field name length");
+        let mut bytes = [0; 64];
+        let mut i = 0;
+        while i < src.len() {
+            assert!(
+                src[i].is_ascii_alphanumeric() || src[i] == b'_',
+                "field name character"
+            );
+            bytes[i] = src[i];
+            i += 1;
+        }
+        Self {
+            bytes,
+            len: src.len() as u8,
+        }
+    }
 }
 
 /// `Retry-After` of [`InferenceError::ScopeBusy`]: about the time a scope's

@@ -121,7 +121,7 @@
             }
           }
         },
-        "description": "Inference-key scoped legacy video objects. The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
+        "description": "Inference-key scoped video objects (servers of the OpenAI video contract on openai_compatible connections; jobs created before OpenAI shut down its Videos API stay readable). The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
         "parameters": [
           {
             "in": "query",
@@ -181,8 +181,26 @@
       "scope": null,
       "operation": {
         "responses": {
+          "200": {
+            "description": "The created video job.",
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "cache-control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/post_v1_videosResponse"
+                }
+              }
+            }
+          },
           "400": {
-            "description": "Validation or explicit no-provider refusal; video creation never succeeds with the current provider registry.",
+            "description": "Validation or an explicit refusal before admission: a length or size none of the caller's routes takes, or a length and size no route takes together (unsupported_video_parameter, param null), an option the gateway does not take (unsupported_video_parameter, param names it), no video route (unsupported_capability), or a route without a video rate for the request (video_price_missing).",
             "headers": {
               "x-request-id": {
                 "$ref": "#/components/headers/RequestId"
@@ -204,17 +222,50 @@
                   ]
                 }
               }
-            },
-            "x-omg-positive-kind": "refusal"
+            }
           },
           "401": {
             "$ref": "#/components/responses/OpenAiUnauthorized"
           },
+          "404": {
+            "description": "The model is not available to this key (unknown, not offered, or no route the caller may use).",
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "cache-control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/JobErrorEnvelope"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OpenAiErrorEnvelope"
+                    }
+                  ]
+                }
+              }
+            }
+          },
           "413": {
             "$ref": "#/components/responses/OpenAiPayloadTooLarge"
           },
+          "429": {
+            "$ref": "#/components/responses/OpenAiTooManyRequests"
+          },
+          "502": {
+            "$ref": "#/components/responses/OpenAiBadGateway"
+          },
           "503": {
             "$ref": "#/components/responses/OpenAiUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/OpenAiGatewayTimeout"
           }
         },
         "requestBody": {
@@ -235,7 +286,7 @@
                     "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]",
                     "maxLength": 200,
                     "x-omg-max-bytes": 200,
-                    "description": "Public video model name: nonblank and at most 200 UTF-8 bytes (jobs/types.rs VideoRequest::validate). With the current provider registry, validated creation returns 400 unsupported_capability before any model lookup."
+                    "description": "Public video model name: nonblank and at most 200 UTF-8 bytes (jobs/types.rs VideoRequest::validate). A model none of whose routes has video options answers 400 unsupported_capability before admission."
                   },
                   "prompt": {
                     "type": "string",
@@ -245,20 +296,15 @@
                   },
                   "seconds": {
                     "type": "string",
-                    "enum": [
-                      "4",
-                      "8",
-                      "12"
-                    ]
+                    "pattern": "^(?:[1-9][0-9]{0,2}|[12][0-9]{3}|3[0-5][0-9]{2}|3600)$",
+                    "description": "A clip length of 1 to 3600 seconds. Each route states the lengths it takes; when no route of the model takes this one, 400 `unsupported_video_parameter` with `param` `seconds`. Absent: the chosen route's first listed length. Always sent upstream.",
+                    "x-omg-pattern-boundaries": "1 to 3600 as a decimal without a leading zero: `1`, `3600` accepted; `0`, `3601`, `012` refused (protocols::videos tests)."
                   },
                   "size": {
                     "type": "string",
-                    "enum": [
-                      "720x1280",
-                      "1280x720",
-                      "1024x1792",
-                      "1792x1024"
-                    ]
+                    "pattern": "^[1-9][0-9]{0,3}x[1-9][0-9]{0,3}$",
+                    "description": "`WIDTHxHEIGHT`, each 1 to 9999. Each route states the sizes it takes (none: a request may not name one); when no route of the model takes this one, 400 `unsupported_video_parameter` with `param` `size`. Sent upstream only when named.",
+                    "x-omg-pattern-boundaries": "`WIDTHxHEIGHT`, each 1 to 9999 without a leading zero: `1x1`, `9999x9999` accepted; `01280x720`, `12800x720` refused (protocols::videos tests)."
                   }
                 },
                 "required": [
@@ -283,13 +329,25 @@
             }
           }
         },
-        "description": "Inference-key scoped legacy video objects. The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
+        "description": "Inference-key scoped video jobs on servers of the OpenAI video contract (openai_compatible connections). The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
         "x-omg-refusals": [
           {
             "status": 400,
             "envelope": "JobErrorEnvelope",
             "code": "unsupported_capability",
-            "trigger": "Validated create; no video provider is supported. input_reference is also unsupported. Decimal seconds strings such as 08 or +8 that parse to an allowed duration also reach this unsupported_capability refusal; they are not invalid_request_error merely for that spelling."
+            "trigger": "No route of the caller's for the model has video options (or no adapter serves video)."
+          },
+          {
+            "status": 400,
+            "envelope": "JobErrorEnvelope",
+            "code": "unsupported_video_parameter",
+            "trigger": "A length or size none of the caller's routes takes (param seconds or size), a length and a size each taken by some route but never together (param null), or a field other than model, prompt, seconds and size (param names it; input_reference unless null; a field name that is not a plain identifier of up to 64 letters, digits and underscores is invalid_request_error without param)."
+          },
+          {
+            "status": 400,
+            "envelope": "JobErrorEnvelope",
+            "code": "video_price_missing",
+            "trigger": "None of the caller's routes that take the request has a price valuing video seconds for every size the request may produce, as settlement values it."
           }
         ],
         "x-omg-limits": {
@@ -421,7 +479,7 @@
             }
           }
         },
-        "description": "Inference-key scoped legacy video objects. The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
+        "description": "Inference-key scoped video objects (servers of the OpenAI video contract on openai_compatible connections; jobs created before OpenAI shut down its Videos API stay readable). The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
         "x-omg-refusals": [
           {
             "status": 404,
@@ -553,7 +611,7 @@
             }
           }
         },
-        "description": "Inference-key scoped legacy video objects. The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
+        "description": "Inference-key scoped video objects (servers of the OpenAI video contract on openai_compatible connections; jobs created before OpenAI shut down its Videos API stay readable). The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
         "x-omg-refusals": [
           {
             "status": 404,
@@ -628,11 +686,18 @@
                   "contentMediaType": "image/png"
                 }
               },
-              "application/binary": {
+              "video/webm": {
                 "schema": {
                   "type": "string",
                   "format": "binary",
-                  "contentMediaType": "application/binary"
+                  "contentMediaType": "video/webm"
+                }
+              },
+              "video/quicktime": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary",
+                  "contentMediaType": "video/quicktime"
                 }
               }
             }
@@ -734,7 +799,7 @@
             }
           }
         },
-        "description": "Inference-key scoped legacy video objects. The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
+        "description": "Inference-key scoped video objects (servers of the OpenAI video contract on openai_compatible connections; jobs created before OpenAI shut down its Videos API stay readable). The /v1/videos create/list route uses GATEWAY_MAX_BODY_BYTES_VIDEOS (default 2 MiB); item and content routes use a fixed 2 MiB cap. Declared Content-Length above the applicable cap is rejected with plain text 413 even on GET. Hidden or foreign ids are indistinguishable from missing objects.",
         "x-omg-binary-stream": {
           "late_error": "truncated",
           "positive_requires": "clean transport EOF"
@@ -2467,15 +2532,19 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "The provider's expiry of its own copy, as it reports it: content is available only until then."
         },
         "seconds": {
           "type": "string",
-          "description": "The database video-kind CHECK requires both fields to be non-null, including legacy rows."
+          "description": "The clip length (seconds) the job was created with: the request's, or its route's first listed length. Always set, including legacy rows."
         },
         "size": {
-          "type": "string",
-          "description": "The database video-kind CHECK requires both fields to be non-null, including legacy rows."
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The size the request named (`WIDTHxHEIGHT`); `null` when it named none (nothing was sent upstream). Legacy rows always have one."
         },
         "remixed_from_video_id": {
           "type": "null"
@@ -2885,7 +2954,7 @@
               "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]",
               "maxLength": 200,
               "x-omg-max-bytes": 200,
-              "description": "Public video model name: nonblank and at most 200 UTF-8 bytes (jobs/types.rs VideoRequest::validate). With the current provider registry, validated creation returns 400 unsupported_capability before any model lookup."
+              "description": "Public video model name: nonblank and at most 200 UTF-8 bytes (jobs/types.rs VideoRequest::validate). A model none of whose routes has video options answers 400 unsupported_capability before admission."
             },
             "prompt": {
               "type": "string",
@@ -2899,42 +2968,36 @@
                   "oneOf": [
                     {
                       "type": "integer",
-                      "enum": [
-                        4,
-                        8,
-                        12
-                      ]
+                      "minimum": 1,
+                      "maximum": 3600
                     },
                     {
                       "type": "string",
-                      "enum": [
-                        "4",
-                        "8",
-                        "12"
-                      ]
+                      "pattern": "^(?:[1-9][0-9]{0,2}|[12][0-9]{3}|3[0-5][0-9]{2}|3600)$",
+                      "description": "A clip length of 1 to 3600 seconds. Each route states the lengths it takes; when no route of the model takes this one, 400 `unsupported_video_parameter` with `param` `seconds`. Absent: the chosen route's first listed length. Always sent upstream.",
+                      "x-omg-pattern-boundaries": "1 to 3600 as a decimal without a leading zero: `1`, `3600` accepted; `0`, `3601`, `012` refused (protocols::videos tests)."
                     }
                   ]
                 },
                 {
                   "type": "null"
                 }
-              ]
+              ],
+              "description": "A clip length of 1 to 3600 seconds. Each route states the lengths it takes; when no route of the model takes this one, 400 `unsupported_video_parameter` with `param` `seconds`. Absent: the chosen route's first listed length. Always sent upstream."
             },
             "size": {
               "anyOf": [
                 {
                   "type": "string",
-                  "enum": [
-                    "720x1280",
-                    "1280x720",
-                    "1024x1792",
-                    "1792x1024"
-                  ]
+                  "pattern": "^[1-9][0-9]{0,3}x[1-9][0-9]{0,3}$",
+                  "description": "`WIDTHxHEIGHT`, each 1 to 9999. Each route states the sizes it takes (none: a request may not name one); when no route of the model takes this one, 400 `unsupported_video_parameter` with `param` `size`. Sent upstream only when named.",
+                  "x-omg-pattern-boundaries": "`WIDTHxHEIGHT`, each 1 to 9999 without a leading zero: `1x1`, `9999x9999` accepted; `01280x720`, `12800x720` refused (protocols::videos tests)."
                 },
                 {
                   "type": "null"
                 }
-              ]
+              ],
+              "description": "`WIDTHxHEIGHT`, each 1 to 9999. Each route states the sizes it takes (none: a request may not name one); when no route of the model takes this one, 400 `unsupported_video_parameter` with `param` `size`. Sent upstream only when named."
             },
             "input_reference": {
               "type": "null"
@@ -2953,7 +3016,7 @@
               "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]",
               "maxLength": 200,
               "x-omg-max-bytes": 200,
-              "description": "Public video model name: nonblank and at most 200 UTF-8 bytes (jobs/types.rs VideoRequest::validate). With the current provider registry, validated creation returns 400 unsupported_capability before any model lookup."
+              "description": "Public video model name: nonblank and at most 200 UTF-8 bytes (jobs/types.rs VideoRequest::validate). A model none of whose routes has video options answers 400 unsupported_capability before admission."
             },
             {
               "type": "string",
@@ -2967,42 +3030,36 @@
                   "oneOf": [
                     {
                       "type": "integer",
-                      "enum": [
-                        4,
-                        8,
-                        12
-                      ]
+                      "minimum": 1,
+                      "maximum": 3600
                     },
                     {
                       "type": "string",
-                      "enum": [
-                        "4",
-                        "8",
-                        "12"
-                      ]
+                      "pattern": "^(?:[1-9][0-9]{0,2}|[12][0-9]{3}|3[0-5][0-9]{2}|3600)$",
+                      "description": "A clip length of 1 to 3600 seconds. Each route states the lengths it takes; when no route of the model takes this one, 400 `unsupported_video_parameter` with `param` `seconds`. Absent: the chosen route's first listed length. Always sent upstream.",
+                      "x-omg-pattern-boundaries": "1 to 3600 as a decimal without a leading zero: `1`, `3600` accepted; `0`, `3601`, `012` refused (protocols::videos tests)."
                     }
                   ]
                 },
                 {
                   "type": "null"
                 }
-              ]
+              ],
+              "description": "A clip length of 1 to 3600 seconds. Each route states the lengths it takes; when no route of the model takes this one, 400 `unsupported_video_parameter` with `param` `seconds`. Absent: the chosen route's first listed length. Always sent upstream."
             },
             {
               "anyOf": [
                 {
                   "type": "string",
-                  "enum": [
-                    "720x1280",
-                    "1280x720",
-                    "1024x1792",
-                    "1792x1024"
-                  ]
+                  "pattern": "^[1-9][0-9]{0,3}x[1-9][0-9]{0,3}$",
+                  "description": "`WIDTHxHEIGHT`, each 1 to 9999. Each route states the sizes it takes (none: a request may not name one); when no route of the model takes this one, 400 `unsupported_video_parameter` with `param` `size`. Sent upstream only when named.",
+                  "x-omg-pattern-boundaries": "`WIDTHxHEIGHT`, each 1 to 9999 without a leading zero: `1x1`, `9999x9999` accepted; `01280x720`, `12800x720` refused (protocols::videos tests)."
                 },
                 {
                   "type": "null"
                 }
-              ]
+              ],
+              "description": "`WIDTHxHEIGHT`, each 1 to 9999. Each route states the sizes it takes (none: a request may not name one); when no route of the model takes this one, 400 `unsupported_video_parameter` with `param` `size`. Sent upstream only when named."
             },
             {
               "type": "null"
@@ -3015,8 +3072,7 @@
       ]
     },
     "post_v1_videosResponse": {
-      "type": "null",
-      "description": "No successful video create representation; legacy read operations remain available."
+      "$ref": "#/components/schemas/VideoObject"
     },
     "get_v1_videos_by_idRequest": {
       "type": "null",
@@ -3041,12 +3097,17 @@
         },
         "deleted": {
           "const": true
+        },
+        "upstream_deleted": {
+          "type": "boolean",
+          "description": "Whether the provider's copy is gone: `false` when the provider offers no delete (it answered `405`), or a create whose outcome is unknown left no provider id to delete; the copy then stays until the provider's own expiry. A `404` counts as gone."
         }
       },
       "required": [
         "id",
         "object",
-        "deleted"
+        "deleted",
+        "upstream_deleted"
       ]
     },
     "get_v1_videos_by_id_contentRequest": {
