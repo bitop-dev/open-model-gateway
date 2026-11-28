@@ -470,7 +470,7 @@ fn group_runs(text: &str, span: &Range<usize>) -> Vec<Range<usize>> {
         .iter()
         .filter_map(|r| {
             digits += r.len();
-            (13..=19).contains(&digits).then(|| span.start..r.end)
+            (13..=19).contains(&digits).then_some(span.start..r.end)
         })
         .collect();
     // The whole candidate was tried already.
