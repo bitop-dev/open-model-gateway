@@ -2,7 +2,7 @@
 //! the OpenAI video contract, PostgreSQL): what happens to a completed
 //! video's output — stored, given up for good (the job stays charged),
 //! retried with backoff under a kept lease, expired, bounded and fenced —
-//! and what `/content` and a create answer for it.
+//! what `/content` and a create answer for it, and its delete.
 use super::db_tests::{bearer, line, na, test_files};
 use super::video_contract_tests::{Contract, MP4, contract, set_status};
 use super::*;
@@ -171,6 +171,17 @@ impl Setup {
     }
     async fn get(&self, path: &str) -> reqwest::Response {
         self.call(reqwest::Method::GET, &self.gateway, path).await
+    }
+    async fn delete(&self, base: &str, job: Uuid) -> (StatusCode, Value) {
+        let response = self
+            .call(
+                reqwest::Method::DELETE,
+                base,
+                &format!("/v1/videos/video_{}", job.simple()),
+            )
+            .await;
+        let status = response.status();
+        (status, response.json().await.unwrap_or(Value::Null))
     }
     async fn content(&self, job: Uuid) -> reqwest::Response {
         self.get(&format!("/v1/videos/video_{}/content", job.simple()))
@@ -841,4 +852,197 @@ async fn the_merged_claim_takes_the_oldest_of_both_heads_once(pool: PgPool) {
     let mut tail = order[4..].to_vec();
     tail.sort();
     assert_eq!(rest_sorted, tail, "the rest, none claimed twice");
+}
+
+/// Delete is local first: the gateway's stored copy, then the record, then
+/// the provider's copy, best effort (`upstream_deleted` says whether it is
+/// gone); a stored copy that cannot be deleted stops the delete.
+#[dbtest::test]
+async fn delete_removes_the_stored_copy_first_and_reports_the_provider_s_copy_truthfully(
+    pool: PgPool,
+) {
+    let s = Setup::new(pool.clone()).await;
+    let routes = s
+        .model("company/clips", &[route("{4}", Some("{1280x720}"))])
+        .await;
+    let live = async |id: Uuid| -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM stored_files f JOIN async_jobs j ON j.output_file_id=f.id WHERE j.id=$1 AND f.deleted_at IS NULL AND (f.expires_at IS NULL OR f.expires_at>now())")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    for (status, upstream_deleted) in [
+        (Some(200), true),
+        (Some(404), true),
+        (Some(204), true),
+        (Some(202), false),
+        (Some(500), false),
+        (None, false),
+    ] {
+        *s.mock.delete_status.lock().unwrap() = status;
+        let id = s.finished("company/clips").await;
+        assert_eq!(live(id).await, 1);
+        let (code, body) = s.delete(&s.gateway, id).await;
+        assert_eq!(code, StatusCode::OK, "{status:?}: {body}");
+        assert_eq!(
+            (body["deleted"].clone(), body["upstream_deleted"].clone()),
+            (json!(true), json!(upstream_deleted)),
+            "{status:?}"
+        );
+        assert_eq!(live(id).await, 0, "the gateway's copy is gone");
+        let removed: bool = sqlx::query_scalar("SELECT f.deleted_at IS NOT NULL FROM stored_files f JOIN async_jobs j ON j.output_file_id=f.id WHERE j.id=$1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            removed,
+            "{status:?}: its object removed, not only unreadable"
+        );
+        // Gone for its owner, to every route.
+        assert_eq!(
+            s.get(&format!("/v1/videos/video_{}", id.simple()))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(s.content(id).await.status(), StatusCode::NOT_FOUND);
+        let deletes = s.mock.deletes.load(Ordering::SeqCst);
+        assert_eq!(s.delete(&s.gateway, id).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            s.mock.deletes.load(Ordering::SeqCst),
+            deletes,
+            "a repeated delete sends nothing"
+        );
+    }
+    // A disabled route: the gateway's copy and the job still go.
+    *s.mock.delete_status.lock().unwrap() = Some(200);
+    let id = s.finished("company/clips").await;
+    sqlx::query("UPDATE deployments SET enabled=false WHERE id=$1")
+        .bind(routes[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+    let deletes = s.mock.deletes.load(Ordering::SeqCst);
+    let (code, body) = s.delete(&s.gateway, id).await;
+    assert_eq!(
+        (code, body["upstream_deleted"].clone()),
+        (StatusCode::OK, json!(false))
+    );
+    assert_eq!(
+        s.mock.deletes.load(Ordering::SeqCst),
+        deletes,
+        "nothing sent on a disabled route"
+    );
+    assert_eq!(live(id).await, 0);
+    sqlx::query("UPDATE deployments SET enabled=true WHERE id=$1")
+        .bind(routes[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+    // The stored copy cannot be deleted (no file store here): an error,
+    // nothing is deleted and the provider is not asked.
+    let id = s.finished("company/clips").await;
+    let deletes = s.mock.deletes.load(Ordering::SeqCst);
+    let (code, _) = s.delete(&s.bare, id).await;
+    assert!(code.is_server_error(), "{code}");
+    assert_eq!(live(id).await, 1);
+    assert_eq!(s.mock.deletes.load(Ordering::SeqCst), deletes);
+    assert_eq!(
+        s.get(&format!("/v1/videos/video_{}", id.simple()))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+}
+
+/// An output stored but not recorded is removed, and one recorded while a
+/// delete runs is deleted with the job, never another job's.
+#[dbtest::test]
+async fn an_output_recorded_during_a_delete_or_left_by_a_failed_record_is_removed(pool: PgPool) {
+    let s = Setup::new(pool.clone()).await;
+    s.model("company/clips", &[route("{4}", Some("{1280x720}"))])
+        .await;
+    let live_outputs = async || -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM stored_files WHERE purpose='video_output' AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at>now())")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    // Recording the stored output fails: the stored file is removed, and the
+    // attempt is retried after the backoff.
+    sqlx::raw_sql("CREATE FUNCTION test_refuse_output() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'refused (test)'; END $$; CREATE TRIGGER test_refuse_output BEFORE UPDATE OF output_file_id ON async_jobs FOR EACH ROW WHEN (NEW.output_file_id IS NOT NULL) EXECUTE FUNCTION test_refuse_output();")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let id = s.finished("company/clips").await;
+    let (failure, file, failures, _) = s.job(id).await;
+    assert_eq!((failure, file, failures), (None, None, 1));
+    assert_eq!(live_outputs().await, 0, "the unrecorded copy is removed");
+    sqlx::raw_sql("DROP TRIGGER test_refuse_output ON async_jobs")
+        .execute(&pool)
+        .await
+        .unwrap();
+    s.poll().await;
+    assert!(s.job(id).await.1.is_some());
+    assert_eq!(live_outputs().await, 1);
+
+    // A job read without an output, whose output is recorded before the
+    // delete marks it: the delete removes that output too. (The trigger
+    // records a stored file as the delete's own UPDATE runs, as a poller
+    // committing just before it would.)
+    s.mock.content_fails.store(true, Ordering::SeqCst);
+    let pending = s.finished("company/clips").await;
+    assert_eq!(s.job(pending).await.1, None);
+    let other: Uuid = sqlx::query_scalar("SELECT output_file_id FROM async_jobs WHERE id=$1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    // A fresh video output of the job's workspace, as the poller stores one.
+    let linked = s
+        .poller
+        .files
+        .as_ref()
+        .unwrap()
+        .create(
+            crate::filestore::NewFile {
+                content_type: Some("video/mp4".into()),
+                ..crate::filestore::NewFile::internal(
+                    crate::filestore::Purpose::VideoOutput,
+                    Some(s.f.principal.workspace_id),
+                )
+            },
+            Box::pin(futures_util::stream::iter([Ok(bytes::Bytes::from_static(
+                MP4,
+            ))])),
+        )
+        .await
+        .unwrap()
+        .id;
+    sqlx::raw_sql(&format!("CREATE FUNCTION test_link_output() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.deleted_at IS NOT NULL AND OLD.deleted_at IS NULL AND NEW.id='{pending}' THEN NEW.output_file_id:='{linked}'; END IF; RETURN NEW; END $$; CREATE TRIGGER test_link_output BEFORE UPDATE OF deleted_at ON async_jobs FOR EACH ROW EXECUTE FUNCTION test_link_output();"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (code, body) = s.delete(&s.gateway, pending).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let gone: bool =
+        sqlx::query_scalar("SELECT deleted_at IS NOT NULL FROM stored_files WHERE id=$1")
+            .bind(linked)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        gone,
+        "the output recorded meanwhile is deleted with the job"
+    );
+    let kept: bool = sqlx::query_scalar(
+        "SELECT deleted_at IS NULL AND coalesce(expires_at,'infinity')>now() FROM stored_files WHERE id=$1",
+    )
+    .bind(other)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(kept, "another job's output is untouched");
 }

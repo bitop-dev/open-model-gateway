@@ -871,24 +871,48 @@ async fn one_upstream_video_belongs_to_one_job(pool: PgPool) {
         calls,
         "nothing asked"
     );
-    // The deleted, settled fresh video's id may be given out again: the new
-    // job records it. A delete answered `204` counts as deleted.
+    // A deleted video still holds its id (its delete asks the server after
+    // the job is marked deleted): given out again, it is refused.
     *mock.fixed_id.lock().unwrap() = Some(upstream.clone());
-    let (status, reissued) = create(&theirs, "company/theirs").await;
-    assert_eq!(status, StatusCode::OK, "{reissued}");
-    set_status(&mock, &upstream, "completed");
-    let reissued_path = format!("{gateway}/v1/videos/{}", reissued["id"].as_str().unwrap());
-    stored().await;
-    assert_eq!(get(&reissued_path, &theirs).await.1["status"], "completed");
-    *mock.delete_status.lock().unwrap() = Some(204);
-    let deleted: Value = client
-        .delete(&reissued_path)
-        .header("authorization", &theirs)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
+    let (status, body) = create(&theirs, "company/theirs").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    // A delete answered `204` counts as deleted; one answered `202` (queued)
+    // confirms nothing.
+    *mock.fixed_id.lock().unwrap() = None;
+    for (answer, gone) in [(204, true), (202, false)] {
+        let (status, video) = create(&theirs, "company/theirs").await;
+        assert_eq!(status, StatusCode::OK, "{video}");
+        let id = Uuid::parse_str(
+            video["id"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("video_")
+                .unwrap(),
+        )
         .unwrap();
-    assert_eq!(deleted["upstream_deleted"], json!(true), "{deleted}");
+        let upstream: String = sqlx::query_scalar("SELECT upstream_id FROM async_jobs WHERE id=$1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        set_status(&mock, &upstream, "completed");
+        let path = format!("{gateway}/v1/videos/{}", video["id"].as_str().unwrap());
+        stored().await;
+        assert_eq!(get(&path, &theirs).await.1["status"], "completed");
+        *mock.delete_status.lock().unwrap() = Some(answer);
+        let deleted: Value = client
+            .delete(&path)
+            .header("authorization", &theirs)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            deleted["upstream_deleted"],
+            json!(gone),
+            "{answer}: {deleted}"
+        );
+    }
 }

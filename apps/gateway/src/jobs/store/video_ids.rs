@@ -44,10 +44,11 @@ pub(crate) async fn record_video_upstream(
     sqlx::query(&format!("SELECT pg_advisory_xact_lock(hashtextextended('video_upstream:'||{ACCOUNT}||':'||$2,0)) FROM async_jobs j WHERE j.id=$1"))
         .bind(id).bind(upstream.as_str())
         .execute(&mut *tx).await.map_err(job_settlement)?;
-    // Every job of the account holding the id, but a deleted and settled
-    // one: it is never read or settled again. A deleted job is not marked
-    // (`others_live`), and an unsettled one still blocks the id.
-    let others: Vec<(Uuid, bool)> = sqlx::query_as(&format!("SELECT o.id,o.deleted_at IS NULL FROM async_jobs o JOIN async_jobs j ON j.id=$1 WHERE o.upstream_id=$2 AND o.id<>$1 AND o.kind='video' AND (o.deleted_at IS NULL OR o.settled_at IS NULL) AND {} = {ACCOUNT}", upstream_account!("o")))
+    // Every job of the account holding the id, deleted ones too: a delete
+    // asks the server to delete its copy after the job is marked deleted,
+    // so an id given out again meanwhile would have that request remove the
+    // new holder's video. A deleted job is not marked (`others_live`).
+    let others: Vec<(Uuid, bool)> = sqlx::query_as(&format!("SELECT o.id,o.deleted_at IS NULL FROM async_jobs o JOIN async_jobs j ON j.id=$1 WHERE o.upstream_id=$2 AND o.id<>$1 AND o.kind='video' AND {} = {ACCOUNT}", upstream_account!("o")))
         .bind(id).bind(upstream.as_str())
         .fetch_all(&mut *tx).await.map_err(job_settlement)?;
     let others_live: Vec<Uuid> = others
@@ -79,6 +80,21 @@ pub(crate) async fn record_video_upstream(
 mod tests {
     use sqlx::PgPool;
     use uuid::Uuid;
+
+    /// The lookup of an id among an account's video jobs has its own index
+    /// (0101): by the id, over video jobs only.
+    #[dbtest::test]
+    async fn the_id_lookup_has_a_partial_index_of_video_jobs(pool: PgPool) {
+        let definition: String =
+            sqlx::query_scalar("SELECT pg_get_indexdef('async_jobs_video_upstream_id'::regclass)")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            definition,
+            "CREATE INDEX async_jobs_video_upstream_id ON public.async_jobs USING btree (upstream_id) WHERE (kind = 'video'::text)"
+        );
+    }
 
     /// One server is one account, whatever connection record or credential
     /// name reaches it: the approved base with or without its trailing slash

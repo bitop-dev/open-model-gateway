@@ -200,12 +200,17 @@ pub(crate) async fn delete_video(
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(VideoDeletion::Deleted);
     }
-    // A success without a deletion object (`204`, or a body that is not
-    // JSON) is the server's confirmation too; a JSON body must be one.
+    // `204`, or a `200` without a deletion object (a body that is not
+    // JSON), is the server's confirmation too; a JSON body must be one. Any
+    // other success (`202` queues the delete) confirms nothing.
     check_status(response.status())?;
-    if response.status() == reqwest::StatusCode::NO_CONTENT
-        || media_type(&response).as_deref() != Some("application/json")
-    {
+    if response.status() == reqwest::StatusCode::NO_CONTENT {
+        return Ok(VideoDeletion::Deleted);
+    }
+    if response.status() != reqwest::StatusCode::OK {
+        return Ok(VideoDeletion::Unconfirmed);
+    }
+    if media_type(&response).as_deref() != Some("application/json") {
         return Ok(VideoDeletion::Deleted);
     }
     let value = read_object_from(wire.kind, response).await?;

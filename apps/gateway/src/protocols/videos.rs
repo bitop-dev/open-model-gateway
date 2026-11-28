@@ -357,9 +357,8 @@ pub async fn delete(
         .delete_video(&principal, &id)
         .await
     {
-        // `upstream_deleted`: whether the provider's copy is gone (`false`
-        // when it offers no delete, or a create of unknown outcome left no
-        // id to delete; the copy then stays until the provider's expiry).
+        // `upstream_deleted`: whether the provider's copy is gone
+        // (`Jobs::delete_video`).
         Ok((job, upstream_deleted)) => Json(json!({
             "id": client_id(JobKind::Video.prefix(), job.id),
             "object": "video.deleted",

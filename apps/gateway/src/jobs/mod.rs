@@ -31,6 +31,7 @@ pub mod schedule;
 mod store;
 pub mod types;
 pub mod video;
+mod video_delete;
 pub mod video_output;
 mod video_route;
 

@@ -426,15 +426,21 @@ pub(crate) async fn mark_cancel_requested(store: &Store, id: Uuid) -> Result<()>
     .await.map_err(job_storage)?;
     Ok(())
 }
-pub(crate) async fn mark_deleted(store: &Store, id: Uuid) -> Result<()> {
-    sqlx::query(
-        "UPDATE async_jobs SET deleted_at=coalesce(deleted_at,clock_timestamp()) WHERE id=$1",
+/// Mark a job deleted, once: its output file as recorded at that moment
+/// (`Some(None)`: none), or `None` when it was deleted already. A delete
+/// clears `output_pending` (0098 trigger), so no output is recorded for the
+/// job after this ([`set_video_output`]). The same statement claims that
+/// file's deletion (unreadable at once, as `FileStorage::delete` claims it),
+/// so a delete that stops before removing it leaves it to the file sweeper,
+/// never live.
+pub(crate) async fn mark_deleted(store: &Store, id: Uuid) -> Result<Option<Option<Uuid>>> {
+    sqlx::query_scalar(
+        "WITH j AS (UPDATE async_jobs SET deleted_at=clock_timestamp() WHERE id=$1 AND deleted_at IS NULL RETURNING output_file_id,workspace_id), claimed AS (UPDATE stored_files f SET last_delete_attempt_at=clock_timestamp(),expires_at=least(f.expires_at,clock_timestamp()) FROM j WHERE f.id=j.output_file_id AND f.workspace_id=j.workspace_id AND f.deleted_at IS NULL) SELECT output_file_id FROM j",
     )
     .bind(id)
-    .execute(&store.pool)
+    .fetch_optional(&store.pool)
     .await
-    .map_err(job_storage)?;
-    Ok(())
+    .map_err(job_storage)
 }
 /// Claim the next due, unsettled provider job within its poll deadline that
 /// no poller holds, for `poller` ([`claim_due_many`] of one).
