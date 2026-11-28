@@ -21,11 +21,13 @@ pub(super) use crate::db::accounting_failure::{job_settlement, job_storage};
 type Result<T> = std::result::Result<T, sqlx::Error>;
 
 mod video_ids;
+mod video_output;
 pub(crate) use video_ids::record_video_upstream;
 #[cfg(all(test, feature = "integration-tests"))]
 pub(crate) use video_ids::upstream_account;
+pub(crate) use video_output::{set_output_failure, set_video_output};
 
-pub(crate) const JOB_COLUMNS: &str = "id,kind,workspace_id,api_key_id,deployment_id,execution_id,public_model,provider,upstream_id,state,upstream_status,progress,error_code,created_at,completed_at,expires_at,cancel_requested_at,deleted_at,poll_deadline_at,settled_at,video_seconds,video_size,batch_endpoint,request_total,request_completed,request_failed,batch_mode,user_id,input_file_id,work_file_id,output_file_id,error_file_id,price_tier,retry_limit,submit_started_at,in_progress_at,finalizing_at,last_progress_at,completion_window_hours";
+pub(crate) const JOB_COLUMNS: &str = "id,kind,workspace_id,api_key_id,deployment_id,execution_id,public_model,provider,upstream_id,state,upstream_status,progress,error_code,created_at,completed_at,expires_at,cancel_requested_at,deleted_at,poll_deadline_at,settled_at,video_seconds,video_size,batch_endpoint,request_total,request_completed,request_failed,batch_mode,user_id,input_file_id,work_file_id,output_file_id,error_file_id,price_tier,retry_limit,submit_started_at,in_progress_at,finalizing_at,last_progress_at,completion_window_hours,output_pending,output_failure,poll_failures";
 
 #[derive(Clone, Debug, FromRow)]
 pub struct JobRow {
@@ -72,6 +74,15 @@ pub struct JobRow {
     pub last_progress_at: Option<UtcInstant>,
     /// Batches (0022): the completion window in hours (`None`: 24).
     pub completion_window_hours: Option<i16>,
+    /// Videos (0098): awaiting the stored output (a completed video whose
+    /// output is neither stored nor given up, and not deleted).
+    pub output_pending: bool,
+    /// Videos (0098): why the output of a completed video is not stored, for
+    /// good (`video_output::OutputFailure`).
+    pub output_failure: Option<String>,
+    /// Failed polls since the last successful one (the backoff's exponent;
+    /// for a completed video awaiting its output, its failed attempts).
+    pub poll_failures: i32,
 }
 impl JobRow {
     /// A batch's completion window (24 h unless created with a longer one).
@@ -363,7 +374,7 @@ pub(crate) async fn observe(
     };
     // A terminal row keeps its recorded terminal facts.
     let (runner, epoch, any) = observer.binds();
-    let changed: Option<JobRow> = sqlx::query_as(&format!("UPDATE async_jobs SET state=$3,upstream_status=CASE WHEN state IN('queued','in_progress') THEN $4 ELSE upstream_status END,progress=greatest(progress,$5),completed_at=CASE WHEN $3 IN('completed','failed','cancelled','expired') THEN coalesce(completed_at,$6,clock_timestamp()) ELSE completed_at END,expires_at=coalesce($7,expires_at),error_code=coalesce(error_code,$8),request_total=greatest(request_total,$9),request_completed=greatest(request_completed,$10),request_failed=greatest(request_failed,$11),last_polled_at=clock_timestamp(),poll_failures=0,next_poll_at=clock_timestamp()+make_interval(secs=>$12) WHERE id=$1 AND state=$2 AND {} RETURNING {JOB_COLUMNS}", writer(13, 14, 15)))
+    let changed: Option<JobRow> = sqlx::query_as(&format!("UPDATE async_jobs SET state=$3,upstream_status=CASE WHEN state IN('queued','in_progress') THEN $4 ELSE upstream_status END,progress=greatest(progress,$5),completed_at=CASE WHEN $3 IN('completed','failed','cancelled','expired') THEN coalesce(completed_at,$6,clock_timestamp()) ELSE completed_at END,expires_at=coalesce($7,expires_at),error_code=coalesce(error_code,$8),request_total=greatest(request_total,$9),request_completed=greatest(request_completed,$10),request_failed=greatest(request_failed,$11),last_polled_at=clock_timestamp(),poll_failures=CASE WHEN output_pending THEN poll_failures ELSE 0 END,output_pending=output_pending OR (kind='video' AND $3='completed' AND state<>'completed' AND output_file_id IS NULL AND output_failure IS NULL AND deleted_at IS NULL),next_poll_at=clock_timestamp()+make_interval(secs=>$12) WHERE id=$1 AND state=$2 AND {} RETURNING {JOB_COLUMNS}", writer(13, 14, 15)))
         .bind(job.id).bind(current.as_str()).bind(next.as_str()).bind(obs.upstream_status).bind(obs.progress.map(i16::from)).bind(at(obs.completed_at)).bind(at(obs.expires_at)).bind(obs.error.map(|e| e.as_str())).bind(obs.counts.map(|c| c.total as i32)).bind(obs.counts.map(|c| c.completed as i32)).bind(obs.counts.map(|c| c.failed as i32)).bind(poll_interval_seconds).bind(runner).bind(epoch).bind(any)
         .fetch_optional(&store.pool).await.map_err(job_storage)?;
     match changed {
@@ -454,7 +465,11 @@ pub(crate) async fn claim_due(
 /// unsettled jobs that no claim takes) once for all the slots it fills. A
 /// video without a provider id stays claimable past its poll deadline: it is
 /// never polled upstream, and only a claim ends and settles it locally
-/// (`video::refresh_unrecorded_video`).
+/// (`video::refresh_unrecorded_video`). A video awaiting its stored output
+/// (`output_pending`, 0098) that is settled, or unsettled past its poll
+/// deadline, is claimable too (the other head holds the rest), until its
+/// output is stored or given up (`video_output`); its failed attempts back
+/// off like any failed poll.
 pub(crate) async fn claim_due_many(
     store: &Store,
     poller: Uuid,
@@ -464,7 +479,9 @@ pub(crate) async fn claim_due_many(
     held: &[Uuid],
 ) -> Result<Vec<(JobRow, BatchFence)>> {
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-    let claimed: Vec<Claimed> = sqlx::query_as(&format!("UPDATE async_jobs SET next_poll_at=clock_timestamp()+make_interval(secs=>$2),runner_id=$1,runner_epoch=runner_epoch+1,runner_lease_until=clock_timestamp()+make_interval(secs=>$3) WHERE id IN(SELECT id FROM async_jobs WHERE settled_at IS NULL AND batch_mode IS DISTINCT FROM 'gateway' AND next_poll_at<=clock_timestamp() AND (poll_deadline_at>clock_timestamp() OR (kind='video' AND upstream_id IS NULL) OR (kind='batch' AND upstream_id IS NULL AND (submit_started_at IS NULL OR state IN('queued','in_progress')))) AND (runner_lease_until IS NULL OR runner_lease_until<clock_timestamp()) AND id<>ALL($5) ORDER BY next_poll_at,id LIMIT $4 FOR UPDATE SKIP LOCKED) RETURNING {JOB_COLUMNS},runner_epoch"))
+    // Two heads merged, each from its own partial index in `next_poll_at`
+    // order: unsettled jobs, and settled videos awaiting their output (0098).
+    let claimed: Vec<Claimed> = sqlx::query_as(&format!("WITH unsettled AS (SELECT id,next_poll_at FROM async_jobs WHERE settled_at IS NULL AND batch_mode IS DISTINCT FROM 'gateway' AND next_poll_at<=clock_timestamp() AND (poll_deadline_at>clock_timestamp() OR (kind='video' AND upstream_id IS NULL) OR (kind='batch' AND upstream_id IS NULL AND (submit_started_at IS NULL OR state IN('queued','in_progress')))) AND (runner_lease_until IS NULL OR runner_lease_until<clock_timestamp()) AND id<>ALL($5) ORDER BY next_poll_at,id LIMIT $4 FOR UPDATE SKIP LOCKED), awaiting AS (SELECT id,next_poll_at FROM async_jobs WHERE output_pending AND (settled_at IS NOT NULL OR poll_deadline_at<=clock_timestamp()) AND next_poll_at<=clock_timestamp() AND (runner_lease_until IS NULL OR runner_lease_until<clock_timestamp()) AND id<>ALL($5) ORDER BY next_poll_at,id LIMIT $4 FOR UPDATE SKIP LOCKED) UPDATE async_jobs SET next_poll_at=clock_timestamp()+make_interval(secs=>$2),runner_id=$1,runner_epoch=runner_epoch+1,runner_lease_until=clock_timestamp()+make_interval(secs=>$3) WHERE id IN(SELECT id FROM (SELECT id,next_poll_at FROM unsettled UNION ALL SELECT id,next_poll_at FROM awaiting) due ORDER BY next_poll_at,id LIMIT $4) RETURNING {JOB_COLUMNS},runner_epoch"))
         .bind(poller).bind(interval_seconds).bind(lease_seconds).bind(limit).bind(held).fetch_all(&store.pool).await.map_err(job_storage)?;
     Ok(claimed
         .into_iter()

@@ -2,10 +2,10 @@
 //! `openai_compatible` connection, against a mock contract server, through
 //! the running gateway and the job poller on PostgreSQL. Per-route options
 //! and refusals, the length always and the size only when named, settlement
-//! from the seconds and size the server reports, content passed through
-//! from the server (and a server that fails it), a server that never
+//! from the seconds and size the server reports, the output stored in the
+//! gateway's file store (and a download that fails), a server that never
 //! finishes (poll budget), and a server without a delete (`405`).
-use super::db_tests::{bearer, line, na};
+use super::db_tests::{bearer, line, na, test_files};
 use super::*;
 use crate::{
     billing::v3::Meter,
@@ -211,6 +211,10 @@ async fn the_openai_video_contract_on_a_compatible_connection_end_to_end(pool: P
         .execute(&pool)
         .await
         .unwrap();
+    sqlx::query("UPDATE installation_settings SET file_video_enabled=true WHERE singleton")
+        .execute(&pool)
+        .await
+        .unwrap();
     let registry = || {
         let mut registry = ProviderRegistry::default();
         for adapter in crate::providers::local::adapters(
@@ -221,17 +225,17 @@ async fn the_openai_video_contract_on_a_compatible_connection_end_to_end(pool: P
         }
         registry
     };
+    let files = test_files().await;
     let engine = Engine::new(
         Arc::new(f.store.clone()),
         registry(),
         EngineLimits::default(),
     )
     .unwrap();
-    let (gateway, _gateway) = serve(crate::http::router_with_engine(
-        f.store.clone(),
-        None,
-        engine,
-    ))
+    let (gateway, _gateway) = serve(
+        crate::http::router_with_engine(f.store.clone(), None, engine)
+            .layer(axum::Extension(files.clone())),
+    )
     .await;
     let poller = Jobs::with(
         f.store.clone(),
@@ -240,7 +244,8 @@ async fn the_openai_video_contract_on_a_compatible_connection_end_to_end(pool: P
             poll_interval: Some(std::time::Duration::from_secs(1)),
             ..JobLimits::default()
         },
-    );
+    )
+    .with_files(Some(files));
     let auth = bearer(&f, f.principal.workspace_id).await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let create = async |body: Value| {
@@ -332,10 +337,11 @@ async fn the_openai_video_contract_on_a_compatible_connection_end_to_end(pool: P
                 .unwrap()
         }
     };
-    // A and B finish; C never finishes.
+    // A and B finish, and their first downloads fail; C never finishes.
     set_status(&mock, "vid_1", "completed");
     set_status(&mock, "vid_2", "completed");
     set_status(&mock, "vid_3", "in_progress");
+    mock.content_fails.store(true, Ordering::SeqCst);
     let due = async || {
         sqlx::query("UPDATE async_jobs SET next_poll_at=now()")
             .execute(&pool)
@@ -343,6 +349,7 @@ async fn the_openai_video_contract_on_a_compatible_connection_end_to_end(pool: P
             .unwrap();
     };
     due().await;
+    // The first poll settles A and B; their downloads fail.
     poller.poll_once().await.unwrap();
     let reservation = async |id: Uuid| {
         sqlx::query_as::<_, (String, Option<i64>, Option<i64>)>(
@@ -357,21 +364,38 @@ async fn the_openai_video_contract_on_a_compatible_connection_end_to_end(pool: P
     // 4 s × $0.20), B as named (8 s × $0.20).
     assert_eq!(reservation(a_id).await.1, Some(800_000));
     assert_eq!(reservation(b_id).await.1, Some(1_600_000));
-    // Content comes from the server, as it sends it; a failing server is an
-    // explicit upstream error.
     let content = |id: Uuid| get(format!("/v1/videos/video_{}/content", id.simple()));
     let response = content(a_id).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.headers()["content-type"], "video/mp4");
-    assert_eq!(response.headers()["x-content-type-options"], "nosniff");
-    assert_eq!(&response.bytes().await.unwrap()[..], MP4);
-    mock.content_fails.store(true, Ordering::SeqCst);
-    assert_eq!(content(b_id).await.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: Value = response.json().await.unwrap();
+    assert_eq!(error["error"]["code"], "video_not_ready");
+    // The download works again: the next poll stores both, from then on
+    // served from the gateway's copy.
     mock.content_fails.store(false, Ordering::SeqCst);
+    due().await;
+    poller.poll_once().await.unwrap();
+    for id in [a_id, b_id] {
+        let response = content(id).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "video/mp4");
+        assert_eq!(&response.bytes().await.unwrap()[..], MP4);
+    }
+    let downloads = mock.contents.load(Ordering::SeqCst);
+    due().await;
+    poller.poll_once().await.unwrap();
+    assert_eq!(content(a_id).await.status(), StatusCode::OK);
     assert_eq!(
         mock.contents.load(Ordering::SeqCst),
-        2,
-        "nothing downloaded by the poller"
+        downloads,
+        "stored once, never downloaded again"
+    );
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM stored_files f JOIN async_jobs j ON j.output_file_id=f.id WHERE f.purpose='video_output' AND f.workspace_id=j.workspace_id AND f.deleted_at IS NULL")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        stored, 2,
+        "each finished video stored once, in its workspace"
     );
 
     // C never finishes: past its poll deadline it is no longer polled, and
@@ -423,6 +447,12 @@ async fn the_openai_video_contract_on_a_compatible_connection_end_to_end(pool: P
         StatusCode::NOT_FOUND,
         "a deleted video is gone"
     );
+    let live: i64 = sqlx::query_scalar("SELECT count(*) FROM stored_files f JOIN async_jobs j ON j.output_file_id=f.id WHERE j.id=$1 AND f.deleted_at IS NULL AND (f.expires_at IS NULL OR f.expires_at>now())")
+        .bind(a_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(live, 0, "the gateway's copy is gone");
 }
 
 /// One upstream object is never reachable through two jobs: a server that
@@ -475,20 +505,50 @@ async fn one_upstream_video_belongs_to_one_job(pool: PgPool) {
         sqlx::query("INSERT INTO deployment_prices(id,deployment_id,input_token_limit,output_token_limit,pricing_version,price_lines,max_units) VALUES($1,$2,0,1,3,$3,'{}')")
             .bind(Uuid::new_v4()).bind(route).bind(json!(lines)).execute(&pool).await.unwrap();
     }
-    let mut registry = ProviderRegistry::default();
-    for adapter in crate::providers::local::adapters(
-        Arc::new(EnvSecrets::new([])),
-        ApprovedEndpoints::for_test(&base),
-    ) {
-        registry.register(adapter).unwrap();
-    }
-    let engine = Engine::new(Arc::new(f.store.clone()), registry, EngineLimits::default()).unwrap();
-    let (gateway, _gateway) = serve(crate::http::router_with_engine(
-        f.store.clone(),
-        None,
-        engine,
-    ))
+    let registry = || {
+        let mut registry = ProviderRegistry::default();
+        for adapter in crate::providers::local::adapters(
+            Arc::new(EnvSecrets::new([])),
+            ApprovedEndpoints::for_test(&base),
+        ) {
+            registry.register(adapter).unwrap();
+        }
+        registry
+    };
+    let engine = Engine::new(
+        Arc::new(f.store.clone()),
+        registry(),
+        EngineLimits::default(),
+    )
+    .unwrap();
+    sqlx::query("UPDATE installation_settings SET file_video_enabled=true WHERE singleton")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let files = test_files().await;
+    let (gateway, _gateway) = serve(
+        crate::http::router_with_engine(f.store.clone(), None, engine)
+            .layer(axum::Extension(files.clone())),
+    )
     .await;
+    // The poller: it observes a finished video and stores its output (until
+    // then the video reads in progress).
+    let poller = Jobs::with(
+        f.store.clone(),
+        registry(),
+        JobLimits {
+            poll_interval: Some(std::time::Duration::from_secs(1)),
+            ..JobLimits::default()
+        },
+    )
+    .with_files(Some(files));
+    let stored = async || {
+        sqlx::query("UPDATE async_jobs SET next_poll_at=now()")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let _ = poller.poll_once().await;
+    };
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let (mine, theirs) = (
         bearer(&f, f.principal.workspace_id).await,
@@ -674,6 +734,7 @@ async fn one_upstream_video_belongs_to_one_job(pool: PgPool) {
         .await
         .unwrap();
     set_status(&mock, &upstream, "completed");
+    stored().await;
     let path = format!("{gateway}/v1/videos/{}", fresh["id"].as_str().unwrap());
     let read: Value = client
         .get(&path)
@@ -695,14 +756,17 @@ async fn one_upstream_video_belongs_to_one_job(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(settled, ("settled".to_owned(), Some(400_000)));
+    // A thumbnail comes from the server (the video itself only from the
+    // gateway's stored copy), as labeled among the image types, a generic
+    // binary label as `application/octet-stream`, never sniffed.
     for (media, served) in [
-        ("video/webm", "video/webm"),
-        ("video/quicktime", "video/quicktime"),
-        ("text/plain", "application/octet-stream"),
+        ("image/png", "image/png"),
+        ("image/webp", "image/webp"),
+        ("application/binary", "application/octet-stream"),
     ] {
         *mock.content.lock().unwrap() = Some((200, media, MP4.to_vec(), None));
         let response = client
-            .get(format!("{path}/content"))
+            .get(format!("{path}/content?variant=thumbnail"))
             .header("authorization", &mine)
             .send()
             .await
@@ -755,14 +819,15 @@ async fn one_upstream_video_belongs_to_one_job(pool: PgPool) {
         let status = response.status();
         (status, response.json().await.unwrap_or(Value::Null))
     };
+    stored().await;
     assert_eq!(get(&kept_path, &mine).await.1["status"], "completed");
     *mock.content.lock().unwrap() = Some((
         200,
-        "video/mp4",
+        "image/png",
         MP4.to_vec(),
-        Some(crate::jobs::content_bounds::VIDEO_OUTPUT_MAX_BYTES + 1),
+        Some(crate::jobs::content_bounds::VIDEO_ASSET_MAX_BYTES + 1),
     ));
-    let (status, _) = get(&format!("{kept_path}/content"), &mine).await;
+    let (status, _) = get(&format!("{kept_path}/content?variant=thumbnail"), &mine).await;
     assert_eq!(
         status,
         StatusCode::BAD_GATEWAY,
@@ -813,6 +878,7 @@ async fn one_upstream_video_belongs_to_one_job(pool: PgPool) {
     assert_eq!(status, StatusCode::OK, "{reissued}");
     set_status(&mock, &upstream, "completed");
     let reissued_path = format!("{gateway}/v1/videos/{}", reissued["id"].as_str().unwrap());
+    stored().await;
     assert_eq!(get(&reissued_path, &theirs).await.1["status"], "completed");
     *mock.delete_status.lock().unwrap() = Some(204);
     let deleted: Value = client

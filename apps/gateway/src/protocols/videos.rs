@@ -54,6 +54,11 @@ pub(crate) fn job_error(e: JobError) -> Response {
             Json(json!({"error":{"message":message,"type":"invalid_request_error","code":code,"param":param.as_str()}})),
         )
             .into_response(),
+        JobError::Gone(code, message, reason) => (
+            StatusCode::GONE,
+            Json(json!({"error":{"message":message,"type":"invalid_request_error","code":code,"param":null,"reason":reason}})),
+        )
+            .into_response(),
         JobError::Forbidden(code, message) => (
             StatusCode::FORBIDDEN,
             Json(json!({"error":{"message":message,"type":"permission_error","code":code,"param":null}})),
@@ -193,6 +198,7 @@ fn parse(headers: &HeaderMap, body: &[u8]) -> Result<VideoRequest, JobError> {
 pub async fn create(
     State(store): State<Store>,
     Extension(engine): Extension<Engine>,
+    files: Option<Extension<crate::filestore::FileStoreRuntime>>,
     Extension(principal): Extension<Principal>,
     Extension(request_id): Extension<RequestId>,
     headers: HeaderMap,
@@ -208,7 +214,7 @@ pub async fn create(
         Err(e) => return job_error(e),
     };
     drop(body);
-    let jobs = Jobs::new(store, &engine);
+    let jobs = Jobs::new(store, &engine).with_files(files.map(|Extension(f)| f));
     match jobs.create_video(principal, request, request_id.0).await {
         Ok(job) => Json(render(&job)).into_response(),
         Err(e) => job_error(e),
@@ -218,10 +224,15 @@ pub async fn create(
 pub async fn retrieve(
     State(store): State<Store>,
     Extension(engine): Extension<Engine>,
+    files: Option<Extension<crate::filestore::FileStoreRuntime>>,
     Extension(principal): Extension<Principal>,
     Path(id): Path<String>,
 ) -> Response {
-    match Jobs::new(store, &engine).get_video(&principal, &id).await {
+    match Jobs::new(store, &engine)
+        .with_files(files.map(|Extension(f)| f))
+        .get_video(&principal, &id)
+        .await
+    {
         Ok(job) => Json(render(&job)).into_response(),
         Err(e) => job_error(e),
     }
@@ -294,18 +305,24 @@ pub(crate) fn stream_response(content: crate::jobs::types::ContentStream) -> Res
             .headers_mut()
             .insert(header::CONTENT_LENGTH, HeaderValue::from(n));
     }
-    // The body is the provider's: never sniffed into
-    // another type than the one stated.
+    // A generated body (the gateway's stored copy of a video, or a
+    // provider's thumbnail): never sniffed into another type than the one
+    // stated, and never cached on the way. `Range` is not served: always the
+    // whole body.
     response.headers_mut().insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 
 pub async fn content(
     State(store): State<Store>,
     Extension(engine): Extension<Engine>,
+    files: Option<Extension<crate::filestore::FileStoreRuntime>>,
     Extension(principal): Extension<Principal>,
     Path(id): Path<String>,
     query: Result<Query<ContentQuery>, axum::extract::rejection::QueryRejection>,
@@ -319,6 +336,7 @@ pub async fn content(
         Some(None) => return job_error(InferenceError::InvalidRequest.into()),
     };
     match Jobs::new(store, &engine)
+        .with_files(files.map(|Extension(f)| f))
         .video_content(&principal, &id, asset)
         .await
     {
@@ -330,10 +348,12 @@ pub async fn content(
 pub async fn delete(
     State(store): State<Store>,
     Extension(engine): Extension<Engine>,
+    files: Option<Extension<crate::filestore::FileStoreRuntime>>,
     Extension(principal): Extension<Principal>,
     Path(id): Path<String>,
 ) -> Response {
     match Jobs::new(store, &engine)
+        .with_files(files.map(|Extension(f)| f))
         .delete_video(&principal, &id)
         .await
     {

@@ -79,7 +79,7 @@ Keep the binary and compiled SPA from the same verified revision. Use a separate
 | `POST /v1/embeddings` | String/string-batch input, float or base64 vectors; declared embedding profiles |
 | `POST /v1/rerank` | `{model,query,documents,top_n?}` → scored indices; OpenRouter |
 | `POST /v1/systemone` | TypeSafe System One contract (TypeSafe SDK compatible); OpenRouter |
-| `/v1/videos`, `/v1/files`, `/v1/batches` | Gateway Files API; batches for any model (native OpenAI/Anthropic batch APIs or gateway-run lines, [batches](docs/batches.md)), workspace-owned gateway ids. `/v1/videos` on any server of the OpenAI video contract behind an approved OpenAI-compatible connection, with per-route lengths and sizes ([async jobs](docs/async-jobs.md)) |
+| `/v1/videos`, `/v1/files`, `/v1/batches` | Gateway Files API; batches for any model (native OpenAI/Anthropic batch APIs or gateway-run lines, [batches](docs/batches.md)), workspace-owned gateway ids. `/v1/videos` on any server of the OpenAI video contract behind an approved OpenAI-compatible connection, with per-route lengths and sizes and the finished video stored encrypted in the file store ([async jobs](docs/async-jobs.md)) |
 | `/api/v1/*` | Browser-session management with exact-Origin/CSRF checks |
 
 Inference keys never authorize management. Model-declared protocols must intersect adapter support. OpenAI, Anthropic, AWS Bedrock and OpenRouter have separate adapters; local vLLM, SGLang, Ollama and generic-compatible profiles have explicit, narrow contracts. Local HTTP requires exact server-controlled endpoint approval and pinned IP destinations; cloud requires HTTPS. Redirects, ambient proxies and implicit retries are disabled.

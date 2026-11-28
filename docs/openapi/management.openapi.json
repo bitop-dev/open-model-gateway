@@ -24159,6 +24159,36 @@
                       "video"
                     ]
                   },
+                  "output_expired": {
+                    "description": "Video jobs: the finished video was stored and its copy is gone (removed by the video retention, or with the job's delete).",
+                    "type": "boolean"
+                  },
+                  "output_failure": {
+                    "description": "Video jobs (0097): why the finished video's output will never be stored (the job stays completed and charged); null otherwise.",
+                    "enum": [
+                      "empty_output",
+                      "too_large",
+                      "upstream_refused",
+                      "storage_disabled",
+                      "download_failed",
+                      "route_unavailable",
+                      "storage_failed",
+                      "upstream_id_reused",
+                      null
+                    ],
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "output_pending": {
+                    "description": "Video jobs: the video is completed and its output is awaited (stored by the poller, or given up with output_failure). False for a video completed before the gateway stored outputs, and for batches.",
+                    "type": "boolean"
+                  },
+                  "output_stored": {
+                    "description": "Video jobs: whether the finished video's stored copy is live in the gateway's file store (false once deleted or removed by retention; always false for batches).",
+                    "type": "boolean"
+                  },
                   "poll_deadline_at": {
                     "$ref": "#/components/schemas/IdentityTime"
                   },
@@ -24271,6 +24301,10 @@
                   "settled_at",
                   "video_seconds",
                   "video_size",
+                  "output_stored",
+                  "output_expired",
+                  "output_pending",
+                  "output_failure",
                   "batch_endpoint",
                   "request_counts"
                 ],
@@ -25671,6 +25705,36 @@
                       "video"
                     ]
                   },
+                  "output_expired": {
+                    "description": "Video jobs: the finished video was stored and its copy is gone (removed by the video retention, or with the job's delete).",
+                    "type": "boolean"
+                  },
+                  "output_failure": {
+                    "description": "Video jobs (0097): why the finished video's output will never be stored (the job stays completed and charged); null otherwise.",
+                    "enum": [
+                      "empty_output",
+                      "too_large",
+                      "upstream_refused",
+                      "storage_disabled",
+                      "download_failed",
+                      "route_unavailable",
+                      "storage_failed",
+                      "upstream_id_reused",
+                      null
+                    ],
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "output_pending": {
+                    "description": "Video jobs: the video is completed and its output is awaited (stored by the poller, or given up with output_failure). False for a video completed before the gateway stored outputs, and for batches.",
+                    "type": "boolean"
+                  },
+                  "output_stored": {
+                    "description": "Video jobs: whether the finished video's stored copy is live in the gateway's file store (false once deleted or removed by retention; always false for batches).",
+                    "type": "boolean"
+                  },
                   "poll_deadline_at": {
                     "$ref": "#/components/schemas/IdentityTime"
                   },
@@ -25783,6 +25847,10 @@
                   "settled_at",
                   "video_seconds",
                   "video_size",
+                  "output_stored",
+                  "output_expired",
+                  "output_pending",
+                  "output_failure",
                   "batch_endpoint",
                   "request_counts"
                 ],

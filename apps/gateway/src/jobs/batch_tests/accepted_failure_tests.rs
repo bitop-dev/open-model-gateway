@@ -90,7 +90,7 @@ async fn accepted_failed_video_preserves_unknown_usage(pool: PgPool) {
     let f = fixture(pool).await;
     video_setup(&f).await;
     let fake = Fake::default();
-    let jobs = db_tests::jobs(&f, &fake, false);
+    let jobs = db_tests::jobs(&f, &fake, false).await;
     // The NA-token price also must not invent observations for a failed job.
     for free in [true, false] {
         if free {

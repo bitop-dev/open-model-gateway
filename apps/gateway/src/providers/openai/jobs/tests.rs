@@ -76,12 +76,16 @@ impl Mock {
                         .unwrap()
                         .pop_front()
                         .expect("unexpected request");
-                    Response::builder()
+                    let mut response = Response::builder()
                         .status(reply.status)
                         .header(header::CONTENT_TYPE, reply.content_type)
-                        .header(header::LOCATION, "https://example.invalid/elsewhere")
-                        .body(Body::from(reply.body))
-                        .unwrap()
+                        .header(header::LOCATION, "https://example.invalid/elsewhere");
+                    // A `range=` parameter on the type marks a reply that
+                    // also says it holds only a range of the content.
+                    if reply.content_type.contains("; range=") {
+                        response = response.header(header::CONTENT_RANGE, "bytes 0-1/1000");
+                    }
+                    response.body(Body::from(reply.body)).unwrap()
                 }
             },
         );
@@ -777,11 +781,16 @@ async fn video_content_is_only_a_complete_answer() {
             content_type: "video/mp4",
             body: b"\x00\x00".to_vec(),
         },
+        Reply {
+            status: 200,
+            content_type: "video/mp4; range=1",
+            body: b"\x00\x00".to_vec(),
+        },
     ])
     .await;
     let a = mock.adapter();
     let (t, id) = (target("sora-2"), UpstreamId::parse("video_abc123").unwrap());
-    for _ in 0..2 {
+    for _ in 0..3 {
         assert_eq!(
             a.video_content(&t, &id, VideoAsset::Video).await.err(),
             Some(InferenceError::InvalidUpstream)

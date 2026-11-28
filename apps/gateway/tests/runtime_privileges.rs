@@ -2454,6 +2454,20 @@ mod jobs_fake {
         ) -> Result<UpstreamVideo, InferenceError> {
             Ok(video(JobState::Completed))
         }
+        async fn video_content(
+            &self,
+            _: &Deployment,
+            _: &UpstreamId,
+            _: VideoAsset,
+        ) -> Result<ContentStream, InferenceError> {
+            Ok(ContentStream {
+                content_type: "video/mp4",
+                content_length: Some(4),
+                body: Box::pin(futures_util::stream::iter([Ok(bytes::Bytes::from_static(
+                    b"mp4!",
+                ))])),
+            })
+        }
         fn native_batch(&self, _: &Deployment, _: BatchEndpoint) -> bool {
             true
         }
@@ -2556,6 +2570,7 @@ async fn async_jobs_run_as_runtime(pool: &PgPool) {
   '[{{"meter":"input_tokens","not_applicable":true}},{{"meter":"output_tokens","not_applicable":true}},{{"meter":"cache_read_tokens","not_applicable":true}},{{"meter":"cache_write_tokens","not_applicable":true}},{{"meter":"cache_write_5m_tokens","not_applicable":true}},{{"meter":"cache_write_1h_tokens","not_applicable":true}},{{"meter":"output_images","not_applicable":true}},{{"meter":"input_characters","not_applicable":true}},{{"meter":"input_audio_seconds_ms","not_applicable":true}},{{"meter":"output_audio_seconds_ms","not_applicable":true}},{{"meter":"search_units","not_applicable":true}},{{"meter":"requests","microusd_per_batch":"0","batch":1,"unit_label":"/request","sku_label":"Request"}},{{"meter":"output_video_seconds_ms","microusd_per_batch":"100000","batch":1000,"unit_label":"/second","sku_label":"Video"}}]','{{}}');
  INSERT INTO deployment_prices(id,deployment_id,input_microusd_per_million,output_microusd_per_million,input_token_limit,output_token_limit,pricing_version) VALUES(gen_random_uuid(),db,1000000,1000000,100,50,1);
  UPDATE deployments SET video_seconds='{{4}}' WHERE id=dv;
+ UPDATE installation_settings SET file_video_enabled=true WHERE singleton;
  END $$"#))
     .execute(pool)
     .await
@@ -2564,7 +2579,30 @@ async fn async_jobs_run_as_runtime(pool: &PgPool) {
     let fake = std::sync::Arc::new(jobs_fake::Fake::default());
     let mut registry = ProviderRegistry::default();
     registry.register(fake.clone()).unwrap();
-    let jobs = Jobs::with(store, registry, JobLimits::default());
+    // Finished videos are stored in the file store (#52), as the runtime role.
+    let files_dir = tempfile::tempdir().unwrap();
+    let files = {
+        use base64::Engine as _;
+        let dir = files_dir.path().join("files");
+        let key = format!(
+            "test:{}",
+            base64::engine::general_purpose::STANDARD
+                .encode(std::array::from_fn::<u8, 32, _>(|i| i as u8))
+        );
+        let config =
+            open_model_gateway::filestore::FileStoreConfig::from_lookup(&|name| match name {
+                "GATEWAY_FILE_STORE" => Some("local".into()),
+                "GATEWAY_FILE_STORE_DIR" => Some(dir.to_str().unwrap().into()),
+                "GATEWAY_FILE_ENCRYPTION_KEYS_ENV" => Some("TEST_KEY".into()),
+                "TEST_KEY" => Some(key.clone()),
+                _ => None,
+            })
+            .unwrap();
+        open_model_gateway::filestore::FileStoreRuntime::build(config)
+            .await
+            .unwrap()
+    };
+    let jobs = Jobs::with(store, registry, JobLimits::default()).with_files(Some(files));
     let principal = Principal {
         key_id: key,
         workspace_id: ws,
@@ -2625,6 +2663,16 @@ async fn async_jobs_run_as_runtime(pool: &PgPool) {
     .await
     .unwrap();
     assert_eq!((state.as_str(), actual), ("settled", Some(400_000)));
+    let stored: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT output_file_id FROM async_jobs WHERE execution_id=$1")
+            .bind(video)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(
+        stored.is_some(),
+        "the finished video is stored as the runtime role"
+    );
     // Batches (0021): a gateway input file, native admission at the pinned
     // price, cancel before submission (released at zero), a native
     // submit/poll/collect, and a gateway-run batch through the engine.

@@ -2,11 +2,39 @@
 
 Notes for changes on `main` after [v0.20.0](v0.20.0.md). They become the next release's notes.
 
+## Breaking and behaviour changes
+
+- **Video creation needs the file store with video outputs allowed** (#52). A finished video is now stored in the gateway, so `POST /v1/videos` answers **400 `video_storage_unavailable`** until a Platform Admin turns video outputs on (`file_video_enabled`, off by default) on an installation with a file store.
+- **Videos completed before this release are no longer served by `/content`** (#52). v0.20.0 passed the server's copy through while the server kept it. Now `/content` serves only the gateway's stored copy, which a video completed before the upgrade never had: it answers **410 `video_output_unavailable`** with `reason: completed_before_storage`. So does a video that a replica of v0.20.0 saw complete during the upgrade, since that replica does not mark it as awaiting its output. A video still running at the upgrade and completed by this release has its output stored.
+- **A completed video reads `in_progress` until its output is stored** (#52), so a client that downloads once it reads `completed` finds it. The charge is made when the provider completes it.
+
+## Gateway behavior
+
+- **Finished videos are stored in the gateway** (#52, part 1b). The poller stores each finished video once, encrypted, in the file store:
+  - typed `video/mp4`, `video/webm` or `video/quicktime` as received, and any other label as `application/octet-stream`;
+  - at most 512 MiB, abandoned after 60 s without data or 25 minutes in all;
+  - counted toward the workspace's storage, and carrying the job's key and its holder (object visibility, legal holds, subject exports);
+  - kept for `file_video_retention_days` (default 7), then `/content` answers **410 `video_output_expired`**.
+- **Downloads** run under the poller's claim, its lease renewed. They take at most half of a replica's poll slots. Failed downloads back off and are retried until 6 hours after the video completed; only `too_large` and a reused provider id are given up at once.
+- **`/content`** serves that stored copy with its type, `nosniff` and `Cache-Control: no-store`, always whole (no `Range`).
+  - It answers `video_not_ready` while the output is awaited.
+  - It answers **503** with the file store unavailable, or when a stored copy's object is missing. That case is logged at error.
+  - Thumbnails and spritesheets still come from the server, bounded, a partial answer refused.
+- **A completed job is charged whether or not its output could be stored.** When it cannot be, the job records why for good: `output_unavailable: {reason}`, shown in Logs. `/content` then answers **410 `video_output_unavailable`** with that `reason`.
+- **A video is created only with storage for it:** the file store accepting video outputs (**400 `video_storage_unavailable`**), and the workspace under its storage quota with 512 MiB counted for each video still awaiting its output (**400 `storage_quota_exceeded`**). Sizing and what to watch: [operations](../operations.md#stored-video-outputs-52).
+- **`DELETE`** deletes the gateway's copy with the record.
+- **Outputs are stored by the job poller only.** With the poller disabled on every replica, a finished video stays `in_progress`.
+
 ## Guardrails
 
 - **What a rule does with content it cannot read (#841, migration 0100).** Unchanged by default: a Block rule keeps `uninspectable: deny`, so a request with an image, audio or a document that isn't plain text is still refused with `guardrail_not_supported` after its text is checked, and existing rules are not rewritten. New: `uninspectable: allow` on a rule lets such a request through unread, the text beside an image still checked and blocked on a match, recorded as `skipped` ("Not readable · let through" in the monthly totals, "Let through unread" on the request page). A native batch is still refused by a Block rule under either value: its lines are text a gateway-run batch reads. New: a rule may name the `images`, `audio_transcriptions` and `realtime` workloads, which this release never reads; a Block rule naming them refuses every request of that workload with `guardrail_not_supported` before admission (a realtime session before the WebSocket upgrade), and with `allow` they pass unread and record `skipped`; a realtime session's decisions are recorded with operation `realtime`. Rules that name only generation and embeddings, every rule written before, change nothing for these workloads. `allow` is the weaker value: a workspace's tightening may move a platform rule from `allow` to `deny`, never back (`403 guardrail_loosen_not_allowed`), and composition takes `deny`. Every decision now records its rule's own verdict (`refuses`), and the monthly totals split not readable decisions by it (`refuses`, null on other rows). The rule dialog says before saving when a Block rule would refuse every request of a workload for every workspace its layer reaches. [Content a rule cannot read](../guardrails-design.md#content-a-rule-cannot-read-841)
 
 ## Upgrade
+
+- **#52:**
+  - **Drain the gateway before upgrading.** A replica of v0.20.0 that sees a video complete does not mark it as awaiting its output, so that video reads `completed_before_storage` for good.
+  - Reapply the runtime grants: `UPDATE(output_pending, output_failure)` on `async_jobs`.
+  - Turn on video outputs if videos are to be created (see above).
 
 ### Migrations
 

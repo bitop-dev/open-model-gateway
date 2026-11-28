@@ -67,7 +67,6 @@ impl<S> Bounded<S> {
             done: false,
         }
     }
-    #[cfg(test)]
     pub(crate) fn cut(&self) -> Arc<OnceLock<Cut>> {
         self.cut.clone()
     }

@@ -726,10 +726,25 @@ BEGIN
   BEGIN UPDATE async_jobs SET state='in_progress' WHERE id=j; RAISE EXCEPTION 'async job regression allowed'; EXCEPTION WHEN raise_exception THEN IF SQLERRM NOT LIKE 'invalid async job transition%' THEN RAISE; END IF; END;
   BEGIN UPDATE async_jobs SET workspace_id=personal WHERE id=j; RAISE EXCEPTION 'async job re-own allowed'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
   BEGIN DELETE FROM async_jobs WHERE id=j; RAISE EXCEPTION 'async job removal allowed'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
-  -- A video's output state (0098) is the poller's: never written at insert, and not writable by this role (yet).
-  IF has_column_privilege('gateway_runtime','public.async_jobs','output_failure','UPDATE') OR has_column_privilege('gateway_runtime','public.async_jobs','output_pending','UPDATE') THEN RAISE EXCEPTION 'video output state writable'; END IF;
+  -- A video's output state (0098) is the poller's: written by this role on an existing job only (never at insert), and only on a completed video: on this batch the CHECK, not the grant, refuses it.
+  BEGIN UPDATE async_jobs SET output_failure='download_failed' WHERE id=j; RAISE EXCEPTION 'output failure on a batch allowed'; EXCEPTION WHEN check_violation THEN NULL; END;
+  BEGIN UPDATE async_jobs SET output_pending=true WHERE id=j; RAISE EXCEPTION 'awaited output on a batch allowed'; EXCEPTION WHEN check_violation THEN NULL; END;
   BEGIN INSERT INTO async_jobs(id,kind,workspace_id,api_key_id,deployment_id,execution_id,public_model,provider,upstream_id,state,poll_deadline_at,video_seconds,completed_at,output_failure) VALUES(gen_random_uuid(),'video',ws,k,d,e,'rollback','openai_compatible','video_out_'||replace(j::text,'-',''),'completed',now(),4,now(),'too_large'); RAISE EXCEPTION 'output failure at insert allowed'; EXCEPTION WHEN check_violation THEN IF SQLERRM NOT LIKE 'a video output state%' THEN RAISE; END IF; END;
   BEGIN INSERT INTO async_jobs(id,kind,workspace_id,api_key_id,deployment_id,execution_id,public_model,provider,upstream_id,state,poll_deadline_at,video_seconds,completed_at,output_pending) VALUES(gen_random_uuid(),'video',ws,k,d,e,'rollback','openai_compatible','video_pend_'||replace(j::text,'-',''),'completed',now(),4,now(),true); RAISE EXCEPTION 'awaited output at insert allowed'; EXCEPTION WHEN check_violation THEN IF SQLERRM NOT LIKE 'a video output state%' THEN RAISE; END IF; END;
+  -- A completed video's output state (0098), as the poller writes it: set by
+  -- the update that completes the video, never by another; cleared only with
+  -- an outcome; given up once, never a second outcome.
+  DECLARE v uuid:=gen_random_uuid(); ve uuid:=gen_random_uuid(); BEGIN
+   INSERT INTO inference_executions(started_at,id,workspace_id,api_key_id,deployment_id,public_model,provider,streamed,state,root_request_id,attempt_number) VALUES(now(),ve,ws,k,d,'rollback','openai_compatible',false,'started',ve,1);
+   INSERT INTO async_jobs(id,kind,workspace_id,api_key_id,deployment_id,execution_id,public_model,provider,upstream_id,poll_deadline_at,video_seconds) VALUES(v,'video',ws,k,d,ve,'rollback','openai_compatible','video_probe_'||replace(v::text,'-',''),now()+interval '6 hours',4);
+   UPDATE async_jobs SET state='in_progress' WHERE id=v;
+   BEGIN UPDATE async_jobs SET output_pending=true,progress=50 WHERE id=v; RAISE EXCEPTION 'awaited output set without completion'; EXCEPTION WHEN check_violation THEN IF SQLERRM NOT LIKE 'a video awaits its output only%' THEN RAISE; END IF; END;
+   UPDATE async_jobs SET state='completed',completed_at=now(),output_pending=true WHERE id=v;
+   BEGIN UPDATE async_jobs SET output_pending=false WHERE id=v; RAISE EXCEPTION 'awaited output cleared without an outcome'; EXCEPTION WHEN check_violation THEN IF SQLERRM NOT LIKE 'a video stops awaiting%' THEN RAISE; END IF; END;
+   UPDATE async_jobs SET output_failure='download_failed',output_pending=false WHERE id=v AND output_pending;
+   IF (SELECT output_failure FROM async_jobs WHERE id=v) IS DISTINCT FROM 'download_failed' THEN RAISE EXCEPTION 'video output not given up'; END IF;
+   BEGIN UPDATE async_jobs SET output_failure='too_large' WHERE id=v; RAISE EXCEPTION 'a second video output outcome allowed'; EXCEPTION WHEN check_violation THEN IF SQLERRM NOT LIKE 'a video output failure is recorded once%' THEN RAISE; END IF; END;
+  END;
   BEGIN UPDATE async_job_files SET upstream_id='x' WHERE id=fi; RAISE EXCEPTION 'async job file rewrite allowed'; EXCEPTION WHEN insufficient_privilege THEN NULL; END;
   BEGIN UPDATE async_job_files SET job_id=NULL WHERE id=fi; RAISE EXCEPTION 'consumed batch file released'; EXCEPTION WHEN raise_exception THEN IF SQLERRM<>'async job files are immutable' THEN RAISE; END IF; END;
   BEGIN INSERT INTO async_jobs(id,kind,workspace_id,api_key_id,deployment_id,execution_id,public_model,provider,upstream_id,poll_deadline_at,video_seconds,video_size) VALUES(gen_random_uuid(),'video',personal,k,d,e,'rollback','openai','video_x',now(),4,'720x1280'); RAISE EXCEPTION 'cross-workspace job allowed'; EXCEPTION WHEN foreign_key_violation OR unique_violation THEN NULL; END;

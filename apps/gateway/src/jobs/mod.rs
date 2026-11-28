@@ -31,6 +31,7 @@ pub mod schedule;
 mod store;
 pub mod types;
 pub mod video;
+pub mod video_output;
 mod video_route;
 
 use gateway_datetime_compat::UtcInstant;
@@ -200,6 +201,9 @@ pub enum JobError {
         &'static str,
         crate::inference::error::FieldName,
     ),
+    /// The object exists but its content is gone for good (HTTP 410): code,
+    /// message, and the reason code when there is one.
+    Gone(&'static str, &'static str, Option<&'static str>),
     /// Visible but not the caller's to change: delete or cancel needs the
     /// creating user, a workspace owner/admin or a service-account key (HTTP 403).
     Forbidden(&'static str, &'static str),
@@ -229,6 +233,9 @@ pub struct Jobs {
     /// Approved local endpoints: batch scheduling reads server load signals
     /// only from their origins (pinned addresses).
     pub(crate) approvals: Option<Arc<crate::providers::local::endpoints::ApprovedEndpoints>>,
+    /// Video output downloads at once: half the poll slots, at least one
+    /// (`video_output::refresh_output`).
+    pub(crate) downloads: Arc<tokio::sync::Semaphore>,
     /// Test-only counters proving `plan::every_candidate_route_refuses`'s
     /// model-level lookups are memoized at most once per scan (#238
     /// follow-up), not once per explicit-maximum line. Never read outside
@@ -335,6 +342,9 @@ impl Jobs {
             files: None,
             engine: None,
             approvals: None,
+            downloads: Arc::new(tokio::sync::Semaphore::new(
+                (limits.poll_concurrency.max(1) / 2).max(1),
+            )),
             #[cfg(test)]
             plan_lookup_counts: Arc::new(plan::PlanLookupCounts::default()),
             #[cfg(test)]
@@ -730,5 +740,7 @@ mod schedule_db_tests;
 mod tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod video_contract_tests;
+#[cfg(all(test, feature = "integration-tests"))]
+mod video_output_tests;
 #[cfg(all(test, feature = "integration-tests"))]
 mod video_routing_tests;

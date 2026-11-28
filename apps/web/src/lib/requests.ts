@@ -98,7 +98,7 @@ export type JobState = "queued" | "in_progress" | "completed" | "failed" | "canc
 /** Job details on the request page. Metadata only: never prompts, lines or outputs. */
 export type JobDetail = JobSummary & Partial<{
   progress: number | null; error_code: string | null; created_at: string; completed_at: string | null; expires_at: string | null; cancel_requested_at: string | null; deleted_at: string | null;
-  poll_deadline_at: string; settled_at: string | null; video_seconds: number | null; video_size: string | null; batch_endpoint: string | null; request_counts: { total: number; completed: number; failed: number } | null;
+  poll_deadline_at: string; settled_at: string | null; video_seconds: number | null; video_size: string | null; /** Video: the finished video is stored in the gateway (absent from older gateways). */ output_stored?: boolean; /** Video: completed and its output awaited (absent from older gateways). */ output_pending?: boolean; /** Video: its stored copy was removed by retention (absent from older gateways). */ output_expired?: boolean; /** Video: why its output will never be stored (the job stays completed and charged). */ output_failure?: string | null; batch_endpoint: string | null; request_counts: { total: number; completed: number; failed: number } | null;
 }>;
 export const jobStateLabels: Record<JobState, string> = { queued: "Queued", in_progress: "In progress", completed: "Completed", failed: "Failed", cancelled: "Cancelled", expired: "Expired" };
 export const jobStateTone = (s: JobState) => s === "completed" ? "success" : s === "failed" ? "danger" : s === "queued" || s === "in_progress" ? "info" : "neutral";
@@ -300,3 +300,16 @@ const reasons: Record<string, string> = {
 export const unresolvedText = (reason: string | null) => reason ? reasons[reason] ?? reason.replaceAll("_", " ") : null;
 const workloads: Record<string, string> = { generation: "Text generation", embeddings: "Embeddings", images: "Images", audio_transcriptions: "Speech to text", audio_speech: "Text to speech", rerank: "Rerank", systemone: "System One", realtime: "Realtime audio", videos: "Video job", batches: "Batch job" };
 export const workloadText = (kind: string) => workloads[kind] ?? kind;
+
+/** Why a completed video's output will never be stored, as the poller recorded it. */
+const outputFailures: Record<string, string> = { empty_output: "the server sent no bytes", too_large: "larger than the 512 MiB the gateway stores", upstream_refused: "the server refused to send it", storage_disabled: "the file store or its video outputs are turned off", download_failed: "the download kept failing", route_unavailable: "its route or connection is disabled", storage_failed: "the file store kept failing", upstream_id_reused: "the provider gave its id to another job, so it is never fetched" };
+/** A completed video's output: stored, not stored yet, or never (the job is still charged). */
+export function videoOutputText(job: Pick<JobDetail, "output_stored" | "output_expired" | "output_pending" | "output_failure" | "deleted_at">): string {
+  if (job.deleted_at) return "Deleted with the job";
+  if (job.output_expired) return "Stored, then removed by the video retention";
+  if (job.output_failure) return `Not stored, for good: ${outputFailures[job.output_failure] ?? job.output_failure}. The video was generated and is charged.`;
+  if (job.output_stored) return "Stored in the gateway";
+  if (job.output_pending) return "Not stored yet";
+  if (job.output_stored === false && job.output_pending === false) return "Not stored: completed before the gateway stored videos. The video was generated and is charged.";
+  return "Unknown";
+}
